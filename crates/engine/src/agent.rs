@@ -95,6 +95,10 @@ impl Agent {
         self.gate.mode()
     }
 
+    pub fn set_reasoning(&mut self, r: crate::provider::Reasoning) {
+        self.cfg.reasoning = r;
+    }
+
     /// Handle for cancelling from another thread (the UI's Stop button).
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
         self.cancel.clone()

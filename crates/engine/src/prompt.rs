@@ -38,6 +38,13 @@ pub struct PromptBuilder {
     /// Incremented every time we drop history. Surfaced in the UI: a compaction
     /// is a visible latency spike, and users notice the spike.
     pub compactions: u32,
+    /// Sequence number of `history[0]`.
+    ///
+    /// Compaction removes from the front, so index-based cursors break. A
+    /// monotonic sequence lets a consumer (the session host) ask "which
+    /// messages have I not persisted yet?" without caring that the window
+    /// shifted. The database keeps everything; the prompt is a window over it.
+    first_seq: u64,
 }
 
 /// Bump when the system prompt text changes, so cache-miss regressions can be
@@ -78,6 +85,7 @@ impl PromptBuilder {
             env_block: String::new(),
             token_budget: 8_000,
             compactions: 0,
+            first_seq: 0,
         }
     }
 
@@ -185,6 +193,7 @@ impl PromptBuilder {
                 break;
             }
             self.history.drain(0..remove);
+            self.first_seq += remove as u64;
             dropped += remove;
         }
         if dropped > 0 {
@@ -222,9 +231,30 @@ impl PromptBuilder {
         &self.history
     }
 
+    /// Sequence number of the oldest message still in the window.
+    pub fn first_seq(&self) -> u64 {
+        self.first_seq
+    }
+
+    /// Sequence number the next pushed message will get.
+    pub fn next_seq(&self) -> u64 {
+        self.first_seq + self.history.len() as u64
+    }
+
+    /// Sequence of the message at `idx` within the current window.
+    pub fn seq_at(&self, idx: usize) -> u64 {
+        self.first_seq + idx as u64
+    }
+
     /// Rehydrate from stored history.
     pub fn with_history(&mut self, msgs: Vec<Message>) {
         self.history = msgs;
+    }
+
+    /// Continue sequence numbering after rehydrating a stored session, so the
+    /// host does not re-persist messages it already has.
+    pub fn set_first_seq(&mut self, s: u64) {
+        self.first_seq = s;
     }
 }
 
