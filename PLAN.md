@@ -155,6 +155,44 @@ Engine allows exactly one in-flight turn. Queued work shows a **prefill ETA** (`
 
 **Total ~6–8 weeks solo.** M1 and M2 are the ones that slip; guard them.
 
+### M0 — DONE (2026-10-01), measured on the dev box
+
+Frameless window + custom titlebar, Svelte 5 + Tailwind v4 wired, and a scripted
+token stream delivered over `tauri::ipc::Channel<EngineEvent>` and painted with
+plain-text appends batched on rAF.
+
+| Gate | Result |
+|---|---|
+| GPU: renderD128 only, no NVIDIA | ✅ `cowry-app` holds **renderD128** only |
+| Mesa pin actually applied | ✅ `[cowry] EGL vendor pinned to: .../50_mesa.json` |
+| Memory (debug build, vite dev server) | **233.2 MB PSS** across 3 processes |
+| — cowry-app host | 89.4 MB |
+| — WebKitWebProcess | 108.9 MB |
+| — WebKitNetworkProcess | 34.9 MB |
+| RSS would have said | 438.3 MB — a **false failure** at the 400 MB gate |
+| Page actually loaded | ✅ WebKitNetworkProcess has an ESTAB connection to vite:5173 |
+| Engine unit tests | 6 passed |
+
+Three processes, ~233 MB, debug profile. Qoder is 14 processes and ~700–850 MB
+PSS. Release build + production bundle should land materially below 233 MB.
+
+**Still needs human eyes:** whether the window visually painted correctly. Every
+machine-checkable gate passed; a blank-webview failure would not show up in any
+of them.
+
+### Config footgun found in M0
+
+Tauri v2 resolves these two things **relative to different directories**:
+
+| Key | Relative to |
+|---|---|
+| `build.frontendDist` | the **config file** (`crates/tauri-app/`) → `"../../ui/dist"` |
+| `build.beforeDevCommand` / `beforeBuildCommand` | the **CWD of the CLI**, which for us is `crates/` → `"npm --prefix ../ui run dev"` |
+
+Verified empirically (`beforeDevCommand: pwd` printed `.../cowry/crates`). Getting
+this wrong produces a confusing `ENOENT .../Projects/ui/package.json`. `dev.sh`
+always runs the CLI from `crates/tauri-app`, so the values above are stable.
+
 ---
 
 ## 7. Telemetry bar
@@ -218,6 +256,7 @@ done | paste -sd+ | bc
 
 1. Virtualize the chat list — biggest lever by far
 2. `Channel<T>` + rAF batching; **plain text while streaming, full markdown on stream end** (re-parsing markdown per token is the classic stutter)
+   — implemented and measured in M0: deltas are buffered into an array and flushed as **one** `appendChild(textNode)` per animation frame
 3. Persist rendered HTML in SQLite → reopening a session is instant
 4. One webview, no iframes, no devtools in release
 5. Heatmap = one `<canvas>`, not 371 divs; lazy-load everything off the composer

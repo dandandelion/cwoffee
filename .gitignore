@@ -21,3 +21,5 @@ assets/working/
 .vscode
 .DS_Store
 *.log
+ui/dist/*
+!ui/dist/.gitkeep

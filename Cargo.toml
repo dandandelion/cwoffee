@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/engine",
+    "crates/tauri-app",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cowry/cowry"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+cowry-engine = { path = "crates/engine" }
+
+# ---- M1 will add: reqwest, futures-util, rusqlite, portable-pty, similar,
+#      pulldown-cmark, rust_xlsxwriter, calamine, typst, bwrap plumbing ----
+
+# ---------------------------------------------------------------------------
+# Release profile — PLAN.md §9 rule 9.
+# We ship an application, so optimise for size + startup, not just throughput.
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Dev builds still need to be usable; keep debug info but cut some bloat.
+[profile.dev]
+opt-level = 1
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2

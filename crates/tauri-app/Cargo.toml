@@ -1,0 +1,18 @@
+[package]
+name = "cowry-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cowry desktop host. Thin: plumbing + the GPU policy, nothing else."
+
+# This crate is deliberately boring. If logic is accumulating here, it belongs
+# in crates/engine instead.
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+cowry-engine.workspace = true

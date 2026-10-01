@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Design tokens — the direction from the mock: pastel, hairline borders,
+   generous whitespace, muted type. Kept small on purpose; every token here
+   has to earn its place.
+--------------------------------------------------------------------------- */
+@theme {
+  /* surfaces */
+  --color-paper: #fdfcf9;
+  --color-paper-2: #f7f5ef;
+  --color-hairline: #e8e5dd;
+  --color-hairline-2: #dcd8ce;
+
+  /* sidebar wash: cream -> pale olive, like the mock */
+  --color-wash-1: #f4f1e4;
+  --color-wash-2: #eef0e6;
+  --color-wash-3: #e9eee9;
+
+  /* ink */
+  --color-ink: #2b2a27;
+  --color-ink-2: #6b6862;
+  --color-ink-3: #9b978e;
+
+  /* accents */
+  --color-shell: #c9a87c;
+  --color-shell-deep: #a8875c;
+  --color-sea: #a9cdec;
+  --color-go: #2f2e2b;
+
+  --radius-card: 14px;
+  --radius-pill: 999px;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  /* frameless window: nothing here should scroll */
+  overflow: hidden;
+}
+
+/* ---------------------------------------------------------------------------
+   Frameless-window chrome.
+   The drag region is Tauri's mechanism (data-tauri-drag-region); do not
+   replace it with a mousedown handler, that fights the WM on Wayland.
+--------------------------------------------------------------------------- */
+.titlebar {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.wbtn {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--color-ink-2);
+  cursor: default;
+}
+.wbtn:hover {
+  background: color-mix(in srgb, var(--color-ink) 8%, transparent);
+  color: var(--color-ink);
+}
+
+/* ---------------------------------------------------------------------------
+   Streaming surface.
+   This is the hot path. Deltas are appended as text nodes; nothing here is
+   re-rendered per token (PLAN.md §9 rule 3).
+--------------------------------------------------------------------------- */
+.stream {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.caret {
+  display: inline-block;
+  width: 7px;
+  height: 1.05em;
+  vertical-align: -0.16em;
+  background: var(--color-shell-deep);
+  animation: blink 1s steps(1, end) infinite;
+}
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* hairline card */
+.card {
+  background: var(--color-paper);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+}
+
+.pill {
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-pill);
+  background: var(--color-paper);
+}

@@ -1,0 +1,15 @@
+[package]
+name = "cowry-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cowry agent engine: providers, tool loop, storage. Zero UI knowledge."
+
+# IMPORTANT: this crate must never depend on tauri, gtk, or any webview crate.
+# The TUI and the desktop app are peers of each other and both talk to this.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

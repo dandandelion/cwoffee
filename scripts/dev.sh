@@ -22,12 +22,17 @@ cd "$(dirname "$0")/.."
 
 echo "cowry dev — EGL pinned to: ${__EGL_VENDOR_LIBRARY_FILENAMES}"
 
-# M0 will replace this with: npm run tauri dev
-# (uses @tauri-apps/cli via npm rather than cargo-tauri, to avoid a slow Rust CLI rebuild)
-if [ -f ui/package.json ]; then
-  ( cd ui && npm run tauri dev )
+# `tauri dev` runs from crates/tauri-app so tauri.conf.json is the config root.
+# The CLI lives in ui/node_modules (installed via npm) to avoid a slow
+# cargo-tauri rebuild on every version bump.
+TAURI_BIN="$(cd "$(dirname "$0")/.." && pwd)/ui/node_modules/.bin/tauri"
+
+if [ -x "$TAURI_BIN" ]; then
+  ( cd crates/tauri-app && "$TAURI_BIN" dev "$@" )
 else
-  echo "ui/ not scaffolded yet (M0). Engine/TUI scaffold is M1."
-  echo "GPU check in the meantime:"
+  echo "dev.sh: tauri CLI not found at $TAURI_BIN"
+  echo "        run: (cd ui && npm install)"
+  echo "        GPU check in the meantime:"
   ./scripts/gpu-check.sh cowry || true
+  exit 1
 fi

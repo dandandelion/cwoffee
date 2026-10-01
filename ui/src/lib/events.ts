@@ -1,0 +1,43 @@
+/**
+ * Mirror of `crates/engine/src/event.rs`.
+ *
+ * Adjacently tagged: `{ kind, d }`. Variant names are camelCase; struct-variant
+ * fields stay snake_case (serde's container `rename_all` does not touch them).
+ * If you change the Rust enum, change this file — the compiler will not.
+ */
+
+export type FinishReason = 'stop' | 'toolCalls' | 'length' | 'cancelled' | 'error'
+export type ExecStream = 'stdout' | 'stderr'
+
+export interface TurnTelemetry {
+  prompt_tokens: number
+  cached_tokens: number
+  completion_tokens: number
+  ttft_ms: number
+  server_prefill_tps: number
+  server_decode_tps: number
+  draft_n: number
+  draft_accepted: number
+}
+
+export type EngineEvent =
+  | { kind: 'turnStart'; d: { turn_id: number; model: string } }
+  | { kind: 'text'; d: string }
+  | { kind: 'reasoning'; d: string }
+  | { kind: 'toolCallBegin'; d: { id: string; name: string } }
+  | { kind: 'toolCallArgs'; d: string }
+  | { kind: 'toolCallReady'; d: { id: string; args: unknown } }
+  | { kind: 'toolCallParseError'; d: { id: string; raw: string; message: string } }
+  | { kind: 'toolExecStart'; d: { id: string } }
+  | { kind: 'toolExecOutput'; d: { id: string; stream: ExecStream; chunk: string } }
+  | { kind: 'toolExecEnd'; d: { id: string; ok: boolean; exit_code: number | null } }
+  | { kind: 'usage'; d: TurnTelemetry }
+  | { kind: 'turnEnd'; d: { turn_id: number; finish: FinishReason } }
+  | { kind: 'error'; d: { message: string; fatal: boolean } }
+
+export interface GpuReport {
+  egl_vendor: string
+  glx_vendor: string
+  render_nodes: string[]
+  leaked_nvidia: boolean
+}
