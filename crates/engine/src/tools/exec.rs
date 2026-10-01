@@ -312,21 +312,38 @@ mod tests {
     use super::*;
     use crate::tools::ToolCtx;
 
+    /// Removes the test workspace when the test ends.
+    struct WsGuard(std::path::PathBuf);
+    impl Drop for WsGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn sink() -> ExecSink {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         tx
     }
 
-    fn ws() -> ToolCtx {
-        let dir = std::env::temp_dir().join(format!("cowry_exec_test_{}", std::process::id()));
+    /// Each test needs its **own** workspace. Keying on the pid is not enough:
+    /// all tests in one binary share a pid, and one test deleting the shared
+    /// directory makes unrelated tests fail intermittently (this produced two
+    /// phantom failures before it was caught).
+    fn ws() -> (ToolCtx, WsGuard) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cowry_exec_test_{}_{n}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
-        ToolCtx { workspace: dir, max_output_bytes: 4096 }
+        (ToolCtx { workspace: dir, max_output_bytes: 4096 }, WsGuard(std::env::temp_dir().join(format!("cowry_exec_test_{}_{n}", std::process::id()))))
     }
 
     #[tokio::test]
     async fn runs_and_captures_stdout() {
         let t = ExecTool::default();
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let r = t.run(json!({"cmd": "echo hello"}), &ctx, &sink()).await;
         assert!(r.ok, "err={:?}", r.error);
         assert_eq!(r.output.trim(), "hello");
@@ -335,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn captures_stderr_and_nonzero_exit() {
         let t = ExecTool::default();
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let r = t.run(json!({"cmd": "echo oops >&2; exit 3"}), &ctx, &sink()).await;
         assert!(!r.ok);
         assert_eq!(r.exit_code, Some(3));
@@ -345,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn network_is_blocked() {
         let t = ExecTool::default();
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let r = t
             .run(json!({"cmd": "curl -s -m 3 -o /dev/null http://example.com || echo NET-BLOCKED"}), &ctx, &sink())
             .await;
@@ -355,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn host_filesystem_is_read_only() {
         let t = ExecTool::default();
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let r = t
             .run(json!({"cmd": "touch /cowry_escape_test 2>/dev/null && echo WROTE || echo BLOCKED"}), &ctx, &sink())
             .await;
@@ -366,20 +383,19 @@ mod tests {
     #[tokio::test]
     async fn workspace_is_writable_and_persists_to_host() {
         let t = ExecTool::default();
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let r = t
             .run(json!({"cmd": "echo hi > persisted.txt && cat persisted.txt"}), &ctx, &sink())
             .await;
         assert!(r.ok, "err={:?}", r.error);
         let on_host = ctx.workspace.join("persisted.txt");
         assert_eq!(std::fs::read_to_string(&on_host).ok().as_deref(), Some("hi\n"));
-        let _ = std::fs::remove_dir_all(&ctx.workspace);
     }
 
     #[tokio::test]
     async fn timeout_kills_a_hang() {
         let t = ExecTool { timeout_secs: 2, ..Default::default() };
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let started = std::time::Instant::now();
         let r = t.run(json!({"cmd": "sleep 30"}), &ctx, &sink()).await;
         let elapsed = started.elapsed();
@@ -391,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn cwd_escape_is_refused() {
         let t = ExecTool::default();
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let r = t.run(json!({"cmd": "pwd", "cwd": "../../etc"}), &ctx, &sink()).await;
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap_or("").contains("escapes the workspace"));
@@ -400,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn absolute_cwd_outside_workspace_is_refused() {
         let t = ExecTool::default();
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let r = t.run(json!({"cmd": "pwd", "cwd": "/etc"}), &ctx, &sink()).await;
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap_or("").contains("escapes the workspace"));
@@ -423,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn missing_cmd_is_a_clear_error() {
         let t = ExecTool::default();
-        let ctx = ws();
+        let (ctx, _g) = ws();
         let r = t.run(json!({"command": "echo hi"}), &ctx, &sink()).await;
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap_or("").contains("cmd"));
@@ -432,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn output_is_clamped() {
         let t = ExecTool::default();
-        let mut ctx = ws();
+        let (mut ctx, _g) = ws();
         ctx.max_output_bytes = 200;
         let r = t.run(json!({"cmd": "seq 1 2000"}), &ctx, &sink()).await;
         assert!(r.truncated);
