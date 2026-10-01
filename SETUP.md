@@ -13,41 +13,60 @@ Status as of 2026-10-01. Machine: Fedora 44 Workstation, x86_64, 20 cores, 62 GB
 | cmake / pkg-config | 4.3.0 / 2.5.1 | pre-existing |
 | **bwrap** (bubblewrap) | `/usr/bin/bwrap` | pre-existing → the `exec` sandbox |
 | **pdftotext** (poppler) | `/usr/bin/pdftotext` | pre-existing → PDF-in fallback |
-| WebKitGTK **runtime** | 2.52.5 (`webkit2gtk4.1`) | pre-existing → the webview will *run* |
+| WebKitGTK **runtime** | 2.54.0 (`webkit2gtk4.1`) | pre-existing, bumped by the `-devel` install |
 
 `~/.cargo/bin` is on PATH via rustup's env; add to your shell if it isn't:
 ```bash
 echo 'source "$HOME/.cargo/env"' >> ~/.bashrc
 ```
 
-## ⚠️ Needs your password (I can't sudo)
+## ✅ System packages — VERIFIED INSTALLED (2026-10-01)
 
-Tauri v2 on Linux needs **dev headers** to *compile* the webview. The runtime is present but the `-devel` packages are not. This blocks **M0 only** — M1 (engine + TUI) is completely unaffected, so we can start M1 immediately.
+`pkg-config` probes (what Tauri's build script actually checks):
 
-```bash
-sudo dnf install -y \
-  webkit2gtk4.1-devel \
-  javascriptcoregtk-4.1-devel \
-  libsoup3-devel \
-  gtk3-devel \
-  glib2-devel \
-  openssl-devel \
-  rhash \
-  libxkbcommon-devel \
-  libxkbcommon-x11-devel
+```
+webkit2gtk-4.1           2.54.0     javascriptcoregtk-4.1    2.54.0
+libsoup-3.0              3.6.6      gtk+-3.0                 3.24.52
+glib-2.0                 2.88.3     gobject-2.0 / gio-2.0    2.88.3
+openssl                  3.5.8      xkbcommon                1.13.1
 ```
 
-Verify afterwards:
-```bash
-for p in webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 gtk+-3.0; do
-  printf "%-24s %s\n" "$p" "$(pkg-config --modversion $p 2>/dev/null || echo MISSING)"
-done
+Note: installing `-devel` upgraded the webkit runtime **2.52.5 → 2.54.0**. Fine, and newer is better here.
+
+### Compile proof (not just package presence)
+
+Built `webkit2gtk v2.0.2` + `webkit2gtk-sys` in a scratch crate — this runs pkg-config, bindgen and `cc` against the real system headers:
+
 ```
+Compiling webkit2gtk-sys v2.0.2
+Checking  webkit2gtk v2.0.2
+Finished dev profile in 18.10s        EXIT=0
+```
+
+**The webview toolchain works.** M0 is unblocked.
+
+## ⚠️ Hardware hazard: NVIDIA + Wayland
+
+```
+GPU:     Intel Iris Xe (Alder Lake-P) + NVIDIA RTX 3080 Ti Laptop
+Driver:  proprietary NVIDIA (/dev/nvidia0 present)
+Session: Wayland (WAYLAND_DISPLAY=wayland-0)
+```
+
+WebKitGTK's DMABUF renderer is known to break with the proprietary NVIDIA driver under Wayland — blank/flickering webview or startup crash. **Test a solid-colour webview window on M0 day 1.** Fixes to try in order:
+
+```bash
+WEBKIT_DISABLE_DMABUF_RENDERER=1
+WEBKIT_DISABLE_COMPOSITING_MODE=1
+LIBGL_ALWAYS_SOFTWARE=1            # last resort
+```
+
+Or the `webkit2gtk-nvidia-quirk` crate (v2.2.0). Details in PLAN.md §12.
 
 ## Optional (not blocking)
 
 ```bash
-sudo dnf install -y pandoc sqlite-typst    # optional converters
+sudo dnf install -y pandoc typst sqlite    # optional converters / CLI
 ```
 - `typst` → we vendor it as a **crate**, so the CLI is not required.
 - `pandoc` → optional DOCX fallback only.
@@ -82,6 +101,9 @@ See `config/cowry.toml.example`.
 
 ```bash
 cd ~/Projects/cowry
-cargo +stable --version && node -v   # sanity
+source "$HOME/.cargo/env" && cargo --version && node -v   # sanity
 ```
-Then say the word and I'll scaffold **M1** (engine + TUI) — which needs none of the sudo'd packages.
+
+Everything needed for **both M0 and M1** is installed. `cargo-tauri` is not installed — we'll use `@tauri-apps/cli` via npm (faster to iterate, no 5-minute Rust CLI build).
+
+**M0 day 1 is the NVIDIA/Wayland webview test.** Then the skeleton.

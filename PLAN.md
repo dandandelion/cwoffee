@@ -223,6 +223,7 @@ done | paste -sd+ | bc
 5. Heatmap = one `<canvas>`, not 371 divs; lazy-load everything off the composer
 6. Subset fonts (~200 KB), inline critical CSS, JS bundle < 250 KB
 7. `WEBKIT_DISABLE_COMPOSITING_MODE=1` if GPU memory creeps on this driver
+   — **this box is the risky case, see §10 "NVIDIA + Wayland"**
 8. Hide rather than destroy the webview on window close → instant reopen
 9. Release profile: `opt-level=3`, `lto=true`, `strip=true`, `panic="abort"`, `codegen-units=1`
 
@@ -232,6 +233,7 @@ done | paste -sd+ | bc
 
 | Risk | Mitigation / kill criterion |
 |---|---|
+| **NVIDIA + Wayland + WebKitGTK** (see below) | test on **day 1 of M0**, before anything else |
 | Memory blows up on long sessions | virtualization; **if a 200-message session > 400 MB PSS, fix before adding features** |
 | Native-UI fidelity gap | we chose Tauri precisely to avoid this; **if the composer isn't at mock fidelity within 3 days of starting M2, our component structure is wrong, not Tauri** |
 | DOCX generation (weakest Rust area) | `docx-rs` is immature → generate OOXML with `zip`+`quick-xml`, or shell to `pandoc` if present. **Decide in M3, not later.** |
@@ -251,7 +253,31 @@ done | paste -sd+ | bc
 
 ---
 
-## 12. Open questions
+## 12. Known hazard on the dev box: NVIDIA + Wayland + WebKitGTK
+
+Verified hardware: **Intel Iris Xe + NVIDIA RTX 3080 Ti Laptop (proprietary driver, `/dev/nvidia0`), Wayland session.**
+
+This is the single most common way a Tauri app dies on Linux: WebKitGTK's **DMABUF renderer** misbehaves with the proprietary NVIDIA driver under Wayland, producing a blank or flickering webview, or a crash on startup. It is a rendering-layer bug, not our bug, and it will look like our bug.
+
+Mitigations, in the order to try (all are env vars, no code changes):
+
+```bash
+WEBKIT_DISABLE_DMABUF_RENDERER=1     # newest WebKitGTK (we have 2.54.0) - try first
+WEBKIT_DISABLE_COMPOSITING_MODE=1    # the classic fallback
+LIBGL_ALWAYS_SOFTWARE=1              # last resort; costs our perf story
+```
+
+There is also a purpose-built crate, **`webkit2gtk-nvidia-quirk`** (v2.2.0), which patches the DMABUF renderer quirk. If the env vars are flaky, that's the durable fix.
+
+Set the var in the `.desktop` file's `Exec=` line and in `tauri.conf.json`'s env, not just the shell — otherwise the packaged app breaks while the dev build works.
+
+**Fallback:** force X11 (`WAYLAND_DISPLAY=` unset / `GDK_BACKEND=x11`) — works, costs Wayland-specific niceties. Decide in M0, not later.
+
+**M0 day-1 task:** render a solid-colour webview window on this box. If it's blank, we solve it before writing a line of product code.
+
+---
+
+## 13. Open questions
 
 1. `dnf` devel packages need a password — see `SETUP.md` (blocks M0's Tauri build only; M1 is unaffected)
 2. `typst` and `pandoc` not installed — `typst` we vendor as a crate, `pandoc` stays optional
