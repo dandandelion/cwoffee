@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use super::path::lexical_resolve;
 use super::{ExecChunk, ExecSink, Risk, Tool, ToolCtx, ToolResult, clamp};
 use crate::event::ExecStream;
 
@@ -285,27 +286,6 @@ fn which(name: &str) -> Option<String> {
 /// containment check happily accepts `<workspace>/../../etc`. We cannot use
 /// `canonicalize` here: the directory may not exist yet, and canonicalize would
 /// also follow symlinks out of the workspace in a way the sandbox does not.
-fn lexical_resolve(base: &std::path::Path, rel: &str) -> std::path::PathBuf {
-    use std::path::{Component, Path, PathBuf};
-    let rel_path = Path::new(rel);
-    let mut out = if rel_path.is_absolute() {
-        PathBuf::from("/")
-    } else {
-        base.to_path_buf()
-    };
-    for comp in rel_path.components() {
-        match comp {
-            Component::RootDir => out = PathBuf::from("/"),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::Normal(c) => out.push(c),
-            Component::Prefix(_) => {}
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -422,19 +402,6 @@ mod tests {
         assert!(r.error.as_deref().unwrap_or("").contains("escapes the workspace"));
     }
 
-    #[test]
-    fn lexical_resolve_collapses_dotdot() {
-        let base = std::path::Path::new("/home/u/ws");
-        assert_eq!(lexical_resolve(base, "a/b").to_str().unwrap(), "/home/u/ws/a/b");
-        assert_eq!(lexical_resolve(base, "a/../b").to_str().unwrap(), "/home/u/ws/b");
-        assert_eq!(lexical_resolve(base, "../../etc").to_str().unwrap(), "/home/etc");
-        assert_eq!(lexical_resolve(base, "../../../etc").to_str().unwrap(), "/etc");
-        assert_eq!(lexical_resolve(base, "/etc").to_str().unwrap(), "/etc");
-        assert_eq!(lexical_resolve(base, "./x").to_str().unwrap(), "/home/u/ws/x");
-        // the point: these must not look contained
-        assert!(!lexical_resolve(base, "../../etc").starts_with(base));
-        assert!(lexical_resolve(base, "sub/dir").starts_with(base));
-    }
 
     #[tokio::test]
     async fn missing_cmd_is_a_clear_error() {

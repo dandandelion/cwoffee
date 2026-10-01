@@ -6,7 +6,10 @@
 //! model to emit a call it shouldn't.
 
 pub mod exec;
+pub mod files;
+pub mod path;
 pub mod repair;
+pub mod web;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -103,6 +106,22 @@ pub struct Registry {
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The v1 tool set, in a **fixed** order.
+    ///
+    /// Order is not cosmetic: tool schemas are serialized into the system
+    /// prompt, so a different order changes the prompt bytes and invalidates
+    /// the llama.cpp prefix cache for every turn in every session. If a tool is
+    /// added later, append it; never reorder.
+    pub fn with_v1_tools() -> Self {
+        let mut r = Self::new();
+        r.register(Box::new(exec::ExecTool::default()));
+        r.register(Box::new(files::ReadFileTool));
+        r.register(Box::new(files::WriteFileTool));
+        r.register(Box::new(web::WebFetchTool::default()));
+        r.register(Box::new(web::WebSearchTool::default()));
+        r
     }
 
     pub fn register(&mut self, t: Box<dyn Tool>) {
