@@ -12,6 +12,7 @@ pub mod provider;
 pub mod sse;
 pub mod telemetry;
 pub mod stream;
+pub mod tools;
 
 pub use event::{EngineEvent, ExecStream, FinishReason};
 pub use provider::{
@@ -19,5 +20,6 @@ pub use provider::{
     ToolDef,
 };
 pub use telemetry::{LiveWindow, Rolling, TelemetrySnapshot, TurnTelemetry};
+pub use tools::{Registry, Risk, Tool, ToolCtx, ToolResult};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

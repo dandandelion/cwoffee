@@ -464,7 +464,7 @@ pub fn assistant_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Message, Reasoning, Role, ToolCall, ToolDef};
+    use crate::provider::{Message, Reasoning, Role, ToolCall};
 
     fn replay(events: &[(&str, &str)]) -> Vec<Delta> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

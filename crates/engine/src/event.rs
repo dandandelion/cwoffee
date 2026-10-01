@@ -118,6 +118,8 @@ pub enum EngineEvent {
     },
 }
 
+/// Which pane a tool output chunk belongs to. The chunk itself travels on
+/// `EngineEvent::ToolExecOutput`, so this stays a plain Copy tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ExecStream {
