@@ -1,0 +1,91 @@
+# Cowry configuration
+# ~/.config/cowry/config.toml
+#
+# The app introspects llama.cpp endpoints (/health, /props, /v1/models) and
+# auto-fills n_ctx / images / slots, so most of the [providers.llama] block
+# below is optional. Hand-config is only needed for non-llama.cpp providers.
+
+[ui]
+theme            = "light"          # light | dark | system
+approval_default = "ask"            # ask | session | full
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
+[providers.llama]
+kind     = "llama.cpp"              # llama.cpp | openai | anthropic
+base_url = "http://127.0.0.1:8090/v1"
+# api_key  = "env:COWRY_KEY"        # not needed on this box
+
+[providers.anthropic]
+kind     = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key  = "env:ANTHROPIC_API_KEY"
+
+# Any OpenAI-compatible gateway:
+# [providers.gateway]
+# kind     = "openai"
+# base_url = "https://gateway.example.com/v1"
+# api_key  = "env:GATEWAY_KEY"
+
+# ---------------------------------------------------------------------------
+# Models (aliases shown in the composer picker)
+# ---------------------------------------------------------------------------
+
+[[models]]
+alias    = "local"
+provider = "llama"
+id       = "qwen3.8-flash-next-iq3_s"
+context  = 131072
+vision   = true
+tools    = true
+thinking = true                     # exposes the thinking toggle
+# thinking_param = "chat_template_kwargs.enable_thinking"
+
+# [[models]]
+# alias    = "cc"
+# provider = "anthropic"
+# id       = "claude-sonnet-4-5"
+# context  = 200000
+# effort   = ["low", "medium", "high"]
+
+# ---------------------------------------------------------------------------
+# Context budget — prefill is ~30-68 tok/s on llama.cpp, so we stay small
+# ---------------------------------------------------------------------------
+
+[context]
+target_tokens      = 8000           # soft budget before compaction is suggested
+max_tool_output    = 2000           # truncated AT INGEST, never recomputed
+tool_output_head   = 1400           # head/tail split keeps errors visible
+tool_output_tail   = 600
+compact_after_turns = 40
+repair_retries     = 1              # malformed tool-call JSON -> repair + 1 retry
+
+# ---------------------------------------------------------------------------
+# Exec sandbox (bwrap)
+# ---------------------------------------------------------------------------
+
+[sandbox]
+enabled        = true
+network        = false              # --unshare-net inside the sandbox
+writable_paths = ["{workspace}"]    # everything else read-only
+timeout_secs   = 120
+
+[sandbox.denylist]                  # enforced even in "full" approval mode
+patterns = [
+  "rm -rf /", "rm -rf ~", "rm -rf /*",
+  "mkfs", "dd if=", ":(){",
+  "curl * | sh", "curl * | bash", "wget * | sh",
+  "shutdown", "reboot",
+]
+
+# ---------------------------------------------------------------------------
+# Research
+# ---------------------------------------------------------------------------
+
+[search]
+backend   = "duckduckgo-html"       # duckduckgo-html | searxng
+# searxng_url = "http://127.0.0.1:8888/search"
+max_results = 8
+fetch_max_bytes = 400_000

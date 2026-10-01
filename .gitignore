@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+# NOTE: Cargo.lock is intentionally COMMITTED — cowry is an application, not a library.
+
+# Node / frontend
+node_modules
+ui/dist
+ui/.svelte-kit
+*.local
+
+# Cowry
+.cowry/
+*.db
+*.db-wal
+*.db-shm
+assets/working/
+
+# Editor / OS
+.idea
+.vscode
+.DS_Store
+*.log
