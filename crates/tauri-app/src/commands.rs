@@ -46,3 +46,41 @@ pub fn start_fake_turn(
 pub fn gpu_report() -> gpu::GpuReport {
     gpu::report()
 }
+
+/// What the front end actually rendered.
+///
+/// This exists because every machine-checkable gate in M0 passed while the
+/// webview was showing a stale vite error overlay. "Is it painted?" is not
+/// answerable from process liveness, memory, or sockets — so the UI reports it.
+#[derive(serde::Deserialize)]
+pub struct RenderReport {
+    pub titlebar: bool,
+    pub sidebar: bool,
+    pub footer: bool,
+    pub stream_el: bool,
+    pub body_bg: String,
+    pub overlay_present: bool,
+    pub text_len: usize,
+    pub device_pixel_ratio: f64,
+}
+
+#[tauri::command]
+pub fn render_report(report: RenderReport) {
+    let ok = report.titlebar
+        && report.footer
+        && report.stream_el
+        && !report.overlay_present
+        && report.text_len > 0;
+    eprintln!(
+        "[cowry] render {}: titlebar={} sidebar={} footer={} stream={} overlay={} text={} bg={} dpr={:.2}",
+        if ok { "OK" } else { "SUSPECT" },
+        report.titlebar,
+        report.sidebar,
+        report.footer,
+        report.stream_el,
+        report.overlay_present,
+        report.text_len,
+        report.body_bg,
+        report.device_pixel_ratio,
+    );
+}

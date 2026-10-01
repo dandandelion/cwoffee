@@ -20,7 +20,8 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             commands::start_fake_turn,
-            commands::gpu_report
+            commands::gpu_report,
+            commands::render_report
         ])
         .run(tauri::generate_context!())
         .expect("error while running cowry");

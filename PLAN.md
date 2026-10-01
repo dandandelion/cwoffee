@@ -180,6 +180,56 @@ PSS. Release build + production bundle should land materially below 233 MB.
 machine-checkable gate passed; a blank-webview failure would not show up in any
 of them.
 
+### M0 correction — the gates above were not sufficient
+
+The user's screenshot showed a **stale vite error overlay covering the whole
+window**. Process liveness, PSS, and the WebKit→vite socket all said "healthy"
+while the app was visibly broken. So the M0 section above over-claimed.
+
+Two real bugs were hiding behind silent failure:
+
+1. **Empty `catch {}` blocks swallowed every `invoke` error.** A field-name
+   mismatch made `render_report` fail on every call and nothing surfaced it.
+2. **Tauri argument casing.** Command *argument names* are camelCase
+   (`{ report }`), but *struct fields* keep serde defaults, so they are
+   **snake_case on the wire** (`stream_el`, `body_bg`). Same rule as
+   `EngineEvent`. Mixing these up yields `invalid args ... missing field`.
+
+Fixing the class of problem, not the instance — a **page-side log that does not
+depend on Tauri IPC**:
+
+- `ui/src/lib/pagelog.ts` → `POST /__cowry_log`, a vite middleware that prints
+  into the same stdout as the Rust side, so page and host output interleave
+  chronologically. Dev-only; compiled out in prod (`import.meta.env.PROD`).
+- `window.onerror` + `unhandledrejection` forward to it, so a blank page can
+  never be silent again.
+- vite middleware logs every module the webview requests — distinguishes "blank
+  page" from "loaded main.ts then threw".
+- `render_report` command: the UI reports what it actually rendered
+  (titlebar/sidebar/footer/stream present, overlay absent, text length, computed
+  bg, dpr) and Rust logs `render OK` or `render SUSPECT`.
+- `ipc ✓/✗` badge in the footer — IPC health is never inferred from silence.
+- `getCurrentWindow()` is resolved inside `try`; at component-init it would
+  blank the entire page with no visible error.
+
+### M0 final, measured
+
+```
+[cowry] render OK: titlebar=true sidebar=true footer=true stream=true
+        overlay=false text=494 bg=rgb(253, 252, 249) dpr=2.00
+[cowry/page] turn: end chars=1443 frames=209 dropped=0 worst=18ms decode=49.0/s
+```
+
+- **0 dropped frames** across 209 frames during a 1443-char stream; worst frame
+  18 ms. The rAF-batched text-node append path is sound.
+- Client-measured **49.0 tok/s** against a scripted 50 — the `LiveWindow`
+  measurement is honest.
+- Memory after a turn: **264.4 MB PSS** / 3 processes (RSS 470 MB).
+- GPU: still `renderD128` only.
+
+Dev harness: `VITE_AUTOTURN=1 ./scripts/dev.sh` streams a turn on launch, which
+proves the whole `Channel → rAF → text node` path without anyone clicking.
+
 ### Config footgun found in M0
 
 Tauri v2 resolves these two things **relative to different directories**:

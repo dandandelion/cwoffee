@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import type { EngineEvent, GpuReport } from './lib/events'
   import { LiveWindow, Rolling, statsFromTurn, fmt } from './lib/live'
+  import { pageLog } from './lib/pagelog'
 
   // ---- state -------------------------------------------------------------
   let streamEl: HTMLPreElement | undefined = $state()
@@ -12,6 +13,9 @@
   let tokPerSec = $state(50)
   let words = $state(140)
   let gpu = $state<GpuReport | null>(null)
+  // IPC health is surfaced in the footer. An empty catch here once hid a CSP
+  // misconfiguration that killed every invoke, and every other gate still passed.
+  let ipc = $state<{ ok: boolean; msg: string }>({ ok: false, msg: 'not tried' })
   let lastUsage = $state<Record<string, number> | null>(null)
   let turnCount = $state(0)
 
@@ -82,12 +86,8 @@
         worstFrame = 0
         lastFrameTs = 0
         rafId = requestAnimationFrame(watchFrames)
-        if (streamEl) {
-          streamEl.textContent = ''
-          streamEl.appendChild(
-            document.createTextNode(`\u001b[0m`) // no-op; keeps node structure stable
-          )
-        }
+        if (streamEl) streamEl.textContent = ''
+        pageLog('turn: start')
         break
       case 'text':
         pushText(ev.d)
@@ -132,6 +132,11 @@
         streaming = false
         if (rafId) cancelAnimationFrame(rafId)
         rafId = 0
+        pageLog(
+          `turn: end chars=${streamEl?.textContent.length ?? 0} ` +
+            `frames=${frames} dropped=${dropped} worst=${worstFrame.toFixed(0)}ms ` +
+            `decode=${curDecode.toFixed(1)}/s`,
+        )
         break
       case 'error':
         pushText(`\n! ${ev.d.message}\n`)
@@ -153,20 +158,75 @@
   }
 
   // ---- window controls (frameless) ---------------------------------------
-  const win = getCurrentWindow()
-  async function closeWin() { await win.close() }
-  async function minimize() { await win.minimize() }
+  // getCurrentWindow() throws if window.__TAURI_INTERNALS__ is missing. Called at
+  // component-init that would blank the entire page with no visible error, so
+  // resolve it lazily and record the failure instead.
+  let win: Awaited<ReturnType<typeof getCurrentWindow>> | null = null
+  let winErr = ''
+  try {
+    win = getCurrentWindow()
+  } catch (e) {
+    winErr = String(e)
+    console.error('[cowry] getCurrentWindow failed:', e)
+  }
+
+  async function closeWin() { await win?.close() }
+  async function minimize() { await win?.minimize() }
   async function toggleMax() {
+    if (!win) return
     const m = await win.isMaximized()
     if (m) await win.unmaximize()
     else await win.maximize()
   }
 
+  // ---- render self-report ------------------------------------------------
+  // M0 lesson: every machine-checkable gate passed while the webview was showing
+  // a stale vite error overlay. Process liveness, memory and sockets cannot tell
+  // you whether the UI painted, so the UI says so, and Rust logs it.
+  async function reportRender(tag = 'mount') {
+    // Convention (same as EngineEvent): Tauri command *argument names* are
+    // camelCase (`{ report }`), but *struct fields* keep serde defaults, so they
+    // are snake_case on the wire. Getting this wrong is a silent-ish
+    // "missing field `stream_el`" invalid-args error.
+    const report = {
+      titlebar: !!document.querySelector('.titlebar'),
+      sidebar: !!document.querySelector('aside'),
+      footer: !!document.querySelector('footer'),
+      stream_el: !!document.querySelector('pre.stream'),
+      body_bg: getComputedStyle(document.body).backgroundColor,
+      overlay_present: !!document.querySelector('vite-error-overlay'),
+      text_len: document.body.innerText.trim().length,
+      device_pixel_ratio: window.devicePixelRatio,
+    }
+    try {
+      await invoke('render_report', { report })
+      ipc = { ok: true, msg: 'ok' }
+    } catch (e) {
+      ipc = { ok: false, msg: String(e).slice(0, 120) }
+      pageLog(`render_report invoke FAILED: ${String(e)} | internals=${typeof (window as any).__TAURI_INTERNALS__}`)
+    }
+  }
+
   onMount(async () => {
     try {
       gpu = await invoke<GpuReport>('gpu_report')
-    } catch {
+      ipc = { ok: true, msg: 'ok' }
+    } catch (e) {
       gpu = null
+      ipc = { ok: false, msg: String(e).slice(0, 120) }
+      pageLog(`gpu_report invoke FAILED: ${String(e)} | internals=${typeof (window as any).__TAURI_INTERNALS__}`)
+    }
+    if (winErr) pageLog(`getCurrentWindow FAILED: ${winErr}`)
+    pageLog(`mounted: titlebar=${!!document.querySelector('.titlebar')} text=${document.body.innerText.trim().length}`)
+    // let fonts + Tailwind settle before reporting
+    setTimeout(() => void reportRender('mount'), 400)
+    setTimeout(() => void reportRender('late'), 2000)
+
+    // Dev harness: `VITE_AUTOTURN=1 ./scripts/dev.sh` (or ?autoturn in the URL)
+    // streams a turn on launch. Proves the Channel -> rAF -> text-node path
+    // without anyone having to click.
+    if (location.search.includes('autoturn') || import.meta.env.VITE_AUTOTURN) {
+      setTimeout(() => void runTurn(), 1200)
     }
   })
 
@@ -283,6 +343,12 @@
     <span>spec <b class="text-ink">{fmt.pct(specPct)}</b></span>
 
     <span class="ml-auto flex items-center gap-3">
+      <span
+        class="rounded-full px-2 py-0.5 {ipc.ok ? 'bg-[#eef0e8] text-ink-3' : 'bg-[#f6e6e6] text-[#8b3d3d]'}"
+        title="Tauri IPC round-trip"
+      >
+        ipc {ipc.ok ? '✓' : '✗'}
+      </span>
       <span title="frames sampled during the last turn">
         jank <b class={dropped > 0 ? 'text-shell-deep' : 'text-ink'}>{dropped}</b>
         <span class="text-ink-3">/ {frames} f · worst {worstFrame.toFixed(0)}ms</span>
