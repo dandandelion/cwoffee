@@ -29,10 +29,14 @@ reqwest = { version = "0.12", default-features = false, features = [
 futures-util = "0.3"
 async-trait = "0.1"
 url = "2"
+# bundled: we ship a desktop app; depending on the distro's libsqlite3 means
+# FTS5 may or may not be compiled in, and a missing virtual table is a runtime
+# failure on the user's machine rather than a build failure on ours.
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+chrono = "0.4"
 
 # ---- M2+ ----
-# rusqlite, portable-pty, similar, pulldown-cmark, rust_xlsxwriter, calamine,
-# typst, bwrap plumbing
+# portable-pty, similar, pulldown-cmark, rust_xlsxwriter, calamine, typst
 
 # ---------------------------------------------------------------------------
 # Release profile — PLAN.md §9 rule 9.

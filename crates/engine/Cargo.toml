@@ -17,6 +17,8 @@ reqwest.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
 url.workspace = true
+rusqlite.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util"] }

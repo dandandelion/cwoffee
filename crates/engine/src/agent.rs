@@ -381,7 +381,6 @@ mod tests {
     use crate::approval::ApprovalAnswer;
     use crate::provider::{DeltaSink, ProviderError};
     use async_trait::async_trait;
-    use serde_json::json;
 
     /// Scripted provider: replays a fixed sequence of Deltas.
     struct Scripted {

@@ -13,6 +13,7 @@ pub mod event;
 pub mod provider;
 pub mod prompt;
 pub mod sse;
+pub mod store;
 pub mod telemetry;
 pub mod stream;
 pub mod tools;
@@ -25,6 +26,7 @@ pub use provider::{
     ToolDef,
 };
 pub use prompt::PromptBuilder;
+pub use store::{SearchHit, Session, Store, StoreError, StoredMessage, Totals};
 pub use telemetry::{LiveWindow, Rolling, TelemetrySnapshot, TurnTelemetry};
 pub use tools::{ExecChunk, Registry, Risk, Tool, ToolCtx, ToolResult};
 
