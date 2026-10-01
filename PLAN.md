@@ -233,7 +233,7 @@ done | paste -sd+ | bc
 
 | Risk | Mitigation / kill criterion |
 |---|---|
-| **NVIDIA + Wayland + WebKitGTK** (see below) | test on **day 1 of M0**, before anything else |
+| **GPU: NVIDIA has 44 MiB VRAM free; it's the default EGL vendor** | pin Mesa — see §12. Verify with `scripts/gpu-check.sh` on **day 1 of M0** |
 | Memory blows up on long sessions | virtualization; **if a 200-message session > 400 MB PSS, fix before adding features** |
 | Native-UI fidelity gap | we chose Tauri precisely to avoid this; **if the composer isn't at mock fidelity within 3 days of starting M2, our component structure is wrong, not Tauri** |
 | DOCX generation (weakest Rust area) | `docx-rs` is immature → generate OOXML with `zip`+`quick-xml`, or shell to `pandoc` if present. **Decide in M3, not later.** |
@@ -253,27 +253,70 @@ done | paste -sd+ | bc
 
 ---
 
-## 12. Known hazard on the dev box: NVIDIA + Wayland + WebKitGTK
+## 12. GPU policy: Cowry renders on the Intel iGPU (mandatory on this box)
 
-Verified hardware: **Intel Iris Xe + NVIDIA RTX 3080 Ti Laptop (proprietary driver, `/dev/nvidia0`), Wayland session.**
+Measured on the dev box, 2026-10-01:
 
-This is the single most common way a Tauri app dies on Linux: WebKitGTK's **DMABUF renderer** misbehaves with the proprietary NVIDIA driver under Wayland, producing a blank or flickering webview, or a crash on startup. It is a rendering-layer bug, not our bug, and it will look like our bug.
+```
+renderD128  pci=0000:00:02.0  driver=i915     <- Intel Iris Xe
+renderD129  pci=0000:01:00.0  driver=nvidia   <- RTX 3080 Ti Laptop
 
-Mitigations, in the order to try (all are env vars, no code changes):
+connected panel:  card1-eDP-1  -> the display is driven by INTEL
 
-```bash
-WEBKIT_DISABLE_DMABUF_RENDERER=1     # newest WebKitGTK (we have 2.54.0) - try first
-WEBKIT_DISABLE_COMPOSITING_MODE=1    # the classic fallback
-LIBGL_ALWAYS_SOFTWARE=1              # last resort; costs our perf story
+NVIDIA VRAM:  16384 MiB total / 15993 MiB used / 44 MiB FREE
+
+EGL vendors, in libglvnd preference order:
+  10_nvidia.json   <- preferred by default
+  50_mesa.json
+
+Existing GTK apps (ptyxis, gnome-shell, gnome-software) hold BOTH render nodes.
 ```
 
-There is also a purpose-built crate, **`webkit2gtk-nvidia-quirk`** (v2.2.0), which patches the DMABUF renderer quirk. If the env vars are flaky, that's the durable fix.
+### Why this is mandatory, not a preference
 
-Set the var in the `.desktop` file's `Exec=` line and in `tauri.conf.json`'s env, not just the shell — otherwise the packaged app breaks while the dev build works.
+1. **NVIDIA has 44 MiB of VRAM free.** llama.cpp owns the rest. If WebKitGTK grabs an NVIDIA EGL context it is allocating into a nearly-full GPU — that produces allocation failures, blank webviews and crashes that will look like *our* bugs. This is almost certainly the real mechanism behind the generic "WebKitGTK + NVIDIA is broken" folklore on a box like this one.
+2. **NVIDIA is the default EGL vendor** (`10_nvidia.json` sorts first), so we get NVIDIA unless we explicitly say otherwise. Existing GTK apps on this machine already hold renderD129 — proof the drift is real.
+3. **The panel is on Intel** (`card1-eDP-1` connected). So app-on-Intel + scanout-on-Intel is **same-vendor DMABUF**, which is the configuration that avoids the cross-vendor DMABUF hazard entirely. Forcing Intel doesn't just free VRAM, it likely removes §12's original problem.
+4. It keeps the whole 16 GB of VRAM for inference — which is the point of this machine.
 
-**Fallback:** force X11 (`WAYLAND_DISPLAY=` unset / `GDK_BACKEND=x11`) — works, costs Wayland-specific niceties. Decide in M0, not later.
+Iris Xe is entirely sufficient for a 2D web compositor. There is no perf downside.
 
-**M0 day-1 task:** render a solid-colour webview window on this box. If it's blank, we solve it before writing a line of product code.
+### The fix
+
+Pin the EGL vendor to Mesa so libglvnd cannot hand us an NVIDIA context:
+
+```bash
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+__GLX_VENDOR_LIBRARY_NAME=mesa          # only matters for the X11/GLX path
+```
+
+Both `libEGL_mesa.so.0` and `libEGL_nvidia.so.0` are present, so the pin resolves.
+
+Note: `DRI_PRIME` is **not** the right lever — it's Mesa's PRIME offload selector for multi-Mesa setups and does nothing against the proprietary NVIDIA driver.
+
+Apply it in **three** places, or the packaged app will break while the dev build works:
+1. `crates/tauri-app/src/main.rs` — set at the very top of `main()`, **before** any GTK/EGL initialisation. (In edition 2024 `std::env::set_var` is `unsafe`; wrap it, or use a `#[ctor]`/constructor so it runs pre-`main`.)
+2. the `.desktop` `Exec=` line (a wrapper script or `env VAR=... cowry`)
+3. `scripts/dev.sh` for `tauri dev`
+
+### Verification (M0 day 1, one command)
+
+```bash
+./scripts/gpu-check.sh cowry
+```
+
+Expected: cowry's processes hold **renderD128 only**. If renderD129 appears, the pin didn't take — fix that before writing any UI code.
+
+### Fallbacks, in order
+1. pin Mesa (above) — expected to be sufficient
+2. `WEBKIT_DISABLE_DMABUF_RENDERER=1` (WebKitGTK 2.54 supports it)
+3. `WEBKIT_DISABLE_COMPOSITING_MODE=1`
+4. `GDK_BACKEND=x11` — works, costs Wayland niceties
+5. `LIBGL_ALWAYS_SOFTWARE=1` — last resort, kills the perf story
+
+There is also `webkit2gtk-nvidia-quirk` (crate, v2.2.0) if we ever must coexist with an NVIDIA context. With Mesa pinned we expect not to need it.
+
+**Residual risk, stated honestly:** `gnome-shell` holds *both* render nodes, so Mutter may composite on NVIDIA while scanning out on Intel. If that turns out to matter, we'd be importing Intel buffers into an NVIDIA compositor — the reverse hazard. `gpu-check.sh` on `gnome-shell` plus a visual check at M0 day 1 settles it. We are not assuming our way past this.
 
 ---
 

@@ -45,23 +45,26 @@ Finished dev profile in 18.10s        EXIT=0
 
 **The webview toolchain works.** M0 is unblocked.
 
-## ⚠️ Hardware hazard: NVIDIA + Wayland
+## ⚠️ GPU policy: pin Cowry to the Intel iGPU
 
 ```
-GPU:     Intel Iris Xe (Alder Lake-P) + NVIDIA RTX 3080 Ti Laptop
-Driver:  proprietary NVIDIA (/dev/nvidia0 present)
-Session: Wayland (WAYLAND_DISPLAY=wayland-0)
+renderD128  pci=0000:00:02.0  i915    <- Intel Iris Xe
+renderD129  pci=0000:01:00.0  nvidia  <- RTX 3080 Ti Laptop
+connected panel: card1-eDP-1  -> display is driven by INTEL
+NVIDIA VRAM: 15993 / 16384 MiB used  -> 44 MiB FREE
+EGL vendor order: 10_nvidia.json, 50_mesa.json  -> NVIDIA preferred by default
 ```
 
-WebKitGTK's DMABUF renderer is known to break with the proprietary NVIDIA driver under Wayland — blank/flickering webview or startup crash. **Test a solid-colour webview window on M0 day 1.** Fixes to try in order:
+So the default EGL vendor is NVIDIA, on a GPU that is 97.6% full from inference. Force Mesa:
 
 ```bash
-WEBKIT_DISABLE_DMABUF_RENDERER=1
-WEBKIT_DISABLE_COMPOSITING_MODE=1
-LIBGL_ALWAYS_SOFTWARE=1            # last resort
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+export __GLX_VENDOR_LIBRARY_NAME=mesa
 ```
 
-Or the `webkit2gtk-nvidia-quirk` crate (v2.2.0). Details in PLAN.md §12.
+Verify with `./scripts/gpu-check.sh cowry` — cowry should hold **renderD128 only**.
+
+Full reasoning, the three places to set it, and fallbacks: **PLAN.md §12**.
 
 ## Optional (not blocking)
 
@@ -106,4 +109,4 @@ source "$HOME/.cargo/env" && cargo --version && node -v   # sanity
 
 Everything needed for **both M0 and M1** is installed. `cargo-tauri` is not installed — we'll use `@tauri-apps/cli` via npm (faster to iterate, no 5-minute Rust CLI build).
 
-**M0 day 1 is the NVIDIA/Wayland webview test.** Then the skeleton.
+**M0 day 1 is the GPU check: `./scripts/gpu-check.sh cowry` must show renderD128 only, and the webview must actually paint.** Then the skeleton.
