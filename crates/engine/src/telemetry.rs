@@ -39,6 +39,31 @@ pub struct TurnTelemetry {
 }
 
 impl TurnTelemetry {
+    /// Fold another provider round-trip into this turn's totals.
+    ///
+    /// One user turn can span several provider requests (each tool call is a
+    /// round-trip), so the turn-level numbers are aggregates. Tokens sum because
+    /// they are real cost. TTFT keeps the first non-zero value because that is
+    /// the latency the user actually perceived; later requests are hidden behind
+    /// tool execution. Rates keep the latest non-zero value, since they describe
+    /// "right now" and averages come from `Rolling`.
+    pub fn merge_server(&mut self, other: &TurnTelemetry) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.draft_n += other.draft_n;
+        self.draft_accepted += other.draft_accepted;
+        if self.ttft_ms == 0 {
+            self.ttft_ms = other.ttft_ms;
+        }
+        if other.server_prefill_tps > 0.0 {
+            self.server_prefill_tps = other.server_prefill_tps;
+        }
+        if other.server_decode_tps > 0.0 {
+            self.server_decode_tps = other.server_decode_tps;
+        }
+    }
+
     /// What the user actually waited for, per prompt token.
     pub fn effective_prefill_tps(&self) -> f64 {
         if self.ttft_ms == 0 || self.prompt_tokens == 0 {
