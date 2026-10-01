@@ -19,8 +19,20 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 
 cowry-engine = { path = "crates/engine" }
 
-# ---- M1 will add: reqwest, futures-util, rusqlite, portable-pty, similar,
-#      pulldown-cmark, rust_xlsxwriter, calamine, typst, bwrap plumbing ----
+# ---- M1 ----
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "http2",
+    "rustls-tls-native-roots",
+] }
+futures-util = "0.3"
+async-trait = "0.1"
+url = "2"
+
+# ---- M2+ ----
+# rusqlite, portable-pty, similar, pulldown-cmark, rust_xlsxwriter, calamine,
+# typst, bwrap plumbing
 
 # ---------------------------------------------------------------------------
 # Release profile — PLAN.md §9 rule 9.

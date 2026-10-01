@@ -32,6 +32,9 @@ pub enum FinishReason {
     Cancelled,
     /// provider or engine error
     Error,
+    /// a vendor stop reason we do not model; the raw string is not carried
+    /// because this enum is Copy and crosses the IPC boundary on every turn
+    Other,
 }
 
 /// One event in a turn's stream. The engine emits these in order; a front end

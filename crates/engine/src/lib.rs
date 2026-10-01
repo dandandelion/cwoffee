@@ -8,10 +8,16 @@
 //! M1 adds providers, the agent loop, the append-only prompt builder, and storage.
 
 pub mod event;
+pub mod provider;
+pub mod sse;
 pub mod telemetry;
 pub mod stream;
 
 pub use event::{EngineEvent, ExecStream, FinishReason};
+pub use provider::{
+    ChatRequest, Delta, DeltaSink, Message, Provider, ProviderError, Reasoning, Role, ToolCall,
+    ToolDef,
+};
 pub use telemetry::{LiveWindow, Rolling, TelemetrySnapshot, TurnTelemetry};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
