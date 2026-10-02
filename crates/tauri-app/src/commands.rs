@@ -30,7 +30,11 @@ pub struct AppState {
     /// Taken by `attach` exactly once and forwarded to the webview.
     pub queue_rx: Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>,
     /// Open approval requests, waiting on an answer from the UI.
-    pub pending_approvals: Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>,
+    /// Shared with the startup pump. It used to be a plain `Mutex<HashMap>` here
+    /// while the pump inserted into a separate `Arc<Mutex<HashMap>>` of its own,
+    /// so every answer looked up an empty map and every gated tool call failed
+    /// closed - approvals had never worked in the desktop app.
+    pub pending_approvals: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>>,
     /// Set the first time the page reports its own DOM state. A webview that
     /// never paints is otherwise indistinguishable from one that is fine.
     pub rendered: Arc<std::sync::atomic::AtomicBool>,

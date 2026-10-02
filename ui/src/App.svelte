@@ -137,8 +137,16 @@
   // "the UI actually reacted", which is the difference between a host bug and a
   // front-end bug when a session click appears to do nothing.
   let sessionChangedCount = 0
+  let eventTaps: ((e: EngineEvent) => void)[] = []
+  function beginEventTap(fn: (e: EngineEvent) => void) {
+    eventTaps.push(fn)
+    return () => {
+      eventTaps = eventTaps.filter((t) => t !== fn)
+    }
+  }
 
   function handle(ev: EngineEvent) {
+    for (const t of eventTaps) t(ev)
     transcript?.apply(ev)
     switch (ev.kind) {
       case 'sessionChanged':
@@ -543,6 +551,47 @@
           fail(`transcript DOM unchanged after selecting session ${other.id}`)
       }
 
+      // The approval round-trip, end to end. Every previous "approval verified"
+      // check only proved the request arrived; none proved the answer landed. It
+      // did not: the pump and the command used two different maps, so every gated
+      // tool call failed closed no matter what the user clicked.
+      {
+        const evs: string[] = []
+        const seen: string[] = []
+        const probe = (e: EngineEvent) => {
+          seen.push(e.kind)
+          if (e.kind === 'toolExecEnd') evs.push(`end:${e.d.ok}`)
+        }
+        const before = sessionChangedCount
+        void before
+        // Wrap handle for the duration of this step by listening to the raw stream.
+        const restore = beginEventTap(probe)
+        await invoke('set_mode', { mode: 'ask' })
+        await invoke('start_turn', { text: 'Use the exec tool to run: echo cowry-ok' })
+        const dl = performance.now() + 90000
+        while (!approval && performance.now() < dl) {
+          await new Promise((r) => setTimeout(r, 200))
+        }
+        if (!approval) {
+          fail('no approval request arrived for the exec call')
+        } else {
+          await answer('allow')
+          const end = performance.now() + 90000
+          while (!evs.length && performance.now() < end) {
+            await new Promise((r) => setTimeout(r, 200))
+          }
+          if (!evs.length) fail('tool never finished after allow')
+          else if (!evs[0].endsWith('true')) fail(`tool failed after allow: ${evs[0]}`)
+        }
+        restore()
+        // A real deadline: `performance.now() < performance.now() + N` is always
+        // true, which would spin here forever if the turn never ended.
+        const quiet = performance.now() + 60000
+        while (busy && performance.now() < quiet) {
+          await new Promise((r) => setTimeout(r, 300))
+        }
+      }
+
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +
@@ -738,16 +787,16 @@
       <button class="scrim" onclick={() => (sidebarOpen = false)} aria-label="Close sidebar"></button>
     {/if}
     <aside
-      class="sidebar w-[248px] shrink-0 flex-col gap-2 border-r border-hairline p-3 min-h-0"
+      class="sidebar w-[248px] shrink-0 flex-col gap-1.5 border-r border-hairline p-2.5 min-h-0"
       class:open={sidebarOpen}
       style="background: linear-gradient(160deg, var(--color-wash-1), var(--color-wash-2) 55%, var(--color-wash-3));"
     >
-      <button class="pill px-3 py-1.5 text-left text-[13px] font-medium" onclick={newSession}>
+      <button class="pill px-2.5 py-1 text-left text-[12.5px] font-medium" onclick={newSession}>
         + New session
       </button>
 
       <input
-        class="pill mt-1 px-2.5 py-1.5 text-[12.5px]"
+        class="pill px-2.5 py-1 text-[12.5px]"
         placeholder="Search messages"
         bind:value={query}
         onkeydown={(e) => e.key === 'Enter' && runSearch()}
@@ -782,9 +831,11 @@
                 onblur={() => commitRename()}
               />
             {:else}
-              <button class="flex-1 min-w-0 text-left" onclick={() => openSession(s.id)}>
-                <span class="block truncate text-[12.5px]">{s.title}</span>
-                <span class="block text-[11px] text-ink-3">{s.message_count} msg</span>
+              <!-- One line per session. Two lines per row roughly halved how
+                   many sessions fit, and the count rarely needs reading. -->
+              <button class="sessbtn" onclick={() => openSession(s.id)}>
+                <span class="sess-title">{s.title}</span>
+                <span class="sess-n" title="{s.message_count} messages">{s.message_count}</span>
               </button>
               <span class="sessrow-acts">
                 <button class="iconbtn" title="Rename" onclick={() => startRename(s.id, s.title)}>✎</button>

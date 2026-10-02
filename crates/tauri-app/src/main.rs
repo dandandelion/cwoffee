@@ -163,7 +163,11 @@ fn main() {
     );
 
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+    // One map, shared by the pump (which parks reply senders) and the
+    // respond_approval command (which resolves them). Two separate maps meant the
+    // command always looked up an empty one.
     let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let pending_pump = Arc::clone(&pending);
 
     // The pump starts at boot, not when the webview attaches: nothing is lost
     // during startup, and if the webview goes away the gate's timeout is what
@@ -193,7 +197,7 @@ fn main() {
                                     let _ = reply.send(ApprovalAnswer::Deny);
                                     continue;
                                 }
-                                pending.lock().unwrap().insert(id, reply);
+                                pending_pump.lock().unwrap().insert(id, reply);
                             }
                             None => ap_open = false,
                         }
@@ -212,7 +216,7 @@ fn main() {
         host,
         store,
         queue_rx: Mutex::new(Some(queue_rx)),
-        pending_approvals: Mutex::new(HashMap::new()),
+        pending_approvals: Arc::clone(&pending),
         rendered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
