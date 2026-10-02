@@ -100,13 +100,14 @@ Verified: streaming tool calls ✅ · `reasoning_content` deltas ✅ · `chat_te
 ```
 See `config/cowry.toml.example`.
 
-## Next command to run
+## Build, run, and the traps
 
-```bash
-cd ~/Projects/cowry
-source "$HOME/.cargo/env" && cargo --version && node -v   # sanity
-```
+See **`docs/BUILDRUN.md`**. It covers the dev loop, the release build, packaging,
+and seven traps that cost real time: the debug binary rendering a blank window,
+embedded assets going stale, Tauri argument casing, the tokio reactor panic,
+`pkill -f` killing the invoking shell, PSS-vs-RSS gating, and the TUI refusing a
+`0x0` terminal.
 
-Everything needed for **both M0 and M1** is installed. `cargo-tauri` is not installed — we'll use `@tauri-apps/cli` via npm (faster to iterate, no 5-minute Rust CLI build).
-
-**M0 day 1 is the GPU check: `./scripts/gpu-check.sh cowry` must show renderD128 only, and the webview must actually paint.** Then the skeleton.
+Everything needed for M0-M2 is installed. `cargo-tauri` is not installed on
+purpose - the Tauri CLI comes from `ui/node_modules/.bin/tauri` via npm, which
+avoids a several-minute Rust CLI build on every iteration.

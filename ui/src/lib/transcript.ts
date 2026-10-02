@@ -289,25 +289,89 @@ export class Transcript {
   }
 
   /** Re-render a stored session. Called on switch, not during streaming. */
+  /** The scroll container the transcript lives in, for anchoring on prepend. */
+  scrollEl(): HTMLElement | null {
+    return this.root.closest('.scroller') as HTMLElement | null
+  }
+
   loadHistory(msgs: StoredMessage[]) {
     this.clear()
+    this.root.appendChild(this.historyFragment(msgs))
+    pageLog(`history: loaded ${msgs.length} messages`)
+  }
+
+  /**
+   * Insert an older page above what is already shown.
+   *
+   * Returns the new scroll height so the caller can keep the viewport anchored:
+   * prepending shifts everything down, and without an adjustment the reader jumps
+   * to the top of the newly loaded page instead of staying where they were.
+   */
+  prependHistory(msgs: StoredMessage[]) {
+    const before = this.root.scrollHeight
+    const frag = this.historyFragment(msgs)
+    this.root.insertBefore(frag, this.root.firstChild)
+    return { shift: this.root.scrollHeight - before }
+  }
+
+  /**
+   * Render stored messages into a detached fragment.
+   *
+   * Detached matters: prepending requires the blocks to exist before they are in
+   * the document, and building them against `this.turn` would attach them to the
+   * live turn group instead.
+   */
+  private historyFragment(msgs: StoredMessage[]): DocumentFragment {
+    const frag = document.createDocumentFragment()
+    // Tool results are separate rows; match them to their card by id rather than
+    // "the most recent card", which is wrong across page boundaries.
+    const cards = new Map<string, { out: HTMLElement }>()
+    let lastCard: { out: HTMLElement } | undefined
+
+    const blk = (kind: string, label: string) => {
+      const wrap = this.el(`blk blk-${kind}`)
+      const head = this.el('blk-head', label)
+      const body = this.el('blk-body')
+      wrap.append(head, body)
+      frag.appendChild(wrap)
+      return body
+    }
+
     for (const m of msgs) {
-      if (m.role === 'user') this.block('user', 'you').textContent = m.content
-      else if (m.role === 'assistant') {
-        if (m.reasoning) this.block('reasoning', 'thinking').textContent = m.reasoning
-        const body = this.block('answer', 'cowry')
+      if (m.role === 'user') {
+        blk('user', 'you').textContent = m.content
+      } else if (m.role === 'assistant') {
+        if (m.reasoning) blk('reasoning', 'thinking').textContent = m.reasoning
+        const body = blk('answer', 'cowry')
         body.innerHTML = renderMarkdown(m.content)
         for (const call of parseCalls(m.tool_calls_json)) {
-          this.openTool(call.id, call.name)
-          this.setToolArgs(call.id, call.arguments)
+          const card = this.el('blk blk-tool')
+          const head = this.el('blk-head')
+          head.append(this.el('tool-name', call.name))
+          head.append(this.el('tool-status', ''))
+          const args = this.el('tool-args')
+          const out = this.el('tool-out')
+          card.append(head, args, out)
+          frag.appendChild(card)
+          args.textContent = call.arguments
+          const ref = { out }
+          cards.set(call.id, ref)
+          lastCard = ref
+          this.tools.set(call.id, {
+            card,
+            args,
+            out,
+            status: head.lastElementChild as HTMLElement,
+            stdout: '',
+            stderr: '',
+          })
         }
       } else if (m.role === 'tool') {
-        // Results arrive as their own rows; attach to the most recent card if any.
-        const last = [...this.tools.values()].pop()
-        if (last) last.out.textContent = m.content.slice(0, 8000)
+        const ref = (m.tool_call_id && cards.get(m.tool_call_id)) || lastCard
+        if (ref) ref.out.textContent = m.content.slice(0, 8000)
       }
     }
-    pageLog(`history: loaded ${msgs.length} messages`)
+    return frag
   }
 }
 

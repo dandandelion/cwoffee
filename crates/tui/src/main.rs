@@ -342,6 +342,12 @@ async fn main() -> Result<()> {
         cfg,
     );
 
+    // No config file means no model id; ask the endpoint rather than sending an
+    // empty one and taking a 400.
+    if let Some(m) = host.adopt_first_model().await {
+        eprintln!("cowry: no model configured, using the endpoint's first: {m}");
+    }
+
     // Terminal setup is wrapped so a panic still leaves the shell usable.
     let terminal = ratatui::init();
     // A 0x0 terminal is not a rendering detail, it is an input we refuse. A pty

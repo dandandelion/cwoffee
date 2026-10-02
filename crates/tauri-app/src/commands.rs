@@ -129,8 +129,29 @@ pub fn search_messages(state: tauri::State<'_, AppState>, query: String) -> Resu
 pub fn session_messages(
     state: tauri::State<'_, AppState>,
     id: i64,
-) -> Result<Vec<cowry_engine::store::StoredMessage>, String> {
-    state.store.messages(id).map_err(|e| e.to_string())
+    before: Option<i64>,
+    limit: Option<usize>,
+) -> Result<MessagePage, String> {
+    // Bounded on purpose. A session can hold thousands of messages; loading all
+    // of them costs memory and scroll performance for content nobody is reading.
+    let limit = limit.unwrap_or(80).clamp(1, 400);
+    // Fetch one extra row as a probe for `has_older` rather than a second COUNT.
+    let mut page = state
+        .store
+        .messages_before(id, before, limit + 1)
+        .map_err(|e| e.to_string())?;
+    let has_older = page.len() > limit;
+    if has_older {
+        page.remove(0); // drop the probe, keeping the newest `limit`
+    }
+    Ok(MessagePage { messages: page, has_older })
+}
+
+/// One page of transcript history, newest window returned in reading order.
+#[derive(serde::Serialize)]
+pub struct MessagePage {
+    pub messages: Vec<cowry_engine::store::StoredMessage>,
+    pub has_older: bool,
 }
 
 #[tauri::command]
@@ -143,7 +164,6 @@ pub fn switch_session(state: tauri::State<'_, AppState>, id: i64) {
     state.host.send(HostCmd::SwitchSession { id });
 }
 
-/// Report which GPU this process actually ended up on (PLAN.md §12 check).
 /// Model ids offered by the endpoint. A provider that exposes no list returns
 /// an empty vec rather than an error: "no picker" is a normal state.
 #[tauri::command]
@@ -190,6 +210,7 @@ pub fn delete_session(state: tauri::State<'_, AppState>, id: i64) -> Result<(), 
     state.store.delete_session(id).map_err(|e| e.to_string())
 }
 
+/// Which GPU this process actually ended up on (PLAN.md §12 check).
 #[tauri::command]
 pub fn gpu_report() -> gpu::GpuReport {
     gpu::report()

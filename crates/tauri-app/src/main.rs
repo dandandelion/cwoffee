@@ -87,11 +87,11 @@ fn main() {
 
     // ---- engine wiring ----------------------------------------------------
     let url = appcfg.provider.base_url.clone();
-    let model = if appcfg.provider.model.is_empty() {
-        "local".to_string()
-    } else {
-        appcfg.provider.model.clone()
-    };
+    // Empty is allowed: adopt_first_model() below asks the endpoint. Hardcoding
+    // a placeholder like "local" only works by luck with llama.cpp's alias and
+    // silently breaks every other server.
+    let configured_model = appcfg.provider.model.trim().to_string();
+    let model = configured_model.clone();
     // Default the workspace to ~/cowry-workspace, not the process CWD. A GUI app
     // launched from a .desktop file or by a WM inherits an arbitrary CWD, and
     // under `tauri dev` that is crates/tauri-app - which would quietly make the
@@ -139,17 +139,27 @@ fn main() {
     // The engine spawns tasks, so it must be constructed inside a tokio
     // context. Tauri's async runtime is tokio, so entering it here is enough;
     // calling SessionHost::spawn from bare `main` panics with "no reactor".
-    let mut host = tauri::async_runtime::block_on(async {
-        SessionHost::spawn(
+    let (mut host, adopted_model) = tauri::async_runtime::block_on(async {
+        let h = SessionHost::spawn(
             provider,
             Registry::with_v1_tools_search(appcfg.search_backend()),
             Arc::clone(&store),
             cfg,
-        )
+        );
+        // No config file means no model id. Ask the endpoint rather than sending
+        // an empty one and taking a 400.
+        let adopted = h.adopt_first_model().await;
+        if let Some(m) = &adopted {
+            eprintln!("[cowry] no model configured; using the endpoint's first: {m}");
+        }
+        (h, adopted)
     });
+    // Read the adopted id from the return value, not host.state(): SetModel is
+    // applied by the host task, so state() can still show the old value here.
+    let model_label = adopted_model.unwrap_or(configured_model);
     eprintln!(
-        "[cowry] engine up: url={url} model={} workspace={} mode={:?}",
-        appcfg.provider.model, workspace.display(), mode
+        "[cowry] engine up: url={url} model={model_label} workspace={} mode={:?}",
+        workspace.display(), mode
     );
 
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();

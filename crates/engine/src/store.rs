@@ -237,6 +237,54 @@ impl Store {
         Ok(id)
     }
 
+    /// Newest `limit` messages with id < `before_id`, returned in ascending order.
+    ///
+    /// The UI needs a bounded window: a session can hold thousands of messages,
+    /// and inserting all of them costs memory and scroll performance for content
+    /// nobody is looking at. The agent still reads the full history through
+    /// `history()` - this is a display concern, not a context concern.
+    pub fn messages_before(
+        &self,
+        session_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
+                    reasoning_signature, created_at
+             FROM messages
+             WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2)
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![session_id, before_id, limit as i64], |r| {
+            Ok(StoredMessage {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                role: r.get(2)?,
+                content: r.get(3)?,
+                reasoning: r.get(4)?,
+                tool_call_id: r.get(5)?,
+                tool_calls_json: r.get(6)?,
+                reasoning_signature: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        })?;
+        let mut out = rows.collect::<Result<Vec<_>, _>>()?;
+        out.reverse();
+        Ok(out)
+    }
+
+    pub fn message_count(&self, session_id: i64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     pub fn messages(&self, session_id: i64) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -575,6 +623,42 @@ mod tests {
         // ids strictly increase: nothing rewrote an earlier row
         let ids: Vec<i64> = s.messages(id).unwrap().iter().map(|m| m.id).collect();
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    #[test]
+    fn paged_history_is_bounded_and_ordered() {
+        let s = Store::in_memory().unwrap();
+        let id = s.create_session("long", "/w", "m").unwrap();
+        for i in 0..50 {
+            s.append_message(id, &Message::user(format!("message {i}"))).unwrap();
+        }
+        assert_eq!(s.message_count(id).unwrap(), 50);
+
+        let page = s.messages_before(id, None, 10).unwrap();
+        assert_eq!(page.len(), 10, "window is bounded");
+        assert_eq!(page[0].content, "message 40", "newest window");
+        assert_eq!(page[9].content, "message 49");
+        // Ascending despite the DESC query - the UI appends in reading order.
+        let ids: Vec<i64> = page.iter().map(|m| m.id).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+
+        let older = s.messages_before(id, Some(page[0].id), 10).unwrap();
+        // The page immediately before the first one, still in reading order.
+        assert_eq!(older.first().unwrap().content, "message 30", "walks backwards");
+        assert_eq!(older.last().unwrap().content, "message 39");
+        assert!(
+            older.iter().all(|m| m.id < page[0].id),
+            "no overlap between pages"
+        );
+
+        // Asking for more than exists returns everything, not an error.
+        assert_eq!(s.messages_before(id, None, 500).unwrap().len(), 50);
+        let rest = s.messages_before(id, Some(older[0].id), 500).unwrap();
+        assert_eq!(rest.len(), 30, "the remainder walks back to the start");
+        assert_eq!(rest.first().unwrap().content, "message 0");
+        // An exhausted window is empty rather than a repeat of the last page.
+        assert!(s.messages_before(id, Some(rest[0].id), 500).unwrap().is_empty());
     }
 
     #[test]

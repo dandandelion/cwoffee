@@ -87,8 +87,7 @@
         // and can render the previous session's messages under the new name.
         void (async () => {
           try {
-            const msgs = await invoke<any[]>('session_messages', { id: ev.d.session_id })
-            transcript?.loadHistory(msgs)
+            await loadTranscript(ev.d.session_id)
           } catch (e) {
             pageLog(`session_messages after switch failed: ${e}`)
           }
@@ -295,6 +294,43 @@
     }
   }
 
+  let hasOlder = $state(false)
+  let oldestId = $state<number | null>(null)
+  let loadingOlder = $state(false)
+
+  async function loadTranscript(id: number) {
+    const page = await invoke<{ messages: any[]; has_older: boolean }>('session_messages', {
+      id,
+    })
+    transcript?.loadHistory(page.messages)
+    hasOlder = page.has_older
+    oldestId = page.messages.length ? page.messages[0].id : null
+  }
+
+  async function loadOlder() {
+    if (oldestId === null || loadingOlder) return
+    loadingOlder = true
+    try {
+      const page = await invoke<{ messages: any[]; has_older: boolean }>('session_messages', {
+        id: hostState?.session_id ?? 0,
+        before: oldestId,
+      })
+      if (page.messages.length) {
+        const { shift } = transcript?.prependHistory(page.messages) ?? { shift: 0 }
+        // Prepending pushes the viewport down; anchor it back to where the
+        // reader was instead of dumping them at the top of the new page.
+        const sc = transcript?.scrollEl()
+        if (sc) sc.scrollTop += shift
+        oldestId = page.messages[0].id
+      }
+      hasOlder = page.has_older
+    } catch (e) {
+      pageLog(`load_older: ${e}`)
+    } finally {
+      loadingOlder = false
+    }
+  }
+
   async function setModel(m: string) {
     model = m
     await invoke('set_model', { model: m }).catch((e) => pageLog(`set_model: ${e}`))
@@ -325,8 +361,16 @@
       const renamed = await invoke<Session[]>('list_sessions')
       if (!renamed.some((s) => s.title === 'selftest-renamed')) fail('rename did not stick')
 
-      const empty = await invoke<any[]>('session_messages', { id: target.id })
-      if (empty.length !== 0) fail(`new session should be empty, got ${empty.length}`)
+      const empty = await invoke<any>('session_messages', { id: target.id })
+      pageLog(`RAW session_messages -> ${JSON.stringify(empty)}`)
+      if (empty.messages.length !== 0) fail(`new session should be empty, got ${empty.messages.length}`)
+      if (empty.has_older !== false) fail('empty session should not report older messages')
+      // Paging arithmetic is covered by the engine's store test; here we only
+      // check the command's shape, which is what the UI actually consumes.
+      const paged = await invoke<any>('session_messages', { id: target.id, limit: 2 })
+      if (!Array.isArray(paged.messages) || typeof paged.has_older !== 'boolean') {
+        fail('session_messages did not return { messages, has_older }')
+      }
 
       await invoke('delete_session', { id: target.id })
       const after = await invoke<Session[]>('list_sessions')
@@ -544,6 +588,11 @@
     <!-- main -->
     <main class="flex min-w-0 flex-1 flex-col">
       <div class="scroller min-h-0 flex-1 overflow-y-auto px-6 py-6">
+        {#if hasOlder}
+          <button class="btn-ghost mb-3 text-[12px]" onclick={loadOlder} disabled={loadingOlder}>
+            {loadingOlder ? 'loading…' : 'Load older messages'}
+          </button>
+        {/if}
         <div class="mx-auto w-full max-w-[780px]">
           <div class="transcript" bind:this={rootEl}></div>
         </div>

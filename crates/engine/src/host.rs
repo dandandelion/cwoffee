@@ -336,6 +336,20 @@ impl SessionHost {
         }
     }
 
+    /// Fill in an empty model id from the endpoint's own list.
+    ///
+    /// A fresh install with no config file has no model. Sending `"model": ""`
+    /// produces a confusing 400 from the server, so the shell resolves one
+    /// instead. Returns the id adopted, or None if there was nothing to adopt.
+    pub async fn adopt_first_model(&self) -> Option<String> {
+        if !self.state().model.trim().is_empty() {
+            return None;
+        }
+        let first = self.provider.list_models().await.ok()?.into_iter().next()?;
+        self.send(HostCmd::SetModel { model: first.clone() });
+        Some(first)
+    }
+
     /// Handle to the endpoint, for shell-level queries that are not turns.
     pub fn provider(&self) -> &Arc<dyn Provider> {
         &self.provider
