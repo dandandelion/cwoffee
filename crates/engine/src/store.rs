@@ -52,7 +52,7 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Current schema version. Bump with a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -125,6 +125,7 @@ impl Store {
     // ---- sessions ---------------------------------------------------------
 
     pub fn create_session(&self, title: &str, workspace: &str, model: &str) -> Result<i64, StoreError> {
+        let title = title_or_default(title);
         let now = now_ts();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -136,6 +137,9 @@ impl Store {
     }
 
     pub fn rename_session(&self, id: i64, title: &str) -> Result<(), StoreError> {
+        // Clearing a name must not blank the row out of usefulness; it falls back
+        // to the default rather than storing "".
+        let title = title_or_default(title);
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE sessions SET title = ?2, updated_at = ?3 WHERE id = ?1", params![id, title, now_ts()])?;
         Ok(())
@@ -490,6 +494,18 @@ fn fts_escape(q: &str) -> String {
         .join(" ")
 }
 
+/// A session row with no title renders as a blank line in the sidebar, which reads
+/// as a corrupted or half-deleted entry. There is no useful meaning in an empty
+/// name, so it is normalised at the store boundary instead of at every caller.
+fn title_or_default(t: &str) -> String {
+    let t = t.trim();
+    if t.is_empty() {
+        "new session".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
     if from < 1 {
         conn.execute_batch(
@@ -554,6 +570,15 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
             "ALTER TABLE messages ADD COLUMN reasoning_signature TEXT NOT NULL DEFAULT '';",
         )?;
     }
+    if from < 4 {
+        // v4: sessions with an empty title. `delete_session` used to move the host
+        // onto a freshly created session titled "", which rendered as a blank row
+        // in the sidebar - the deleted session was gone, but it left a title-less
+        // orphan behind. Backfill the rows that already exist.
+        conn.execute_batch(
+            "UPDATE sessions SET title = 'new session' WHERE trim(title) = '';",
+        )?;
+    }
     Ok(())
 }
 
@@ -568,6 +593,21 @@ mod tests {
 
     fn sid(s: &Store) -> i64 {
         s.create_session("t", "/tmp", "m").unwrap()
+    }
+
+    #[test]
+    fn empty_titles_are_normalised_at_the_store_boundary() {
+        let s = store();
+        let a = s.create_session("", "/w", "m").unwrap();
+        let b = s.create_session("   ", "/w", "m").unwrap();
+        let c = s.create_session("real title", "/w", "m").unwrap();
+        assert_eq!(s.session(a).unwrap().unwrap().title, "new session");
+        assert_eq!(s.session(b).unwrap().unwrap().title, "new session");
+        assert_eq!(s.session(c).unwrap().unwrap().title, "real title");
+
+        // Renaming to blank must not blank the row out of usefulness either.
+        s.rename_session(c, "").unwrap();
+        assert_eq!(s.session(c).unwrap().unwrap().title, "new session");
     }
 
     #[test]

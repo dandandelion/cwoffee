@@ -363,7 +363,13 @@
    * rename/delete/search round-trip through the store correctly.
    */
   async function selfTest() {
-    const fail = (m: string) => pageLog(`SELFTEST FAIL: ${m}`)
+    let fails = 0
+    // Counting failures matters: a harness that logs FAIL and then prints "ok"
+    // is worse than no harness, because the last line is the one you read.
+    const fail = (m: string) => {
+      fails++
+      pageLog(`SELFTEST FAIL: ${m}`)
+    }
     try {
       const before = await invoke<Session[]>('list_sessions')
       await invoke('new_session', { title: 'selftest' })
@@ -388,9 +394,27 @@
         fail('session_messages did not return { messages, has_older }')
       }
 
+      const emptiesBefore = (await invoke<Session[]>('list_sessions')).filter(
+        (s) => s.message_count === 0,
+      ).length
+
       await invoke('delete_session', { id: target.id })
+      // Deleting the active session moves the host off the row asynchronously;
+      // read after it has had a chance to land, or the counts below are noise.
+      await new Promise((r) => setTimeout(r, 400))
       const after = await invoke<Session[]>('list_sessions')
       if (after.some((s) => s.id === target.id)) fail('delete did not remove the row')
+
+      // The replacement session used to be created with an empty title, so the
+      // sidebar kept a blank row for a session the user had just deleted.
+      const blank = after.filter((s) => !s.title || !s.title.trim())
+      if (blank.length) fail(`${blank.length} session(s) have an empty title after delete`)
+
+      // It must also not pile up one empty orphan per delete. Compare against the
+      // count before, since a real DB already contains empty sessions.
+      const emptiesAfter = after.filter((s) => s.message_count === 0).length
+      if (emptiesAfter > emptiesBefore)
+        fail(`delete accumulated empty sessions: ${emptiesBefore} -> ${emptiesAfter}`)
 
       // Renaming to blank must be refused rather than producing an untitled row.
       let rejected = false
@@ -413,11 +437,13 @@
       if (st.model !== pick) fail(`set_model did not stick: state=${st.model} wanted=${pick}`)
 
       pageLog(
-        `SELFTEST ok: sessions ${before.length}->${after.length}, fts-safe query -> ` +
+        `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
+          `sessions ${before.length}->${after.length}, fts-safe query -> ` +
           `${hits.length} hits, models=${ms.length} picked=${pick}`,
       )
     } catch (e) {
       fail(String(e))
+      pageLog(`SELFTEST FAILED (${fails}): aborted before the summary`)
     }
   }
 

@@ -211,7 +211,20 @@ pub fn delete_session(state: tauri::State<'_, AppState>, id: i64) -> Result<(), 
     if id == st.session_id {
         // Move the host off the row before deleting it, otherwise the next turn
         // writes into a session that no longer exists.
-        state.host.send(HostCmd::NewSession { title: String::new() });
+        //
+        // Reuse an existing empty session when there is one. Always creating a
+        // fresh session left an orphan row per delete, which accumulated into a
+        // sidebar full of blank entries.
+        let reuse = state
+            .store
+            .list_sessions(50)
+            .ok()
+            .and_then(|list| list.into_iter().find(|s| s.id != id && s.message_count == 0))
+            .map(|s| s.id);
+        match reuse {
+            Some(sid) => state.host.send(HostCmd::SwitchSession { id: sid }),
+            None => state.host.send(HostCmd::NewSession { title: "new session".into() }),
+        }
     }
     state.store.delete_session(id).map_err(|e| e.to_string())
 }
