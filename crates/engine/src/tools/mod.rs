@@ -5,11 +5,13 @@
 //! (which costs prefill on a slow local model) and more chances for a quantized
 //! model to emit a call it shouldn't.
 
+pub mod docs;
 pub mod exec;
 pub mod files;
 pub mod path;
 pub mod repair;
 pub mod web;
+pub mod xlsx;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -63,6 +65,16 @@ impl ToolResult {
     pub fn err(msg: impl Into<String>) -> Self {
         let m = msg.into();
         Self { ok: false, output: String::new(), exit_code: None, truncated: false, error: Some(m) }
+    }
+
+    /// Whatever the tool actually said, success or failure. Keeps call sites and
+    /// tests from repeating the ok/output-vs-error dance.
+    pub fn text(&self) -> String {
+        match (&self.error, self.output.is_empty()) {
+            (Some(e), _) => e.clone(),
+            (None, false) => self.output.clone(),
+            (None, true) => String::new(),
+        }
     }
 }
 
@@ -121,11 +133,16 @@ impl Registry {
     /// Same fixed order as `with_v1_tools`; only the search backend differs.
     /// There is exactly one place that decides the order, because order changes
     /// the prompt bytes and invalidates the prefix cache for every later turn.
+    ///
+    /// Adding a tool also changes those bytes, so every existing session takes
+    /// one cold-prefill turn after an upgrade. That is unavoidable and cheaper
+    /// than versioning the tool set.
     pub fn with_v1_tools_search(search: web::SearchBackend) -> Self {
         let mut r = Self::new();
         r.register(Box::new(exec::ExecTool::default()));
         r.register(Box::new(files::ReadFileTool));
         r.register(Box::new(files::WriteFileTool));
+        r.register(Box::new(xlsx::WriteXlsxTool));
         r.register(Box::new(web::WebFetchTool::default()));
         r.register(Box::new(web::WebSearchTool::from_backend(search)));
         r

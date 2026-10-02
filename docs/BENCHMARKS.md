@@ -108,3 +108,48 @@ must be watchdog-armed against **PSS**, not `RLIMIT_AS`. `RLIMIT_AS` caps virtua
 address space; tokio/reqwest binaries legitimately map large VmSize at small PSS,
 and the result is a misleading "memory allocation failed" that looks like an app
 bug. A TUI regression once reached 8.7 GB PSS and pushed the machine into swap.
+
+## Document output
+
+Measured on this box, LibreOffice 26.2.6.3:
+
+| conversion | result |
+|---|---|
+| markdown → HTML → PDF | works, `writer_web_pdf_Export`, ~34 KB for a one-page note |
+| docx → PDF | **fails**: "source file could not be loaded" |
+| HTML → docx | **fails**: "no export filter found" |
+
+The Fedora LibreOffice here has no MS Word 2007 XML filter, so it cannot read or
+write .docx at all. That is why the PDF path is markdown → HTML → PDF and not
+markdown → docx → PDF: the renderer cannot consume the intermediate we would
+have produced. The .docx is still written as a deliverable for Word users.
+
+This also means LibreOffice cannot validate our hand-rolled .docx. `scripts/check-docx.py`
+does it instead with `zipfile` + `ElementTree` (stdlib only). It will not prove
+Word accepts the file; it does catch the failure that matters, which is a part
+that is not valid XML.
+
+End-to-end with the real model (`cargo run -p cowry-engine --example live_docs_agent`):
+
+```
+tool ▸ write_xlsx   args {"path":"budget.xlsx","sheets":[{"name":"Budget",
+                     "rows":[["item","cost"],["rent",1200],["food",300],["power",90]]}]}
+tool ▸ write_file   args {"path":"summary.pdf","content":"# Monthly Budget Summary..."}
+tool ▸ exec         args {"cmd":"ls -l ..."}        # model verified its own output
+
+summary.pdf (21593 bytes)   budget.xlsx (5581 bytes)
+pdftotext -> "Monthly Budget Summary / The total ... is 1590."
+xlsx cells -> 1200, 300, 90 stored as numbers, not text
+prompt=4349 cached=2728 (63% hit) decode=27.3/s
+```
+
+Two dependency decisions worth keeping:
+
+- `docx-rs` was tried and pulled **88 transitive crates** (zstd, xz, zopfli, a
+  JPEG decoder). Writing the five OOXML parts directly with `zip` (already a
+  dependency of rust_xlsxwriter, so no new version) took the engine from 445 to
+  317 crates and puts the escaping under our control — model output quotes
+  fetched web pages, and a writer that passes text through raw is an injection
+  path into a file the user opens in Word.
+- PDF is not generated from scratch. That is a font-metrics project, and the
+  honest alternative is a "PDF" that is really a bad text dump.

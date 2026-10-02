@@ -236,7 +236,7 @@ impl Tool for WriteFileTool {
             "type": "object",
             "properties": {
                 "path":    { "type": "string", "description": "Path relative to the workspace root" },
-                "content": { "type": "string", "description": "Full text content to write" },
+                "content": { "type": "string", "description": "Full text content. For .docx and .pdf this is markdown and gets converted." },
                 "mode":    { "type": "string", "enum": ["overwrite", "append"], "description": "Default overwrite" }
             },
             "required": ["path", "content"]
@@ -265,6 +265,30 @@ impl Tool for WriteFileTool {
         if path == ctx.workspace || path.is_dir() {
             return ToolResult::err(format!("{} is a directory, not a file", path.display()));
         }
+
+        // Document formats: the content is markdown and the extension decides
+        // the writer. Keeping this inside write_file rather than adding a
+        // second "write_document" tool matters for a small local model - every
+        // extra tool is another schema it has to choose between correctly.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "xlsx" => {
+                return ToolResult::err(
+                    "write_file cannot produce .xlsx (cells would be text). Use write_xlsx.",
+                )
+            }
+            "docx" | "pdf" => {
+                if append {
+                    return ToolResult::err("cannot append to a .docx/.pdf; rewrite the whole document");
+                }
+                return write_document(&path, content, &ext, ctx).await;
+            }
+            _ => {}
+        }
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return ToolResult::err(format!("cannot create {}: {e}", parent.display()));
@@ -291,6 +315,35 @@ impl Tool for WriteFileTool {
             )),
             Err(e) => ToolResult::err(format!("cannot write {}: {e}", path.display())),
         }
+    }
+}
+
+/// Convert markdown into a binary document and place it at `path`.
+async fn write_document(path: &Path, markdown: &str, ext: &str, ctx: &ToolCtx) -> ToolResult {
+    match ext {
+        "docx" => match super::docs::markdown_to_docx(markdown) {
+            Ok(bytes) => match std::fs::write(path, &bytes) {
+                Ok(_) => ToolResult::ok(format!(
+                    "{} created (docx, {} bytes from markdown)",
+                    display_rel(&ctx.workspace, path),
+                    bytes.len()
+                )),
+                Err(e) => ToolResult::err(format!("cannot write {}: {e}", path.display())),
+            },
+            Err(e) => ToolResult::err(e),
+        },
+        "pdf" => match super::docs::markdown_to_pdf(markdown, path, 120).await {
+            Ok(p) => {
+                let n = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                ToolResult::ok(format!(
+                    "{} created (pdf, {} bytes; rendered via LibreOffice)",
+                    display_rel(&ctx.workspace, &p),
+                    n
+                ))
+            }
+            Err(e) => ToolResult::err(e),
+        },
+        other => ToolResult::err(format!("unsupported document format {other:?}")),
     }
 }
 
@@ -464,5 +517,53 @@ mod tests {
         let mut s = vec![b'a'; 9000];
         s[8500] = 0;
         assert!(!looks_binary(&s));
+    }
+
+    #[tokio::test]
+    async fn docx_extension_produces_a_real_package() {
+        let dir = tmp("docx");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let r = WriteFileTool
+            .run(
+                json!({"path": "note.docx", "content": "# Title\n\nTom & Jerry **bold**"}),
+                &ctx_in(&dir),
+                &tx,
+            )
+            .await;
+        assert!(r.ok, "{}", r.text());
+        let bytes = std::fs::read(dir.join("note.docx")).unwrap();
+        assert_eq!(&bytes[0..2], b"PK", "not a zip");
+        let cur = std::io::Cursor::new(bytes);
+        let zip = zip::ZipArchive::new(cur).expect("docx opens as a zip");
+        assert!(zip.file_names().any(|n| n == "word/document.xml"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn xlsx_through_write_file_is_refused_and_points_at_the_right_tool() {
+        let dir = tmp("xlsx-refuse");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let r = WriteFileTool
+            .run(json!({"path": "a.xlsx", "content": "x,y\n1,2"}), &ctx_in(&dir), &tx)
+            .await;
+        assert!(!r.ok, "xlsx accepted by write_file");
+        assert!(r.text().contains("write_xlsx"), "not actionable: {}", r.text());
+        assert!(!dir.join("a.xlsx").exists(), "refusal must not leave a file behind");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn appending_to_a_binary_document_is_refused() {
+        let dir = tmp("docx-append");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let r = WriteFileTool
+            .run(
+                json!({"path": "a.docx", "content": "more", "mode": "append"}),
+                &ctx_in(&dir),
+                &tx,
+            )
+            .await;
+        assert!(!r.ok, "append to docx accepted");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
