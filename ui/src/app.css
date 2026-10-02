@@ -55,6 +55,16 @@ body {
   height: 100%;
 }
 
+/* Mobile browsers resize the viewport as the URL bar hides and shows, so 100%
+   against a 100vh body gives a layout that is briefly taller than what is
+   visible. dvh tracks the current visible height; in a desktop webview it is
+   identical to 100%. */
+@supports (height: 100dvh) {
+  #app {
+    height: 100dvh;
+  }
+}
+
 /* ---------------------------------------------------------------------------
    Frameless-window chrome.
    The drag region is Tauri's mechanism (data-tauri-drag-region); do not
