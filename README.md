@@ -1,25 +1,26 @@
 # Cowry
 
-**A local-first, BYOM co-work agent for Linux. One process tree, 282 MB, your model, your machine.**
+**A local-first, BYOM co-work agent for Linux. One process tree, ~230–285 MB, your model, your machine.**
 
 Chat, tools, and research — Excel, PDF, docs, sandboxed command execution — against any
 OpenAI-compatible, Anthropic-compatible, or custom endpoint.
 
 ```
 Qoder:  ~1.3 GB across 14 processes, cloud
-Cowry:  282 MB PSS, one process tree, local
+Cowry:  230–285 MB PSS, one process tree, local
 ```
 
-The 282 MB is measured, not estimated, on the production build with the frontend
-embedded: 106.7 MB for the app (engine + Tauri + GTK), 129.5 MB WebKit web process,
-38.1 MB WebKit network process, 8.0 MB WebKit's own sandboxed image loaders. The same
-code without a browser — the TUI — is **7.7 MB PSS**. See
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+The memory figure is measured, not estimated, on the production build with the
+frontend embedded. It is quoted as a range because the total moves with which WebKit
+helpers are alive: 87.6–106.7 MB for the app (engine + Tauri + GTK), 114.7–129.5 MB
+WebKit web process, 27.5–38.1 MB WebKit network process, plus 8 MB of WebKit's own
+sandboxed image loaders in the heavier sample. The same code without a browser — the
+TUI — is **7.0 MB PSS**. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-> Status: M0–M2 built and running. The engine, both clients, the sandbox, the store
-> and document output are live and verified against a real local model. Packaging
-> produces an installable RPM. Not yet done: attachments, Knowledge Center, browser
-> module.
+> Status: M0–M2 built and running. The engine, both clients, the sandbox, the store,
+> document output and image attachments are live and verified against a real local
+> model. Packaging produces an installable RPM. Not yet done: Knowledge Center,
+> browser module, LAN gateway (designed in `docs/GATEWAY.md`, deliberately not built).
 
 ## Run it
 
@@ -35,6 +36,9 @@ cowry --config /path/to/config.toml
 ```
 
 Precedence is **CLI flags > environment > config file > defaults**.
+
+Keyboard: `Ctrl+K` composer, `Ctrl+Enter` send, `Ctrl+N` new session, `Ctrl+B`
+sidebar, `Alt+1-9` switch session. The `?` in the status bar lists them.
 
 Gates:
 
@@ -83,6 +87,11 @@ channels, which is also the seam for a future daemon/remote mode.
 - **Document writers escape before they emit any markup.** Model output quotes fetched
   web pages, so `<script>` and `javascript:` arrive in the text. A writer that passes
   them through is an injection path into a file the user opens in Word.
+- **Links leave the webview, and attachments are refused at the engine boundary.**
+  Rendered markdown links go to the OS through tauri's opener plugin (scope-checked),
+  never by navigating the app window. Image attachments are validated by the engine —
+  mime allow-list, count and byte caps, base64 shape — not by the composer, because
+  the composer is not going to be the only client forever.
 
 ## Name
 

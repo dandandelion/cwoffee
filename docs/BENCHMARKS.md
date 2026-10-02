@@ -14,46 +14,44 @@ process set that really occupies 282 MB.
 
 ### Desktop app (`cowry-app`), release build, embedded assets
 
-| Process | PSS |
-|---|---|
-| `cowry-app` (engine + Tauri + GTK) | 106.7 MB |
-| `WebKitWebProcess` | 129.5 MB |
-| `WebKitNetworkProcess` | 38.1 MB |
-| `glycin-svg` + 2 × `bwrap` | 8.0 MB |
-| **total** | **282.2 MB** |
+Measured twice on the same build, because the total moves with which WebKit
+helpers happen to be alive:
 
-RSS for the same state is 464.9 MB — 65% higher, and the reason RSS is not the
+| Process | sample A | sample B |
+|---|---|---|
+| `cowry-app` (engine + Tauri + GTK) | 87.6 MB | 106.7 MB |
+| `WebKitWebProcess` | 114.7 MB | 129.5 MB |
+| `WebKitNetworkProcess` | 27.5 MB | 38.1 MB |
+| `glycin-svg` + 2 × `bwrap` | — | 8.0 MB |
+| **total** | **229.8 MB** | **282.2 MB** |
+
+Quote **~230–285 MB PSS** rather than a single figure. The spread is mostly
+WebKit's, and the `glycin-svg` / `bwrap` entries in the second sample are not
+Cowry's: WebKitGTK sandboxes its own image loaders with bubblewrap. They are real
+memory and belong in the number, but they are the webview's cost, not the
+engine's.
+
+RSS for the same state is 450–465 MB — 65% higher, and the reason RSS is not the
 gate.
 
-The `glycin-svg` / `bwrap` entries are not Cowry's: WebKitGTK sandboxes its image
-loaders with bubblewrap. They are real memory and belong in the number, but they
-are the webview's cost, not the engine's.
-
-> **Correction (M2h).** An earlier revision of this file reported 248.2 MB for the
-> release app. That binary was not a production build: `cargo build --release`
-> does not enable tauri's `custom-protocol` feature, so tauri's build script set
-> `cfg(dev)`, the app loaded `build.devUrl` from a running vite server, and no
-> assets were embedded. The measurement was of a dev-mode app. See
-> `docs/BUILDRUN.md` trap 2 — the same bug also made the release binary render a
-> blank window whenever vite was not running, which is how it was finally caught.
-
-Debug build + vite dev server measures 289.9 MB PSS. That is the number to
-compare against when developing, not the shipping number.
+Debug build + vite dev server measures ~290 MB PSS. That is the number to compare
+against when developing, not the shipping number.
 
 ### TUI (`cowry`), release build
 
-**7.7 MB PSS**, flat over 12 s across a completed streamed turn, measured with a
-PSS watchdog rather than `RLIMIT_AS`.
+**7.0 MB PSS** peak over 10 s at idle, measured with a PSS watchdog rather than
+`RLIMIT_AS` (which caps virtual address space, not resident memory, and produces
+misleading allocation failures in tokio/reqwest binaries).
 
-This is the argument for the engine/UI split: the webview costs ~280 MB and the
-agent costs ~8 MB. Anything that does not need a browser should not carry one.
+This is the argument for the engine/UI split: the webview costs ~220–275 MB and
+the agent costs ~7 MB. Anything that does not need a browser should not carry one.
 
 ### Binary size
 
 | Binary | Size |
 |---|---|
-| `target/release/cowry` | 7.7 MB |
-| `target/release/cowry-app` | 11.3 MB (includes the embedded frontend) |
+| `target/release/cowry` | 7.4 MB |
+| `target/release/cowry-app` | 12.1 MB (includes the embedded frontend) |
 | `bundle/rpm/cowry-0.0.0-1.x86_64.rpm` | 4.79 MiB |
 
 The packaged artifact was measured separately after installing nothing — the RPM

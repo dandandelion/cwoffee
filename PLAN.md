@@ -144,16 +144,14 @@ Engine allows exactly one in-flight turn. Queued work shows a **prefill ETA** (`
 
 ## 6. Milestones
 
-| | Milestone | Est. | Acceptance |
-|---|---|---|---|
 | | Milestone | Status | Acceptance |
 |---|---|---|---|
 | M0 | Skeleton: workspace, Tauri hello, Svelte+Tailwind wired, `Channel` proven with a fake streamer | **done** | a token stream paints in the webview with no jank |
 | M1 | **Engine + TUI**: adapters, SSE, tool-call normalization, JSON repair, agent loop, append-only `PromptBuilder`, SQLite sessions, `exec` in bwrap, approvals, ratatui client | **done** | real BYOM tool-calling conversation from a terminal |
 | M2 | **Chat surface**: sidebar, imperative transcript, markdown on stream end, tool cards, composer + pickers, session switching | **done** | the webview drives the real engine |
-| M3 | **Doc tools**: xlsx writer, docx writer, LibreOffice→PDF | **mostly done** — typst templates and attachment chips not started | "spreadsheet + PDF report" works end to end |
+| M3 | **Doc tools**: xlsx writer, docx writer, LibreOffice→PDF | **done** — typst templates not started; image attachments now land in the composer | "spreadsheet + PDF report" works end to end |
 | M4 | **Research**: `web_search` + `web_fetch` → readability → markdown | **done**, inline citations not started | cited multi-source answer |
-| M5 | **Shell & polish**: custom titlebar, themes, shortcuts, packaging | **partly done** — RPM builds, themes/shortcuts pending | matches the mock; binary ~10 MB |
+| M5 | **Shell & polish**: custom titlebar, themes, shortcuts, packaging | **partly done** — RPM builds, shortcuts and external links done; themes pending | matches the mock; binary ~12 MB |
 
 **Total ~6–8 weeks solo.** M1 and M2 are the ones that slip; guard them.
 

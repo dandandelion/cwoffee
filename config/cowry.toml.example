@@ -69,6 +69,10 @@ max_results = 8
 # bwrap is the security boundary. The denylist is a guardrail, not a boundary.
 [sandbox]
 enabled = true
+# Hard ceiling for a command. The model may ask for a shorter deadline per call
+# (exec takes an optional "timeout"), but it can never raise this. Anything it
+# requests above it is clamped down and the clamp is reported back to the model,
+# because a silently clamped deadline just means it keeps asking for longer.
 timeout_secs = 120
 
 # ---------------------------------------------------------------------------
