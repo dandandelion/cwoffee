@@ -54,6 +54,12 @@ agent costs ~8 MB. Anything that does not need a browser should not carry one.
 |---|---|
 | `target/release/cowry` | 7.7 MB |
 | `target/release/cowry-app` | 11.3 MB (includes the embedded frontend) |
+| `bundle/rpm/cowry-0.0.0-1.x86_64.rpm` | 4.79 MiB |
+
+The packaged artifact was measured separately after installing nothing — the RPM
+binary is the same one `tauri build` produced, and it was checked to contain the
+hashed asset filenames before running. It renders (`render OK`) with no dev server
+and measures **284.1 MB PSS**, matching the direct release measurement.
 
 ## Streaming smoothness
 
