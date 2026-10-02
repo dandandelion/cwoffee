@@ -10,18 +10,29 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cowry_engine::approval::{ApprovalAnswer, ApprovalMode};
+use cowry_engine::approval::ApprovalAnswer;
 use cowry_engine::host::{approval_event, HostConfig, SessionHost};
-use cowry_engine::provider::openai::{Flavor, OpenAiProvider};
 use cowry_engine::provider::Provider;
 use cowry_engine::store::Store;
 use cowry_engine::tools::Registry;
+use cowry_engine::Config;
 use tokio::sync::{mpsc, oneshot};
 
 use commands::AppState;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
+}
+
+/// Minimal flag parser. Tauri hands us its own arguments too, so unknown flags
+/// are ignored rather than fatal.
+fn flag(args: &[String], long: &str, short: Option<&str>) -> Option<String> {
+    for (i, a) in args.iter().enumerate() {
+        if (a == long || short.map(|s| a == s).unwrap_or(false)) && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+    }
+    None
 }
 
 fn data_dir() -> PathBuf {
@@ -44,25 +55,57 @@ fn main() {
         eprintln!("[cowry] WARNING: this process holds an NVIDIA render node despite the pin");
     }
 
+    // ---- configuration ----------------------------------------------------
+    // precedence: CLI flags > env > config file > defaults
+    let args: Vec<String> = std::env::args().collect();
+    let cfg_path = flag(&args, "--config", None);
+    let (mut appcfg, loaded) = match Config::load(cfg_path.as_deref().map(std::path::Path::new)) {
+        Ok(v) => v,
+        Err(e) => {
+            // A malformed config must not silently fall back to defaults: that
+            // would send the agent at the wrong endpoint with no explanation.
+            eprintln!("[cowry] {e}");
+            std::process::exit(1);
+        }
+    };
+    appcfg.apply_env();
+    if let Some(p) = flag(&args, "--url", None) {
+        appcfg.provider.base_url = p;
+    }
+    if let Some(p) = flag(&args, "--model", None) {
+        appcfg.provider.model = p;
+    }
+    if let Some(p) = flag(&args, "-C", Some("--workspace")) {
+        appcfg.workspace = Some(p);
+    }
+    if let Some(p) = flag(&args, "--mode", None) {
+        appcfg.mode = Some(p);
+    }
+    if let Some(p) = &loaded {
+        eprintln!("[cowry] config: {}", p.display());
+    }
+
     // ---- engine wiring ----------------------------------------------------
-    let url = env_or("COWRY_URL", "http://127.0.0.1:8090/v1");
-    let model = env_or("COWRY_MODEL", "local");
+    let url = appcfg.provider.base_url.clone();
+    let model = if appcfg.provider.model.is_empty() {
+        "local".to_string()
+    } else {
+        appcfg.provider.model.clone()
+    };
     // Default the workspace to ~/cowry-workspace, not the process CWD. A GUI app
     // launched from a .desktop file or by a WM inherits an arbitrary CWD, and
     // under `tauri dev` that is crates/tauri-app - which would quietly make the
     // agent edit the wrong tree.
-    let workspace = {
-        let explicit = std::env::var("COWRY_WORKSPACE").ok().filter(|s| !s.is_empty());
-        let ws = explicit.map(PathBuf::from).unwrap_or_else(|| {
-            PathBuf::from(env_or("HOME", ".")).join("cowry-workspace")
-        });
-        if let Err(e) = std::fs::create_dir_all(&ws) {
-            eprintln!("[cowry] cannot create workspace {}: {e}", ws.display());
-        }
-        ws
-    };
+    let workspace = appcfg
+        .workspace
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env_or("HOME", ".")).join("cowry-workspace"));
+    if let Err(e) = std::fs::create_dir_all(&workspace) {
+        eprintln!("[cowry] cannot create workspace {}: {e}", workspace.display());
+    }
     let db_path = data_dir().join("sessions.db");
-    let mode = ApprovalMode::parse(&env_or("COWRY_MODE", "ask")).unwrap_or(ApprovalMode::Ask);
+    let mode = appcfg.mode();
 
     if let Err(e) = std::fs::create_dir_all(db_path.parent().unwrap_or_else(|| std::path::Path::new("."))) {
         eprintln!("[cowry] cannot create data dir: {e}");
@@ -76,31 +119,38 @@ fn main() {
         }
     };
 
-    let provider: Box<dyn Provider> = match OpenAiProvider::new("local", Flavor::LlamaCpp, &url) {
-        Ok(p) => Box::new(p),
+    let provider: Box<dyn Provider> = match appcfg.build_provider() {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("[cowry] bad COWRY_URL {url:?}: {e}");
+            eprintln!("[cowry] {e}");
             std::process::exit(1);
         }
     };
 
     let mut cfg = HostConfig::new(model, workspace.clone());
     cfg.mode = mode;
-    cfg.context_budget = 24_000;
+    cfg.context_budget = appcfg.context.target_tokens;
     cfg.env_block = cowry_engine::host::default_env_block(&workspace, "linux");
-    // Configurable so fail-closed behaviour is testable without waiting minutes,
-    // and so a headless/CI run can set it low.
-    cfg.approval_timeout = std::time::Duration::from_secs(
-        env_or("COWRY_APPROVAL_TIMEOUT_SECS", "300").parse().unwrap_or(300),
-    );
+    // Fail-closed default: an unanswered prompt refuses rather than hanging the
+    // turn forever.
+    cfg.approval_timeout =
+        std::time::Duration::from_secs(appcfg.approval_timeout_secs.unwrap_or(300));
 
     // The engine spawns tasks, so it must be constructed inside a tokio
     // context. Tauri's async runtime is tokio, so entering it here is enough;
     // calling SessionHost::spawn from bare `main` panics with "no reactor".
     let mut host = tauri::async_runtime::block_on(async {
-        SessionHost::spawn(provider, Registry::with_v1_tools(), Arc::clone(&store), cfg)
+        SessionHost::spawn(
+            provider,
+            Registry::with_v1_tools_search(appcfg.search_backend()),
+            Arc::clone(&store),
+            cfg,
+        )
     });
-    eprintln!("[cowry] engine up: url={url} workspace={}", workspace.display());
+    eprintln!(
+        "[cowry] engine up: url={url} model={} workspace={} mode={:?}",
+        appcfg.provider.model, workspace.display(), mode
+    );
 
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();
     let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>> = Arc::new(Mutex::new(HashMap::new()));

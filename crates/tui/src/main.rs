@@ -24,10 +24,11 @@ use ratatui::{DefaultTerminal, Frame};
 use cowry_engine::approval::{ApprovalAnswer, ApprovalMode, ApprovalRequest};
 use cowry_engine::event::{EngineEvent, ExecStream, FinishReason};
 use cowry_engine::host::{default_env_block, HostCmd, HostConfig, SessionHost};
-use cowry_engine::provider::{openai::{Flavor, OpenAiProvider}, Reasoning};
+use cowry_engine::provider::Reasoning;
 use cowry_engine::store::Store;
 use cowry_engine::telemetry::{Rolling, TurnTelemetry};
 use cowry_engine::tools::Registry;
+use cowry_engine::Config;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -188,26 +189,29 @@ impl App {
 // ---------------------------------------------------------------------------
 
 struct Args {
-    url: String,
-    model: String,
-    workspace: PathBuf,
+    /// Everything here is an *override*. Unset means "whatever the config file
+    /// and environment produced", so precedence stays CLI > env > file > default
+    /// in one readable place.
+    config: Option<PathBuf>,
+    url: Option<String>,
+    model: Option<String>,
+    workspace: Option<PathBuf>,
     db: PathBuf,
-    mode: ApprovalMode,
-    flavor: Flavor,
-    anthropic: bool,
-    context: usize,
+    mode: Option<String>,
+    kind: Option<String>,
+    context: Option<usize>,
 }
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
-        url: std::env::var("COWRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8090/v1".into()),
-        model: std::env::var("COWRY_MODEL").unwrap_or_else(|_| "local".into()),
-        workspace: std::env::current_dir()?,
+        config: None,
+        url: None,
+        model: None,
+        workspace: None,
         db: dirs_data_dir().join("sessions.db"),
-        mode: ApprovalMode::Ask,
-        flavor: Flavor::LlamaCpp,
-        anthropic: false,
-        context: 32_000,
+        mode: None,
+        kind: None,
+        context: None,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -217,20 +221,25 @@ fn parse_args() -> Result<Args> {
             argv.get(*i).cloned().ok_or_else(|| anyhow::anyhow!("{} needs a value", argv[*i - 1]))
         };
         match argv[i].as_str() {
-            "--url" => a.url = next(&mut i)?,
-            "--model" => a.model = next(&mut i)?,
-            "--workspace" | "-C" => a.workspace = PathBuf::from(next(&mut i)?),
+            "--config" => a.config = Some(PathBuf::from(next(&mut i)?)),
+            "--url" => a.url = Some(next(&mut i)?),
+            "--model" => a.model = Some(next(&mut i)?),
+            "--workspace" | "-C" => a.workspace = Some(PathBuf::from(next(&mut i)?)),
             "--db" => a.db = PathBuf::from(next(&mut i)?),
             "--mode" => {
-                a.mode = ApprovalMode::parse(&next(&mut i)?)
-                    .ok_or_else(|| anyhow::anyhow!("mode must be ask | session | auto"))?
+                let v = next(&mut i)?;
+                if ApprovalMode::parse(&v).is_none() {
+                    anyhow::bail!("mode must be ask | session | auto");
+                }
+                a.mode = Some(v);
             }
-            "--openai" => a.flavor = Flavor::OpenAi,
-            "--anthropic" => a.anthropic = true,
-            "--context" => a.context = next(&mut i)?.parse()?,
+            "--openai" => a.kind = Some("openai".into()),
+            "--anthropic" => a.kind = Some("anthropic".into()),
+            "--context" => a.context = Some(next(&mut i)?.parse()?),
             "--help" | "-h" => {
                 println!(
                     "cowry [options]\n  \
+                     --config PATH      config file (default ~/.config/cowry/config.toml)\n  \
                      --url URL          API root (default http://127.0.0.1:8090/v1)\n  \
                      --model NAME       model id sent to the API\n  \
                      -C, --workspace D  workspace directory (default cwd)\n  \
@@ -238,6 +247,7 @@ fn parse_args() -> Result<Args> {
                      --mode M           ask | session | auto\n  \
                      --openai | --anthropic\n  \
                      --context N        prompt token budget\n\n  \
+                     precedence: flags > environment > config file > defaults\n\n  \
                      keys: enter send · ctrl-c cancel/quit · esc quit · \
                      pgup/pgdn scroll · ctrl-a cycle approval mode · ctrl-r cycle thinking"
                 );
@@ -261,25 +271,70 @@ fn dirs_data_dir() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = parse_args()?;
+    let flags = parse_args()?;
 
-    if let Some(parent) = args.db.parent() {
+    // precedence: CLI flags > environment > config file > defaults
+    let (mut appcfg, loaded) = Config::load(flags.config.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    appcfg.apply_env();
+    if let Some(v) = flags.url {
+        appcfg.provider.base_url = v;
+    }
+    if let Some(v) = flags.model {
+        appcfg.provider.model = v;
+    }
+    if let Some(v) = flags.mode {
+        appcfg.mode = Some(v);
+    }
+    if let Some(v) = flags.kind {
+        appcfg.provider.kind = v;
+    }
+    if let Some(v) = flags.context {
+        appcfg.context.target_tokens = v;
+    }
+    if let Some(p) = &loaded {
+        eprintln!("config: {}", p.display());
+    }
+
+    // A CLI user expects the workspace to be the directory they launched from;
+    // the desktop app deliberately does *not* do this, because a WM-launched GUI
+    // inherits an arbitrary CWD.
+    let workspace = flags
+        .workspace
+        .clone()
+        .or_else(|| appcfg.workspace.as_ref().map(PathBuf::from))
+        .unwrap_or(std::env::current_dir()?);
+
+    if let Some(parent) = flags.db.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let store = Arc::new(Store::open(&args.db)?);
+    let store = Arc::new(Store::open(&flags.db)?);
 
-    let provider: Box<dyn cowry_engine::provider::Provider> = if args.anthropic {
-        Box::new(cowry_engine::provider::anthropic::AnthropicProvider::new("anthropic", &args.url)?)
+    let provider: Box<dyn cowry_engine::provider::Provider> = appcfg.build_provider()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let model = if appcfg.provider.model.is_empty() {
+        "local".to_string()
     } else {
-        Box::new(OpenAiProvider::new("openai-compatible", args.flavor, &args.url)?)
+        appcfg.provider.model.clone()
     };
 
-    let mut cfg = HostConfig::new(args.model.clone(), args.workspace.clone());
-    cfg.mode = args.mode;
-    cfg.context_budget = args.context;
-    cfg.env_block = default_env_block(&args.workspace, "linux");
+    let mut cfg = HostConfig::new(model, workspace.clone());
+    cfg.mode = appcfg.mode();
+    cfg.context_budget = appcfg.context.target_tokens;
+    cfg.env_block = default_env_block(&workspace, "linux");
+    cfg.approval_timeout =
+        std::time::Duration::from_secs(appcfg.approval_timeout_secs.unwrap_or(300));
 
-    let mut host = SessionHost::spawn(provider, Registry::with_v1_tools(), store, cfg);
+    let mode = cfg.mode;
+    let model = cfg.model.clone();
+
+    let mut host = SessionHost::spawn(
+        provider,
+        Registry::with_v1_tools_search(appcfg.search_backend()),
+        store,
+        cfg,
+    );
 
     // Terminal setup is wrapped so a panic still leaves the shell usable.
     let terminal = ratatui::init();
@@ -298,14 +353,19 @@ async fn main() -> Result<()> {
             );
         }
     }
-    let result = run(terminal, &mut host, &args).await;
+    let result = run(terminal, &mut host, model, mode).await;
     ratatui::restore();
     result
 }
 
-async fn run(mut terminal: DefaultTerminal, host: &mut SessionHost, args: &Args) -> Result<()> {
-    let mut app = App::new(args.model.clone());
-    app.mode = args.mode;
+async fn run(
+    mut terminal: DefaultTerminal,
+    host: &mut SessionHost,
+    model: String,
+    mode: ApprovalMode,
+) -> Result<()> {
+    let mut app = App::new(model);
+    app.mode = mode;
 
     // The receivers move out of the host once: recv() needs &mut, and two
     // consumers would silently split one event stream.

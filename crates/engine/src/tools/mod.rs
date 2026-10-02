@@ -115,12 +115,19 @@ impl Registry {
     /// the llama.cpp prefix cache for every turn in every session. If a tool is
     /// added later, append it; never reorder.
     pub fn with_v1_tools() -> Self {
+        Self::with_v1_tools_search(web::SearchBackend::DuckDuckGo)
+    }
+
+    /// Same fixed order as `with_v1_tools`; only the search backend differs.
+    /// There is exactly one place that decides the order, because order changes
+    /// the prompt bytes and invalidates the prefix cache for every later turn.
+    pub fn with_v1_tools_search(search: web::SearchBackend) -> Self {
         let mut r = Self::new();
         r.register(Box::new(exec::ExecTool::default()));
         r.register(Box::new(files::ReadFileTool));
         r.register(Box::new(files::WriteFileTool));
         r.register(Box::new(web::WebFetchTool::default()));
-        r.register(Box::new(web::WebSearchTool::default()));
+        r.register(Box::new(web::WebSearchTool::from_backend(search)));
         r
     }
 

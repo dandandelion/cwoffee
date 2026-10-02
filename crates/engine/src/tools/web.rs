@@ -447,6 +447,20 @@ impl Default for WebSearchTool {
     }
 }
 
+impl WebSearchTool {
+    pub fn from_backend(backend: SearchBackend) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .user_agent(UA)
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .expect("reqwest client"),
+            backend,
+            max_results: 8,
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
