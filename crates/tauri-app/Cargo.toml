@@ -23,6 +23,10 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Opening links in the real browser. Deliberately the official plugin rather than
+# an xdg-open command of our own: it validates the URL against a declared scope
+# instead of handing a caller's string to a shell.
+tauri-plugin-opener = "2"
 serde.workspace = true
 serde_json.workspace = true
 cowry-engine.workspace = true

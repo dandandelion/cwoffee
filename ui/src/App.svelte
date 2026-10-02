@@ -11,7 +11,7 @@
     Session,
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
-  import { Transcript } from './lib/transcript'
+  import { Transcript, linkProbe } from './lib/transcript'
   import { pageLog } from './lib/pagelog'
 
   // ---- state --------------------------------------------------------------
@@ -702,6 +702,16 @@
             if (document.querySelector('.pop')) fail('row menu did not close on outside click')
           }
         }
+      }
+
+      // Links: navigation inside the webview is always prevented, and the URL is
+      // handed to the opener plugin. file:// must be refused by the plugin's
+      // scope - if it reports "opened", the scope is too wide and that is a bug.
+      {
+        const st = await linkProbe('file:///etc/passwd')
+        if (st === 'inert: no opener') fail('opener plugin not reachable in the desktop app')
+        else if (st === 'opened') fail('opener scope accepted a file:// URL')
+        else if (!st.startsWith('failed')) fail(`unexpected link probe: ${st}`)
       }
 
       // The approval round-trip, end to end. Every previous "approval verified"

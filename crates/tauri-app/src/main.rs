@@ -222,6 +222,10 @@ fn main() {
 
     let rendered_flag = state.rendered.clone();
     let app = tauri::Builder::default()
+        // Rendered markdown contains links to pages the model fetched. Those must
+        // open in the user's browser, never in this webview (which would replace
+        // the app), and never through a shell string we built ourselves.
+        .plugin(tauri_plugin_opener::init())
         .manage(state)
         // A webview that never paints leaves no trace: the engine logs look
         // healthy, WebKit processes are up, memory is fine. The only outward

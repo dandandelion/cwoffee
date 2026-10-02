@@ -1,3 +1,38 @@
+import { pageLog } from './pagelog'
+
+// Resolved once: the plugin module does not exist in a plain browser build, and a
+// static import would make the preview crash at load rather than at click.
+let opener: ((url: string) => Promise<void>) | null | undefined
+
+// Exported so the self-test can assert the opener is present AND that its scope
+// refuses non-http schemes. Probing with file:// proves both without launching a
+// browser on the user's machine.
+export async function linkProbe(href: string): Promise<string> {
+  if (!href) return 'empty'
+  if (opener === undefined) {
+    try {
+      const mod = await import('@tauri-apps/plugin-opener')
+      opener = (u: string) => mod.openUrl(u)
+      pageLog('opener plugin available')
+    } catch {
+      opener = null
+      pageLog('opener plugin unavailable: links stay inert')
+    }
+  }
+  if (!opener) return 'inert: no opener'
+  try {
+    await opener(href)
+    return 'opened'
+  } catch (err) {
+    // A refused scope or a missing desktop handler must be visible, not silent.
+    return `failed: ${err}`
+  }
+}
+
+async function openExternal(href: string) {
+  const st = await linkProbe(href)
+  pageLog(`link ${st}: ${href}`)
+}
 /**
  * The transcript is rendered imperatively, not by the framework.
  *
@@ -14,7 +49,6 @@
 
 import type { EngineEvent, ExecStream, StoredMessage } from './events'
 import { renderMarkdown, LiveMarkdown } from './markdown'
-import { pageLog } from './pagelog'
 
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
 
@@ -51,14 +85,16 @@ export class Transcript {
   constructor(root: HTMLElement) {
     this.root = root
     // A link that navigates replaces the whole app with a web page, which is
-    // worse than a dead link. Opening in the external browser needs Tauri's
-    // opener plugin (not wired yet); until then links are inert.
+    // worse than a dead link, so default navigation is always prevented. The URL
+    // then goes to Tauri's opener plugin, which checks it against the declared
+    // scope. Outside Tauri (the vite preview) there is no opener, so the link
+    // stays inert rather than hijacking the window.
     root.addEventListener('click', (e) => {
       const a = (e.target as HTMLElement | null)?.closest?.('a')
-      if (a) {
-        e.preventDefault()
-        pageLog(`link suppressed: ${a.getAttribute('href')}`)
-      }
+      if (!a) return
+      e.preventDefault()
+      const href = a.getAttribute('href') ?? ''
+      void openExternal(href)
     })
   }
 
