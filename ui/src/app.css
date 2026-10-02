@@ -24,6 +24,9 @@
 
   /* accents */
   --color-shell: #c9a87c;
+  /* Referenced by .sessrow.active and .pop-item.on but never declared, so those
+     rules resolved to nothing and the active session had no highlight at all. */
+  --color-tint: color-mix(in srgb, var(--color-shell) 22%, var(--color-paper));
   --color-shell-deep: #a8875c;
   --color-sea: #a9cdec;
   --color-go: #2f2e2b;
@@ -300,9 +303,11 @@ body {
 
 /* popover */
 .pop {
-  position: absolute;
-  top: calc(100% + 6px);
-  z-index: 40;
+  /* Fixed, not absolute: an absolutely positioned popover inside .cbox or a
+     sidebar row is clipped by that ancestor's overflow, and the composer sits at
+     the bottom of the window so a downward popover was cut off entirely. */
+  position: fixed;
+  z-index: 60;
   min-width: 210px;
   max-height: 320px;
   overflow-y: auto;
@@ -335,6 +340,9 @@ body {
 .pop-item:hover { background: var(--color-paper-2); }
 .pop-item.on { background: var(--color-tint); }
 .pop-item.on::after { content: '\2713'; margin-left: auto; color: #3d6b3d; }
+.pop-item.danger { color: #8b3d3d; }
+.pop-item.danger:hover { background: #f6ecea; }
+.pop-sub.pad { padding: 4px 8px 2px; }
 .pop-sub { font-size: 11px; color: var(--color-ink-3); margin-top: 1px; }
 .pop-mono { font-family: var(--font-mono); font-size: 12px; }
 .pop-empty { padding: 6px 8px; font-size: 12px; color: var(--color-ink-3); }
@@ -500,7 +508,34 @@ body {
   font-weight: 500;
 }
 .sessrow:hover { background: var(--color-paper-2); }
-.sessrow.active { background: var(--color-tint); }
+.sessrow.active {
+  background: var(--color-tint);
+  box-shadow: inset 2px 0 0 var(--color-shell-deep);
+}
+.sessrow.active .sess-title { font-weight: 550; }
+
+/* Unread marker. The dot is always laid out and merely transparent, so titles do
+   not shift horizontally when one arrives. */
+.sess-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: transparent;
+}
+.sessrow.unread .sess-dot {
+  background: var(--color-shell-deep);
+  animation: cowry-pulse 1.7s ease-in-out infinite;
+}
+@keyframes cowry-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.75); }
+  50%      { opacity: 1;    transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sessrow.unread .sess-dot { animation: none; opacity: 1; transform: none; }
+}
+.iconbtn.more { opacity: 0; }
+.sessrow:hover .iconbtn.more, .sessrow.active .iconbtn.more, .sessrow.unread .iconbtn.more { opacity: 1; }
 .sessrow-acts { display: flex; gap: 2px; opacity: 0; }
 .sessrow:hover .sessrow-acts, .sessrow.active .sessrow-acts { opacity: 1; }
 .iconbtn {

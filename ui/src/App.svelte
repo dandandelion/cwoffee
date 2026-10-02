@@ -46,7 +46,15 @@
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
-  let pop = $state<'' | 'mode' | 'model' | 'think'>('')
+  type MenuKind = 'mode' | 'model' | 'think' | 'row'
+  // Anchored in viewport coordinates rather than to the opener, so no ancestor
+  // overflow can clip it. `place` records which side it was put on.
+  let menu = $state<{ kind: MenuKind; sessionId?: number; x: number; y: number } | null>(null)
+  let menuEl = $state<HTMLElement | null>(null)
+  // Genuinely unread: a session whose stored message count grew since it was last
+  // opened, and which is not the session currently on screen.
+  let unread = $state<Set<number>>(new Set())
+  let seenCounts: Record<number, number> = {}
   const MODES = ['ask', 'session', 'auto'] as const
   const THINKS = ['off', 'low', 'medium', 'high', 'xhigh'] as const
   const MODE_LABEL: Record<'ask' | 'session' | 'auto', string> = {
@@ -66,20 +74,110 @@
     high: 'High',
     xhigh: 'Extra high',
   }
+  function titleOf(id: number) {
+    return sessions.find((x) => x.id === id)?.title ?? 'session'
+  }
+
+  function openMenu(kind: MenuKind, anchor: HTMLElement, sessionId?: number) {
+    if (menu && menu.kind === kind && menu.sessionId === sessionId) {
+      menu = null
+      return
+    }
+    const r = anchor.getBoundingClientRect()
+    const W = 236
+    // Prefer opening upward when the anchor sits in the lower half of the window:
+    // the composer is always near the bottom, which is exactly where a downward
+    // popover got cut off.
+    const up = r.top > window.innerHeight / 2
+    let x = kind === 'mode' ? r.left : r.right - W
+    x = Math.max(8, Math.min(x, window.innerWidth - W - 8))
+    const y = up ? r.top - 260 : r.bottom + 6
+    menu = { kind, sessionId, x, y }
+    // Second pass with the real height, since the estimate above cannot know it.
+    queueMicrotask(() => clampMenu())
+  }
+
+  function clampMenu() {
+    if (!menu || !menuEl) return
+    const h = menuEl.offsetHeight
+    const w = menuEl.offsetWidth
+    let { x, y } = menu
+    x = Math.max(8, Math.min(x, window.innerWidth - w - 8))
+    y = Math.max(8, Math.min(y, window.innerHeight - h - 8))
+    if (x !== menu.x || y !== menu.y) menu = { ...menu, x, y }
+  }
+
+  function closeMenu() {
+    menu = null
+    confirmDeleteId = null
+  }
+
+  function renameFromMenu(id: number) {
+    const t = titleOf(id)
+    menu = null
+    confirmDeleteId = null
+    startRename(id, t)
+  }
+
+  async function removeFromMenu(id: number) {
+    menu = null
+    confirmDeleteId = null
+    await removeSession(id)
+  }
+
+  const SEEN_KEY = 'cowry.seenCounts.v1'
+  function loadSeen() {
+    try {
+      const raw = localStorage.getItem(SEEN_KEY)
+      if (raw) seenCounts = JSON.parse(raw)
+    } catch {
+      /* a corrupt entry is not worth failing the session list over */
+    }
+  }
+  function saveSeen() {
+    try {
+      localStorage.setItem(SEEN_KEY, JSON.stringify(seenCounts))
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  function applyUnread(list: Session[]) {
+    const active = hostState?.session_id ?? 0
+    const next = new Set<number>()
+    for (const s of list) {
+      const seen = seenCounts[s.id]
+      // First sight of a session is not unread; only growth since it was read is.
+      if (seen === undefined) continue
+      if (s.id !== active && s.message_count > seen) next.add(s.id)
+    }
+    unread = next
+  }
+
+  function recordSeen(list: Session[]) {
+    const active = hostState?.session_id ?? 0
+    const s = list.find((x) => x.id === active)
+    if (s) {
+      seenCounts[active] = s.message_count
+      saveSeen()
+      if (unread.delete(active)) unread = new Set(unread)
+    }
+  }
+
   function shortModel(m: string) {
     if (!m) return 'no model'
     return m.length > 22 ? m.slice(0, 21) + '\u2026' : m
   }
   async function pickMode(m: 'ask' | 'session' | 'auto') {
-    pop = ''
+    menu = null
     await setMode(m)
   }
   async function pickThinking(t: 'off' | 'low' | 'medium' | 'high' | 'xhigh') {
-    pop = ''
+    menu = null
     await setThinking(t)
   }
   async function pickModel(m: string) {
-    pop = ''
+    menu = null
     await setModel(m)
   }
   async function stopTurn() {
@@ -291,6 +389,11 @@
   async function loadSessions() {
     try {
       sessions = await invoke<Session[]>('list_sessions')
+      // Order matters: record what the open session looks like, then decide who
+      // is unread relative to that. Reversing it marks the session you are
+      // looking at as unread.
+      recordSeen(sessions)
+      applyUnread(sessions)
     } catch (e) {
       pageLog(`list_sessions failed: ${e}`)
     }
@@ -551,6 +654,33 @@
           fail(`transcript DOM unchanged after selecting session ${other.id}`)
       }
 
+      // The session row menu: opens, offers rename and delete, fits in the
+      // window, and closes on an outside click.
+      {
+        const more = document.querySelector('.sessrow .iconbtn.more') as HTMLElement | null
+        if (!more) fail('no session row action button rendered')
+        else {
+          more.click()
+          await new Promise((r) => setTimeout(r, 250))
+          const pop = document.querySelector('.pop')
+          if (!pop) fail('row menu did not open')
+          else {
+            const items = [...pop.querySelectorAll('.pop-item')].map((i) => i.textContent!.trim())
+            if (!items.includes('Rename')) fail(`row menu missing Rename: ${items.join(', ')}`)
+            if (!items.some((i) => i.startsWith('Delete')))
+              fail(`row menu missing Delete: ${items.join(', ')}`)
+            const r = pop.getBoundingClientRect()
+            if (r.top < 0 || r.bottom > window.innerHeight)
+              fail(`row menu clipped: top=${Math.round(r.top)} bottom=${Math.round(r.bottom)} win=${window.innerHeight}`)
+            document
+              .querySelector('.scroller')
+              ?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+            await new Promise((r) => setTimeout(r, 200))
+            if (document.querySelector('.pop')) fail('row menu did not close on outside click')
+          }
+        }
+      }
+
       // The approval round-trip, end to end. Every previous "approval verified"
       // check only proved the request arrived; none proved the answer landed. It
       // did not: the pump and the command used two different maps, so every gated
@@ -606,6 +736,10 @@
   // y / a / n answer an approval without hunting for the mouse. Ignored while a
   // text field has focus, so typing "no" into the composer cannot deny a tool call.
   function onApprovalKey(e: KeyboardEvent) {
+    if (e.key === 'Escape' && menu) {
+      closeMenu()
+      return
+    }
     if (!approval) return
     const t = e.target as HTMLElement | null
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
@@ -727,19 +861,25 @@
 
   // Window-level: the root div has no tabindex, so a keydown bound there would
   // simply never fire.
-  function onDocDown(e: MouseEvent) {
-    if (!pop) return
+  function onDocDown(e: Event) {
+    if (!menu) return
     const t = e.target as HTMLElement | null
-    if (t && t.closest('.cbox')) return
-    pop = ''
+    // Clicks inside the menu belong to the menu; clicks on an opener belong to
+    // that button's own toggle, which would otherwise close and immediately
+    // reopen it.
+    if (t && (t.closest('.pop') || t.closest('[data-menu]'))) return
+    closeMenu()
   }
 
   onMount(() => {
+    loadSeen()
     window.addEventListener('keydown', onApprovalKey)
-    window.addEventListener('mousedown', onDocDown)
+    window.addEventListener('pointerdown', onDocDown)
+    window.addEventListener('resize', clampMenu)
     return () => {
       window.removeEventListener('keydown', onApprovalKey)
-      window.removeEventListener('mousedown', onDocDown)
+      window.removeEventListener('pointerdown', onDocDown)
+      window.removeEventListener('resize', clampMenu)
     }
   })
 
@@ -819,7 +959,9 @@
       {:else}
         <div class="mt-2 px-1 text-[11px] uppercase tracking-wide text-ink-3">Sessions</div>
         {#each sessions as s}
-          <div class="sessrow {hostState?.session_id === s.id ? 'active' : ''}">
+          <div
+            class="sessrow {hostState?.session_id === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''}"
+          >
             {#if editingId === s.id}
               <input
                 class="pill px-2 py-1 text-[12.5px] w-full"
@@ -831,22 +973,22 @@
                 onblur={() => commitRename()}
               />
             {:else}
-              <!-- One line per session. Two lines per row roughly halved how
-                   many sessions fit, and the count rarely needs reading. -->
+              <!-- One line per session, no message count: the row is a target,
+                   not a report. Rename/delete live in a menu so the row stays
+                   quiet, and the dot is always laid out (invisible until unread)
+                   so titles do not shift when one arrives. -->
               <button class="sessbtn" onclick={() => openSession(s.id)}>
+                <span class="sess-dot" aria-hidden="true"></span>
                 <span class="sess-title">{s.title}</span>
-                <span class="sess-n" title="{s.message_count} messages">{s.message_count}</span>
               </button>
-              <span class="sessrow-acts">
-                <button class="iconbtn" title="Rename" onclick={() => startRename(s.id, s.title)}>✎</button>
-                {#if confirmDeleteId === s.id}
-                  <button class="iconbtn wide text-[#8b3d3d]" title="Confirm delete" onclick={() => removeSession(s.id)}>
-                    sure?
-                  </button>
-                {:else}
-                  <button class="iconbtn" title="Delete" onclick={() => removeSession(s.id)}>✕</button>
-                {/if}
-              </span>
+              <button
+                class="iconbtn more"
+                data-menu
+                aria-label="More actions"
+                onclick={(e) => openMenu('row', e.currentTarget as HTMLElement, s.id)}
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="2.6" cy="6" r="1.05" fill="currentColor"/><circle cx="6" cy="6" r="1.05" fill="currentColor"/><circle cx="9.4" cy="6" r="1.05" fill="currentColor"/></svg>
+              </button>
             {/if}
           </div>
         {/each}
@@ -911,19 +1053,19 @@
                 <svg width="14" height="14" viewBox="0 0 14 14"><path d="M9.2 4.3 5 8.5a1.9 1.9 0 0 0 2.7 2.7l4.2-4.2a3.4 3.4 0 0 0-4.8-4.8L2.8 6.5a4.9 4.9 0 0 0 6.9 6.9" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
               </button>
 
-              <button class="cbtn chip" onclick={() => (pop = pop === 'mode' ? '' : 'mode')} aria-expanded={pop === 'mode'}>
+              <button class="cbtn chip" data-menu onclick={(e) => openMenu('mode', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'mode'}>
                 <svg width="13" height="13" viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.2" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M5.4 7h3.2M7 5.4v3.2" stroke="currentColor" stroke-width="1.1"/></svg>
                 <span>{MODE_LABEL[mode]}</span>
                 <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
               </button>
 
               <div class="ml-auto flex items-center gap-1">
-                <button class="cbtn chip" onclick={() => (pop = pop === 'model' ? '' : 'model')} aria-expanded={pop === 'model'}>
+                <button class="cbtn chip" data-menu onclick={(e) => openMenu('model', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'model'}>
                   <svg width="13" height="13" viewBox="0 0 14 14"><path d="M7.8 1.6 3.4 7.6h2.6l-.8 4.8 4.4-6H7z" fill="currentColor"/></svg>
                   <span class="chip-label">{shortModel(model)}</span>
                   <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
                 </button>
-                <button class="cbtn chip" onclick={() => (pop = pop === 'think' ? '' : 'think')} aria-expanded={pop === 'think'}>
+                <button class="cbtn chip" data-menu onclick={(e) => openMenu('think', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'think'}>
                   <span>{THINK_LABEL[thinking]}</span>
                   <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
                 </button>
@@ -950,38 +1092,6 @@
               </div>
             </div>
 
-            {#if pop}
-              <div class="pop {pop === 'mode' ? 'pop-left' : 'pop-right'}" role="menu">
-                {#if pop === 'mode'}
-                  <div class="pop-title">Approvals</div>
-                  {#each MODES as m}
-                    <button class="pop-item {mode === m ? 'on' : ''}" onclick={() => pickMode(m)} role="menuitemradio" aria-checked={mode === m}>
-                      <span>{MODE_LABEL[m]}</span>
-                      <span class="pop-sub">{MODE_HINT[m]}</span>
-                    </button>
-                  {/each}
-                {:else if pop === 'think'}
-                  <div class="pop-title">Thinking effort</div>
-                  {#each THINKS as t}
-                    <button class="pop-item {thinking === t ? 'on' : ''}" onclick={() => pickThinking(t)} role="menuitemradio" aria-checked={thinking === t}>
-                      <span>{THINK_LABEL[t]}</span>
-                    </button>
-                  {/each}
-                {:else}
-                  <div class="pop-title">Model</div>
-                  {#if models.length}
-                    {#each models as m}
-                      <button class="pop-item {model === m ? 'on' : ''}" onclick={() => pickModel(m)} role="menuitemradio" aria-checked={model === m}>
-                        <span class="pop-mono">{m}</span>
-                      </button>
-                    {/each}
-                  {:else}
-                    <!-- endpoint exposes no /models: show the id, do not fake a picker -->
-                    <div class="pop-empty">This endpoint does not list models.<br />Using <span class="pop-mono">{model || '\u2014'}</span></div>
-                  {/if}
-                {/if}
-              </div>
-            {/if}
           </div>
 
           <button class="wsrow" disabled title="Workspace picking is not implemented yet">
@@ -992,6 +1102,54 @@
       </div>
     </main>
   </div>
+
+  <!-- One menu for everything, positioned fixed. A popover inside .cbox or a
+       sidebar row is clipped by that ancestor's overflow and by the window edge.
+       Fixed positioning escapes the ancestors, and the coordinates are clamped
+       to the viewport. A webview still cannot paint outside its own window, so
+       placement is chosen to fit rather than allowed to overflow. -->
+  {#if menu}
+    <div class="pop" style="left:{menu.x}px; top:{menu.y}px" role="menu" bind:this={menuEl}>
+      {#if menu.kind === 'mode'}
+        <div class="pop-title">Approvals</div>
+        {#each MODES as m}
+          <button class="pop-item {mode === m ? 'on' : ''}" onclick={() => pickMode(m)} role="menuitemradio" aria-checked={mode === m}>
+            <span>{MODE_LABEL[m]}</span>
+            <span class="pop-sub">{MODE_HINT[m]}</span>
+          </button>
+        {/each}
+      {:else if menu.kind === 'think'}
+        <div class="pop-title">Thinking effort</div>
+        {#each THINKS as t}
+          <button class="pop-item {thinking === t ? 'on' : ''}" onclick={() => pickThinking(t)} role="menuitemradio" aria-checked={thinking === t}>
+            <span>{THINK_LABEL[t]}</span>
+          </button>
+        {/each}
+      {:else if menu.kind === 'model'}
+        <div class="pop-title">Model</div>
+        {#if models.length}
+          {#each models as m}
+            <button class="pop-item {model === m ? 'on' : ''}" onclick={() => pickModel(m)} role="menuitemradio" aria-checked={model === m}>
+              <span class="pop-mono">{m}</span>
+            </button>
+          {/each}
+        {:else}
+          <div class="pop-empty">This endpoint does not list models.<br />Using <span class="pop-mono">{model || '\u2014'}</span></div>
+        {/if}
+      {:else}
+        {@const sid = menu.sessionId ?? -1}
+        <div class="pop-title">{titleOf(sid)}</div>
+        <button class="pop-item" onclick={() => renameFromMenu(sid)} role="menuitem">Rename</button>
+        {#if confirmDeleteId === sid}
+          <div class="pop-sub pad">Delete this session? Its messages go with it.</div>
+          <button class="pop-item danger" onclick={() => removeFromMenu(sid)} role="menuitem">Delete</button>
+          <button class="pop-item" onclick={() => (confirmDeleteId = null)} role="menuitem">Cancel</button>
+        {:else}
+          <button class="pop-item danger" onclick={() => (confirmDeleteId = sid)} role="menuitem">Delete</button>
+        {/if}
+      {/if}
+    </div>
+  {/if}
 
   <!-- ========================== telemetry bar ========================= -->
   <footer class="telem flex h-9 shrink-0 items-center gap-4 border-t border-hairline bg-paper-2 px-4 text-[11.5px] text-ink-2">

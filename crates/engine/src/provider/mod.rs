@@ -139,7 +139,37 @@ pub enum Reasoning {
     /// The top setting. Named rather than implied by "High" because the UI shows
     /// it as a distinct choice; providers that have no equivalent clamp to their
     /// highest real level rather than inventing a value the API would reject.
+    ///
+    /// Renamed explicitly: camelCase would emit "xHigh", which the front end and
+    /// the config file both spell "xhigh". A missed lookup there renders an empty
+    /// label rather than failing, which is how this one hid.
+    #[serde(rename = "xhigh")]
     XHigh,
+}
+
+#[cfg(test)]
+mod reasoning_wire_tests {
+    use super::*;
+
+    /// The front end indexes a label table with these exact strings, and the
+    /// config parser accepts them. A serde rename on either side renders an empty
+    /// chip label instead of erroring, so assert the literal set.
+    #[test]
+    fn reasoning_wire_names_match_the_front_end() {
+        let cases = [
+            (Reasoning::Off, "off"),
+            (Reasoning::Low, "low"),
+            (Reasoning::Medium, "medium"),
+            (Reasoning::High, "high"),
+            (Reasoning::XHigh, "xhigh"),
+        ];
+        for (r, want) in cases {
+            let v = serde_json::to_value(r).unwrap();
+            assert_eq!(v.as_str().unwrap(), want, "wrong wire name for {r:?}");
+            let back: Reasoning = serde_json::from_value(v).unwrap();
+            assert_eq!(back, r);
+        }
+    }
 }
 
 impl Reasoning {
