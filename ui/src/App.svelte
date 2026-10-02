@@ -49,7 +49,16 @@
   type MenuKind = 'mode' | 'model' | 'think' | 'row'
   // Anchored in viewport coordinates rather than to the opener, so no ancestor
   // overflow can clip it. `place` records which side it was put on.
-  let menu = $state<{ kind: MenuKind; sessionId?: number; x: number; y: number } | null>(null)
+  type Menu = {
+    kind: MenuKind
+    sessionId?: number
+    left: number
+    right: number
+    top: number
+    bottom: number
+  }
+  let menu = $state<Menu | null>(null)
+  let menuPos = $state<{ x: number; y: number } | null>(null)
   let menuEl = $state<HTMLElement | null>(null)
   // Genuinely unread: a session whose stored message count grew since it was last
   // opened, and which is not the session currently on screen.
@@ -84,32 +93,46 @@
       return
     }
     const r = anchor.getBoundingClientRect()
-    const W = 236
-    // Prefer opening upward when the anchor sits in the lower half of the window:
-    // the composer is always near the bottom, which is exactly where a downward
-    // popover got cut off.
-    const up = r.top > window.innerHeight / 2
-    let x = kind === 'mode' ? r.left : r.right - W
-    x = Math.max(8, Math.min(x, window.innerWidth - W - 8))
-    const y = up ? r.top - 260 : r.bottom + 6
-    menu = { kind, sessionId, x, y }
-    // Second pass with the real height, since the estimate above cannot know it.
-    queueMicrotask(() => clampMenu())
+    menu = {
+      kind,
+      sessionId,
+      left: r.left,
+      right: r.right,
+      top: r.top,
+      bottom: r.bottom,
+    }
   }
 
-  function clampMenu() {
-    if (!menu || !menuEl) return
-    const h = menuEl.offsetHeight
-    const w = menuEl.offsetWidth
-    let { x, y } = menu
-    x = Math.max(8, Math.min(x, window.innerWidth - w - 8))
-    y = Math.max(8, Math.min(y, window.innerHeight - h - 8))
-    if (x !== menu.x || y !== menu.y) menu = { ...menu, x, y }
-  }
+  // The menu is rendered invisible first, measured, then placed. Guessing the
+  // height is what left it floating 260px above the composer with a visible gap.
+  // Prefer below the opener; flip above only when it genuinely does not fit.
+  $effect(() => {
+    const m = menu
+    const el = menuEl
+    if (!m || !el) return
+    const w = el.offsetWidth
+    const h = el.offsetHeight
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    let x = m.kind === 'mode' ? m.left : m.right - w
+    x = Math.max(8, Math.min(x, vw - w - 8))
+    let y = m.bottom + 6
+    if (y + h + 8 > vh) {
+      const above = m.top - h - 6
+      y = above >= 8 ? above : Math.max(8, vh - h - 8)
+    }
+    menuPos = { x, y }
+  })
 
   function closeMenu() {
     menu = null
+    menuPos = null
     confirmDeleteId = null
+  }
+
+  // Re-run the placement effect (it reads `menu`) without changing anything else.
+  function reposition() {
+    if (menu) menu = { ...menu }
   }
 
   function renameFromMenu(id: number) {
@@ -875,11 +898,11 @@
     loadSeen()
     window.addEventListener('keydown', onApprovalKey)
     window.addEventListener('pointerdown', onDocDown)
-    window.addEventListener('resize', clampMenu)
+    window.addEventListener('resize', reposition)
     return () => {
       window.removeEventListener('keydown', onApprovalKey)
       window.removeEventListener('pointerdown', onDocDown)
-      window.removeEventListener('resize', clampMenu)
+      window.removeEventListener('resize', reposition)
     }
   })
 
@@ -1109,12 +1132,17 @@
        to the viewport. A webview still cannot paint outside its own window, so
        placement is chosen to fit rather than allowed to overflow. -->
   {#if menu}
-    <div class="pop" style="left:{menu.x}px; top:{menu.y}px" role="menu" bind:this={menuEl}>
+    <div
+      class="pop {menuPos ? '' : 'measuring'}"
+      style={menuPos ? `left:${menuPos.x}px; top:${menuPos.y}px` : 'left:0px; top:0px'}
+      role="menu"
+      bind:this={menuEl}
+    >
       {#if menu.kind === 'mode'}
         <div class="pop-title">Approvals</div>
         {#each MODES as m}
           <button class="pop-item {mode === m ? 'on' : ''}" onclick={() => pickMode(m)} role="menuitemradio" aria-checked={mode === m}>
-            <span>{MODE_LABEL[m]}</span>
+            <span class="pop-lbl">{MODE_LABEL[m]}</span>
             <span class="pop-sub">{MODE_HINT[m]}</span>
           </button>
         {/each}
@@ -1122,7 +1150,7 @@
         <div class="pop-title">Thinking effort</div>
         {#each THINKS as t}
           <button class="pop-item {thinking === t ? 'on' : ''}" onclick={() => pickThinking(t)} role="menuitemradio" aria-checked={thinking === t}>
-            <span>{THINK_LABEL[t]}</span>
+            <span class="pop-lbl">{THINK_LABEL[t]}</span>
           </button>
         {/each}
       {:else if menu.kind === 'model'}
@@ -1130,7 +1158,7 @@
         {#if models.length}
           {#each models as m}
             <button class="pop-item {model === m ? 'on' : ''}" onclick={() => pickModel(m)} role="menuitemradio" aria-checked={model === m}>
-              <span class="pop-mono">{m}</span>
+              <span class="pop-lbl pop-mono">{m}</span>
             </button>
           {/each}
         {:else}

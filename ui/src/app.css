@@ -326,25 +326,48 @@ body {
   color: var(--color-ink-3);
   padding: 4px 8px 6px;
 }
+/* Grid, not a column flex: with flex-direction: column the trailing check mark
+   became its own row, so every item read as two or three stacked lines.
+   Label and check share row 1; the hint sits under the label only when there is
+   one, and the check stays vertically centred across both rows. */
 .pop-item {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: 12px;
+  row-gap: 1px;
   width: 100%;
   text-align: left;
-  padding: 6px 8px;
-  border-radius: 9px;
+  padding: 5px 8px;
+  border-radius: 7px;
   font-size: 13px;
   color: var(--color-ink);
 }
+.pop-lbl { grid-column: 1; grid-row: 1; }
+.pop-item.on .pop-lbl { font-weight: 550; }
 .pop-item:hover { background: var(--color-paper-2); }
 .pop-item.on { background: var(--color-tint); }
-.pop-item.on::after { content: '\2713'; margin-left: auto; color: #3d6b3d; }
+.pop-item.on::after {
+  content: '\2713';
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  color: #3d6b3d;
+}
 .pop-item.danger { color: #8b3d3d; }
 .pop-item.danger:hover { background: #f6ecea; }
 .pop-sub.pad { padding: 4px 8px 2px; }
-.pop-sub { font-size: 11px; color: var(--color-ink-3); margin-top: 1px; }
-.pop-mono { font-family: var(--font-mono); font-size: 12px; }
+.pop-sub {
+  grid-column: 1;
+  grid-row: 2;
+  font-size: 11px;
+  color: var(--color-ink-3);
+  margin-top: 1px;
+}
+.pop-mono { font-family: var(--font-mono); font-size: 12px; word-break: break-all; }
+/* Rendered but not shown until the placement effect has measured it, so the menu
+   never flashes at a guessed coordinate. */
+.pop.measuring { visibility: hidden; }
 .pop-empty { padding: 6px 8px; font-size: 12px; color: var(--color-ink-3); }
 
 /* workspace row under the card */
