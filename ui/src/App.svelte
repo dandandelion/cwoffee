@@ -391,7 +391,38 @@
   let pending = $state<Pending[]>([])
   let fileInput = $state<HTMLInputElement | null>(null)
   let composerEl = $state<HTMLTextAreaElement | null>(null)
+  let theme = $state<'light' | 'dark'>('light')
   let attachErr = $state('')
+
+  const THEME_KEY = 'cowry.theme.v1'
+
+  // Explicit choice wins; otherwise follow the OS. Applied to the document
+  // element rather than a class on a component, because the palette lives on
+  // :root and every utility reads it from there.
+  function applyTheme(t: 'light' | 'dark') {
+    theme = t
+    document.documentElement.dataset.theme = t
+    try {
+      localStorage.setItem(THEME_KEY, t)
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  function initTheme() {
+    let saved: string | null = null
+    try {
+      saved = localStorage.getItem(THEME_KEY)
+    } catch {
+      /* non-fatal */
+    }
+    const t = saved === 'light' || saved === 'dark'
+      ? saved
+      : matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light'
+    applyTheme(t)
+  }
 
   function fmtBytes(n: number) {
     if (n < 1024) return `${n} B`
@@ -1092,6 +1123,7 @@
   }
 
   onMount(() => {
+    initTheme()
     loadSeen()
     window.addEventListener('keydown', onApprovalKey)
     window.addEventListener('keydown', onGlobalKey)
@@ -1163,7 +1195,7 @@
         bind:value={query}
         onkeydown={(e) => e.key === 'Enter' && runSearch()}
       />
-      {#if searchErr}<div class="text-[11px] text-[#8b3d3d]">{searchErr}</div>{/if}
+      {#if searchErr}<div class="text-[11px] text-danger">{searchErr}</div>{/if}
 
       <!-- The list scrolls inside the sidebar. Without min-h-0 a flex item's
            min-height defaults to `auto`, i.e. its content height, so N sessions
@@ -1235,7 +1267,7 @@
       {#if approval}
         <div class="approval mx-auto w-full max-w-[780px] px-6">
           <div class="card approval-card">
-            <div class="text-[12px] font-semibold uppercase tracking-wide text-[#8a6d1f]">
+            <div class="text-[12px] font-semibold uppercase tracking-wide text-warn">
               Approve · {approval.tool} ({approval.risk})
             </div>
             <div class="mt-1 font-mono text-[13px]">{approval.summary}</div>
@@ -1428,14 +1460,14 @@
       <span>ctx <b class="text-ink">{hostState.context_tokens}</b></span>
     {/if}
     {#if hostState?.compactions}
-      <span class="text-[#7a4fa0]" title="history was dropped; the next prefill will be slow">
+      <span class="text-note" title="history was dropped; the next prefill will be slow">
         compacted {hostState.compactions}
       </span>
     {/if}
 
     <span class="ml-auto flex items-center gap-3">
       <span
-        class="rounded-full px-2 py-0.5 {ipc.ok ? 'bg-[#eef0e8] text-ink-3' : 'bg-[#f6e6e6] text-[#8b3d3d]'}"
+        class="rounded-full px-2 py-0.5 {ipc.ok ? 'bg-paper-2 text-ink-3' : 'bg-danger-bg text-danger'}"
         title="Tauri IPC round-trip: {ipc.msg}"
       >
         ipc {ipc.ok ? '✓' : '✗'}
@@ -1445,11 +1477,19 @@
         <span class="text-ink-3">/ {frames} f · worst {worstFrame.toFixed(0)}ms</span>
       </span>
       <span
-        class="rounded-full px-2 py-0.5 {gpuOk ? 'bg-[#e6f0e6] text-[#3d6b3d]' : 'bg-[#f6e6e6] text-[#8b3d3d]'}"
+        class="rounded-full px-2 py-0.5 {gpuOk ? 'bg-ok-bg text-ok' : 'bg-danger-bg text-danger'}"
         title={gpu ? `EGL: ${gpu.egl_vendor}\nnodes: ${gpu.render_nodes.join(', ')}` : 'gpu_report unavailable'}
       >
         {gpuOk ? 'iGPU renderD128' : gpu ? `GPU LEAK: ${gpu.render_nodes.join(',')}` : 'gpu ?'}
       </span>
+      <button
+        class="keyhelp"
+        title="Toggle light / dark"
+        aria-label="Toggle light or dark theme"
+        onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}
+      >
+        {theme === 'dark' ? '\u2600' : '\u263e'}
+      </button>
       <button
         class="keyhelp"
         data-menu

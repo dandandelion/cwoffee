@@ -31,11 +31,59 @@
   --color-sea: #a9cdec;
   --color-go: #2f2e2b;
 
+  /* Semantic colours. These were hardcoded in a dozen rules, which is how a
+     dark theme becomes a game of whack-a-mole against literal hexes. */
+  --color-ok: #3d6b3d;
+  --color-ok-bg: #e6f0e6;
+  --color-danger: #8b3d3d;
+  --color-danger-bg: #f6e6e6;
+  --color-danger-hairline: #e3c9c9;
+  --color-warn: #8a6d1f;
+  --color-warn-bg: #fdf9ef;
+  --color-warn-hairline: #e6d9b8;
+  --color-note: #7a4fa0;
+
   --radius-card: 14px;
   --radius-pill: 999px;
 
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* Dark theme. Overrides the same custom properties Tailwind's @theme emits at
+   :root, so every `bg-paper` / `text-ink` utility follows automatically. Kept
+   warm rather than neutral-black to stay in the same design family as the mock.
+   Semantic tokens shift hue, not just lightness: var(--color-ok) on a dark surface is
+   barely legible. */
+[data-theme='dark'] {
+  --color-paper: #1e1d1b;
+  --color-paper-2: #26241f;
+  --color-hairline: #35332d;
+  --color-hairline-2: #4a473f;
+
+  --color-wash-1: #232118;
+  --color-wash-2: #24271e;
+  --color-wash-3: #22271f;
+
+  --color-ink: #e9e6de;
+  --color-ink-2: #b4b0a6;
+  --color-ink-3: #8b877e;
+
+  --color-shell: #c2a179;
+  --color-shell-deep: #dcbf95;
+  --color-sea: #5d84a6;
+  --color-go: #e9e6de;
+  --color-tint: color-mix(in srgb, var(--color-shell) 26%, var(--color-paper));
+
+  --color-ok: #86bd8b;
+  --color-ok-bg: #24301f;
+  --color-danger: #e0918c;
+  --color-danger-bg: #33201e;
+  --color-danger-hairline: #5c3632;
+  --color-warn: #d9b45e;
+  --color-warn-bg: #2e2718;
+  --color-warn-hairline: #5b4a24;
+  --color-note: #b79ad8;
 }
 
 html,
@@ -195,8 +243,8 @@ body {
   border-left: 2px solid var(--color-hairline-2);
   padding-left: 10px;
 }
-.blk-warn .blk-body { color: #8a6d1f; }
-.blk-fail .blk-body { color: #8b3d3d; }
+.blk-warn .blk-body { color: var(--color-warn); }
+.blk-fail .blk-body { color: var(--color-danger); }
 
 /* tool card */
 /* Not a 62px/1fr grid. The head is display:none, so it is not a grid item, and
@@ -225,8 +273,8 @@ body {
   font-size: 11.5px;
   color: var(--color-ink-3);
 }
-.tool-status.ok { color: #3d6b3d; }
-.tool-status.bad { color: #8b3d3d; }
+.tool-status.ok { color: var(--color-ok); }
+.tool-status.bad { color: var(--color-danger); }
 .tool-args {
   margin-top: 6px;
   font-family: var(--font-mono);
@@ -245,7 +293,7 @@ body {
   max-height: 260px;
   overflow-y: auto;
 }
-.tool-bad { border-color: #e3c9c9; }
+.tool-bad { border-color: var(--color-danger-hairline); }
 
 /* ---------------------------------------------------------------------------
    Composer + buttons
@@ -299,7 +347,7 @@ body {
 }
 .cbtn.go:hover:not(:disabled) { background: var(--color-ink); opacity: 0.85; }
 .cbtn.go:disabled { opacity: 0.3; }
-.cbtn.go.warn { background: #8a6d1f; }
+.cbtn.go.warn { background: var(--color-warn); }
 
 /* popover */
 .pop {
@@ -352,10 +400,10 @@ body {
   grid-column: 2;
   grid-row: 1 / span 2;
   align-self: center;
-  color: #3d6b3d;
+  color: var(--color-ok);
 }
-.pop-item.danger { color: #8b3d3d; }
-.pop-item.danger:hover { background: #f6ecea; }
+.pop-item.danger { color: var(--color-danger); }
+.pop-item.danger:hover { background: var(--color-danger-bg); }
 .pop-sub.pad { padding: 4px 8px 2px; }
 .pop-sub {
   grid-column: 1;
@@ -414,7 +462,7 @@ body {
 .btn-go:disabled { opacity: 0.4; }
 .btn-ghost { background: var(--color-paper); border-color: var(--color-hairline); color: var(--color-ink-2); }
 .btn-ghost:hover { background: var(--color-paper-2); color: var(--color-ink); }
-.btn-bad { background: var(--color-paper); border-color: #e3c9c9; color: #8b3d3d; }
+.btn-bad { background: var(--color-paper); border-color: var(--color-danger-hairline); color: var(--color-danger); }
 
 /* sidebar rows */
 .sesshit, .searchhit {
@@ -435,8 +483,8 @@ body {
 .approval { padding-bottom: 8px; }
 .approval-card {
   padding: 12px 14px;
-  border-color: #e6d9b8;
-  background: #fdf9ef;
+  border-color: var(--color-warn-hairline);
+  background: var(--color-warn-bg);
 }
 
 /* ---------------------------------------------------------------------------
@@ -677,8 +725,8 @@ body {
   line-height: 1;
   padding: 0 2px;
 }
-.att-x:hover { color: #8b3d3d; }
-.att-err { font-size: 11px; color: #8b3d3d; }
+.att-x:hover { color: var(--color-danger); }
+.att-err { font-size: 11px; color: var(--color-danger); }
 
 /* Transcript placeholder for an attachment. Deliberately not a thumbnail:
    history pages carry metadata only, so a thumbnail here would vanish on
