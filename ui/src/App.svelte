@@ -127,6 +127,13 @@
         promptTokens = ev.d.prompt_tokens
         specPct = s.specAcceptPct
         ttft = ev.d.ttft_ms
+        // Prove the bar is populated rather than assume it: these are the exact
+        // values the footer binds.
+        pageLog(
+          `telemetry: cache=${s.cacheHitPct}% (${ev.d.cached_tokens}/${ev.d.prompt_tokens}) ` +
+            `prefill=${s.effectivePrefillTps}/s avg=${avgPrefill}/s decode=${s.decodeTps}/s ` +
+            `avg=${avgDecode}/s spec=${s.specAcceptPct}% ttft=${ev.d.ttft_ms}ms`,
+        )
         break
       }
       case 'turnEnd':

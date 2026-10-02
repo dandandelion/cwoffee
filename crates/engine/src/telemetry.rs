@@ -18,8 +18,14 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 /// Per-turn telemetry: server aggregates plus client-measured TTFT.
+///
+/// Field names are snake_case on the wire, matching the rest of the event
+/// contract (variant names are camelCase, struct fields are not). This struct
+/// once carried `rename_all = "camelCase"`, which silently made every field
+/// `undefined` in the front end: the telemetry bar rendered zeros and NaN and
+/// nothing errored. The wire form is asserted in `wire_form_matches_the_front_end`
+/// because a mismatch here is invisible on both sides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TurnTelemetry {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
@@ -299,5 +305,42 @@ mod tests {
         }
         let rate = w.decode_tps();
         assert!(rate > 9.0 && rate < 11.0, "rate was {rate}");
+    }
+
+
+    /// The front end reads these names literally. Renaming them is a breaking
+    /// change to the UI contract, and serde does it with no compile error on
+    /// either side - which is exactly how the telemetry bar ended up showing
+    /// zeros and NaN.
+    #[test]
+    fn wire_form_matches_the_front_end() {
+        let t = TurnTelemetry {
+            prompt_tokens: 10,
+            cached_tokens: 4,
+            completion_tokens: 7,
+            ttft_ms: 120,
+            server_prefill_tps: 33.0,
+            server_decode_tps: 41.5,
+            draft_n: 9,
+            draft_accepted: 6,
+        };
+        let v: serde_json::Value = serde_json::to_value(&t).unwrap();
+        let obj = v.as_object().unwrap();
+        let want: Vec<&str> = vec![
+            "prompt_tokens",
+            "cached_tokens",
+            "completion_tokens",
+            "ttft_ms",
+            "server_prefill_tps",
+            "server_decode_tps",
+            "draft_n",
+            "draft_accepted",
+        ];
+        for k in want.iter() {
+            assert!(obj.contains_key(*k), "missing {k}; got {:?}", obj.keys());
+        }
+        assert_eq!(obj.len(), want.len(), "unexpected extra keys: {:?}", obj.keys());
+        let back: TurnTelemetry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.prompt_tokens, 10);
     }
 }
