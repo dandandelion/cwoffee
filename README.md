@@ -2,8 +2,8 @@
 
 **A local-first, BYOM co-work agent for Linux. One process tree, ~230–285 MB, your model, your machine.**
 
-Chat, tools, and research — Excel, PDF, docs, sandboxed command execution — against any
-OpenAI-compatible, Anthropic-compatible, or custom endpoint.
+Chat, tools, and research — Excel, PDF, docs, image input, sandboxed command
+execution — against any OpenAI-compatible, Anthropic-compatible, or custom endpoint.
 
 ```
 Qoder:  ~1.3 GB across 14 processes, cloud
@@ -38,7 +38,11 @@ cowry --config /path/to/config.toml
 Precedence is **CLI flags > environment > config file > defaults**.
 
 Keyboard: `Ctrl+K` composer, `Ctrl+Enter` send, `Ctrl+N` new session, `Ctrl+B`
-sidebar, `Alt+1-9` switch session. The `?` in the status bar lists them.
+sidebar, `Alt+1-9` switch session. The `?` in the status bar lists them. Light and
+dark themes; the choice persists, and the default follows the OS.
+
+Images go in by picker, paste, or drag — same guardrails whichever way (mime
+allow-list, count and byte caps, enforced by the engine rather than the UI).
 
 Gates:
 
