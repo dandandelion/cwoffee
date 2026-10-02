@@ -213,10 +213,40 @@ fn main() {
         store,
         queue_rx: Mutex::new(Some(queue_rx)),
         pending_approvals: Mutex::new(HashMap::new()),
+        rendered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
+    let rendered_flag = state.rendered.clone();
     let app = tauri::Builder::default()
         .manage(state)
+        // A webview that never paints leaves no trace: the engine logs look
+        // healthy, WebKit processes are up, memory is fine. The only outward
+        // symptom is a missing "render OK" line. So log what the webview was
+        // actually given, at startup, before anyone has to guess.
+        .setup(move |app| {
+            let cfg = app.config();
+            let cfg_build = cfg.build.clone();
+            eprintln!(
+                "[cowry] frontend_dist={:?} csp_hashes={}",
+                cfg.build.frontend_dist,
+                cfg.app.security.csp.is_some(),
+            );
+            // A webview that never paints leaves no trace. Process liveness,
+            // memory and sockets all report healthy; the only outward symptom is
+            // a missing "render OK" line, which is easy to miss in a log. So make
+            // the absence itself an explicit failure.
+            let painted = rendered_flag.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                if !painted.load(std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!(
+                        "[cowry] SUSPECT: no render report after 8s - the window is probably blank.                          frontend_dist={:?}; a debug build loads devUrl and needs vite running.",
+                        cfg_build.frontend_dist
+                    );
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::attach,
             commands::start_turn,
@@ -235,7 +265,8 @@ fn main() {
             commands::delete_session,
             commands::switch_session,
             commands::gpu_report,
-            commands::render_report
+            commands::render_report,
+            commands::boot_log
         ]);
 
     if let Err(e) = app.run(tauri::generate_context!()) {

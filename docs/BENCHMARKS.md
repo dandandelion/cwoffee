@@ -9,37 +9,51 @@ the commit that changed it.
 Target ~250–350 MB PSS, hard CI ceiling 400 MB, overall envelope ~500 MB.
 
 **PSS, not RSS.** RSS double-counts shared pages: Firefox measured 97.9 MB RSS
-against 24.3 MB PSS on this box. Gating on RSS would fail Cowry at 475 MB for a
-process set that really occupies 248 MB.
+against 24.3 MB PSS on this box. Gating on RSS would fail Cowry at ~465 MB for a
+process set that really occupies 282 MB.
 
 ### Desktop app (`cowry-app`), release build, embedded assets
 
 | Process | PSS |
 |---|---|
-| `cowry-app` (engine + Tauri + GTK) | 105.6 MB |
-| `WebKitWebProcess` | 102.1 MB |
-| `WebKitNetworkProcess` | 40.6 MB |
-| **total** | **248.2 MB** |
+| `cowry-app` (engine + Tauri + GTK) | 106.7 MB |
+| `WebKitWebProcess` | 129.5 MB |
+| `WebKitNetworkProcess` | 38.1 MB |
+| `glycin-svg` + 2 × `bwrap` | 8.0 MB |
+| **total** | **282.2 MB** |
 
-RSS for the same state is 419.4 MB — 69% higher, and the reason RSS is not the
+RSS for the same state is 464.9 MB — 65% higher, and the reason RSS is not the
 gate.
+
+The `glycin-svg` / `bwrap` entries are not Cowry's: WebKitGTK sandboxes its image
+loaders with bubblewrap. They are real memory and belong in the number, but they
+are the webview's cost, not the engine's.
+
+> **Correction (M2h).** An earlier revision of this file reported 248.2 MB for the
+> release app. That binary was not a production build: `cargo build --release`
+> does not enable tauri's `custom-protocol` feature, so tauri's build script set
+> `cfg(dev)`, the app loaded `build.devUrl` from a running vite server, and no
+> assets were embedded. The measurement was of a dev-mode app. See
+> `docs/BUILDRUN.md` trap 2 — the same bug also made the release binary render a
+> blank window whenever vite was not running, which is how it was finally caught.
 
 Debug build + vite dev server measures 289.9 MB PSS. That is the number to
 compare against when developing, not the shipping number.
 
 ### TUI (`cowry`), release build
 
-**6.8 MB PSS**, flat over 10 s across a completed streamed turn.
+**7.7 MB PSS**, flat over 12 s across a completed streamed turn, measured with a
+PSS watchdog rather than `RLIMIT_AS`.
 
-This is the argument for the engine/UI split: the webview costs ~240 MB and the
-agent costs ~7 MB. Anything that does not need a browser should not carry one.
+This is the argument for the engine/UI split: the webview costs ~280 MB and the
+agent costs ~8 MB. Anything that does not need a browser should not carry one.
 
 ### Binary size
 
 | Binary | Size |
 |---|---|
-| `target/release/cowry` | 5.8 MB |
-| `target/release/cowry-app` | 9.3 MB |
+| `target/release/cowry` | 7.7 MB |
+| `target/release/cowry-app` | 11.3 MB (includes the embedded frontend) |
 
 ## Streaming smoothness
 

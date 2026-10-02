@@ -11,6 +11,16 @@ description = "Local-model co-work agent: chat, tools, sandboxed commands, and d
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Without `custom-protocol`, tauri's own build script sets cfg(dev) and the app
+# loads build.devUrl instead of the embedded assets - so a plain
+# `cargo build --release` produces a binary that shows a blank window unless a
+# vite server happens to be running. `tauri build` passes this feature itself;
+# `tauri dev` re-runs cargo with --no-default-features. Declaring it here (and on
+# by default) is what makes `cargo build --release` produce a real artifact.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde.workspace = true

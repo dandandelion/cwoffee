@@ -29,38 +29,69 @@ cd ui && npx tauri build --bundles rpm
 `--bundles`, not `--bundle`. `dpkg-deb` and `appimagetool` are not installed here,
 so rpm is the only bundle that works on this box.
 
-## Trap 1 — a debug binary run by itself shows a blank window
+## Trap 1 — `cargo build --release` does not produce a release app
 
-A **debug** build loads `build.devUrl` (`http://localhost:5173`). Run
-`./target/debug/cowry-app` with no vite server and the window is blank, with no
-error anywhere: the engine logs look healthy, WebKit processes are up, memory is
-fine, and nothing paints.
+This one cost the most time and invalidated a published benchmark.
 
+Tauri's own build script computes `dev = !custom_protocol`, where `custom_protocol`
+is the **cargo feature** `tauri/custom-protocol`. The Tauri CLI enables it during
+`tauri build`; a bare `cargo build --release` does not. So unless the app crate
+declares the feature, `cfg(dev)` is on in the "release" binary, which means:
+
+- the app loads `build.devUrl` (`http://localhost:5173`) instead of embedded assets,
+- **no assets are embedded at all**,
+- run with no vite server, the window is blank and the page's JS never executes —
+  no error, no log, engine healthy, WebKit up, memory fine.
+
+The app crate must declare it, and it must be on by default:
+
+```toml
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
 ```
-[cowry] engine up: url=... model=... workspace=...     <-- looks alive
-(no "render OK" line at all)                            <-- this is the tell
+
+`tauri dev` re-runs cargo with `--no-default-features`, so the dev loop is
+unaffected. Verify the feature actually took effect before trusting any release
+measurement:
+
+```bash
+# must print nothing
+grep -c 'rustc-cfg=dev' $(ls -dt target/release/build/cowry-app-*/ | head -1)/output
+# must list the hashed filenames from ui/dist/assets
+strings target/release/cowry-app | grep -oE 'index-[A-Za-z0-9_-]{8}\.(js|css)' | sort -u
 ```
 
-The render self-report is what makes this visible. `render OK` / `render SUSPECT`
-is printed by Rust after the page reports its own DOM state; **silence means the
-page never ran**, which process liveness, PSS and socket checks all fail to catch.
+## Trap 2 — a blank webview is invisible from the outside
 
-Use the release binary, or run vite alongside it. Do not conclude "it works" from
-a debug binary that printed no render line.
+Every conventional health signal says "fine": the process is alive, PSS is
+normal, WebKit child processes exist, the GPU node is held. The only outward
+tell is a **missing** `render OK` line.
 
-## Trap 2 — frontend changes do not reliably reach the binary
+Two mechanisms make it visible, and both are now in the code:
 
-Assets are embedded by `build.rs` (`tauri_build::build()`). `cargo build -p
-cowry-app` after a `vite build` can finish in 0.25s and keep the old asset set.
-`tauri dev` and `tauri build` handle this correctly; a bare `cargo build` may not.
+- `boot_log` — the page's first lines of JS report into the Rust log, in release
+  as well as dev. If `boot: main.ts executing` never appears, the page never ran.
+- a startup watchdog — if no `render_report` arrives within 8 s the app logs
+  `SUSPECT: no render report after 8s - the window is probably blank`.
 
+```bash
+# healthy production run, no vite needed
+[cowry] webview attached: page JS is running
+[cowry/page] boot: main.ts executing
+[cowry/page] boot: mount() returned
+[cowry] render OK: titlebar=true sidebar=true footer=true stream=true overlay=false text=1280 bg=rgb(253, 252, 249) dpr=2.00
+```
+
+## Trap 3 — embedded assets can go stale
+
+Assets are embedded by `build.rs` (`tauri_build::build()`). After a `vite build`,
+a `cargo build -p cowry-app` can finish in 0.25s and keep the previous asset set.
 If embedded assets look stale: `touch crates/tauri-app/build.rs && cargo build -p
-cowry-app`.
+cowry-app`. Also check `ls ui/dist` — `index.html` has been found missing while
+`dist/assets/` was present.
 
-Related: `ui/dist/index.html` has been observed missing while `dist/assets/` was
-present. Check `ls ui/dist` before trusting a build.
-
-## Trap 3 — Tauri argument casing
+## Trap 4 — Tauri argument casing
 
 Command **argument names** are camelCase on the wire; **struct fields** keep their
 serde names. Getting this wrong is a runtime error, not a compile error:
@@ -69,7 +100,7 @@ serde names. Getting this wrong is a runtime error, not a compile error:
 invalid args `report` for command `render_report`: missing field `stream_el`
 ```
 
-## Trap 4 — the engine needs a tokio reactor
+## Trap 5 — the engine needs a tokio reactor
 
 `SessionHost::spawn` calls `tokio::spawn`. From bare `main` it panics:
 
@@ -83,7 +114,7 @@ Construct it inside Tauri's runtime:
 let (mut host, adopted) = tauri::async_runtime::block_on(async { ... });
 ```
 
-## Trap 5 — killing test processes
+## Trap 6 — killing test processes
 
 ```bash
 pkill -f 'target/debug/cowry-app'   # matches this shell's own cmdline; kills the shell (143)
@@ -92,7 +123,7 @@ pkill -f 'target/debug/cowry-app'   # matches this shell's own cmdline; kills th
 Kill by exact name (`pkill -x cowry-app`) or by PID from `ps`. Likewise
 `pkill -f mock_llm.py`.
 
-## Trap 6 — memory probes
+## Trap 7 — memory probes
 
 Gate on **PSS**, and watch the whole descendant tree. RSS double-counts shared
 pages: the app is 248 MB PSS / 419 MB RSS, so an RSS gate would fail a build that
@@ -109,7 +140,7 @@ VmSize at small PSS, and the limit produces allocation failures that are not rea
 ./scripts/sandbox-probe.sh
 ```
 
-## Trap 7 — the TUI needs a real terminal
+## Trap 8 — the TUI needs a real terminal
 
 A pty with no winsize reports `0x0`. The TUI refuses it rather than rendering:
 

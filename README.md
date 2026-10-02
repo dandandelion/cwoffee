@@ -1,18 +1,20 @@
 # Cowry
 
-**A local-first, BYOM co-work agent for Linux. One process, 248 MB, your model, your machine.**
+**A local-first, BYOM co-work agent for Linux. One process tree, 282 MB, your model, your machine.**
 
 Chat, tools, and research — Excel, PDF, docs, sandboxed command execution — against any
 OpenAI-compatible, Anthropic-compatible, or custom endpoint.
 
 ```
 Qoder:  ~1.3 GB across 14 processes, cloud
-Cowry:  248 MB PSS, one process tree, local
+Cowry:  282 MB PSS, one process tree, local
 ```
 
-The 248 MB is measured, not estimated: 105.6 MB for the app (engine + Tauri + GTK),
-102.1 MB WebKit web process, 40.6 MB WebKit network process. The same code without a
-browser — the TUI — is **6.8 MB PSS**. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+The 282 MB is measured, not estimated, on the production build with the frontend
+embedded: 106.7 MB for the app (engine + Tauri + GTK), 129.5 MB WebKit web process,
+38.1 MB WebKit network process, 8.0 MB WebKit's own sandboxed image loaders. The same
+code without a browser — the TUI — is **7.7 MB PSS**. See
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 > Status: M0–M2 built and running. The engine, both clients, the sandbox, the store
 > and document output are live and verified against a real local model. Packaging

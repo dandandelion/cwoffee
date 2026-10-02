@@ -31,6 +31,9 @@ pub struct AppState {
     pub queue_rx: Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>,
     /// Open approval requests, waiting on an answer from the UI.
     pub pending_approvals: Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>,
+    /// Set the first time the page reports its own DOM state. A webview that
+    /// never paints is otherwise indistinguishable from one that is fine.
+    pub rendered: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Register the webview's event channel. Called once at startup.
@@ -42,6 +45,9 @@ pub fn attach(state: tauri::State<'_, AppState>, on_event: Channel<EngineEvent>)
         .unwrap()
         .take()
         .ok_or_else(|| "event channel already attached".to_string())?;
+    // Reaching here proves the page's JS ran: it is the first call the app makes.
+    // Without it a blank window is indistinguishable from a healthy one.
+    eprintln!("[cowry] webview attached: page JS is running");
 
     tauri::async_runtime::spawn(async move {
         let mut rx = rx;
@@ -210,6 +216,14 @@ pub fn delete_session(state: tauri::State<'_, AppState>, id: i64) -> Result<(), 
     state.store.delete_session(id).map_err(|e| e.to_string())
 }
 
+/// Page-side log line, forwarded into the same stream as the Rust output.
+/// This is the only way to see a page-side failure in a release build, which is
+/// exactly where the "blank window, no error" class of bug hides.
+#[tauri::command]
+pub fn boot_log(msg: String) {
+    eprintln!("[cowry/page] {msg}");
+}
+
 /// Which GPU this process actually ended up on (PLAN.md §12 check).
 #[tauri::command]
 pub fn gpu_report() -> gpu::GpuReport {
@@ -234,7 +248,10 @@ pub struct RenderReport {
 }
 
 #[tauri::command]
-pub fn render_report(report: RenderReport) {
+pub fn render_report(state: tauri::State<'_, AppState>, report: RenderReport) {
+    // The watchdog in main.rs keys off this; without it a blank window looks
+    // healthy from every outside signal.
+    state.rendered.store(true, std::sync::atomic::Ordering::SeqCst);
     let sane = report.titlebar
         && report.footer
         && !report.overlay_present
