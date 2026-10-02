@@ -34,6 +34,7 @@
   let editingId = $state<number | null>(null)
   let editTitle = $state('')
   let confirmDeleteId = $state<number | null>(null)
+  let models = $state<string[]>([])
 
   let gpu = $state<GpuReport | null>(null)
   // IPC health is surfaced in the footer. An empty catch here once hid a CSP
@@ -189,6 +190,7 @@
       if (hostState) {
         mode = hostState.mode
         thinking = hostState.reasoning
+        model = hostState.model
       }
     } catch (e) {
       ipc = { ok: false, msg: String(e).slice(0, 140) }
@@ -281,6 +283,23 @@
     mode = m as any
     await invoke('set_mode', { mode: m }).catch((e) => pageLog(`set_mode: ${e}`))
   }
+
+  async function loadModels() {
+    try {
+      models = await invoke<string[]>('list_models')
+    } catch (e) {
+      // An endpoint without /models is a normal configuration. Fall back to the
+      // configured id rather than showing an error the user cannot act on.
+      pageLog(`list_models: ${e}`)
+      models = []
+    }
+  }
+
+  async function setModel(m: string) {
+    model = m
+    await invoke('set_model', { model: m }).catch((e) => pageLog(`set_model: ${e}`))
+    await refreshState()
+  }
   async function setThinking(l: string) {
     thinking = l as any
     await invoke('set_reasoning', { level: l }).catch((e) => pageLog(`set_reasoning: ${e}`))
@@ -323,7 +342,20 @@
       if (!rejected) fail('blank rename was accepted')
 
       const hits = await invoke<SearchHit[]>('search_messages', { query: 'AND OR NOT' })
-      pageLog(`SELFTEST ok: sessions ${before.length}->${after.length}, fts-safe query -> ${hits.length} hits`)
+
+      // Model picker: the endpoint should offer a list, and switching must be
+      // observable in session_state rather than only in the DOM.
+      const ms = await invoke<string[]>('list_models')
+      if (!ms.length) fail('list_models returned nothing')
+      const pick = ms[0]
+      await invoke('set_model', { model: pick })
+      const st = await invoke<HostState>('session_state')
+      if (st.model !== pick) fail(`set_model did not stick: state=${st.model} wanted=${pick}`)
+
+      pageLog(
+        `SELFTEST ok: sessions ${before.length}->${after.length}, fts-safe query -> ` +
+          `${hits.length} hits, models=${ms.length} picked=${pick}`,
+      )
     } catch (e) {
       fail(String(e))
     }
@@ -381,6 +413,8 @@
   onMount(async () => {
     if (rootEl) transcript = new Transcript(rootEl)
     await attachChannel()
+    // Non-blocking: a missing /models must not delay first paint.
+    void loadModels()
     try {
       gpu = await invoke<GpuReport>('gpu_report')
     } catch (e) {
@@ -557,6 +591,23 @@
             {/if}
 
             <label class="ml-auto flex items-center gap-1">
+              model
+              {#if models.length}
+                <select class="pill px-2 py-1 text-[12px] max-w-[190px]" bind:value={model} onchange={(e) => setModel((e.target as HTMLSelectElement).value)}>
+                  {#if !models.includes(model)}
+                    <option value={model}>{model}</option>
+                  {/if}
+                  {#each models as m}
+                    <option value={m}>{m}</option>
+                  {/each}
+                </select>
+              {:else}
+                <!-- endpoint exposes no /models; show the id, do not fake a picker -->
+                <span class="pill px-2 py-1 text-[12px] text-ink-2">{model || '—'}</span>
+              {/if}
+            </label>
+
+            <label class="flex items-center gap-1">
               approvals
               <select class="pill px-2 py-1 text-[12px]" bind:value={mode} onchange={(e) => setMode((e.target as HTMLSelectElement).value)}>
                 <option value="ask">ask</option>

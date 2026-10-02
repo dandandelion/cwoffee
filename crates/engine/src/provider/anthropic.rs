@@ -54,6 +54,13 @@ impl AnthropicProvider {
         self
     }
 
+    fn models_url(&self) -> String {
+        self.base_url
+            .join("models")
+            .map(|u| u.into())
+            .unwrap_or_else(|_| self.base_url.as_str().to_string())
+    }
+
     fn endpoint(&self) -> String {
         self.base_url
             .join("messages")
@@ -267,7 +274,36 @@ struct BlockMap {
 }
 
 #[async_trait]
+
+
 impl Provider for AnthropicProvider {
+    async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        let url = self.models_url();
+        let mut req = self.http.get(&url);
+        if let Some(k) = &self.api_key {
+            req = req.header("x-api-key", k);
+        }
+        req = req.header("anthropic-version", "2023-06-01");
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                url,
+                body: body.chars().take(400).collect(),
+            });
+        }
+        let v: serde_json::Value = resp.json().await?;
+        let arr = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| ProviderError::Shape("models response has no `data` array".into()))?;
+        Ok(arr
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+            .collect())
+    }
     fn id(&self) -> &str {
         "anthropic"
     }

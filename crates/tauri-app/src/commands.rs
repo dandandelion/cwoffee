@@ -144,6 +144,27 @@ pub fn switch_session(state: tauri::State<'_, AppState>, id: i64) {
 }
 
 /// Report which GPU this process actually ended up on (PLAN.md §12 check).
+/// Model ids offered by the endpoint. A provider that exposes no list returns
+/// an empty vec rather than an error: "no picker" is a normal state.
+#[tauri::command]
+pub async fn list_models(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    // An endpoint with no /models is a normal configuration, not a failure the
+    // user should see as an error banner.
+    state
+        .host
+        .provider()
+        .list_models()
+        .await
+        .inspect_err(|e| eprintln!("[cowry] list_models: {e}"))
+        .map(Ok)
+        .unwrap_or_else(|_| Ok(Vec::new()))
+}
+
+#[tauri::command]
+pub fn set_model(state: tauri::State<'_, AppState>, model: String) {
+    state.host.send(HostCmd::SetModel { model });
+}
+
 #[tauri::command]
 pub fn rename_session(state: tauri::State<'_, AppState>, id: i64, title: String) -> Result<(), String> {
     let title = title.trim().to_string();

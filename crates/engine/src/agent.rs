@@ -52,7 +52,7 @@ impl Default for AgentConfig {
 }
 
 pub struct Agent {
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
     registry: Registry,
     prompt: PromptBuilder,
     gate: ApprovalGate,
@@ -64,7 +64,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(
-        provider: Box<dyn Provider>,
+        provider: Arc<dyn Provider>,
         registry: Registry,
         gate: ApprovalGate,
         cfg: AgentConfig,
@@ -93,6 +93,17 @@ impl Agent {
     /// For the composer picker's current-state label.
     pub fn mode(&self) -> crate::approval::ApprovalMode {
         self.gate.mode()
+    }
+
+    /// Switching model mid-session is allowed: the transcript is provider
+    /// agnostic. It does invalidate the server-side prefix cache, since the
+    /// new model tokenises the same bytes differently.
+    pub fn set_model(&mut self, m: String) {
+        self.cfg.model = m;
+    }
+
+    pub fn model(&self) -> String {
+        self.cfg.model.clone()
     }
 
     pub fn set_reasoning(&mut self, r: crate::provider::Reasoning) {
@@ -424,7 +435,7 @@ mod tests {
         reg.register(Box::<crate::tools::exec::ExecTool>::default());
         let gate = ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx);
         let agent = Agent::new(
-            Box::new(Scripted { turns, n: std::sync::atomic::AtomicUsize::new(0) }),
+            std::sync::Arc::new(Scripted { turns, n: std::sync::atomic::AtomicUsize::new(0) }),
             reg,
             gate,
             AgentConfig::default(),

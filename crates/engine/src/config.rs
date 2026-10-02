@@ -251,7 +251,7 @@ impl Config {
     }
 
     /// Build the provider described by this config.
-    pub fn build_provider(&self) -> Result<Box<dyn Provider>, String> {
+    pub fn build_provider(&self) -> Result<std::sync::Arc<dyn Provider>, String> {
         let key = self.api_key();
         let url = self.provider.base_url.clone();
         match self.provider.kind.as_str() {
@@ -261,7 +261,7 @@ impl Config {
                 if let Some(k) = key {
                     p = p.with_key(k);
                 }
-                Ok(Box::new(p))
+                Ok(std::sync::Arc::new(p))
             }
             "openai" => {
                 let mut p = OpenAiProvider::new("openai", Flavor::OpenAi, url)
@@ -269,7 +269,7 @@ impl Config {
                 if let Some(k) = key {
                     p = p.with_key(k);
                 }
-                Ok(Box::new(p))
+                Ok(std::sync::Arc::new(p))
             }
             "llama.cpp" | "llamacpp" | "local" => {
                 let mut p = OpenAiProvider::new("local", Flavor::LlamaCpp, url)
@@ -277,7 +277,7 @@ impl Config {
                 if let Some(k) = key {
                     p = p.with_key(k);
                 }
-                Ok(Box::new(p))
+                Ok(std::sync::Arc::new(p))
             }
             other => Err(format!(
                 "unknown provider kind {other:?} (expected llama.cpp | openai | anthropic)"

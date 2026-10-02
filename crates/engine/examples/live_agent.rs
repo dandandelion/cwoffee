@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = ToolCtx { workspace: workspace.clone(), max_output_bytes: 16 * 1024 };
 
     let mut agent = Agent::new(
-        Box::new(provider),
+        std::sync::Arc::new(provider),
         reg,
         gate,
         AgentConfig {

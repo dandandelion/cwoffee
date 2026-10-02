@@ -43,6 +43,9 @@ pub enum ProviderError {
     #[error("provider returned an unexpected shape: {0}")]
     Shape(String),
 
+    #[error("{0} is not supported by this provider")]
+    Unsupported(String),
+
     #[error("stream cancelled")]
     Cancelled,
 }
@@ -201,6 +204,15 @@ pub trait Provider: Send + Sync {
     /// returned verbatim when tools are used.
     fn wants_reasoning(&self) -> bool {
         false
+    }
+
+    /// Model ids offered by the endpoint, for the composer's picker.
+    ///
+    /// Optional by design: a hand-written custom endpoint may expose nothing, and
+    /// "no list" is a normal state rather than an error the user should see as a
+    /// failure.
+    async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        Err(ProviderError::Unsupported("model listing".into()))
     }
 
     /// Cheap local token estimate used for the context-usage bar. Exact only if

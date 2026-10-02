@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
     }
     let store = Arc::new(Store::open(&flags.db)?);
 
-    let provider: Box<dyn cowry_engine::provider::Provider> = appcfg.build_provider()
+    let provider: std::sync::Arc<dyn cowry_engine::provider::Provider> = appcfg.build_provider()
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let model = if appcfg.provider.model.is_empty() {

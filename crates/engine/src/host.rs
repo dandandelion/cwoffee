@@ -66,6 +66,8 @@ pub enum HostCmd {
     Send { text: String },
     SetMode { mode: ApprovalMode },
     SetReasoning { reasoning: Reasoning },
+    /// Change the model id for subsequent turns. Does not rewrite history.
+    SetModel { model: String },
     NewSession { title: String },
     SwitchSession { id: i64 },
     Cancel,
@@ -77,6 +79,7 @@ pub enum HostCmd {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HostState {
     pub session_id: i64,
+    pub model: String,
     pub mode: ApprovalMode,
     pub reasoning: Reasoning,
     pub busy: bool,
@@ -97,6 +100,9 @@ pub struct SessionHost {
     approvals: Option<mpsc::UnboundedReceiver<ApprovalRx>>,
     state: Arc<Mutex<HostState>>,
     cancel: Arc<AtomicBool>,
+    /// The host keeps a handle so the shell can ask the endpoint questions that
+    /// are not turns - the composer's model picker being the obvious one.
+    provider: Arc<dyn Provider>,
 }
 
 pub type EventRx = mpsc::UnboundedReceiver<EngineEvent>;
@@ -104,11 +110,12 @@ pub type ApprovalRx = (ApprovalRequest, oneshot::Sender<ApprovalAnswer>);
 
 impl SessionHost {
     pub fn spawn(
-        provider: Box<dyn Provider>,
+        provider: Arc<dyn Provider>,
         registry: Registry,
         store: Arc<Store>,
         cfg: HostConfig,
     ) -> SessionHost {
+        let provider = Arc::clone(&provider);
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<HostCmd>();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
         let (ap_tx, ap_rx) =
@@ -117,6 +124,7 @@ impl SessionHost {
 
         let state = Arc::new(Mutex::new(HostState {
             session_id: 0,
+            model: cfg.model.clone(),
             mode: cfg.mode,
             reasoning: cfg.reasoning,
             busy: false,
@@ -126,6 +134,9 @@ impl SessionHost {
         }));
 
         let state_bg = Arc::clone(&state);
+        // The task takes the provider; the host keeps a second handle for
+        // non-turn questions like the model list.
+        let host_provider = Arc::clone(&provider);
 
         tokio::spawn(async move {
             let gate = ApprovalGate::new(cfg.mode, ap_tx).with_timeout(cfg.approval_timeout);
@@ -179,6 +190,20 @@ impl SessionHost {
 
                     HostCmd::Cancel => {
                         agent_cancel.store(true, Ordering::Relaxed);
+                    }
+
+                    HostCmd::SetModel { model } => {
+                        // Empty would send `"model": ""` to the endpoint, which
+                        // is a confusing 400 rather than an obvious bug.
+                        if model.trim().is_empty() {
+                            let _ = ev_tx.send(EngineEvent::Error {
+                                message: "model id cannot be empty".into(),
+                                fatal: false,
+                            });
+                        } else {
+                            agent.set_model(model.clone());
+                            state_bg.lock().unwrap().model = model;
+                        }
                     }
 
                     HostCmd::SetMode { mode } => {
@@ -301,7 +326,19 @@ impl SessionHost {
             }
         });
 
-        SessionHost { cmd: cmd_tx, events: Some(ev_rx), approvals: Some(ap_rx), state, cancel }
+        SessionHost {
+            cmd: cmd_tx,
+            events: Some(ev_rx),
+            approvals: Some(ap_rx),
+            state,
+            cancel,
+            provider: host_provider,
+        }
+    }
+
+    /// Handle to the endpoint, for shell-level queries that are not turns.
+    pub fn provider(&self) -> &Arc<dyn Provider> {
+        &self.provider
     }
 
     /// Move the event and approval receivers out of the host, exactly once.
@@ -418,7 +455,7 @@ mod tests {
 
     fn host(replies: Vec<String>) -> (SessionHost, Arc<Store>) {
         let store = Arc::new(Store::in_memory().unwrap());
-        let p = Box::new(Scripted {
+        let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(replies),
             calls: AtomicUsize::new(0),
         });
@@ -434,7 +471,10 @@ mod tests {
     /// The host runs on its own task, so reading `state()` straight after
     /// `send()` races it. Every test waits on an observable condition instead
     /// of sleeping.
-    async fn wait_for(what: String, f: impl Fn() -> bool) {
+    /// `FnMut` rather than `Fn` so a poll can drain the event channel while it
+    /// waits. A condition that is already true would otherwise let the caller
+    /// inspect the channel before the host has written anything to it.
+    async fn wait_for(what: String, mut f: impl FnMut() -> bool) {
         for _ in 0..400 {
             if f() {
                 return;
@@ -562,9 +602,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_model_changes_later_turns_but_not_history() {
+        let (mut h, store) = host(vec!["a".into(), "b".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        h.send(HostCmd::SetModel { model: "second-model".into() });
+        wait_for("model change".into(), || h.state().model == "second-model").await;
+
+        h.submit("after switch");
+        turns_done(&h, 1).await;
+        let evs = drain_events(&mut ev).await;
+        assert!(
+            evs.iter().any(|e| matches!(e, EngineEvent::TurnStart { model, .. } if model == "second-model")),
+            "turn should report the new model: {evs:?}"
+        );
+        // History is provider-agnostic: switching mid-session must not rewrite it.
+        assert_eq!(store.history(h.state().session_id).unwrap().len(), 2);
+
+        // An empty id would send `"model": ""` and produce a confusing 400 from
+        // the endpoint instead of an obvious local error.
+        h.send(HostCmd::SetModel { model: "   ".into() });
+        let mut rejected = false;
+        for _ in 0..400 {
+            if drain_events(&mut ev).await.iter().any(|e| {
+                matches!(e, EngineEvent::Error { message, .. } if message.contains("empty"))
+            }) {
+                rejected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(rejected, "an empty model id must be reported, not ignored");
+        assert_eq!(h.state().model, "second-model", "rejection must not clear the model");
+    }
+
+    #[tokio::test]
     async fn approval_channel_stays_open_and_unused_when_no_tools_are_called() {
         let store = Arc::new(Store::in_memory().unwrap());
-        let p = Box::new(Scripted {
+        let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(vec!["tool".into()]),
             calls: AtomicUsize::new(0),
         });

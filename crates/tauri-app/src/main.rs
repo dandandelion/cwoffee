@@ -119,7 +119,7 @@ fn main() {
         }
     };
 
-    let provider: Box<dyn Provider> = match appcfg.build_provider() {
+    let provider: std::sync::Arc<dyn Provider> = match appcfg.build_provider() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[cowry] {e}");
@@ -214,6 +214,8 @@ fn main() {
             commands::respond_approval,
             commands::set_mode,
             commands::set_reasoning,
+            commands::list_models,
+            commands::set_model,
             commands::session_state,
             commands::list_sessions,
             commands::search_messages,

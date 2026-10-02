@@ -51,6 +51,7 @@ export interface GpuReport {
 
 export interface HostState {
   session_id: number
+  model: string
   mode: 'ask' | 'session' | 'auto'
   reasoning: 'off' | 'low' | 'medium' | 'high'
   busy: boolean
