@@ -22,7 +22,7 @@
   let model = $state('')
   let draft = $state('')
   let mode = $state<'ask' | 'session' | 'auto'>('ask')
-  let thinking = $state<'off' | 'low' | 'medium' | 'high'>('low')
+  let thinking = $state<'off' | 'low' | 'medium' | 'high' | 'xhigh'>('xhigh')
   let hostState = $state<HostState | null>(null)
 
   let sessions = $state<Session[]>([])
@@ -42,6 +42,54 @@
   let confirmDeleteId = $state<number | null>(null)
   let sidebarOpen = $state(false)
   let models = $state<string[]>([])
+
+  // Custom popovers instead of <select>: native dropdowns render with the
+  // toolkit's own chrome, which cannot be themed, and they look nothing like the
+  // rest of the app.
+  let pop = $state<'' | 'mode' | 'model' | 'think'>('')
+  const MODES = ['ask', 'session', 'auto'] as const
+  const THINKS = ['off', 'low', 'medium', 'high', 'xhigh'] as const
+  const MODE_LABEL: Record<'ask' | 'session' | 'auto', string> = {
+    ask: 'Ask',
+    session: 'Auto for session',
+    auto: 'Full auto',
+  }
+  const MODE_HINT: Record<'ask' | 'session' | 'auto', string> = {
+    ask: 'prompt for every mutating call',
+    session: 'first allow per tool is remembered',
+    auto: 'no prompts; denylist still applies',
+  }
+  const THINK_LABEL: Record<'off' | 'low' | 'medium' | 'high' | 'xhigh', string> = {
+    off: 'Off',
+    low: 'Low',
+    medium: 'Medium',
+    high: 'High',
+    xhigh: 'Extra high',
+  }
+  function shortModel(m: string) {
+    if (!m) return 'no model'
+    return m.length > 22 ? m.slice(0, 21) + '\u2026' : m
+  }
+  async function pickMode(m: 'ask' | 'session' | 'auto') {
+    pop = ''
+    await setMode(m)
+  }
+  async function pickThinking(t: 'off' | 'low' | 'medium' | 'high' | 'xhigh') {
+    pop = ''
+    await setThinking(t)
+  }
+  async function pickModel(m: string) {
+    pop = ''
+    await setModel(m)
+  }
+  async function stopTurn() {
+    try {
+      await invoke('cancel_turn')
+      pageLog('cancel requested')
+    } catch (e) {
+      pageLog(`cancel_turn failed: ${e}`)
+    }
+  }
 
   let gpu = $state<GpuReport | null>(null)
   // IPC health is surfaced in the footer. An empty catch here once hid a CSP
@@ -630,9 +678,20 @@
 
   // Window-level: the root div has no tabindex, so a keydown bound there would
   // simply never fire.
+  function onDocDown(e: MouseEvent) {
+    if (!pop) return
+    const t = e.target as HTMLElement | null
+    if (t && t.closest('.cbox')) return
+    pop = ''
+  }
+
   onMount(() => {
     window.addEventListener('keydown', onApprovalKey)
-    return () => window.removeEventListener('keydown', onApprovalKey)
+    window.addEventListener('mousedown', onDocDown)
+    return () => {
+      window.removeEventListener('keydown', onApprovalKey)
+      window.removeEventListener('mousedown', onDocDown)
+    }
   })
 
   function onKey(e: KeyboardEvent) {
@@ -778,64 +837,106 @@
       {/if}
 
       <!-- composer -->
-      <div class="border-t border-hairline px-6 py-3">
-        <div class="mx-auto w-full max-w-[780px]">
-          <textarea
-            class="composer"
-            rows="3"
-            placeholder="Ask something. Enter to send, Shift+Enter for a newline."
-            bind:value={draft}
-            onkeydown={onKey}
-            disabled={busy}
-          ></textarea>
+      <div class="px-4 pb-2 pt-2">
+        <div class="mx-auto w-full max-w-[860px]">
+          <div class="cbox">
+            <textarea
+              class="composer"
+              rows="3"
+              placeholder="Ask something. Enter to send, Shift+Enter for a newline."
+              bind:value={draft}
+              onkeydown={onKey}
+              disabled={busy}
+            ></textarea>
 
-          <div class="mt-2 flex items-center gap-2 text-[12px] text-ink-2">
-            <button
-              class="btn-go {busy || approval ? 'opacity-40' : ''}"
-              onclick={send}
-              disabled={busy || !draft.trim()}
-            >
-              {approval ? 'waiting on you' : busy ? 'working…' : 'Send'}
-            </button>
-            {#if busy}
-              <button class="btn-ghost" onclick={() => invoke('cancel_turn')}>Cancel</button>
-            {/if}
+            <div class="crow">
+              <!-- Placeholders for features that do not exist yet. They are
+                   disabled rather than absent so the layout matches where the
+                   control will land, and the title says why it is inert. -->
+              <button class="cbtn sq" disabled title="Not implemented yet">
+                <svg width="14" height="14" viewBox="0 0 14 14"><path d="M7 2.5v9M2.5 7h9" stroke="currentColor" stroke-width="1.4"/></svg>
+              </button>
+              <button class="cbtn sq" disabled title="Attachments are not implemented yet">
+                <svg width="14" height="14" viewBox="0 0 14 14"><path d="M9.2 4.3 5 8.5a1.9 1.9 0 0 0 2.7 2.7l4.2-4.2a3.4 3.4 0 0 0-4.8-4.8L2.8 6.5a4.9 4.9 0 0 0 6.9 6.9" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+              </button>
 
-            <label class="ml-auto flex items-center gap-1">
-              model
-              {#if models.length}
-                <select class="pill px-2 py-1 text-[12px] max-w-[190px]" bind:value={model} onchange={(e) => setModel((e.target as HTMLSelectElement).value)}>
-                  {#if !models.includes(model)}
-                    <option value={model}>{model}</option>
+              <button class="cbtn chip" onclick={() => (pop = pop === 'mode' ? '' : 'mode')} aria-expanded={pop === 'mode'}>
+                <svg width="13" height="13" viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.2" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M5.4 7h3.2M7 5.4v3.2" stroke="currentColor" stroke-width="1.1"/></svg>
+                <span>{MODE_LABEL[mode]}</span>
+                <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+              </button>
+
+              <div class="ml-auto flex items-center gap-1">
+                <button class="cbtn chip" onclick={() => (pop = pop === 'model' ? '' : 'model')} aria-expanded={pop === 'model'}>
+                  <svg width="13" height="13" viewBox="0 0 14 14"><path d="M7.8 1.6 3.4 7.6h2.6l-.8 4.8 4.4-6H7z" fill="currentColor"/></svg>
+                  <span class="chip-label">{shortModel(model)}</span>
+                  <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+                </button>
+                <button class="cbtn chip" onclick={() => (pop = pop === 'think' ? '' : 'think')} aria-expanded={pop === 'think'}>
+                  <span>{THINK_LABEL[thinking]}</span>
+                  <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+                </button>
+                <button class="cbtn sq" disabled title="Dictation is not implemented yet">
+                  <svg width="14" height="14" viewBox="0 0 14 14"><rect x="5.6" y="1.8" width="2.8" height="5.6" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M3.6 6.6a3.4 3.4 0 0 0 6.8 0M7 10v2.2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+                </button>
+
+                <!-- One control for send and stop. A separate "Cancel" text
+                     button sat far from the action and, until the host cancel
+                     flag was fixed, did nothing. -->
+                <button
+                  class="cbtn go {approval ? 'warn' : ''}"
+                  onclick={() => (busy ? stopTurn() : send())}
+                  disabled={!busy && !draft.trim()}
+                  title={busy ? 'Stop this turn' : approval ? 'Waiting on an approval above' : 'Send'}
+                  aria-label={busy ? 'Stop' : 'Send'}
+                >
+                  {#if busy}
+                    <svg width="14" height="14" viewBox="0 0 14 14"><rect x="4" y="4" width="6" height="6" rx="1.4" fill="currentColor"/></svg>
+                  {:else}
+                    <svg width="14" height="14" viewBox="0 0 14 14"><path d="M7 11V3M3.6 6.4 7 3l3.4 3.4" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
                   {/if}
-                  {#each models as m}
-                    <option value={m}>{m}</option>
-                  {/each}
-                </select>
-              {:else}
-                <!-- endpoint exposes no /models; show the id, do not fake a picker -->
-                <span class="pill px-2 py-1 text-[12px] text-ink-2">{model || '—'}</span>
-              {/if}
-            </label>
+                </button>
+              </div>
+            </div>
 
-            <label class="flex items-center gap-1">
-              approvals
-              <select class="pill px-2 py-1 text-[12px]" bind:value={mode} onchange={(e) => setMode((e.target as HTMLSelectElement).value)}>
-                <option value="ask">ask</option>
-                <option value="session">auto for session</option>
-                <option value="auto">full auto</option>
-              </select>
-            </label>
-            <label class="flex items-center gap-1">
-              thinking
-              <select class="pill px-2 py-1 text-[12px]" bind:value={thinking} onchange={(e) => setThinking((e.target as HTMLSelectElement).value)}>
-                <option value="off">off</option>
-                <option value="low">low</option>
-                <option value="medium">medium</option>
-                <option value="high">high</option>
-              </select>
-            </label>
+            {#if pop}
+              <div class="pop {pop === 'mode' ? 'pop-left' : 'pop-right'}" role="menu">
+                {#if pop === 'mode'}
+                  <div class="pop-title">Approvals</div>
+                  {#each MODES as m}
+                    <button class="pop-item {mode === m ? 'on' : ''}" onclick={() => pickMode(m)} role="menuitemradio" aria-checked={mode === m}>
+                      <span>{MODE_LABEL[m]}</span>
+                      <span class="pop-sub">{MODE_HINT[m]}</span>
+                    </button>
+                  {/each}
+                {:else if pop === 'think'}
+                  <div class="pop-title">Thinking effort</div>
+                  {#each THINKS as t}
+                    <button class="pop-item {thinking === t ? 'on' : ''}" onclick={() => pickThinking(t)} role="menuitemradio" aria-checked={thinking === t}>
+                      <span>{THINK_LABEL[t]}</span>
+                    </button>
+                  {/each}
+                {:else}
+                  <div class="pop-title">Model</div>
+                  {#if models.length}
+                    {#each models as m}
+                      <button class="pop-item {model === m ? 'on' : ''}" onclick={() => pickModel(m)} role="menuitemradio" aria-checked={model === m}>
+                        <span class="pop-mono">{m}</span>
+                      </button>
+                    {/each}
+                  {:else}
+                    <!-- endpoint exposes no /models: show the id, do not fake a picker -->
+                    <div class="pop-empty">This endpoint does not list models.<br />Using <span class="pop-mono">{model || '\u2014'}</span></div>
+                  {/if}
+                {/if}
+              </div>
+            {/if}
           </div>
+
+          <button class="wsrow" disabled title="Workspace picking is not implemented yet">
+            <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+            <span>Choose workspace (optional)</span>
+          </button>
         </div>
       </div>
     </main>

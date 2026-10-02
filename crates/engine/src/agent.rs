@@ -205,6 +205,14 @@ impl Agent {
     }
 
     /// One provider round-trip. Streams deltas out and collects the tool calls.
+    /// Resolves once `flag` is set. Polled rather than signalled: the flag is also
+    /// read synchronously by the tool loop, and a channel would not be.
+    async fn wait_cancel(flag: Arc<AtomicBool>) {
+        while !flag.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     async fn stream_once(&mut self, req: &ChatRequest, out: &EngineSink) -> Result<Collected, String> {
         let (tx, mut rx) = mpsc::unbounded_channel::<Delta>();
 
@@ -214,12 +222,18 @@ impl Agent {
         // (this deadlocked every agent test the first time it was written).
         // Dropping `tx` after the call is what ends the loop.
         let out2 = out.clone();
+        let cancel_consume = Arc::clone(&self.cancel);
         let consume = tokio::spawn(async move {
             let mut text = String::new();
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut tel = TurnTelemetry::default();
             let mut finish = FinishReason::Stop;
             while let Some(d) = rx.recv().await {
+                // Stop forwarding as soon as the user asks to stop: otherwise the
+                // transcript keeps filling in for the rest of the generation.
+                if cancel_consume.load(Ordering::Relaxed) {
+                    break;
+                }
                 match d {
                     Delta::Text(t) => {
                         text.push_str(&t);
@@ -245,12 +259,34 @@ impl Agent {
             (text, calls, tel, finish)
         });
 
-        let res = self.provider.stream(req, &tx).await;
+        // A Stop press has to interrupt the generation, not just the gap between
+        // tool iterations: a single streamed answer can run for a minute. Polling
+        // the flag is cheap and avoids threading a notification channel through
+        // every provider.
+        let cancel_wait = Arc::clone(&self.cancel);
+        let mut cancelled = false;
+        let res = tokio::select! {
+            biased;
+            _ = Self::wait_cancel(cancel_wait) => {
+                cancelled = true;
+                Ok(())
+            }
+            r = self.provider.stream(req, &tx) => r,
+        };
+        // Dropping tx is what ends the consumer loop, cancelled or not.
         drop(tx);
 
         let (text, calls, tel, finish) = consume
             .await
             .map_err(|e| format!("event consumer task failed: {e}"))?;
+        if cancelled {
+            return Ok(Collected {
+                text,
+                calls,
+                telemetry: tel,
+                finish: FinishReason::Cancelled,
+            });
+        }
         if let Err(e) = res {
             return Err(format!("provider error: {e}"));
         }
@@ -443,6 +479,63 @@ mod tests {
         );
         let _ = answer;
         (agent, erx, arx)
+    }
+
+    /// Streams forever. Used to prove Stop interrupts a live generation rather
+    /// than only being observed between tool iterations.
+    struct Endless;
+
+    #[async_trait]
+    impl Provider for Endless {
+        fn id(&self) -> &str { "endless" }
+        fn label(&self) -> &str { "endless" }
+        async fn stream(&self, _req: &ChatRequest, sink: &DeltaSink) -> Result<(), ProviderError> {
+            for i in 0..1000u32 {
+                if sink.send(Delta::Text(format!("tok{i} "))).is_err() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Ok(())
+        }
+        fn wants_reasoning(&self) -> bool { false }
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_an_in_flight_stream() {
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            std::sync::Arc::new(Endless),
+            Registry::new(),
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        let cancel = agent.cancel_handle();
+        let run = tokio::spawn(async move { agent.run_turn("go", &etx).await });
+
+        // Let a few tokens arrive, then stop.
+        let mut got = 0usize;
+        while let Some(e) = erx.recv().await {
+            if matches!(e, EngineEvent::Text(_)) {
+                got += 1;
+                if got >= 3 {
+                    break;
+                }
+            }
+        }
+        let t0 = std::time::Instant::now();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _tel = run.await.unwrap();
+        let dt = t0.elapsed();
+
+        // 1000 tokens at 20ms is 20s. Returning in well under that is the proof.
+        assert!(
+            dt < std::time::Duration::from_millis(800),
+            "cancel did not interrupt the stream: took {dt:?}"
+        );
+        assert!(got < 1000, "provider ran to completion despite cancel");
     }
 
     /// The invariant that keeps providers from 400ing: every call gets a result.

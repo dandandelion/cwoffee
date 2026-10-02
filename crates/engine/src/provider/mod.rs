@@ -136,6 +136,10 @@ pub enum Reasoning {
     Low,
     Medium,
     High,
+    /// The top setting. Named rather than implied by "High" because the UI shows
+    /// it as a distinct choice; providers that have no equivalent clamp to their
+    /// highest real level rather than inventing a value the API would reject.
+    XHigh,
 }
 
 impl Reasoning {

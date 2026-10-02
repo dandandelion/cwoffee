@@ -85,7 +85,7 @@ impl App {
             ctx_tokens: 0,
             compactions: 0,
             mode: ApprovalMode::Ask,
-            reasoning: Reasoning::Low,
+            reasoning: Reasoning::XHigh,
             busy: false,
             session_id: 0,
             pending: None,
@@ -477,7 +477,8 @@ fn handle_key(k: KeyEvent, app: &mut App, host: &SessionHost) {
                     Reasoning::Off => Reasoning::Low,
                     Reasoning::Low => Reasoning::Medium,
                     Reasoning::Medium => Reasoning::High,
-                    Reasoning::High => Reasoning::Off,
+                    Reasoning::High => Reasoning::XHigh,
+                    Reasoning::XHigh => Reasoning::Off,
                 };
                 host.send(HostCmd::SetReasoning { reasoning: app.reasoning });
             }
@@ -580,6 +581,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Reasoning::Low => "low",
         Reasoning::Medium => "med",
         Reasoning::High => "high",
+        Reasoning::XHigh => "xhigh",
     };
     let line = Line::from(vec![
         Span::styled(" Cowry ", Style::default().fg(Color::Black).bg(Color::Cyan)),

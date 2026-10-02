@@ -184,6 +184,7 @@ impl AnthropicProvider {
             let budget = match req.reasoning {
                 crate::provider::Reasoning::Low => (max / 4).max(1024),
                 crate::provider::Reasoning::High => (max * 3 / 4).max(1024),
+                crate::provider::Reasoning::XHigh => (max * 9 / 10).max(1024),
                 _ => (max / 2).max(1024),
             };
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget.min(max - 1) });

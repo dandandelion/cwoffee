@@ -135,6 +135,9 @@ impl OpenAiProvider {
                     body["reasoning_effort"] = json!(match req.reasoning {
                         Reasoning::Low => "low",
                         Reasoning::High => "high",
+                        // "xhigh" is not a value the OpenAI API accepts; clamping
+                        // beats sending a string that 400s the whole request.
+                        Reasoning::XHigh => "high",
                         _ => "medium",
                     });
                 }

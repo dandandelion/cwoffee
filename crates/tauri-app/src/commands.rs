@@ -91,8 +91,19 @@ pub fn respond_approval(
 ) -> Result<(), String> {
     let reply = state.pending_approvals.lock().unwrap().remove(&id);
     match reply {
-        Some(r) => r.send(answer).map_err(|_| "turn already ended".to_string()),
-        None => Ok(()),
+        Some(r) => {
+            eprintln!("[cowry] approval {id} answered {answer:?}");
+            r.send(answer).map_err(|_| "turn already ended".to_string())
+        }
+        // Previously silent. A click that reaches this path with no parked sender
+        // means the answer was lost, and the gate then fails closed after the full
+        // timeout - which reads to the user as "I allowed it and it ran anyway".
+        None => {
+            eprintln!(
+                "[cowry] approval {id} answer dropped: no pending request with that id                  (already answered, timed out, or the turn ended)"
+            );
+            Err(format!("no pending approval with id {id}"))
+        }
     }
 }
 
@@ -110,6 +121,7 @@ pub fn set_reasoning(state: tauri::State<'_, AppState>, level: String) -> Result
         "low" => Reasoning::Low,
         "medium" => Reasoning::Medium,
         "high" => Reasoning::High,
+        "xhigh" => Reasoning::XHigh,
         other => return Err(format!("unknown reasoning level {other:?}")),
     };
     state.host.send(HostCmd::SetReasoning { reasoning: r });

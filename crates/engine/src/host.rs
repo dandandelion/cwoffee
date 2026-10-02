@@ -50,7 +50,7 @@ impl HostConfig {
             model: model.into(),
             workspace: workspace.into(),
             mode: ApprovalMode::Ask,
-            reasoning: Reasoning::Low,
+            reasoning: Reasoning::XHigh,
             max_tool_iters: 8,
             max_tokens: None,
             context_budget: 8_000,
@@ -124,8 +124,6 @@ impl SessionHost {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
         let (ap_tx, ap_rx) =
             mpsc::unbounded_channel::<(ApprovalRequest, oneshot::Sender<ApprovalAnswer>)>();
-        let cancel = Arc::new(AtomicBool::new(false));
-
         let state = Arc::new(Mutex::new(HostState {
             session_id: 0,
             model: cfg.model.clone(),
@@ -143,27 +141,35 @@ impl SessionHost {
         // non-turn questions like the model list.
         let host_provider = Arc::clone(&provider);
 
+        // Built here, not inside the task, so the host can hold the agent's own
+        // cancel flag. `SessionHost::cancel()` used to set a separate AtomicBool
+        // that nothing ever read, so the UI's Stop button did nothing at all.
+        // It has to be a shared flag rather than a HostCmd: the command loop is
+        // sequential and is parked inside run_turn() for the whole turn, so a
+        // Cancel command would only be processed after the turn it should stop.
+        let gate = ApprovalGate::new(cfg.mode, ap_tx).with_timeout(cfg.approval_timeout);
+        let ctx = ToolCtx {
+            workspace: cfg.workspace.clone(),
+            max_output_bytes: 24 * 1024,
+        };
+        let mut agent = Agent::new(
+            provider,
+            registry,
+            gate,
+            AgentConfig {
+                model: cfg.model.clone(),
+                max_tool_iters: cfg.max_tool_iters,
+                reasoning: cfg.reasoning,
+                max_tokens: cfg.max_tokens,
+            },
+            ctx,
+        );
+        agent.prompt_mut().token_budget = cfg.context_budget;
+        agent.prompt_mut().set_env(cfg.env_block.clone());
+        let cancel = agent.cancel_handle();
+        let agent_cancel = cancel.clone();
+
         tokio::spawn(async move {
-            let gate = ApprovalGate::new(cfg.mode, ap_tx).with_timeout(cfg.approval_timeout);
-            let ctx = ToolCtx {
-                workspace: cfg.workspace.clone(),
-                max_output_bytes: 24 * 1024,
-            };
-            let mut agent = Agent::new(
-                provider,
-                registry,
-                gate,
-                AgentConfig {
-                    model: cfg.model.clone(),
-                    max_tool_iters: cfg.max_tool_iters,
-                    reasoning: cfg.reasoning,
-                    max_tokens: cfg.max_tokens,
-                },
-                ctx,
-            );
-            agent.prompt_mut().token_budget = cfg.context_budget;
-            agent.prompt_mut().set_env(cfg.env_block.clone());
-            let agent_cancel = agent.cancel_handle();
 
             // Sequence number the next unpersisted message will have. Sequences
             // start at 0, so this must not be initialised to "the highest
