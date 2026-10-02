@@ -206,6 +206,10 @@ impl SessionHost {
                                 s.session_id = id;
                                 s.context_tokens = 0;
                                 s.compactions = 0;
+                                let _ = ev_tx.send(EngineEvent::SessionChanged {
+                                    session_id: id,
+                                    title: title.clone(),
+                                });
                             }
                             Err(e) => {
                                 let _ = ev_tx.send(EngineEvent::Error {
@@ -234,6 +238,16 @@ impl SessionHost {
                                 s.session_id = id;
                                 s.context_tokens = agent.prompt_mut().estimate_tokens("");
                                 s.compactions = 0;
+                                let title = store
+                                    .session(id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|x| x.title)
+                                    .unwrap_or_default();
+                                let _ = ev_tx.send(EngineEvent::SessionChanged {
+                                    session_id: id,
+                                    title,
+                                });
                                 let _ = ev_tx.send(EngineEvent::Error {
                                     message: format!("resumed session {id} with {n} messages; \
                                                       the prefix cache is cold, first turn will be slow"),
@@ -568,6 +582,42 @@ mod tests {
         h.submit("say hi");
         turns_done(&h, 1).await;
         assert!(ap.try_recv().is_err(), "unexpected approval request");
+    }
+
+    #[tokio::test]
+    async fn session_changes_are_announced_so_the_ui_reloads_in_order() {
+        // The UI must not read the store on its own initiative after switching:
+        // the host owns when the switch lands. Without this event the webview
+        // can render the previous session's transcript under the new session's
+        // name, which is a confusing and easy-to-miss bug.
+        let (mut h, _store) = host(vec![]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+        let first = h.state().session_id;
+
+        h.send(HostCmd::NewSession { title: "beta".into() });
+        wait_for("new session id".into(), || h.state().session_id != first).await;
+        let evs = drain_events(&mut ev).await;
+        let got: Vec<(i64, String)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::SessionChanged { session_id, title } => {
+                    Some((*session_id, title.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got.len(), 1, "expected exactly one announcement, got {evs:?}");
+        assert_eq!(got[0].1, "beta");
+
+        h.send(HostCmd::SwitchSession { id: first });
+        wait_for("switch back".into(), || h.state().session_id == first).await;
+        let evs = drain_events(&mut ev).await;
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::SessionChanged { session_id, .. } if *session_id == first)),
+            "switching must also announce: {evs:?}"
+        );
     }
 
     #[tokio::test]

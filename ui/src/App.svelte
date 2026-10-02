@@ -31,6 +31,9 @@
   let searchErr = $state('')
 
   let approval = $state<{ id: number; tool: string; risk: string; summary: string } | null>(null)
+  let editingId = $state<number | null>(null)
+  let editTitle = $state('')
+  let confirmDeleteId = $state<number | null>(null)
 
   let gpu = $state<GpuReport | null>(null)
   // IPC health is surfaced in the footer. An empty catch here once hid a CSP
@@ -77,6 +80,21 @@
   function handle(ev: EngineEvent) {
     transcript?.apply(ev)
     switch (ev.kind) {
+      case 'sessionChanged':
+        // The host tells us when the switch actually landed. Loading the
+        // transcript from the UI right after invoke() would race the host task
+        // and can render the previous session's messages under the new name.
+        void (async () => {
+          try {
+            const msgs = await invoke<any[]>('session_messages', { id: ev.d.session_id })
+            transcript?.loadHistory(msgs)
+          } catch (e) {
+            pageLog(`session_messages after switch failed: ${e}`)
+          }
+          await refreshState()
+          await loadSessions()
+        })()
+        break
       case 'turnStart':
         model = ev.d.model
         busy = true
@@ -202,11 +220,10 @@
   }
 
   async function openSession(id: number) {
+    // Fire the command; the transcript reload happens on the sessionChanged
+    // event so it is ordered after the host has actually moved.
     try {
-      const msgs = await invoke<any[]>('session_messages', { id })
-      transcript?.loadHistory(msgs)
       await invoke('switch_session', { id })
-      await refreshState()
     } catch (e) {
       pageLog(`switch_session failed: ${e}`)
     }
@@ -219,6 +236,47 @@
     await loadSessions()
   }
 
+  function startRename(id: number, current: string) {
+    editingId = id
+    editTitle = current
+  }
+
+  async function commitRename() {
+    if (editingId == null) return
+    const id = editingId
+    editingId = null
+    const title = editTitle.trim()
+    editTitle = ''
+    if (!title) return
+    try {
+      await invoke('rename_session', { id, title })
+      await loadSessions()
+    } catch (e) {
+      pageLog(`rename_session failed: ${e}`)
+    }
+  }
+
+  async function removeSession(id: number) {
+    // Two-step inline confirm rather than window.confirm: WebKitGTK does not
+    // reliably present a JS dialog, and a confirm() that silently returns false
+    // would make the delete button look broken. Destructive actions need visible
+    // intent.
+    if (confirmDeleteId !== id) {
+      confirmDeleteId = id
+      setTimeout(() => {
+        if (confirmDeleteId === id) confirmDeleteId = null
+      }, 4000)
+      return
+    }
+    confirmDeleteId = null
+    try {
+      await invoke('delete_session', { id })
+      await loadSessions()
+    } catch (e) {
+      pageLog(`delete_session failed: ${e}`)
+    }
+  }
+
   async function setMode(m: string) {
     mode = m as any
     await invoke('set_mode', { mode: m }).catch((e) => pageLog(`set_mode: ${e}`))
@@ -226,6 +284,49 @@
   async function setThinking(l: string) {
     thinking = l as any
     await invoke('set_reasoning', { level: l }).catch((e) => pageLog(`set_reasoning: ${e}`))
+  }
+
+  /**
+   * Dev-only end-to-end check of the session commands. Clicking is not always
+   * available (CI, scripted runs), and "the button exists" is not evidence that
+   * rename/delete/search round-trip through the store correctly.
+   */
+  async function selfTest() {
+    const fail = (m: string) => pageLog(`SELFTEST FAIL: ${m}`)
+    try {
+      const before = await invoke<Session[]>('list_sessions')
+      await invoke('new_session', { title: 'selftest' })
+      await new Promise((r) => setTimeout(r, 400))
+      const mid = await invoke<Session[]>('list_sessions')
+      if (mid.length !== before.length + 1) fail(`new_session: ${before.length} -> ${mid.length}`)
+      const target = mid.find((s) => s.title === 'selftest')
+      if (!target) return fail('selftest session not listed')
+
+      await invoke('rename_session', { id: target.id, title: 'selftest-renamed' })
+      const renamed = await invoke<Session[]>('list_sessions')
+      if (!renamed.some((s) => s.title === 'selftest-renamed')) fail('rename did not stick')
+
+      const empty = await invoke<any[]>('session_messages', { id: target.id })
+      if (empty.length !== 0) fail(`new session should be empty, got ${empty.length}`)
+
+      await invoke('delete_session', { id: target.id })
+      const after = await invoke<Session[]>('list_sessions')
+      if (after.some((s) => s.id === target.id)) fail('delete did not remove the row')
+
+      // Renaming to blank must be refused rather than producing an untitled row.
+      let rejected = false
+      try {
+        await invoke('rename_session', { id: after[0]?.id ?? 1, title: '   ' })
+      } catch {
+        rejected = true
+      }
+      if (!rejected) fail('blank rename was accepted')
+
+      const hits = await invoke<SearchHit[]>('search_messages', { query: 'AND OR NOT' })
+      pageLog(`SELFTEST ok: sessions ${before.length}->${after.length}, fts-safe query -> ${hits.length} hits`)
+    } catch (e) {
+      fail(String(e))
+    }
   }
 
   // ---- window controls (frameless) ---------------------------------------
@@ -305,6 +406,9 @@
         void send()
       }, 1500)
     }
+    if (import.meta.env.VITE_SELFTEST) {
+      setTimeout(() => void selfTest(), 1200)
+    }
   })
 
   onDestroy(stopFrames)
@@ -371,13 +475,34 @@
       {:else}
         <div class="mt-2 px-1 text-[11px] uppercase tracking-wide text-ink-3">Sessions</div>
         {#each sessions as s}
-          <button
-            class="sesshit {hostState?.session_id === s.id ? 'active' : ''}"
-            onclick={() => openSession(s.id)}
-          >
-            <span class="block truncate text-[12.5px]">{s.title}</span>
-            <span class="block text-[11px] text-ink-3">{s.message_count} msg</span>
-          </button>
+          <div class="sessrow {hostState?.session_id === s.id ? 'active' : ''}">
+            {#if editingId === s.id}
+              <input
+                class="pill px-2 py-1 text-[12.5px] w-full"
+                bind:value={editTitle}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') commitRename()
+                  else if (e.key === 'Escape') editingId = null
+                }}
+                onblur={() => commitRename()}
+              />
+            {:else}
+              <button class="flex-1 min-w-0 text-left" onclick={() => openSession(s.id)}>
+                <span class="block truncate text-[12.5px]">{s.title}</span>
+                <span class="block text-[11px] text-ink-3">{s.message_count} msg</span>
+              </button>
+              <span class="sessrow-acts">
+                <button class="iconbtn" title="Rename" onclick={() => startRename(s.id, s.title)}>✎</button>
+                {#if confirmDeleteId === s.id}
+                  <button class="iconbtn wide text-[#8b3d3d]" title="Confirm delete" onclick={() => removeSession(s.id)}>
+                    sure?
+                  </button>
+                {:else}
+                  <button class="iconbtn" title="Delete" onclick={() => removeSession(s.id)}>✕</button>
+                {/if}
+              </span>
+            {/if}
+          </div>
         {/each}
       {/if}
     </aside>

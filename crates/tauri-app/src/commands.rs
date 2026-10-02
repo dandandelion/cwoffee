@@ -145,6 +145,31 @@ pub fn switch_session(state: tauri::State<'_, AppState>, id: i64) {
 
 /// Report which GPU this process actually ended up on (PLAN.md §12 check).
 #[tauri::command]
+pub fn rename_session(state: tauri::State<'_, AppState>, id: i64, title: String) -> Result<(), String> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("session title cannot be empty".into());
+    }
+    state.store.rename_session(id, &title).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_session(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
+    let st = state.host.state();
+    if id == st.session_id && st.busy {
+        // The agent appends to the active session; removing the row mid-turn
+        // would either orphan the writes or trip the foreign key.
+        return Err("cannot delete the active session while a turn is running".into());
+    }
+    if id == st.session_id {
+        // Move the host off the row before deleting it, otherwise the next turn
+        // writes into a session that no longer exists.
+        state.host.send(HostCmd::NewSession { title: String::new() });
+    }
+    state.store.delete_session(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn gpu_report() -> gpu::GpuReport {
     gpu::report()
 }

@@ -321,3 +321,27 @@ body {
 }
 .blk-body hr { border: none; border-top: 1px solid var(--color-hairline); margin: 12px 0; }
 .blk-body a { color: var(--color-shell-deep); text-decoration: underline; }
+
+/* session rows: actions appear on hover so the list stays quiet at rest */
+.sessrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 9px;
+}
+.sessrow:hover { background: var(--color-paper-2); }
+.sessrow.active { background: var(--color-tint); }
+.sessrow-acts { display: flex; gap: 2px; opacity: 0; }
+.sessrow:hover .sessrow-acts, .sessrow.active .sessrow-acts { opacity: 1; }
+.iconbtn {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+.iconbtn:hover { background: var(--color-hairline); color: var(--color-ink); }
+.iconbtn.wide { width: auto; padding: 0 7px; font-size: 11px; }

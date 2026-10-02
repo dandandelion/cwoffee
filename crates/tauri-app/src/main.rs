@@ -219,6 +219,8 @@ fn main() {
             commands::search_messages,
             commands::session_messages,
             commands::new_session,
+            commands::rename_session,
+            commands::delete_session,
             commands::switch_session,
             commands::gpu_report,
             commands::render_report

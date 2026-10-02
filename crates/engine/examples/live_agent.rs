@@ -105,6 +105,9 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
 
     while let Some(e) = rx.recv().await {
         match e {
+            EngineEvent::SessionChanged { session_id, .. } => {
+                println!("(session changed -> {session_id})");
+            }
             EngineEvent::TurnStart { turn_id, model } => {
                 println!("=== turn {turn_id} ({model}) ===");
             }

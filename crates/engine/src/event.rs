@@ -44,6 +44,14 @@ pub enum FinishReason {
 #[serde(tag = "kind", content = "d", rename_all = "camelCase")]
 pub enum EngineEvent {
     /// A turn began. Carries the resolved model id so the UI can label the reply.
+    /// The active session changed. The UI reloads its transcript in response to
+    /// this event rather than assuming the switch already landed: the host owns
+    /// that ordering, and reading the store before it moves shows the previous
+    /// session's messages.
+    SessionChanged {
+        session_id: i64,
+        title: String,
+    },
     TurnStart {
         turn_id: u64,
         model: String,

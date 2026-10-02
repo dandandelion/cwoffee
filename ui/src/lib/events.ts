@@ -23,6 +23,7 @@ export interface TurnTelemetry {
 }
 
 export type EngineEvent =
+  | { kind: 'sessionChanged'; d: { session_id: number; title: string } }
   | { kind: 'turnStart'; d: { turn_id: number; model: string } }
   | { kind: 'text'; d: string }
   | { kind: 'reasoning'; d: string }

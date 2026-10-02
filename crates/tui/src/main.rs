@@ -96,6 +96,12 @@ impl App {
 
     fn apply(&mut self, ev: EngineEvent) {
         match ev {
+            EngineEvent::SessionChanged { session_id, title } => {
+                self.items.push(Item::Note(format!(
+                    "── session {session_id}{} ──",
+                    if title.is_empty() { String::new() } else { format!(" · {title}") }
+                )));
+            }
             EngineEvent::TurnStart { turn_id, model } => {
                 self.busy = true;
                 self.tel = TurnTelemetry::default();
