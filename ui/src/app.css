@@ -691,3 +691,28 @@ body {
   border-radius: 6px;
   padding: 2px 6px;
 }
+
+/* ---- keyboard help ------------------------------------------------------ */
+.keyhelp {
+  border: 1px solid var(--color-hairline);
+  background: transparent;
+  color: var(--color-ink-3);
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  line-height: 1;
+  font-size: 11px;
+  cursor: pointer;
+}
+.keyhelp:hover { color: var(--color-ink); border-color: var(--color-shell); }
+/* Not a menu item: nothing to click, it is a two-column reference row. */
+.pop-item.static { cursor: default; }
+.pop-item.static:hover { background: transparent; }
+.pop-key {
+  grid-column: 2;
+  grid-row: 1;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+  white-space: nowrap;
+}

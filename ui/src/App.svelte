@@ -46,7 +46,7 @@
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
-  type MenuKind = 'mode' | 'model' | 'think' | 'row'
+  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys'
   // Anchored in viewport coordinates rather than to the opener, so no ancestor
   // overflow can clip it. `place` records which side it was put on.
   type Menu = {
@@ -65,6 +65,17 @@
   let unread = $state<Set<number>>(new Set())
   let seenCounts: Record<number, number> = {}
   const MODES = ['ask', 'session', 'auto'] as const
+  const SHORTCUTS = [
+    { keys: 'Ctrl K', label: 'Focus the composer' },
+    { keys: 'Ctrl Enter', label: 'Send' },
+    { keys: 'Ctrl N', label: 'New session' },
+    { keys: 'Ctrl B', label: 'Toggle sidebar' },
+    { keys: 'Alt 1-9', label: 'Open session by position' },
+    { keys: 'Enter', label: 'Send (Shift+Enter newline)' },
+    { keys: 'y / a / n', label: 'Approve / allow session / deny' },
+    { keys: 'Esc', label: 'Close a menu' },
+  ]
+
   const THINKS = ['off', 'low', 'medium', 'high', 'xhigh'] as const
   const MODE_LABEL: Record<'ask' | 'session' | 'auto', string> = {
     ask: 'Ask',
@@ -379,6 +390,7 @@
   type Pending = { name: string; mime: string; bytes: number; b64: string; url: string }
   let pending = $state<Pending[]>([])
   let fileInput = $state<HTMLInputElement | null>(null)
+  let composerEl = $state<HTMLTextAreaElement | null>(null)
   let attachErr = $state('')
 
   function fmtBytes(n: number) {
@@ -907,6 +919,42 @@
 
   // y / a / n answer an approval without hunting for the mouse. Ignored while a
   // text field has focus, so typing "no" into the composer cannot deny a tool call.
+  // App-wide shortcuts. Deliberately modifier-gated: an unmodified key has to
+  // reach the composer, and a bare "?" would be typed into a message.
+  function onGlobalKey(e: KeyboardEvent) {
+    const mod = e.ctrlKey || e.metaKey
+    const key = e.key.toLowerCase()
+
+    if (mod && key === 'k') {
+      e.preventDefault()
+      composerEl?.focus()
+      return
+    }
+    if (mod && key === 'b') {
+      e.preventDefault()
+      sidebarOpen = !sidebarOpen
+      return
+    }
+    if (mod && key === 'n') {
+      e.preventDefault()
+      void newSession()
+      return
+    }
+    if (mod && key === 'enter') {
+      e.preventDefault()
+      void send()
+      return
+    }
+    if (e.altKey && /^[1-9]$/.test(e.key)) {
+      const target = sessions[Number(e.key) - 1]
+      if (target) {
+        e.preventDefault()
+        void openSession(target.id)
+      }
+      return
+    }
+  }
+
   function onApprovalKey(e: KeyboardEvent) {
     if (e.key === 'Escape' && menu) {
       closeMenu()
@@ -1046,10 +1094,12 @@
   onMount(() => {
     loadSeen()
     window.addEventListener('keydown', onApprovalKey)
+    window.addEventListener('keydown', onGlobalKey)
     window.addEventListener('pointerdown', onDocDown)
     window.addEventListener('resize', reposition)
     return () => {
       window.removeEventListener('keydown', onApprovalKey)
+      window.removeEventListener('keydown', onGlobalKey)
       window.removeEventListener('pointerdown', onDocDown)
       window.removeEventListener('resize', reposition)
     }
@@ -1220,6 +1270,7 @@
             {/if}
             <textarea
               class="composer"
+              bind:this={composerEl}
               rows="3"
               placeholder="Ask something. Enter to send, Shift+Enter for a newline."
               bind:value={draft}
@@ -1334,6 +1385,14 @@
         {:else}
           <div class="pop-empty">This endpoint does not list models.<br />Using <span class="pop-mono">{model || '\u2014'}</span></div>
         {/if}
+      {:else if menu.kind === 'keys'}
+        <div class="pop-title">Keyboard</div>
+        {#each SHORTCUTS as sc}
+          <div class="pop-item static">
+            <span class="pop-lbl">{sc.label}</span>
+            <span class="pop-key">{sc.keys}</span>
+          </div>
+        {/each}
       {:else}
         {@const sid = menu.sessionId ?? -1}
         <div class="pop-title">{titleOf(sid)}</div>
@@ -1391,6 +1450,15 @@
       >
         {gpuOk ? 'iGPU renderD128' : gpu ? `GPU LEAK: ${gpu.render_nodes.join(',')}` : 'gpu ?'}
       </span>
+      <button
+        class="keyhelp"
+        data-menu
+        title="Keyboard shortcuts"
+        aria-label="Keyboard shortcuts"
+        onclick={(e) => openMenu('keys', e.currentTarget as HTMLElement)}
+      >
+        ?
+      </button>
     </span>
   </footer>
 </div>
