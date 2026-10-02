@@ -161,7 +161,7 @@ impl Default for SandboxCfg {
 fn default_true() -> bool {
     true
 }
-fn default_exec_timeout() -> u64 {
+pub fn default_exec_timeout() -> u64 {
     120
 }
 
@@ -255,6 +255,14 @@ impl Config {
             return env(var);
         }
         Some(k.to_string())
+    }
+
+    /// The `[sandbox]` block as the tool layer actually consumes it.
+    pub fn exec_cfg(&self) -> crate::tools::ExecCfg {
+        crate::tools::ExecCfg {
+            timeout_secs: self.sandbox.timeout_secs,
+            sandbox_enabled: self.sandbox.enabled,
+        }
     }
 
     pub fn search_backend(&self) -> SearchBackend {

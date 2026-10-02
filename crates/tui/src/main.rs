@@ -337,7 +337,7 @@ async fn main() -> Result<()> {
 
     let mut host = SessionHost::spawn(
         provider,
-        Registry::with_v1_tools_search(appcfg.search_backend()),
+        Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg()),
         store,
         cfg,
     );

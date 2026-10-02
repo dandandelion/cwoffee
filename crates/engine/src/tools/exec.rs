@@ -31,7 +31,9 @@ pub struct ExecTool {
 
 impl Default for ExecTool {
     fn default() -> Self {
-        Self { timeout_secs: 60, allow_unsandboxed: false }
+        // Matches the documented config default. Two different "defaults" for
+        // the same knob is how a config key ends up looking ignored.
+        Self { timeout_secs: crate::config::default_exec_timeout(), allow_unsandboxed: false }
     }
 }
 
@@ -47,6 +49,10 @@ impl Tool for ExecTool {
     }
 
     fn schema(&self) -> Value {
+        // The ceiling is config-driven, so the model is told the real number
+        // rather than guessing and repeatedly dying at the default.
+        let d = self.timeout_secs;
+        let c = self.timeout_secs;
         json!({
             "type": "object",
             "properties": {
@@ -57,6 +63,14 @@ impl Tool for ExecTool {
                 "cwd": {
                     "type": "string",
                     "description": "Optional directory relative to the workspace."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": format!(
+                        "Wall-clock seconds to allow. Default {d}s; anything above the \
+                         hard ceiling of {c}s is clamped down. Set it deliberately for \
+                         slow commands (builds, large searches) instead of letting them die."
+                    )
                 }
             },
             "required": ["cmd"]
@@ -88,6 +102,10 @@ impl Tool for ExecTool {
             None => ctx.workspace.clone(),
         };
 
+        // The model budgets the deadline per call, but only downwards: the
+        // configured ceiling is the user's, not the model's to raise.
+        let (timeout_secs, timeout_note) = self.effective_timeout(&args);
+
         let bwrap = which("bwrap");
         let use_sandbox = bwrap.is_some();
         if !use_sandbox && !self.allow_unsandboxed {
@@ -107,7 +125,7 @@ impl Tool for ExecTool {
                 "/usr/bin/timeout".into(),
                 "-k".into(),
                 "2".into(),
-                self.timeout_secs.to_string(),
+                timeout_secs.to_string(),
                 "/bin/sh".into(),
                 "-c".into(),
                 cmd.clone(),
@@ -128,6 +146,14 @@ impl Tool for ExecTool {
                 "[WARNING: running UNSANDBOXED] ".into()
             },
         });
+        // A silently clamped deadline is the worst version of this: the model
+        // would keep asking for longer and never learn why runs keep dying.
+        if let Some(note) = &timeout_note {
+            let _ = sink.send(ExecChunk {
+                stream: ExecStream::Stderr,
+                chunk: format!("{note}\n"),
+            });
+        }
 
         let mut c = Command::new(&program);
         c.args(&pre_args)
@@ -151,7 +177,7 @@ impl Tool for ExecTool {
 
         // Outer safety net: inner `timeout` should already have fired.
         let status = tokio::time::timeout(
-            std::time::Duration::from_secs(self.timeout_secs + 10),
+            std::time::Duration::from_secs(timeout_secs + 10),
             child.wait(),
         )
         .await;
@@ -176,7 +202,7 @@ impl Tool for ExecTool {
                 output: combine(&out, &err),
                 exit_code: None,
                 truncated: false,
-                error: Some(format!("exec: killed after {}s", self.timeout_secs)),
+                error: Some(timeout_error(timeout_secs)),
             };
         }
 
@@ -187,7 +213,7 @@ impl Tool for ExecTool {
                 output: combine(&out, &err),
                 exit_code: code,
                 truncated: false,
-                error: Some(format!("exec: killed after {}s", self.timeout_secs)),
+                error: Some(timeout_error(timeout_secs)),
             };
         }
 
@@ -200,6 +226,50 @@ impl Tool for ExecTool {
             error: None,
         }
     }
+}
+
+impl ExecTool {
+    /// Resolve the per-call deadline. Accepts a JSON number or a numeric string,
+    /// because quantized models emit both. Never exceeds the configured ceiling.
+    fn effective_timeout(&self, args: &Value) -> (u64, Option<String>) {
+        let requested = match args.get("timeout") {
+            Some(Value::Null) | None => None,
+            Some(v) => v.as_u64().or_else(|| {
+                v.as_str()
+                    .map(|s| s.trim().parse::<u64>().ok())
+                    .flatten()
+            }),
+        };
+        let Some(r) = requested else {
+            return (self.timeout_secs, None)
+        };
+        if r == 0 {
+            return (
+                self.timeout_secs,
+                Some(format!(
+                    "note: timeout 0 is not allowed; using the default {n}s",
+                    n = self.timeout_secs
+                )),
+            )
+        }
+        if r > self.timeout_secs {
+            return (
+                self.timeout_secs,
+                Some(format!(
+                    "note: requested timeout {r}s exceeds the configured ceiling; clamped to {c}s",
+                    c = self.timeout_secs
+                )),
+            )
+        }
+        (r, None)
+    }
+}
+
+fn timeout_error(secs: u64) -> String {
+    format!(
+        "exec: killed after {secs}s. Re-run with a larger \'timeout\' if the command \
+         legitimately needs longer (ceiling applies)."
+    )
 }
 
 fn combine(out: &str, err: &str) -> String {
@@ -420,5 +490,52 @@ mod tests {
         let r = t.run(json!({"cmd": "seq 1 2000"}), &ctx, &sink()).await;
         assert!(r.truncated);
         assert!(r.output.len() < 500);
+    }
+
+    // ---- per-call deadline -------------------------------------------------
+
+    #[test]
+    fn per_call_timeout_clamps_to_the_configured_ceiling() {
+        let t = ExecTool { timeout_secs: 30, ..Default::default() };
+        assert_eq!(t.effective_timeout(&json!({})), (30, None));
+        assert_eq!(t.effective_timeout(&json!({"timeout": 5})), (5, None));
+        // Quantized models emit numbers and numeric strings interchangeably.
+        assert_eq!(t.effective_timeout(&json!({"timeout": "8"})), (8, None));
+        let (secs, note) = t.effective_timeout(&json!({"timeout": 3600}));
+        assert_eq!(secs, 30, "the ceiling belongs to the user, not the model");
+        assert!(note.unwrap().contains("clamped to 30s"));
+        let (secs, note) = t.effective_timeout(&json!({"timeout": 0}));
+        assert_eq!(secs, 30, "0 would mean an instant kill");
+        assert!(note.unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn a_short_per_call_timeout_kills_a_long_command() {
+        // Ceiling is generous; the call asks for one second. If the per-call
+        // value were ignored this would take 5s and succeed.
+        let t = ExecTool { timeout_secs: 60, ..Default::default() };
+        let (ctx, _g) = ws();
+        let started = std::time::Instant::now();
+        let r = t.run(json!({"cmd": "sleep 5; echo done", "timeout": 1}), &ctx, &sink()).await;
+        let took = started.elapsed();
+        assert!(!r.ok, "a 1s budget must not complete a 5s command");
+        assert!(took < std::time::Duration::from_secs(4), "took {took:?}");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("killed after 1s"), "err={err}");
+        assert!(err.contains("timeout"), "the model has to be told how to fix it: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_clamped_deadline_is_reported_to_the_model() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let t = ExecTool { timeout_secs: 5, ..Default::default() };
+        let (ctx, _g) = ws();
+        let r = t.run(json!({"cmd": "echo hi", "timeout": 600}), &ctx, &tx).await;
+        assert!(r.ok);
+        let mut seen = String::new();
+        while let Ok(c) = rx.try_recv() {
+            seen.push_str(&c.chunk);
+        }
+        assert!(seen.contains("clamped to 5s"), "chunks={seen:?}");
     }
 }

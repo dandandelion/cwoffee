@@ -108,6 +108,23 @@ pub trait Tool: Send + Sync {
     async fn run(&self, args: Value, ctx: &ToolCtx, sink: &ExecSink) -> ToolResult;
 }
 
+/// Exec knobs that come from config. Kept separate from ExecTool so the registry
+/// remains the single place that decides which tools exist and in what order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecCfg {
+    pub timeout_secs: u64,
+    pub sandbox_enabled: bool,
+}
+
+impl Default for ExecCfg {
+    fn default() -> Self {
+        Self {
+            timeout_secs: crate::config::default_exec_timeout(),
+            sandbox_enabled: true,
+        }
+    }
+}
+
 /// Name-indexed tool set.
 #[derive(Default)]
 pub struct Registry {
@@ -138,8 +155,22 @@ impl Registry {
     /// one cold-prefill turn after an upgrade. That is unavoidable and cheaper
     /// than versioning the tool set.
     pub fn with_v1_tools_search(search: web::SearchBackend) -> Self {
+        Self::with_v1_tools_exec(search, ExecCfg::default())
+    }
+
+    /// The config-driven variant. Without this the `[sandbox]` block parses,
+    /// validates, and then goes nowhere: the registry would build ExecTool with
+    /// its own defaults and the user's timeout and sandbox settings would be
+    /// silently ignored.
+    pub fn with_v1_tools_exec(search: web::SearchBackend, exec: ExecCfg) -> Self {
         let mut r = Self::new();
-        r.register(Box::new(exec::ExecTool::default()));
+        r.register(Box::new(exec::ExecTool {
+            timeout_secs: exec.timeout_secs,
+            // `enabled = false` is a debugging escape hatch; it flips the tool
+            // into unsandboxed mode, which is why it is spelled allow_unsandboxed
+            // on the receiving side.
+            allow_unsandboxed: !exec.sandbox_enabled,
+        }));
         r.register(Box::new(files::ReadFileTool));
         r.register(Box::new(files::WriteFileTool));
         r.register(Box::new(xlsx::WriteXlsxTool));
@@ -242,5 +273,36 @@ mod tests {
             }
         }
         Box::new(S(name.into()))
+    }
+}
+
+#[cfg(test)]
+mod cfg_tests {
+    use super::*;
+
+    /// The `[sandbox]` block has to reach the tool, not just parse. The schema
+    /// description carries the ceiling, so this asserts the whole path:
+    /// config value -> registry -> the number the model is actually told.
+    #[test]
+    fn sandbox_config_reaches_the_exec_tool() {
+        let r = Registry::with_v1_tools_exec(
+            web::SearchBackend::DuckDuckGo,
+            ExecCfg { timeout_secs: 777, sandbox_enabled: true },
+        );
+        let schema = r.get("exec").unwrap().schema();
+        let d = schema["properties"]["timeout"]["description"].as_str().unwrap();
+        assert!(d.contains("777s"), "configured ceiling not surfaced: {d}");
+        assert!(!d.contains("120s"), "default leaked through the config value: {d}");
+    }
+
+    /// Order is load-bearing for the prefix cache; assert it rather than trust it.
+    #[test]
+    fn tool_order_is_fixed() {
+        let r = Registry::with_v1_tools();
+        let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
+        assert_eq!(
+            names,
+            vec!["exec", "read_file", "write_file", "write_xlsx", "web_fetch", "web_search"]
+        );
     }
 }

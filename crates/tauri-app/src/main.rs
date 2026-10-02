@@ -142,7 +142,7 @@ fn main() {
     let (mut host, adopted_model) = tauri::async_runtime::block_on(async {
         let h = SessionHost::spawn(
             provider,
-            Registry::with_v1_tools_search(appcfg.search_backend()),
+            Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg()),
             Arc::clone(&store),
             cfg,
         );
@@ -160,6 +160,13 @@ fn main() {
     eprintln!(
         "[cowry] engine up: url={url} model={model_label} workspace={} mode={:?}",
         workspace.display(), mode
+    );
+    // The exec deadline used to be invisible: a [sandbox] block that parsed,
+    // validated, and then went nowhere looked identical to one that worked.
+    let ec = appcfg.exec_cfg();
+    eprintln!(
+        "[cowry] exec: ceiling {}s, sandbox={}",
+        ec.timeout_secs, ec.sandbox_enabled
     );
 
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();
