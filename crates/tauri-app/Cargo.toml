@@ -3,7 +3,7 @@ name = "cowry-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cowry desktop host. Thin: plumbing + the GPU policy, nothing else."
+description = "Local-model co-work agent: chat, tools, sandboxed commands, and document output."
 
 # This crate is deliberately boring. If logic is accumulating here, it belongs
 # in crates/engine instead.

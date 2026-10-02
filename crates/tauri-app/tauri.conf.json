@@ -29,11 +29,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["rpm", "appimage"],
+    "targets": [
+      "rpm",
+      "appimage"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/icon.png"
-    ]
+    ],
+    "publisher": "cowry",
+    "homepage": "https://cowry.dev",
+    "license": "Apache-2.0",
+    "category": "Utility",
+    "longDescription": "Cowry runs a tool-using agent against any OpenAI- or Anthropic-compatible endpoint, including a local llama.cpp server. Sessions are stored in SQLite with full-text search; commands run inside a bubblewrap sandbox; output includes spreadsheets and documents, not just chat text."
   }
 }

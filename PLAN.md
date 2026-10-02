@@ -146,12 +146,14 @@ Engine allows exactly one in-flight turn. Queued work shows a **prefill ETA** (`
 
 | | Milestone | Est. | Acceptance |
 |---|---|---|---|
-| M0 | Skeleton: workspace, Tauri hello, Svelte+Tailwind wired, `Channel` proven with a fake streamer | 2–3 d | a token stream paints in the webview with no jank |
-| M1 | **Engine + TUI**: 3 adapters, SSE, tool-call normalization, JSON repair, agent loop, append-only `PromptBuilder` + cache-stability tests, SQLite sessions, `exec` in bwrap, approvals, ratatui client | 1.5–2 w | real BYOM tool-calling conversation from a terminal |
-| M2 | **Chat surface**: sidebar, virtualized list, streaming markdown, tool cards, composer + pickers, mid-stream session switching | 2 w | 40% of perceived quality — do not rush |
-| M3 | **Doc tools**: typst→PDF (3 templates), xlsx writer, attachment chips, in-app preview | 1–1.5 w | "spreadsheet + PDF report" works end to end |
-| M4 | **Research**: `web_search` + `web_fetch` → readability → markdown, inline citations | 3–4 d | cited multi-source answer |
-| M5 | **Shell & polish**: custom titlebar, pastel sidebar, themes, shortcuts, packaging, release profile | 1–1.5 w | matches the mock; `cowry` binary ~10 MB |
+| | Milestone | Status | Acceptance |
+|---|---|---|---|
+| M0 | Skeleton: workspace, Tauri hello, Svelte+Tailwind wired, `Channel` proven with a fake streamer | **done** | a token stream paints in the webview with no jank |
+| M1 | **Engine + TUI**: adapters, SSE, tool-call normalization, JSON repair, agent loop, append-only `PromptBuilder`, SQLite sessions, `exec` in bwrap, approvals, ratatui client | **done** | real BYOM tool-calling conversation from a terminal |
+| M2 | **Chat surface**: sidebar, imperative transcript, markdown on stream end, tool cards, composer + pickers, session switching | **done** | the webview drives the real engine |
+| M3 | **Doc tools**: xlsx writer, docx writer, LibreOffice→PDF | **mostly done** — typst templates and attachment chips not started | "spreadsheet + PDF report" works end to end |
+| M4 | **Research**: `web_search` + `web_fetch` → readability → markdown | **done**, inline citations not started | cited multi-source answer |
+| M5 | **Shell & polish**: custom titlebar, themes, shortcuts, packaging | **partly done** — RPM builds, themes/shortcuts pending | matches the mock; binary ~10 MB |
 
 **Total ~6–8 weeks solo.** M1 and M2 are the ones that slip; guard them.
 
@@ -242,6 +244,44 @@ Tauri v2 resolves these two things **relative to different directories**:
 Verified empirically (`beforeDevCommand: pwd` printed `.../cowry/crates`). Getting
 this wrong produces a confusing `ENOENT .../Projects/ui/package.json`. `dev.sh`
 always runs the CLI from `crates/tauri-app`, so the values above are stable.
+
+### M1 + M2 — done, measured against the live model
+
+Engine: `410b1d3 … 25be6a8`. Desktop wiring: `cb7ead0 … ea8f9d5`.
+
+What the live runs proved, rather than what unit tests prove:
+
+```
+prefix cache      turn1 prompt=324 cached=0    raw_prefill=119/s
+                  turn2 prompt=347 cached=319  eff_prefill=452/s (92% hit)
+agent + tools     model emitted exec(ls -la) -> repaired args -> approval
+                  round-trip -> bwrap -> result fed back -> second round-trip
+fail closed       ask mode + nobody answers -> 12s timeout -> tool end ok=false
+                  -> loop still received a result and finished the turn
+documents         write_xlsx -> numeric cells 1200/300/90 confirmed in the package
+                  write_file(.pdf) -> summary.pdf, read back with pdftotext
+                  the model then ran `exec ls -l` to check its own output
+memory            release desktop app 248.2 MB PSS total; TUI 6.8 MB PSS
+gpu               renderD128 only, debug and release
+packaging         target/release/bundle/rpm/cowry-0.0.0-1.x86_64.rpm (4.77 MiB)
+```
+
+Three bugs worth remembering because they were only visible at runtime:
+
+- `SessionHost::spawn` calls `tokio::spawn`, which panics with "no reactor running"
+  from bare `main()`. Tauri's async runtime *is* tokio, so the host is constructed
+  inside `block_on`.
+- The workspace defaulted to the process CWD, which under `tauri dev` is
+  `crates/tauri-app`. A GUI app launched by a window manager inherits an arbitrary
+  CWD; an agent silently editing the wrong tree is a bad class of failure.
+- A TUI wrapping bug looped forever on a 0-width pane and reached **8.7 GB PSS**,
+  pushing the box into swap mid-inference. `0x0` geometry is now refused at startup
+  rather than defended at every call site.
+
+The M0 lesson held: every gate below is a *render* or *round-trip* assertion, not a
+liveness check. Process alive + memory in budget + socket open all passed while the
+window was visibly showing a stale error overlay.
+
 
 ---
 
