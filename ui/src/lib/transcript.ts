@@ -13,7 +13,7 @@
  */
 
 import type { EngineEvent, ExecStream, StoredMessage } from './events'
-import { renderMarkdown } from './markdown'
+import { renderMarkdown, LiveMarkdown } from './markdown'
 import { pageLog } from './pagelog'
 
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
@@ -42,6 +42,11 @@ export class Transcript {
    * at stream end — never per delta.
    */
   private answerEls: HTMLElement[] = []
+  // Live markdown state for the answer block currently streaming.
+  private liveEl: HTMLElement | null = null
+  private live = new LiveMarkdown()
+  private lastLiveRender = 0
+  private liveTimer = 0
 
   constructor(root: HTMLElement) {
     this.root = root
@@ -63,6 +68,8 @@ export class Transcript {
     this.textBuf = null
     this.tools.clear()
     this.answerEls = []
+    this.liveEl = null
+    this.live = new LiveMarkdown()
   }
 
   /** Total answer text streamed so far this turn. Used by the render self-report. */
@@ -101,16 +108,62 @@ export class Transcript {
     const joined = this.pending.join('')
     this.pending = []
     if (!this.textBuf) return
-    this.textBuf.appendChild(document.createTextNode(joined))
+    if (this.textKind === 'answer') {
+      // Answers format as they arrive. The naive version re-parses the whole
+      // answer on every frame, which is what makes streaming UIs stutter on a
+      // local model; instead only the still-growing tail block is re-parsed and
+      // finished blocks are rendered exactly once.
+      this.live.push(joined)
+      this.renderLive(false)
+    } else {
+      this.textBuf.appendChild(document.createTextNode(joined))
+    }
     this.scrollIfNeeded()
+  }
+
+  /**
+   * Render the streaming answer.
+   *
+   * `force` is used at turn end, where correctness matters more than cost and a
+   * single full pass is cheap.
+   */
+  private renderLive(force: boolean) {
+    if (!this.liveEl) return
+    const now = performance.now()
+    if (!force && now - this.lastLiveRender < LIVE_RENDER_MS) {
+      // Do not drop the update; re-render when the throttle window closes.
+      if (!this.liveTimer) {
+        this.liveTimer = window.setTimeout(() => {
+          this.liveTimer = 0
+          this.renderLive(false)
+        }, LIVE_RENDER_MS)
+      }
+      return
+    }
+    this.lastLiveRender = now
+    this.liveEl.innerHTML = this.live.render()
+  }
+
+  /** Start a fresh live-render target. */
+  private beginLive(el: HTMLElement) {
+    this.liveEl = el
+    this.live = new LiveMarkdown()
+    this.lastLiveRender = 0
   }
 
   private push(s: string, kind: BlockKind) {
     if (this.textKind !== kind || !this.textBuf) {
+      // Leaving an answer block: finish its markdown before anything else is
+      // appended, so a tool call in the middle of an answer cannot truncate the
+      // formatting of the part already on screen.
+      if (this.textKind === 'answer') this.finalizeAnswer()
       const label = kind === 'reasoning' ? 'thinking' : kind === 'user' ? 'you' : 'cowry'
       this.textBuf = this.block(kind, label)
       this.textKind = kind
-      if (kind === 'answer') this.answerEls.push(this.textBuf)
+      if (kind === 'answer') {
+        this.answerEls.push(this.textBuf)
+        this.beginLive(this.textBuf)
+      }
     }
     this.pending.push(s)
     if (!this.raf) this.raf = requestAnimationFrame(() => this.flush())
@@ -175,7 +228,7 @@ export class Transcript {
         break
       case 'turnEnd':
         this.flushNow()
-        this.renderAnswers()
+        this.finalizeAnswer()
         this.textBuf = null
         this.textKind = null
         break
@@ -190,21 +243,30 @@ export class Transcript {
   flushNow() {
     if (this.raf) cancelAnimationFrame(this.raf)
     this.raf = 0
+    if (this.liveTimer) {
+      clearTimeout(this.liveTimer)
+      this.liveTimer = 0
+    }
     this.flush()
   }
 
   /**
-   * One markdown pass per answer block, at stream end. This is the only place
-   * innerHTML is ever assigned, and `renderMarkdown` escapes first so the only
-   * tags in the result are ones it wrote.
+   * Final full markdown pass over the streaming answer.
+   *
+   * During streaming only the tail block is re-parsed; at the end one pass over
+   * the whole source guarantees the displayed result matches what
+   * `renderMarkdown` would produce for the stored text.
    */
-  private renderAnswers() {
-    for (const el of this.answerEls) {
-      const text = el.textContent ?? ''
-      if (!text) continue
-      el.innerHTML = renderMarkdown(text)
+  private finalizeAnswer() {
+    if (this.liveTimer) {
+      clearTimeout(this.liveTimer)
+      this.liveTimer = 0
     }
-    this.answerEls = []
+    if (this.liveEl) {
+      if (this.live.text) this.liveEl.innerHTML = this.live.finish()
+      this.liveEl = null
+    }
+    this.live = new LiveMarkdown()
   }
 
   // ---- user echo ----------------------------------------------------------
@@ -374,6 +436,9 @@ export class Transcript {
     return frag
   }
 }
+
+/** Minimum interval between live markdown passes. */
+const LIVE_RENDER_MS = 120
 
 function parseCalls(jsonStr: string): Array<{ id: string; name: string; arguments: string }> {
   if (!jsonStr) return []

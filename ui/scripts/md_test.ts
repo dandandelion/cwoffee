@@ -4,7 +4,7 @@
  * The security cases are the point. Model output quotes fetched web pages, so
  * anything that reaches this function is untrusted input from the internet.
  */
-import { renderMarkdown, escapeHtml } from '../src/lib/markdown.ts'
+import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks } from '../src/lib/markdown.ts'
 
 let failed = 0
 function eq(name: string, got: string, want: string) {
@@ -135,6 +135,66 @@ const nasty2 = 'a'.repeat(50000) + '\n' + '- '.repeat(20000)
 const t1 = Date.now()
 renderMarkdown(nasty2)
 ok('large input is fast', Date.now() - t1 < 1000, `took ${Date.now() - t1}ms`)
+
+// ---- incremental streaming ------------------------------------------------
+
+const doc = [
+  '# Title',
+  '',
+  'First paragraph with **bold**.',
+  '',
+  '- one',
+  '- two',
+  '',
+  '```rust',
+  'fn main() { println!("hi"); }',
+  '```',
+  '',
+  'Tail paragraph.',
+].join('\n')
+
+// Word-by-word streaming must end at exactly the same DOM as a single pass,
+// otherwise reloading a session shows something different from what was watched.
+const lm = new LiveMarkdown()
+for (const w of doc.split(/(?<=\s)/)) lm.push(w)
+const streamed = lm.render()
+const final = lm.finish()
+ok('streamed render matches a single pass', streamed === final,
+   `\n  streamed: ${streamed.slice(0, 160)}\n  final:    ${final.slice(0, 160)}`)
+
+// Finished blocks must not be re-parsed on every frame - that is the whole point.
+const lm2 = new LiveMarkdown()
+let renders = 0
+for (const w of doc.split(/(?<=\s)/)) {
+  lm2.push(w)
+  lm2.render()
+  renders++
+}
+ok('frozen blocks are never re-parsed', lm2.refrozen === 0, `refrozen=${lm2.refrozen}`)
+ok('tail-only rendering is cheaper than full re-render', renders > 10, `renders=${renders}`)
+
+// An open fence stays in the tail: its contents must render as code while still
+// streaming, not as paragraphs that then reflow when the closing ``` lands.
+const lm3 = new LiveMarkdown()
+lm3.push('intro\n\n```\nlet a = 1\n')
+const mid = lm3.render()
+ok('open fence renders as code mid-stream', mid.includes('<pre>') && mid.includes('let a = 1'), mid)
+lm3.push('```\n')
+ok('closed fence still code', lm3.render().includes('<pre>'))
+
+// Blank lines inside a fence must not split the block.
+const blocks = splitBlocks('```\nline1\n\nline2\n```\n')
+ok('blank line inside a fence does not split the block', blocks.length === 1,
+   `blocks=${blocks.length}: ${JSON.stringify(blocks)}`)
+ok('blank line outside a fence splits', splitBlocks('a\n\nb\n').length === 2)
+
+// HTML from the model stays inert even mid-stream, not just at the end.
+const lm4 = new LiveMarkdown()
+lm4.push('text\n\n<img src=x onerror=alert(1)>')
+ok('mid-stream html is escaped', !lm4.render().includes('<img'), lm4.render())
+
+// Empty and whitespace-only sources must not throw or emit stray tags.
+ok('empty source renders empty', new LiveMarkdown().render() === '')
 
 if (failed) {
   console.log(`\n${failed} markdown test(s) failed`)

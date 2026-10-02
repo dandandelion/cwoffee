@@ -242,3 +242,82 @@ export function renderMarkdown(src: string): string {
   closeList()
   return html.join('\n')
 }
+
+/**
+ * Split markdown into blocks at blank lines, keeping fenced code intact.
+ *
+ * Only blocks that cannot change again may be frozen: a block ends at a blank
+ * line outside a fence, and a fence is only complete once its closing ``` has
+ * arrived. An unterminated fence therefore stays in the tail and keeps being
+ * re-rendered as its contents stream in.
+ */
+export function splitBlocks(src: string): string[] {
+  const out: string[] = []
+  let buf = ''
+  let inFence = false
+  for (const line of src.split('\n')) {
+    if (line.trimStart().startsWith('```')) inFence = !inFence
+    buf += line + '\n'
+    if (!inFence && line.trim() === '') {
+      out.push(buf)
+      buf = ''
+    }
+  }
+  if (buf) out.push(buf)
+  return out
+}
+
+/**
+ * Incremental markdown for streaming text.
+ *
+ * Re-parsing the whole answer on every frame is what makes a streaming UI stutter
+ * on a local model: the parser costs more than token generation does. This keeps
+ * finished blocks rendered exactly once and re-parses only the tail block that is
+ * still growing.
+ *
+ * `finish()` deliberately re-renders the whole source. During streaming the
+ * output is allowed to be a good approximation; the final DOM must match what a
+ * single pass over the stored text produces, or a reload would show something
+ * different from what the user just watched.
+ */
+export class LiveMarkdown {
+  private src = ''
+  private frozenHtml = ''
+  private frozenCount = 0
+  /** Count of render() calls that re-parsed a frozen block; used by tests. */
+  refrozen = 0
+
+  push(chunk: string) {
+    this.src += chunk
+  }
+
+  get text(): string {
+    return this.src
+  }
+
+  render(): string {
+    const blocks = splitBlocks(this.src)
+    const complete = Math.max(0, blocks.length - 1)
+    if (complete > this.frozenCount) {
+      for (let i = this.frozenCount; i < complete; i++) {
+        // Blocks are joined with a newline so the incremental output is byte for
+        // byte what a single pass produces. Without it the DOM shifts at stream
+        // end, which reads as a flicker.
+        this.frozenHtml += (this.frozenHtml ? '\n' : '') + renderMarkdown(blocks[i])
+      }
+      this.frozenCount = complete
+    } else if (complete < this.frozenCount) {
+      // The source shrank or re-blocked; the cache is no longer valid.
+      this.frozenHtml = ''
+      this.frozenCount = 0
+      this.refrozen++
+    }
+    const tail = blocks.slice(this.frozenCount).join('')
+    if (!tail) return this.frozenHtml
+    return this.frozenHtml + (this.frozenHtml ? '\n' : '') + renderMarkdown(tail)
+  }
+
+  finish(): string {
+    return renderMarkdown(this.src)
+  }
+}

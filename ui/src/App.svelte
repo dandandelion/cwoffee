@@ -34,6 +34,7 @@
   let editingId = $state<number | null>(null)
   let editTitle = $state('')
   let confirmDeleteId = $state<number | null>(null)
+  let sidebarOpen = $state(false)
   let models = $state<string[]>([])
 
   let gpu = $state<GpuReport | null>(null)
@@ -206,6 +207,7 @@
 
   async function runSearch() {
     const q = query.trim()
+    closeDrawerOnMobile()
     if (!q) {
       hits = []
       searchErr = ''
@@ -220,9 +222,16 @@
     }
   }
 
+  function closeDrawerOnMobile() {
+    // The drawer overlays the transcript on narrow screens; leaving it open after
+    // a tap hides the thing the tap was meant to show.
+    if (matchMedia('(max-width: 767px)').matches) sidebarOpen = false
+  }
+
   async function openSession(id: number) {
     // Fire the command; the transcript reload happens on the sessionChanged
     // event so it is ordered after the host has actually moved.
+    closeDrawerOnMobile()
     try {
       await invoke('switch_session', { id })
     } catch (e) {
@@ -509,6 +518,11 @@
   >
     <img src="/icon.png" alt="" class="h-5 w-5 rounded" />
     <span class="text-[13px] font-medium tracking-tight">cowry</span>
+    <!-- Sidebar toggle: below 768px the sidebar is a drawer, and without this
+         button the session list and search are simply unreachable. -->
+    <button class="iconbtn sidemenu" onclick={() => (sidebarOpen = !sidebarOpen)} aria-label="Sessions">
+      <svg width="14" height="14" viewBox="0 0 14 14"><path d="M2 4h10M2 7h10M2 10h10" stroke="currentColor" stroke-width="1.3"/></svg>
+    </button>
     <span class="ml-2 text-[11px] text-ink-3">{model || 'connecting…'}</span>
 
     <div class="ml-auto flex items-center gap-1">
@@ -526,8 +540,12 @@
 
   <!-- ============================= body ============================== -->
   <div class="flex min-h-0 flex-1">
+    {#if sidebarOpen}
+      <button class="scrim" onclick={() => (sidebarOpen = false)} aria-label="Close sidebar"></button>
+    {/if}
     <aside
-      class="hidden w-[248px] shrink-0 flex-col gap-2 border-r border-hairline p-3 sm:flex"
+      class="sidebar w-[248px] shrink-0 flex-col gap-2 border-r border-hairline p-3 min-h-0"
+      class:open={sidebarOpen}
       style="background: linear-gradient(160deg, var(--color-wash-1), var(--color-wash-2) 55%, var(--color-wash-3));"
     >
       <button class="pill px-3 py-1.5 text-left text-[13px] font-medium" onclick={newSession}>
@@ -542,6 +560,11 @@
       />
       {#if searchErr}<div class="text-[11px] text-[#8b3d3d]">{searchErr}</div>{/if}
 
+      <!-- The list scrolls inside the sidebar. Without min-h-0 a flex item's
+           min-height defaults to `auto`, i.e. its content height, so N sessions
+           grew the sidebar, which grew the row, which pushed the composer and
+           the telemetry bar off-screen. -->
+      <div class="sesslist min-h-0 flex-1 overflow-y-auto">
       {#if hits.length}
         <div class="mt-2 px-1 text-[11px] uppercase tracking-wide text-ink-3">Search</div>
         {#each hits as h}
@@ -583,10 +606,11 @@
           </div>
         {/each}
       {/if}
+      </div>
     </aside>
 
     <!-- main -->
-    <main class="flex min-w-0 flex-1 flex-col">
+    <main class="flex min-w-0 flex-1 flex-col min-h-0">
       <div class="scroller min-h-0 flex-1 overflow-y-auto px-6 py-6">
         {#if hasOlder}
           <button class="btn-ghost mb-3 text-[12px]" onclick={loadOlder} disabled={loadingOlder}>
@@ -680,7 +704,7 @@
   </div>
 
   <!-- ========================== telemetry bar ========================= -->
-  <footer class="flex h-9 shrink-0 items-center gap-4 border-t border-hairline bg-paper-2 px-4 text-[11.5px] text-ink-2">
+  <footer class="telem flex h-9 shrink-0 items-center gap-4 border-t border-hairline bg-paper-2 px-4 text-[11.5px] text-ink-2">
     <span title="prefix cache hit — the number that explains most perceived latency on a local model">
       ⚡ cache <b class="text-ink">{fmt.pct(cacheHit)}</b>
       <span class="text-ink-3">({cachedTokens}/{promptTokens})</span>
@@ -693,8 +717,8 @@
       decode <b class="text-ink">{fmt.rate(curDecode)}</b>
       <span class="text-ink-3">· avg {fmt.rate(avgDecode)}</span>
     </span>
-    <span>spec <b class="text-ink">{fmt.pct(specPct)}</b></span>
-    <span>ttft <b class="text-ink">{ttft}</b>ms</span>
+    <span class="telem-extra">spec <b class="text-ink">{fmt.pct(specPct)}</b></span>
+    <span class="telem-extra">ttft <b class="text-ink">{ttft}</b>ms</span>
     {#if hostState?.context_tokens}
       <span>ctx <b class="text-ink">{hostState.context_tokens}</b></span>
     {/if}
@@ -711,7 +735,7 @@
       >
         ipc {ipc.ok ? '✓' : '✗'}
       </span>
-      <span title="frames sampled during the last turn">
+      <span class="telem-extra" title="frames sampled during the last turn">
         jank <b class={dropped > 0 ? 'text-shell-deep' : 'text-ink'}>{dropped}</b>
         <span class="text-ink-3">/ {frames} f · worst {worstFrame.toFixed(0)}ms</span>
       </span>

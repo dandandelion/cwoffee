@@ -47,6 +47,14 @@ body {
   overflow: hidden;
 }
 
+/* The app root is `h-full`, which resolves against #app. If #app has no height
+   it is auto, so the whole layout sizes to its content and nothing is ever
+   constrained: a long transcript or a long session list pushes the composer and
+   the telemetry bar below the bottom of the window. */
+#app {
+  height: 100%;
+}
+
 /* ---------------------------------------------------------------------------
    Frameless-window chrome.
    The drag region is Tauri's mechanism (data-tauri-drag-region); do not
@@ -345,3 +353,63 @@ body {
 }
 .iconbtn:hover { background: var(--color-hairline); color: var(--color-ink); }
 .iconbtn.wide { width: auto; padding: 0 7px; font-size: 11px; }
+
+/* ---------------------------------------------------------------------------
+   Narrow viewports (phone over the LAN gateway, or a small window).
+   The sidebar becomes an overlay drawer; the telemetry bar drops the items that
+   are diagnostics rather than status.
+--------------------------------------------------------------------------- */
+.sidebar {
+  display: flex;
+}
+
+.sidemenu {
+  display: none;
+}
+
+.scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  background: rgba(20, 18, 15, 0.34);
+  z-index: 30;
+}
+
+@media (max-width: 767px) {
+  .sidebar {
+    position: absolute;
+    z-index: 40;
+    top: 2.75rem;      /* below the titlebar */
+    bottom: 0;
+    left: 0;
+    width: 78%;
+    max-width: 320px;
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
+    box-shadow: 2px 0 14px rgba(0, 0, 0, 0.16);
+  }
+  .sidebar.open {
+    transform: translateX(0);
+  }
+  .sidemenu {
+    display: inline-flex;
+  }
+  /* Keep the status that matters on a small screen; drop the diagnostics. */
+  .telem .telem-extra {
+    display: none;
+  }
+  .telem {
+    gap: 10px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+  /* Tap targets: 11px text with a 20px hit area is unusable with thumbs. */
+  .composer textarea {
+    font-size: 16px;   /* <16px triggers zoom-on-focus on iOS */
+  }
+  .pill {
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+}
