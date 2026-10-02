@@ -31,6 +31,12 @@
   let searchErr = $state('')
 
   let approval = $state<{ id: number; tool: string; risk: string; summary: string } | null>(null)
+  // A turn blocked on a human and a turn still computing look identical unless the
+  // UI says otherwise: same disabled button, same spinner-ish label. That is how a
+  // web_search that was simply waiting for approval read as "stuck".
+  let approvalDeadline = $state(0)
+  let approvalLeft = $state(0)
+  let tick: number | undefined = undefined
   let editingId = $state<number | null>(null)
   let editTitle = $state('')
   let confirmDeleteId = $state<number | null>(null)
@@ -79,10 +85,16 @@
   }
 
   // ---- event handling -----------------------------------------------------
+  // Counted so the self-test can tell "the command was accepted" apart from
+  // "the UI actually reacted", which is the difference between a host bug and a
+  // front-end bug when a session click appears to do nothing.
+  let sessionChangedCount = 0
+
   function handle(ev: EngineEvent) {
     transcript?.apply(ev)
     switch (ev.kind) {
       case 'sessionChanged':
+        sessionChangedCount++
         // The host tells us when the switch actually landed. Loading the
         // transcript from the UI right after invoke() would race the host task
         // and can render the previous session's messages under the new name.
@@ -114,6 +126,14 @@
         break
       case 'approvalRequested':
         approval = { id: ev.d.id, tool: ev.d.tool, risk: ev.d.risk, summary: ev.d.summary }
+        const secs = hostState?.approval_timeout_secs ?? 300
+        approvalDeadline = Date.now() + secs * 1000
+        approvalLeft = secs
+        if (tick === undefined) {
+          tick = window.setInterval(() => {
+            approvalLeft = Math.max(0, Math.round((approvalDeadline - Date.now()) / 1000))
+          }, 1000)
+        }
         pageLog(`approval ${ev.d.id}: ${ev.d.summary}`)
         break
       case 'usage': {
@@ -140,6 +160,10 @@
         transcript?.flushNow()
         busy = false
         approval = null
+        if (tick !== undefined) {
+          window.clearInterval(tick)
+          tick = undefined
+        }
         stopFrames()
         pageLog(
           `turn end chars=${transcript?.streamedChars ?? 0} frames=${frames} ` +
@@ -184,6 +208,10 @@
     if (!approval) return
     const id = approval.id
     approval = null
+    if (tick !== undefined) {
+      window.clearInterval(tick)
+      tick = undefined
+    }
     try {
       await invoke('respond_approval', { id, answer: a })
     } catch (e) {
@@ -436,6 +464,37 @@
       const st = await invoke<HostState>('session_state')
       if (st.model !== pick) fail(`set_model did not stick: state=${st.model} wanted=${pick}`)
 
+      // Re-selecting a session has to actually move the host AND make the UI
+      // reload. invoke() resolving only proves the command was accepted.
+      const stNow = await invoke<HostState>('session_state')
+      const other = after.find((s) => s.id !== stNow.session_id)
+      if (other) {
+        const evBefore = sessionChangedCount
+        const domBefore = (rootEl?.textContent ?? '').trim()
+        await openSession(other.id)
+        const deadline = performance.now() + 5000
+        while (sessionChangedCount === evBefore && performance.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 100))
+        }
+        if (sessionChangedCount === evBefore)
+          fail(`openSession(${other.id}) produced no sessionChanged event`)
+        const stAfter = await invoke<HostState>('session_state')
+        if (stAfter.session_id !== other.id)
+          fail(`host did not move: state=${stAfter.session_id} wanted=${other.id}`)
+        // Give the event-driven transcript reload a chance to land.
+        let domChanged = false
+        const d2 = performance.now() + 3000
+        while (performance.now() < d2) {
+          await new Promise((r) => setTimeout(r, 100))
+          if ((rootEl?.textContent ?? '').trim() !== domBefore) {
+            domChanged = true
+            break
+          }
+        }
+        if (!domChanged && other.message_count !== stNow.turns)
+          fail(`transcript DOM unchanged after selecting session ${other.id}`)
+      }
+
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +
@@ -445,6 +504,18 @@
       fail(String(e))
       pageLog(`SELFTEST FAILED (${fails}): aborted before the summary`)
     }
+  }
+
+  // y / a / n answer an approval without hunting for the mouse. Ignored while a
+  // text field has focus, so typing "no" into the composer cannot deny a tool call.
+  function onApprovalKey(e: KeyboardEvent) {
+    if (!approval) return
+    const t = e.target as HTMLElement | null
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+    const k = e.key.toLowerCase()
+    if (k === 'y') { e.preventDefault(); answer('allow') }
+    else if (k === 'a') { e.preventDefault(); answer('allowSession') }
+    else if (k === 'n' || k === 'escape') { e.preventDefault(); answer('deny') }
   }
 
   // ---- window controls (frameless) ---------------------------------------
@@ -459,13 +530,37 @@
     winErr = String(e)
     console.error('[cowry] getCurrentWindow failed:', e)
   }
-  async function closeWin() { await win?.close() }
-  async function minimize() { await win?.minimize() }
+  // A missing permission, a missing window handle, or a null `win` all look
+  // identical from the outside: the button does nothing. Log which one it was.
+  function winFail(what: string, e: unknown) {
+    pageLog(`window ${what} failed: ${e}${win ? '' : ' (no window handle)'}`)
+  }
+  async function closeWin() {
+    try {
+      await win?.close()
+    } catch (e) {
+      winFail('close', e)
+    }
+  }
+  async function minimize() {
+    try {
+      await win?.minimize()
+    } catch (e) {
+      winFail('minimize', e)
+    }
+  }
   async function toggleMax() {
-    if (!win) return
-    const m = await win.isMaximized()
-    if (m) await win.unmaximize()
-    else await win.maximize()
+    if (!win) {
+      winFail('maximize', 'getCurrentWindow() failed')
+      return
+    }
+    try {
+      const m = await win.isMaximized()
+      if (m) await win.unmaximize()
+      else await win.maximize()
+    } catch (e) {
+      winFail('maximize', e)
+    }
   }
 
   // ---- render self-report ------------------------------------------------
@@ -532,6 +627,13 @@
   })
 
   onDestroy(stopFrames)
+
+  // Window-level: the root div has no tabindex, so a keydown bound there would
+  // simply never fire.
+  onMount(() => {
+    window.addEventListener('keydown', onApprovalKey)
+    return () => window.removeEventListener('keydown', onApprovalKey)
+  })
 
   function onKey(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -663,10 +765,13 @@
               Approve · {approval.tool} ({approval.risk})
             </div>
             <div class="mt-1 font-mono text-[13px]">{approval.summary}</div>
-            <div class="mt-3 flex gap-2">
-              <button class="btn-go" onclick={() => answer('allow')}>Allow</button>
-              <button class="btn-ghost" onclick={() => answer('allowSession')}>Allow for session</button>
-              <button class="btn-bad" onclick={() => answer('deny')}>Deny</button>
+            <div class="mt-3 flex items-center gap-2">
+              <button class="btn-go" onclick={() => answer('allow')}>Allow (y)</button>
+              <button class="btn-ghost" onclick={() => answer('allowSession')}>Allow for session (a)</button>
+              <button class="btn-bad" onclick={() => answer('deny')}>Deny (n)</button>
+              <span class="ml-auto text-[11.5px] text-ink-3" title="Unanswered approvals fail closed">
+                auto-denies in {approvalLeft}s
+              </span>
             </div>
           </div>
         </div>
@@ -686,11 +791,11 @@
 
           <div class="mt-2 flex items-center gap-2 text-[12px] text-ink-2">
             <button
-              class="btn-go {busy ? 'opacity-40' : ''}"
+              class="btn-go {busy || approval ? 'opacity-40' : ''}"
               onclick={send}
               disabled={busy || !draft.trim()}
             >
-              {busy ? 'working…' : 'Send'}
+              {approval ? 'waiting on you' : busy ? 'working…' : 'Send'}
             </button>
             {#if busy}
               <button class="btn-ghost" onclick={() => invoke('cancel_turn')}>Cancel</button>

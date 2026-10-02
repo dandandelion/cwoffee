@@ -58,6 +58,7 @@ export interface HostState {
   turns: number
   context_tokens: number
   compactions: number
+  approval_timeout_secs: number
 }
 
 export interface Session {

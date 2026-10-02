@@ -174,6 +174,15 @@ body {
   min-width: 0;
 }
 
+/* pre-wrap is right for plain-text bodies (user, reasoning, tool output) where
+   the newlines are the author's. It is wrong for a markdown body: renderMarkdown
+   emits block tags separated by newlines, and pre-wrap turns those inter-tag
+   newlines into real blank lines - which is what made a four-item list render as
+   four widely spaced paragraphs. */
+.blk-answer .blk-body {
+  white-space: normal;
+}
+
 .blk-user .blk-body { color: var(--color-ink); }
 .blk-answer .blk-body { color: var(--color-ink); }
 .blk-reasoning .blk-body {
@@ -187,10 +196,13 @@ body {
 .blk-fail .blk-body { color: #8b3d3d; }
 
 /* tool card */
+/* Not a 62px/1fr grid. The head is display:none, so it is not a grid item, and
+   that silently shifted .tool-args into the 62px column - arguments wrapped at
+   about eight monospace characters. One column keeps args and output full width. */
 .blk-tool {
-  grid-template-columns: 62px 1fr;
+  display: block;
 }
-.blk-tool .blk-head { display: none; }
+.blk-tool .blk-head { display: flex; align-items: baseline; }
 .blk-tool > .tool-name,
 .blk-tool > .tool-status { display: inline; }
 
@@ -305,7 +317,12 @@ body {
 .blk-body h2 { font-size: 17px; }
 .blk-body h3 { font-size: 15px; }
 .blk-body h4 { font-size: 14px; }
+/* Tailwind preflight sets `ul, ol { list-style: none }`. Restoring the marker is
+   on us; without it a list renders as indented, bullet-less paragraphs. */
 .blk-body ul, .blk-body ol { margin: 0 0 10px; padding-left: 22px; }
+.blk-body ul { list-style: disc; }
+.blk-body ol { list-style: decimal; }
+.blk-body ul ul, .blk-body ol ol, .blk-body ul ol, .blk-body ol ul { margin-bottom: 0; }
 .blk-body li { margin: 2px 0; }
 .blk-body code {
   font-family: var(--font-mono);

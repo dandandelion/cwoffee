@@ -89,6 +89,10 @@ pub struct HostState {
     pub turns: u64,
     pub context_tokens: usize,
     pub compactions: u32,
+    /// Seconds before an unanswered approval fails closed. The UI shows this as a
+    /// countdown: a turn blocked on a human looks identical to a turn still
+    /// working, and that difference is the entire message.
+    pub approval_timeout_secs: u64,
 }
 
 pub struct SessionHost {
@@ -131,6 +135,7 @@ impl SessionHost {
             turns: 0,
             context_tokens: 0,
             compactions: 0,
+            approval_timeout_secs: cfg.approval_timeout.as_secs(),
         }));
 
         let state_bg = Arc::clone(&state);
