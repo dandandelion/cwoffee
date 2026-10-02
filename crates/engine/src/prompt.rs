@@ -98,6 +98,15 @@ impl PromptBuilder {
     /// Append a user turn. `env_block` is attached here because this message is
     /// new bytes regardless, so including it cannot invalidate the prefix.
     pub fn push_user(&mut self, text: impl Into<String>) {
+        self.push_user_with(text, Vec::new())
+    }
+
+    /// Append a user turn that carries attachments (images in v1).
+    pub fn push_user_with(
+        &mut self,
+        text: impl Into<String>,
+        attachments: Vec<crate::provider::Attachment>,
+    ) {
         let text = text.into();
         let content = if self.env_block.is_empty() {
             text
@@ -109,6 +118,7 @@ impl PromptBuilder {
         self.history.push(Message {
             role: Role::User,
             content,
+            attachments,
             ..Default::default()
         });
     }

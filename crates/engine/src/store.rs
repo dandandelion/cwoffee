@@ -52,7 +52,7 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Current schema version. Bump with a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -78,6 +78,9 @@ pub struct StoredMessage {
     /// Anthropic attests thinking blocks with a signature and will reject a
     /// replayed block without one. Losing this makes a resumed session 400.
     pub reasoning_signature: String,
+    /// Metadata only: mime, filename, decoded size. The payload lives in the
+    /// attachments table and is loaded by `history()`, never by transcript reads.
+    pub attachments: Vec<crate::provider::AttachmentMeta>,
     pub created_at: i64,
 }
 
@@ -237,6 +240,13 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, m.content, session_id, id, role_str(&m.role)],
         )?;
+        for a in &m.attachments {
+            conn.execute(
+                "INSERT INTO attachments (message_id, mime, name, data_b64, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, a.mime, a.name, a.data_b64, now],
+            )?;
+        }
         conn.execute("UPDATE sessions SET updated_at = ?2 WHERE id = ?1", params![session_id, now])?;
         Ok(id)
     }
@@ -271,11 +281,13 @@ impl Store {
                 tool_call_id: r.get(5)?,
                 tool_calls_json: r.get(6)?,
                 reasoning_signature: r.get(7)?,
+                attachments: Vec::new(),
                 created_at: r.get(8)?,
             })
         })?;
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
         out.reverse();
+        attach_meta(&conn, &mut out)?;
         Ok(out)
     }
 
@@ -306,16 +318,55 @@ impl Store {
                 tool_call_id: r.get(5)?,
                 tool_calls_json: r.get(6)?,
                 reasoning_signature: r.get(7)?,
+                attachments: Vec::new(),
                 created_at: r.get(8)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut out = rows.collect::<Result<Vec<_>, _>>()?;
+        attach_meta(&conn, &mut out)?;
+        Ok(out)
+    }
+
+    /// Full payloads for a set of messages, keyed by message id.
+    fn attachment_payloads(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<crate::provider::Attachment>>, StoreError> {
+        let mut out: std::collections::HashMap<i64, Vec<crate::provider::Attachment>> =
+            std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(out)
+        }
+        let conn = self.conn.lock().unwrap();
+        let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT message_id, mime, name, data_b64
+             FROM attachments WHERE message_id IN ({ph}) ORDER BY id ASC"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                crate::provider::Attachment {
+                    mime: r.get(1)?,
+                    data_b64: r.get(3)?,
+                    name: r.get(2)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (mid, a) = row?;
+            out.entry(mid).or_default().push(a);
+        }
+        Ok(out)
     }
 
     /// Rehydrate a PromptBuilder's history. Tool calls are restored with their
     /// ids, because a tool_result whose call is missing is a hard 400.
     pub fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError> {
         let stored = self.messages(session_id)?;
+        // Full payloads only here. A transcript page gets metadata; the agent
+        // prompt is the only thing that needs the bytes back.
+        let mut payloads = self.attachment_payloads(&stored.iter().map(|m| m.id).collect::<Vec<_>>())?;
         let mut out = Vec::with_capacity(stored.len());
         for s in stored {
             let role = match s.role.as_str() {
@@ -334,6 +385,7 @@ impl Store {
             out.push(Message {
                 role,
                 content: s.content,
+                attachments: payloads.remove(&s.id).unwrap_or_default(),
                 tool_calls,
                 // Must survive the round trip: a tool_result whose call id is
                 // missing is rejected outright by every provider.
@@ -506,6 +558,40 @@ fn title_or_default(t: &str) -> String {
     }
 }
 
+/// Metadata for the transcript, without dragging base64 across IPC.
+fn attach_meta(conn: &Connection, msgs: &mut [StoredMessage]) -> Result<(), StoreError> {
+    if msgs.is_empty() {
+        return Ok(())
+    }
+    let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+    let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT message_id, mime, name, length(data_b64) * 3 / 4
+         FROM attachments WHERE message_id IN ({ph}) ORDER BY id ASC"
+    ))?;
+    let mut by_id: std::collections::HashMap<i64, Vec<crate::provider::AttachmentMeta>> =
+        std::collections::HashMap::new();
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        let mid: i64 = r.get(0)?;
+        Ok((
+            mid,
+            crate::provider::AttachmentMeta {
+                mime: r.get(1)?,
+                name: r.get(2)?,
+                bytes: r.get::<_, i64>(3)? as usize,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (mid, meta) = row?;
+        by_id.entry(mid).or_default().push(meta);
+    }
+    for m in msgs.iter_mut() {
+        m.attachments = by_id.remove(&m.id).unwrap_or_default();
+    }
+    Ok(())
+}
+
 fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
     if from < 1 {
         conn.execute_batch(
@@ -570,6 +656,22 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
             "ALTER TABLE messages ADD COLUMN reasoning_signature TEXT NOT NULL DEFAULT '';",
         )?;
     }
+    if from < 5 {
+        // v5: image attachments. Separate table, not a column: a 2 MB image is
+        // ~2.7 MB of base64, and putting that in `messages` makes every
+        // transcript page and every FTS maintenance step carry it.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS attachments (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 mime TEXT NOT NULL,
+                 name TEXT,
+                 data_b64 TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_attachments_msg ON attachments(message_id);",
+        )?;
+    }
     if from < 4 {
         // v4: sessions with an empty title. `delete_session` used to move the host
         // onto a freshly created session titled "", which rendered as a blank row
@@ -593,6 +695,66 @@ mod tests {
 
     fn sid(s: &Store) -> i64 {
         s.create_session("t", "/tmp", "m").unwrap()
+    }
+
+    #[test]
+    fn attachments_round_trip_but_transcript_reads_stay_light() {
+        let s = store();
+        let id = sid(&s);
+        let msg = Message::user_with(
+            "what is in this picture?",
+            vec![
+                crate::provider::Attachment {
+                    mime: "image/png".into(),
+                    data_b64: "aGVsbG8=".into(),
+                    name: Some("shot.png".into()),
+                },
+                crate::provider::Attachment {
+                    mime: "image/jpeg".into(),
+                    data_b64: "aGk=".into(),
+                    name: None,
+                },
+            ],
+        );
+        s.append_message(id, &msg).unwrap();
+
+        // The agent prompt needs the bytes back, in order.
+        let h = s.history(id).unwrap();
+        assert_eq!(h[0].attachments.len(), 2);
+        assert_eq!(h[0].attachments[0].data_b64, "aGVsbG8=");
+        assert_eq!(h[0].attachments[0].name.as_deref(), Some("shot.png"));
+        assert_eq!(h[0].attachments[1].mime, "image/jpeg");
+
+        // A transcript page must not carry megabytes of base64 over IPC.
+        let page = s.messages_before(id, None, 10).unwrap();
+        assert_eq!(page[0].attachments.len(), 2);
+        assert_eq!(page[0].attachments[0].name.as_deref(), Some("shot.png"));
+        assert_eq!(page[0].attachments[0].bytes, 6);
+        assert_eq!(page[0].content, "what is in this picture?");
+    }
+
+    #[test]
+    fn deleting_a_session_takes_its_attachments_with_it() {
+        let s = store();
+        let id = sid(&s);
+        s.append_message(
+            id,
+            &Message::user_with(
+                "x",
+                vec![crate::provider::Attachment {
+                    mime: "image/png".into(),
+                    data_b64: "aGVsbG8=".into(),
+                    name: None,
+                }],
+            ),
+        )
+        .unwrap();
+        s.delete_session(id).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "orphaned blobs would outlive the session that owns them");
     }
 
     #[test]

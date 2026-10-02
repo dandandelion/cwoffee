@@ -77,10 +77,46 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// A non-text part of a message. Images are carried inline as base64 because
+/// every provider's multimodal wire format wants them inline; the store keeps
+/// them in their own table so ordinary transcript reads do not drag megabytes
+/// across IPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    /// e.g. `image/png`. Validated against an allow-list at the boundary.
+    pub mime: String,
+    /// base64 payload, no `data:` prefix.
+    pub data_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Attachment {
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.data_b64)
+    }
+
+    /// Decoded size, ignoring base64 padding.
+    pub fn approx_bytes(&self) -> usize {
+        self.data_b64.len() * 3 / 4
+    }
+}
+
+/// What the transcript needs to draw a placeholder without the payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    pub mime: String,
+    pub name: Option<String>,
+    pub bytes: usize,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// Only meaningful on user messages in v1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     /// Reasoning we chose to retain. Whether this round-trips back into the
     /// next prompt is a per-provider decision (see `Provider::wants_reasoning`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +137,16 @@ impl Message {
     }
     pub fn user(s: impl Into<String>) -> Self {
         Self { role: Role::User, content: s.into(), ..Default::default() }
+    }
+    pub fn user_with(
+        s: impl Into<String>,
+        attachments: Vec<Attachment>,
+    ) -> Self {
+        Self { role: Role::User, content: s.into(), attachments, ..Default::default() }
+    }
+    /// True when there is nothing to send, text or otherwise.
+    pub fn is_empty(&self) -> bool {
+        self.content.trim().is_empty() && self.attachments.is_empty()
     }
     pub fn assistant(s: impl Into<String>) -> Self {
         Self { role: Role::Assistant, content: s.into(), ..Default::default() }

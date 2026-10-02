@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 likely written in. Use the exec tool.";
 
     println!("mode={:?}  task: {task}", agent.mode());
-    let tel = agent.run_turn(task, &etx).await;
+    let tel = agent.run_turn(task, vec![], &etx).await;
     drop(etx);
     render.await?;
 

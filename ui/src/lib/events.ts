@@ -80,6 +80,12 @@ export interface SearchHit {
   rank: number
 }
 
+export interface AttachmentMeta {
+  mime: string
+  name: string | null
+  bytes: number
+}
+
 export interface StoredMessage {
   id: number
   session_id: number
@@ -90,4 +96,5 @@ export interface StoredMessage {
   tool_calls_json: string
   reasoning_signature: string
   created_at: number
+  attachments: AttachmentMeta[]
 }

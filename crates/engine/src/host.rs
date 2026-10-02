@@ -42,6 +42,11 @@ pub struct HostConfig {
     pub env_block: String,
     /// How long an unanswered approval prompt waits before refusing.
     pub approval_timeout: std::time::Duration,
+    /// Attachment guardrails. Enforced at the host boundary rather than in the
+    /// UI, because the UI is not the only client and never will be again.
+    pub max_attachments: usize,
+    /// Decoded bytes per attachment.
+    pub max_attachment_bytes: usize,
 }
 
 impl HostConfig {
@@ -56,6 +61,8 @@ impl HostConfig {
             context_budget: 8_000,
             env_block: String::new(),
             approval_timeout: std::time::Duration::from_secs(300),
+            max_attachments: 4,
+            max_attachment_bytes: 2 * 1024 * 1024,
         }
     }
 }
@@ -63,7 +70,13 @@ impl HostConfig {
 /// Commands the UI sends. Everything the agent does on its own goes out over
 /// `events`, so the UI never has to poll for state.
 pub enum HostCmd {
-    Send { text: String },
+    /// `attachments` are validated at this boundary, before anything reaches the
+    /// provider: an unbounded or arbitrary-mime payload from a UI would be a
+    /// memory and SSRF-adjacent problem downstream.
+    Send {
+        text: String,
+        attachments: Vec<crate::provider::Attachment>,
+    },
     SetMode { mode: ApprovalMode },
     SetReasoning { reasoning: Reasoning },
     /// Change the model id for subsequent turns. Does not rewrite history.
@@ -135,6 +148,10 @@ impl SessionHost {
             compactions: 0,
             approval_timeout_secs: cfg.approval_timeout.as_secs(),
         }));
+        let limits = AttachmentLimits {
+            max_count: cfg.max_attachments,
+            max_bytes: cfg.max_attachment_bytes,
+        };
 
         let state_bg = Arc::clone(&state);
         // The task takes the provider; the host keeps a second handle for
@@ -299,9 +316,23 @@ impl SessionHost {
                         }
                     }
 
-                    HostCmd::Send { text } => {
+                    HostCmd::Send { text, attachments } => {
+                        let attachments = match check_attachments(&attachments, limits) {
+                            Ok(()) => attachments,
+                            Err(reason) => {
+                                let _ = ev_tx.send(EngineEvent::Error {
+                                    message: format!("attachment rejected: {reason}"),
+                                    fatal: false,
+                                });
+                                continue;
+                            }
+                        };
+                        if text.trim().is_empty() && attachments.is_empty() {
+                            continue;
+                        }
                         set_busy(&state_bg, true);
-                        let tel: TurnTelemetry = agent.run_turn(&text, &ev_tx).await;
+                        let tel: TurnTelemetry =
+                            agent.run_turn(&text, attachments, &ev_tx).await;
 
                         // Persist whatever the turn added. Sequence numbers make
                         // this correct even if compaction shifted the window.
@@ -380,7 +411,16 @@ impl SessionHost {
     }
 
     pub fn submit(&self, text: impl Into<String>) {
-        self.send(HostCmd::Send { text: text.into() });
+        self.send_with(text, Vec::new())
+    }
+
+    /// Send a message that carries attachments.
+    pub fn send_with(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<crate::provider::Attachment>,
+    ) {
+        self.send(HostCmd::Send { text: text.into(), attachments })
     }
 
     pub fn cancel(&self) {
@@ -422,6 +462,66 @@ pub fn default_env_block(workspace: &std::path::Path, os: &str) -> String {
     )
 }
 
+/// Attachment guardrails, checked before anything reaches a provider.
+#[derive(Debug, Clone, Copy)]
+pub struct AttachmentLimits {
+    pub max_count: usize,
+    pub max_bytes: usize,
+}
+
+/// Only these are accepted. The provider will happily forward any mime string,
+/// and a UI (or a future gateway client) should not be able to ask the model to
+/// interpret an arbitrary data blob.
+const ALLOWED_MIME: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+fn b64_ok(s: &str) -> bool {
+    if s.is_empty() || s.len() % 4 != 0 {
+        return false
+    }
+    s.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+    })
+}
+
+fn check_attachments(atts: &[crate::provider::Attachment], limits: AttachmentLimits) -> Result<(), String> {
+    if atts.len() > limits.max_count {
+        return Err(format!(
+            "{} attachments exceeds the limit of {}",
+            atts.len(),
+            limits.max_count
+        ));
+    }
+    for (i, a) in atts.iter().enumerate() {
+        if !ALLOWED_MIME.contains(&a.mime.as_str()) {
+            return Err(format!(
+                "attachment {}: mime {:?} is not allowed (allowed: {})",
+                i + 1,
+                a.mime,
+                ALLOWED_MIME.join(", ")
+            ));
+        }
+        let bytes = a.approx_bytes();
+        if bytes > limits.max_bytes {
+            return Err(format!(
+                "attachment {} is {} bytes, over the {} byte limit",
+                i + 1,
+                bytes,
+                limits.max_bytes
+            ));
+        }
+        // Cheap and local: a corrupt payload otherwise surfaces as an opaque
+        // provider error several seconds later.
+        if !b64_ok(&a.data_b64) {
+            return Err(format!(
+                "attachment {} is not valid base64 (expected unprefixed base64, got {} chars)",
+                i + 1,
+                a.data_b64.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +535,9 @@ mod tests {
     struct Scripted {
         replies: std::sync::Mutex<Vec<String>>,
         calls: AtomicUsize,
+        /// What the provider actually received, so a test can prove an
+        /// attachment survived the host, the prompt builder and the request.
+        seen_attachments: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -450,9 +553,15 @@ mod tests {
         }
         async fn stream(
             &self,
-            _req: &crate::provider::ChatRequest,
+            req: &crate::provider::ChatRequest,
             sink: &crate::provider::DeltaSink,
         ) -> Result<(), ProviderError> {
+            let seen = req
+                .messages
+                .iter()
+                .map(|m| m.attachments.len())
+                .sum::<usize>();
+            self.seen_attachments.fetch_add(seen, Ordering::Relaxed);
             let n = self.calls.fetch_add(1, Ordering::Relaxed);
             let reply = self
                 .replies
@@ -483,6 +592,7 @@ mod tests {
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(replies),
             calls: AtomicUsize::new(0),
+            seen_attachments: Arc::new(AtomicUsize::new(0)),
         });
         let h = SessionHost::spawn(
             p,
@@ -491,6 +601,66 @@ mod tests {
             HostConfig::new("test-model", std::env::temp_dir()),
         );
         (h, store)
+    }
+
+    #[tokio::test]
+    async fn an_attachment_survives_host_prompt_and_store() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let p = Arc::new(Scripted {
+            replies: std::sync::Mutex::new(vec!["noted".into()]),
+            calls: AtomicUsize::new(0),
+            seen_attachments: Arc::clone(&seen),
+        });
+        let h = SessionHost::spawn(
+            p,
+            Registry::new(),
+            Arc::clone(&store),
+            HostConfig::new("test-model", std::env::temp_dir()),
+        );
+        ready(&h).await;
+        let sid = h.state().session_id;
+        h.send(HostCmd::Send {
+            text: "what is in this image?".into(),
+            attachments: vec![crate::provider::Attachment {
+                mime: "image/png".into(),
+                data_b64: "aGVsbG8=".into(),
+                name: Some("shot.png".into()),
+            }],
+        });
+        turns_done(&h, 1).await;
+        wait_for("provider saw the image".into(), || {
+            seen.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        let hist = store.history(sid).unwrap();
+        assert_eq!(hist[0].attachments.len(), 1, "payload must persist for replay");
+        assert_eq!(hist[0].attachments[0].data_b64, "aGVsbG8=");
+    }
+
+    #[test]
+    fn attachment_guardrails_reject_bad_input_at_the_host_boundary() {
+        let l = AttachmentLimits { max_count: 2, max_bytes: 64 };
+        let a = |mime: &str, b64: &str| crate::provider::Attachment {
+            mime: mime.into(),
+            data_b64: b64.into(),
+            name: None,
+        };
+        assert!(check_attachments(&[a("image/png", "aGVsbG8=")], l).is_ok());
+        let e = check_attachments(&[a("application/x-msdownload", "aGk=")], l).unwrap_err();
+        assert!(e.contains("not allowed"), "{e}");
+        let e = check_attachments(
+            &[a("image/png", "aGk="), a("image/png", "aGk="), a("image/png", "aGk=")],
+            l,
+        )
+        .unwrap_err();
+        assert!(e.contains("limit of 2"), "{e}");
+        // A data: URL passed through verbatim is the most likely UI mistake.
+        let e = check_attachments(&[a("image/png", "data:image/png;base64,aGk=")], l).unwrap_err();
+        assert!(e.contains("not valid base64"), "{e}");
+        let big = "A".repeat(200);
+        let e = check_attachments(&[a("image/png", &big)], l).unwrap_err();
+        assert!(e.contains("over the 64 byte limit"), "{e}");
     }
 
     /// The host runs on its own task, so reading `state()` straight after
@@ -668,6 +838,7 @@ mod tests {
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(vec!["tool".into()]),
             calls: AtomicUsize::new(0),
+            seen_attachments: Arc::new(AtomicUsize::new(0)),
         });
         let mut reg = Registry::new();
         reg.register(Box::new(ExecTool { timeout_secs: 5, allow_unsandboxed: false }));

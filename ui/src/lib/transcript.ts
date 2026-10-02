@@ -47,7 +47,7 @@ async function openExternal(href: string) {
  * markdown per token is how you get a UI that visibly reflows mid-sentence.
  */
 
-import type { EngineEvent, ExecStream, StoredMessage } from './events'
+import type { AttachmentMeta, EngineEvent, ExecStream, StoredMessage } from './events'
 import { renderMarkdown, LiveMarkdown } from './markdown'
 
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
@@ -311,10 +311,27 @@ export class Transcript {
    * The engine does not echo the user's message over the event stream, so the
    * UI must render it itself or your own turns silently vanish.
    */
-  addUser(text: string) {
-    this.textBuf = this.block('user', 'you')
+  addUser(text: string, attachments: AttachmentMeta[] = []) {
+    const body = this.block('user', 'you')
+    this.textBuf = body
     this.textKind = 'user'
-    this.textBuf.textContent = text
+    body.textContent = text
+    this.appendAttachmentTags(body, attachments)
+  }
+
+  /**
+   * Name and size, not a thumbnail. History pages carry attachment metadata
+   * only, so a thumbnail here would disappear on reopen and make the transcript
+   * look lossy when the payload is in fact intact.
+   */
+  private appendAttachmentTags(body: HTMLElement, attachments: AttachmentMeta[]) {
+    if (!attachments.length) return
+    const row = this.el('attlist')
+    for (const a of attachments) {
+      const kb = Math.max(1, Math.round(a.bytes / 1024))
+      row.append(this.el('atttag', `${a.name ?? a.mime} · ${kb} kB`))
+    }
+    body.append(row)
   }
 
   // ---- tool cards ---------------------------------------------------------
@@ -437,7 +454,9 @@ export class Transcript {
 
     for (const m of msgs) {
       if (m.role === 'user') {
-        blk('user', 'you').textContent = m.content
+        const body = blk('user', 'you')
+        body.textContent = m.content
+        this.appendAttachmentTags(body, m.attachments ?? [])
       } else if (m.role === 'assistant') {
         if (m.reasoning) blk('reasoning', 'thinking').textContent = m.reasoning
         const body = blk('answer', 'cowry')

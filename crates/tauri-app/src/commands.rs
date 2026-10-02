@@ -68,13 +68,37 @@ pub fn attach(state: tauri::State<'_, AppState>, on_event: Channel<EngineEvent>)
     Ok(())
 }
 
+/// An attachment as the webview submits it. The engine re-validates mime, size
+/// and base64 at its own boundary; this only refuses the obviously absurd before
+/// it crosses IPC.
+#[derive(Debug, serde::Deserialize)]
+pub struct AttachmentIn {
+    pub mime: String,
+    pub data_b64: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Send a user message. Events stream over the channel registered by `attach`.
 #[tauri::command]
-pub fn start_turn(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
-    if text.trim().is_empty() {
+pub fn start_turn(
+    state: tauri::State<'_, AppState>,
+    text: String,
+    attachments: Option<Vec<AttachmentIn>>,
+) -> Result<(), String> {
+    let atts: Vec<cowry_engine::provider::Attachment> = attachments
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| cowry_engine::provider::Attachment {
+            mime: a.mime,
+            data_b64: a.data_b64,
+            name: a.name,
+        })
+        .collect();
+    if text.trim().is_empty() && atts.is_empty() {
         return Err("empty message".into());
     }
-    state.host.submit(text);
+    state.host.send_with(text, atts);
     Ok(())
 }
 

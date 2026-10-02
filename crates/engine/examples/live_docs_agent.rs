@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let render = tokio::spawn(async move { render(&mut erx).await });
 
     println!("task: {TASK}\n");
-    let tel = agent.run_turn(TASK, &etx).await;
+    let tel = agent.run_turn(TASK, vec![], &etx).await;
     drop(etx);
     render.await?;
 

@@ -368,14 +368,113 @@
     }
   }
 
+  // ---- attachments --------------------------------------------------------
+  // Mirrors the engine's guardrails. Duplicated on purpose: a UI-side check
+  // gives an instant message, and the engine still refuses the same input if it
+  // arrives from anywhere else.
+  const MAX_ATTACH = 4
+  const MAX_ATTACH_BYTES = 2 * 1024 * 1024
+  const OK_MIME = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+
+  type Pending = { name: string; mime: string; bytes: number; b64: string; url: string }
+  let pending = $state<Pending[]>([])
+  let fileInput = $state<HTMLInputElement | null>(null)
+  let attachErr = $state('')
+
+  function fmtBytes(n: number) {
+    if (n < 1024) return `${n} B`
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} kB`
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  }
+
+  function readAsBase64(f: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => {
+        const s = String(r.result ?? '')
+        // data:image/png;base64,.... -> strip through the comma
+        resolve(s.slice(s.indexOf(',') + 1))
+      }
+      r.onerror = () => reject(r.error)
+      r.readAsDataURL(f)
+    })
+  }
+
+  async function pickFiles(e: Event) {
+    const input = e.target as HTMLInputElement
+    const files = Array.from(input.files ?? [])
+    input.value = ''
+    attachErr = ''
+    for (const f of files) {
+      if (!OK_MIME.includes(f.type)) {
+        attachErr = `${f.name}: ${f.type || 'unknown type'} is not a supported image`
+        continue
+      }
+      if (f.size > MAX_ATTACH_BYTES) {
+        attachErr = `${f.name}: ${fmtBytes(f.size)} exceeds ${fmtBytes(MAX_ATTACH_BYTES)}`
+        continue
+      }
+      if (pending.length >= MAX_ATTACH) {
+        attachErr = `at most ${MAX_ATTACH} images per message`
+        break
+      }
+      try {
+        const b64 = await readAsBase64(f)
+        pending = [
+          ...pending,
+          { name: f.name, mime: f.type, bytes: f.size, b64, url: URL.createObjectURL(f) },
+        ]
+      } catch (err) {
+        attachErr = `${f.name}: could not read (${err})`
+      }
+    }
+  }
+
+  function dropAttachment(i: number) {
+    const [gone] = pending.splice(i, 1)
+    if (gone) URL.revokeObjectURL(gone.url)
+    pending = [...pending]
+  }
+
+  function clearAttachments() {
+    for (const a of pending) URL.revokeObjectURL(a.url)
+    pending = []
+    attachErr = ''
+  }
+
+  /// Wait for a turn to finish. `busy` cannot be the condition: start_turn only
+  /// submits, and the host sets busy=true on its own task, so a caller that
+  /// checks busy immediately sees false and proceeds before anything happened.
+  /// HostState.turns is monotonic and incremented after persistence, so it is
+  /// the honest signal.
+  async function waitTurnDone(prevTurns: number, budgetMs = 90000): Promise<boolean> {
+    const dl = performance.now() + budgetMs
+    while (performance.now() < dl) {
+      const st = await invoke<HostState>('session_state')
+      if (st.turns > prevTurns) return true
+      await new Promise((r) => setTimeout(r, 250))
+    }
+    return false
+  }
+
+  async function turnCount(): Promise<number> {
+    return (await invoke<HostState>('session_state')).turns
+  }
+
   // ---- actions ------------------------------------------------------------
   async function send() {
     const text = draft.trim()
-    if (!text || busy) return
+    if ((!text && pending.length === 0) || busy) return
+    const atts = pending.map((a) => ({ mime: a.mime, data_b64: a.b64, name: a.name }))
     draft = ''
-    transcript?.addUser(text)
+    // The transcript shows what was attached by name and size, not a thumbnail:
+    // history pages carry metadata only, so a thumbnail here would be a preview
+    // that disappears the moment the session is reopened.
+    transcript?.addUser(text, pending.map((a) => ({ mime: a.mime, name: a.name, bytes: a.bytes })))
+    clearAttachments()
     try {
-      await invoke('start_turn', { text })
+      await invoke('start_turn', { text, attachments: atts })
+      pageLog(`turn sent with ${atts.length} attachment(s)`)
     } catch (e) {
       pageLog(`start_turn failed: ${e}`)
     }
@@ -714,6 +813,48 @@
         else if (!st.startsWith('failed')) fail(`unexpected link probe: ${st}`)
       }
 
+      // Attachments: the tag renders, the payload survives the round trip to the
+      // store, and the turn completes. Whether the endpoint actually *sees* the
+      // image is a property of the server, so an error event is logged rather
+      // than failed on - but a turn that never ends is a bug.
+      {
+        const PNG1x1 =
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg=='
+        transcript?.addUser('attachment probe', [
+          { mime: 'image/png', name: 'probe.png', bytes: 70 },
+        ])
+        const tags = [...document.querySelectorAll('.atttag')]
+        if (!tags.length) fail('attachment tag not rendered in the transcript')
+        else if (!tags[tags.length - 1].textContent?.includes('probe.png'))
+          fail(`attachment tag missing the name: ${tags[tags.length - 1].textContent}`)
+
+        const errs: string[] = []
+        const restore = beginEventTap((e) => {
+          if (e.kind === 'error') errs.push(e.d.message)
+        })
+        const turnsBefore = await turnCount()
+        await invoke('start_turn', {
+          text: 'What colour is this image? Answer in one word.',
+          attachments: [{ mime: 'image/png', data_b64: PNG1x1, name: 'probe.png' }],
+        })
+        const done = await waitTurnDone(turnsBefore)
+        restore()
+        if (!done) fail('attachment turn never ended')
+        for (const e of errs) pageLog(`SELFTEST note: endpoint said: ${e}`)
+
+        const st = await invoke<HostState>('session_state')
+        const page = await invoke<any>('session_messages', { id: st.session_id })
+        const withAtt = (page.messages ?? []).filter(
+          (m: any) => Array.isArray(m.attachments) && m.attachments.length,
+        )
+        if (!withAtt.length) fail('attachment metadata did not come back from the store')
+        else {
+          const a = withAtt[0].attachments[0]
+          if (a.name !== 'probe.png') fail(`attachment name lost in storage: ${JSON.stringify(a)}`)
+          if (a.bytes < 60 || a.bytes > 80) fail(`attachment size wrong: ${a.bytes}`)
+        }
+      }
+
       // The approval round-trip, end to end. Every previous "approval verified"
       // check only proved the request arrived; none proved the answer landed. It
       // did not: the pump and the command used two different maps, so every gated
@@ -729,6 +870,7 @@
         void before
         // Wrap handle for the duration of this step by listening to the raw stream.
         const restore = beginEventTap(probe)
+        const approvalTurnsBefore = await turnCount()
         await invoke('set_mode', { mode: 'ask' })
         await invoke('start_turn', { text: 'Use the exec tool to run: echo cowry-ok' })
         const dl = performance.now() + 90000
@@ -747,12 +889,9 @@
           else if (!evs[0].endsWith('true')) fail(`tool failed after allow: ${evs[0]}`)
         }
         restore()
-        // A real deadline: `performance.now() < performance.now() + N` is always
-        // true, which would spin here forever if the turn never ended.
-        const quiet = performance.now() + 60000
-        while (busy && performance.now() < quiet) {
-          await new Promise((r) => setTimeout(r, 300))
-        }
+        // Same trap as above: waiting on `busy` here can pass before the host
+        // has even started the turn.
+        if (!(await waitTurnDone(approvalTurnsBefore))) fail('approval turn never ended')
       }
 
       pageLog(
@@ -1066,6 +1205,19 @@
       <div class="px-4 pb-2 pt-2">
         <div class="mx-auto w-full max-w-[860px]">
           <div class="cbox">
+            {#if pending.length || attachErr}
+              <div class="attrow">
+                {#each pending as a, i}
+                  <span class="attchip">
+                    <img src={a.url} alt="" />
+                    <span class="att-name">{a.name}</span>
+                    <span class="att-size">{fmtBytes(a.bytes)}</span>
+                    <button class="att-x" aria-label="Remove attachment" onclick={() => dropAttachment(i)}>×</button>
+                  </span>
+                {/each}
+                {#if attachErr}<span class="att-err">{attachErr}</span>{/if}
+              </div>
+            {/if}
             <textarea
               class="composer"
               rows="3"
@@ -1082,7 +1234,15 @@
               <button class="cbtn sq" disabled title="Not implemented yet">
                 <svg width="14" height="14" viewBox="0 0 14 14"><path d="M7 2.5v9M2.5 7h9" stroke="currentColor" stroke-width="1.4"/></svg>
               </button>
-              <button class="cbtn sq" disabled title="Attachments are not implemented yet">
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                multiple
+                class="attfile"
+                bind:this={fileInput}
+                onchange={pickFiles}
+              />
+              <button class="cbtn sq" title="Attach images (png, jpeg, webp, gif)" onclick={() => fileInput?.click()}>
                 <svg width="14" height="14" viewBox="0 0 14 14"><path d="M9.2 4.3 5 8.5a1.9 1.9 0 0 0 2.7 2.7l4.2-4.2a3.4 3.4 0 0 0-4.8-4.8L2.8 6.5a4.9 4.9 0 0 0 6.9 6.9" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
               </button>
 

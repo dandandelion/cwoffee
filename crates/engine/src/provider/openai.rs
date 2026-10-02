@@ -170,7 +170,24 @@ fn to_openai_message(m: &crate::provider::Message) -> Value {
     // Do NOT replay reasoning to llama.cpp: it inflates the prompt and, more
     // importantly, breaks the append-only prefix that makes llama.cpp's prefix
     // cache hit. Reasoning is displayed, not re-fed.
-    obj.insert("content".into(), json!(m.content));
+    if m.attachments.is_empty() {
+        obj.insert("content".into(), json!(m.content));
+    } else {
+        // Multimodal content is an array of parts, not a string. Text first:
+        // llama.cpp's chat templates handle text-then-image ordering, and it
+        // keeps the text prefix stable when the same text is reused.
+        let mut parts: Vec<Value> = Vec::new();
+        if !m.content.is_empty() {
+            parts.push(json!({ "type": "text", "text": m.content }));
+        }
+        for a in &m.attachments {
+            parts.push(json!({
+                "type": "image_url",
+                "image_url": { "url": a.data_url() },
+            }));
+        }
+        obj.insert("content".into(), Value::Array(parts));
+    }
 
     if !m.tool_calls.is_empty() {
         obj.insert(
@@ -575,6 +592,41 @@ mod tests {
     }
 
     /// Byte-stability of the request body is what makes llama.cpp prefix caching
+    #[test]
+    fn an_image_becomes_an_image_url_part() {
+        let m = to_openai_message(&Message::user_with(
+            "describe this",
+            vec![crate::provider::Attachment {
+                mime: "image/png".into(),
+                data_b64: "aGVsbG8=".into(),
+                name: Some("x.png".into()),
+            }],
+        ));
+        let parts = m["content"].as_array().expect("content array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"].as_str().unwrap(),
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn an_attachment_only_message_still_has_its_parts() {
+        let m = to_openai_message(&Message::user_with(
+            "",
+            vec![crate::provider::Attachment {
+                mime: "image/png".into(),
+                data_b64: "aGk=".into(),
+                name: None,
+            }],
+        ));
+        let parts = m["content"].as_array().expect("content array");
+        assert_eq!(parts.len(), 1, "no empty text part is invented");
+        assert_eq!(parts[0]["type"], "image_url");
+    }
+
     /// work. Same messages must serialize to identical bytes, every time.
     #[test]
     fn body_serialization_is_byte_stable() {

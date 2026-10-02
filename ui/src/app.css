@@ -632,3 +632,62 @@ body {
     padding-bottom: 6px;
   }
 }
+
+/* ---- attachments ------------------------------------------------------- */
+/* Hidden, not absent: the picker is opened from the paperclip button. */
+.attfile { display: none; }
+.attrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px 0;
+}
+.attchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 3px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 7px;
+  background: var(--color-paper-2);
+  font-size: 11px;
+  max-width: 220px;
+}
+.attchip img {
+  width: 26px;
+  height: 26px;
+  object-fit: cover;
+  border-radius: 5px;
+  flex: none;
+}
+.att-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.att-size { color: var(--color-ink-faint); flex: none; }
+.att-x {
+  border: 0;
+  background: transparent;
+  color: var(--color-ink-faint);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.att-x:hover { color: #8b3d3d; }
+.att-err { font-size: 11px; color: #8b3d3d; }
+
+/* Transcript placeholder for an attachment. Deliberately not a thumbnail:
+   history pages carry metadata only, so a thumbnail here would vanish on
+   reopen and make the transcript look lossy. */
+.attlist { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.atttag {
+  font-size: 11px;
+  color: var(--color-ink-3);
+  border: 1px dashed var(--color-hairline);
+  border-radius: 6px;
+  padding: 2px 6px;
+}

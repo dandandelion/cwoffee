@@ -95,8 +95,28 @@ pub fn to_anthropic_messages(msgs: &[Message]) -> (Vec<Value>, Vec<String>) {
                 continue;
             }
             Role::User => {
-                let block = json!({ "type": "text", "text": m.content });
-                push_block(&mut out, "user", block);
+                if !m.content.is_empty() {
+                    push_block(&mut out, "user", json!({ "type": "text", "text": m.content }));
+                }
+                for a in &m.attachments {
+                    push_block(
+                        &mut out,
+                        "user",
+                        json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": a.mime,
+                                "data": a.data_b64,
+                            },
+                        }),
+                    );
+                }
+                // Anthropic rejects an empty content list, so a message that
+                // carried only an attachment still needs a text block.
+                if m.content.is_empty() && m.attachments.is_empty() {
+                    push_block(&mut out, "user", json!({ "type": "text", "text": "" }));
+                }
             }
             Role::Assistant => {
                 // Signed thinking must come first in the block list, and only
@@ -491,6 +511,7 @@ pub fn assistant_message(
     Message {
         role: Role::Assistant,
         content: text,
+        attachments: Vec::new(),
         reasoning,
         reasoning_signature: signature,
         tool_calls,
@@ -502,6 +523,41 @@ pub fn assistant_message(
 mod tests {
     use super::*;
     use crate::provider::{Message, Reasoning, Role, ToolCall};
+
+    #[test]
+    fn an_image_becomes_an_image_block() {
+        let (msgs, _) = to_anthropic_messages(&[Message::user_with(
+            "look",
+            vec![crate::provider::Attachment {
+                mime: "image/jpeg".into(),
+                data_b64: "aGk=".into(),
+                name: None,
+            }],
+        )]);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[1]["source"]["data"], "aGk=");
+    }
+
+    /// An attachment-only user turn must not produce an empty content list:
+    /// Anthropic rejects the request outright.
+    #[test]
+    fn an_attachment_only_turn_still_carries_a_block() {
+        let (msgs, _) = to_anthropic_messages(&[Message::user_with(
+            "",
+            vec![crate::provider::Attachment {
+                mime: "image/png".into(),
+                data_b64: "aGk=".into(),
+                name: None,
+            }],
+        )]);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "image");
+    }
 
     fn replay(events: &[(&str, &str)]) -> Vec<Delta> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

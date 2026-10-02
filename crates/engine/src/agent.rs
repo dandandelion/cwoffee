@@ -116,7 +116,12 @@ impl Agent {
     }
 
     /// Run one user turn to completion. Returns aggregated telemetry.
-    pub async fn run_turn(&mut self, user_text: &str, out: &EngineSink) -> TurnTelemetry {
+    pub async fn run_turn(
+        &mut self,
+        user_text: &str,
+        attachments: Vec<crate::provider::Attachment>,
+        out: &EngineSink,
+    ) -> TurnTelemetry {
         self.turn_id += 1;
         let turn = self.turn_id;
         self.cancel.store(false, Ordering::Relaxed);
@@ -126,7 +131,7 @@ impl Agent {
             model: self.cfg.model.clone(),
         });
 
-        self.prompt.push_user(user_text);
+        self.prompt.push_user_with(user_text, attachments);
 
         let defs = self.registry.defs();
         let schemas = serde_json::to_string(&defs).unwrap_or_default();
@@ -513,7 +518,7 @@ mod tests {
             ToolCtx::default(),
         );
         let cancel = agent.cancel_handle();
-        let run = tokio::spawn(async move { agent.run_turn("go", &etx).await });
+        let run = tokio::spawn(async move { agent.run_turn("go", vec![], &etx).await });
 
         // Let a few tokens arrive, then stop.
         let mut got = 0usize;
@@ -557,7 +562,7 @@ mod tests {
             }
         });
         let (tx, rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", &tx).await;
+        agent.run_turn("go", vec![], &tx).await;
         drop(tx);
         let mut rx = rx;
         let mut events = Vec::new();
@@ -586,7 +591,7 @@ mod tests {
         ];
         let (mut agent, _ev, _arx) = harness(turns, ApprovalAnswer::Allow);
         let (tx, rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", &tx).await;
+        agent.run_turn("go", vec![], &tx).await;
         drop(rx);
         let h = agent.prompt.history();
         let tr = h.iter().find(|m| m.tool_call_id.as_deref() == Some("b1")).expect("tool_result exists");
@@ -609,7 +614,7 @@ mod tests {
             }
         });
         let (tx, _rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", &tx).await;
+        agent.run_turn("go", vec![], &tx).await;
         let h = agent.prompt.history();
         let tr = h.iter().find(|m| m.tool_call_id.as_deref() == Some("d1")).expect("result exists");
         assert!(tr.content.contains("DENIED BY USER"));
@@ -627,7 +632,7 @@ mod tests {
         ];
         let (mut agent, _ev, _arx) = harness(turns, ApprovalAnswer::Allow);
         let (tx, _rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", &tx).await;
+        agent.run_turn("go", vec![], &tx).await;
         let h = agent.prompt.history();
         let tr = h.iter().find(|m| m.tool_call_id.as_deref() == Some("u1")).expect("result exists");
         assert!(tr.content.contains("unknown tool"));
@@ -649,7 +654,7 @@ mod tests {
         });
         agent.cfg.max_tool_iters = 3;
         let (tx, rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", &tx).await;
+        agent.run_turn("go", vec![], &tx).await;
         drop(tx);
         let mut rx = rx;
         let mut saw_cap = false;
