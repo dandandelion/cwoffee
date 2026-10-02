@@ -102,6 +102,35 @@ pub fn start_turn(
     Ok(())
 }
 
+/// Open a native folder picker. Non-blocking: the plugin hands the result to a
+/// callback, so the command awaits it rather than parking the main thread.
+#[tauri::command]
+pub async fn pick_workspace(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .pick_folder(move |p| {
+            let _ = tx.send(p.map(|f| f.to_string()));
+        });
+    // A dialog the user never closes must not pin a task forever.
+    tokio::time::timeout(std::time::Duration::from_secs(300), rx)
+        .await
+        .map_err(|_| "folder picker timed out".to_string())?
+        .map_err(|_| "folder picker closed without a result".to_string())
+}
+
+/// Move the tools to a different workspace. The engine refuses a non-directory,
+/// a non-writable directory, and any change while a turn is running.
+#[tauri::command]
+pub fn set_workspace(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("empty workspace path".into());
+    }
+    state.host.send(cowry_engine::HostCmd::SetWorkspace { path });
+    Ok(())
+}
+
 #[tauri::command]
 pub fn cancel_turn(state: tauri::State<'_, AppState>) {
     state.host.cancel();

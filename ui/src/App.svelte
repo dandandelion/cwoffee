@@ -392,6 +392,8 @@
   let fileInput = $state<HTMLInputElement | null>(null)
   let composerEl = $state<HTMLTextAreaElement | null>(null)
   let dropping = $state(false)
+  let wsBusy = $state(false)
+  let shortWorkspace = $state('')
   let theme = $state<'light' | 'dark'>('light')
   let attachErr = $state('')
 
@@ -428,6 +430,26 @@
   // Paste is the path people actually reach for with screenshots, and drag in
   // from a file manager is the other one. Both feed the same guardrails as the
   // picker rather than a second, laxer copy.
+  // The engine is the authority on what a workspace may be: it refuses a
+  // non-directory, a non-writable one, and any change while a turn is running.
+  // The browser preview has no Tauri, so every native call needs this guard.
+  const isTauri = () => typeof (window as any).__TAURI_INTERNALS__ !== 'undefined'
+
+  async function chooseWorkspace() {
+    if (!isTauri() || wsBusy) return
+    wsBusy = true
+    try {
+      const picked = (await invoke('pick_workspace')) as string | null
+      if (picked) {
+        await invoke('set_workspace', { path: picked })
+      }
+    } catch (e) {
+      pageLog(`set_workspace failed: ${String(e)}`)
+    } finally {
+      wsBusy = false
+    }
+  }
+
   function onPaste(e: ClipboardEvent) {
     const files = Array.from(e.clipboardData?.files ?? [])
     if (!files.length) return
@@ -501,11 +523,11 @@
     attachErr = ''
   }
 
-  /// Wait for a turn to finish. `busy` cannot be the condition: start_turn only
-  /// submits, and the host sets busy=true on its own task, so a caller that
-  /// checks busy immediately sees false and proceeds before anything happened.
-  /// HostState.turns is monotonic and incremented after persistence, so it is
-  /// the honest signal.
+  // Wait for a turn to finish. `busy` cannot be the condition: start_turn only
+  // submits, and the host sets busy=true on its own task, so a caller that
+  // checks busy immediately sees false and proceeds before anything happened.
+  // HostState.turns is monotonic and incremented after persistence, so it is
+  // the honest signal.
   async function waitTurnDone(prevTurns: number, budgetMs = 90000): Promise<boolean> {
     const dl = performance.now() + budgetMs
     while (performance.now() < dl) {
@@ -953,6 +975,26 @@
         if (!(await waitTurnDone(approvalTurnsBefore))) fail('approval turn never ended')
       }
 
+      // Workspace switching. The engine is the authority on what a workspace may
+      // be, so a bad path must be refused *and* the previous one kept.
+      const wsBefore = (await invoke<HostState>('session_state')).workspace
+      await invoke('set_workspace', { path: '/nonexistent/definitely-not' })
+      await new Promise((r) => setTimeout(r, 500))
+      const wsBad = (await invoke<HostState>('session_state')).workspace
+      if (wsBad !== wsBefore) fail(`a non-directory workspace was adopted: ${wsBad}`)
+
+      await invoke('set_workspace', { path: '/tmp' })
+      await new Promise((r) => setTimeout(r, 500))
+      const wsTmp = (await invoke<HostState>('session_state')).workspace
+      if (wsTmp !== '/tmp') fail(`workspace switch did not land: ${wsTmp}`)
+
+      await invoke('set_workspace', { path: wsBefore })
+      await new Promise((r) => setTimeout(r, 500))
+      const wsBack = (await invoke<HostState>('session_state')).workspace
+      if (wsBack !== wsBefore) fail(`workspace was not restored: ${wsBack}`)
+      // Say it out loud: a silent pass is indistinguishable from a skipped step.
+      pageLog(`workspace: rejected bad path, moved to /tmp, restored to ${wsBack}`)
+
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +
@@ -1345,12 +1387,9 @@
             ></textarea>
 
             <div class="crow">
-              <!-- Placeholders for features that do not exist yet. They are
-                   disabled rather than absent so the layout matches where the
-                   control will land, and the title says why it is inert. -->
-              <button class="cbtn sq" disabled title="Not implemented yet">
-                <svg width="14" height="14" viewBox="0 0 14 14"><path d="M7 2.5v9M2.5 7h9" stroke="currentColor" stroke-width="1.4"/></svg>
-              </button>
+              <!-- The "+" this used to be would duplicate the paperclip now that
+                   attachments exist. A disabled button that duplicates a live one
+                   is worse than no button. -->
               <input
                 type="file"
                 accept="image/png,image/jpeg,image/webp,image/gif"
@@ -1404,9 +1443,14 @@
 
           </div>
 
-          <button class="wsrow" disabled title="Workspace picking is not implemented yet">
+          <button
+            class="wsrow"
+            title="Choose the directory the tools operate in"
+            onclick={chooseWorkspace}
+          >
             <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
-            <span>Choose workspace (optional)</span>
+            <span>{shortWorkspace || 'Choose workspace'}</span>
+            {#if wsBusy}<span class="ws-note">opening…</span>{/if}
           </button>
         </div>
       </div>

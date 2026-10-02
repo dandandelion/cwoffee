@@ -86,6 +86,18 @@ impl Agent {
         &mut self.prompt
     }
 
+    /// Point the tools at a different workspace.
+    ///
+    /// Only safe between turns: a running tool already holds the old `ToolCtx`,
+    /// and the sandbox bind is fixed for the lifetime of that process.
+    pub fn set_workspace(&mut self, path: std::path::PathBuf) {
+        self.ctx.workspace = path
+    }
+
+    pub fn workspace(&self) -> &std::path::Path {
+        &self.ctx.workspace
+    }
+
     pub fn set_mode(&mut self, m: crate::approval::ApprovalMode) {
         self.gate.set_mode(m);
     }

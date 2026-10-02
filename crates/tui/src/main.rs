@@ -173,6 +173,7 @@ impl App {
                 self.avg.push(u.clone());
                 self.tel = u;
             }
+            EngineEvent::Note { message } => self.items.push(Item::Note(message)),
             EngineEvent::Error { message, fatal } => {
                 if fatal {
                     self.items.push(Item::Fail(message));

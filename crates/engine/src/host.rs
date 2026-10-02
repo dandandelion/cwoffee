@@ -81,6 +81,8 @@ pub enum HostCmd {
     SetReasoning { reasoning: Reasoning },
     /// Change the model id for subsequent turns. Does not rewrite history.
     SetModel { model: String },
+    /// Move the tools to a different workspace. Refused while a turn is running.
+    SetWorkspace { path: String },
     NewSession { title: String },
     SwitchSession { id: i64 },
     Cancel,
@@ -92,6 +94,7 @@ pub enum HostCmd {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HostState {
     pub session_id: i64,
+    pub workspace: String,
     pub model: String,
     pub mode: ApprovalMode,
     pub reasoning: Reasoning,
@@ -139,6 +142,7 @@ impl SessionHost {
             mpsc::unbounded_channel::<(ApprovalRequest, oneshot::Sender<ApprovalAnswer>)>();
         let state = Arc::new(Mutex::new(HostState {
             session_id: 0,
+            workspace: cfg.workspace.display().to_string(),
             model: cfg.model.clone(),
             mode: cfg.mode,
             reasoning: cfg.reasoning,
@@ -220,6 +224,41 @@ impl SessionHost {
                         agent_cancel.store(true, Ordering::Relaxed);
                     }
 
+                    HostCmd::SetWorkspace { path } => {
+                        // No busy check is needed, and one here would be dead
+                        // code: `Send` runs the turn inline in this loop, so no
+                        // command - including this one - can be processed while
+                        // a tool holds the previous ToolCtx.
+                        let p = std::path::PathBuf::from(&path);
+                        if !p.is_dir() {
+                            let _ = ev_tx.send(EngineEvent::Error {
+                                message: format!("workspace {path:?} is not a directory"),
+                                fatal: false,
+                            });
+                            continue;
+                        }
+                        // The sandbox confines writes to this directory, so an
+                        // unreadable one is a configuration mistake worth saying
+                        // out loud rather than discovering on the first exec.
+                        if std::fs::File::create(p.join(".cowry-write-test")).is_err() {
+                            let _ = ev_tx.send(EngineEvent::Error {
+                                message: format!("workspace {path:?} is not writable"),
+                                fatal: false,
+                            });
+                            continue;
+                        } else {
+                            let _ = std::fs::remove_file(p.join(".cowry-write-test"));
+                        }
+                        agent.set_workspace(p.clone());
+                        // The env block rides on the newest user message only, so
+                        // changing it does not disturb the cached prefix.
+                        agent.prompt_mut().set_env(default_env_block(&p, "linux"));
+                        let _ = store.set_session_workspace(session_id, &p);
+                        state_bg.lock().unwrap().workspace = p.display().to_string();
+                        let _ = ev_tx.send(EngineEvent::Note {
+                            message: format!("workspace is now {}", p.display()),
+                        });
+                    }
                     HostCmd::SetModel { model } => {
                         // Empty would send `"model": ""` to the endpoint, which
                         // is a confusing 400 rather than an obvious bug.
@@ -604,6 +643,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_switch_validates_the_path() {
+        let base = std::env::temp_dir().join(format!("cowry_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let (mut h, _store) = host(vec!["a".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        // A path that is not a directory must be refused, not silently adopted:
+        // bwrap would bind a non-directory and every tool call would then fail
+        // far from the cause.
+        h.send(HostCmd::SetWorkspace { path: "/nonexistent/nope".into() });
+        assert!(
+            await_error(&mut ev, "not a directory").await,
+            "a non-directory workspace was accepted"
+        );
+
+        // A directory that exists but cannot be written is also worth saying so
+        // now: the sandbox makes exactly this directory writable, so a read-only
+        // choice guarantees the first write fails.
+        let ro = base.join("read-only");
+        std::fs::create_dir_all(&ro).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(ro.join("probe")).is_err() {
+            // skipped when running as root, which can write anything
+            h.send(HostCmd::SetWorkspace { path: ro.display().to_string() });
+            assert!(
+                await_error(&mut ev, "not writable").await,
+                "an unwritable workspace was accepted"
+            );
+        }
+        let _ = std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700));
+
+        // A real, writable directory is adopted, and the state the UI reads
+        // follows it.
+        let other = base.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        h.send(HostCmd::SetWorkspace { path: other.display().to_string() });
+        wait_for("workspace change".into(), || {
+            h.state().workspace == other.display().to_string()
+        })
+        .await;
+        assert!(
+            drain_events(&mut ev).await.iter().any(|e| matches!(e, EngineEvent::Note { .. })),
+            "a workspace move should be visible in the transcript"
+        );
+
+        // Ordering: a change queued behind a turn lands after it, never during
+        // it, because the command loop runs turns inline.
+        h.submit("go");
+        h.send(HostCmd::SetWorkspace { path: base.display().to_string() });
+        turns_done(&h, 1).await;
+        assert_eq!(h.state().workspace, base.display().to_string());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
     async fn an_attachment_survives_host_prompt_and_store() {
         let store = Arc::new(Store::in_memory().unwrap());
         let seen = Arc::new(AtomicUsize::new(0));
@@ -687,6 +786,20 @@ mod tests {
     /// poll, so `busy` is never observed as true.
     async fn turns_done(h: &SessionHost, n: u64) {
         wait_for(format!("{n} turns"), move || h.state().turns >= n).await;
+    }
+
+    /// Poll for an `Error` whose message contains `needle`. `wait_for` takes a
+    /// sync closure, so an async drain needs its own polling loop.
+    async fn await_error(rx: &mut EventRx, needle: &str) -> bool {
+        for _ in 0..400 {
+            if drain_events(rx).await.iter().any(|e| {
+                matches!(e, EngineEvent::Error { message, .. } if message.contains(needle))
+            }) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
     }
 
     async fn drain_events(rx: &mut EventRx) -> Vec<EngineEvent> {

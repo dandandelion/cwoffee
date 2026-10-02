@@ -40,6 +40,7 @@ export type EngineEvent =
     }
   | { kind: 'usage'; d: TurnTelemetry }
   | { kind: 'turnEnd'; d: { turn_id: number; finish: FinishReason } }
+  | { kind: 'note'; d: { message: string } }
   | { kind: 'error'; d: { message: string; fatal: boolean } }
 
 export interface GpuReport {
@@ -59,6 +60,7 @@ export interface HostState {
   context_tokens: number
   compactions: number
   approval_timeout_secs: number
+  workspace: string
 }
 
 export interface Session {

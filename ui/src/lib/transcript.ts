@@ -258,6 +258,10 @@ export class Transcript {
       case 'approvalRequested':
         // rendered by the composer overlay, not inline: it needs the keyboard
         break
+      case 'note':
+        this.flushNow()
+        this.block('note', 'note').textContent = ev.d.message
+        break
       case 'error':
         this.flushNow()
         this.block(ev.d.fatal ? 'fail' : 'warn', ev.d.fatal ? 'error' : 'warning').textContent = ev.d.message

@@ -148,6 +148,20 @@ impl Store {
         Ok(())
     }
 
+    /// Record which directory a session's tools operate in.
+    pub fn set_session_workspace(
+        &self,
+        id: i64,
+        path: &std::path::Path,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET workspace = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, path.to_string_lossy().to_string(), now_ts()],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, id: i64) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
@@ -827,7 +841,6 @@ mod tests {
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
     }
 
-    #[test]
     #[test]
     fn paged_history_is_bounded_and_ordered() {
         let s = Store::in_memory().unwrap();

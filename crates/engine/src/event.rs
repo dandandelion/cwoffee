@@ -134,6 +134,12 @@ pub enum EngineEvent {
         finish: FinishReason,
     },
 
+    /// A non-actionable state change worth showing in the transcript, e.g. the
+    /// workspace moving. Not an error: nothing went wrong.
+    Note {
+        message: String,
+    },
+
     /// A non-fatal or fatal problem. `fatal` means the turn is over.
     Error {
         message: String,

@@ -233,6 +233,7 @@ fn main() {
         // open in the user's browser, never in this webview (which would replace
         // the app), and never through a shell string we built ourselves.
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         // A webview that never paints leaves no trace: the engine logs look
         // healthy, WebKit processes are up, memory is fine. The only outward
@@ -265,6 +266,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::attach,
             commands::start_turn,
+            commands::pick_workspace,
+            commands::set_workspace,
             commands::cancel_turn,
             commands::respond_approval,
             commands::set_mode,
