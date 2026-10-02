@@ -159,6 +159,9 @@ impl App {
                     *running = false;
                 }
             }
+            // The TUI answers approvals from `ap_rx` directly; this variant
+            // exists for front ends that consume a single merged stream.
+            EngineEvent::ApprovalRequested { .. } => {}
             EngineEvent::Usage(u) => {
                 self.avg.push(u.clone());
                 self.tel = u;
@@ -304,6 +307,10 @@ async fn run(mut terminal: DefaultTerminal, host: &mut SessionHost, args: &Args)
     let mut app = App::new(args.model.clone());
     app.mode = args.mode;
 
+    // The receivers move out of the host once: recv() needs &mut, and two
+    // consumers would silently split one event stream.
+    let (mut ev_rx, mut ap_rx) = host.take_receivers().expect("event receivers");
+
     // Keyboard on a blocking thread: crossterm's read() is blocking, and running
     // it on the async runtime would stall the stream.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<KeyEvent>();
@@ -327,15 +334,15 @@ async fn run(mut terminal: DefaultTerminal, host: &mut SessionHost, args: &Args)
         // once. Drawing per token would re-wrap the transcript ~50x/s.
         tokio::select! {
             Some(k) = key_rx.recv() => handle_key(k, &mut app, host),
-            Some(ev) = host.events.recv() => app.apply(ev),
-            Some((req, reply)) = host.approvals.recv() => {
+            Some(ev) = ev_rx.recv() => app.apply(ev),
+            Some((req, reply)) = ap_rx.recv() => {
                 app.pending = Some((req, reply));
                 app.busy = true;
             }
             else => break,
         }
 
-        while let Ok(ev) = host.events.try_recv() {
+        while let Ok(ev) = ev_rx.try_recv() {
             app.apply(ev);
         }
         let st = host.state();

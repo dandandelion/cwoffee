@@ -40,6 +40,8 @@ pub struct HostConfig {
     pub context_budget: usize,
     /// Extra volatile context appended to the newest user message.
     pub env_block: String,
+    /// How long an unanswered approval prompt waits before refusing.
+    pub approval_timeout: std::time::Duration,
 }
 
 impl HostConfig {
@@ -53,6 +55,7 @@ impl HostConfig {
             max_tokens: None,
             context_budget: 8_000,
             env_block: String::new(),
+            approval_timeout: std::time::Duration::from_secs(300),
         }
     }
 }
@@ -71,7 +74,7 @@ pub enum HostCmd {
 
 /// Snapshot for status lines / the composer's current-state labels. Cheap to
 /// clone, safe to read from any thread.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct HostState {
     pub session_id: i64,
     pub mode: ApprovalMode,
@@ -87,11 +90,17 @@ pub struct HostState {
 
 pub struct SessionHost {
     cmd: mpsc::UnboundedSender<HostCmd>,
-    pub events: mpsc::UnboundedReceiver<EngineEvent>,
-    pub approvals: mpsc::UnboundedReceiver<(ApprovalRequest, oneshot::Sender<ApprovalAnswer>)>,
+    /// Receivers are `Option` because `recv()` needs `&mut`, which shared UI
+    /// state (Tauri's `State<AppState>`) cannot give out. A shell calls
+    /// `take_receivers` once and owns them; the TUI does the same.
+    events: Option<mpsc::UnboundedReceiver<EngineEvent>>,
+    approvals: Option<mpsc::UnboundedReceiver<ApprovalRx>>,
     state: Arc<Mutex<HostState>>,
     cancel: Arc<AtomicBool>,
 }
+
+pub type EventRx = mpsc::UnboundedReceiver<EngineEvent>;
+pub type ApprovalRx = (ApprovalRequest, oneshot::Sender<ApprovalAnswer>);
 
 impl SessionHost {
     pub fn spawn(
@@ -119,7 +128,7 @@ impl SessionHost {
         let state_bg = Arc::clone(&state);
 
         tokio::spawn(async move {
-            let gate = ApprovalGate::new(cfg.mode, ap_tx);
+            let gate = ApprovalGate::new(cfg.mode, ap_tx).with_timeout(cfg.approval_timeout);
             let ctx = ToolCtx {
                 workspace: cfg.workspace.clone(),
                 max_output_bytes: 24 * 1024,
@@ -278,7 +287,16 @@ impl SessionHost {
             }
         });
 
-        SessionHost { cmd: cmd_tx, events: ev_rx, approvals: ap_rx, state, cancel }
+        SessionHost { cmd: cmd_tx, events: Some(ev_rx), approvals: Some(ap_rx), state, cancel }
+    }
+
+    /// Move the event and approval receivers out of the host, exactly once.
+    /// Returns `None` on a second call: two consumers would silently split one
+    /// event stream, which shows up as a UI randomly missing tool calls.
+    pub fn take_receivers(&mut self) -> Option<(EventRx, mpsc::UnboundedReceiver<ApprovalRx>)> {
+        let ev = self.events.take()?;
+        let ap = self.approvals.take()?;
+        Some((ev, ap))
     }
 
     pub fn send(&self, cmd: HostCmd) {
@@ -300,6 +318,20 @@ impl SessionHost {
 
 fn set_busy(state: &Arc<Mutex<HostState>>, busy: bool) {
     state.lock().unwrap().busy = busy;
+}
+
+/// Convert a gate request into the wire event every front end renders.
+///
+/// Shared so the TUI and the webview cannot drift into asking different
+/// questions about the same call.
+pub fn approval_event(req: &ApprovalRequest) -> EngineEvent {
+    EngineEvent::ApprovalRequested {
+        id: req.id,
+        tool: req.tool.clone(),
+        risk: req.risk,
+        summary: req.summary.clone(),
+        args: req.args.clone(),
+    }
 }
 
 /// Build the volatile environment block. Kept out of the system prompt on
@@ -408,9 +440,9 @@ mod tests {
         wait_for(format!("{n} turns"), move || h.state().turns >= n).await;
     }
 
-    async fn drain_events(h: &mut SessionHost) -> Vec<EngineEvent> {
+    async fn drain_events(rx: &mut EventRx) -> Vec<EngineEvent> {
         let mut out = Vec::new();
-        while let Ok(e) = h.events.try_recv() {
+        while let Ok(e) = rx.try_recv() {
             out.push(e);
         }
         out
@@ -419,11 +451,12 @@ mod tests {
     #[tokio::test]
     async fn a_turn_is_streamed_and_persisted() {
         let (mut h, store) = host(vec!["hello there".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
         ready(&h).await;
         h.submit("first question");
         turns_done(&h, 1).await;
 
-        let evs = drain_events(&mut h).await;
+        let evs = drain_events(&mut ev).await;
         assert!(evs
             .iter()
             .any(|e| matches!(e, EngineEvent::TurnEnd { finish: FinishReason::Stop, .. })));
@@ -530,18 +563,20 @@ mod tests {
             Arc::clone(&store),
             HostConfig { mode: ApprovalMode::Ask, ..HostConfig::new("m", std::env::temp_dir()) },
         );
+        let (mut ap, _ev) = h.take_receivers().map(|(e, a)| (a, e)).expect("receivers");
         ready(&h).await;
         h.submit("say hi");
         turns_done(&h, 1).await;
-        assert!(h.approvals.try_recv().is_err(), "unexpected approval request");
+        assert!(ap.try_recv().is_err(), "unexpected approval request");
     }
 
     #[tokio::test]
     async fn shutdown_stops_the_host() {
         let (mut h, _store) = host(vec!["ok".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
         h.send(HostCmd::Shutdown);
         // the events channel closes once the host task returns
-        assert!(h.events.recv().await.is_none());
+        assert!(ev.recv().await.is_none());
     }
 
     #[test]

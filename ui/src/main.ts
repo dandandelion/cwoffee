@@ -10,7 +10,7 @@ window.addEventListener('error', (e) => {
   pageLog(`UNCAUGHT: ${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`)
 })
 window.addEventListener('unhandledrejection', (e) => {
-  pageLog(`REJECTION: ${String((e as PromiseRejectionHandlingEvent).reason)}`)
+  pageLog(`REJECTION: ${String((e as PromiseRejectionEvent).reason)}`)
 })
 
 pageLog('boot: main.ts executing')

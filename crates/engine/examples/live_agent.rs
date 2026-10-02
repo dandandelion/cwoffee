@@ -151,6 +151,9 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
             EngineEvent::ToolExecEnd { ok, exit_code, .. } => {
                 println!("[tool done] ok={ok} exit={exit_code:?}");
             }
+            EngineEvent::ApprovalRequested { id, tool, risk, summary, .. } => {
+                println!("\n[approval #{id}] tool={tool} risk={risk:?}\n  {summary}");
+            }
             EngineEvent::Usage(u) => {
                 println!(
                     "[usage] prompt={} cached={} completion={} raw_prefill={:.0}/s decode={:.1}/s ttft={}ms",

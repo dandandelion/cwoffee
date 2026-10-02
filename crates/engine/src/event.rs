@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::telemetry::TurnTelemetry;
+use crate::tools::Risk;
 
 /// Why a turn stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +101,20 @@ pub enum EngineEvent {
         id: String,
         ok: bool,
         exit_code: Option<i32>,
+    },
+
+    /// The gate wants permission before a tool runs.
+    ///
+    /// CONTRACT: the front end must answer with `respond_approval(id, answer)`.
+    /// If it never does — closed webview, crashed renderer — the gate fails
+    /// closed and the tool does not run. A UI that disappears must never turn
+    /// into an agent that runs things unattended.
+    ApprovalRequested {
+        id: u64,
+        tool: String,
+        risk: Risk,
+        summary: String,
+        args: serde_json::Value,
     },
 
     /// Per-turn telemetry. Emitted once, just before `TurnEnd`.

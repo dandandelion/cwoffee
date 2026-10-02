@@ -121,6 +121,10 @@ pub struct ApprovalGate {
     session_allowed: HashSet<String>,
     next_id: u64,
     tx: mpsc::UnboundedSender<(ApprovalRequest, oneshot::Sender<ApprovalAnswer>)>,
+    /// How long to wait for a human before refusing. Long enough to step away
+    /// and come back; finite, because an unanswered prompt must not pin a turn
+    /// open forever.
+    timeout: std::time::Duration,
 }
 
 impl ApprovalGate {
@@ -131,7 +135,15 @@ impl ApprovalGate {
             session_allowed: HashSet::new(),
             next_id: 1,
             tx,
+            timeout: std::time::Duration::from_secs(300),
         }
+    }
+
+    /// Override the approval timeout. Mostly for tests, which cannot sleep
+    /// five minutes.
+    pub fn with_timeout(mut self, d: std::time::Duration) -> Self {
+        self.timeout = d;
+        self
     }
 
     pub fn set_mode(&mut self, m: ApprovalMode) {
@@ -188,22 +200,36 @@ impl ApprovalGate {
                 reason: "no approval UI is connected; refusing to run".into(),
             };
         }
-        match reply_rx.await {
+        // Bounded wait. The UI can disappear mid-turn — window closed, renderer
+        // crashed, or the user simply walked away. Awaiting forever would hold
+        // the turn open indefinitely, so the timeout fails closed exactly the way
+        // a missing UI does.
+        match tokio::time::timeout(self.timeout, reply_rx).await {
             // In Session mode an Allow is implicitly session-scoped: that is the
             // whole point of the mode, and asking twice for the same tool is how
             // users end up clicking through six prompts and stopping reading them.
-            Ok(ApprovalAnswer::Allow) => {
+            Ok(Ok(ApprovalAnswer::Allow)) => {
                 if self.mode == ApprovalMode::Session {
                     self.session_allowed.insert(tool.to_string());
                 }
                 GateOutcome::Allow
             }
-            Ok(ApprovalAnswer::AllowSession) => {
+            Ok(Ok(ApprovalAnswer::AllowSession)) => {
                 self.session_allowed.insert(tool.to_string());
                 GateOutcome::Allow
             }
-            Ok(ApprovalAnswer::Deny) => GateOutcome::Deny { reason: "denied by user".into() },
-            Err(_) => GateOutcome::Deny { reason: "approval prompt closed".into() },
+            Ok(Ok(ApprovalAnswer::Deny)) => GateOutcome::Deny { reason: "denied by user".into() },
+            // The reply channel closed without an answer: the front end went away
+            // after being asked.
+            Ok(Err(_)) => GateOutcome::Deny {
+                reason: "approval UI disconnected; refusing to run".into(),
+            },
+            Err(_) => GateOutcome::Deny {
+                reason: format!(
+                    "no answer within {}s; refusing to run unattended",
+                    self.timeout.as_secs()
+                ),
+            },
         }
     }
 
@@ -399,6 +425,34 @@ mod tests {
             assert_eq!(ApprovalMode::parse(m.as_str()), Some(m));
         }
         assert_eq!(ApprovalMode::parse("yolo"), None);
+    }
+
+    /// A prompt nobody answers must not pin a turn open forever.
+    #[tokio::test]
+    async fn an_unanswered_prompt_times_out_and_denies() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut g = ApprovalGate::new(ApprovalMode::Ask, tx).with_timeout(std::time::Duration::from_millis(60));
+        let out = g.check("exec", Risk::Exec, &json!({"cmd": "ls"})).await;
+        match out {
+            GateOutcome::Deny { reason } => {
+                assert!(reason.contains("no answer within"), "reason was {reason:?}");
+            }
+            other => panic!("expected a deny on timeout, got {other:?}"),
+        }
+    }
+
+    /// A front end that takes the prompt then dies must fail closed too.
+    #[tokio::test]
+    async fn a_disconnected_ui_denies() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut g = ApprovalGate::new(ApprovalMode::Ask, tx).with_timeout(std::time::Duration::from_secs(30));
+        let h = tokio::spawn(async move {
+            let (_req, reply) = rx.recv().await.expect("prompt");
+            drop(reply); // UI vanished mid-prompt
+        });
+        let out = g.check("exec", Risk::Exec, &json!({"cmd": "ls"})).await;
+        h.await.ok();
+        assert!(matches!(out, GateOutcome::Deny { .. }), "got {out:?}");
     }
 
     #[test]

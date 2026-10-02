@@ -109,3 +109,165 @@ body {
   border-radius: var(--radius-pill);
   background: var(--color-paper);
 }
+
+/* ---------------------------------------------------------------------------
+   Transcript.
+   Rendered imperatively by ui/src/lib/transcript.ts, not by the framework.
+   Rules here must not depend on structure that changes per token.
+--------------------------------------------------------------------------- */
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.turn-head {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-ink-3);
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--color-hairline);
+}
+
+.blk {
+  display: grid;
+  grid-template-columns: 62px 1fr;
+  gap: 10px;
+  align-items: start;
+}
+.blk-head {
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--color-ink-3);
+  padding-top: 3px;
+  text-align: right;
+}
+.blk-body {
+  font-size: 14px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-width: 0;
+}
+
+.blk-user .blk-body { color: var(--color-ink); }
+.blk-answer .blk-body { color: var(--color-ink); }
+.blk-reasoning .blk-body {
+  color: var(--color-ink-3);
+  font-style: italic;
+  font-size: 13px;
+  border-left: 2px solid var(--color-hairline-2);
+  padding-left: 10px;
+}
+.blk-warn .blk-body { color: #8a6d1f; }
+.blk-fail .blk-body { color: #8b3d3d; }
+
+/* tool card */
+.blk-tool {
+  grid-template-columns: 62px 1fr;
+}
+.blk-tool .blk-head { display: none; }
+.blk-tool > .tool-name,
+.blk-tool > .tool-status { display: inline; }
+
+.blk-tool {
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+  padding: 10px 12px;
+  background: var(--color-paper-2);
+}
+.tool-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+.tool-status {
+  margin-left: 8px;
+  font-size: 11.5px;
+  color: var(--color-ink-3);
+}
+.tool-status.ok { color: #3d6b3d; }
+.tool-status.bad { color: #8b3d3d; }
+.tool-args {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-2);
+  word-break: break-all;
+}
+.tool-out {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-ink-2);
+  max-height: 260px;
+  overflow-y: auto;
+}
+.tool-bad { border-color: #e3c9c9; }
+
+/* ---------------------------------------------------------------------------
+   Composer + buttons
+--------------------------------------------------------------------------- */
+.composer {
+  width: 100%;
+  resize: none;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+  background: var(--color-paper);
+  padding: 10px 12px;
+  font-size: 14px;
+  line-height: 1.55;
+  font-family: inherit;
+  color: var(--color-ink);
+}
+.composer:focus {
+  outline: none;
+  border-color: var(--color-hairline-2);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-sea) 28%, transparent);
+}
+
+.btn-go, .btn-ghost, .btn-bad {
+  border-radius: 10px;
+  padding: 6px 13px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: default;
+  border: 1px solid transparent;
+}
+.btn-go { background: var(--color-go); color: var(--color-paper); }
+.btn-go:disabled { opacity: 0.4; }
+.btn-ghost { background: var(--color-paper); border-color: var(--color-hairline); color: var(--color-ink-2); }
+.btn-ghost:hover { background: var(--color-paper-2); color: var(--color-ink); }
+.btn-bad { background: var(--color-paper); border-color: #e3c9c9; color: #8b3d3d; }
+
+/* sidebar rows */
+.sesshit, .searchhit {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 9px;
+  border-radius: 9px;
+  cursor: default;
+  border: 1px solid transparent;
+}
+.sesshit:hover, .searchhit:hover { background: color-mix(in srgb, var(--color-ink) 5%, transparent); }
+.sesshit.active {
+  background: var(--color-paper);
+  border-color: var(--color-hairline);
+}
+
+.approval { padding-bottom: 8px; }
+.approval-card {
+  padding: 12px 14px;
+  border-color: #e6d9b8;
+  background: #fdf9ef;
+}
