@@ -764,3 +764,10 @@ body {
   color: var(--color-ink-3);
   white-space: nowrap;
 }
+
+/* Drop target needs to be visible or a dropped file is indistinguishable from a
+   dropped file that went nowhere. */
+.cbox.dropping {
+  border-color: var(--color-shell);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-shell) 22%, transparent);
+}

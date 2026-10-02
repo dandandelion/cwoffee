@@ -391,6 +391,7 @@
   let pending = $state<Pending[]>([])
   let fileInput = $state<HTMLInputElement | null>(null)
   let composerEl = $state<HTMLTextAreaElement | null>(null)
+  let dropping = $state(false)
   let theme = $state<'light' | 'dark'>('light')
   let attachErr = $state('')
 
@@ -424,6 +425,16 @@
     applyTheme(t)
   }
 
+  // Paste is the path people actually reach for with screenshots, and drag in
+  // from a file manager is the other one. Both feed the same guardrails as the
+  // picker rather than a second, laxer copy.
+  function onPaste(e: ClipboardEvent) {
+    const files = Array.from(e.clipboardData?.files ?? [])
+    if (!files.length) return
+    e.preventDefault()
+    void addFiles(files)
+  }
+
   function fmtBytes(n: number) {
     if (n < 1024) return `${n} B`
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} kB`
@@ -447,6 +458,11 @@
     const input = e.target as HTMLInputElement
     const files = Array.from(input.files ?? [])
     input.value = ''
+    await addFiles(files)
+  }
+
+  async function addFiles(files: File[]) {
+    if (!files.length) return
     attachErr = ''
     for (const f of files) {
       if (!OK_MIME.includes(f.type)) {
@@ -1286,7 +1302,25 @@
       <!-- composer -->
       <div class="px-4 pb-2 pt-2">
         <div class="mx-auto w-full max-w-[860px]">
-          <div class="cbox">
+          <div
+            class="cbox"
+            role="group"
+            aria-label="Message composer"
+            class:dropping={dropping}
+            onpaste={onPaste}
+            ondragover={(e: DragEvent) => {
+              if (e.dataTransfer?.types?.includes('Files')) {
+                e.preventDefault()
+                dropping = true
+              }
+            }}
+            ondragleave={() => (dropping = false)}
+            ondrop={(e: DragEvent) => {
+              e.preventDefault()
+              dropping = false
+              void addFiles(Array.from(e.dataTransfer?.files ?? []))
+            }}
+          >
             {#if pending.length || attachErr}
               <div class="attrow">
                 {#each pending as a, i}
