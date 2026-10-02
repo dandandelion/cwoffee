@@ -1,91 +1,78 @@
 # Cowry configuration
-# ~/.config/cowry/config.toml
+# Copy to ~/.config/cowry/config.toml
 #
-# The app introspects llama.cpp endpoints (/health, /props, /v1/models) and
-# auto-fills n_ctx / images / slots, so most of the [providers.llama] block
-# below is optional. Hand-config is only needed for non-llama.cpp providers.
-
-[ui]
-theme            = "light"          # light | dark | system
-approval_default = "ask"            # ask | session | full
+# Precedence: CLI flag > environment variable > this file > built-in defaults.
+# A malformed file is fatal at startup rather than silently ignored — a wrong
+# endpoint with no explanation is worse than a crash. A missing file is fine.
+#
+# This block lists every key the parser accepts. Anything not listed here is
+# ignored, so do not copy keys from older drafts.
 
 # ---------------------------------------------------------------------------
-# Providers
+# Endpoint
 # ---------------------------------------------------------------------------
-
-[providers.llama]
-kind     = "llama.cpp"              # llama.cpp | openai | anthropic
+[provider]
+kind     = "llama.cpp"        # llama.cpp | openai | anthropic
 base_url = "http://127.0.0.1:8090/v1"
-# api_key  = "env:COWRY_KEY"        # not needed on this box
+model    = ""                 # empty => adopt the first id from /v1/models
+# api_key = "env:COWRY_KEY"   # env:VARNAME keeps secrets off disk
 
-[providers.anthropic]
-kind     = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key  = "env:ANTHROPIC_API_KEY"
-
-# Any OpenAI-compatible gateway:
-# [providers.gateway]
-# kind     = "openai"
-# base_url = "https://gateway.example.com/v1"
-# api_key  = "env:GATEWAY_KEY"
+# `kind` selects the wire protocol, not the vendor:
+#   llama.cpp  -> OpenAI chat format + chat_template_kwargs.enable_thinking,
+#                 reads llama.cpp `timings` for cache/speculative telemetry
+#   openai     -> OpenAI chat format, no llama.cpp fields
+#   anthropic  -> /v1/messages, thinking blocks, signed-thinking replay
 
 # ---------------------------------------------------------------------------
-# Models (aliases shown in the composer picker)
+# Workspace and approval
 # ---------------------------------------------------------------------------
+# Where read_file / write_file / exec operate. A leading ~ is expanded.
+# Default: ~/cowry-workspace for the desktop app, the process CWD for the TUI.
+# Never the GUI's CWD: a window launched by a .desktop file inherits one at random.
+workspace = "~/cowry-workspace"
 
-[[models]]
-alias    = "local"
-provider = "llama"
-id       = "qwen3.8-flash-next-iq3_s"
-context  = 131072
-vision   = true
-tools    = true
-thinking = true                     # exposes the thinking toggle
-# thinking_param = "chat_template_kwargs.enable_thinking"
+# ask     - prompt for every tool call
+# session - first allow per tool is remembered for the session
+# auto    - no prompts; the denylist still applies
+mode = "ask"
 
-# [[models]]
-# alias    = "cc"
-# provider = "anthropic"
-# id       = "claude-sonnet-4-5"
-# context  = 200000
-# effort   = ["low", "medium", "high"]
+# Seconds an unanswered approval prompt waits before refusing. Fail closed:
+# an unreachable UI must not leave the agent waiting forever.
+approval_timeout_secs = 300
+
+theme = "light"               # light | dark | system (not wired up yet)
 
 # ---------------------------------------------------------------------------
-# Context budget — prefill is ~30-68 tok/s on llama.cpp, so we stay small
+# Context budget
 # ---------------------------------------------------------------------------
-
+# Prefill on a local quantized model is ~30-120 tok/s, so a long transcript is a
+# latency problem rather than a correctness one. Compaction is explicit, rare and
+# reported — it throws away the server-side prefix cache.
 [context]
-target_tokens      = 8000           # soft budget before compaction is suggested
-max_tool_output    = 2000           # truncated AT INGEST, never recomputed
-tool_output_head   = 1400           # head/tail split keeps errors visible
-tool_output_tail   = 600
-compact_after_turns = 40
-repair_retries     = 1              # malformed tool-call JSON -> repair + 1 retry
+target_tokens   = 8000
+max_tool_output = 8000
 
 # ---------------------------------------------------------------------------
-# Exec sandbox (bwrap)
+# Search
 # ---------------------------------------------------------------------------
-
-[sandbox]
-enabled        = true
-network        = false              # --unshare-net inside the sandbox
-writable_paths = ["{workspace}"]    # everything else read-only
-timeout_secs   = 120
-
-[sandbox.denylist]                  # enforced even in "full" approval mode
-patterns = [
-  "rm -rf /", "rm -rf ~", "rm -rf /*",
-  "mkfs", "dd if=", ":(){",
-  "curl * | sh", "curl * | bash", "wget * | sh",
-  "shutdown", "reboot",
-]
-
-# ---------------------------------------------------------------------------
-# Research
-# ---------------------------------------------------------------------------
-
 [search]
-backend   = "duckduckgo-html"       # duckduckgo-html | searxng
-# searxng_url = "http://127.0.0.1:8888/search"
+backend = "duckduckgo"        # duckduckgo | searxng
 max_results = 8
-fetch_max_bytes = 400_000
+# searxng_url = "http://127.0.0.1:8888/search"
+# Public DuckDuckGo serves a bot challenge (HTTP 202) from many IPs; Cowry
+# reports that as an actionable error rather than "no results". Self-hosting
+# SearXNG and enabling JSON is the reliable path.
+
+# ---------------------------------------------------------------------------
+# Exec sandbox
+# ---------------------------------------------------------------------------
+# bwrap is the security boundary. The denylist is a guardrail, not a boundary.
+[sandbox]
+enabled = true
+timeout_secs = 120
+
+# ---------------------------------------------------------------------------
+# Environment overrides (no config keys - these win over the file)
+# ---------------------------------------------------------------------------
+#   COWRY_URL, COWRY_MODEL, COWRY_KEY, COWRY_WORKSPACE, COWRY_MODE,
+#   COWRY_CONTEXT, COWRY_SEARXNG_URL, COWRY_APPROVAL_TIMEOUT_SECS

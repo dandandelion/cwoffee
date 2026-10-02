@@ -186,8 +186,11 @@ impl Config {
         }
         let text = std::fs::read_to_string(&p)
             .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-        let cfg: Config = toml::from_str(&text)
+        let mut cfg: Config = toml::from_str(&text)
             .map_err(|e| format!("malformed {}: {e}", p.display()))?;
+        if let Some(w) = cfg.workspace.take() {
+            cfg.workspace = Some(Self::expand_tilde(&w));
+        }
         Ok((cfg, Some(p)))
     }
 
@@ -204,7 +207,7 @@ impl Config {
             self.provider.api_key = Some(v);
         }
         if let Some(v) = env("COWRY_WORKSPACE") {
-            self.workspace = Some(v);
+            self.workspace = Some(Self::expand_tilde(&v));
         }
         if let Some(v) = env("COWRY_MODE") {
             self.mode = Some(v);
@@ -223,6 +226,19 @@ impl Config {
                 self.approval_timeout_secs = Some(n);
             }
         }
+    }
+
+    /// Expand a leading `~` / `~/`. People write `~` in config files; without
+    /// this the app happily creates a directory literally named `~` in the
+    /// current directory and the agent "loses" every file it writes.
+    pub fn expand_tilde(p: &str) -> String {
+        if p == "~" || p.starts_with("~/") {
+            if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+                let rest = p.trim_start_matches('~');
+                return format!("{home}{rest}");
+            }
+        }
+        p.to_string()
     }
 
     pub fn mode(&self) -> ApprovalMode {
@@ -293,6 +309,19 @@ fn env(k: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_in_workspace_is_expanded() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        assert_eq!(Config::expand_tilde("~/ws"), format!("{home}/ws"));
+        assert_eq!(Config::expand_tilde("~"), home.clone());
+        // Not a tilde prefix: untouched.
+        assert_eq!(Config::expand_tilde("/abs/ws"), "/abs/ws");
+        assert_eq!(Config::expand_tilde("a~/b"), "a~/b");
+    }
 
     #[test]
     fn defaults_match_the_documented_local_setup() {
