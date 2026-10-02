@@ -13,6 +13,7 @@
  */
 
 import type { EngineEvent, ExecStream, StoredMessage } from './events'
+import { renderMarkdown } from './markdown'
 import { pageLog } from './pagelog'
 
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
@@ -36,9 +37,24 @@ export class Transcript {
   private raf = 0
   /** Collected during a turn so it can be committed once, at stream end. */
   private collected: { answer: string; reasoning: string } = { answer: '', reasoning: '' }
+  /**
+   * Answer bodies created this turn. Markdown is applied to them exactly once,
+   * at stream end — never per delta.
+   */
+  private answerEls: HTMLElement[] = []
 
   constructor(root: HTMLElement) {
     this.root = root
+    // A link that navigates replaces the whole app with a web page, which is
+    // worse than a dead link. Opening in the external browser needs Tauri's
+    // opener plugin (not wired yet); until then links are inert.
+    root.addEventListener('click', (e) => {
+      const a = (e.target as HTMLElement | null)?.closest?.('a')
+      if (a) {
+        e.preventDefault()
+        pageLog(`link suppressed: ${a.getAttribute('href')}`)
+      }
+    })
   }
 
   clear() {
@@ -46,6 +62,7 @@ export class Transcript {
     this.turn = null
     this.textBuf = null
     this.tools.clear()
+    this.answerEls = []
   }
 
   /** Total answer text streamed so far this turn. Used by the render self-report. */
@@ -93,6 +110,7 @@ export class Transcript {
       const label = kind === 'reasoning' ? 'thinking' : kind === 'user' ? 'you' : 'cowry'
       this.textBuf = this.block(kind, label)
       this.textKind = kind
+      if (kind === 'answer') this.answerEls.push(this.textBuf)
     }
     this.pending.push(s)
     if (!this.raf) this.raf = requestAnimationFrame(() => this.flush())
@@ -119,6 +137,7 @@ export class Transcript {
         this.textBuf = null
         this.textKind = null
         this.collected = { answer: '', reasoning: '' }
+        this.answerEls = []
         const head = this.el('turn-head', `turn ${ev.d.turn_id} · ${ev.d.model}`)
         this.ensureTurn()
         this.turn!.insertBefore(head, this.turn!.firstChild)
@@ -156,6 +175,7 @@ export class Transcript {
         break
       case 'turnEnd':
         this.flushNow()
+        this.renderAnswers()
         this.textBuf = null
         this.textKind = null
         break
@@ -171,6 +191,20 @@ export class Transcript {
     if (this.raf) cancelAnimationFrame(this.raf)
     this.raf = 0
     this.flush()
+  }
+
+  /**
+   * One markdown pass per answer block, at stream end. This is the only place
+   * innerHTML is ever assigned, and `renderMarkdown` escapes first so the only
+   * tags in the result are ones it wrote.
+   */
+  private renderAnswers() {
+    for (const el of this.answerEls) {
+      const text = el.textContent ?? ''
+      if (!text) continue
+      el.innerHTML = renderMarkdown(text)
+    }
+    this.answerEls = []
   }
 
   // ---- user echo ----------------------------------------------------------
@@ -247,6 +281,13 @@ export class Transcript {
 
   // ---- history ------------------------------------------------------------
 
+  /** Dev diagnostic: did the markdown pass actually run, and what did it emit? */
+  debugLastAnswerHtml(limit = 220): string {
+    const els = this.root.querySelectorAll('.blk-answer .blk-body')
+    const last = els[els.length - 1] as HTMLElement | undefined
+    return last ? last.innerHTML.slice(0, limit) : ''
+  }
+
   /** Re-render a stored session. Called on switch, not during streaming. */
   loadHistory(msgs: StoredMessage[]) {
     this.clear()
@@ -254,7 +295,8 @@ export class Transcript {
       if (m.role === 'user') this.block('user', 'you').textContent = m.content
       else if (m.role === 'assistant') {
         if (m.reasoning) this.block('reasoning', 'thinking').textContent = m.reasoning
-        this.block('answer', 'cowry').textContent = m.content
+        const body = this.block('answer', 'cowry')
+        body.innerHTML = renderMarkdown(m.content)
         for (const call of parseCalls(m.tool_calls_json)) {
           this.openTool(call.id, call.name)
           this.setToolArgs(call.id, call.arguments)

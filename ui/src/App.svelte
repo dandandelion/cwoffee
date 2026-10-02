@@ -119,6 +119,7 @@
           `turn end chars=${transcript?.streamedChars ?? 0} frames=${frames} ` +
             `dropped=${dropped} worst=${worstFrame.toFixed(0)}ms`,
         )
+        pageLog(`answer html: ${transcript?.debugLastAnswerHtml() ?? ''}`)
         void refreshState()
         void loadSessions()
         break
