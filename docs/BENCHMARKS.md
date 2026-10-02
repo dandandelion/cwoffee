@@ -53,6 +53,15 @@ the agent costs ~7 MB. Anything that does not need a browser should not carry on
 | `target/release/cowry` | 7.4 MB |
 | `target/release/cowry-app` | 12.1 MB (includes the embedded frontend) |
 | `bundle/rpm/cowry-0.0.0-1.x86_64.rpm` | 4.79 MiB |
+| `bundle/appimage/cowry_0.0.0_amd64.AppImage` | 112.1 MiB |
+
+The AppImage is **23× the RPM** and that is not a bug: it carries its own GTK /
+WebKitGTK / JavaScriptCore stack so it runs on a machine that has none of them,
+while the RPM declares them as dependencies and links the system copies. Runtime
+memory is essentially unchanged — a single AppImage instance measures 275.8 MB PSS
+against the RPM's 230–285 MB range — because it is the same webview either way,
+just a private copy of it. Ship the RPM to Fedora machines; the AppImage is for
+"this other box might not have webkit2gtk".
 
 The packaged artifact was measured separately after installing nothing — the RPM
 binary is the same one `tauri build` produced, and it was checked to contain the

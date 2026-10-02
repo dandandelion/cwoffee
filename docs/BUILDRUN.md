@@ -150,3 +150,23 @@ Error: terminal reports 0x0 - Cowry needs a real terminal size.
 
 This is not cosmetic. An unbounded wrap loop at width 0 once grew the process to
 8.7 GB PSS and pushed this box into swap while the inference server was running.
+
+## Packaging
+
+Both artifacts build from `crates/`, never from `ui/`:
+
+```bash
+cd crates
+../ui/node_modules/.bin/tauri build --bundles rpm        # 4.79 MiB, system webkit
+../ui/node_modules/.bin/tauri build --bundles appimage   # 112 MiB, bundles webkit
+```
+
+The AppImage needs FUSE to mount itself. On a machine without it (or inside a
+container) run:
+
+```bash
+./cowry_0.0.0_amd64.AppImage --appimage-extract-and-run
+```
+
+Verified: the AppImage renders with no dev server, and the GPU pinning survives
+its `AppRun` wrapper — `cowry-app` still holds `renderD128` only.
