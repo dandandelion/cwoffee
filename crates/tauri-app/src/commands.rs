@@ -230,8 +230,20 @@ pub struct MessagePage {
 }
 
 #[tauri::command]
-pub fn new_session(state: tauri::State<'_, AppState>, title: String) {
-    state.host.send(HostCmd::NewSession { title });
+/// Create a session row immediately and return its id.
+///
+/// It used to be a message queued to the host, which meant that during a turn
+/// the UI had no id to show: the click appeared to do nothing, and the session
+/// the user was in seemed to vanish. The host is still told to move there, so
+/// the next message lands in the new session once the current turn finishes.
+pub fn new_session(state: tauri::State<'_, AppState>, title: String) -> Result<i64, String> {
+    let st = state.host.state();
+    let id = state
+        .store
+        .create_session(&title, &st.workspace, &st.model)
+        .map_err(|e| e.to_string())?;
+    state.host.send(HostCmd::SwitchSession { id });
+    Ok(id)
 }
 
 #[tauri::command]
@@ -296,6 +308,37 @@ pub fn delete_session(state: tauri::State<'_, AppState>, id: i64) -> Result<(), 
         }
     }
     state.store.delete_session(id).map_err(|e| e.to_string())
+}
+
+/// Delete a batch of sessions. Same guards as a single delete: the host must not
+/// be writing into a row that disappears.
+#[tauri::command]
+pub fn delete_sessions(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let st = state.host.state();
+    if ids.contains(&st.session_id) && st.busy {
+        return Err("cannot delete the active session while a turn is running".into());
+    }
+    if ids.contains(&st.session_id) {
+        // Move somewhere that survives the batch: an empty session that is not
+        // itself being deleted, otherwise a fresh one.
+        let reuse = state
+            .store
+            .list_sessions(50)
+            .ok()
+            .and_then(|list| {
+                list.into_iter()
+                    .find(|s| !ids.contains(&s.id) && s.message_count == 0)
+                    .map(|s| s.id)
+            });
+        match reuse {
+            Some(sid) => state.host.send(HostCmd::SwitchSession { id: sid }),
+            None => state.host.send(HostCmd::NewSession { title: "new session".into() }),
+        }
+    }
+    state.store.delete_sessions(&ids).map_err(|e| e.to_string())
 }
 
 /// Page-side log line, forwarded into the same stream as the Rust output.

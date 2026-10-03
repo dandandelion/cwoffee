@@ -107,17 +107,17 @@ impl PromptBuilder {
         text: impl Into<String>,
         attachments: Vec<crate::provider::Attachment>,
     ) {
-        let text = text.into();
-        let content = if self.env_block.is_empty() {
-            text
-        } else {
-            // Env first, question last: models weight the tail of the prompt
-            // more heavily, and the question is what must be answered.
-            format!("{}\n\n{}", self.env_block, text)
-        };
+        // The env block is NOT baked into the stored content. It is injected at
+        // build() time instead, because this history is also what gets persisted
+        // and rendered: baking it in put a raw <env>...</env> block in front of
+        // every user message in the transcript.
+        //
+        // The bytes on the wire are unchanged - every user message still carries
+        // the block, so older messages never change and the prefix cache is
+        // unaffected.
         self.history.push(Message {
             role: Role::User,
-            content,
+            content: text.into(),
             attachments,
             ..Default::default()
         });
@@ -164,7 +164,17 @@ impl PromptBuilder {
     pub fn build(&self, model: &str) -> ChatRequest {
         let mut msgs = Vec::with_capacity(self.history.len() + 1);
         msgs.push(Message::system(&self.system));
-        msgs.extend(self.history.iter().cloned());
+        for m in self.history.iter() {
+            if m.role == Role::User && !self.env_block.is_empty() {
+                // Env first, question last: models weight the tail of the prompt
+                // more heavily, and the question is what must be answered.
+                let mut wired = m.clone();
+                wired.content = format!("{}\n\n{}", self.env_block, m.content);
+                msgs.push(wired);
+            } else {
+                msgs.push(m.clone());
+            }
+        }
         ChatRequest::new(model, msgs)
     }
 
@@ -329,6 +339,53 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&PromptBuilder::new().build("m").messages).unwrap(),
             serde_json::to_string(&PromptBuilder::new().build("m").messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn env_reaches_the_wire_but_never_the_stored_history() {
+        // The transcript and the DB read `history()`. If env leaked in there,
+        // every user message would render a raw <env> block - which is exactly
+        // the bug this guards.
+        let mut p = PromptBuilder::new();
+        p.set_env("<env>\nworkspace: /w\n</env>");
+        p.push_user("first question");
+        p.push_assistant("answer");
+        p.push_user("second question");
+
+        for m in p.history() {
+            if m.role == Role::User {
+                assert!(
+                    !m.content.contains("<env>"),
+                    "env leaked into stored history: {:?}",
+                    m.content
+                );
+            }
+        }
+
+        // The wire form must still carry it, on every user message, or the
+        // prefix-cache property (older messages byte-identical) is lost.
+        let req = p.build("m");
+        let users: Vec<&str> = req
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(users.len(), 2);
+        for u in &users {
+            assert!(u.starts_with("<env>"), "env missing on the wire: {u}");
+            assert!(u.ends_with("question"), "question must come last: {u}");
+        }
+
+        // Older turns must not change bytes when a new turn is appended.
+        let before = p.build("m");
+        p.push_assistant("later");
+        p.push_user("third");
+        let after = p.build("m");
+        assert_eq!(
+            before.messages[1].content, after.messages[1].content,
+            "an older user message changed bytes, which invalidates the prefix cache"
         );
     }
 

@@ -281,6 +281,7 @@ fn main() {
             commands::new_session,
             commands::rename_session,
             commands::delete_session,
+            commands::delete_sessions,
             commands::switch_session,
             commands::gpu_report,
             commands::render_report,

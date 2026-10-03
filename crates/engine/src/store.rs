@@ -52,7 +52,7 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Current schema version. Bump with a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -171,6 +171,26 @@ impl Store {
         Ok(())
     }
 
+    /// Delete several sessions in one transaction.
+    ///
+    /// A loop over `delete_session` would leave a half-applied batch if one row
+    /// failed, and each call would take the connection lock separately.
+    pub fn delete_sessions(&self, ids: &[i64]) -> Result<usize, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut n = 0usize;
+        for id in ids {
+            conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM messages_fts WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM turns WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -249,6 +269,21 @@ impl Store {
             ],
         )?;
         let id = conn.last_insert_rowid();
+
+        // Name the session after its first question. The WHERE clause makes this
+        // a no-op once a session has a real title (or a manual one), so rename
+        // still wins, and it costs one cheap statement per user message.
+        if matches!(m.role, Role::User) {
+            let t = derive_title(&m.content);
+            if !t.is_empty() {
+                conn.execute(
+                    "UPDATE sessions SET title = ?2, updated_at = ?3
+                      WHERE id = ?1 AND title = 'new session'",
+                    params![session_id, t, now],
+                )?;
+            }
+        }
+
         conn.execute(
             "INSERT INTO messages_fts (rowid, content, session_id, message_id, role)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -606,6 +641,23 @@ fn attach_meta(conn: &Connection, msgs: &mut [StoredMessage]) -> Result<(), Stor
     Ok(())
 }
 
+/// A short, single-line label from the first user message.
+///
+/// Sessions otherwise stay titled "new session" forever, which turns a list of
+/// real conversations into a list of identical rows.
+fn derive_title(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = String::new();
+    for ch in one_line.chars() {
+        if out.chars().count() >= 48 {
+            out.push('\u{2026}');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
     if from < 1 {
         conn.execute_batch(
@@ -685,6 +737,56 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
              );
              CREATE INDEX IF NOT EXISTS idx_attachments_msg ON attachments(message_id);",
         )?;
+    }
+    if from < 6 {
+        // v6a: the env block used to be baked into the stored user message, so
+        // the transcript rendered a raw <env>...</env> block above every
+        // question. Strip it from rows that were written the old way.
+        let rows: Vec<(i64, String)> = {
+            let mut s = conn.prepare("SELECT id, content FROM messages WHERE role = 'user' AND content LIKE '<env>%'")?;
+            let it = s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            it.filter_map(|x| x.ok()).collect()
+        };
+        for (id, content) in rows {
+            match content.find("</env>") {
+                Some(end) => {
+                    let rest = &content[end + 6..];
+                    let rest = rest.trim_start_matches(['\n', '\r']);
+                    let mut c = conn.prepare("UPDATE messages SET content = ?2 WHERE id = ?1")?;
+                    c.execute(rusqlite::params![id, rest])?;
+                }
+                None => {
+                    // Malformed: no closing tag. Leaving it is better than
+                    // guessing where the user's text begins.
+                }
+            }
+        }
+
+        // v6b: sessions were titled "new session" forever, so a list of real
+        // conversations was a list of identical rows. Derive a title from the
+        // first user message for any session still carrying the placeholder.
+        let untitled: Vec<i64> = {
+            let mut s = conn.prepare("SELECT id FROM sessions WHERE title = 'new session'")?;
+            let it = s.query_map([], |r| r.get::<_, i64>(0))?;
+            it.filter_map(|x| x.ok()).collect()
+        };
+        for sid in untitled {
+            let first: Option<String> = conn
+                .query_row(
+                    "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY id LIMIT 1",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(t) = first.as_deref().map(derive_title) {
+                if !t.is_empty() {
+                    conn.execute(
+                        "UPDATE sessions SET title = ?2 WHERE id = ?1",
+                        rusqlite::params![sid, t],
+                    )?;
+                }
+            }
+        }
     }
     if from < 4 {
         // v4: sessions with an empty title. `delete_session` used to move the host
@@ -769,6 +871,74 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "orphaned blobs would outlive the session that owns them");
+    }
+
+    #[test]
+    fn a_session_names_itself_after_its_first_question() {
+        let s = store();
+        let id = s.create_session("", "/w", "m").unwrap();
+        assert_eq!(s.session(id).unwrap().unwrap().title, "new session");
+
+        let msg = Message {
+            role: Role::User,
+            content: "  can you\n\nmake me a styled   excel sheet please\n".into(),
+            ..Default::default()
+        };
+        s.append_message(id, &msg).unwrap();
+        let title = s.session(id).unwrap().unwrap().title;
+        assert_eq!(title, "can you make me a styled excel sheet please");
+
+        // Later messages must not rename the session.
+        s.append_message(id, &Message { role: Role::User, content: "second question".into(), ..Default::default() })
+            .unwrap();
+        assert_eq!(s.session(id).unwrap().unwrap().title, title);
+
+        // A manual rename outranks the derived one, permanently.
+        s.rename_session(id, "quarterly numbers").unwrap();
+        let other = s.create_session("", "/w", "m").unwrap();
+        s.append_message(other, &Message { role: Role::User, content: "hello there".into(), ..Default::default() })
+            .unwrap();
+        assert_eq!(s.session(other).unwrap().unwrap().title, "hello there");
+        assert_eq!(s.session(id).unwrap().unwrap().title, "quarterly numbers");
+    }
+
+    #[test]
+    fn titles_are_single_line_and_bounded() {
+        let long = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        let t = derive_title(&format!("\n\t  {long}  \n\n"));
+        assert!(!t.contains('\n') && !t.contains('\t'));
+        assert!(t.chars().count() <= 49, "too long: {} chars", t.chars().count());
+        assert!(t.ends_with('\u{2026}'));
+        assert_eq!(derive_title("   "), "");
+    }
+
+    #[test]
+    fn migration_v6_strips_env_baked_into_old_rows() {
+        // Rows written before the fix carry the block in `content`. Re-open them
+        // through the migrator and check the transcript text is clean while the
+        // question survives.
+        let dir = std::env::temp_dir().join(format!("cowry_v6_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn, 0).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id,title,workspace,model,created_at,updated_at) VALUES (1,'new session','/w','m',1,1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO messages (id,session_id,role,content,reasoning,reasoning_signature,tool_call_id,tool_calls_json,created_at) VALUES (1,1,'user','<env>\nos: linux\nworkspace: /w\n</env>\n\nHello there!','','','', '',1)",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let rows = s.messages(1).unwrap();
+        assert_eq!(rows[0].content, "Hello there!");
+        // The title backfill also runs, so pre-existing conversations are findable.
+        assert_eq!(s.session(1).unwrap().unwrap().title, "Hello there!");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

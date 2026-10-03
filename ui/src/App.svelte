@@ -38,6 +38,38 @@
   let approvalLeft = $state(0)
   let tick: number | undefined = undefined
   let editingId = $state<number | null>(null)
+  let selectMode = $state(false)
+  let selected = $state<Set<number>>(new Set())
+  let confirmBulkDelete = $state(false)
+
+  function toggleSelect(id: number) {
+    const next = new Set(selected)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    selected = next
+    // Any change to the selection invalidates a pending confirmation.
+    confirmBulkDelete = false
+  }
+
+  function selectAll() {
+    selected = new Set(sessions.map((s) => s.id))
+    confirmBulkDelete = false
+  }
+
+  async function doBulkDelete() {
+    const ids = [...selected]
+    if (!ids.length) return
+    try {
+      const n = await invoke<number>('delete_sessions', { ids })
+      pageLog(`deleted ${n} session(s)`)
+    } catch (e) {
+      pageLog(`delete_sessions failed: ${e}`)
+    }
+    selected = new Set()
+    confirmBulkDelete = false
+    await loadSessions()
+    await refreshState()
+  }
   let editTitle = $state('')
   let confirmDeleteId = $state<number | null>(null)
   let sidebarOpen = $state(false)
@@ -272,6 +304,20 @@
   // "the UI actually reacted", which is the difference between a host bug and a
   // front-end bug when a session click appears to do nothing.
   let sessionChangedCount = 0
+  // Which session the *view* shows, and which session the in-flight turn
+  // belongs to. They are different things, and conflating them caused two of
+  // the reported bugs: clicking a session during a turn did nothing (the view
+  // was waiting on a host command that was queued behind the turn), and the
+  // running turn's reasoning block was painted into whatever session happened
+  // to be on screen, which read as "this conversation lost its history".
+  let viewId = $state<number | null>(null)
+  let turnSessionId = $state<number | null>(null)
+  // Events of the in-flight turn, kept so returning to its session restores the
+  // partial answer instead of showing a truncated one. Bounded: a runaway stream
+  // must not grow this without limit.
+  let liveBuf: EngineEvent[] = []
+  let sentDraft: { text: string; atts: { mime: string; name: string; bytes: number }[] } | null = null
+  const LIVE_CAP = 4000
   let eventTaps: ((e: EngineEvent) => void)[] = []
   function beginEventTap(fn: (e: EngineEvent) => void) {
     eventTaps.push(fn)
@@ -282,25 +328,46 @@
 
   function handle(ev: EngineEvent) {
     for (const t of eventTaps) t(ev)
-    transcript?.apply(ev)
+
+    // Live output belongs to the session that started the turn. Buffer it when
+    // the user is looking elsewhere, and replay it when they come back.
+    const inFlight = turnSessionId !== null && ev.kind !== 'sessionChanged'
+    if (inFlight) {
+      // Buffer every event of the running turn, not just the ones that arrive
+      // while the user is looking elsewhere. Buffering only the latter lost the
+      // output that had already been painted before the switch, so coming back
+      // showed an empty session - the very thing this is meant to prevent.
+      if (liveBuf.length < LIVE_CAP) liveBuf.push(ev)
+      if (viewId !== turnSessionId) {
+        // painted on return, not now
+      } else {
+        transcript?.apply(ev)
+      }
+    } else {
+      transcript?.apply(ev)
+    }
+
     switch (ev.kind) {
       case 'sessionChanged':
         sessionChangedCount++
-        // The host tells us when the switch actually landed. Loading the
-        // transcript from the UI right after invoke() would race the host task
-        // and can render the previous session's messages under the new name.
-        void (async () => {
-          try {
-            await loadTranscript(ev.d.session_id)
-          } catch (e) {
-            pageLog(`session_messages after switch failed: ${e}`)
-          }
-          await refreshState()
-          await loadSessions()
-        })()
+        // The host's switch only repaints the view when it matches what the
+        // user is already looking at. Otherwise a queued switch that lands
+        // after a turn would yank the transcript out from under them.
+        if (ev.d.session_id === viewId) {
+          void (async () => {
+            try {
+              await loadTranscript(ev.d.session_id)
+            } catch (e) {
+              pageLog(`session_messages after switch failed: ${e}`)
+            }
+            await refreshState()
+            await loadSessions()
+          })()
+        }
         break
       case 'turnStart':
         model = ev.d.model
+        if (turnSessionId === null) turnSessionId = viewId
         busy = true
         frames = 0
         dropped = 0
@@ -348,8 +415,11 @@
         break
       }
       case 'turnEnd':
-        transcript?.flushNow()
+        if (viewId === turnSessionId) transcript?.flushNow()
         busy = false
+        turnSessionId = null
+        liveBuf = []
+        sentDraft = null
         approval = null
         if (tick !== undefined) {
           window.clearInterval(tick)
@@ -531,6 +601,20 @@
   // checks busy immediately sees false and proceeds before anything happened.
   // HostState.turns is monotonic and incremented after persistence, so it is
   // the honest signal.
+  async function waitFor(
+    what: string,
+    pred: () => boolean,
+    budgetMs = 15000,
+  ): Promise<boolean> {
+    const dl = performance.now() + budgetMs
+    while (performance.now() < dl) {
+      if (pred()) return true
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    pageLog(`selftest: timed out waiting for ${what}`)
+    return false
+  }
+
   async function waitTurnDone(prevTurns: number, budgetMs = 90000): Promise<boolean> {
     const dl = performance.now() + budgetMs
     while (performance.now() < dl) {
@@ -554,7 +638,11 @@
     // The transcript shows what was attached by name and size, not a thumbnail:
     // history pages carry metadata only, so a thumbnail here would be a preview
     // that disappears the moment the session is reopened.
-    transcript?.addUser(text, pending.map((a) => ({ mime: a.mime, name: a.name, bytes: a.bytes })))
+    const shown = pending.map((a) => ({ mime: a.mime, name: a.name, bytes: a.bytes }))
+    transcript?.addUser(text, shown)
+    sentDraft = { text, atts: shown }
+    turnSessionId = viewId
+    liveBuf = []
     clearAttachments()
     try {
       await invoke('start_turn', { text, attachments: atts })
@@ -628,10 +716,14 @@
     if (matchMedia('(max-width: 767px)').matches) sidebarOpen = false
   }
 
+  // The view is the front end's business: the transcript comes straight from
+  // the store, so browsing during a turn does not wait on a host command that
+  // is parked behind that turn. The host is still told, so the *next* message
+  // goes to the session being viewed.
   async function openSession(id: number) {
-    // Fire the command; the transcript reload happens on the sessionChanged
-    // event so it is ordered after the host has actually moved.
     closeDrawerOnMobile()
+    if (id === viewId) return
+    await resyncView(id)
     try {
       await invoke('switch_session', { id })
     } catch (e) {
@@ -639,10 +731,37 @@
     }
   }
 
-  async function newSession() {
-    await invoke('new_session', { title: 'new session' })
+  async function resyncView(id: number) {
+    viewId = id
     transcript?.clear()
+    try {
+      await loadTranscript(id)
+    } catch (e) {
+      pageLog(`session_messages failed: ${e}`)
+    }
+    // Returning to the session that owns a running turn: the stored history
+    // does not contain that turn yet, so replay what we buffered.
+    if (turnSessionId === id && sentDraft) {
+      transcript?.addUser(sentDraft.text, sentDraft.atts)
+      for (const e of liveBuf) transcript?.apply(e)
+    }
     await refreshState()
+  }
+
+  async function newSession() {
+    let id: number | null = null
+    try {
+      id = await invoke<number>('new_session', { title: 'new session' })
+    } catch (e) {
+      pageLog(`new_session failed: ${e}`)
+      return
+    }
+    if (id !== null) await resyncView(id)
+    try {
+      await invoke('switch_session', { id })
+    } catch (e) {
+      pageLog(`switch_session failed: ${e}`)
+    }
     await loadSessions()
   }
 
@@ -1004,6 +1123,58 @@
       // Say it out loud: a silent pass is indistinguishable from a skipped step.
       pageLog(`workspace: rejected bad path, moved to /tmp, restored to ${wsBack}`)
 
+      // --- browsing during a live turn -------------------------------------
+      // This is the reported bug: clicking another session while the model was
+      // answering appeared to do nothing, and the running turn's thinking block
+      // was painted over whatever session was on screen, which read as a
+      // conversation that had lost its history.
+      const sessA = await invoke<number>('new_session', { title: 'selftest live A' })
+      await resyncView(sessA)
+      const sessB = await invoke<number>('new_session', { title: 'selftest live B' })
+      const turnsBeforeLive = (await invoke<HostState>('session_state')).turns
+      // Go through send(), not invoke(): the user message and the turn's owner
+      // are recorded there, and replaying a partial turn depends on them.
+      draft = 'Count out loud from one to fifteen, one number per line.'
+      await send()
+
+      const sawStream = await waitFor('stream to start', () => busy && turnSessionId === sessA, 30000)
+      if (!sawStream) fail('turn never started for the live-browsing check')
+
+      if (sawStream) {
+        // Switch the view while the turn is still running.
+        await resyncView(sessB)
+        if (viewId !== sessB) fail(`view did not move during a turn: viewId=${viewId}`)
+        if (turnSessionId !== sessA) fail(`turn ownership lost: turnSessionId=${turnSessionId}`)
+        const bText = rootEl?.innerText ?? ''
+        if (/one|\b1\b/i.test(bText) && !bText.includes('selftest live B')) {
+          fail('the running turn was painted into a different session')
+        }
+
+        // Come back: the partial answer must be there, not a blank session.
+        await resyncView(sessA)
+        const backText = rootEl?.innerText ?? ''
+        if (!/one|\b1\b/i.test(backText)) {
+          fail(`returning to the running session lost its output: ${backText.slice(0, 120)}`)
+        }
+        if (!(await waitTurnDone(turnsBeforeLive))) fail('live turn never finished')
+      }
+      await invoke('delete_sessions', { ids: [sessA, sessB] })
+
+      // --- bulk delete ------------------------------------------------------
+      const beforeBulk = await invoke<Session[]>('list_sessions')
+      const junk: number[] = []
+      for (let i = 0; i < 3; i++) junk.push(await invoke<number>('new_session', { title: `selftest junk ${i}` }))
+      const midBulk = await invoke<Session[]>('list_sessions')
+      if (midBulk.length !== beforeBulk.length + 3) {
+        fail(`new_session did not create 3 rows: ${beforeBulk.length} -> ${midBulk.length}`)
+      }
+      const removed = await invoke<number>('delete_sessions', { ids: junk })
+      if (removed !== 3) fail(`delete_sessions removed ${removed}, expected 3`)
+      const afterBulk = await invoke<Session[]>('list_sessions')
+      if (afterBulk.length !== beforeBulk.length) {
+        fail(`bulk delete did not restore the count: ${beforeBulk.length} -> ${afterBulk.length}`)
+      }
+
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +
@@ -1142,6 +1313,8 @@
   // ---- lifecycle -----------------------------------------------------------
   onMount(async () => {
     if (rootEl) transcript = new Transcript(rootEl)
+    // Test seam: lets a browser harness drive the transcript without an engine.
+    if (import.meta.env.DEV) (window as any).__cowryTranscript = transcript
     await attachChannel()
     // Non-blocking: a missing /models must not delay first paint.
     void loadModels()
@@ -1278,10 +1451,21 @@
           </button>
         {/each}
       {:else}
-        <div class="mt-2 px-1 text-[11px] uppercase tracking-wide text-ink-3">Sessions</div>
+        <div class="sesshead mt-2">
+          <span>Sessions</span>
+          <button
+            class="sesshead-toggle"
+            onclick={() => {
+              selectMode = !selectMode
+              if (!selectMode) selected = new Set()
+            }}
+          >
+            {selectMode ? 'done' : 'select'}
+          </button>
+        </div>
         {#each sessions as s}
           <div
-            class="sessrow {hostState?.session_id === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''}"
+            class="sessrow {hostState?.session_id === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''} {selectMode ? 'selecting' : ''}"
           >
             {#if editingId === s.id}
               <input
@@ -1298,8 +1482,15 @@
                    not a report. Rename/delete live in a menu so the row stays
                    quiet, and the dot is always laid out (invisible until unread)
                    so titles do not shift when one arrives. -->
-              <button class="sessbtn" onclick={() => openSession(s.id)}>
-                <span class="sess-dot" aria-hidden="true"></span>
+              <button
+                class="sessbtn"
+                onclick={() => (selectMode ? toggleSelect(s.id) : openSession(s.id))}
+              >
+                {#if selectMode}
+                  <span class="sess-check {selected.has(s.id) ? 'on' : ''}" aria-hidden="true"></span>
+                {:else}
+                  <span class="sess-dot" aria-hidden="true"></span>
+                {/if}
                 <span class="sess-title">{s.title}</span>
               </button>
               <button

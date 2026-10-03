@@ -71,6 +71,11 @@ export class Transcript {
   private raf = 0
   /** Collected during a turn so it can be committed once, at stream end. */
   private collected: { answer: string; reasoning: string } = { answer: '', reasoning: '' }
+  // Thinking blocks are clamped to a few lines by default. While the model is
+  // thinking they follow the tail (the newest thought is the interesting one);
+  // once the turn is over they snap back to the start, which is where a reader
+  // scanning a finished block expects to begin.
+  private reasoningEls: HTMLElement[] = []
   /**
    * Answer bodies created this turn. Markdown is applied to them exactly once,
    * at stream end — never per delta.
@@ -90,7 +95,19 @@ export class Transcript {
     // scope. Outside Tauri (the vite preview) there is no opener, so the link
     // stays inert rather than hijacking the window.
     root.addEventListener('click', (e) => {
-      const a = (e.target as HTMLElement | null)?.closest?.('a')
+      const t = e.target as HTMLElement | null
+      // A clamped thinking block expands in place.
+      const head = t?.closest?.('.blk-reasoning .blk-head')
+      if (head) {
+        const body = head.parentElement?.querySelector('.blk-body') as HTMLElement | null
+        if (body) {
+          const open = body.classList.toggle('expanded')
+          head.classList.toggle('open', open)
+          if (open) body.scrollTop = 0
+        }
+        return
+      }
+      const a = t?.closest?.('a')
       if (!a) return
       e.preventDefault()
       const href = a.getAttribute('href') ?? ''
@@ -138,6 +155,15 @@ export class Transcript {
     return body
   }
 
+  /** Collapse the thinking blocks of a finished turn back to their first lines. */
+  private settleReasoning() {
+    for (const el of this.reasoningEls) {
+      el.classList.add('settled')
+      el.scrollTop = 0
+    }
+    this.reasoningEls = []
+  }
+
   private flush() {
     this.raf = 0
     if (!this.pending.length) return
@@ -153,6 +179,10 @@ export class Transcript {
       this.renderLive(false)
     } else {
       this.textBuf.appendChild(document.createTextNode(joined))
+    if (this.textKind === 'reasoning' && this.textBuf.classList.contains('clamp')
+        && !this.textBuf.classList.contains('expanded')) {
+      this.textBuf.scrollTop = this.textBuf.scrollHeight
+    }
     }
     this.scrollIfNeeded()
   }
@@ -196,6 +226,10 @@ export class Transcript {
       const label = kind === 'reasoning' ? 'thinking' : kind === 'user' ? 'you' : 'cowry'
       this.textBuf = this.block(kind, label)
       this.textKind = kind
+      if (kind === 'reasoning') {
+        this.textBuf.classList.add('clamp')
+        this.reasoningEls.push(this.textBuf)
+      }
       if (kind === 'answer') {
         this.answerEls.push(this.textBuf)
         this.beginLive(this.textBuf)
@@ -269,6 +303,7 @@ export class Transcript {
       case 'turnEnd':
         this.flushNow()
         this.finalizeAnswer()
+        this.settleReasoning()
         this.textBuf = null
         this.textKind = null
         break
@@ -462,7 +497,11 @@ export class Transcript {
         body.textContent = m.content
         this.appendAttachmentTags(body, m.attachments ?? [])
       } else if (m.role === 'assistant') {
-        if (m.reasoning) blk('reasoning', 'thinking').textContent = m.reasoning
+        if (m.reasoning) {
+          const r = blk('reasoning', 'thinking')
+          r.classList.add('clamp', 'settled')
+          r.textContent = m.reasoning
+        }
         const body = blk('answer', 'cowry')
         body.innerHTML = renderMarkdown(m.content)
         for (const call of parseCalls(m.tool_calls_json)) {
