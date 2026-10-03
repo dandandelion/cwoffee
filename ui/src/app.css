@@ -893,13 +893,21 @@ body {
    and the composer are the whole subject, so they are centred as a pair. The
    spacers carry unequal flex weight so the block sits slightly above true
    centre, which is where it reads as centred rather than sunk. */
-.espacer { flex: 1 1 0; min-height: 0; }
+/* Empty mode centres the greeting and the composer together. The transcript is
+   still in the tree, just not laid out. */
+.empty-mode {
+  justify-content: center;
+  /* The workspace row sits under the composer, so centring the group leaves the
+     composer itself ~58px low. This padding compensates for that fixed height;
+     measured to put the composer's own centre on the viewport's (offset 0 in a
+     948px viewport). */
+  padding-bottom: 116px;
+}
+.empty { margin-bottom: 30px; }
+
 /* Hidden, not unmounted: the transcript renderer holds a reference to its root
    node, and an {#if} would destroy the very element it keeps writing into. */
 .empty-mode .scroller { display: none; }
-.esp-top { flex-grow: 4; }
-.esp-bot { flex-grow: 3; }
-
 .empty {
   display: flex;
   flex-direction: column;

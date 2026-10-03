@@ -841,7 +841,10 @@
       id,
     })
     transcript?.loadHistory(page.messages)
-    viewMsgCount = page.messages.length
+    // A queued session switch can land before the turn has persisted anything,
+    // and reloading then would report an in-flight session as empty and drop
+    // the view back to the greeting mid-turn.
+    viewMsgCount = turnSessionId === id ? Math.max(page.messages.length, 1) : page.messages.length
     hasOlder = page.has_older
     oldestId = page.messages.length ? page.messages[0].id : null
   }
@@ -1560,15 +1563,15 @@
     <!-- main -->
     <main class="flex min-w-0 flex-1 flex-col min-h-0" class:empty-mode={showEmpty}>
       {#if showEmpty}
-        <!-- The composer is the subject of an empty session, so the greeting
-             sits above it and the pair is centred rather than pinned down. -->
-        <div class="espacer esp-top" aria-hidden="true"></div>
+        <!-- Sibling of the composer, not a wrapper around it: `main` centres
+             them as one group in empty mode. Spacer divs would absorb the free
+             space above the composer and leave it pinned to the bottom, which
+             is what they did. -->
         <div class="empty">
           <span class="empty-mark" aria-hidden="true"></span>
           <h1 class="empty-hi">{greeting.hi}</h1>
           <p class="empty-sub">{greeting.sub}</p>
         </div>
-        <div class="espacer esp-bot" aria-hidden="true"></div>
       {/if}
       <div class="scroller min-h-0 flex-1 overflow-y-auto px-6 py-6">
         {#if hasOlder}
