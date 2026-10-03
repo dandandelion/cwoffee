@@ -203,6 +203,7 @@ impl Tool for ExecTool {
                 exit_code: None,
                 truncated: false,
                 error: Some(timeout_error(timeout_secs)),
+                files: Vec::new(),
             };
         }
 
@@ -214,6 +215,7 @@ impl Tool for ExecTool {
                 exit_code: code,
                 truncated: false,
                 error: Some(timeout_error(timeout_secs)),
+                files: Vec::new(),
             };
         }
 
@@ -224,6 +226,7 @@ impl Tool for ExecTool {
             exit_code: code,
             truncated: combined.1,
             error: None,
+            files: Vec::new(),
         }
     }
 }

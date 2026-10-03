@@ -50,6 +50,27 @@ async function openExternal(href: string) {
 import type { AttachmentMeta, EngineEvent, ExecStream, StoredMessage } from './events'
 import { renderMarkdown, LiveMarkdown } from './markdown'
 import { fmtThink } from './think'
+import type { OutputFile } from './events'
+
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} kB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function shortMime(mime: string): string {
+  const sub = mime.split('/')[1] ?? mime
+  return sub.split(';')[0]
+}
+
+function fileGlyph(mime: string): string {
+  if (mime.startsWith('image/')) return '\u{1f5bc}'
+  if (mime === 'application/pdf') return '\u{1f4c4}'
+  if (mime.includes('spreadsheet') || mime.endsWith('csv')) return '\u{1f4ca}'
+  if (mime.includes('wordprocessing') || mime === 'text/markdown' || mime === 'text/plain')
+    return '\u{1f4c4}'
+  return '\u{1f4c1}'
+}
 
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
 
@@ -89,6 +110,9 @@ export class Transcript {
   private lastLiveRender = 0
   private liveTimer = 0
 
+  /** Set by the shell: opening a file is a Tauri concern, not a renderer one. */
+  onOpenFile: ((path: string) => void) | null = null
+
   constructor(root: HTMLElement) {
     this.root = root
     // A link that navigates replaces the whole app with a web page, which is
@@ -98,6 +122,13 @@ export class Transcript {
     // stays inert rather than hijacking the window.
     root.addEventListener('click', (e) => {
       const t = e.target as HTMLElement | null
+      const chip = t?.closest?.('.filechip') as HTMLElement | null
+      if (chip) {
+        e.preventDefault()
+        const path = chip.dataset.path
+        if (path && this.onOpenFile) this.onOpenFile(path)
+        return
+      }
       // A clamped thinking block expands in place. While it is collapsed the
       // whole block is the target - three lines of italic text is a small and
       // annoying thing to aim at. Once expanded, only the label collapses it,
@@ -408,6 +439,44 @@ export class Transcript {
     body.append(row)
   }
 
+  /** Surface a shell-level failure in the transcript, not just the log. */
+  showError(msg: string) {
+    this.flushNow()
+    this.block('fail', 'error').textContent = msg
+  }
+
+  // ---- produced files -----------------------------------------------------
+
+  /**
+   * Files a turn wrote into the workspace, shown as clickable attachments.
+   * The path is workspace-relative and the shell re-validates it before
+   * opening anything, so a model-authored name cannot escape the workspace.
+   */
+  addFiles(files: OutputFile[]) {
+    if (!files.length) return
+    this.flushNow()
+    this.ensureTurn()
+    this.turn!.appendChild(this.fileRow(files))
+  }
+
+  private fileRow(files: OutputFile[]): HTMLElement {
+    const row = this.el('filestrip')
+    for (const f of files) {
+      const chip = document.createElement('button')
+      chip.className = 'filechip'
+      chip.type = 'button'
+      chip.dataset.path = f.path
+      chip.title = `Open ${f.path}`
+      chip.append(this.el('file-ico', fileGlyph(f.mime)))
+      const meta = this.el('file-meta')
+      meta.append(this.el('file-name', f.name))
+      meta.append(this.el('file-sub', `${shortMime(f.mime)} · ${fmtSize(f.bytes)}`))
+      chip.append(meta)
+      row.append(chip)
+    }
+    return row
+  }
+
   // ---- tool cards ---------------------------------------------------------
 
   private openTool(id: string, name: string) {
@@ -540,6 +609,10 @@ export class Transcript {
         }
         const body = blk('answer', 'cowry')
         body.innerHTML = renderMarkdown(m.content)
+        if (m.files?.length) {
+          this.ensureTurn()
+          this.turn!.appendChild(this.fileRow(m.files))
+        }
         for (const call of parseCalls(m.tool_calls_json)) {
           const card = this.el('blk blk-tool')
           const head = this.el('blk-head')

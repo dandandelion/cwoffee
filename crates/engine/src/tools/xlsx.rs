@@ -208,7 +208,8 @@ impl Tool for WriteXlsxTool {
                 "wrote {} ({})",
                 super::path::display_rel(&ctx.workspace, &path),
                 summary.join("; ")
-            )),
+            ))
+            .with_file(super::OutputFile::from_path(&ctx.workspace, &path)),
             Err(e) => ToolResult::err(format!("cannot write {}: {e}", path.display())),
         }
     }

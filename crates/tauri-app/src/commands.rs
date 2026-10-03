@@ -200,6 +200,33 @@ pub fn search_messages(state: tauri::State<'_, AppState>, query: String) -> Resu
     state.store.search(&query, 25).map_err(|e| e.to_string())
 }
 
+/// Open a produced file with the desktop's default handler.
+///
+/// The containment check lives here, not in the plugin: the Rust-side
+/// `open_path` bypasses the opener plugin's JS scope entirely, so the only
+/// thing standing between a model-authored path and `~/.ssh/id_rsa` is this
+/// confine() call. Paths are workspace-relative on the wire for the same
+/// reason - an absolute path in a tool result would be an invitation.
+#[tauri::command]
+pub fn open_file(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let ws = state.host.state().workspace;
+    let full = cowry_engine::tools::path::confine(std::path::Path::new(&ws), &path)
+        .map_err(|e| e.to_string())?;
+    let md = std::fs::metadata(&full).map_err(|_| format!("{path} no longer exists"))?;
+    if !md.is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    app.opener()
+        .open_path(full.display().to_string(), None::<&str>)
+        .map_err(|e| format!("could not open {path}: {e}"))?;
+    Ok(full.display().to_string())
+}
+
 #[tauri::command]
 pub fn session_messages(
     state: tauri::State<'_, AppState>,

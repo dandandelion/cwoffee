@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::path::{confine, display_rel};
-use super::{ExecSink, Risk, Tool, ToolCtx, ToolResult};
+use super::{ExecSink, OutputFile, Risk, Tool, ToolCtx, ToolResult};
 
 /// Reading a whole large file into the prompt costs prefill at 30-70 tok/s on a
 /// local model. Above this size the tool insists on a range instead.
@@ -312,7 +312,8 @@ impl Tool for WriteFileTool {
                 if append { "appended to" } else if existed { "overwrote" } else { "created" },
                 n,
                 content.lines().count()
-            )),
+            ))
+            .with_file(OutputFile::from_path(&ctx.workspace, &path)),
             Err(e) => ToolResult::err(format!("cannot write {}: {e}", path.display())),
         }
     }
@@ -327,7 +328,8 @@ async fn write_document(path: &Path, markdown: &str, ext: &str, ctx: &ToolCtx) -
                     "{} created (docx, {} bytes from markdown)",
                     display_rel(&ctx.workspace, path),
                     bytes.len()
-                )),
+                ))
+                .with_file(OutputFile::from_path(&ctx.workspace, path)),
                 Err(e) => ToolResult::err(format!("cannot write {}: {e}", path.display())),
             },
             Err(e) => ToolResult::err(e),
@@ -340,6 +342,7 @@ async fn write_document(path: &Path, markdown: &str, ext: &str, ctx: &ToolCtx) -
                     display_rel(&ctx.workspace, &p),
                     n
                 ))
+                .with_file(OutputFile::from_path(&ctx.workspace, &p))
             }
             Err(e) => ToolResult::err(e),
         },

@@ -22,7 +22,7 @@ use crate::agent::{Agent, AgentConfig};
 use crate::approval::{ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalRequest};
 use crate::event::EngineEvent;
 use crate::prompt::PromptBuilder;
-use crate::provider::{Provider, Reasoning};
+use crate::provider::{Provider, Reasoning, Role};
 use crate::store::Store;
 use crate::telemetry::TurnTelemetry;
 use crate::tools::{Registry, ToolCtx};
@@ -305,6 +305,7 @@ impl SessionHost {
                                     p.set_env(cfg.env_block.clone());
                                     p
                                 };
+                                agent.reset_turn_id();
                                 let mut s = state_bg.lock().unwrap();
                                 s.session_id = id;
                                 s.context_tokens = 0;
@@ -332,6 +333,7 @@ impl SessionHost {
                                 let n = hist.len() as u64;
                                 agent.prompt_mut().with_history(hist);
                                 agent.prompt_mut().set_first_seq(0);
+                                agent.reset_turn_id();
                                 persisted_next = n;
                                 // Must rebind the persistence target too, not just
                                 // the reported state, or the resumed session's new
@@ -407,20 +409,43 @@ impl SessionHost {
                         // Persist whatever the turn added. Sequence numbers make
                         // this correct even if compaction shifted the window.
                         let hist = agent.prompt_mut().history().to_vec();
+                        // Files are attached to the assistant row that closed the
+                        // turn, so a reload shows the same attachments the live
+                        // turn showed.
+                        let mut last_assistant: Option<i64> = None;
                         for (i, m) in hist.iter().enumerate() {
                             let seq = agent.prompt_mut().seq_at(i);
                             if seq < persisted_next {
                                 continue;
                             }
-                            if let Err(e) = store.append_message(session_id, m) {
-                                let _ = ev_tx.send(EngineEvent::Error {
-                                    message: format!("failed to persist message: {e}"),
-                                    fatal: false,
-                                });
-                                break;
+                            match store.append_message(session_id, m) {
+                                Ok(id) => {
+                                    if matches!(m.role, Role::Assistant) {
+                                        last_assistant = Some(id);
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = ev_tx.send(EngineEvent::Error {
+                                        message: format!("failed to persist message: {e}"),
+                                        fatal: false,
+                                    });
+                                    break;
+                                }
                             }
                         }
                         persisted_next = agent.prompt_mut().next_seq();
+
+                        let files = agent.take_turn_files();
+                        if !files.is_empty() {
+                            if let Some(id) = last_assistant {
+                                if let Err(e) = store.set_message_files(id, &files) {
+                                    let _ = ev_tx.send(EngineEvent::Error {
+                                        message: format!("failed to persist output files: {e}"),
+                                        fatal: false,
+                                    });
+                                }
+                            }
+                        }
 
                         if tel.prompt_tokens > 0 {
                             let _ = store.record_turn(session_id, &tel);
@@ -905,6 +930,36 @@ mod tests {
         assert_eq!(store.history(second).unwrap().len(), 2);
         assert_eq!(store.history(first).unwrap()[0].content, "in session one");
         assert_eq!(store.history(second).unwrap()[0].content, "in session two");
+    }
+
+    /// Turn numbering is per conversation. Without the reset, a brand-new
+    /// session opened at "turn 4" because the counter lived on the Agent.
+    #[tokio::test]
+    async fn turn_numbering_restarts_in_a_different_session() {
+        let (mut h, _store) = host(vec!["one".into(), "two".into()]);
+        ready(&h).await;
+        let (mut ev, _arx) = h.take_receivers().expect("receivers");
+        let ids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&ids);
+        tokio::spawn(async move {
+            while let Some(e) = ev.recv().await {
+                if let EngineEvent::TurnStart { turn_id, .. } = e {
+                    sink.lock().unwrap().push(turn_id);
+                }
+            }
+        });
+
+        let a = h.state().session_id;
+        h.submit("first in a");
+        turns_done(&h, 1).await;
+
+        h.send(HostCmd::NewSession { title: "b".into() });
+        wait_for("new session".into(), || h.state().session_id != a).await;
+        h.submit("first in b");
+        turns_done(&h, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(*ids.lock().unwrap(), vec![1, 1], "turn ids must restart per session");
     }
 
     #[tokio::test]

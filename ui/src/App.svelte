@@ -45,6 +45,18 @@
   const greeting = pickGreeting()
   let confirmDeleteId = $state<number | null>(null)
   let sidebarOpen = $state(false)
+  // Layer promotion is scoped to the animation itself. Held permanently, the
+  // compositor drops the layer when the transition ends and re-rasterises the
+  // drawer once - a visible flash at the end of open *and* close.
+  let sidebarAnimating = $state(false)
+  let sidebarAnimTimer: ReturnType<typeof setTimeout> | undefined
+  function setSidebar(open: boolean) {
+    if (sidebarOpen === open) return
+    sidebarOpen = open
+    sidebarAnimating = true
+    clearTimeout(sidebarAnimTimer)
+    sidebarAnimTimer = setTimeout(() => (sidebarAnimating = false), 320)
+  }
   let models = $state<string[]>([])
 
   // Custom popovers instead of <select>: native dropdowns render with the
@@ -382,6 +394,10 @@
         break
       case 'toolExecEnd':
         pageLog(`tool end: ok=${ev.d.ok} exit=${ev.d.exit_code}`)
+        break
+      case 'turnFiles':
+        pageLog(`turn files: ${ev.d.files.map((f) => f.path).join(', ')}`)
+        transcript?.addFiles(ev.d.files)
         break
       case 'approvalRequested':
         approval = { id: ev.d.id, tool: ev.d.tool, risk: ev.d.risk, summary: ev.d.summary }
@@ -735,7 +751,7 @@
   function closeDrawerOnMobile() {
     // The drawer overlays the transcript on narrow screens; leaving it open after
     // a tap hides the thing the tap was meant to show.
-    if (matchMedia('(max-width: 767px)').matches) sidebarOpen = false
+    if (matchMedia('(max-width: 767px)').matches) setSidebar(false)
   }
 
   // The view is the front end's business: the transcript comes straight from
@@ -1086,9 +1102,14 @@
         )
         if (!withAtt.length) fail('attachment metadata did not come back from the store')
         else {
-          const a = withAtt[0].attachments[0]
-          if (a.name !== 'probe.png') fail(`attachment name lost in storage: ${JSON.stringify(a)}`)
-          if (a.bytes < 60 || a.bytes > 80) fail(`attachment size wrong: ${a.bytes}`)
+          // Select the probe, not just "some attachment on the page". The page
+          // is the newest 80 rows of a session that may already hold images
+          // from earlier turns, and asserting on whichever came first made this
+          // check pass or fail depending on unrelated history.
+          const all = withAtt.flatMap((m: any) => m.attachments)
+          const a = all.find((x: any) => x.name === 'probe.png')
+          if (!a) fail(`probe attachment missing: ${JSON.stringify(all.slice(0, 3))}`)
+          else if (a.bytes < 60 || a.bytes > 80) fail(`attachment size wrong: ${a.bytes}`)
         }
       }
 
@@ -1362,6 +1383,31 @@
         }
       }
 
+      // --- files a turn produces show up as clickable attachments ----------
+      {
+        await invoke('set_mode', { mode: 'auto' })
+        draft =
+          'Use write_file to create selftest-note.md in the workspace containing exactly ' +
+          'the line: cowry output file. Then tell me the path you wrote.'
+        const turnsBefore = (await invoke<HostState>('session_state')).turns
+        await send()
+        if (!(await waitTurnDone(turnsBefore))) {
+          fail('output-file turn never finished')
+        } else {
+          await new Promise((r) => setTimeout(r, 400))
+          const chips = [...document.querySelectorAll('.filechip')] as HTMLElement[]
+          if (!chips.length) {
+            fail('no file attachment rendered for a turn that wrote a file')
+          } else {
+            const paths = chips.map((c) => c.dataset.path ?? '')
+            if (!paths.some((p) => p.includes('selftest-note.md')))
+              fail(`file chip path wrong: ${JSON.stringify(paths)}`)
+            if (!chips[0].textContent?.includes('selftest-note.md'))
+              fail(`file chip has no file name: ${JSON.stringify(chips[0].textContent)}`)
+          }
+        }
+      }
+
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +
@@ -1388,7 +1434,7 @@
     }
     if (mod && key === 'b') {
       e.preventDefault()
-      sidebarOpen = !sidebarOpen
+      setSidebar(!sidebarOpen)
       return
     }
     if (mod && key === 'n') {
@@ -1500,7 +1546,18 @@
 
   // ---- lifecycle -----------------------------------------------------------
   onMount(async () => {
-    if (rootEl) transcript = new Transcript(rootEl)
+    if (rootEl) {
+      transcript = new Transcript(rootEl)
+      transcript.onOpenFile = async (path) => {
+        try {
+          const opened = await invoke<string>('open_file', { path })
+          pageLog(`opened file: ${opened}`)
+        } catch (e) {
+          pageLog(`open_file failed: ${e}`)
+          transcript?.showError(String(e))
+        }
+      }
+    }
     // Test seam: lets a browser harness drive the transcript without an engine.
     if (import.meta.env.DEV) (window as any).__cowryTranscript = transcript
     await attachChannel()
@@ -1585,7 +1642,7 @@
     <span class="text-[13px] font-medium tracking-tight">cowry</span>
     <!-- Sidebar toggle: below 768px the sidebar is a drawer, and without this
          button the session list and search are simply unreachable. -->
-    <button class="iconbtn sidemenu" onclick={() => (sidebarOpen = !sidebarOpen)} aria-label="Sessions">
+    <button class="iconbtn sidemenu" onclick={() => setSidebar(!sidebarOpen)} aria-label="Sessions">
       <svg width="14" height="14" viewBox="0 0 14 14"><path d="M2 4h10M2 7h10M2 10h10" stroke="currentColor" stroke-width="1.3"/></svg>
     </button>
     <span class="ml-2 text-[11px] text-ink-3">{model || 'connecting…'}</span>
@@ -1610,7 +1667,7 @@
     <button
       class="scrim"
       class:show={sidebarOpen}
-      onclick={() => (sidebarOpen = false)}
+      onclick={() => setSidebar(false)}
       aria-label="Close sidebar"
       aria-hidden={!sidebarOpen}
       tabindex={sidebarOpen ? 0 : -1}
@@ -1618,6 +1675,7 @@
     <aside
       class="sidebar w-[248px] shrink-0 flex-col gap-1.5 border-r border-hairline p-2.5 min-h-0"
       class:open={sidebarOpen}
+      class:animating={sidebarAnimating}
       style="background: linear-gradient(160deg, var(--color-wash-1), var(--color-wash-2) 55%, var(--color-wash-3));"
     >
       <button class="pill px-2.5 py-1 text-left text-[12.5px] font-medium" onclick={newSession}>
@@ -1756,8 +1814,10 @@
                 {#each pending as a, i}
                   <span class="attchip">
                     <img src={a.url} alt="" />
-                    <span class="att-name">{a.name}</span>
-                    <span class="att-size">{fmtBytes(a.bytes)}</span>
+                    <span class="att-meta">
+                      <span class="att-name">{a.name}</span>
+                      <span class="att-size">{fmtBytes(a.bytes)}</span>
+                    </span>
                     <button class="att-x" aria-label="Remove attachment" onclick={() => dropAttachment(i)}>×</button>
                   </span>
                 {/each}

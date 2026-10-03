@@ -288,6 +288,7 @@ fn main() {
             commands::list_sessions,
             commands::search_messages,
             commands::session_messages,
+            commands::open_file,
             commands::new_session,
             commands::rename_session,
             commands::delete_session,

@@ -111,6 +111,11 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
             EngineEvent::TurnStart { turn_id, model } => {
                 println!("=== turn {turn_id} ({model}) ===");
             }
+            EngineEvent::TurnFiles { files, .. } => {
+                for f in &files {
+                    println!("(file) {} - {} bytes, {}", f.path, f.bytes, f.mime);
+                }
+            }
             EngineEvent::Reasoning(r) => {
                 if !in_reasoning {
                     print!("\n[thinking] ");

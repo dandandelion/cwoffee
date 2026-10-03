@@ -263,7 +263,19 @@ body {
   white-space: normal;
 }
 
-.blk-user .blk-body { color: var(--color-ink); }
+/* A user turn has to survive a glance. Same ink and same size as the answer
+   above it, with only a small grey label to separate them, and consecutive
+   turns blur together. A tinted card with an accent edge makes the boundary
+   unmistakable without adding a bubble shape that fights the layout. */
+.blk-user {
+  background: var(--color-tint);
+  border-radius: 10px;
+  padding: 9px 12px 9px 0;
+  margin: 16px 0 12px;
+  box-shadow: inset 2px 0 0 var(--color-shell);
+}
+.blk-user .blk-who { color: var(--color-shell-deep); font-weight: 600; }
+.blk-user .blk-body { color: var(--color-ink); font-weight: 450; }
 .blk-answer .blk-body { color: var(--color-ink); }
 .blk-reasoning .blk-body {
   color: var(--color-ink-3);
@@ -736,7 +748,9 @@ body {
      the animation, which is where the hitch came from. */
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.2s ease;
+  /* Same duration and curve as the drawer. A scrim that finishes 40ms early
+     visibly "settles" mid-animation, which reads as the dim flickering. */
+  transition: opacity 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 .scrim.show {
   opacity: 1;
@@ -754,12 +768,32 @@ body {
     max-width: 320px;
     transform: translateX(-100%);
     transition: transform 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
-    /* Without this the slide is repaint-driven: the whole session list, its
-       text, and the 14px shadow are re-rasterised every frame. Measured a 67ms
-       hitch on open in a 180ms transition - one lost frame in eleven. */
-    will-change: transform;
     backface-visibility: hidden;
-    box-shadow: 2px 0 14px rgba(0, 0, 0, 0.16);
+  }
+  /* Layer promotion only while it actually moves. A permanent will-change keeps
+     the layer allocated across the whole session, and WebKit tears it down when
+     the transition ends - the sidebar is re-rasterised once at that moment,
+     which is the frame that reads as a flash at the end of both directions. */
+  .sidebar.animating {
+    will-change: transform;
+  }
+  /* The shadow lives on its own element and fades in after the slide. A 14px
+     shadow on the moving layer is the most expensive thing to re-rasterise, so
+     it is the thing most likely to show up as that last-frame hitch. */
+  .sidebar::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 100%;
+    width: 16px;
+    background: linear-gradient(to right, rgba(0, 0, 0, 0.16), rgba(0, 0, 0, 0));
+    opacity: 0;
+    transition: opacity 0.16s ease;
+    pointer-events: none;
+  }
+  .sidebar.open::after {
+    opacity: 1;
   }
   .sidebar.open {
     transform: translateX(0);
@@ -799,26 +833,40 @@ body {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px 0;
+  gap: 8px;
+  padding: 10px 12px 2px;
 }
 .attchip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 6px 3px 3px;
+  gap: 8px;
+  padding: 6px 26px 6px 6px;
   border: 1px solid var(--color-hairline);
-  border-radius: 7px;
+  border-radius: 9px;
   background: var(--color-paper-2);
-  font-size: 11px;
+  font-size: 12px;
+  max-width: 260px;
   max-width: 220px;
 }
+.attchip { position: relative; }
 .attchip img {
-  width: 26px;
-  height: 26px;
+  width: 38px;
+  height: 38px;
   object-fit: cover;
-  border-radius: 5px;
+  border-radius: 6px;
   flex: none;
+  border: 1px solid var(--color-hairline);
+}
+.att-meta { display: flex; flex-direction: column; min-width: 0; }
+.att-size { color: var(--color-ink-4); font-size: 11px; }
+.att-x {
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  width: 16px;
+  height: 16px;
+  line-height: 14px;
+  border-radius: 4px;
 }
 .att-name {
   overflow: hidden;
@@ -1037,4 +1085,50 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .empty { animation: none; }
+}
+
+/* ---- files a turn produced ------------------------------------------------
+   These are the agent's output, not decoration: a spreadsheet or a docx has to
+   read as a thing you can open. A button element, not a div, so it is reachable
+   by keyboard and focus-visible works. */
+.filestrip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 4px 62px;
+}
+.filechip {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 11px 7px 9px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 9px;
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  cursor: pointer;
+  text-align: left;
+  max-width: 300px;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.filechip:hover {
+  border-color: var(--color-shell);
+  background: var(--color-tint);
+}
+.file-ico {
+  font-size: 17px;
+  line-height: 1;
+  flex: none;
+}
+.file-meta { display: flex; flex-direction: column; min-width: 0; }
+.file-name {
+  font-size: 12.5px;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-sub {
+  font-size: 11px;
+  color: var(--color-ink-4);
 }

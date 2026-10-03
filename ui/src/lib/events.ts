@@ -8,6 +8,13 @@
 
 export type FinishReason = 'stop' | 'toolCalls' | 'length' | 'cancelled' | 'error' | 'other'
 export type ExecStream = 'stdout' | 'stderr'
+export type OutputFile = {
+  path: string
+  name: string
+  mime: string
+  bytes: number
+}
+
 export type Risk = 'readOnly' | 'mutating' | 'exec'
 export type ApprovalAnswer = 'allow' | 'allowSession' | 'deny'
 
@@ -33,6 +40,7 @@ export type EngineEvent =
   | { kind: 'toolCallParseError'; d: { id: string; raw: string; message: string } }
   | { kind: 'toolExecStart'; d: { id: string } }
   | { kind: 'toolExecOutput'; d: { id: string; stream: ExecStream; chunk: string } }
+  | { kind: 'turnFiles'; d: { turn_id: number; files: OutputFile[] } }
   | { kind: 'toolExecEnd'; d: { id: string; ok: boolean; exit_code: number | null } }
   | {
       kind: 'approvalRequested'
@@ -99,6 +107,7 @@ export interface StoredMessage {
   reasoning_signature: string
   /** Milliseconds the model spent thinking; 0 when it did not think. */
   reasoning_ms: number
+  files: OutputFile[]
   created_at: number
   attachments: AttachmentMeta[]
 }

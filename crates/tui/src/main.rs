@@ -96,6 +96,14 @@ impl App {
 
     fn apply(&mut self, ev: EngineEvent) {
         match ev {
+            EngineEvent::TurnFiles { files, .. } => {
+                for f in &files {
+                    self.items.push(Item::Note(format!(
+                        "file · {} · {} bytes",
+                        f.path, f.bytes
+                    )));
+                }
+            }
             EngineEvent::SessionChanged { session_id, title } => {
                 self.items.push(Item::Note(format!(
                     "── session {session_id}{} ──",

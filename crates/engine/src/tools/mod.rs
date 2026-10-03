@@ -57,15 +57,89 @@ pub struct ToolResult {
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Files this call produced inside the workspace. The UI renders these as
+    /// clickable attachments; the model never sees them, so they cost no
+    /// prompt bytes and cannot invalidate the prefix cache.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<OutputFile>,
+}
+
+/// A file the agent produced, described for the UI rather than the model.
+/// `path` is always relative to the workspace: an absolute path would let the
+/// front end be talked into opening anything on the machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputFile {
+    pub path: String,
+    pub name: String,
+    pub mime: String,
+    pub bytes: u64,
+}
+
+impl OutputFile {
+    /// Describe a file on disk. `path` is stored workspace-relative on purpose:
+    /// an absolute path in this field would let a model-authored tool result
+    /// point the UI at anything on the machine.
+    pub fn from_path(workspace: &std::path::Path, path: &std::path::Path) -> OutputFile {
+        let rel = path::display_rel(workspace, path);
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        OutputFile {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| rel.clone()),
+            path: rel,
+            mime: mime_for(path).to_string(),
+            bytes,
+        }
+    }
+}
+
+/// Extension-based mime. Deliberately small: it exists so the UI can pick an
+/// icon and decide whether to open in place, not to identify file contents.
+pub fn mime_for(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "markdown" => "text/markdown",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "zip" => "application/zip",
+        "toml" => "application/toml",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "js" | "ts" => "text/javascript",
+        "css" => "text/css",
+        _ => "application/octet-stream",
+    }
 }
 
 impl ToolResult {
     pub fn ok(output: impl Into<String>) -> Self {
-        Self { ok: true, output: output.into(), exit_code: None, truncated: false, error: None }
+        Self { ok: true, output: output.into(), exit_code: None, truncated: false, error: None, files: Vec::new() }
     }
     pub fn err(msg: impl Into<String>) -> Self {
         let m = msg.into();
-        Self { ok: false, output: String::new(), exit_code: None, truncated: false, error: Some(m) }
+        Self { ok: false, output: String::new(), exit_code: None, truncated: false, error: Some(m), files: Vec::new() }
+    }
+
+    /// Attach a produced file. Returns self so call sites read in one chain.
+    pub fn with_file(mut self, f: OutputFile) -> Self {
+        self.files.push(f);
+        self
     }
 
     /// Whatever the tool actually said, success or failure. Keeps call sites and
@@ -180,6 +254,10 @@ impl Registry {
         r.register(Box::new(xlsx::WriteXlsxTool));
         r.register(Box::new(web::WebFetchTool::default()));
         r.register(Box::new(web::WebSearchTool::from_backend(search)));
+        // Appended, never inserted: this list is the tool order in the system
+        // prompt, and reordering it invalidates the llama.cpp prefix cache for
+        // every existing session.
+        r.register(Box::new(web::DownloadTool::default()));
         r
     }
 
@@ -311,7 +389,15 @@ mod cfg_tests {
         let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
         assert_eq!(
             names,
-            vec!["exec", "read_file", "write_file", "write_xlsx", "web_fetch", "web_search"]
+            vec![
+                "exec",
+                "read_file",
+                "write_file",
+                "write_xlsx",
+                "web_fetch",
+                "web_search",
+                "download_file",
+            ]
         );
     }
 }

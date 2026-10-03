@@ -61,6 +61,10 @@ pub struct Agent {
     ctx: ToolCtx,
     turn_id: u64,
     cancel: Arc<AtomicBool>,
+    /// Files produced by tools during the current turn. UI metadata only: these
+    /// never enter the prompt, so they cost no prefill and cannot invalidate the
+    /// prefix cache.
+    turn_files: Vec<crate::tools::OutputFile>,
 }
 
 impl Agent {
@@ -79,6 +83,7 @@ impl Agent {
             cfg,
             ctx,
             turn_id: 0,
+            turn_files: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -102,6 +107,30 @@ impl Agent {
     /// Swap the whole prompt out, e.g. when moving to a different session.
     pub fn replace_prompt(&mut self, p: crate::prompt::PromptBuilder) {
         self.prompt = p;
+        self.turn_id = 0;
+    }
+
+    /// Turn numbering is per conversation, not per process. Without this a
+    /// brand-new session opened at "turn 4" because the counter belonged to the
+    /// Agent, which outlives every session switch.
+    pub fn reset_turn_id(&mut self) {
+        self.turn_id = 0;
+    }
+
+    /// Files the last turn produced. The host persists these onto the assistant
+    /// row so they survive a reload; the event is only the live path.
+    pub fn take_turn_files(&mut self) -> Vec<crate::tools::OutputFile> {
+        std::mem::take(&mut self.turn_files)
+    }
+
+    fn emit_turn_files(&mut self, turn: u64, out: &EngineSink) {
+        if self.turn_files.is_empty() {
+            return;
+        }
+        let _ = out.send(EngineEvent::TurnFiles {
+            turn_id: turn,
+            files: self.turn_files.clone(),
+        });
     }
 
     pub fn set_mode(&mut self, m: crate::approval::ApprovalMode) {
@@ -168,9 +197,11 @@ impl Agent {
         }
 
         let mut agg = TurnTelemetry::default();
+        self.turn_files.clear();
 
         for iter in 0..self.cfg.max_tool_iters {
             if self.cancel.load(Ordering::Relaxed) {
+                self.emit_turn_files(turn, out);
                 let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Cancelled });
                 return agg;
             }
@@ -184,7 +215,8 @@ impl Agent {
                 Ok(c) => c,
                 Err(msg) => {
                     let _ = out.send(EngineEvent::Error { message: msg, fatal: true });
-                    let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Error });
+                    self.emit_turn_files(turn, out);
+                let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Error });
                     return agg;
                 }
             };
@@ -204,6 +236,7 @@ impl Agent {
                     reason(&collected),
                     collected.reasoning_ms,
                 );
+                self.emit_turn_files(turn, out);
                 let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Stop });
                 return agg;
             }
@@ -232,7 +265,8 @@ impl Agent {
             }
         }
 
-        let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Length });
+        self.emit_turn_files(turn, out);
+                let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Length });
         agg
     }
 
@@ -460,6 +494,7 @@ impl Agent {
                 output: String::new(),
                 exit_code: None,
                 truncated: false,
+                files: Vec::new(),
                 error: Some(if e.is_panic() {
                     format!(
                         "tool '{}' panicked and was isolated; the session continues",
@@ -472,6 +507,10 @@ impl Agent {
         };
         drop(etchunk);
         let _ = bridge.await;
+
+        if !result.files.is_empty() {
+            self.turn_files.extend(result.files.iter().cloned());
+        }
 
         let _ = out.send(EngineEvent::ToolExecEnd {
             id: call.id.clone(),
@@ -884,7 +923,7 @@ mod tests {
     fn render_result_never_returns_empty_to_the_model() {
         assert_eq!(render_result(&ToolResult::ok("")), "(succeeded, no output)");
         assert!(render_result(&ToolResult::err("boom")).contains("ERROR"));
-        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None };
+        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new() };
         assert!(render_result(&r).contains("(no output)"));
     }
 

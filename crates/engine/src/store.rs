@@ -52,7 +52,7 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Current schema version. Bump with a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -80,6 +80,9 @@ pub struct StoredMessage {
     pub reasoning_signature: String,
     /// Milliseconds the model spent thinking, 0 when it did not think.
     pub reasoning_ms: u64,
+    /// Files this message produced in the workspace, for the UI. Never sent to
+    /// the model.
+    pub files: Vec<crate::tools::OutputFile>,
     /// Metadata only: mime, filename, decoded size. The payload lives in the
     /// attachments table and is loaded by `history()`, never by transcript reads.
     pub attachments: Vec<crate::provider::AttachmentMeta>,
@@ -298,7 +301,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
-                    reasoning_signature, reasoning_ms, created_at
+                    reasoning_signature, reasoning_ms, files, created_at
              FROM messages
              WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2)
              ORDER BY id DESC LIMIT ?3",
@@ -314,8 +317,9 @@ impl Store {
                 tool_calls_json: r.get(6)?,
                 reasoning_signature: r.get(7)?,
                 reasoning_ms: r.get(8)?,
+                files: decode_files(r.get(9)?),
                 attachments: Vec::new(),
-                created_at: r.get(9)?,
+                created_at: r.get(10)?,
             })
         })?;
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
@@ -338,7 +342,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
-                    reasoning_signature, reasoning_ms, created_at
+                    reasoning_signature, reasoning_ms, files, created_at
              FROM messages WHERE session_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
@@ -352,8 +356,9 @@ impl Store {
                 tool_calls_json: r.get(6)?,
                 reasoning_signature: r.get(7)?,
                 reasoning_ms: r.get(8)?,
+                files: decode_files(r.get(9)?),
                 attachments: Vec::new(),
-                created_at: r.get(9)?,
+                created_at: r.get(10)?,
             })
         })?;
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
@@ -396,6 +401,15 @@ impl Store {
 
     /// Rehydrate a PromptBuilder's history. Tool calls are restored with their
     /// ids, because a tool_result whose call is missing is a hard 400.
+    /// Attach produced files to a message row. Called after the turn, because
+    /// the tool result is only known once the turn has finished.
+    pub fn set_message_files(&self, message_id: i64, files: &[crate::tools::OutputFile]) -> Result<(), StoreError> {
+        let json = serde_json::to_string(files).unwrap_or_else(|_| "[]".into());
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE messages SET files = ?2 WHERE id = ?1", params![message_id, json])?;
+        Ok(())
+    }
+
     pub fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError> {
         let stored = self.messages(session_id)?;
         // Full payloads only here. A transcript page gets metadata; the agent
@@ -650,6 +664,12 @@ fn derive_title(text: &str) -> String {
 /// version counter is the only way in. But a column add is the one migration
 /// step that is not naturally repeatable, and re-running it turns a recoverable
 /// situation into a hard open failure. Check first.
+/// A corrupt or legacy value degrades to "no files" rather than failing the
+/// whole transcript read.
+fn decode_files(raw: String) -> Vec<crate::tools::OutputFile> {
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
 fn add_column_if_missing(conn: &Connection, table: &str, col: &str, ddl: &str) -> rusqlite::Result<()> {
     let names: Vec<String> = {
         let mut s = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -803,6 +823,16 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
             "messages",
             "reasoning_ms",
             "reasoning_ms INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    if from < 8 {
+        // v8: files a turn produced. Without this the attachment chips under an
+        // answer exist only while the app is open and vanish on reload.
+        add_column_if_missing(
+            conn,
+            "messages",
+            "files",
+            "files TEXT NOT NULL DEFAULT '[]'",
         )?;
     }
     if from < 4 {

@@ -92,6 +92,13 @@ pub enum EngineEvent {
         message: String,
     },
 
+    /// Files the turn produced inside the workspace. Rendered as clickable
+    /// attachments under the answer; never sent to the model.
+    TurnFiles {
+        turn_id: u64,
+        files: Vec<crate::tools::OutputFile>,
+    },
+
     /// A tool began executing (used for the live "running…" card state).
     ToolExecStart {
         id: String,

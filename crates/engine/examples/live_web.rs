@@ -45,6 +45,48 @@ async fn main() {
         );
     }
 
+    println!("\n=== download_file: the chakra-ui docs dump that web_fetch truncated ===");
+    let dl = cowry_engine::tools::web::DownloadTool::default();
+    let r = dl
+        .run(
+            json!({ "url": "https://chakra-ui.com/llms.txt" }),
+            &ctx,
+            &tx,
+        )
+        .await;
+    show(&r);
+    println!("  files: {:?}", r.files.iter().map(|f| (&f.path, f.bytes, &f.mime)).collect::<Vec<_>>());
+
+    println!("\n=== download_file: refuse to clobber ===");
+    let r2 = dl.run(json!({ "url": "https://chakra-ui.com/llms.txt" }), &ctx, &tx).await;
+    show(&r2);
+
+    println!("\n=== download_file: oversized response is refused, not truncated ===");
+    let small = cowry_engine::tools::web::DownloadTool {
+        max_bytes: 200,
+        ..Default::default()
+    };
+    let r3 = small
+        .run(
+            json!({ "url": "https://chakra-ui.com/llms.txt", "path": "too-big.txt" }),
+            &ctx,
+            &tx,
+        )
+        .await;
+    show(&r3);
+    let leftover = std::path::Path::new(&ctx.workspace).join("too-big.txt");
+    println!("  partial file left behind: {}", leftover.exists());
+
+    println!("\n=== download_file: path escape is refused ===");
+    let r4 = dl
+        .run(
+            json!({ "url": "https://chakra-ui.com/llms.txt", "path": "../escaped.txt" }),
+            &ctx,
+            &tx,
+        )
+        .await;
+    show(&r4);
+
     println!("\n=== web_search ===");
     let r = search.run(json!({"query": "llama.cpp --cache-reuse prefix caching"}), &ctx, &tx).await;
     show(&r);

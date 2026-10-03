@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{ExecSink, Risk, Tool, ToolCtx, ToolResult};
+use super::{ExecSink, OutputFile, Risk, Tool, ToolCtx, ToolResult};
+use tokio::io::AsyncWriteExt;
 
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) Cowry/0.1 (+local agent)";
 
@@ -215,6 +216,209 @@ impl Tool for WebFetchTool {
 // ---------------------------------------------------------------------------
 
 /// Pull the <title> out, for a readable tool card.
+/// Download a file verbatim into the workspace.
+///
+/// `web_fetch` is a *reader*: it strips markup and clamps to a few tens of
+/// kilobytes because its output goes into the prompt. That is the right shape
+/// for reading a page and the wrong shape for obtaining a file, and the two
+/// must not be conflated: a truncated docs dump fed back into the context costs
+/// real prefill time on a local model and is useless afterwards. This writes
+/// bytes to disk and reports only the path, size and type.
+pub struct DownloadTool {
+    pub client: reqwest::Client,
+    pub max_bytes: u64,
+}
+
+impl Default for DownloadTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .user_agent(UA)
+                .timeout(std::time::Duration::from_secs(120))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .expect("reqwest client"),
+            max_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DownloadTool {
+    fn name(&self) -> &str {
+        "download_file"
+    }
+
+    fn description(&self) -> &str {
+        "Download a URL and save it verbatim into the workspace. Use this instead \
+         of web_fetch when the goal is to obtain a file (docs dump, PDF, archive, \
+         CSV, JSON blob) rather than to read a page: web_fetch strips markup and \
+         truncates, this preserves bytes. Read the result back with read_file. \
+         Returns the saved path, byte count and content type."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "http(s) URL to download" },
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative destination. Defaults to the URL's file name."
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Replace the destination if it already exists. Default false."
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Mutating
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {
+        let Some(raw) = args.get("url").and_then(|v| v.as_str()) else {
+            return ToolResult::err("download_file needs a `url` string");
+        };
+        let url = match check_url(raw) {
+            Ok(u) => u,
+            Err(e) => return ToolResult::err(e.to_string()),
+        };
+
+        let requested = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p.to_string(),
+            None => default_filename(&url),
+        };
+        let dest = match super::path::confine(&ctx.workspace, &requested) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::err(e),
+        };
+        if dest.exists() && !args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return ToolResult::err(format!(
+                "{} already exists. Pass overwrite: true to replace it, or choose another path.",
+                super::path::display_rel(&ctx.workspace, &dest)
+            ));
+        }
+
+        let resp = match self.client.get(url.clone()).send().await {
+            Ok(r) => r,
+            Err(e) => return ToolResult::err(format!("request failed: {e}")),
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            return ToolResult::err(format!("server returned {status} for {url}"));
+        }
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        // Write to a sibling `.part` and rename. A download that dies halfway
+        // must not leave a half-file that looks like a completed one.
+        let mut part = dest.clone();
+        part.set_extension(format!(
+            "{}.part",
+            dest.extension().and_then(|e| e.to_str()).unwrap_or("file")
+        ));
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return ToolResult::err(format!("cannot create {}: {e}", parent.display()));
+            }
+        }
+
+        let mut written: u64 = 0;
+        let mut truncated = false;
+        // reqwest and tokio::fs produce different error types; the caller only
+        // needs a sentence, so collapse both here rather than at every `?`.
+        let write = async {
+            let mut fh = tokio::fs::File::create(&part)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut stream = resp;
+            loop {
+                let chunk = stream.chunk().await.map_err(|e| e.to_string())?;
+                let Some(chunk) = chunk else { break };
+                if written + chunk.len() as u64 > self.max_bytes {
+                    truncated = true;
+                    break;
+                }
+                fh.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                written += chunk.len() as u64;
+            }
+            fh.flush().await.map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(e) = write {
+            let _ = tokio::fs::remove_file(&part).await;
+            return ToolResult::err(format!("write failed: {e}"));
+        }
+        if truncated {
+            let _ = tokio::fs::remove_file(&part).await;
+            return ToolResult::err(format!(
+                "response exceeds the {} byte download limit; nothing was saved",
+                self.max_bytes
+            ));
+        }
+        if let Err(e) = tokio::fs::rename(&part, &dest).await {
+            let _ = tokio::fs::remove_file(&part).await;
+            return ToolResult::err(format!("could not finalise the file: {e}"));
+        }
+
+        let rel = super::path::display_rel(&ctx.workspace, &dest);
+        let file = OutputFile {
+            path: rel.clone(),
+            name: dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| rel.clone()),
+            mime,
+            bytes: written,
+        };
+        ToolResult::ok(format!(
+            "saved {} to {} ({})",
+            human_bytes(written),
+            rel,
+            file.mime
+        ))
+        .with_file(file)
+    }
+}
+
+/// Turn a URL into a safe workspace-relative file name. Query strings, leading
+/// dots and path separators all have to go: the name comes from the network.
+fn default_filename(url: &url::Url) -> String {
+    let last = url
+        .path_segments()
+        .and_then(|mut s| s.rfind(|seg| !seg.is_empty()))
+        .unwrap_or("");
+    let cleaned: String = last
+        .chars()
+        .map(|c| if c == '/' || c == '\0' { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_matches('.').trim().to_string();
+    if cleaned.is_empty() {
+        url.domain().unwrap_or("download").to_string() + ".download"
+    } else {
+        cleaned
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} kB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
 pub fn html_title(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let Some(start) = lower.find("<title") else { return String::new() };
@@ -712,7 +916,6 @@ mod tests {
 
     // ---- url policy -------------------------------------------------------
 
-    #[test]
     // The crash that closed the app mid-session: a real page whose <script>
     // body contained a multi-byte character. The scan for the closing tag
     // sliced the string at every byte offset and panicked inside the tool,
@@ -740,6 +943,7 @@ mod tests {
         assert_eq!(text.trim(), "before", "{text}");
     }
 
+    #[test]
     fn non_http_schemes_are_rejected() {
         for u in [
             "file:///etc/passwd",
