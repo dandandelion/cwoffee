@@ -16,6 +16,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -198,14 +199,23 @@ impl Agent {
             }
 
             if collected.calls.is_empty() {
-                self.prompt.push_assistant(&collected.text);
+                self.prompt.push_assistant_with(
+                    &collected.text,
+                    reason(&collected),
+                    collected.reasoning_ms,
+                );
                 let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Stop });
                 return agg;
             }
 
             // The model asked for tools. Record the assistant turn *with* its
             // calls, then answer every one of them.
-            self.prompt.push_assistant_calls(&collected.text, &collected.calls);
+            self.prompt.push_assistant_calls_with(
+                &collected.text,
+                &collected.calls,
+                reason(&collected),
+                collected.reasoning_ms,
+            );
 
             for call in &collected.calls {
                 self.run_tool(call, out).await;
@@ -250,6 +260,13 @@ impl Agent {
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut tel = TurnTelemetry::default();
             let mut finish = FinishReason::Stop;
+            // Thinking duration is measured here, at the deltas, because this
+            // is the only place that sees when reasoning actually started and
+            // stopped. A UI-side timer would be wrong across a reload or a
+            // session switch mid-turn.
+            let mut think: String = String::new();
+            let mut think_start: Option<Instant> = None;
+            let mut think_end: Option<Instant> = None;
             while let Some(d) = rx.recv().await {
                 // Stop forwarding as soon as the user asks to stop: otherwise the
                 // transcript keeps filling in for the rest of the generation.
@@ -262,6 +279,9 @@ impl Agent {
                         let _ = out2.send(EngineEvent::Text(t));
                     }
                     Delta::Reasoning(r) => {
+                        think_start.get_or_insert_with(Instant::now);
+                        think_end = Some(Instant::now());
+                        think.push_str(&r);
                         let _ = out2.send(EngineEvent::Reasoning(r));
                     }
                     Delta::ToolCallBegin { id, name } => {
@@ -270,7 +290,13 @@ impl Agent {
                     Delta::ToolCallArgs(a) => {
                         let _ = out2.send(EngineEvent::ToolCallArgs(a));
                     }
-                    Delta::ReasoningEnd { .. } => {}
+                    Delta::ReasoningEnd { .. } => {
+                        // Some providers close the thinking block explicitly.
+                        // Trust that over the last delta's arrival time.
+                        if think_start.is_some() {
+                            think_end = Some(Instant::now());
+                        }
+                    }
                     Delta::ToolCallReady { id, name, arguments } => {
                         calls.push(ToolCall { id, name, arguments });
                     }
@@ -278,7 +304,11 @@ impl Agent {
                     Delta::Done(f) => finish = f,
                 }
             }
-            (text, calls, tel, finish)
+            let reasoning_ms = match (think_start, think_end) {
+                (Some(s), Some(e)) => Some(e.duration_since(s).as_millis() as u64),
+                _ => None,
+            };
+            (text, calls, tel, finish, think, reasoning_ms)
         });
 
         // A Stop press has to interrupt the generation, not just the gap between
@@ -298,7 +328,7 @@ impl Agent {
         // Dropping tx is what ends the consumer loop, cancelled or not.
         drop(tx);
 
-        let (text, calls, tel, finish) = consume
+        let (text, calls, tel, finish, think, reasoning_ms) = consume
             .await
             .map_err(|e| format!("event consumer task failed: {e}"))?;
         if cancelled {
@@ -307,6 +337,8 @@ impl Agent {
                 calls,
                 telemetry: tel,
                 finish: FinishReason::Cancelled,
+                reasoning: think,
+                reasoning_ms,
             });
         }
         if let Err(e) = res {
@@ -314,7 +346,7 @@ impl Agent {
         }
 
         let _ = out.send(EngineEvent::Usage(tel.clone()));
-        Ok(Collected { text, calls, telemetry: tel, finish })
+        Ok(Collected { text, calls, telemetry: tel, finish, reasoning: think, reasoning_ms })
     }
 
     /// Repair args, gate, execute, and always produce a tool_result.
@@ -424,12 +456,26 @@ impl Agent {
     }
 }
 
+/// Empty reasoning must not become `Some("")`: an empty thinking block replayed
+/// to a provider that wants reasoning is a different prompt from no block at all.
+fn reason(c: &Collected) -> Option<String> {
+    if c.reasoning.is_empty() {
+        None
+    } else {
+        Some(c.reasoning.clone())
+    }
+}
+
 struct Collected {
     text: String,
     calls: Vec<ToolCall>,
     telemetry: TurnTelemetry,
     #[allow(dead_code)]
     finish: FinishReason,
+    /// Raw thinking text from this round-trip, kept for the transcript.
+    reasoning: String,
+    /// Wall time the model spent thinking, when it thought at all.
+    reasoning_ms: Option<u64>,
 }
 
 /// What the model sees for a tool result. Shaped for a small model: lead with
@@ -521,6 +567,57 @@ mod tests {
             Ok(())
         }
         fn wants_reasoning(&self) -> bool { false }
+    }
+
+    /// The transcript label says "thought for 2m34s". That number has to be
+    /// measured where the deltas arrive, and stored, or it is gone on reload.
+    #[tokio::test]
+    async fn thinking_is_captured_with_its_duration() {
+        let (etx, _erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            std::sync::Arc::new(Scripted {
+                turns: vec![vec![
+                    Delta::Reasoning("step one. ".into()),
+                    Delta::Reasoning("step two.".into()),
+                    Delta::ReasoningEnd { signature: None },
+                    Delta::Text("42".into()),
+                    Delta::Done(FinishReason::Stop),
+                ]],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Registry::new(),
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        agent.run_turn("q", vec![], &etx).await;
+
+        let h = agent.prompt_mut().history();
+        let a = h.iter().find(|m| matches!(m.role, crate::provider::Role::Assistant)).expect("assistant message");
+        assert_eq!(a.reasoning.as_deref(), Some("step one. step two."));
+        assert!(a.reasoning_ms.is_some(), "thinking duration was not measured");
+    }
+
+    /// A turn that never thinks must not produce an empty thinking block: an
+    /// empty block replayed to a provider that wants reasoning is a different
+    /// prompt from no block at all.
+    #[tokio::test]
+    async fn a_turn_without_thinking_stores_no_reasoning_block() {
+        let (etx, _erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            std::sync::Arc::new(Scripted { turns: vec![], n: std::sync::atomic::AtomicUsize::new(0) }),
+            Registry::new(),
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        agent.run_turn("q", vec![], &etx).await;
+        let h = agent.prompt_mut().history();
+        let a = h.iter().find(|m| matches!(m.role, crate::provider::Role::Assistant)).expect("assistant message");
+        assert_eq!(a.reasoning, None);
+        assert_eq!(a.reasoning_ms, None);
     }
 
     #[tokio::test]

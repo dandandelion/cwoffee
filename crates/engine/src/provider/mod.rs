@@ -125,6 +125,11 @@ pub struct Message {
     /// sent back verbatim when tools are used. Only meaningful for that backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_signature: Option<String>,
+    /// How long the model spent thinking, in milliseconds. UI metadata only: it
+    /// never reaches the wire, but it is persisted so a reloaded transcript
+    /// still says "thought for 2m34s" instead of losing the information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

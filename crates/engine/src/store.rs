@@ -52,7 +52,7 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Current schema version. Bump with a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -78,6 +78,8 @@ pub struct StoredMessage {
     /// Anthropic attests thinking blocks with a signature and will reject a
     /// replayed block without one. Losing this makes a resumed session 400.
     pub reasoning_signature: String,
+    /// Milliseconds the model spent thinking, 0 when it did not think.
+    pub reasoning_ms: u64,
     /// Metadata only: mime, filename, decoded size. The payload lives in the
     /// attachments table and is loaded by `history()`, never by transcript reads.
     pub attachments: Vec<crate::provider::AttachmentMeta>,
@@ -235,14 +237,15 @@ impl Store {
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, reasoning, reasoning_signature, tool_call_id, tool_calls_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (session_id, role, content, reasoning, reasoning_signature, reasoning_ms, tool_call_id, tool_calls_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 session_id,
                 role_str(&m.role),
                 m.content,
                 m.reasoning.clone().unwrap_or_default(),
                 m.reasoning_signature.clone().unwrap_or_default(),
+                m.reasoning_ms.unwrap_or(0) as i64,
                 m.tool_call_id,
                 tool_calls,
                 now
@@ -295,7 +298,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
-                    reasoning_signature, created_at
+                    reasoning_signature, reasoning_ms, created_at
              FROM messages
              WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2)
              ORDER BY id DESC LIMIT ?3",
@@ -310,8 +313,9 @@ impl Store {
                 tool_call_id: r.get(5)?,
                 tool_calls_json: r.get(6)?,
                 reasoning_signature: r.get(7)?,
+                reasoning_ms: r.get(8)?,
                 attachments: Vec::new(),
-                created_at: r.get(8)?,
+                created_at: r.get(9)?,
             })
         })?;
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
@@ -334,7 +338,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
-                    reasoning_signature, created_at
+                    reasoning_signature, reasoning_ms, created_at
              FROM messages WHERE session_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
@@ -347,8 +351,9 @@ impl Store {
                 tool_call_id: r.get(5)?,
                 tool_calls_json: r.get(6)?,
                 reasoning_signature: r.get(7)?,
+                reasoning_ms: r.get(8)?,
                 attachments: Vec::new(),
-                created_at: r.get(8)?,
+                created_at: r.get(9)?,
             })
         })?;
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
@@ -420,6 +425,7 @@ impl Store {
                 // missing is rejected outright by every provider.
                 tool_call_id: s.tool_call_id,
                 reasoning: if s.reasoning.is_empty() { None } else { Some(s.reasoning) },
+                reasoning_ms: if s.reasoning_ms == 0 { None } else { Some(s.reasoning_ms) },
                 reasoning_signature: if s.reasoning_signature.is_empty() {
                     None
                 } else {
@@ -638,6 +644,26 @@ fn derive_title(text: &str) -> String {
     out
 }
 
+/// Add a column only if it is missing.
+///
+/// The older migrations use a bare `ALTER TABLE`, which is fine while the
+/// version counter is the only way in. But a column add is the one migration
+/// step that is not naturally repeatable, and re-running it turns a recoverable
+/// situation into a hard open failure. Check first.
+fn add_column_if_missing(conn: &Connection, table: &str, col: &str, ddl: &str) -> rusqlite::Result<()> {
+    let names: Vec<String> = {
+        let mut s = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = s.query_map([], |r| r.get::<_, String>(1))?;
+        let out: Vec<String> = rows.filter_map(|x| x.ok()).collect();
+        out
+    };
+    let exists = names.iter().any(|name| name == col);
+    if exists {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl};"))
+}
+
 fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
     if from < 1 {
         conn.execute_batch(
@@ -768,6 +794,17 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
             }
         }
     }
+    if from < 7 {
+        // v7: how long the model spent thinking. The transcript says "thought
+        // for 2m34s"; if the number is not stored, that fact is lost the moment
+        // the session is reloaded.
+        add_column_if_missing(
+            conn,
+            "messages",
+            "reasoning_ms",
+            "reasoning_ms INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     if from < 4 {
         // v4: sessions with an empty title. `delete_session` used to move the host
         // onto a freshly created session titled "", which rendered as a blank row
@@ -783,7 +820,7 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ToolCall;
+    use crate::provider::{Message, Role, ToolCall};
 
     fn store() -> Store {
         Store::in_memory().expect("in-memory store")
@@ -919,6 +956,40 @@ mod tests {
         // The title backfill also runs, so pre-existing conversations are findable.
         assert_eq!(s.session(1).unwrap().unwrap().title, "Hello there!");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thinking_duration_survives_a_reload() {
+        let s = store();
+        let sid = s.create_session("t", "/w", "m").unwrap();
+        s.append_message(sid, &Message {
+            role: Role::Assistant,
+            content: "answer".into(),
+            reasoning: Some("considered a, then b".into()),
+            reasoning_ms: Some(154_000),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let rows = s.messages(sid).unwrap();
+        assert_eq!(rows[0].reasoning_ms, 154_000);
+
+        // The prompt rebuild path, which is what a resumed session uses.
+        let hist = s.history(sid).unwrap();
+        let a = hist.iter().find(|m| matches!(m.role, Role::Assistant)).unwrap();
+        assert_eq!(a.reasoning.as_deref(), Some("considered a, then b"));
+        assert_eq!(a.reasoning_ms, Some(154_000));
+    }
+
+    #[test]
+    fn no_thinking_stores_zero_not_a_null_guess() {
+        let s = store();
+        let sid = s.create_session("t", "/w", "m").unwrap();
+        s.append_message(sid, &Message { role: Role::Assistant, content: "x".into(), ..Default::default() })
+            .unwrap();
+        let rows = s.messages(sid).unwrap();
+        assert_eq!(rows[0].reasoning_ms, 0);
+        assert_eq!(s.history(sid).unwrap()[0].reasoning_ms, None);
     }
 
     #[test]

@@ -261,7 +261,20 @@ body {
   -webkit-mask-image: none;
   mask-image: none;
 }
+/* Reasoning keeps its own layout rather than the shared 62px label column.
+   That column fits "THINKING" but not "THOUGHT FOR 2M34S", and the chevron was
+   wrapping onto a second line. Here the head is a full-width line above the
+   body, so the label can be any length and the arrow stays inline. */
+.blk-reasoning {
+  display: block;
+  cursor: pointer;
+}
+.blk-reasoning.is-open { cursor: default; }
 .blk-reasoning .blk-head {
+  text-align: left;
+  white-space: nowrap;
+  padding-top: 0;
+  margin-bottom: 4px;
   cursor: pointer;
   user-select: none;
 }
@@ -904,6 +917,33 @@ body {
   padding-bottom: 116px;
 }
 .empty { margin-bottom: 30px; }
+
+/* Markdown tables. The model emits them for anything tabular; before this they
+   rendered as one long paragraph of pipes. */
+.blk-body table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 13.5px;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto; /* wide tables scroll instead of crushing columns */
+}
+.blk-body th,
+.blk-body td {
+  border: 1px solid var(--color-hairline-2);
+  padding: 5px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.blk-body th {
+  background: var(--color-tint);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.blk-body tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--color-tint) 45%, transparent); }
+.blk-body .ta-left { text-align: left; }
+.blk-body .ta-center { text-align: center; }
+.blk-body .ta-right { text-align: right; }
 
 /* Hidden, not unmounted: the transcript renderer holds a reference to its root
    node, and an {#if} would destroy the very element it keeps writing into. */

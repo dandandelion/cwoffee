@@ -196,6 +196,65 @@ ok('mid-stream html is escaped', !lm4.render().includes('<img'), lm4.render())
 // Empty and whitespace-only sources must not throw or emit stray tags.
 ok('empty source renders empty', new LiveMarkdown().render() === '')
 
+// --- tables -------------------------------------------------------------
+// The model emits these constantly and the renderer had no support at all, so
+// a whole table collapsed into one paragraph of pipes.
+const tbl = renderMarkdown(
+  'Cross-check:\n\n| Source | Price |\n|---|---:|\n| CoinGecko | $84,593 |\n| NowPrice | $84,664 |\n',
+)
+ok('table becomes a table', tbl.includes('<table>') && tbl.includes('<thead>') && tbl.includes('<tbody>'), tbl)
+ok('table cells present', tbl.includes('<td>CoinGecko</td>') && tbl.includes('>$84,593</td>'), tbl)
+ok('right alignment from ---:', tbl.includes('class="ta-right"'), tbl)
+ok('header uses th', tbl.includes('<th>Source</th>'), tbl)
+ok('no stray pipes left over', !tbl.includes('|'), tbl)
+
+// Alignment on both sides.
+const al2 = renderMarkdown('| a | b | c |\n|:--|--:|:-:|\n| 1 | 2 | 3 |\n')
+ok('left align', al2.includes('class="ta-left"'), al2)
+ok('center align', al2.includes('class="ta-center"'), al2)
+
+// Ragged rows are normal from a model: column count comes from the delimiter.
+const rag = renderMarkdown('| a | b | c |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |\n')
+ok('short row padded', (rag.match(/<td><\/td>/) || {}).valid !== false && rag.includes('<td>1</td><td></td><td></td>'), rag)
+ok('extra cell dropped', rag.includes('<td>1</td><td>2</td><td>3</td>') && !rag.includes('<td>4</td>'), rag)
+
+// A pipe escaped inside a cell is content, not a column break.
+const esc = renderMarkdown('| a | b |\n|---|---|\n| x \\| y | z |\n')
+ok('escaped pipe stays in cell', esc.includes('<td>x | y</td>'), esc)
+
+// Prose containing a pipe must not become a table without a delimiter row.
+const prose = renderMarkdown('a | b | c\nnext line\n')
+ok('prose pipe is not a table', !prose.includes('<table>'), prose)
+
+// HTML inside a cell stays inert.
+const evil = renderMarkdown('| a |\n|---|\n| <script>alert(1)</script> |\n')
+ok('script inside cell neutralised', !evil.includes('<script>'), evil)
+
+// Inline formatting still works inside cells.
+const inl = renderMarkdown('| a |\n|---|\n| **bold** and `code` |\n')
+ok('inline markup in cell', inl.includes('<strong>bold</strong>') && inl.includes('<code>code</code>'), inl)
+
+// A table must not swallow the paragraph before it.
+const around = renderMarkdown('before\n\n| a |\n|---|\n| 1 |\n\nafter\n')
+ok('paragraph before table kept', around.includes('<p>before</p>') && around.includes('<p>after</p>'), around)
+
+// Mid-stream: a partial table is not a table until the delimiter row arrives.
+const lmT = new LiveMarkdown()
+lmT.push('| Source | Price |\n|---|---|')
+const partial = lmT.render()
+ok('partial table renders as table once delimiter lands', partial.includes('<table>'), partial)
+
+// --- thinking duration label ----------------------------------------------
+import { fmtThink } from '../src/lib/think.ts'
+ok('sub-minute seconds', fmtThink(7_000) === 'thought for 7s', fmtThink(7_000))
+ok('zero', fmtThink(0) === 'thought for 0s', fmtThink(0))
+ok('sub-second rounds, never goes negative', fmtThink(400) === 'thought for 0s', fmtThink(400))
+ok('minutes are padded', fmtThink(154_000) === 'thought for 2m34s', fmtThink(154_000))
+ok('exactly one minute', fmtThink(60_000) === 'thought for 1m00s', fmtThink(60_000))
+ok('59s stays in seconds', fmtThink(59_400) === 'thought for 59s', fmtThink(59_400))
+ok('hours drop seconds', fmtThink(3_723_000) === 'thought for 1h02m', fmtThink(3_723_000))
+ok('negative input is clamped', fmtThink(-5_000) === 'thought for 0s', fmtThink(-5_000))
+
 if (failed) {
   console.log(`\n${failed} markdown test(s) failed`)
   process.exit(1)

@@ -124,9 +124,24 @@ impl PromptBuilder {
     }
 
     pub fn push_assistant(&mut self, text: impl Into<String>) {
+        self.push_assistant_with(text, None, None);
+    }
+
+    /// As `push_assistant`, but carrying the reasoning text and how long it
+    /// took. Reasoning is not replayed to the model unless the provider asks
+    /// for it (`Provider::wants_reasoning`); it is kept so the transcript can
+    /// be rebuilt after a reload.
+    pub fn push_assistant_with(
+        &mut self,
+        text: impl Into<String>,
+        reasoning: Option<String>,
+        reasoning_ms: Option<u64>,
+    ) {
         self.history.push(Message {
             role: Role::Assistant,
             content: text.into(),
+            reasoning,
+            reasoning_ms,
             ..Default::default()
         });
     }
@@ -134,9 +149,21 @@ impl PromptBuilder {
     /// An assistant turn that requested tool calls. The calls must be replayed
     /// verbatim: providers match tool_result back to these ids.
     pub fn push_assistant_calls(&mut self, text: &str, calls: &[ToolCall]) {
+        self.push_assistant_calls_with(text, calls, None, None);
+    }
+
+    pub fn push_assistant_calls_with(
+        &mut self,
+        text: &str,
+        calls: &[ToolCall],
+        reasoning: Option<String>,
+        reasoning_ms: Option<u64>,
+    ) {
         self.history.push(Message {
             role: Role::Assistant,
             content: text.to_string(),
+            reasoning,
+            reasoning_ms,
             tool_calls: calls.to_vec(),
             ..Default::default()
         });

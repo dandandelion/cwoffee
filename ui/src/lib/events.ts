@@ -97,6 +97,8 @@ export interface StoredMessage {
   tool_call_id: string | null
   tool_calls_json: string
   reasoning_signature: string
+  /** Milliseconds the model spent thinking; 0 when it did not think. */
+  reasoning_ms: number
   created_at: number
   attachments: AttachmentMeta[]
 }

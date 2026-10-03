@@ -514,6 +514,7 @@ pub fn assistant_message(
         attachments: Vec::new(),
         reasoning,
         reasoning_signature: signature,
+        reasoning_ms: None,
         tool_calls,
         tool_call_id: None,
     }

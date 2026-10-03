@@ -124,6 +124,79 @@ function renderInline(text: string): string {
  * Input is untrusted (model output, possibly quoting a fetched page). Output
  * contains only tags this function emits.
  */
+/**
+ * Split a table row into cells.
+ *
+ * A `\|` inside a cell is a literal pipe, not a column separator. Leading and
+ * trailing pipes are structural and dropped, but a trailing *escaped* pipe is
+ * content, so the closing-pipe strip has to check for it.
+ */
+function splitRow(line: string): string[] {
+  let s = line.trim()
+  if (s.startsWith('|')) s = s.slice(1)
+  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1)
+  const cells: string[] = []
+  let cur = ''
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k]
+    if (ch === '\\' && s[k + 1] === '|') {
+      cur += '|'
+      k++
+      continue
+    }
+    if (ch === '|') {
+      cells.push(cur.trim())
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  cells.push(cur.trim())
+  return cells
+}
+
+/** `|---|` `|:---|` `|---:|` `|:---:|` in any column count. */
+// Single dashes are legal (`|:-:|`), so this is `-+`, not `-{2,}`.
+const TABLE_DELIM = /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$/
+
+function aligns(delim: string): string[] {
+  return splitRow(delim).map((c) => {
+    const l = c.startsWith(':')
+    const r = c.endsWith(':')
+    if (l && r) return 'center'
+    if (r) return 'right'
+    if (l) return 'left'
+    return ''
+  })
+}
+
+/**
+ * Render a pipe table. `header` is the line before the delimiter row.
+ *
+ * Ragged rows are normal from a model, so the column count comes from the
+ * delimiter and short rows are padded rather than dropped.
+ */
+function renderTable(header: string, delim: string, rows: string[]): string {
+  const cols = splitRow(delim)
+  const al = aligns(delim)
+  const n = cols.length
+  const pad = (cells: string[]) =>
+    Array.from({ length: n }, (_, i) => cells[i] ?? '')
+
+  const cell = (tag: string, text: string, i: number) => {
+    const a = al[i] ? ` class="ta-${al[i]}"` : ''
+    return `<${tag}${a}>${renderInline(escapeHtml(text))}</${tag}>`
+  }
+
+  const head = pad(splitRow(header))
+    .map((c, i) => cell('th', c, i))
+    .join('')
+  const body = rows
+    .map((r) => `<tr>${pad(splitRow(r)).map((c, i) => cell('td', c, i)).join('')}</tr>`)
+    .join('')
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
+}
+
 export function renderMarkdown(src: string): string {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const html: string[] = []
@@ -145,8 +218,8 @@ export function renderMarkdown(src: string): string {
     }
   }
 
-  for (const raw of lines) {
-    const line = raw
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx]
 
     // fenced code
     if (line.startsWith('```')) {
@@ -226,6 +299,25 @@ export function renderMarkdown(src: string): string {
         listType = 'ol'
       }
       html.push(`<li>${renderInline(escapeHtml(ol[1]))}</li>`)
+      continue
+    }
+
+    // Table: a header line containing a pipe, immediately followed by a
+    // delimiter row. Both must be present, which is what keeps "a | b" in
+    // prose from becoming a table.
+    if (t.includes('|') && idx + 1 < lines.length && TABLE_DELIM.test(lines[idx + 1].trim())) {
+      flushPara()
+      closeList()
+      const header = t
+      const delim = lines[idx + 1].trim()
+      let j = idx + 2
+      const rows: string[] = []
+      while (j < lines.length && lines[j].trim() !== '' && lines[j].includes('|')) {
+        rows.push(lines[j].trim())
+        j++
+      }
+      html.push(renderTable(header, delim, rows))
+      idx = j - 1
       continue
     }
 

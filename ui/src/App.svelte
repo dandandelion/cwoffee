@@ -1244,6 +1244,57 @@
         }
       }
 
+      // --- thinking label + markdown tables ---------------------------------
+      {
+        await invoke('set_reasoning', { level: 'medium' })
+        draft =
+          'Reply with ONLY a markdown table, no prose. Two columns named name and value, ' +
+          'two data rows: alpha 1 and beta 2.'
+        const turnsBefore = (await invoke<HostState>('session_state')).turns
+        await send()
+        if (!(await waitTurnDone(turnsBefore))) {
+          fail('table turn never finished')
+        } else {
+          await new Promise((r) => setTimeout(r, 400))
+
+          const table = document.querySelector('.transcript table')
+          if (!table) {
+            fail('markdown table was not rendered as a table')
+          } else {
+            if (!table.querySelector('thead th')) fail('table has no header cells')
+            if (table.querySelectorAll('tbody tr').length < 2)
+              fail(`table has too few body rows: ${table.querySelectorAll('tbody tr').length}`)
+            if (table.textContent?.includes('|')) fail('stray pipes left in the table')
+          }
+
+          const rblk = document.querySelector('.blk-reasoning') as HTMLElement | null
+          if (!rblk) {
+            fail('no thinking block in the turn')
+          } else {
+            const head = rblk.querySelector('.blk-head') as HTMLElement
+            const body = rblk.querySelector('.blk-body') as HTMLElement
+            const label = head.textContent ?? ''
+            if (!/^thought for /.test(label))
+              fail(`thinking label was not replaced with a duration: ${JSON.stringify(label)}`)
+            // The arrow wrapping onto its own line was the reported bug.
+            if (head.getBoundingClientRect().height > 22)
+              fail(`thinking head is not a single line: ${head.getBoundingClientRect().height}px`)
+
+            // Whole collapsed block is the click target, not just the label.
+            body.click()
+            await new Promise((r) => setTimeout(r, 120))
+            if (!body.classList.contains('expanded')) fail('clicking the thinking body did not expand it')
+            // Once open, only the label collapses it.
+            body.click()
+            await new Promise((r) => setTimeout(r, 120))
+            if (!body.classList.contains('expanded')) fail('clicking the body while expanded collapsed it')
+            head.click()
+            await new Promise((r) => setTimeout(r, 120))
+            if (body.classList.contains('expanded')) fail('clicking the label did not collapse it')
+          }
+        }
+      }
+
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +

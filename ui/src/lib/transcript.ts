@@ -49,8 +49,10 @@ async function openExternal(href: string) {
 
 import type { AttachmentMeta, EngineEvent, ExecStream, StoredMessage } from './events'
 import { renderMarkdown, LiveMarkdown } from './markdown'
+import { fmtThink } from './think'
 
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
+
 
 interface ToolRefs {
   card: HTMLElement
@@ -96,15 +98,21 @@ export class Transcript {
     // stays inert rather than hijacking the window.
     root.addEventListener('click', (e) => {
       const t = e.target as HTMLElement | null
-      // A clamped thinking block expands in place.
-      const head = t?.closest?.('.blk-reasoning .blk-head')
-      if (head) {
-        const body = head.parentElement?.querySelector('.blk-body') as HTMLElement | null
-        if (body) {
-          const open = body.classList.toggle('expanded')
-          head.classList.toggle('open', open)
-          if (open) body.scrollTop = 0
-        }
+      // A clamped thinking block expands in place. While it is collapsed the
+      // whole block is the target - three lines of italic text is a small and
+      // annoying thing to aim at. Once expanded, only the label collapses it,
+      // so selecting text inside a long block does not hide it.
+      const rblk = t?.closest?.('.blk-reasoning')
+      if (rblk) {
+        const body = rblk.querySelector('.blk-body') as HTMLElement | null
+        const head = rblk.querySelector('.blk-head') as HTMLElement | null
+        if (!body) return
+        const open = body.classList.contains('expanded')
+        if (open && !t?.closest?.('.blk-head')) return
+        const nowOpen = body.classList.toggle('expanded')
+        head?.classList.toggle('open', nowOpen)
+        rblk.classList.toggle('is-open', nowOpen)
+        if (nowOpen) body.scrollTop = 0
         return
       }
       const a = t?.closest?.('a')
@@ -160,6 +168,13 @@ export class Transcript {
     for (const el of this.reasoningEls) {
       el.classList.add('settled')
       el.scrollTop = 0
+      // The label changes once thinking is over: while it runs "thinking" is
+      // the truth, afterwards the useful fact is how long it took.
+      const started = Number(el.dataset.thinkStart ?? 0)
+      if (started) {
+        const head = el.parentElement?.querySelector('.blk-head')
+        if (head) head.textContent = fmtThink(performance.now() - started)
+      }
     }
     this.reasoningEls = []
   }
@@ -228,6 +243,7 @@ export class Transcript {
       this.textKind = kind
       if (kind === 'reasoning') {
         this.textBuf.classList.add('clamp')
+        this.textBuf.dataset.thinkStart = String(performance.now())
         this.reasoningEls.push(this.textBuf)
       }
       if (kind === 'answer') {
@@ -498,7 +514,7 @@ export class Transcript {
         this.appendAttachmentTags(body, m.attachments ?? [])
       } else if (m.role === 'assistant') {
         if (m.reasoning) {
-          const r = blk('reasoning', 'thinking')
+          const r = blk('reasoning', m.reasoning_ms ? fmtThink(m.reasoning_ms) : 'thinking')
           r.classList.add('clamp', 'settled')
           r.textContent = m.reasoning
         }
