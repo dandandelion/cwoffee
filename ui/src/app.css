@@ -217,6 +217,35 @@ body {
   padding-top: 3px;
   text-align: right;
 }
+/* The block that is currently producing output carries a live marker in its
+   label column: one pulsing dot, on one block, removed at turn end. A spinner
+   per message reads as noise; nothing at all reads as "is it working?". */
+.blk.live .blk-head::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--color-shell-deep);
+  vertical-align: middle;
+  animation: cowry-live 1.15s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes cowry-live {
+  0%, 100% { transform: scale(0.55); opacity: 0.3; }
+  50%      { transform: scale(1);    opacity: 1;   }
+}
+/* Reasoning sits outside the label grid, so its marker leads the line. */
+.blk-reasoning.live .blk-head::before { margin-right: 6px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .blk.live .blk-head::before {
+    animation: none;
+    opacity: 0.75;
+    transform: none;
+  }
+}
+
 .blk-body {
   font-size: 14px;
   line-height: 1.65;
@@ -702,6 +731,16 @@ body {
   padding: 0;
   background: rgba(20, 18, 15, 0.34);
   z-index: 30;
+  /* Always mounted, faded rather than inserted. Mounting it inside the same
+     frame the sidebar starts sliding adds a layout+paint pass in the middle of
+     the animation, which is where the hitch came from. */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+.scrim.show {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 @media (max-width: 767px) {
@@ -714,11 +753,22 @@ body {
     width: 78%;
     max-width: 320px;
     transform: translateX(-100%);
-    transition: transform 0.18s ease;
+    transition: transform 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
+    /* Without this the slide is repaint-driven: the whole session list, its
+       text, and the 14px shadow are re-rasterised every frame. Measured a 67ms
+       hitch on open in a 180ms transition - one lost frame in eleven. */
+    will-change: transform;
+    backface-visibility: hidden;
     box-shadow: 2px 0 14px rgba(0, 0, 0, 0.16);
   }
   .sidebar.open {
     transform: translateX(0);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sidebar,
+    .scrim {
+      transition: none;
+    }
   }
   .sidemenu {
     display: inline-flex;

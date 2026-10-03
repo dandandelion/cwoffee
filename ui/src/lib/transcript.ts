@@ -130,8 +130,25 @@ export class Transcript {
     this.tools.clear()
     this.answerEls = []
     this.liveEl = null
+    this.setLive(null)
     this.live = new LiveMarkdown()
   }
+
+  /**
+   * Mark the one block that is currently producing output. The indicator is on
+   * the latest active block only - several pulsing at once reads as noise - and
+   * it is removed outright at turn end rather than left idle, so a settled
+   * transcript carries no animation at all.
+   */
+  private setLive(body: HTMLElement | null) {
+    const wrap = body?.parentElement ?? null
+    if (this.liveWrap === wrap) return
+    this.liveWrap?.classList.remove('live')
+    this.liveWrap = wrap
+    wrap?.classList.add('live')
+  }
+
+  private liveWrap: HTMLElement | null = null
 
   /** Total answer text streamed so far this turn. Used by the render self-report. */
   get streamedChars() {
@@ -250,6 +267,7 @@ export class Transcript {
         this.answerEls.push(this.textBuf)
         this.beginLive(this.textBuf)
       }
+      this.setLive(this.textBuf)
     }
     this.pending.push(s)
     if (!this.raf) this.raf = requestAnimationFrame(() => this.flush())
@@ -320,6 +338,7 @@ export class Transcript {
         this.flushNow()
         this.finalizeAnswer()
         this.settleReasoning()
+        this.setLive(null)
         this.textBuf = null
         this.textKind = null
         break
@@ -404,6 +423,7 @@ export class Transcript {
     const args = this.el('tool-args')
     const out = this.el('tool-out')
     card.append(head, args, out)
+    this.setLive(card)
     this.turn!.appendChild(card)
     this.tools.set(id, { card, args, out, status, stdout: '', stderr: '' })
     this.scrollIfNeeded()

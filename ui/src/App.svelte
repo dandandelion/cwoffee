@@ -306,6 +306,12 @@
   // partial answer instead of showing a truncated one. Bounded: a runaway stream
   // must not grow this without limit.
   let liveBuf: EngineEvent[] = []
+  // A resync clears the transcript and then awaits a store read. Events that
+  // arrive during that await must not be painted into a transcript that is about
+  // to be replaced - they would be lost, and the replay that follows would not
+  // know they had already been shown. Counted, not boolean: resyncs can nest.
+  let resyncing = 0
+  let resyncSeq = 0
   // Empty view = draft, or a session with nothing in it yet.
   const showEmpty = $derived(viewId === null || (viewMsgCount === 0 && !busy))
   let sentDraft: { text: string; atts: { mime: string; name: string; bytes: number }[] } | null = null
@@ -330,8 +336,8 @@
       // output that had already been painted before the switch, so coming back
       // showed an empty session - the very thing this is meant to prevent.
       if (liveBuf.length < LIVE_CAP) liveBuf.push(ev)
-      if (viewId !== turnSessionId) {
-        // painted on return, not now
+      if (viewId !== turnSessionId || resyncing > 0) {
+        // painted by the replay once the view settles
       } else {
         transcript?.apply(ev)
       }
@@ -348,11 +354,14 @@
         if (ev.d.session_id === viewId) {
           void (async () => {
             try {
-              await loadTranscript(ev.d.session_id)
+              // resyncView, not loadTranscript: the store lags a live turn, so
+              // a plain reload repaints from a history that does not contain the
+              // turn in flight and wipes the user's own message. resyncView
+              // replays it from the buffer instead.
+              await resyncView(ev.d.session_id)
             } catch (e) {
               pageLog(`session_messages after switch failed: ${e}`)
             }
-            await refreshState()
             await loadSessions()
           })()
         }
@@ -643,14 +652,19 @@
       }
     }
     const shown = pending.map((a) => ({ mime: a.mime, name: a.name, bytes: a.bytes }))
-    transcript?.addUser(text, shown)
-    sentDraft = { text, atts: shown }
+    // Ownership and the replay copy are recorded *before* anything is painted.
+    // A sessionChanged event for the row we just created can be delivered at any
+    // await below; if it lands after the message is painted but before ownership
+    // is recorded, the resync it triggers wipes the message and cannot put it
+    // back.
     turnSessionId = viewId
+    sentDraft = { text, atts: shown }
+    liveBuf = []
+    transcript?.addUser(text, shown)
     // The view is no longer empty the moment a message exists, and a turn does
     // not go through loadTranscript, so record it here rather than waiting for
     // a reload that will not come.
     viewMsgCount = Math.max(viewMsgCount, 1)
-    liveBuf = []
     clearAttachments()
     try {
       await invoke('start_turn', { text, attachments: atts })
@@ -740,6 +754,8 @@
   }
 
   async function resyncView(id: number) {
+    const mySeq = ++resyncSeq
+    resyncing++
     viewId = id
     transcript?.clear()
     try {
@@ -747,6 +763,10 @@
     } catch (e) {
       pageLog(`session_messages failed: ${e}`)
     }
+    resyncing--
+    // A newer resync has already taken the view; painting this one's result
+    // would show a session the user has since moved away from.
+    if (mySeq !== resyncSeq) return
     // Returning to the session that owns a running turn: the stored history
     // does not contain that turn yet, so replay what we buffered.
     if (turnSessionId === id && sentDraft) {
@@ -1244,6 +1264,53 @@
         }
       }
 
+      // --- the message you just sent must survive the session being created --
+      // This is the video bug: sending from a draft wiped the user's own message
+      // and opened on a blank transcript, because the new session announced
+      // itself and the handler reloaded from a store that did not contain the
+      // turn yet.
+      {
+        newSession()
+        draft = 'Selftest wipe check: reply with the single word ok.'
+        const turnsBeforeWipe = (await invoke<HostState>('session_state')).turns
+        await send()
+        // Assert while the turn is in flight, not after it settles: after the
+        // turn the store catches up and the bug is invisible.
+        const mine = () =>
+          [...document.querySelectorAll('.blk-user .blk-body')].some((u) =>
+            u.textContent?.includes('Selftest wipe check'),
+          )
+        // Waited, not sampled: a resync is legitimately in flight here. What must
+        // never happen is the message staying missing.
+        if (!(await waitFor('sent message to be in the transcript', mine, 4000))) {
+          const detail = [...document.querySelectorAll('.transcript .blk')]
+            .map((b) => `${b.className} :: ${(b.textContent ?? '').slice(0, 90)}`)
+            .join(' || ')
+          fail(
+            `sent message vanished from the transcript (viewId=${viewId} turnId=${turnSessionId} blocks: ${detail})`,
+          )
+        }
+        if (!(await waitTurnDone(turnsBeforeWipe))) fail('wipe-check turn never finished')
+      }
+
+      // --- the live marker: one during the turn, none after ------------------
+      {
+        const liveCount = () => document.querySelectorAll('.transcript .blk.live').length
+        newSession()
+        draft = 'Selftest live marker: count from one to five.'
+        const turnsBeforeLive = (await invoke<HostState>('session_state')).turns
+        await send()
+        // Wait for output to actually be streaming, then look.
+        if (!(await waitFor('a live block to appear', () => liveCount() === 1, 6000))) {
+          fail(`expected exactly one live block during a turn, saw ${liveCount()}`)
+        }
+        if (!(await waitTurnDone(turnsBeforeLive))) {
+          fail('live-marker turn never finished')
+        } else if (liveCount() !== 0) {
+          fail(`live marker survived the turn: ${liveCount()} still marked`)
+        }
+      }
+
       // --- thinking label + markdown tables ---------------------------------
       {
         await invoke('set_reasoning', { level: 'medium' })
@@ -1538,9 +1605,16 @@
 
   <!-- ============================= body ============================== -->
   <div class="flex min-h-0 flex-1">
-    {#if sidebarOpen}
-      <button class="scrim" onclick={() => (sidebarOpen = false)} aria-label="Close sidebar"></button>
-    {/if}
+    <!-- Mounted unconditionally and faded with a class: inserting it in the
+         same frame the sidebar starts moving costs a layout+paint pass mid-slide. -->
+    <button
+      class="scrim"
+      class:show={sidebarOpen}
+      onclick={() => (sidebarOpen = false)}
+      aria-label="Close sidebar"
+      aria-hidden={!sidebarOpen}
+      tabindex={sidebarOpen ? 0 : -1}
+    ></button>
     <aside
       class="sidebar w-[248px] shrink-0 flex-col gap-1.5 border-r border-hairline p-2.5 min-h-0"
       class:open={sidebarOpen}
