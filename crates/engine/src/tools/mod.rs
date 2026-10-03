@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::event::ExecStream;
@@ -128,7 +129,10 @@ impl Default for ExecCfg {
 /// Name-indexed tool set.
 #[derive(Default)]
 pub struct Registry {
-    tools: HashMap<String, Box<dyn Tool>>,
+    // Arc, not Box: a tool call is spawned so a panic inside one tool cannot
+    // take the process with it (a web-fetch panic closed the app mid-session).
+    // Spawning needs shared ownership of the tool across the task boundary.
+    tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
 }
 
@@ -181,12 +185,17 @@ impl Registry {
 
     pub fn register(&mut self, t: Box<dyn Tool>) {
         let n = t.name().to_string();
-        self.tools.insert(n.clone(), t);
+        self.tools.insert(n.clone(), Arc::from(t));
         self.order.push(n);
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|b| b.as_ref())
+    }
+
+    /// Shared handle for running a tool on its own task.
+    pub fn get_shared(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
     }
 
     /// Schemas in a **stable order**. Tool order changes the prompt bytes, which

@@ -351,7 +351,7 @@ impl Agent {
 
     /// Repair args, gate, execute, and always produce a tool_result.
     async fn run_tool(&mut self, call: &ToolCall, out: &EngineSink) {
-        let Some(tool) = self.registry.get(&call.name) else {
+        let Some(tool) = self.registry.get_shared(&call.name) else {
             let msg = format!(
                 "unknown tool {:?}. Available: {}",
                 call.name,
@@ -442,7 +442,34 @@ impl Agent {
             }
         });
 
-        let result = tool.run(args.clone(), &self.ctx, &etchunk).await;
+        // The tool runs on its own task so a panic inside it becomes a
+        // tool_result the model can see rather than a dead app. That is not
+        // hypothetical: a byte-index slice in the HTML stripper walked into a
+        // multi-byte character and closed the whole process mid-session.
+        let running = tokio::spawn({
+            let tool = tool.clone();
+            let ctx = self.ctx.clone();
+            let sink = etchunk.clone();
+            let args = args.clone();
+            async move { tool.run(args, &ctx, &sink).await }
+        });
+        let result = match running.await {
+            Ok(r) => r,
+            Err(e) => ToolResult {
+                ok: false,
+                output: String::new(),
+                exit_code: None,
+                truncated: false,
+                error: Some(if e.is_panic() {
+                    format!(
+                        "tool '{}' panicked and was isolated; the session continues",
+                        call.name
+                    )
+                } else {
+                    format!("tool '{}' task failed: {e}", call.name)
+                }),
+            },
+        };
         drop(etchunk);
         let _ = bridge.await;
 
@@ -618,6 +645,77 @@ mod tests {
         let a = h.iter().find(|m| matches!(m.role, crate::provider::Role::Assistant)).expect("assistant message");
         assert_eq!(a.reasoning, None);
         assert_eq!(a.reasoning_ms, None);
+    }
+
+    /// A tool that panics. Real example: the HTML stripper sliced a string at a
+    /// non-char boundary and the panic took the whole app down mid-session.
+    #[derive(Default)]
+    struct Exploding;
+
+    #[async_trait]
+    impl crate::tools::Tool for Exploding {
+        fn name(&self) -> &str { "explode" }
+        fn description(&self) -> &str { "always panics" }
+        fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
+        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::ReadOnly }
+        async fn run(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+            _sink: &crate::tools::ExecSink,
+        ) -> crate::tools::ToolResult {
+            panic!("boom from inside a tool")
+        }
+    }
+
+    /// The panic must be contained: the model gets an error result, the turn
+    /// finishes, and the process survives.
+    #[tokio::test]
+    async fn a_panicking_tool_is_isolated_not_fatal() {
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Exploding::default()));
+        let mut agent = Agent::new(
+            std::sync::Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "c1".into(),
+                            name: "explode".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        Delta::Text("recovered".into()),
+                        Delta::Done(FinishReason::Stop),
+                    ],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        agent.run_turn("go", vec![], &etx).await;
+
+        let h = agent.prompt_mut().history();
+        let tr = h
+            .iter()
+            .find(|m| matches!(m.role, crate::provider::Role::Tool))
+            .expect("the failed call still needs a tool_result");
+        assert!(tr.content.contains("panicked"), "result was: {}", tr.content);
+
+        let mut saw_end = false;
+        while let Ok(e) = erx.try_recv() {
+            if let EngineEvent::ToolExecEnd { ok, .. } = e {
+                saw_end = true;
+                assert!(!ok, "a panicked tool must not report ok");
+            }
+        }
+        assert!(saw_end, "tool exec end was never emitted");
     }
 
     #[tokio::test]

@@ -332,13 +332,22 @@ fn ci_starts_with(hay: &str, needle: &str) -> bool {
         && hay.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle.as_bytes())
 }
 
-/// Case-insensitive substring search returning a byte offset. Compares ASCII
-/// needles against byte slices, so a match always begins on a char boundary.
+/// Case-insensitive substring search returning a byte offset.
+///
+/// The scan runs over bytes, not over `&hay[i..]`. Slicing at every byte offset
+/// panics the moment the haystack contains a multi-byte character, because most
+/// offsets land inside one. This crashed the app on a real page: the scan for
+/// `</script>` walked into a `▾` and took the whole process with it.
+///
+/// The returned offset is still a char boundary: every needle here is ASCII, so
+/// a match cannot begin on a UTF-8 continuation byte.
 fn ci_find(hay: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
     }
-    (0..=hay.len() - needle.len()).find(|&i| ci_starts_with(&hay[i..], needle))
+    let hb = hay.as_bytes();
+    let nb = needle.as_bytes();
+    (0..=hb.len() - nb.len()).find(|&i| hb[i..i + nb.len()].eq_ignore_ascii_case(nb))
 }
 
 /// Leading run of ASCII alphanumerics: the tag name.
@@ -704,6 +713,33 @@ mod tests {
     // ---- url policy -------------------------------------------------------
 
     #[test]
+    // The crash that closed the app mid-session: a real page whose <script>
+    // body contained a multi-byte character. The scan for the closing tag
+    // sliced the string at every byte offset and panicked inside the tool,
+    // which took the whole process down.
+    #[test]
+    fn multibyte_content_inside_a_dropped_block_does_not_panic() {
+        let html = "<div>a</div><script>var x = '\u{25be}\u{25be}\u{25be}'; // \u{4e2d}\u{6587} </script><p>kept</p>";
+        let text = html_to_text(html);
+        assert!(text.contains("kept"), "{text}");
+        assert!(!text.contains('\u{25be}'), "script content leaked: {text}");
+    }
+
+    #[test]
+    fn multibyte_everywhere_does_not_panic() {
+        let html = format!("\u{25be}\u{25be}\u{25be}\u{25be}\u{25be}\u{25be}\u{25be}\u{25be}\u{25be}\u{25be}");
+        let html = html.repeat(50) + "<STYLE>\u{1f600}\u{1f600}</style>tail";
+        let text = html_to_text(&html);
+        assert!(text.ends_with("tail"), "{text}");
+    }
+
+    #[test]
+    fn unterminated_script_with_multibyte_stops_cleanly() {
+        let html = "before<script>\u{25be}\u{25be} never closed";
+        let text = html_to_text(html);
+        assert_eq!(text.trim(), "before", "{text}");
+    }
+
     fn non_http_schemes_are_rejected() {
         for u in [
             "file:///etc/passwd",
