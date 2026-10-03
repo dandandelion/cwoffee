@@ -168,6 +168,16 @@ fn main() {
         "[cowry] exec: ceiling {}s, sandbox={}",
         ec.timeout_secs, ec.sandbox_enabled
     );
+    // Same reason: a search backend you cannot see is a backend you cannot tell
+    // apart from one that is silently falling back.
+    eprintln!(
+        "[cowry] search: {}",
+        match appcfg.search_backend() {
+            cowry_engine::tools::web::SearchBackend::SearXNG { base } => format!("searxng {base}"),
+            cowry_engine::tools::web::SearchBackend::DuckDuckGo =>
+                "duckduckgo html (set [search] searxng_url for a reliable backend)".into(),
+        }
+    );
 
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();
     // One map, shared by the pump (which parks reply senders) and the
