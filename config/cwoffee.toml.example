@@ -1,35 +1,25 @@
-# Cowry configuration
-# Copy to ~/.config/cowry/config.toml
+# Cwoffee configuration
+# Copy to ~/.config/cwoffee/config.toml
 #
 # Precedence: CLI flag > environment variable > this file > built-in defaults.
 # A malformed file is fatal at startup rather than silently ignored — a wrong
 # endpoint with no explanation is worse than a crash. A missing file is fine.
 #
-# This block lists every key the parser accepts. Anything not listed here is
-# ignored, so do not copy keys from older drafts.
+# Unknown keys are rejected at startup, so do not copy keys from older drafts.
+#
+# ORDER MATTERS. In TOML a bare key belongs to whichever [table] is currently
+# open, so a top-level key written after [provider] parses as provider.workspace
+# and silently does nothing. Every top-level key appears below, before the first
+# table header.
 
 # ---------------------------------------------------------------------------
-# Endpoint
+# Workspace and approval  (top level - must come before any [table])
 # ---------------------------------------------------------------------------
-[provider]
-kind     = "llama.cpp"        # llama.cpp | openai | anthropic
-base_url = "http://127.0.0.1:8090/v1"
-model    = ""                 # empty => adopt the first id from /v1/models
-# api_key = "env:COWRY_KEY"   # env:VARNAME keeps secrets off disk
-
-# `kind` selects the wire protocol, not the vendor:
-#   llama.cpp  -> OpenAI chat format + chat_template_kwargs.enable_thinking,
-#                 reads llama.cpp `timings` for cache/speculative telemetry
-#   openai     -> OpenAI chat format, no llama.cpp fields
-#   anthropic  -> /v1/messages, thinking blocks, signed-thinking replay
-
-# ---------------------------------------------------------------------------
-# Workspace and approval
-# ---------------------------------------------------------------------------
-# Where read_file / write_file / exec operate. A leading ~ is expanded.
-# Default: ~/cowry-workspace for the desktop app, the process CWD for the TUI.
-# Never the GUI's CWD: a window launched by a .desktop file inherits one at random.
-workspace = "~/cowry-workspace"
+# Where read_file / write_file / exec / download_file operate. A leading ~ is
+# expanded. Default: ~/cwoffee-workspace for the desktop app, the process CWD
+# for the TUI. Never the GUI's CWD: a window launched by a .desktop file
+# inherits one at random.
+workspace = "~/cwoffee-workspace"
 
 # ask     - prompt for every tool call
 # session - first allow per tool is remembered for the session
@@ -41,6 +31,21 @@ mode = "ask"
 approval_timeout_secs = 300
 
 theme = "light"               # light | dark | system (not wired up yet)
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+[provider]
+kind     = "llama.cpp"        # llama.cpp | openai | anthropic
+base_url = "http://127.0.0.1:8090/v1"
+model    = ""                 # empty => adopt the first id from /v1/models
+# api_key = "env:CWOFFEE_KEY"   # env:VARNAME keeps secrets off disk
+
+# `kind` selects the wire protocol, not the vendor:
+#   llama.cpp  -> OpenAI chat format + chat_template_kwargs.enable_thinking,
+#                 reads llama.cpp `timings` for cache/speculative telemetry
+#   openai     -> OpenAI chat format, no llama.cpp fields
+#   anthropic  -> /v1/messages, thinking blocks, signed-thinking replay
 
 # ---------------------------------------------------------------------------
 # Context budget
@@ -59,7 +64,7 @@ max_tool_output = 8000
 backend = "duckduckgo"        # duckduckgo | searxng
 max_results = 8
 # searxng_url = "http://127.0.0.1:8888/search"
-# Public DuckDuckGo serves a bot challenge (HTTP 202) from many IPs; Cowry
+# Public DuckDuckGo serves a bot challenge (HTTP 202) from many IPs; Cwoffee
 # reports that as an actionable error rather than "no results". Self-hosting
 # SearXNG and enabling JSON is the reliable path.
 
@@ -78,5 +83,5 @@ timeout_secs = 120
 # ---------------------------------------------------------------------------
 # Environment overrides (no config keys - these win over the file)
 # ---------------------------------------------------------------------------
-#   COWRY_URL, COWRY_MODEL, COWRY_KEY, COWRY_WORKSPACE, COWRY_MODE,
-#   COWRY_CONTEXT, COWRY_SEARXNG_URL, COWRY_APPROVAL_TIMEOUT_SECS
+#   CWOFFEE_URL, CWOFFEE_MODEL, CWOFFEE_KEY, CWOFFEE_WORKSPACE, CWOFFEE_MODE,
+#   CWOFFEE_CONTEXT, CWOFFEE_SEARXNG_URL, CWOFFEE_APPROVAL_TIMEOUT_SECS

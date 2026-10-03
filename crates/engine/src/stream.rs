@@ -68,7 +68,7 @@ pub fn fake_turn<F: FnMut(EngineEvent)>(turn_id: u64, script: &FakeScript, mut e
         }
         emit(EngineEvent::ToolCallReady {
             id: id.clone(),
-            args: serde_json::json!({ "cmd": "ls -la", "cwd": "~/Projects/cowry" }),
+            args: serde_json::json!({ "cmd": "ls -la", "cwd": "~/Projects/cwoffee" }),
         });
         emit(EngineEvent::ToolExecStart { id: id.clone() });
         for line in ["total 48", "drwxr-xr-x  9 you you 4096 Oct  1 19:00 .", "-rw-r--r-- 1 you you 8123 Oct 1 19:00 PLAN.md"] {

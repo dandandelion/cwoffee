@@ -1,4 +1,4 @@
-//! Cowry desktop host.
+//! Cwoffee desktop host.
 //!
 //! Thin by design. Everything interesting lives in `crates/engine`; this file
 //! wires one up and gets out of the way.
@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cowry_engine::approval::ApprovalAnswer;
-use cowry_engine::host::{approval_event, HostConfig, SessionHost};
-use cowry_engine::provider::Provider;
-use cowry_engine::store::Store;
-use cowry_engine::tools::Registry;
-use cowry_engine::Config;
+use cwoffee_engine::approval::ApprovalAnswer;
+use cwoffee_engine::host::{approval_event, HostConfig, SessionHost};
+use cwoffee_engine::provider::Provider;
+use cwoffee_engine::store::Store;
+use cwoffee_engine::tools::Registry;
+use cwoffee_engine::Config;
 use tokio::sync::{mpsc, oneshot};
 
 use commands::AppState;
@@ -37,7 +37,7 @@ fn flag(args: &[String], long: &str, short: Option<&str>) -> Option<String> {
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env_or("XDG_DATA_HOME", &format!("{}/.local/share", std::env::var("HOME").unwrap_or_default())))
-        .join("cowry")
+        .join("cwoffee")
 }
 
 fn main() {
@@ -48,11 +48,11 @@ fn main() {
 
     let report = gpu::report();
     eprintln!(
-        "[cowry] EGL vendor pinned to: {}\n[cowry] GLX vendor: {}",
+        "[cwoffee] EGL vendor pinned to: {}\n[cwoffee] GLX vendor: {}",
         report.egl_vendor, report.glx_vendor
     );
     if report.leaked_nvidia {
-        eprintln!("[cowry] WARNING: this process holds an NVIDIA render node despite the pin");
+        eprintln!("[cwoffee] WARNING: this process holds an NVIDIA render node despite the pin");
     }
 
     // ---- configuration ----------------------------------------------------
@@ -64,7 +64,7 @@ fn main() {
         Err(e) => {
             // A malformed config must not silently fall back to defaults: that
             // would send the agent at the wrong endpoint with no explanation.
-            eprintln!("[cowry] {e}");
+            eprintln!("[cwoffee] {e}");
             std::process::exit(1);
         }
     };
@@ -82,7 +82,7 @@ fn main() {
         appcfg.mode = Some(p);
     }
     if let Some(p) = &loaded {
-        eprintln!("[cowry] config: {}", p.display());
+        eprintln!("[cwoffee] config: {}", p.display());
     }
 
     // ---- engine wiring ----------------------------------------------------
@@ -92,7 +92,7 @@ fn main() {
     // silently breaks every other server.
     let configured_model = appcfg.provider.model.trim().to_string();
     let model = configured_model.clone();
-    // Default the workspace to ~/cowry-workspace, not the process CWD. A GUI app
+    // Default the workspace to ~/cwoffee-workspace, not the process CWD. A GUI app
     // launched from a .desktop file or by a WM inherits an arbitrary CWD, and
     // under `tauri dev` that is crates/tauri-app - which would quietly make the
     // agent edit the wrong tree.
@@ -100,21 +100,29 @@ fn main() {
         .workspace
         .clone()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env_or("HOME", ".")).join("cowry-workspace"));
+        .unwrap_or_else(|| PathBuf::from(env_or("HOME", ".")).join("cwoffee-workspace"));
     if let Err(e) = std::fs::create_dir_all(&workspace) {
-        eprintln!("[cowry] cannot create workspace {}: {e}", workspace.display());
+        eprintln!("[cwoffee] cannot create workspace {}: {e}", workspace.display());
     }
+    // Rename safety: move ~/.config/cowry and ~/.local/share/cowry to their
+    // cwoffee equivalents before anything reads them, or the rebrand strands
+    // every existing session.
+    let migration_notes = cwoffee_engine::legacy::migrate_legacy_dirs();
+    for note in &migration_notes {
+        println!("[cwoffee] {note}");
+    }
+
     let db_path = data_dir().join("sessions.db");
     let mode = appcfg.mode();
 
     if let Err(e) = std::fs::create_dir_all(db_path.parent().unwrap_or_else(|| std::path::Path::new("."))) {
-        eprintln!("[cowry] cannot create data dir: {e}");
+        eprintln!("[cwoffee] cannot create data dir: {e}");
     }
 
     let store = match Store::open(&db_path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("[cowry] cannot open store at {}: {e}", db_path.display());
+            eprintln!("[cwoffee] cannot open store at {}: {e}", db_path.display());
             std::process::exit(1);
         }
     };
@@ -122,7 +130,7 @@ fn main() {
     let provider: std::sync::Arc<dyn Provider> = match appcfg.build_provider() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[cowry] {e}");
+            eprintln!("[cwoffee] {e}");
             std::process::exit(1);
         }
     };
@@ -130,7 +138,7 @@ fn main() {
     let mut cfg = HostConfig::new(model, workspace.clone());
     cfg.mode = mode;
     cfg.context_budget = appcfg.context.target_tokens;
-    cfg.env_block = cowry_engine::host::default_env_block(&workspace, "linux");
+    cfg.env_block = cwoffee_engine::host::default_env_block(&workspace, "linux");
     // Fail-closed default: an unanswered prompt refuses rather than hanging the
     // turn forever.
     cfg.approval_timeout =
@@ -150,7 +158,7 @@ fn main() {
         // an empty one and taking a 400.
         let adopted = h.adopt_first_model().await;
         if let Some(m) = &adopted {
-            eprintln!("[cowry] no model configured; using the endpoint's first: {m}");
+            eprintln!("[cwoffee] no model configured; using the endpoint's first: {m}");
         }
         (h, adopted)
     });
@@ -158,23 +166,23 @@ fn main() {
     // applied by the host task, so state() can still show the old value here.
     let model_label = adopted_model.unwrap_or(configured_model);
     eprintln!(
-        "[cowry] engine up: url={url} model={model_label} workspace={} mode={:?}",
+        "[cwoffee] engine up: url={url} model={model_label} workspace={} mode={:?}",
         workspace.display(), mode
     );
     // The exec deadline used to be invisible: a [sandbox] block that parsed,
     // validated, and then went nowhere looked identical to one that worked.
     let ec = appcfg.exec_cfg();
     eprintln!(
-        "[cowry] exec: ceiling {}s, sandbox={}",
+        "[cwoffee] exec: ceiling {}s, sandbox={}",
         ec.timeout_secs, ec.sandbox_enabled
     );
     // Same reason: a search backend you cannot see is a backend you cannot tell
     // apart from one that is silently falling back.
     eprintln!(
-        "[cowry] search: {}",
+        "[cwoffee] search: {}",
         match appcfg.search_backend() {
-            cowry_engine::tools::web::SearchBackend::SearXNG { base } => format!("searxng {base}"),
-            cowry_engine::tools::web::SearchBackend::DuckDuckGo =>
+            cwoffee_engine::tools::web::SearchBackend::SearXNG { base } => format!("searxng {base}"),
+            cwoffee_engine::tools::web::SearchBackend::DuckDuckGo =>
                 "duckduckgo html (set [search] searxng_url for a reliable backend)".into(),
         }
     );
@@ -225,7 +233,7 @@ fn main() {
                     break;
                 }
             }
-            eprintln!("[cowry] event pump finished");
+            eprintln!("[cwoffee] event pump finished");
         });
     }
 
@@ -235,6 +243,7 @@ fn main() {
         queue_rx: Mutex::new(Some(queue_rx)),
         pending_approvals: Arc::clone(&pending),
         rendered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        migration_notes,
     };
 
     let rendered_flag = state.rendered.clone();
@@ -253,7 +262,7 @@ fn main() {
             let cfg = app.config();
             let cfg_build = cfg.build.clone();
             eprintln!(
-                "[cowry] frontend_dist={:?} csp_hashes={}",
+                "[cwoffee] frontend_dist={:?} csp_hashes={}",
                 cfg.build.frontend_dist,
                 cfg.app.security.csp.is_some(),
             );
@@ -266,7 +275,7 @@ fn main() {
                 tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                 if !painted.load(std::sync::atomic::Ordering::SeqCst) {
                     eprintln!(
-                        "[cowry] SUSPECT: no render report after 8s - the window is probably blank.                          frontend_dist={:?}; a debug build loads devUrl and needs vite running.",
+                        "[cwoffee] SUSPECT: no render report after 8s - the window is probably blank.                          frontend_dist={:?}; a debug build loads devUrl and needs vite running.",
                         cfg_build.frontend_dist
                     );
                 }
@@ -283,6 +292,7 @@ fn main() {
             commands::set_mode,
             commands::set_reasoning,
             commands::list_models,
+            commands::migration_notes,
             commands::set_model,
             commands::session_state,
             commands::list_sessions,
@@ -300,7 +310,7 @@ fn main() {
         ]);
 
     if let Err(e) = app.run(tauri::generate_context!()) {
-        eprintln!("[cowry] error while running: {e}");
+        eprintln!("[cwoffee] error while running: {e}");
         std::process::exit(1);
     }
 }

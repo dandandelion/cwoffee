@@ -364,7 +364,7 @@ mod tests {
     fn tmp(label: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
-            "cowry_file_{}_{}_{}",
+            "cwoffee_file_{}_{}_{}",
             std::process::id(),
             label,
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -409,7 +409,7 @@ mod tests {
         let d = tmp("escape");
         std::fs::write(d.join("secret"), "top secret").unwrap();
         let outer = d.parent().unwrap().join(format!(
-            "cowry_file_outer_{}",
+            "cwoffee_file_outer_{}",
             std::process::id()
         ));
         std::fs::write(&outer, "outside").unwrap();

@@ -6,9 +6,9 @@
 # "which /dev/dri/renderD* does the process have open". This script answers that.
 #
 #   usage: ./scripts/gpu-check.sh [pattern]
-#   example: ./scripts/gpu-check.sh cowry
+#   example: ./scripts/gpu-check.sh cwoffee
 #
-# Run it on a known-good app first (e.g. `firefox`) to calibrate, then on cowry.
+# Run it on a known-good app first (e.g. `firefox`) to calibrate, then on cwoffee.
 
 set -uo pipefail
 

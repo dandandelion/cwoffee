@@ -13,12 +13,12 @@
 #   usage: ./scripts/memory.sh [pattern] [pss_limit_mb]
 #   exit:  0 under budget, 1 over budget, 2 no matching process
 #
-#   ./scripts/memory.sh cowry-app 400
+#   ./scripts/memory.sh cwoffee-app 400
 #   ./scripts/memory.sh qoder 0        # 0 = report only, never fail
 
 set -uo pipefail
 
-PATTERN="${1:-cowry}"
+PATTERN="${1:-cwoffee}"
 LIMIT_MB="${2:-400}"
 
 mapfile -t roots < <(pgrep -f -- "$PATTERN" 2>/dev/null)

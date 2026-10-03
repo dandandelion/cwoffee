@@ -4,12 +4,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cowry_engine::approval::{ApprovalAnswer, ApprovalMode};
-use cowry_engine::event::EngineEvent;
-use cowry_engine::host::{HostCmd, HostState, SessionHost};
-use cowry_engine::provider::Reasoning;
-use cowry_engine::store::{SearchHit, Session, Store};
+use cwoffee_engine::approval::{ApprovalAnswer, ApprovalMode};
+use cwoffee_engine::event::EngineEvent;
+use cwoffee_engine::host::{HostCmd, HostState, SessionHost};
+use cwoffee_engine::provider::Reasoning;
+use cwoffee_engine::store::{SearchHit, Session, Store};
 use tauri::ipc::Channel;
+use tauri::State;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::gpu;
@@ -38,6 +39,10 @@ pub struct AppState {
     /// Set the first time the page reports its own DOM state. A webview that
     /// never paints is otherwise indistinguishable from one that is fine.
     pub rendered: Arc<std::sync::atomic::AtomicBool>,
+    /// What the cowry -> cwoffee directory migration did, or why it declined.
+    /// Shown in the UI: "left both alone" in a log file the user never opens is
+    /// indistinguishable from "your history is gone".
+    pub migration_notes: Vec<String>,
 }
 
 /// Register the webview's event channel. Called once at startup.
@@ -51,7 +56,7 @@ pub fn attach(state: tauri::State<'_, AppState>, on_event: Channel<EngineEvent>)
         .ok_or_else(|| "event channel already attached".to_string())?;
     // Reaching here proves the page's JS ran: it is the first call the app makes.
     // Without it a blank window is indistinguishable from a healthy one.
-    eprintln!("[cowry] webview attached: page JS is running");
+    eprintln!("[cwoffee] webview attached: page JS is running");
 
     tauri::async_runtime::spawn(async move {
         let mut rx = rx;
@@ -60,7 +65,7 @@ pub fn attach(state: tauri::State<'_, AppState>, on_event: Channel<EngineEvent>)
             // gate's timeout then refuses any further tool call, so a dead UI
             // cannot become an unattended agent.
             if on_event.send(ev).is_err() {
-                eprintln!("[cowry] event channel closed; detaching webview");
+                eprintln!("[cwoffee] event channel closed; detaching webview");
                 break;
             }
         }
@@ -86,10 +91,10 @@ pub fn start_turn(
     text: String,
     attachments: Option<Vec<AttachmentIn>>,
 ) -> Result<(), String> {
-    let atts: Vec<cowry_engine::provider::Attachment> = attachments
+    let atts: Vec<cwoffee_engine::provider::Attachment> = attachments
         .unwrap_or_default()
         .into_iter()
-        .map(|a| cowry_engine::provider::Attachment {
+        .map(|a| cwoffee_engine::provider::Attachment {
             mime: a.mime,
             data_b64: a.data_b64,
             name: a.name,
@@ -127,7 +132,7 @@ pub fn set_workspace(state: tauri::State<'_, AppState>, path: String) -> Result<
     if path.trim().is_empty() {
         return Err("empty workspace path".into());
     }
-    state.host.send(cowry_engine::HostCmd::SetWorkspace { path });
+    state.host.send(cwoffee_engine::HostCmd::SetWorkspace { path });
     Ok(())
 }
 
@@ -149,7 +154,7 @@ pub fn respond_approval(
     let reply = state.pending_approvals.lock().unwrap().remove(&id);
     match reply {
         Some(r) => {
-            eprintln!("[cowry] approval {id} answered {answer:?}");
+            eprintln!("[cwoffee] approval {id} answered {answer:?}");
             r.send(answer).map_err(|_| "turn already ended".to_string())
         }
         // Previously silent. A click that reaches this path with no parked sender
@@ -157,7 +162,7 @@ pub fn respond_approval(
         // timeout - which reads to the user as "I allowed it and it ran anyway".
         None => {
             eprintln!(
-                "[cowry] approval {id} answer dropped: no pending request with that id                  (already answered, timed out, or the turn ended)"
+                "[cwoffee] approval {id} answer dropped: no pending request with that id                  (already answered, timed out, or the turn ended)"
             );
             Err(format!("no pending approval with id {id}"))
         }
@@ -215,7 +220,7 @@ pub fn open_file(
 ) -> Result<String, String> {
     use tauri_plugin_opener::OpenerExt;
     let ws = state.host.state().workspace;
-    let full = cowry_engine::tools::path::confine(std::path::Path::new(&ws), &path)
+    let full = cwoffee_engine::tools::path::confine(std::path::Path::new(&ws), &path)
         .map_err(|e| e.to_string())?;
     let md = std::fs::metadata(&full).map_err(|_| format!("{path} no longer exists"))?;
     if !md.is_file() {
@@ -252,7 +257,7 @@ pub fn session_messages(
 /// One page of transcript history, newest window returned in reading order.
 #[derive(serde::Serialize)]
 pub struct MessagePage {
-    pub messages: Vec<cowry_engine::store::StoredMessage>,
+    pub messages: Vec<cwoffee_engine::store::StoredMessage>,
     pub has_older: bool,
 }
 
@@ -289,7 +294,7 @@ pub async fn list_models(state: tauri::State<'_, AppState>) -> Result<Vec<String
         .provider()
         .list_models()
         .await
-        .inspect_err(|e| eprintln!("[cowry] list_models: {e}"))
+        .inspect_err(|e| eprintln!("[cwoffee] list_models: {e}"))
         .map(Ok)
         .unwrap_or_else(|_| Ok(Vec::new()))
 }
@@ -350,10 +355,15 @@ pub fn clear_session(state: tauri::State<'_, AppState>) {
 /// exactly where the "blank window, no error" class of bug hides.
 #[tauri::command]
 pub fn boot_log(msg: String) {
-    eprintln!("[cowry/page] {msg}");
+    eprintln!("[cwoffee/page] {msg}");
 }
 
 /// Which GPU this process actually ended up on (PLAN.md §12 check).
+#[tauri::command]
+pub fn migration_notes(state: State<'_, AppState>) -> Vec<String> {
+    state.migration_notes.clone()
+}
+
 #[tauri::command]
 pub fn gpu_report() -> gpu::GpuReport {
     gpu::report()
@@ -392,7 +402,7 @@ pub fn render_report(state: tauri::State<'_, AppState>, report: RenderReport) {
         && report.body_bg != "rgba(0, 0, 0, 0)"
         && report.body_bg != "rgb(0, 0, 0)";
     eprintln!(
-        "[cowry] render {}: titlebar={} sidebar={} footer={} stream={} empty={} overlay={} text={} bg={} dpr={:.2}",
+        "[cwoffee] render {}: titlebar={} sidebar={} footer={} stream={} empty={} overlay={} text={} bg={} dpr={:.2}",
         if sane { "OK" } else { "SUSPECT" },
         report.titlebar,
         report.sidebar,

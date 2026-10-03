@@ -17,13 +17,13 @@ before anything touches EGL; running `tauri dev` by hand gets an NVIDIA context.
 ## Release
 
 ```bash
-cargo build --release -p cowry-app -p cowry-tui
-./target/release/cowry-app
-./target/release/cowry --url http://127.0.0.1:8090/v1
+cargo build --release -p cwoffee-app -p cwoffee-tui
+./target/release/cwoffee-app
+./target/release/cwoffee --url http://127.0.0.1:8090/v1
 
 # package
 cd ui && npx tauri build --bundles rpm
-# -> target/release/bundle/rpm/cowry-0.0.0-1.x86_64.rpm
+# -> target/release/bundle/rpm/cwoffee-0.0.0-1.x86_64.rpm
 ```
 
 `--bundles`, not `--bundle`. `dpkg-deb` and `appimagetool` are not installed here,
@@ -57,9 +57,9 @@ measurement:
 
 ```bash
 # must print nothing
-grep -c 'rustc-cfg=dev' $(ls -dt target/release/build/cowry-app-*/ | head -1)/output
+grep -c 'rustc-cfg=dev' $(ls -dt target/release/build/cwoffee-app-*/ | head -1)/output
 # must list the hashed filenames from ui/dist/assets
-strings target/release/cowry-app | grep -oE 'index-[A-Za-z0-9_-]{8}\.(js|css)' | sort -u
+strings target/release/cwoffee-app | grep -oE 'index-[A-Za-z0-9_-]{8}\.(js|css)' | sort -u
 ```
 
 ## Trap 2 — a blank webview is invisible from the outside
@@ -77,18 +77,18 @@ Two mechanisms make it visible, and both are now in the code:
 
 ```bash
 # healthy production run, no vite needed
-[cowry] webview attached: page JS is running
-[cowry/page] boot: main.ts executing
-[cowry/page] boot: mount() returned
-[cowry] render OK: titlebar=true sidebar=true footer=true stream=true overlay=false text=1280 bg=rgb(253, 252, 249) dpr=2.00
+[cwoffee] webview attached: page JS is running
+[cwoffee/page] boot: main.ts executing
+[cwoffee/page] boot: mount() returned
+[cwoffee] render OK: titlebar=true sidebar=true footer=true stream=true overlay=false text=1280 bg=rgb(253, 252, 249) dpr=2.00
 ```
 
 ## Trap 3 — embedded assets can go stale
 
 Assets are embedded by `build.rs` (`tauri_build::build()`). After a `vite build`,
-a `cargo build -p cowry-app` can finish in 0.25s and keep the previous asset set.
+a `cargo build -p cwoffee-app` can finish in 0.25s and keep the previous asset set.
 If embedded assets look stale: `touch crates/tauri-app/build.rs && cargo build -p
-cowry-app`. Also check `ls ui/dist` — `index.html` has been found missing while
+cwoffee-app`. Also check `ls ui/dist` — `index.html` has been found missing while
 `dist/assets/` was present.
 
 ## Trap 4 — Tauri argument casing
@@ -117,10 +117,10 @@ let (mut host, adopted) = tauri::async_runtime::block_on(async { ... });
 ## Trap 6 — killing test processes
 
 ```bash
-pkill -f 'target/debug/cowry-app'   # matches this shell's own cmdline; kills the shell (143)
+pkill -f 'target/debug/cwoffee-app'   # matches this shell's own cmdline; kills the shell (143)
 ```
 
-Kill by exact name (`pkill -x cowry-app`) or by PID from `ps`. Likewise
+Kill by exact name (`pkill -x cwoffee-app`) or by PID from `ps`. Likewise
 `pkill -f mock_llm.py`.
 
 ## Trap 7 — memory probes
@@ -135,8 +135,8 @@ For anything that might allocate, use a PSS watchdog that SIGKILLs on threshold.
 VmSize at small PSS, and the limit produces allocation failures that are not real.
 
 ```bash
-./scripts/memory.sh cowry-app 400
-./scripts/gpu-check.sh cowry-app
+./scripts/memory.sh cwoffee-app 400
+./scripts/gpu-check.sh cwoffee-app
 ./scripts/sandbox-probe.sh
 ```
 
@@ -145,11 +145,56 @@ VmSize at small PSS, and the limit produces allocation failures that are not rea
 A pty with no winsize reports `0x0`. The TUI refuses it rather than rendering:
 
 ```
-Error: terminal reports 0x0 - Cowry needs a real terminal size.
+Error: terminal reports 0x0 - Cwoffee needs a real terminal size.
 ```
 
 This is not cosmetic. An unbounded wrap loop at width 0 once grew the process to
 8.7 GB PSS and pushed this box into swap while the inference server was running.
+
+## Trap 9 — moving or renaming the project directory breaks the Tauri build
+
+Tauri's build script records absolute paths in its cached output. After
+`mv ~/Projects/cowry ~/Projects/cwoffee`, the build fails with:
+
+```text
+failed to read plugin permissions: failed to read file
+'/home/dandandelion/Projects/cowry/target/release/build/tauri-*/out/permissions/...'
+```
+
+The path in the error is the *old* one, which makes it look like a stray
+reference in the source. It is not; it is a stale artifact.
+
+```bash
+cargo clean --release -p tauri -p tauri-build -p cwoffee-app
+cargo clean -p tauri -p tauri-build -p cwoffee-app   # debug profile, separately
+```
+
+`cargo clean -p` is per-profile: without `--release` it leaves the release
+artifacts stale, so the debug build succeeds and the release build still fails.
+
+## Trap 10 — a top-level config key written after a `[table]` is silently ignored
+
+TOML assigns a bare key to whichever table is currently open. This parses fine
+and does nothing:
+
+```toml
+[provider]
+base_url = "http://127.0.0.1:8090/v1"
+workspace = "~/somewhere"      # parsed as provider.workspace -> ignored
+```
+
+The shipped example config had exactly this shape, so `workspace`, `mode` and
+`approval_timeout_secs` in a user's file had never been read. Every config
+struct now uses `#[serde(deny_unknown_fields)]`, and the error carries a hint:
+
+```text
+unknown field `workspace`, expected one of `kind`, `base_url`, `model`, `api_key`
+
+  hint: `workspace` is a top-level key. In TOML it belongs to whichever
+  [table] is open, so it must appear before the first [table] header.
+```
+
+Top-level keys go before the first `[table]` header.
 
 ## Packaging
 
@@ -165,8 +210,8 @@ The AppImage needs FUSE to mount itself. On a machine without it (or inside a
 container) run:
 
 ```bash
-./cowry_0.0.0_amd64.AppImage --appimage-extract-and-run
+./cwoffee_0.0.0_amd64.AppImage --appimage-extract-and-run
 ```
 
 Verified: the AppImage renders with no dev server, and the GPU pinning survives
-its `AppRun` wrapper — `cowry-app` still holds `renderD128` only.
+its `AppRun` wrapper — `cwoffee-app` still holds `renderD128` only.

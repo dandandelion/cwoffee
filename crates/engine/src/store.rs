@@ -964,7 +964,7 @@ mod tests {
         // Rows written before the fix carry the block in `content`. Re-open them
         // through the migrator and check the transcript text is clean while the
         // question survives.
-        let dir = std::env::temp_dir().join(format!("cowry_v6_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cwoffee_v6_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.db");
         {
@@ -1290,12 +1290,12 @@ mod tests {
     fn file_store_persists_across_reopen() {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "cowry_store_test_{}_{}",
+            "cwoffee_store_test_{}_{}",
             std::process::id(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cowry.db");
+        let path = dir.join("cwoffee.db");
 
         {
             let s = Store::open(&path).unwrap();

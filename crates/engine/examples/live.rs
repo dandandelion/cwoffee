@@ -1,12 +1,12 @@
 //! Live smoke test against a real llama.cpp server.
 //!
-//!   cargo run -p cowry-engine --example live -- http://127.0.0.1:8090/v1
+//!   cargo run -p cwoffee-engine --example live -- http://127.0.0.1:8090/v1
 //!
 //! Unit tests prove the parser; this proves the parser against the actual
 //! bytes on the wire, including prefix-cache behaviour across two turns.
 
-use cowry_engine::Provider;
-use cowry_engine::provider::{
+use cwoffee_engine::Provider;
+use cwoffee_engine::provider::{
     ChatRequest, Delta, Message, Reasoning, ToolDef,
     openai::{Flavor, OpenAiProvider},
 };
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- turn 1: plain answer, thinking on -------------------------------
     let mut req = ChatRequest::new("qwen3.8-flash-next-iq3_s", vec![
-        Message::system("You are Cowry, a concise local assistant."),
+        Message::system("You are Cwoffee, a concise local assistant."),
         Message::user("Name three JSON parsers, one line each."),
     ]);
     req.tools = tools.clone();
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run(
     p: &OpenAiProvider,
     req: &ChatRequest,
-) -> Result<cowry_engine::TurnTelemetry, Box<dyn std::error::Error>> {
+) -> Result<cwoffee_engine::TurnTelemetry, Box<dyn std::error::Error>> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     // No spawn: the provider is borrowed, and `join!` polls both futures on this
@@ -82,7 +82,7 @@ async fn run(
 
     let mut text = String::new();
     let mut reasoning_len = 0usize;
-    let mut tel = cowry_engine::TurnTelemetry::default();
+    let mut tel = cwoffee_engine::TurnTelemetry::default();
 
     let recv_fut = async {
         while let Some(d) = rx.recv().await {

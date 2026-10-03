@@ -1,4 +1,4 @@
-# Environment setup — Cowry
+# Environment setup — Cwoffee
 
 Status as of 2026-10-01. Machine: Fedora 44 Workstation, x86_64, 20 cores, 62 GB RAM.
 
@@ -45,7 +45,7 @@ Finished dev profile in 18.10s        EXIT=0
 
 **The webview toolchain works.** M0 is unblocked.
 
-## ⚠️ GPU policy: pin Cowry to the Intel iGPU
+## ⚠️ GPU policy: pin Cwoffee to the Intel iGPU
 
 ```
 renderD128  pci=0000:00:02.0  i915    <- Intel Iris Xe
@@ -62,7 +62,7 @@ export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
 export __GLX_VENDOR_LIBRARY_NAME=mesa
 ```
 
-Verify with `./scripts/gpu-check.sh cowry` — cowry should hold **renderD128 only**.
+Verify with `./scripts/gpu-check.sh cwoffee` — cwoffee should hold **renderD128 only**.
 
 Full reasoning, the three places to set it, and fallbacks: **PLAN.md §12**.
 
@@ -95,10 +95,10 @@ Verified: streaming tool calls ✅ · `reasoning_content` deltas ✅ · `chat_te
 ## Config location
 
 ```
-~/.config/cowry/config.toml      # providers, models, approval defaults
-~/.local/share/cowry/cowry.db    # SQLite: sessions, messages, FTS, rendered HTML
+~/.config/cwoffee/config.toml      # providers, models, approval defaults
+~/.local/share/cwoffee/cwoffee.db    # SQLite: sessions, messages, FTS, rendered HTML
 ```
-See `config/cowry.toml.example`.
+See `config/cwoffee.toml.example`.
 
 ## Build, run, and the traps
 

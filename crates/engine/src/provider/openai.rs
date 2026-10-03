@@ -56,7 +56,7 @@ impl OpenAiProvider {
             label: label.into(),
             flavor,
             base_url: base,
-            api_key: std::env::var("COWRY_API_KEY").ok().filter(|s| !s.is_empty()),
+            api_key: std::env::var("CWOFFEE_API_KEY").ok().filter(|s| !s.is_empty()),
             http: reqwest::Client::builder()
                 .tcp_nodelay(true)
                 .pool_idle_timeout(std::time::Duration::from_secs(90))

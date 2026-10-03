@@ -4,28 +4,28 @@ import tailwindcss from '@tailwindcss/vite'
 
 // M0 diagnostic: log every module the webview actually requests.
 // Without this you cannot tell "the page is blank" from "the page requested
-// main.ts and then threw". Set COWRY_REQ_LOG=0 to silence.
+// main.ts and then threw". Set CWOFFEE_REQ_LOG=0 to silence.
 const reqLog = {
-  name: 'cowry-req-log',
+  name: 'cwoffee-req-log',
   configureServer(server) {
     server.middlewares.use((req, res, next) => {
       const url = req.url || ''
 
       // Dev-only escape hatch: the webview's console is not reachable from the
       // shell, so the UI POSTs its errors here and they land in the dev log.
-      if (url.startsWith('/__cowry_log')) {
+      if (url.startsWith('/__cwoffee_log')) {
         let body = ''
         req.on('data', (c) => (body += c))
         req.on('end', () => {
-          process.stdout.write(`[cowry/page] ${body}\n`)
+          process.stdout.write(`[cwoffee/page] ${body}\n`)
           res.statusCode = 204
           res.end()
         })
         return
       }
 
-      if (process.env.COWRY_REQ_LOG !== '0' && !url.startsWith('/@vite') && !url.includes('.map')) {
-        process.stdout.write(`[cowry/vite] -> ${url}\n`)
+      if (process.env.CWOFFEE_REQ_LOG !== '0' && !url.startsWith('/@vite') && !url.includes('.map')) {
+        process.stdout.write(`[cwoffee/vite] -> ${url}\n`)
       }
       next()
     })

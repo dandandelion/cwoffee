@@ -1,4 +1,4 @@
-//! Cowry TUI — a thin skin over `cowry_engine::host::SessionHost`.
+//! Cwoffee TUI — a thin skin over `cwoffee_engine::host::SessionHost`.
 //!
 //! Everything here is rendering and keybinding. There is no agent logic, no
 //! provider logic, no persistence logic in this file: if a behaviour is wrong,
@@ -21,14 +21,14 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use cowry_engine::approval::{ApprovalAnswer, ApprovalMode, ApprovalRequest};
-use cowry_engine::event::{EngineEvent, ExecStream, FinishReason};
-use cowry_engine::host::{default_env_block, HostCmd, HostConfig, SessionHost};
-use cowry_engine::provider::Reasoning;
-use cowry_engine::store::Store;
-use cowry_engine::telemetry::{Rolling, TurnTelemetry};
-use cowry_engine::tools::Registry;
-use cowry_engine::Config;
+use cwoffee_engine::approval::{ApprovalAnswer, ApprovalMode, ApprovalRequest};
+use cwoffee_engine::event::{EngineEvent, ExecStream, FinishReason};
+use cwoffee_engine::host::{default_env_block, HostCmd, HostConfig, SessionHost};
+use cwoffee_engine::provider::Reasoning;
+use cwoffee_engine::store::Store;
+use cwoffee_engine::telemetry::{Rolling, TurnTelemetry};
+use cwoffee_engine::tools::Registry;
+use cwoffee_engine::Config;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -253,8 +253,8 @@ fn parse_args() -> Result<Args> {
             "--context" => a.context = Some(next(&mut i)?.parse()?),
             "--help" | "-h" => {
                 println!(
-                    "cowry [options]\n  \
-                     --config PATH      config file (default ~/.config/cowry/config.toml)\n  \
+                    "cwoffee [options]\n  \
+                     --config PATH      config file (default ~/.config/cwoffee/config.toml)\n  \
                      --url URL          API root (default http://127.0.0.1:8090/v1)\n  \
                      --model NAME       model id sent to the API\n  \
                      -C, --workspace D  workspace directory (default cwd)\n  \
@@ -281,12 +281,16 @@ fn dirs_data_dir() -> PathBuf {
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/share")
         });
-    base.join("cowry")
+    base.join("cwoffee")
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let flags = parse_args()?;
+
+    for note in cwoffee_engine::legacy::migrate_legacy_dirs() {
+        eprintln!("[cwoffee] {note}");
+    }
 
     // precedence: CLI flags > environment > config file > defaults
     let (mut appcfg, loaded) = Config::load(flags.config.as_deref())
@@ -325,7 +329,7 @@ async fn main() -> Result<()> {
     }
     let store = Arc::new(Store::open(&flags.db)?);
 
-    let provider: std::sync::Arc<dyn cowry_engine::provider::Provider> = appcfg.build_provider()
+    let provider: std::sync::Arc<dyn cwoffee_engine::provider::Provider> = appcfg.build_provider()
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let model = if appcfg.provider.model.is_empty() {
@@ -354,7 +358,7 @@ async fn main() -> Result<()> {
     // No config file means no model id; ask the endpoint rather than sending an
     // empty one and taking a 400.
     if let Some(m) = host.adopt_first_model().await {
-        eprintln!("cowry: no model configured, using the endpoint's first: {m}");
+        eprintln!("cwoffee: no model configured, using the endpoint's first: {m}");
     }
 
     // Terminal setup is wrapped so a panic still leaves the shell usable.
@@ -367,7 +371,7 @@ async fn main() -> Result<()> {
         if sz.width == 0 || sz.height == 0 {
             ratatui::restore();
             anyhow::bail!(
-                "terminal reports {}x{} - Cowry needs a real terminal size. \
+                "terminal reports {}x{} - Cwoffee needs a real terminal size. \
                  If you are driving it from a script or pty, set winsize first.",
                 sz.width,
                 sz.height
@@ -535,17 +539,17 @@ fn handle_key(k: KeyEvent, app: &mut App, host: &SessionHost) {
 // render
 // ---------------------------------------------------------------------------
 
-/// Dev-only loop trace, gated on COWRY_DEBUG. Used to find the spin that
+/// Dev-only loop trace, gated on CWOFFEE_DEBUG. Used to find the spin that
 /// preceded the memory blowup: it records what the loop sees each iteration.
 fn dbg_tick(app: &App, terminal: &DefaultTerminal) {
-    if std::env::var_os("COWRY_DEBUG").is_none() {
+    if std::env::var_os("CWOFFEE_DEBUG").is_none() {
         return;
     }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/cowry_debug.log")
+        .open("/tmp/cwoffee_debug.log")
     {
         let _ = writeln!(
             f,
@@ -593,7 +597,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Reasoning::XHigh => "xhigh",
     };
     let line = Line::from(vec![
-        Span::styled(" Cowry ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" Cwoffee ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::raw(format!("  {}  ·  session {}  ·  thinking {}  ·  ", app.model, app.session_id, thinking)),
         Span::styled(format!("approvals: {mode}"), Style::default().fg(Color::Yellow)),
         Span::raw("  (ctrl-a mode · ctrl-r thinking)"),
@@ -617,7 +621,7 @@ fn flatten(app: &App, width: usize) -> Vec<Line<'static>> {
                 push_wrapped(&mut out, t, width, "  ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
             }
             Item::Assistant(t) => {
-                push_wrapped(&mut out, t, width, "cowry ▸ ", Style::default().fg(Color::Green));
+                push_wrapped(&mut out, t, width, "cwoffee ▸ ", Style::default().fg(Color::Green));
             }
             Item::Tool { name, args, output, running, ok, exit } => {
                 let status = if *running { "running…" } else if *ok { "ok" } else { "failed" };
@@ -873,7 +877,7 @@ mod tests {
     fn prefix_nearly_as_wide_as_the_pane_is_safe() {
         let mut out: Vec<Line<'static>> = Vec::new();
         for width in [0usize, 1, 4, 8, 9, 20] {
-            push_wrapped(&mut out, "some text that needs wrapping here", width, "cowry > ", Style::default());
+            push_wrapped(&mut out, "some text that needs wrapping here", width, "cwoffee > ", Style::default());
             assert!(out.len() < 500, "width {width} produced {} lines", out.len());
             out.clear();
         }

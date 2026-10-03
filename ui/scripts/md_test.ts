@@ -19,6 +19,19 @@ function ok(name: string, cond: boolean, detail = '') {
     console.log(`FAIL ${name} ${detail}`)
   }
 }
+/** Substring check: for output where surrounding chrome is not the point. */
+function has(name: string, got: string, needle: string) {
+  if (!got.includes(needle)) {
+    failed++
+    console.log(`FAIL ${name}\n  want substring: ${JSON.stringify(needle)}\n  got: ${JSON.stringify(got)}`)
+  }
+}
+function lacks(name: string, got: string, needle: string) {
+  if (got.includes(needle)) {
+    failed++
+    console.log(`FAIL ${name}\n  must not contain: ${JSON.stringify(needle)}\n  got: ${JSON.stringify(got)}`)
+  }
+}
 
 // ---- escaping: the security boundary -------------------------------------
 
@@ -79,17 +92,36 @@ eq(
   renderMarkdown('`**not bold**`'),
   '<p><code>**not bold**</code></p>',
 )
-eq(
+has(
   'fenced block keeps content verbatim and escapes it',
   renderMarkdown('```\nlet x = 1 < 2;\n```'),
   '<pre><code>let x = 1 &lt; 2;</code></pre>',
 )
-eq(
+has(
+  'fenced block gets a copy action',
+  renderMarkdown('```\nlet x = 1;\n```'),
+  'data-act="copy"',
+)
+has('non-previewable languages get no preview action', renderMarkdown('```c\nint x;\n```'), 'data-act="copy"')
+ok('a C block is not offered a preview it cannot honour',
+  !renderMarkdown('```c\nint x;\n```').includes('data-act="preview"'))
+has('html block gets a preview action', renderMarkdown('```html\n<b>x</b>\n```'), 'data-act="preview"')
+has('svg block gets an inline toggle', renderMarkdown('```svg\n<svg/>\n```'), 'data-act="inline"')
+has('svg block gets a panel preview', renderMarkdown('```svg\n<svg/>\n```'), 'data-act="preview"')
+has('html block is labelled', renderMarkdown('```html\n<b>x</b>\n```'), '<span class="code-lang">html</span>')
+has(
+  'code source stays in the code element for copy to read',
+  renderMarkdown('```js\nalert(1)\n```'),
+  '<pre><code class="lang-js">alert(1)</code></pre>',
+)
+lacks('a script tag inside a code fence stays escaped',
+  renderMarkdown('```html\n<script>alert(1)</script>\n```'), '<script>')
+has(
   'fenced block with language',
   renderMarkdown('```rust\nfn main() {}\n```'),
   '<pre><code class="lang-rust">fn main() {}</code></pre>',
 )
-eq(
+has(
   'unterminated fence still renders as code',
   renderMarkdown('```\nstill code'),
   '<pre><code>still code</code></pre>',

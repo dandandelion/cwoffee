@@ -251,14 +251,14 @@ impl SessionHost {
                         // The sandbox confines writes to this directory, so an
                         // unreadable one is a configuration mistake worth saying
                         // out loud rather than discovering on the first exec.
-                        if std::fs::File::create(p.join(".cowry-write-test")).is_err() {
+                        if std::fs::File::create(p.join(".cwoffee-write-test")).is_err() {
                             let _ = ev_tx.send(EngineEvent::Error {
                                 message: format!("workspace {path:?} is not writable"),
                                 fatal: false,
                             });
                             continue;
                         } else {
-                            let _ = std::fs::remove_file(p.join(".cowry-write-test"));
+                            let _ = std::fs::remove_file(p.join(".cwoffee-write-test"));
                         }
                         agent.set_workspace(p.clone());
                         // The env block rides on the newest user message only, so
@@ -700,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_switch_validates_the_path() {
-        let base = std::env::temp_dir().join(format!("cowry_ws_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("cwoffee_ws_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
 

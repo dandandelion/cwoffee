@@ -5,11 +5,11 @@
 //!   CLI flags  >  environment variables  >  config file  >  defaults
 //!
 //! Env vars win over the file because the dev scripts and container runs set
-//! them, and a stray `~/.config/cowry/config.toml` should not silently override
-//! an explicit `COWRY_URL`.
+//! them, and a stray `~/.config/cwoffee/config.toml` should not silently override
+//! an explicit `CWOFFEE_URL`.
 //!
 //! API keys are never stored inline in the file by default. `api_key =
-//! "env:COWRY_KEY"` means "read this variable", so a pasted config does not
+//! "env:CWOFFEE_KEY"` means "read this variable", so a pasted config does not
 //! become a leaked secret on disk.
 
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ use crate::provider::Provider;
 use crate::tools::web::SearchBackend;
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub provider: ProviderCfg,
@@ -55,6 +56,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderCfg {
     /// llama.cpp | openai | anthropic
     #[serde(default = "default_kind")]
@@ -84,6 +86,7 @@ fn default_kind() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextCfg {
     /// Soft budget before compaction. Prefill on a local quantized model is
     /// 20-120 tok/s, so a long transcript is a latency problem, not a
@@ -111,6 +114,7 @@ fn default_max_output() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchCfg {
     /// duckduckgo | searxng
     #[serde(default = "default_backend")]
@@ -139,6 +143,7 @@ fn default_max_results() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxCfg {
     /// Disabling the sandbox is supported for debugging only; the denylist is a
     /// guardrail, not the security boundary, so turning it off changes the
@@ -165,15 +170,48 @@ pub fn default_exec_timeout() -> u64 {
     120
 }
 
+/// Read `new`, falling back to the pre-rebrand name `old`.
+fn env2(new: &str, old: &str) -> Option<String> {
+    env(new).or_else(|| env(old))
+}
+
+/// TOML assigns a bare key to whichever `[table]` is currently open, so a key
+/// written after `[provider]` silently becomes `provider.workspace` and does
+/// nothing. The example config shipped with exactly that mistake, which is how
+/// a user ended up with a workspace setting the app never read. Unknown fields
+/// are now rejected; this turns the common case into an actionable message.
+fn table_hint(err: &toml::de::Error) -> String {
+    let msg = err.message().to_string();
+    let top_level = [
+        "workspace",
+        "mode",
+        "approval_timeout_secs",
+        "theme",
+        "provider",
+        "context",
+        "search",
+        "sandbox",
+    ];
+    for key in top_level {
+        if msg.contains(key) {
+            return format!(
+                "\n  hint: `{key}` is a top-level key. In TOML it belongs to whichever \
+                 [table] is open, so it must appear before the first [table] header."
+            );
+        }
+    }
+    String::new()
+}
+
 impl Config {
-    /// `~/.config/cowry/config.toml` (or `$XDG_CONFIG_HOME`).
+    /// `~/.config/cwoffee/config.toml` (or `$XDG_CONFIG_HOME`).
     pub fn default_path() -> PathBuf {
         let base = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "~".into())).join(".config"));
-        base.join("cowry").join("config.toml")
+        base.join("cwoffee").join("config.toml")
     }
 
     /// Load from `path` if it exists. A missing file is not an error; a
@@ -187,7 +225,7 @@ impl Config {
         let text = std::fs::read_to_string(&p)
             .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
         let mut cfg: Config = toml::from_str(&text)
-            .map_err(|e| format!("malformed {}: {e}", p.display()))?;
+            .map_err(|e| format!("malformed {}: {}{}", p.display(), e, table_hint(&e)))?;
         if let Some(w) = cfg.workspace.take() {
             cfg.workspace = Some(Self::expand_tilde(&w));
         }
@@ -197,31 +235,34 @@ impl Config {
     /// Environment overrides. Kept explicit rather than `figment`-style magic so
     /// the set of knobs is greppable.
     pub fn apply_env(&mut self) {
-        if let Some(v) = env("COWRY_URL") {
+        // The pre-rebrand names keep working. Someone with COWRY_URL in a shell
+        // profile or a systemd unit should get a working app, not a silent
+        // fallback to defaults.
+        if let Some(v) = env2("CWOFFEE_URL", "COWRY_URL") {
             self.provider.base_url = v;
         }
-        if let Some(v) = env("COWRY_MODEL") {
+        if let Some(v) = env2("CWOFFEE_MODEL", "COWRY_MODEL") {
             self.provider.model = v;
         }
-        if let Some(v) = env("COWRY_KEY") {
+        if let Some(v) = env2("CWOFFEE_KEY", "COWRY_KEY") {
             self.provider.api_key = Some(v);
         }
-        if let Some(v) = env("COWRY_WORKSPACE") {
+        if let Some(v) = env2("CWOFFEE_WORKSPACE", "COWRY_WORKSPACE") {
             self.workspace = Some(Self::expand_tilde(&v));
         }
-        if let Some(v) = env("COWRY_MODE") {
+        if let Some(v) = env2("CWOFFEE_MODE", "COWRY_MODE") {
             self.mode = Some(v);
         }
-        if let Some(v) = env("COWRY_CONTEXT") {
+        if let Some(v) = env2("CWOFFEE_CONTEXT", "COWRY_CONTEXT") {
             if let Ok(n) = v.parse() {
                 self.context.target_tokens = n;
             }
         }
-        if let Some(v) = env("COWRY_SEARXNG_URL") {
+        if let Some(v) = env2("CWOFFEE_SEARXNG_URL", "COWRY_SEARXNG_URL") {
             self.search.searxng_url = Some(v);
             self.search.backend = "searxng".into();
         }
-        if let Some(v) = env("COWRY_APPROVAL_TIMEOUT_SECS") {
+        if let Some(v) = env2("CWOFFEE_APPROVAL_TIMEOUT_SECS", "COWRY_APPROVAL_TIMEOUT_SECS") {
             if let Ok(n) = v.parse() {
                 self.approval_timeout_secs = Some(n);
             }
@@ -318,6 +359,50 @@ fn env(k: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The trap the shipped example config fell into: a top-level key written
+    /// after `[provider]` is parsed as `provider.workspace` and silently does
+    /// nothing. It must be a startup error with a hint, not a shrug.
+    #[test]
+    fn a_top_level_key_after_a_table_header_is_refused_not_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "cwoffee_misplaced_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[provider]
+base_url = "http://127.0.0.1:9/v1"
+workspace = "~/somewhere"
+mode = "auto"
+"#,
+        )
+        .unwrap();
+
+        let err = Config::load(Some(&path)).unwrap_err();
+        assert!(err.contains("workspace"), "unhelpful error: {err}");
+        assert!(err.contains("top-level key"), "no hint: {err}");
+
+        // And the same file with the keys in the right place works.
+        std::fs::write(
+            &path,
+            r#"workspace = "~/somewhere"
+mode = "auto"
+
+[provider]
+base_url = "http://127.0.0.1:9/v1"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = Config::load(Some(&path)).unwrap();
+        // load() also expands ~, which the misplaced version never reached.
+        let ws = cfg.workspace.expect("workspace was dropped");
+        assert!(ws.ends_with("/somewhere") && !ws.starts_with('~'), "not expanded: {ws}");
+        assert_eq!(cfg.mode.as_deref(), Some("auto"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn tilde_in_workspace_is_expanded() {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -343,7 +428,7 @@ mod tests {
 
     #[test]
     fn parses_the_example_file() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/cowry.toml.example");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/cwoffee.toml.example");
         let text = std::fs::read_to_string(path).expect("example config present");
         // The example documents keys the loader does not model yet; unknown
         // fields must not be fatal or every doc update would break startup.
@@ -381,12 +466,12 @@ searxng_url = "http://127.0.0.1:8888/search"
 
     #[test]
     fn missing_file_is_not_an_error_but_malformed_is() {
-        let (cfg, loaded) = Config::load(Some(std::path::Path::new("/nonexistent/cowry.toml")))
+        let (cfg, loaded) = Config::load(Some(std::path::Path::new("/nonexistent/cwoffee.toml")))
             .expect("missing file is fine");
         assert!(loaded.is_none());
         assert_eq!(cfg.provider.base_url, "http://127.0.0.1:8090/v1");
 
-        let dir = std::env::temp_dir().join(format!("cowry_cfg_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cwoffee_cfg_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bad = dir.join("bad.toml");
         std::fs::write(&bad, "this is = = not toml").unwrap();
@@ -400,11 +485,11 @@ searxng_url = "http://127.0.0.1:8888/search"
         let mut c = Config::default();
         c.provider.base_url = "http://from-file/v1".into();
         unsafe {
-            std::env::set_var("COWRY_URL", "http://from-env/v1");
+            std::env::set_var("CWOFFEE_URL", "http://from-env/v1");
         }
         c.apply_env();
         unsafe {
-            std::env::remove_var("COWRY_URL");
+            std::env::remove_var("CWOFFEE_URL");
         }
         assert_eq!(c.provider.base_url, "http://from-env/v1");
     }
@@ -413,15 +498,15 @@ searxng_url = "http://127.0.0.1:8888/search"
     fn api_key_env_indirection_does_not_store_the_secret() {
         let c: Config = toml::from_str(
             r#"[provider]
-api_key = "env:COWRY_TEST_KEY""#,
+api_key = "env:CWOFFEE_TEST_KEY""#,
         )
         .expect("parses");
         unsafe {
-            std::env::set_var("COWRY_TEST_KEY", "sk-abc");
+            std::env::set_var("CWOFFEE_TEST_KEY", "sk-abc");
         }
         assert_eq!(c.api_key().as_deref(), Some("sk-abc"));
         unsafe {
-            std::env::remove_var("COWRY_TEST_KEY");
+            std::env::remove_var("CWOFFEE_TEST_KEY");
         }
 
         let lit: Config = toml::from_str(

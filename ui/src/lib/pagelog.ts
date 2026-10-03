@@ -16,7 +16,7 @@ let tauriUsable: boolean | null = null
 export function pageLog(msg: string) {
   try {
     if (import.meta.env.DEV) {
-      void fetch('/__cowry_log', {
+      void fetch('/__cwoffee_log', {
         method: 'POST',
         body: msg,
         headers: { 'content-type': 'text/plain' },

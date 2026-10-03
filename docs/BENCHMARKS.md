@@ -9,17 +9,17 @@ the commit that changed it.
 Target ~250–350 MB PSS, hard CI ceiling 400 MB, overall envelope ~500 MB.
 
 **PSS, not RSS.** RSS double-counts shared pages: Firefox measured 97.9 MB RSS
-against 24.3 MB PSS on this box. Gating on RSS would fail Cowry at ~465 MB for a
+against 24.3 MB PSS on this box. Gating on RSS would fail Cwoffee at ~465 MB for a
 process set that really occupies 282 MB.
 
-### Desktop app (`cowry-app`), release build, embedded assets
+### Desktop app (`cwoffee-app`), release build, embedded assets
 
 Measured twice on the same build, because the total moves with which WebKit
 helpers happen to be alive:
 
 | Process | sample A | sample B |
 |---|---|---|
-| `cowry-app` (engine + Tauri + GTK) | 87.6 MB | 106.7 MB |
+| `cwoffee-app` (engine + Tauri + GTK) | 87.6 MB | 106.7 MB |
 | `WebKitWebProcess` | 114.7 MB | 129.5 MB |
 | `WebKitNetworkProcess` | 27.5 MB | 38.1 MB |
 | `glycin-svg` + 2 × `bwrap` | — | 8.0 MB |
@@ -27,7 +27,7 @@ helpers happen to be alive:
 
 Quote **~230–285 MB PSS** rather than a single figure. The spread is mostly
 WebKit's, and the `glycin-svg` / `bwrap` entries in the second sample are not
-Cowry's: WebKitGTK sandboxes its own image loaders with bubblewrap. They are real
+Cwoffee's: WebKitGTK sandboxes its own image loaders with bubblewrap. They are real
 memory and belong in the number, but they are the webview's cost, not the
 engine's.
 
@@ -37,7 +37,7 @@ gate.
 Debug build + vite dev server measures ~290 MB PSS. That is the number to compare
 against when developing, not the shipping number.
 
-### TUI (`cowry`), release build
+### TUI (`cwoffee`), release build
 
 **7.0 MB PSS** peak over 10 s at idle, measured with a PSS watchdog rather than
 `RLIMIT_AS` (which caps virtual address space, not resident memory, and produces
@@ -50,10 +50,10 @@ the agent costs ~7 MB. Anything that does not need a browser should not carry on
 
 | Binary | Size |
 |---|---|
-| `target/release/cowry` | 7.4 MB |
-| `target/release/cowry-app` | 12.1 MB (includes the embedded frontend) |
-| `bundle/rpm/cowry-0.0.0-1.x86_64.rpm` | 4.79 MiB |
-| `bundle/appimage/cowry_0.0.0_amd64.AppImage` | 112.1 MiB |
+| `target/release/cwoffee` | 7.4 MB |
+| `target/release/cwoffee-app` | 12.1 MB (includes the embedded frontend) |
+| `bundle/rpm/cwoffee-0.0.0-1.x86_64.rpm` | 4.79 MiB |
+| `bundle/appimage/cwoffee_0.0.0_amd64.AppImage` | 112.1 MiB |
 
 The AppImage is **23× the RPM** and that is not a bug: it carries its own GTK /
 WebKitGTK / JavaScriptCore stack so it runs on a machine that has none of them,
@@ -101,25 +101,25 @@ a 0.8 s and a 9 s first token on a long transcript, which is why:
 
 ## GPU
 
-Cowry must render on the Intel iGPU (`renderD128`). The NVIDIA GPU is at ~15993 /
+Cwoffee must render on the Intel iGPU (`renderD128`). The NVIDIA GPU is at ~15993 /
 16384 MiB from local inference and its EGL vendor sorts first by default.
 
-`scripts/gpu-check.sh cowry-app` must show Cowry processes holding `renderD128`
+`scripts/gpu-check.sh cwoffee-app` must show Cwoffee processes holding `renderD128`
 only. Verified for both debug and release builds.
 
 ## How to reproduce
 
 ```bash
 # gates, against a running app
-./scripts/gpu-check.sh cowry-app
-./scripts/memory.sh cowry-app 400      # walks the whole descendant tree
+./scripts/gpu-check.sh cwoffee-app
+./scripts/memory.sh cwoffee-app 400      # walks the whole descendant tree
 
 # streaming + engine path, driven from a script
 VITE_AUTOTURN=1 VITE_AUTOTURN_PROMPT='Say hello in five words.' ./scripts/dev.sh
 
 # live provider smoke test
-cargo run -q -p cowry-engine --example live
-cargo run -q -p cowry-engine --example live_agent -- http://127.0.0.1:8090/v1
+cargo run -q -p cwoffee-engine --example live
+cargo run -q -p cwoffee-engine --example live_agent -- http://127.0.0.1:8090/v1
 
 # sandbox isolation (re-run after any bubblewrap / kernel / distro upgrade)
 ./scripts/sandbox-probe.sh
@@ -156,7 +156,7 @@ does it instead with `zipfile` + `ElementTree` (stdlib only). It will not prove
 Word accepts the file; it does catch the failure that matters, which is a part
 that is not valid XML.
 
-End-to-end with the real model (`cargo run -p cowry-engine --example live_docs_agent`):
+End-to-end with the real model (`cargo run -p cwoffee-engine --example live_docs_agent`):
 
 ```
 tool ▸ write_xlsx   args {"path":"budget.xlsx","sheets":[{"name":"Budget",

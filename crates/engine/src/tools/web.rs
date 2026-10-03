@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use super::{ExecSink, OutputFile, Risk, Tool, ToolCtx, ToolResult};
 use tokio::io::AsyncWriteExt;
 
-const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) Cowry/0.1 (+local agent)";
+const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) Cwoffee/0.1 (+local agent)";
 
 #[derive(Debug)]
 pub enum WebError {
@@ -645,7 +645,7 @@ pub struct WebSearchTool {
 
 impl Default for WebSearchTool {
     fn default() -> Self {
-        let base = std::env::var("COWRY_SEARXNG_URL").ok().filter(|s| !s.is_empty());
+        let base = std::env::var("CWOFFEE_SEARXNG_URL").ok().filter(|s| !s.is_empty());
         Self {
             client: reqwest::Client::builder()
                 .user_agent(UA)
@@ -752,7 +752,7 @@ impl WebSearchTool {
         if !ctype.contains("json") {
             return Err(WebError::Unsupported(format!(
                 "SearXNG at {base} did not return JSON (content-type {ctype:?}); \
-                 enable format=json in settings.yml, or unset COWRY_SEARXNG_URL to \
+                 enable format=json in settings.yml, or unset CWOFFEE_SEARXNG_URL to \
                  fall back to DuckDuckGo"
             )));
         }
@@ -800,7 +800,7 @@ impl WebSearchTool {
             return Err(WebError::Unsupported(
                 "the DuckDuckGo HTML endpoint returned a bot challenge instead of \
                  results (HTTP 202). This is expected for automated traffic and may \
-                 clear on retry. For reliable search, set COWRY_SEARXNG_URL to a \
+                 clear on retry. For reliable search, set CWOFFEE_SEARXNG_URL to a \
                  SearXNG instance (with format=json enabled in settings.yml)."
                     .into(),
             ));

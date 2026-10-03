@@ -10,7 +10,7 @@ members = [
 version = "0.0.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/cowry/cowry"
+repository = "https://github.com/cwoffee/cwoffee"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -18,7 +18,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
-cowry-engine = { path = "crates/engine" }
+cwoffee-engine = { path = "crates/engine" }
 
 # ---- M1 ----
 reqwest = { version = "0.12", default-features = false, features = [

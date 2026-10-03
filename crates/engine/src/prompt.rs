@@ -1,6 +1,6 @@
 //! Append-only prompt construction.
 //!
-//! This is the module that decides whether Cowry feels fast or feels broken on a
+//! This is the module that decides whether Cwoffee feels fast or feels broken on a
 //! local model. Prefill on this box runs at 30–70 tok/s *uncached*; a 4k-token
 //! prompt is a minute of staring at nothing. llama.cpp's prefix cache is the only
 //! reason that is tolerable, and it only hits when the prompt's **leading bytes
@@ -49,7 +49,7 @@ pub struct PromptBuilder {
 
 /// Bump when the system prompt text changes, so cache-miss regressions can be
 /// attributed to a specific change rather than appearing as mysterious slowness.
-pub const SYSTEM_VERSION: &str = "cowry-v1";
+pub const SYSTEM_VERSION: &str = "cwoffee-v1";
 
 /// The stable system prompt. Deliberately contains no clock, no path, no git
 /// state — see the module comment.
@@ -60,7 +60,7 @@ pub fn system_prompt() -> String {
 /// The instructions, kept separate from the version tag so the "no volatile
 /// data" test can assert on the body without tripping on the version digit.
 fn system_body() -> String {
-    r#"You are Cowry, a capable local assistant that works on real files and runs real commands.
+    r#"You are Cwoffee, a capable local assistant that works on real files and runs real commands.
 
 Working style:
 - Be concise. Prefer doing over explaining.

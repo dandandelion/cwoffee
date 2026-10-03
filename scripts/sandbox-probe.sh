@@ -11,7 +11,7 @@
 
 set -uo pipefail
 
-WS="$(mktemp -d /tmp/cowry_probe_ws.XXXXXX)"
+WS="$(mktemp -d /tmp/cwoffee_probe_ws.XXXXXX)"
 trap 'rm -rf "$WS"' EXIT
 
 fails=0
@@ -44,15 +44,15 @@ out=$(run 'curl -s -m 5 -o /dev/null http://example.com 2>/dev/null && echo REAC
 case "$out" in *BLOCKED*) pass "no network from inside the sandbox";; *) fail "network reachable: $out";; esac
 
 echo "2. host filesystem is read-only"
-out=$(run 'touch /cowry_escape 2>/dev/null && echo WROTE || echo BLOCKED' 2>&1)
-case "$out" in *BLOCKED*) pass "cannot write to /";; *) fail "wrote to /"; rm -f /cowry_escape;; esac
+out=$(run 'touch /cwoffee_escape 2>/dev/null && echo WROTE || echo BLOCKED' 2>&1)
+case "$out" in *BLOCKED*) pass "cannot write to /";; *) fail "wrote to /"; rm -f /cwoffee_escape;; esac
 
 echo "3. the real host home is not writable, and HOME is redirected"
 real_home="$HOME"
-out=$(run "touch $real_home/.cowry_home_escape 2>/dev/null && echo WROTE || echo BLOCKED" 2>&1)
+out=$(run "touch $real_home/.cwoffee_home_escape 2>/dev/null && echo WROTE || echo BLOCKED" 2>&1)
 case "$out" in
   *BLOCKED*) pass "cannot write to the real host home ($real_home)";;
-  *) fail "wrote to the real host home"; rm -f "$real_home/.cowry_home_escape";;
+  *) fail "wrote to the real host home"; rm -f "$real_home/.cwoffee_home_escape";;
 esac
 inner_home=$(run 'printf %s "$HOME"' 2>/dev/null)
 if [ "$inner_home" = "$WS" ]; then

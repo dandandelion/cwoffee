@@ -1,15 +1,15 @@
 [package]
-name = "cowry-tui"
+name = "cwoffee-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "cowry"
+name = "cwoffee"
 path = "src/main.rs"
 
 [dependencies]
-cowry-engine = { workspace = true }
+cwoffee-engine = { workspace = true }
 tokio = { workspace = true }
 ratatui = "0.30"
 crossterm = "0.29"

@@ -1,6 +1,6 @@
 # LAN gateway (not built yet)
 
-Goal: open Cowry from a phone on the same network to watch progress and answer
+Goal: open Cwoffee from a phone on the same network to watch progress and answer
 approvals when you are not at the machine.
 
 ## What exists today
@@ -25,7 +25,7 @@ seam a gateway plugs into — no engine changes are required.
 Build this first, because it is the actual want ("see what it is doing") and it
 is the safe half:
 
-1. `cowry-gateway` binary: serves `ui/dist` over HTTP and upgrades one path
+1. `cwoffee-gateway` binary: serves `ui/dist` over HTTP and upgrades one path
    (`/ws`) to WebSocket.
 2. Client sends `{ id, cmd, args }`; server calls the same engine functions the
    Tauri commands call and replies `{ id, ok, result }`.
@@ -39,7 +39,7 @@ Monitor mode alone answers most of the use case and cannot cause anything.
 
 ## Security — read this before binding 0.0.0.0
 
-Cowry runs commands in a sandbox and writes files in a workspace. An unauthenticated
+Cwoffee runs commands in a sandbox and writes files in a workspace. An unauthenticated
 listener on every interface turns "my laptop, my agent" into "any device on my
 network can drive an agent with shell access". The sandbox is the boundary, but it
 is a *containment* boundary, not an *authorization* one.

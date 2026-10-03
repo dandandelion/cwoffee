@@ -197,6 +197,42 @@ function renderTable(header: string, delim: string, rows: string[]): string {
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
 }
 
+/**
+ * Fenced code becomes a titled block with actions, not a bare <pre>.
+ *
+ * The source lives in the <code> textContent and is read back at click time.
+ * Duplicating it into a data attribute would double the DOM for every block and
+ * mean two copies that can disagree.
+ *
+ * Only html and svg get preview actions. Every other language would need its
+ * own sandbox story, and "we can preview it" is a promise the renderer cannot
+ * keep for, say, a C++ file.
+ */
+function codeBlock(langRaw: string, escapedCode: string): string {
+  const lang = (langRaw || '').toLowerCase()
+  const safe = /^[a-z0-9+-]*$/.test(lang) ? lang : ''
+  const acts: string[] = [
+    '<button class="code-act" data-act="copy" type="button" title="Copy code">copy</button>',
+  ]
+  if (safe === 'html') {
+    acts.push(
+      '<button class="code-act" data-act="preview" type="button" title="Preview in a panel">preview</button>',
+    )
+  } else if (safe === 'svg') {
+    acts.push(
+      '<button class="code-act" data-act="inline" type="button" title="Toggle inline preview">inline</button>',
+      '<button class="code-act" data-act="preview" type="button" title="Preview in a panel">preview</button>',
+    )
+  }
+  return (
+    `<div class="codeblk" data-lang="${safe}">\n` +
+    `<div class="code-head"><span class="code-lang">${escapeHtml(safe || 'text')}</span>` +
+    `<span class="code-acts">${acts.join('')}</span></div>\n` +
+    `<pre><code${safe ? ` class="lang-${safe}"` : ''}>${escapedCode}</code></pre>\n` +
+    `</div>`
+  )
+}
+
 export function renderMarkdown(src: string): string {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const html: string[] = []
@@ -230,8 +266,7 @@ export function renderMarkdown(src: string): string {
         codeLang = line.slice(3).trim()
         code = []
       } else {
-        const lang = codeLang && /^[a-z0-9+-]*$/i.test(codeLang) ? ` class="lang-${codeLang}"` : ''
-        html.push(`<pre><code${lang}>${code.join('\n')}</code></pre>`)
+        html.push(codeBlock(codeLang, code.join('\n')))
         inCode = false
         codeLang = ''
       }
@@ -327,8 +362,10 @@ export function renderMarkdown(src: string): string {
   }
 
   if (inCode) {
-    // unterminated fence: still render as code rather than swallowing the text
-    html.push(`<pre><code>${code.join('\n')}</code></pre>`)
+    // unterminated fence: still render as code rather than swallowing the text.
+    // The model stops mid-block more often than markdown documents suggest, and
+    // swallowing the remainder loses content the user can still read.
+    html.push(codeBlock(codeLang, code.join('\n')))
   }
   flushPara()
   closeList()

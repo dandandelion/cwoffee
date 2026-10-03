@@ -1,4 +1,4 @@
-//! Cowry engine.
+//! Cwoffee engine.
 //!
 //! Deliberate constraint: **this crate knows nothing about any UI.** It compiles
 //! without tauri, gtk, or a webview, and it must stay that way — the TUI and the
@@ -14,6 +14,7 @@ pub mod event;
 pub mod provider;
 pub mod prompt;
 pub mod sse;
+pub mod legacy;
 pub mod host;
 pub mod store;
 pub mod telemetry;

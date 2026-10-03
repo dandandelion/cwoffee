@@ -1,9 +1,9 @@
-# Cowry
+# Cwoffee
 
 A local-first, BYOM co-work agent for Linux. Light, fast, and beautiful.
 
 > **Thesis.** Qoder runs ~1.3 GB across 14 processes and talks to the cloud.
-> Cowry runs ~300 MB in one process against *your* model on *your* machine.
+> Cwoffee runs ~300 MB in one process against *your* model on *your* machine.
 > We are not a cheaper clone — we are the private, fast one.
 
 ---
@@ -44,7 +44,7 @@ These are architectural, not aspirational. Every one of them has a CI check or a
 ## 3. Architecture
 
 ```
-cowry/
+cwoffee/
   Cargo.toml                    # workspace
   crates/
     engine/                     # THE product. zero UI knowledge.
@@ -63,7 +63,7 @@ cowry/
   scripts/                      # memory.sh, bench.sh
 ```
 
-Three binaries off one library: `cowry` (desktop), `cowry-tui` (dev + debug), and later `cowryd` (headless).
+Three binaries off one library: `cwoffee` (desktop), `cwoffee-tui` (dev + debug), and later `cwoffeed` (headless).
 
 **Provider abstraction** — the most important 40 lines in the repo:
 
@@ -163,10 +163,10 @@ plain-text appends batched on rAF.
 
 | Gate | Result |
 |---|---|
-| GPU: renderD128 only, no NVIDIA | ✅ `cowry-app` holds **renderD128** only |
-| Mesa pin actually applied | ✅ `[cowry] EGL vendor pinned to: .../50_mesa.json` |
+| GPU: renderD128 only, no NVIDIA | ✅ `cwoffee-app` holds **renderD128** only |
+| Mesa pin actually applied | ✅ `[cwoffee] EGL vendor pinned to: .../50_mesa.json` |
 | Memory (debug build, vite dev server) | **233.2 MB PSS** across 3 processes |
-| — cowry-app host | 89.4 MB |
+| — cwoffee-app host | 89.4 MB |
 | — WebKitWebProcess | 108.9 MB |
 | — WebKitNetworkProcess | 34.9 MB |
 | RSS would have said | 438.3 MB — a **false failure** at the 400 MB gate |
@@ -198,7 +198,7 @@ Two real bugs were hiding behind silent failure:
 Fixing the class of problem, not the instance — a **page-side log that does not
 depend on Tauri IPC**:
 
-- `ui/src/lib/pagelog.ts` → `POST /__cowry_log`, a vite middleware that prints
+- `ui/src/lib/pagelog.ts` → `POST /__cwoffee_log`, a vite middleware that prints
   into the same stdout as the Rust side, so page and host output interleave
   chronologically. Dev-only; compiled out in prod (`import.meta.env.PROD`).
 - `window.onerror` + `unhandledrejection` forward to it, so a blank page can
@@ -215,9 +215,9 @@ depend on Tauri IPC**:
 ### M0 final, measured
 
 ```
-[cowry] render OK: titlebar=true sidebar=true footer=true stream=true
+[cwoffee] render OK: titlebar=true sidebar=true footer=true stream=true
         overlay=false text=494 bg=rgb(253, 252, 249) dpr=2.00
-[cowry/page] turn: end chars=1443 frames=209 dropped=0 worst=18ms decode=49.0/s
+[cwoffee/page] turn: end chars=1443 frames=209 dropped=0 worst=18ms decode=49.0/s
 ```
 
 - **0 dropped frames** across 209 frames during a 1443-char stream; worst frame
@@ -239,7 +239,7 @@ Tauri v2 resolves these two things **relative to different directories**:
 | `build.frontendDist` | the **config file** (`crates/tauri-app/`) → `"../../ui/dist"` |
 | `build.beforeDevCommand` / `beforeBuildCommand` | the **CWD of the CLI**, which for us is `crates/` → `"npm --prefix ../ui run dev"` |
 
-Verified empirically (`beforeDevCommand: pwd` printed `.../cowry/crates`). Getting
+Verified empirically (`beforeDevCommand: pwd` printed `.../cwoffee/crates`). Getting
 this wrong produces a confusing `ENOENT .../Projects/ui/package.json`. `dev.sh`
 always runs the CLI from `crates/tauri-app`, so the values above are stable.
 
@@ -261,7 +261,7 @@ documents         write_xlsx -> numeric cells 1200/300/90 confirmed in the packa
                   the model then ran `exec ls -l` to check its own output
 memory            release desktop app 248.2 MB PSS total; TUI 6.8 MB PSS
 gpu               renderD128 only, debug and release
-packaging         target/release/bundle/rpm/cowry-0.0.0-1.x86_64.rpm (4.77 MiB)
+packaging         target/release/bundle/rpm/cwoffee-0.0.0-1.x86_64.rpm (4.77 MiB)
 ```
 
 Three bugs worth remembering because they were only visible at runtime:
@@ -322,7 +322,7 @@ Click → popover with per-turn history, sparklines, and a cold/warm split. Turn
 | | naive RSS sum | PSS (the metric we use) |
 |---|---|---|
 | Qoder (measured, 14 procs) | ~1,333 MB | ~700–850 MB (est.) |
-| **Cowry target** | ~300 MB | **250–350 MB** |
+| **Cwoffee target** | ~300 MB | **250–350 MB** |
 | CI failure threshold | 450 MB | **400 MB** |
 
 Breakdown: WebKitGTK web process 140–240 MB · Tauri host + engine 60–110 MB.
@@ -333,7 +333,7 @@ The win is structural: **one web process instead of fourteen Chromium processes.
 `scripts/memory.sh` samples PSS at a fixed scenario (200-message session, 3 attachments) and fails CI over 400 MB.
 
 ```bash
-for p in $(pgrep -f cowry); do
+for p in $(pgrep -f cwoffee); do
   awk '/^Pss:/{s+=$2} END{print s}' /proc/$p/smaps_rollup
 done | paste -sd+ | bc
 ```
@@ -372,7 +372,7 @@ done | paste -sd+ | bc
 
 ## 11. Brand
 
-**Cowry** — keeps the "cow-" of *cowork*; a cowrie shell is one of the oldest currencies, i.e. *value exchanged between people*. Ownable, short, `cowry`/`cow` CLI-friendly.
+**Cwoffee** — keeps the "cow-" of *cowork*; a cowrie shell is one of the oldest currencies, i.e. *value exchanged between people*. Ownable, short, `cwoffee`/`cow` CLI-friendly.
 
 **Icon:** hand-drawn watercolor **cowrie shell with a small face** — same warmth as Qoder's duck, but it's *our* object. Rounded shell, fine hatched ridge, two dot eyes, faint smile, wet-on-wet blue wash behind it (echoes the mock's illustration). Used at 96px in the hero and 16px in the titlebar — so it must survive both, which means the face has to read at 16px.
 
@@ -380,7 +380,7 @@ done | paste -sd+ | bc
 
 ---
 
-## 12. GPU policy: Cowry renders on the Intel iGPU (mandatory on this box)
+## 12. GPU policy: Cwoffee renders on the Intel iGPU (mandatory on this box)
 
 Measured on the dev box, 2026-10-01:
 
@@ -423,16 +423,16 @@ Note: `DRI_PRIME` is **not** the right lever — it's Mesa's PRIME offload selec
 
 Apply it in **three** places, or the packaged app will break while the dev build works:
 1. `crates/tauri-app/src/main.rs` — set at the very top of `main()`, **before** any GTK/EGL initialisation. (In edition 2024 `std::env::set_var` is `unsafe`; wrap it, or use a `#[ctor]`/constructor so it runs pre-`main`.)
-2. the `.desktop` `Exec=` line (a wrapper script or `env VAR=... cowry`)
+2. the `.desktop` `Exec=` line (a wrapper script or `env VAR=... cwoffee`)
 3. `scripts/dev.sh` for `tauri dev`
 
 ### Verification (M0 day 1, one command)
 
 ```bash
-./scripts/gpu-check.sh cowry
+./scripts/gpu-check.sh cwoffee
 ```
 
-Expected: cowry's processes hold **renderD128 only**. If renderD129 appears, the pin didn't take — fix that before writing any UI code.
+Expected: cwoffee's processes hold **renderD128 only**. If renderD129 appears, the pin didn't take — fix that before writing any UI code.
 
 ### Fallbacks, in order
 1. pin Mesa (above) — expected to be sufficient

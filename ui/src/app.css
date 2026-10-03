@@ -229,9 +229,9 @@ body {
   border-radius: 50%;
   background: var(--color-shell-deep);
   vertical-align: middle;
-  animation: cowry-live 1.15s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  animation: cwoffee-live 1.15s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
-@keyframes cowry-live {
+@keyframes cwoffee-live {
   0%, 100% { transform: scale(0.55); opacity: 0.3; }
   50%      { transform: scale(1);    opacity: 1;   }
 }
@@ -679,9 +679,9 @@ body {
 }
 .sessrow.unread .sess-dot {
   background: var(--color-shell-deep);
-  animation: cowry-pulse 1.7s ease-in-out infinite;
+  animation: cwoffee-pulse 1.7s ease-in-out infinite;
 }
-@keyframes cowry-pulse {
+@keyframes cwoffee-pulse {
   0%, 100% { opacity: 0.25; transform: scale(0.75); }
   50%      { opacity: 1;    transform: scale(1); }
 }
@@ -1053,7 +1053,7 @@ body {
   gap: 12px;
   padding: 0 24px;
   text-align: center;
-  animation: cowry-rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation: cwoffee-rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 .empty-mark {
   width: 26px;
@@ -1079,7 +1079,7 @@ body {
   line-height: 1.6;
   color: var(--color-ink-3);
 }
-@keyframes cowry-rise {
+@keyframes cwoffee-rise {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: none; }
 }
@@ -1132,3 +1132,100 @@ body {
   font-size: 11px;
   color: var(--color-ink-4);
 }
+
+/* ---- code blocks ----------------------------------------------------------
+   A bare <pre> gives no way to take the code out of the app. The head carries
+   the language and the actions; the actions are buttons so they are reachable
+   by keyboard. */
+.codeblk {
+  margin: 10px 0;
+  border: 1px solid var(--color-hairline);
+  border-radius: 9px;
+  background: var(--color-paper-2);
+  overflow: hidden;
+}
+.code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px 5px 11px;
+  border-bottom: 1px solid var(--color-hairline);
+  background: var(--color-paper-3);
+}
+.code-lang {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-ink-4);
+}
+.code-acts { display: flex; gap: 6px; flex: none; }
+.code-act {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--color-hairline);
+  background: transparent;
+  color: var(--color-ink-3);
+  cursor: pointer;
+}
+.code-act:hover { color: var(--color-ink); border-color: var(--color-shell); }
+.code-act.done { color: var(--color-ok); border-color: var(--color-ok); }
+.codeblk pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.pv-inline {
+  display: block;
+  max-width: 100%;
+  margin: 0 auto;
+  padding: 12px;
+  border-top: 1px solid var(--color-hairline);
+  background: var(--color-paper);
+}
+
+/* ---- preview panel -------------------------------------------------------- */
+.pv {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  padding: 28px;
+  background: rgba(0, 0, 0, 0.34);
+}
+.pv-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-radius: 10px 10px 0 0;
+  background: var(--color-paper-2);
+  border: 1px solid var(--color-hairline);
+  border-bottom: 0;
+}
+.pv-title { font-size: 13px; font-weight: 600; color: var(--color-ink); }
+.pv-note { font-size: 11px; color: var(--color-ink-4); flex: 1; }
+.pv-x {
+  font-size: 11.5px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--color-hairline);
+  background: transparent;
+  color: var(--color-ink-2);
+  cursor: pointer;
+}
+.pv-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: auto;
+  border: 1px solid var(--color-hairline);
+  border-radius: 0 0 10px 10px;
+  background: var(--color-paper);
+}
+.pv-frame { flex: 1; width: 100%; height: 100%; border: 0; background: #fff; }
+.pv-svg { max-width: 100%; max-height: 100%; margin: auto; }
+.pv-err { font-size: 12px; color: var(--color-danger); padding: 16px; }

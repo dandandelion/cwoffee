@@ -50,6 +50,18 @@ async function openExternal(href: string) {
 import type { AttachmentMeta, EngineEvent, ExecStream, StoredMessage } from './events'
 import { renderMarkdown, LiveMarkdown } from './markdown'
 import { fmtThink } from './think'
+import { openPreview, inlineSvg } from './preview'
+
+/** Clipboard feedback without a toast system: the button says it, briefly. */
+function markCopied(btn: HTMLElement) {
+  const prev = btn.textContent ?? 'copy'
+  btn.textContent = 'copied'
+  btn.classList.add('done')
+  window.setTimeout(() => {
+    btn.textContent = prev
+    btn.classList.remove('done')
+  }, 1200)
+}
 import type { OutputFile } from './events'
 
 function fmtSize(n: number): string {
@@ -122,6 +134,28 @@ export class Transcript {
     // stays inert rather than hijacking the window.
     root.addEventListener('click', (e) => {
       const t = e.target as HTMLElement | null
+      const act = t?.closest?.('.code-act') as HTMLElement | null
+      if (act) {
+        e.preventDefault()
+        const blk = act.closest('.codeblk') as HTMLElement | null
+        const code = blk?.querySelector('pre code') as HTMLElement | null
+        if (!blk || !code) return
+        const kind = (blk.dataset.lang ?? '') as 'html' | 'svg'
+        const src = code.textContent ?? ''
+        switch (act.dataset.act) {
+          case 'copy':
+            markCopied(act)
+            void navigator.clipboard?.writeText(src).catch((err) => pageLog(`copy failed: ${err}`))
+            break
+          case 'preview':
+            if (kind === 'html' || kind === 'svg') openPreview(kind, src)
+            break
+          case 'inline':
+            inlineSvg(blk, src)
+            break
+        }
+        return
+      }
       const chip = t?.closest?.('.filechip') as HTMLElement | null
       if (chip) {
         e.preventDefault()
@@ -286,7 +320,7 @@ export class Transcript {
       // appended, so a tool call in the middle of an answer cannot truncate the
       // formatting of the part already on screen.
       if (this.textKind === 'answer') this.finalizeAnswer()
-      const label = kind === 'reasoning' ? 'thinking' : kind === 'user' ? 'you' : 'cowry'
+      const label = kind === 'reasoning' ? 'thinking' : kind === 'user' ? 'you' : 'cwoffee'
       this.textBuf = this.block(kind, label)
       this.textKind = kind
       if (kind === 'reasoning') {
@@ -440,6 +474,21 @@ export class Transcript {
   }
 
   /** Surface a shell-level failure in the transcript, not just the log. */
+  /** A quiet informational line: migration notices, backend defaults. */
+  showNote(msg: string) {
+    const el = document.createElement('div')
+    el.className = 'blk blk-note'
+    const body = document.createElement('div')
+    body.className = 'blk-body'
+    body.textContent = msg
+    el.appendChild(body)
+    // ensureTurn, not this.turn!: a startup note can arrive before any turn
+    // exists, and the first version of this dereferenced a null turn.
+    this.ensureTurn()
+    this.turn!.appendChild(el)
+    this.scrollIfNeeded()
+  }
+
   showError(msg: string) {
     this.flushNow()
     this.block('fail', 'error').textContent = msg
@@ -607,7 +656,7 @@ export class Transcript {
           r.classList.add('clamp', 'settled')
           r.textContent = m.reasoning
         }
-        const body = blk('answer', 'cowry')
+        const body = blk('answer', 'cwoffee')
         body.innerHTML = renderMarkdown(m.content)
         if (m.files?.length) {
           this.ensureTurn()

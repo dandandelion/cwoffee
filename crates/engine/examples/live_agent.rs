@@ -1,6 +1,6 @@
 //! End-to-end agent loop against a real model, with a real sandboxed tool.
 //!
-//!   cargo run -p cowry-engine --example live_agent -- http://127.0.0.1:8090/v1
+//!   cargo run -p cwoffee-engine --example live_agent -- http://127.0.0.1:8090/v1
 //!
 //! Unit tests use a scripted provider. This proves the parts a script cannot:
 //! that the model actually emits a tool call our accumulator + repair pipeline
@@ -9,11 +9,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cowry_engine::approval::{ApprovalAnswer, ApprovalGate, ApprovalMode};
-use cowry_engine::event::EngineEvent;
-use cowry_engine::provider::{openai::{Flavor, OpenAiProvider}, Reasoning};
-use cowry_engine::tools::{exec::ExecTool, Registry, ToolCtx};
-use cowry_engine::{Agent, AgentConfig};
+use cwoffee_engine::approval::{ApprovalAnswer, ApprovalGate, ApprovalMode};
+use cwoffee_engine::event::EngineEvent;
+use cwoffee_engine::provider::{openai::{Flavor, OpenAiProvider}, Reasoning};
+use cwoffee_engine::tools::{exec::ExecTool, Registry, ToolCtx};
+use cwoffee_engine::{Agent, AgentConfig};
 use tokio::sync::mpsc;
 
 static APPROVALS: AtomicU64 = AtomicU64::new(0);
@@ -150,8 +150,8 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
             EngineEvent::ToolExecStart { .. } => println!("[running...]"),
             EngineEvent::ToolExecOutput { stream, chunk, .. } => {
                 let tag = match stream {
-                    cowry_engine::ExecStream::Stdout => "",
-                    cowry_engine::ExecStream::Stderr => "[err] ",
+                    cwoffee_engine::ExecStream::Stdout => "",
+                    cwoffee_engine::ExecStream::Stderr => "[err] ",
                 };
                 print!("{tag}{chunk}");
                 std::io::stdout().flush().ok();

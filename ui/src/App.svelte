@@ -178,10 +178,29 @@
     await removeSession(id)
   }
 
-  const SEEN_KEY = 'cowry.seenCounts.v1'
+  const SEEN_KEY = 'cwoffee.seenCounts.v1'
+
+  /**
+   * Read a stored value under its current key, falling back to the pre-rebrand
+   * `cowry.` name and re-saving under the new one. Without this the rebrand
+   * silently resets everyone's theme and unread state.
+   */
+  function readStored(key: string): string | null {
+    try {
+      const v = localStorage.getItem(key)
+      if (v !== null) return v
+      const legacy = key.replace(/^cwoffee\./, 'cowry.')
+      const old = localStorage.getItem(legacy)
+      if (old !== null) localStorage.setItem(key, old)
+      return old
+    } catch {
+      return null
+    }
+  }
+
   function loadSeen() {
     try {
-      const raw = localStorage.getItem(SEEN_KEY)
+      const raw = readStored(SEEN_KEY)
       if (raw) seenCounts = JSON.parse(raw)
     } catch {
       /* a corrupt entry is not worth failing the session list over */
@@ -487,7 +506,7 @@
   let theme = $state<'light' | 'dark'>('light')
   let attachErr = $state('')
 
-  const THEME_KEY = 'cowry.theme.v1'
+  const THEME_KEY = 'cwoffee.theme.v1'
 
   // Explicit choice wins; otherwise follow the OS. Applied to the document
   // element rather than a class on a component, because the palette lives on
@@ -505,7 +524,7 @@
   function initTheme() {
     let saved: string | null = null
     try {
-      saved = localStorage.getItem(THEME_KEY)
+      saved = readStored(THEME_KEY)
     } catch {
       /* non-fatal */
     }
@@ -1130,7 +1149,7 @@
         const restore = beginEventTap(probe)
         const approvalTurnsBefore = await turnCount()
         await invoke('set_mode', { mode: 'ask' })
-        await invoke('start_turn', { text: 'Use the exec tool to run: echo cowry-ok' })
+        await invoke('start_turn', { text: 'Use the exec tool to run: echo cwoffee-ok' })
         const dl = performance.now() + 90000
         while (!approval && performance.now() < dl) {
           await new Promise((r) => setTimeout(r, 200))
@@ -1388,7 +1407,7 @@
         await invoke('set_mode', { mode: 'auto' })
         draft =
           'Use write_file to create selftest-note.md in the workspace containing exactly ' +
-          'the line: cowry output file. Then tell me the path you wrote.'
+          'the line: cwoffee output file. Then tell me the path you wrote.'
         const turnsBefore = (await invoke<HostState>('session_state')).turns
         await send()
         if (!(await waitTurnDone(turnsBefore))) {
@@ -1405,6 +1424,84 @@
             if (!chips[0].textContent?.includes('selftest-note.md'))
               fail(`file chip has no file name: ${JSON.stringify(chips[0].textContent)}`)
           }
+        }
+      }
+
+      // --- code block chrome + what the preview sandbox actually blocks ----
+      {
+        await invoke('set_reasoning', { level: 'off' })
+        draft =
+          'Reply with ONLY a fenced html code block. Inside it put exactly: ' +
+          '<b>bold</b> and a <script>window.__pwn=1<\/script>. No prose.'
+        const turnsBefore = (await invoke<HostState>('session_state')).turns
+        await send()
+        if (!(await waitTurnDone(turnsBefore))) {
+          fail('code block turn never finished')
+        } else {
+          await new Promise((r) => setTimeout(r, 400))
+          const blk = document.querySelector('.codeblk[data-lang="html"]') as HTMLElement | null
+          if (!blk) fail('html fence did not render as a code block with chrome')
+          else {
+            if (!blk.querySelector('.code-act[data-act="copy"]')) fail('code block has no copy button')
+            if (!blk.querySelector('.code-act[data-act="preview"]')) fail('html block has no preview button')
+            // The fence must not execute: it is escaped markup, not live HTML.
+            if (document.querySelector('.transcript b'))
+              fail('html inside a code fence was rendered as live markup')
+          }
+
+          // What is the actual blast radius of a preview frame? If a sandboxed
+          // iframe can see the IPC bridge, "preview" is a remote-code path and
+          // scripts must stay off forever. Measure it instead of assuming.
+          const probe = await new Promise<Record<string, unknown>>((resolve) => {
+            const f = document.createElement('iframe')
+            f.setAttribute('sandbox', 'allow-scripts')
+            f.style.display = 'none'
+            f.srcdoc =
+              '<script>parent.postMessage({t: !!window.__TAURI__, i: !!window.__TAURI_INTERNALS__,' +
+              ' loc: String(location.href).slice(0,40)}, "*")<\/script>'
+            const on = (e: MessageEvent) => {
+              window.removeEventListener('message', on)
+              f.remove()
+              resolve(e.data as Record<string, unknown>)
+            }
+            window.addEventListener('message', on)
+            document.body.append(f)
+            setTimeout(() => resolve({ timeout: true }), 2500)
+          })
+          pageLog(`preview sandbox probe: ${JSON.stringify(probe)}`)
+          if (probe.t || probe.i) {
+            fail('a sandboxed preview frame can reach the Tauri IPC bridge')
+          }
+
+          // The shipped preview path does allow scripts, so the thing that has
+          // to hold is the injected CSP: no network at all from the frame.
+          const net = await new Promise<Record<string, unknown>>((resolve) => {
+            const f = document.createElement('iframe')
+            f.setAttribute('sandbox', 'allow-scripts')
+            f.style.display = 'none'
+            f.srcdoc =
+              '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; ' +
+              "script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; " +
+              'font-src data:; media-src blob:">' +
+              '<script>(async () => { const out = {};' +
+              "for (const u of ['http://127.0.0.1:8090/health','ipc://localhost/x','https://example.com/']) {" +
+              ' try { await fetch(u); out[u] = "FETCHED" } catch (e) { out[u] = String(e).slice(0,60) } }' +
+              ' out.ran = 1; parent.postMessage(out, "*") })()<\/script>'
+            const on = (e: MessageEvent) => {
+              window.removeEventListener('message', on)
+              f.remove()
+              resolve(e.data as Record<string, unknown>)
+            }
+            window.addEventListener('message', on)
+            document.body.append(f)
+            setTimeout(() => resolve({ timeout: true }), 3000)
+          })
+          pageLog(`preview CSP probe: ${JSON.stringify(net)}`)
+          const leaked = Object.entries(net).filter(
+            ([k, v]) => k !== 'ran' && String(v) === 'FETCHED',
+          )
+          if (leaked.length) fail(`preview frame reached the network: ${JSON.stringify(leaked)}`)
+          if (net.timeout) fail('preview CSP probe never reported')
         }
       }
 
@@ -1481,7 +1578,7 @@
     win = getCurrentWindow()
   } catch (e) {
     winErr = String(e)
-    console.error('[cowry] getCurrentWindow failed:', e)
+    console.error('[cwoffee] getCurrentWindow failed:', e)
   }
   // A missing permission, a missing window handle, or a null `win` all look
   // identical from the outside: the button does nothing. Log which one it was.
@@ -1548,6 +1645,11 @@
   onMount(async () => {
     if (rootEl) {
       transcript = new Transcript(rootEl)
+      invoke<string[]>('migration_notes')
+        .then((notes) => {
+          for (const n of notes) transcript?.showNote(n)
+        })
+        .catch((e) => pageLog(`migration_notes failed: ${String(e)}`))
       transcript.onOpenFile = async (path) => {
         try {
           const opened = await invoke<string>('open_file', { path })
@@ -1559,7 +1661,7 @@
       }
     }
     // Test seam: lets a browser harness drive the transcript without an engine.
-    if (import.meta.env.DEV) (window as any).__cowryTranscript = transcript
+    if (import.meta.env.DEV) (window as any).__cwoffeeTranscript = transcript
     await attachChannel()
     // Non-blocking: a missing /models must not delay first paint.
     void loadModels()
@@ -1639,7 +1741,7 @@
     data-tauri-drag-region
   >
     <img src="/icon.png" alt="" class="h-5 w-5 rounded" />
-    <span class="text-[13px] font-medium tracking-tight">cowry</span>
+    <span class="text-[13px] font-medium tracking-tight">cwoffee</span>
     <!-- Sidebar toggle: below 768px the sidebar is a drawer, and without this
          button the session list and search are simply unreachable. -->
     <button class="iconbtn sidemenu" onclick={() => setSidebar(!sidebarOpen)} aria-label="Sessions">
@@ -1947,7 +2049,7 @@
               <strong>Cannot reach the endpoint.</strong><br />
               <span class="pop-mono">{modelErr}</span><br />
               Start the server, or fix the URL in
-              <span class="pop-mono">~/.config/cowry/config.toml</span>.
+              <span class="pop-mono">~/.config/cwoffee/config.toml</span>.
             {:else}
               This endpoint does not list models.<br />
               Using <span class="pop-mono">{model || '\u2014'}</span>

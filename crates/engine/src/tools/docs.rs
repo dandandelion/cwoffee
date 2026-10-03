@@ -477,7 +477,7 @@ pub async fn markdown_to_pdf(md: &str, out: &Path, timeout_secs: u64) -> Result<
 
     // LibreOffice names the output after the input, so the scratch HTML has to
     // carry the wanted stem.
-    let scratch = dir.join(format!("{stem}.cowry-tmp.html"));
+    let scratch = dir.join(format!("{stem}.cwoffee-tmp.html"));
     std::fs::write(&scratch, markdown_to_html(md))
         .map_err(|e| format!("cannot write scratch html: {e}"))?;
 
@@ -507,7 +507,7 @@ pub async fn to_pdf(src: &Path, timeout_secs: u64) -> Result<PathBuf, String> {
     let dir = src
         .parent()
         .ok_or_else(|| "document has no parent directory".to_string())?;
-    let profile = std::env::temp_dir().join(format!("cowry_lo_profile_{}", std::process::id()));
+    let profile = std::env::temp_dir().join(format!("cwoffee_lo_profile_{}", std::process::id()));
 
     let mut cmd = tokio::process::Command::new(&bin);
     // `-env:` must come before the action arguments or LibreOffice ignores it.

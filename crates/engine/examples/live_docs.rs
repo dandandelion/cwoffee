@@ -5,7 +5,7 @@
 //! signal on this box, and it is the check that would catch a wrong content-types
 //! part or a bad relationship table.
 
-use cowry_engine::tools::docs::{markdown_to_docx, markdown_to_html, markdown_to_pdf};
+use cwoffee_engine::tools::docs::{markdown_to_docx, markdown_to_html, markdown_to_pdf};
 
 const MD: &str = r#"# Quarterly note
 
@@ -29,7 +29,7 @@ become markup.
 
 #[tokio::main]
 async fn main() {
-    let dir = std::env::temp_dir().join(format!("cowry_docs_live_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cwoffee_docs_live_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let docx = dir.join("note.docx");

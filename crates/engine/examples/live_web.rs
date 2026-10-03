@@ -1,11 +1,11 @@
 //! Live check of the network tools. Parsing is unit-tested; this proves the
 //! tools actually work against real servers, which no fixture can show.
 //!
-//!   cargo run -p cowry-engine --example live_web
+//!   cargo run -p cwoffee-engine --example live_web
 
-use cowry_engine::tools::Tool;
-use cowry_engine::tools::web::{WebFetchTool, WebSearchTool};
-use cowry_engine::tools::ToolCtx;
+use cwoffee_engine::tools::Tool;
+use cwoffee_engine::tools::web::{WebFetchTool, WebSearchTool};
+use cwoffee_engine::tools::ToolCtx;
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -46,7 +46,7 @@ async fn main() {
     }
 
     println!("\n=== download_file: the chakra-ui docs dump that web_fetch truncated ===");
-    let dl = cowry_engine::tools::web::DownloadTool::default();
+    let dl = cwoffee_engine::tools::web::DownloadTool::default();
     let r = dl
         .run(
             json!({ "url": "https://chakra-ui.com/llms.txt" }),
@@ -62,7 +62,7 @@ async fn main() {
     show(&r2);
 
     println!("\n=== download_file: oversized response is refused, not truncated ===");
-    let small = cowry_engine::tools::web::DownloadTool {
+    let small = cwoffee_engine::tools::web::DownloadTool {
         max_bytes: 200,
         ..Default::default()
     };
@@ -96,7 +96,7 @@ async fn main() {
     show(&r);
 }
 
-fn show(r: &cowry_engine::tools::ToolResult) {
+fn show(r: &cwoffee_engine::tools::ToolResult) {
     if r.ok {
         let head: String = r.output.chars().take(700).collect();
         let indented = head.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n");

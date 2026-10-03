@@ -7,12 +7,12 @@
 //! read the file" is.
 use std::path::PathBuf;
 
-use cowry_engine::agent::{Agent, AgentConfig};
-use cowry_engine::approval::{ApprovalAnswer, ApprovalGate, ApprovalMode};
-use cowry_engine::event::EngineEvent;
-use cowry_engine::provider::openai::{Flavor, OpenAiProvider};
-use cowry_engine::provider::Reasoning;
-use cowry_engine::tools::{Registry, ToolCtx};
+use cwoffee_engine::agent::{Agent, AgentConfig};
+use cwoffee_engine::approval::{ApprovalAnswer, ApprovalGate, ApprovalMode};
+use cwoffee_engine::event::EngineEvent;
+use cwoffee_engine::provider::openai::{Flavor, OpenAiProvider};
+use cwoffee_engine::provider::Reasoning;
+use cwoffee_engine::tools::{Registry, ToolCtx};
 use tokio::sync::mpsc;
 
 const TASK: &str = "Make two deliverables in the workspace:\n\
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "http://127.0.0.1:8090/v1".into());
 
     let workspace: PathBuf =
-        std::env::temp_dir().join(format!("cowry_docs_agent_{}", std::process::id()));
+        std::env::temp_dir().join(format!("cwoffee_docs_agent_{}", std::process::id()));
     std::fs::create_dir_all(&workspace)?;
 
     let provider = OpenAiProvider::new("llama.cpp", Flavor::LlamaCpp, base)?;

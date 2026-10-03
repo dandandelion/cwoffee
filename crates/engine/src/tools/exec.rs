@@ -386,11 +386,11 @@ mod tests {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "cowry_exec_test_{}_{n}",
+            "cwoffee_exec_test_{}_{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        (ToolCtx { workspace: dir, max_output_bytes: 4096 }, WsGuard(std::env::temp_dir().join(format!("cowry_exec_test_{}_{n}", std::process::id()))))
+        (ToolCtx { workspace: dir, max_output_bytes: 4096 }, WsGuard(std::env::temp_dir().join(format!("cwoffee_exec_test_{}_{n}", std::process::id()))))
     }
 
     #[tokio::test]
@@ -427,10 +427,10 @@ mod tests {
         let t = ExecTool::default();
         let (ctx, _g) = ws();
         let r = t
-            .run(json!({"cmd": "touch /cowry_escape_test 2>/dev/null && echo WROTE || echo BLOCKED"}), &ctx, &sink())
+            .run(json!({"cmd": "touch /cwoffee_escape_test 2>/dev/null && echo WROTE || echo BLOCKED"}), &ctx, &sink())
             .await;
         assert!(r.output.contains("BLOCKED"), "escaped the sandbox: {:?}", r.output);
-        let _ = std::fs::remove_file("/cowry_escape_test");
+        let _ = std::fs::remove_file("/cwoffee_escape_test");
     }
 
     #[tokio::test]

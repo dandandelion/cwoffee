@@ -1,7 +1,7 @@
 # Rust
 /target
 **/*.rs.bk
-# NOTE: Cargo.lock is intentionally COMMITTED — cowry is an application, not a library.
+# NOTE: Cargo.lock is intentionally COMMITTED — cwoffee is an application, not a library.
 
 # Node / frontend
 node_modules
@@ -9,8 +9,8 @@ ui/dist
 ui/.svelte-kit
 *.local
 
-# Cowry
-.cowry/
+# Cwoffee
+.cwoffee/
 *.db
 *.db-wal
 *.db-shm

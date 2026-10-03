@@ -1,9 +1,9 @@
 [package]
-name = "cowry-engine"
+name = "cwoffee-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cowry agent engine: providers, tool loop, storage. Zero UI knowledge."
+description = "Cwoffee agent engine: providers, tool loop, storage. Zero UI knowledge."
 
 # IMPORTANT: this crate must never depend on tauri, gtk, or any webview crate.
 # The TUI and the desktop app are peers of each other and both talk to this.
