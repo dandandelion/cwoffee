@@ -771,3 +771,21 @@ body {
   border-color: var(--color-shell);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-shell) 22%, transparent);
 }
+
+/* A dead endpoint must not look like an ordinary "nothing selected" state. */
+.chip-warn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--color-danger);
+  color: var(--color-paper);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+.pop-empty .pop-mono {
+  word-break: break-all;
+}

@@ -103,6 +103,9 @@
       menu = null
       return
     }
+    // Opening the model list is a natural retry point: if the endpoint was down
+    // when the app started, this is the moment the user is asking about it.
+    if (kind === 'model' && (modelErr || !models.length)) void loadModels()
     const r = anchor.getBoundingClientRect()
     menu = {
       kind,
@@ -689,14 +692,20 @@
     await invoke('set_mode', { mode: m }).catch((e) => pageLog(`set_mode: ${e}`))
   }
 
+  // Two very different reasons end up with an empty list, and showing the same
+  // "no models" for both sends the user to the wrong fix: an endpoint that does
+  // not implement /models is normal, an endpoint that is not reachable is the
+  // whole app being disconnected.
+  let modelErr = $state('')
+
   async function loadModels() {
     try {
       models = await invoke<string[]>('list_models')
+      modelErr = ''
     } catch (e) {
-      // An endpoint without /models is a normal configuration. Fall back to the
-      // configured id rather than showing an error the user cannot act on.
       pageLog(`list_models: ${e}`)
       models = []
+      modelErr = String(e)
     }
   }
 
@@ -1412,6 +1421,7 @@
                 <button class="cbtn chip" data-menu onclick={(e) => openMenu('model', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'model'}>
                   <svg width="13" height="13" viewBox="0 0 14 14"><path d="M7.8 1.6 3.4 7.6h2.6l-.8 4.8 4.4-6H7z" fill="currentColor"/></svg>
                   <span class="chip-label">{shortModel(model)}</span>
+            {#if modelErr}<span class="chip-warn" title="Endpoint unreachable">!</span>{/if}
                   <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
                 </button>
                 <button class="cbtn chip" data-menu onclick={(e) => openMenu('think', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'think'}>
@@ -1493,7 +1503,17 @@
             </button>
           {/each}
         {:else}
-          <div class="pop-empty">This endpoint does not list models.<br />Using <span class="pop-mono">{model || '\u2014'}</span></div>
+          <div class="pop-empty">
+            {#if modelErr}
+              <strong>Cannot reach the endpoint.</strong><br />
+              <span class="pop-mono">{modelErr}</span><br />
+              Start the server, or fix the URL in
+              <span class="pop-mono">~/.config/cowry/config.toml</span>.
+            {:else}
+              This endpoint does not list models.<br />
+              Using <span class="pop-mono">{model || '\u2014'}</span>
+            {/if}
+          </div>
         {/if}
       {:else if menu.kind === 'keys'}
         <div class="pop-title">Keyboard</div>
