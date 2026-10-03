@@ -37,6 +37,9 @@ cowry --config /path/to/config.toml
 
 Precedence is **CLI flags > environment > config file > defaults**.
 
+Sessions are created lazily: "new session" is a blank view, not a blank row. The
+row appears when you send the first message, already titled by it.
+
 Keyboard: `Ctrl+K` composer, `Ctrl+Enter` send, `Ctrl+N` new session, `Ctrl+B`
 sidebar, `Alt+1-9` switch session. The `?` in the status bar lists them. Light and
 dark themes; the choice persists, and the default follows the OS.

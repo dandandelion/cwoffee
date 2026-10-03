@@ -171,26 +171,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete several sessions in one transaction.
-    ///
-    /// A loop over `delete_session` would leave a half-applied batch if one row
-    /// failed, and each call would take the connection lock separately.
-    pub fn delete_sessions(&self, ids: &[i64]) -> Result<usize, StoreError> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let conn = self.conn.lock().unwrap();
-        let mut n = 0usize;
-        for id in ids {
-            conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
-            conn.execute("DELETE FROM messages_fts WHERE session_id = ?1", params![id])?;
-            conn.execute("DELETE FROM turns WHERE session_id = ?1", params![id])?;
-            conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
-            n += 1;
-        }
-        Ok(n)
-    }
-
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

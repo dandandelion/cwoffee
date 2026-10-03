@@ -887,3 +887,56 @@ body {
 .iconbtn-danger { color: var(--color-danger); }
 .iconbtn-danger:hover { background: var(--color-danger-bg); color: var(--color-danger); }
 .iconbtn:disabled { opacity: 0.35; }
+
+/* ---- empty session ----------------------------------------------------
+   A draft session is not a blank page with a bar at the bottom; the greeting
+   and the composer are the whole subject, so they are centred as a pair. The
+   spacers carry unequal flex weight so the block sits slightly above true
+   centre, which is where it reads as centred rather than sunk. */
+.espacer { flex: 1 1 0; min-height: 0; }
+/* Hidden, not unmounted: the transcript renderer holds a reference to its root
+   node, and an {#if} would destroy the very element it keeps writing into. */
+.empty-mode .scroller { display: none; }
+.esp-top { flex-grow: 4; }
+.esp-bot { flex-grow: 3; }
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 0 24px;
+  text-align: center;
+  animation: cowry-rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.empty-mark {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 34% 30%,
+    var(--color-shell) 0 46%,
+    var(--color-shell-deep) 47% 100%
+  );
+}
+.empty-hi {
+  margin: 0;
+  font-size: 27px;
+  font-weight: 550;
+  letter-spacing: -0.018em;
+  color: var(--color-ink);
+}
+.empty-sub {
+  margin: 0;
+  max-width: 46ch;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--color-ink-3);
+}
+@keyframes cowry-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .empty { animation: none; }
+}

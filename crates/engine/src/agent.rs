@@ -98,6 +98,11 @@ impl Agent {
         &self.ctx.workspace
     }
 
+    /// Swap the whole prompt out, e.g. when moving to a different session.
+    pub fn replace_prompt(&mut self, p: crate::prompt::PromptBuilder) {
+        self.prompt = p;
+    }
+
     pub fn set_mode(&mut self, m: crate::approval::ApprovalMode) {
         self.gate.set_mode(m);
     }

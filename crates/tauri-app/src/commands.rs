@@ -304,41 +304,18 @@ pub fn delete_session(state: tauri::State<'_, AppState>, id: i64) -> Result<(), 
             .map(|s| s.id);
         match reuse {
             Some(sid) => state.host.send(HostCmd::SwitchSession { id: sid }),
-            None => state.host.send(HostCmd::NewSession { title: "new session".into() }),
+            // Draft, not a fresh row: the replacement used to be an empty
+            // session, which is exactly the blank entry that piled up.
+            None => state.host.send(HostCmd::ClearSession),
         }
     }
     state.store.delete_session(id).map_err(|e| e.to_string())
 }
 
-/// Delete a batch of sessions. Same guards as a single delete: the host must not
-/// be writing into a row that disappears.
+/// Drop the host to draft state: no session row, empty prompt.
 #[tauri::command]
-pub fn delete_sessions(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let st = state.host.state();
-    if ids.contains(&st.session_id) && st.busy {
-        return Err("cannot delete the active session while a turn is running".into());
-    }
-    if ids.contains(&st.session_id) {
-        // Move somewhere that survives the batch: an empty session that is not
-        // itself being deleted, otherwise a fresh one.
-        let reuse = state
-            .store
-            .list_sessions(50)
-            .ok()
-            .and_then(|list| {
-                list.into_iter()
-                    .find(|s| !ids.contains(&s.id) && s.message_count == 0)
-                    .map(|s| s.id)
-            });
-        match reuse {
-            Some(sid) => state.host.send(HostCmd::SwitchSession { id: sid }),
-            None => state.host.send(HostCmd::NewSession { title: "new session".into() }),
-        }
-    }
-    state.store.delete_sessions(&ids).map_err(|e| e.to_string())
+pub fn clear_session(state: tauri::State<'_, AppState>) {
+    state.host.send(HostCmd::ClearSession);
 }
 
 /// Page-side log line, forwarded into the same stream as the Rust output.
@@ -366,6 +343,10 @@ pub struct RenderReport {
     pub sidebar: bool,
     pub footer: bool,
     pub stream_el: bool,
+    /// True when the view is showing the draft/empty state. Reported because a
+    /// hidden transcript is expected there, and a diagnostic that lies about it
+    /// trains you to ignore the line.
+    pub empty_mode: bool,
     pub body_bg: String,
     pub overlay_present: bool,
     pub text_len: usize,
@@ -384,12 +365,13 @@ pub fn render_report(state: tauri::State<'_, AppState>, report: RenderReport) {
         && report.body_bg != "rgba(0, 0, 0, 0)"
         && report.body_bg != "rgb(0, 0, 0)";
     eprintln!(
-        "[cowry] render {}: titlebar={} sidebar={} footer={} stream={} overlay={} text={} bg={} dpr={:.2}",
+        "[cowry] render {}: titlebar={} sidebar={} footer={} stream={} empty={} overlay={} text={} bg={} dpr={:.2}",
         if sane { "OK" } else { "SUSPECT" },
         report.titlebar,
         report.sidebar,
         report.footer,
         report.stream_el,
+        report.empty_mode,
         report.overlay_present,
         report.text_len,
         report.body_bg,

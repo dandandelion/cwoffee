@@ -38,39 +38,11 @@
   let approvalLeft = $state(0)
   let tick: number | undefined = undefined
   let editingId = $state<number | null>(null)
-  let selectMode = $state(false)
-  let selected = $state<Set<number>>(new Set())
-  let confirmBulkDelete = $state(false)
-
-  function toggleSelect(id: number) {
-    const next = new Set(selected)
-    if (next.has(id)) next.delete(id)
-    else next.add(id)
-    selected = next
-    // Any change to the selection invalidates a pending confirmation.
-    confirmBulkDelete = false
-  }
-
-  function selectAll() {
-    selected = new Set(sessions.map((s) => s.id))
-    confirmBulkDelete = false
-  }
-
-  async function doBulkDelete() {
-    const ids = [...selected]
-    if (!ids.length) return
-    try {
-      const n = await invoke<number>('delete_sessions', { ids })
-      pageLog(`deleted ${n} session(s)`)
-    } catch (e) {
-      pageLog(`delete_sessions failed: ${e}`)
-    }
-    selected = new Set()
-    confirmBulkDelete = false
-    await loadSessions()
-    await refreshState()
-  }
   let editTitle = $state('')
+  // Draft state: no session row exists until the first message is sent, so the
+  // sidebar never fills with blanks and "new session" costs nothing.
+  let viewMsgCount = $state(0)
+  const greeting = pickGreeting()
   let confirmDeleteId = $state<number | null>(null)
   let sidebarOpen = $state(false)
   let models = $state<string[]>([])
@@ -233,6 +205,24 @@
     }
   }
 
+  // Time of day for the greeting; the sub-line is seeded by the date, so it
+  // changes across days but stays stable within one (a line that changed on
+  // every render would be noise, not warmth).
+  function pickGreeting() {
+    const h = new Date().getHours()
+    const hi =
+      h < 5 ? 'Still up?' : h < 12 ? 'Good morning.' : h < 18 ? 'Good afternoon.' : 'Good evening.'
+    const subs = [
+      'Files, spreadsheets, documents, sandboxed commands — on a model you run yourself.',
+      'Ask something, or point me at a directory to work in.',
+      'I can read, write, run and look things up. Nothing leaves this machine.',
+      'Give me a mess. I can turn it into a spreadsheet.',
+      'Start typing. The session only exists once you do.',
+    ]
+    const day = Math.floor(Date.now() / 86_400_000)
+    return { hi, sub: subs[day % subs.length] }
+  }
+
   function shortModel(m: string) {
     if (!m) return 'no model'
     return m.length > 22 ? m.slice(0, 21) + '\u2026' : m
@@ -316,6 +306,8 @@
   // partial answer instead of showing a truncated one. Bounded: a runaway stream
   // must not grow this without limit.
   let liveBuf: EngineEvent[] = []
+  // Empty view = draft, or a session with nothing in it yet.
+  const showEmpty = $derived(viewId === null || (viewMsgCount === 0 && !busy))
   let sentDraft: { text: string; atts: { mime: string; name: string; bytes: number }[] } | null = null
   const LIVE_CAP = 4000
   let eventTaps: ((e: EngineEvent) => void)[] = []
@@ -638,10 +630,26 @@
     // The transcript shows what was attached by name and size, not a thumbnail:
     // history pages carry metadata only, so a thumbnail here would be a preview
     // that disappears the moment the session is reopened.
+    // First message of a draft: create the row now, before the turn, so the
+    // host writes into it. new_session also queues the host switch, and the
+    // command queue preserves the order, so start_turn lands after it.
+    if (viewId === null) {
+      try {
+        const id = await invoke<number>('new_session', { title: 'new session' })
+        viewId = id
+      } catch (e) {
+        pageLog(`new_session on first send failed: ${e}`)
+        return
+      }
+    }
     const shown = pending.map((a) => ({ mime: a.mime, name: a.name, bytes: a.bytes }))
     transcript?.addUser(text, shown)
     sentDraft = { text, atts: shown }
     turnSessionId = viewId
+    // The view is no longer empty the moment a message exists, and a turn does
+    // not go through loadTranscript, so record it here rather than waiting for
+    // a reload that will not come.
+    viewMsgCount = Math.max(viewMsgCount, 1)
     liveBuf = []
     clearAttachments()
     try {
@@ -748,21 +756,21 @@
     await refreshState()
   }
 
-  async function newSession() {
-    let id: number | null = null
+  // Draft, not a new row: a fresh session is a blank view. The row appears when
+  // the first message is sent, already titled by that message.
+  function newSession() {
+    viewId = null
+    viewMsgCount = 0
+    hasOlder = false
+    oldestId = null
+    transcript?.clear()
     try {
-      id = await invoke<number>('new_session', { title: 'new session' })
+      invoke('clear_session')
     } catch (e) {
-      pageLog(`new_session failed: ${e}`)
-      return
+      pageLog(`clear_session failed: ${e}`)
     }
-    if (id !== null) await resyncView(id)
-    try {
-      await invoke('switch_session', { id })
-    } catch (e) {
-      pageLog(`switch_session failed: ${e}`)
-    }
-    await loadSessions()
+    void loadSessions()
+    setTimeout(() => composerEl?.focus(), 0)
   }
 
   function startRename(id: number, current: string) {
@@ -785,22 +793,17 @@
     }
   }
 
+  /// Perform the delete. Confirmation is the caller's business.
+  ///
+  /// This used to carry its own two-step confirm, and so did the row menu. The
+  /// menu set `confirmDeleteId`, then called this, which cleared it and saw
+  /// "not yet confirmed" - so it re-armed the prompt and returned without
+  /// deleting. Every delete from the menu was a no-op. One owner, one confirm.
   async function removeSession(id: number) {
-    // Two-step inline confirm rather than window.confirm: WebKitGTK does not
-    // reliably present a JS dialog, and a confirm() that silently returns false
-    // would make the delete button look broken. Destructive actions need visible
-    // intent.
-    if (confirmDeleteId !== id) {
-      confirmDeleteId = id
-      setTimeout(() => {
-        if (confirmDeleteId === id) confirmDeleteId = null
-      }, 4000)
-      return
-    }
-    confirmDeleteId = null
     try {
       await invoke('delete_session', { id })
       await loadSessions()
+      await refreshState()
     } catch (e) {
       pageLog(`delete_session failed: ${e}`)
     }
@@ -833,10 +836,12 @@
   let loadingOlder = $state(false)
 
   async function loadTranscript(id: number) {
+    viewMsgCount = 0
     const page = await invoke<{ messages: any[]; has_older: boolean }>('session_messages', {
       id,
     })
     transcript?.loadHistory(page.messages)
+    viewMsgCount = page.messages.length
     hasOlder = page.has_older
     oldestId = page.messages.length ? page.messages[0].id : null
   }
@@ -1158,21 +1163,82 @@
         }
         if (!(await waitTurnDone(turnsBeforeLive))) fail('live turn never finished')
       }
-      await invoke('delete_sessions', { ids: [sessA, sessB] })
+      await invoke('delete_session', { id: sessA })
+      await invoke('delete_session', { id: sessB })
 
-      // --- bulk delete ------------------------------------------------------
-      const beforeBulk = await invoke<Session[]>('list_sessions')
-      const junk: number[] = []
-      for (let i = 0; i < 3; i++) junk.push(await invoke<number>('new_session', { title: `selftest junk ${i}` }))
-      const midBulk = await invoke<Session[]>('list_sessions')
-      if (midBulk.length !== beforeBulk.length + 3) {
-        fail(`new_session did not create 3 rows: ${beforeBulk.length} -> ${midBulk.length}`)
+      // --- draft sessions ----------------------------------------------------
+      // "New session" must not leave an empty row behind, and the row must
+      // appear only when the first message is sent - already titled by it.
+      {
+        const beforeDraft = await invoke<Session[]>('list_sessions')
+        newSession()
+        await new Promise((r) => setTimeout(r, 300))
+        const afterDraft = await invoke<Session[]>('list_sessions')
+        if (afterDraft.length !== beforeDraft.length) {
+          fail(`new session created a row: ${beforeDraft.length} -> ${afterDraft.length}`)
+        }
+        if (!showEmpty) fail('draft view did not present the empty state')
+
+        // Deliberately tool-free: a prompt that tempts the model into a tool
+        // call would park this step on an approval nobody is there to answer.
+        draft = 'What is 6 times 7? Answer with just the number.'
+        // Read the turn counter *before* sending. Reading it after can already
+        // be satisfied by the turn we are waiting for, which makes the wait a
+        // no-op and the assertions below race persistence.
+        const turnsBeforeDraft = (await invoke<HostState>('session_state')).turns
+        await send()
+        if (!(await waitTurnDone(turnsBeforeDraft))) {
+          fail('draft first turn never finished')
+        }
+        const afterSend = await invoke<Session[]>('list_sessions')
+        if (afterSend.length !== beforeDraft.length + 1) {
+          fail(`first message did not create exactly one row: ${beforeDraft.length} -> ${afterSend.length}`)
+        }
+        const mine = afterSend.find((x) => x.title.includes('6 times 7'))
+        if (!mine) fail(`the new row was not titled by its first message: ${afterSend.slice(0,3).map((x)=>x.title).join(' | ')}`)
+        if (!(await waitFor('view to leave the empty state', () => !showEmpty, 5000))) {
+          fail(`view stayed empty after sending (viewId=${viewId} msgCount=${viewMsgCount} busy=${busy})`)
+        }
+        if (mine) await invoke('delete_session', { id: mine.id })
       }
-      const removed = await invoke<number>('delete_sessions', { ids: junk })
-      if (removed !== 3) fail(`delete_sessions removed ${removed}, expected 3`)
-      const afterBulk = await invoke<Session[]>('list_sessions')
-      if (afterBulk.length !== beforeBulk.length) {
-        fail(`bulk delete did not restore the count: ${beforeBulk.length} -> ${afterBulk.length}`)
+
+      // --- delete through the actual DOM, the way a user does it ------------
+      {
+        const doomed = await invoke<number>('new_session', { title: 'selftest doomed' })
+        await loadSessions()
+        await new Promise((r) => setTimeout(r, 300))
+        const row = [...document.querySelectorAll('.sessrow')].find((r) =>
+          r.textContent?.includes('selftest doomed'),
+        )
+        if (!row) {
+          fail('the doomed session row was not rendered')
+        } else {
+          const dots = row.querySelector('.iconbtn.more') as HTMLElement | null
+          if (!dots) {
+            fail('no 3-dots control on the session row')
+          } else {
+            dots.click()
+            await new Promise((r) => setTimeout(r, 350))
+            const items = () =>
+              [...document.querySelectorAll('.pop .pop-item')] as HTMLElement[]
+            let del = items().find((b) => b.textContent?.trim() === 'Delete')
+            if (!del) {
+              fail(`row menu did not offer Delete (items: ${items().map((b) => b.textContent?.trim()).join('|')})`)
+            } else {
+              del.click()
+              await new Promise((r) => setTimeout(r, 350))
+              del = items().find((b) => b.textContent?.trim() === 'Delete')
+              if (!del) {
+                fail('two-step confirm never showed a second Delete button')
+              } else {
+                del.click()
+                await new Promise((r) => setTimeout(r, 600))
+                const still = await invoke<Session[]>('list_sessions')
+                if (still.some((x) => x.id === doomed)) fail('session survived the delete flow')
+              }
+            }
+          }
+        }
       }
 
       pageLog(
@@ -1296,6 +1362,7 @@
       sidebar: !!document.querySelector('aside'),
       footer: !!document.querySelector('footer'),
       stream_el: !!document.querySelector('.transcript'),
+      empty_mode: !!document.querySelector('.empty'),
       body_bg: getComputedStyle(document.body).backgroundColor,
       overlay_present: !!document.querySelector('vite-error-overlay'),
       text_len: document.body.innerText.trim().length,
@@ -1451,21 +1518,10 @@
           </button>
         {/each}
       {:else}
-        <div class="sesshead mt-2">
-          <span>Sessions</span>
-          <button
-            class="sesshead-toggle"
-            onclick={() => {
-              selectMode = !selectMode
-              if (!selectMode) selected = new Set()
-            }}
-          >
-            {selectMode ? 'done' : 'select'}
-          </button>
-        </div>
+        <div class="sesshead mt-2"><span>Sessions</span></div>
         {#each sessions as s}
           <div
-            class="sessrow {hostState?.session_id === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''} {selectMode ? 'selecting' : ''}"
+            class="sessrow {hostState?.session_id === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''}"
           >
             {#if editingId === s.id}
               <input
@@ -1482,15 +1538,8 @@
                    not a report. Rename/delete live in a menu so the row stays
                    quiet, and the dot is always laid out (invisible until unread)
                    so titles do not shift when one arrives. -->
-              <button
-                class="sessbtn"
-                onclick={() => (selectMode ? toggleSelect(s.id) : openSession(s.id))}
-              >
-                {#if selectMode}
-                  <span class="sess-check {selected.has(s.id) ? 'on' : ''}" aria-hidden="true"></span>
-                {:else}
-                  <span class="sess-dot" aria-hidden="true"></span>
-                {/if}
+              <button class="sessbtn" onclick={() => openSession(s.id)}>
+                <span class="sess-dot" aria-hidden="true"></span>
                 <span class="sess-title">{s.title}</span>
               </button>
               <button
@@ -1509,7 +1558,18 @@
     </aside>
 
     <!-- main -->
-    <main class="flex min-w-0 flex-1 flex-col min-h-0">
+    <main class="flex min-w-0 flex-1 flex-col min-h-0" class:empty-mode={showEmpty}>
+      {#if showEmpty}
+        <!-- The composer is the subject of an empty session, so the greeting
+             sits above it and the pair is centred rather than pinned down. -->
+        <div class="espacer esp-top" aria-hidden="true"></div>
+        <div class="empty">
+          <span class="empty-mark" aria-hidden="true"></span>
+          <h1 class="empty-hi">{greeting.hi}</h1>
+          <p class="empty-sub">{greeting.sub}</p>
+        </div>
+        <div class="espacer esp-bot" aria-hidden="true"></div>
+      {/if}
       <div class="scroller min-h-0 flex-1 overflow-y-auto px-6 py-6">
         {#if hasOlder}
           <button class="btn-ghost mb-3 text-[12px]" onclick={loadOlder} disabled={loadingOlder}>
@@ -1723,7 +1783,19 @@
           <button class="pop-item danger" onclick={() => removeFromMenu(sid)} role="menuitem">Delete</button>
           <button class="pop-item" onclick={() => (confirmDeleteId = null)} role="menuitem">Cancel</button>
         {:else}
-          <button class="pop-item danger" onclick={() => (confirmDeleteId = sid)} role="menuitem">Delete</button>
+          <button
+            class="pop-item danger"
+            onclick={() => {
+              confirmDeleteId = sid
+              // Let the prompt expire rather than hanging open forever.
+              setTimeout(() => {
+                if (confirmDeleteId === sid) confirmDeleteId = null
+              }, 4000)
+            }}
+            role="menuitem"
+          >
+            Delete
+          </button>
         {/if}
       {/if}
     </div>

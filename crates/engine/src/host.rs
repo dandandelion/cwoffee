@@ -83,6 +83,10 @@ pub enum HostCmd {
     SetModel { model: String },
     /// Move the tools to a different workspace. Refused while a turn is running.
     SetWorkspace { path: String },
+    /// Drop to draft state: no session row, empty prompt. Used after deleting
+    /// the active session, where creating a replacement row just produced
+    /// another blank entry in the sidebar.
+    ClearSession,
     NewSession { title: String },
     SwitchSession { id: i64 },
     Cancel,
@@ -196,20 +200,12 @@ impl SessionHost {
             // start at 0, so this must not be initialised to "the highest
             // persisted seq" or the first message of every session is skipped.
             let mut persisted_next: u64 = 0;
-            let mut session_id: i64 = match store.create_session(
-                "new session",
-                &cfg.workspace.display().to_string(),
-                &cfg.model,
-            ) {
-                Ok(id) => id,
-                Err(e) => {
-                    let _ = ev_tx.send(EngineEvent::Error {
-                        message: format!("cannot open session store: {e}"),
-                        fatal: true,
-                    });
-                    return;
-                }
-            };
+            // 0 means "draft": no session row exists yet. Creating one at
+            // startup (and again on every NewSession) left an empty row behind
+            // for every launch and every click of the button, which accumulated
+            // into a sidebar full of identical blanks. A session row now appears
+            // when the first message is sent.
+            let mut session_id: i64 = 0;
 
             {
                 let mut s = state_bg.lock().unwrap();
@@ -224,6 +220,21 @@ impl SessionHost {
                         agent_cancel.store(true, Ordering::Relaxed);
                     }
 
+                    HostCmd::ClearSession => {
+                        session_id = 0;
+                        persisted_next = 0;
+                        agent.replace_prompt(PromptBuilder::new());
+                        agent.prompt_mut().set_env(cfg.env_block.clone());
+                        {
+                            let mut s = state_bg.lock().unwrap();
+                            s.session_id = 0;
+                            s.context_tokens = 0;
+                        }
+                        let _ = ev_tx.send(EngineEvent::SessionChanged {
+                            session_id: 0,
+                            title: String::new(),
+                        });
+                    }
                     HostCmd::SetWorkspace { path } => {
                         // No busy check is needed, and one here would be dead
                         // code: `Send` runs the turn inline in this loop, so no
@@ -368,6 +379,26 @@ impl SessionHost {
                         };
                         if text.trim().is_empty() && attachments.is_empty() {
                             continue;
+                        }
+                        if session_id == 0 {
+                            match store.create_session(
+                                "new session",
+                                &cfg.workspace.display().to_string(),
+                                &cfg.model,
+                            ) {
+                                Ok(id) => {
+                                    session_id = id;
+                                    persisted_next = 0;
+                                    state_bg.lock().unwrap().session_id = id;
+                                }
+                                Err(e) => {
+                                    let _ = ev_tx.send(EngineEvent::Error {
+                                        message: format!("cannot open session store: {e}"),
+                                        fatal: true,
+                                    });
+                                    continue;
+                                }
+                            }
                         }
                         set_busy(&state_bg, true);
                         let tel: TurnTelemetry =
@@ -718,7 +749,6 @@ mod tests {
             HostConfig::new("test-model", std::env::temp_dir()),
         );
         ready(&h).await;
-        let sid = h.state().session_id;
         h.send(HostCmd::Send {
             text: "what is in this image?".into(),
             attachments: vec![crate::provider::Attachment {
@@ -732,6 +762,8 @@ mod tests {
             seen.load(Ordering::Relaxed) == 1
         })
         .await;
+        // The row only exists once the first message has been sent.
+        let sid = h.state().session_id;
         let hist = store.history(sid).unwrap();
         assert_eq!(hist[0].attachments.len(), 1, "payload must persist for replay");
         assert_eq!(hist[0].attachments[0].data_b64, "aGVsbG8=");
@@ -778,9 +810,11 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
-    async fn ready(h: &SessionHost) {
-        wait_for("initial session id".into(), || h.state().session_id > 0).await;
-    }
+    /// The host starts in draft state: no session row exists until the first
+    /// message is sent, so there is nothing to wait for here. Kept as a named
+    /// call site so tests read as "host is up" rather than a bare no-op.
+    async fn ready(_h: &SessionHost) {}
+
 
     /// Waiting on `busy` is wrong: a fast turn can finish before the first
     /// poll, so `busy` is never observed as true.
