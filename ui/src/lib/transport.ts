@@ -98,7 +98,10 @@ function connect(): Promise<void> {
     }
     ws = sock
 
+    let settled = false
     const settle = (fn: () => void) => {
+      if (settled) return
+      settled = true
       connecting = null
       fn()
     }
@@ -158,6 +161,14 @@ function connect(): Promise<void> {
       role = null
       connecting = null
       failAll('gateway connection closed')
+      // If the socket dies before auth_ok, the connect promise has to settle.
+      // It used not to: `await connect()` then hung forever, loadModels() never
+      // returned, modelErr stayed empty, and the model menu reported "this
+      // endpoint does not list models" when the truth was "there is no
+      // connection" - which is exactly what was reported from a phone.
+      if (!settled) {
+        reject(new Error('gateway closed the connection before authenticating'))
+      }
       // Reconnect unless the page is going away. A phone that drops wifi should
       // pick the session back up when it returns rather than sit on a dead view.
       if (wantSocket && reconnect == null) {
@@ -172,12 +183,20 @@ function connect(): Promise<void> {
       /* onclose follows and handles it */
     }
   })
-  connecting = p
+  // A socket stuck in CONNECTING must not wedge the whole boot: nothing else
+  // settles this promise, so put a ceiling on it.
+  const guarded: Promise<void> = Promise.race([
+    p,
+    new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error('gateway did not respond within 15s')), 15000),
+    ),
+  ])
+  connecting = guarded
   // The stored promise may be awaited by nobody if the first caller already
   // gave up; swallow the orphan rejection so it does not surface as an
   // unhandled error while still propagating to real awaiters.
-  p.catch(() => {})
-  return p
+  guarded.catch(() => {})
+  return guarded
 }
 
 export async function invoke<T = unknown>(

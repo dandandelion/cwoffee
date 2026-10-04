@@ -131,6 +131,17 @@ fn role_for(token: &str, cfg: &GatewayConfig) -> Option<Role> {
 /// Safari has no console to check which one happened. Collapsing both into
 /// "gateway rejected the token" is what sent the first report off to edit a
 /// config file on the wrong machine.
+/// True if the first line of a (possibly partial) request targets `prefix`.
+///
+/// The upgrade header may not have arrived yet when we have to decide, but the
+/// request line always has: it is the first thing any client sends.
+fn request_line_targets(head: &str, prefix: &str) -> bool {
+    match head.split_whitespace().nth(1) {
+        Some(path) => path.starts_with(prefix),
+        None => false,
+    }
+}
+
 fn auth_refusal_reason(token: &str) -> &'static str {
     if token.is_empty() {
         "no token supplied: open the URL with ?token=<CWOFFEE_GATEWAY_TOKEN>"
@@ -242,10 +253,28 @@ async fn connection(
     // handshake that had already been consumed: every WebSocket connection hung
     // open with no response. peek() leaves the bytes in the socket, so the
     // websocket layer can read its own request.
+    //
+    // One peek is not enough. A phone on a cellular link, or anything behind a
+    // proxy, can deliver the handshake in pieces, and a first peek holding only
+    // "GET /ws HTTP/1.1\r\n" would be classified as plain HTTP and answered with
+    // a 404 - which the client sees as a socket that closes, and then retries
+    // forever. Peek until the header block terminates, and fall back to the
+    // request line: a GET for /ws is an upgrade whatever else arrived.
     let mut peeked = vec![0u8; 2048];
-    let n = stream.peek(&mut peeked).await?;
-    let head_peek = String::from_utf8_lossy(&peeked[..n]).to_ascii_lowercase();
-    if head_peek.contains("upgrade: websocket") {
+    let mut head_peek = String::new();
+    for attempt in 0..4 {
+        let n = stream.peek(&mut peeked).await?;
+        if n > 0 {
+            head_peek = String::from_utf8_lossy(&peeked[..n]).to_ascii_lowercase();
+            if head_peek.contains("\r\n\r\n") || head_peek.contains("upgrade: websocket") {
+                break;
+            }
+        }
+        // Nothing more has arrived yet; give the peer a moment to send the rest.
+        tokio::time::sleep(std::time::Duration::from_millis(40 * (attempt + 1))).await;
+    }
+    let wants_ws = head_peek.contains("upgrade: websocket") || request_line_targets(&head_peek, "/ws");
+    if wants_ws {
         let ws = tokio_tungstenite::accept_async(stream).await?;
         return websocket(ws, cfg, handle, peer.to_string()).await;
     }
@@ -800,6 +829,18 @@ mod tests {
 
     /// The two tokens must not be interchangeable by prefix either: a shorter
     /// watch token that is a prefix of the drive token must not match.
+    #[test]
+    fn a_partial_handshake_is_still_recognised_as_a_websocket_upgrade() {
+        // The upgrade header is the obvious signal, but on a split first segment
+        // only the request line has arrived. Both have to route to the websocket
+        // layer, or a phone gets a 404 and retries forever.
+        assert!(request_line_targets("get /ws http/1.1\r\n", "/ws"));
+        assert!(request_line_targets("get /ws?x=1 http/1.1\r\nhost: x\r\n", "/ws"));
+        assert!(!request_line_targets("get /assets/app.js http/1.1\r\n", "/ws"));
+        assert!(!request_line_targets("get", "/ws"));
+        assert!(!request_line_targets("", "/ws"));
+    }
+
     #[test]
     fn an_absent_token_is_reported_differently_from_a_wrong_one() {
         // Same symptom in the UI, opposite causes.

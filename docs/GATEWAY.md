@@ -54,6 +54,16 @@ highlights what you are looking at (`viewId`), not what the host last switched t
 The workspace chip shows the host's workspace and is read-only in the browser; the
 tooltip says so and points at the desktop to change it.
 
+### Model list empty on a phone
+
+`This endpoint does not list models. Using —` in the model menu does not mean the
+endpoint has no `/models`. It meant the socket never authenticated: `connect()`
+left its promise unsettled when the socket closed before `auth_ok`, so the model
+fetch never returned and the menu fell through to its "server said no" branch.
+The menu now checks connection state first and says **Not connected to the host**
+with the actual reason, and the banner's `retry` re-fetches state, sessions and
+the model list without a page reload.
+
 ### When auth fails
 
 The server distinguishes the two cases, logs the peer without the token, and the

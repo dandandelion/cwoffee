@@ -269,3 +269,25 @@ Two rules:
 * a command that cannot be honoured should return an error, not a plausible object;
 * anything rendered from a remote struct gets guarded field by field. One missing
   key must not take down the whole view.
+
+## Trap 15: a connect promise that never settles invents a false diagnosis
+
+`connect()` resolved on `auth_ok`/`ready` and rejected on `auth_fail`, but **not**
+when the socket simply closed first. So if the upgrade never completed - a 404 on
+`/ws`, a proxy, a captive portal, a server that went away - `await connect()` hung
+forever. `loadModels()` never returned, `modelErr` stayed empty, and the model menu
+rendered the `{:else}` branch: *"This endpoint does not list models. Using —"*.
+
+That is the interesting kind of bug: the UI was not wrong about what it had, it was
+reporting the absence of a value it never got, and the message blamed a llama.cpp
+server that was running fine. Two rules:
+
+* every promise that represents a connection must settle on **all** terminal paths,
+  including plain close;
+* a UI branch that means "the server said no" must be distinguished from "we never
+  asked". Guard the branch on connection state, not just on an empty result.
+
+Related: one `peek()` is not enough to classify a request. A handshake split across
+segments leaves a first peek holding only `GET /ws HTTP/1.1`, which is not the
+upgrade header. Decide on the header *or* the request-line path, after retrying the
+peek a few times.

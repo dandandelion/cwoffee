@@ -566,6 +566,10 @@
       await refreshState()
       await loadSessions()
       await adoptHostSession()
+      // The model list is fetched once at boot; if boot happened while the
+      // transport was down, a successful retry has to fetch it too or the menu
+      // stays empty for the rest of the session.
+      void loadModels()
     }
   }
 
@@ -2180,7 +2184,13 @@
           {/each}
         {:else}
           <div class="pop-empty">
-            {#if modelErr}
+            {#if !ipc.ok}
+              <!-- Not the endpoint's fault: there is no connection to ask. Saying
+                   "this endpoint does not list models" here sends people to debug
+                   a server that is running fine. -->
+              <strong>Not connected to the host.</strong><br />
+              <span class="pop-mono">{ipc.msg}</span>
+            {:else if modelErr}
               <strong>Cannot reach the endpoint.</strong><br />
               <span class="pop-mono">{modelErr}</span><br />
               Start the server, or fix the URL in
