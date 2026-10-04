@@ -87,6 +87,43 @@ Verified behaviour, from the LAN address rather than from a unit test:
 * correct token -> `drive`, and `list_sessions` / `session_state` answer.
 * a turn driven from the browser streams into the browser *and* the desktop window.
 
+### Why the first load took a while
+
+Reported from a phone: the page paints quickly, but the session list and model
+name lag behind it. Measured, the server was never the problem:
+
+| step | before | after |
+|---|---|---|
+| TCP + WebSocket handshake | ~1ms | ~1ms |
+| auth round trip | **~41ms** | ~0.5ms |
+| boot RPCs | 4 serial calls | 1 `bootstrap` call |
+| static assets | 3 requests, 3 TCP connections | 3 requests, 1 connection |
+| asset re-fetch on every visit | yes (`no-store`) | no (`immutable`) |
+
+Four separate causes, all invisible in a server log:
+
+1. **Nagle on the accepted socket.** The protocol is a chain of tiny messages
+   (hello, auth_ok, ready, one reply per RPC), and Nagle plus delayed ACK made
+   each back-to-back write wait for the previous acknowledgement. 41ms between
+   `auth_ok` and `ready`, on every connection. Fixed with `set_nodelay(true)`.
+2. **Serial boot.** `session_state`, `list_sessions`, `list_models` and
+   `session_messages` were awaited one after another, and a `gpu_report` call
+   that always fails over the gateway sat in the middle of it.
+3. **`Connection: close` on static serving.** Every asset cost a fresh TCP
+   handshake. On the measured path to the iPhone (direct on the LAN per
+   `tailscale status`, but 200-400ms and 25% loss because iOS parks the Wi-Fi
+   radio) that is several round trips before the app can even run.
+4. **`Cache-Control: no-store` everywhere.** The JS/CSS names are content-hashed
+   and can never change under the same name, yet every visit re-fetched ~148K.
+   `/assets/*` is now `immutable`; `index.html` stays `no-cache` so a rebuilt app
+   is never invisible.
+
+The lesson that generalises: on a high-RTT link the **number of round trips** is
+the user-perceived latency, not the work. Server-side the whole boot protocol now
+measures ~5ms; the phone still pays roughly one RTT each for TCP, the WebSocket
+handshake, auth, and `bootstrap`. That is why boot is one RPC now rather than
+four.
+
 ### The part that is not done
 
 * **No TLS.** The startup line says so out loud. A bearer token over plain HTTP

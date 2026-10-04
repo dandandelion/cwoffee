@@ -309,3 +309,27 @@ a client that sends the request line, waits 2.5s, then sends the remaining heade
 When you reproduce a handshake by hand, be careful that your split does not insert
 a second `\r\n` - that terminates the header block early and produces a bogus
 "Junk after client request" that looks like a server bug and is a test bug.
+
+## Trap 17: a blocking client read inside `#[tokio::test]` starves the server task
+
+`#[tokio::test]` runs on a **current-thread** runtime. A test that spawns the
+connection handler and then calls `client.read_to_string(...)` blocks the only
+thread, so the handler never runs, the read times out, and the failure reads as
+"the server sent zero bytes". It had in fact sent everything - after the test
+gave up.
+
+Use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` when the test
+drives a real socket from blocking std code, or move the client I/O into
+`spawn_blocking`.
+
+## Trap 18: keep-alive must not discard bytes past the request head
+
+Once a connection answers more than one request, a single `read()` can return the
+head of request 1 *and* part of request 2. The first keep-alive version did
+`buf.truncate(pos + 4)`, which threw request 2 away: the client sat waiting for a
+response that would never be written. Keep the buffer across iterations and
+`drain(..head_end)` instead of truncating.
+
+The test that catches it pipelines two requests in one write. Sequential requests
+(a browser, `curl`, `http.client`) all pass without it, so pipelining has to be
+tested explicitly.

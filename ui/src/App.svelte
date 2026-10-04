@@ -562,15 +562,10 @@
   async function retryAttach() {
     connNote = ''
     await attachChannel()
-    if (!connNote) {
-      await refreshState()
-      await loadSessions()
-      await adoptHostSession()
-      // The model list is fetched once at boot; if boot happened while the
-      // transport was down, a successful retry has to fetch it too or the menu
-      // stays empty for the rest of the session.
-      void loadModels()
-    }
+    if (connNote) return
+    if (transportKind === 'gateway' && (await bootstrapGateway())) return
+    await Promise.all([refreshState(), loadSessions(), loadModels()])
+    await adoptHostSession()
   }
 
   async function chooseWorkspace() {
@@ -825,6 +820,53 @@
     // read-only - viewing is not switching.
     const recent = sessions.find((s) => s.message_count > 0)
     if (recent) await resyncView(recent.id)
+  }
+
+  /**
+   * Everything a cold client needs, in one round trip.
+   *
+   * Boot used to be four RPCs. Each costs the server under 2ms, but a phone on
+   * the measured path (Tailscale to an iOS device, ~200-400ms RTT and lossy)
+   * pays a full round trip for each one, so the number of calls - not the work -
+   * is what feels slow. Returns false when the server has no such command, so
+   * boot falls back to the individual calls rather than showing nothing.
+   */
+  async function bootstrapGateway(): Promise<boolean> {
+    try {
+      const b = await invoke<{
+        state: HostState
+        sessions: Session[]
+        models: string[]
+        session_id: number | null
+        page: { messages: any[]; has_older: boolean }
+      }>('bootstrap')
+      hostState = b.state
+      if (hostState) {
+        mode = hostState.mode
+        thinking = hostState.reasoning
+        model = hostState.model
+      }
+      sessions = b.sessions ?? []
+      recordSeen(sessions)
+      applyUnread(sessions)
+      models = b.models ?? []
+      modelErr = ''
+      const page = b.page ?? { messages: [], has_older: false }
+      if (b.session_id) {
+        // The server picked which session to show using the same rule this client
+        // would have applied, so the transcript arrives with the rest.
+        viewId = b.session_id
+        transcript?.clear()
+        transcript?.loadHistory(page.messages)
+        viewMsgCount = page.messages.length
+        hasOlder = page.has_older
+        oldestId = page.messages.length ? page.messages[0].id : null
+      }
+      return true
+    } catch (e) {
+      pageLog(`bootstrap failed, falling back to separate calls: ${String(e)}`)
+      return false
+    }
   }
 
   async function loadSessions() {
@@ -1664,11 +1706,16 @@
   // resolve it lazily and record the failure instead.
   let win: Awaited<ReturnType<typeof getCurrentWindow>> | null = null
   let winErr = ''
-  try {
-    win = getCurrentWindow()
-  } catch (e) {
-    winErr = String(e)
-    console.error('[cwoffee] getCurrentWindow failed:', e)
+  // In gateway mode there is no window to control, and calling it anyway logged a
+  // stack trace on every phone load - noise that reads like a real fault on a
+  // device with no console open.
+  if (transportKind === 'tauri') {
+    try {
+      win = getCurrentWindow()
+    } catch (e) {
+      winErr = String(e)
+      console.error('[cwoffee] getCurrentWindow failed:', e)
+    }
   }
   // A missing permission, a missing window handle, or a null `win` all look
   // identical from the outside: the button does nothing. Log which one it was.
@@ -1757,21 +1804,36 @@
     // should come back on its own rather than sit on "connecting…" until someone
     // reloads the tab.
     if (transportKind === 'gateway') onReconnect(() => void retryAttach())
-    // Non-blocking: a missing /models must not delay first paint.
-    void loadModels()
-    try {
-      gpu = await invoke<GpuReport>('gpu_report')
-    } catch (e) {
-      gpu = null
-      ipc = { ok: false, msg: String(e).slice(0, 140) }
-      pageLog(`gpu_report FAILED: ${String(e)}`)
+    // One round trip in gateway mode; on a phone link this is the difference
+    // between "a moment" and a wait you notice. Desktop keeps the parallel
+    // calls because they are sub-millisecond over IPC.
+    let booted = false
+    if (transportKind === 'gateway') booted = await bootstrapGateway()
+    if (!booted) {
+      // The independent fetches run concurrently. They used to be awaited one
+      // after another, and over a VPN each one pays a full round trip.
+      const fetches: Promise<unknown>[] = [refreshState(), loadSessions(), loadModels()]
+      if (transportKind === 'tauri') {
+        // gpu_report is desktop-only and always errors over the gateway, so asking
+        // for one there is a guaranteed-failed round trip in the middle of boot.
+        fetches.push(
+          invoke<GpuReport>('gpu_report')
+            .then((g) => {
+              gpu = g
+            })
+            .catch((e) => {
+              gpu = null
+              ipc = { ok: false, msg: String(e).slice(0, 140) }
+              pageLog(`gpu_report FAILED: ${String(e)}`)
+            }),
+        )
+      }
+      await Promise.all(fetches)
+      // Open the host's current session rather than a blank draft. On a phone this
+      // was the whole "it's using its own session" impression: the list was there
+      // but the transcript was the empty screen.
+      await adoptHostSession()
     }
-    await refreshState()
-    await loadSessions()
-    // Open the host's current session rather than a blank draft. On a phone this
-    // was the whole "it's using its own session" impression: the list was there
-    // but the transcript was the empty screen.
-    await adoptHostSession()
     if (winErr) pageLog(`getCurrentWindow FAILED: ${winErr}`)
     pageLog(`mounted text=${document.body.innerText.trim().length}`)
     setTimeout(() => void reportRender('mount'), 400)

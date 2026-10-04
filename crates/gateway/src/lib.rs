@@ -225,6 +225,13 @@ pub async fn serve(cfg: GatewayConfig, handle: Arc<EngineHandle>) -> Result<(), 
                 continue;
             }
         };
+        // Nagle is actively harmful here. The protocol is a sequence of small
+        // messages - hello, auth_ok, ready, then one reply per RPC - and with
+        // Nagle plus delayed ACK each back-to-back small write waits for the
+        // previous acknowledgement: a measured ~40ms between auth_ok and ready on
+        // a link with sub-millisecond RTT. The boot does several such round trips,
+        // so on a phone over a VPN the cost compounds into seconds of "connecting".
+        let _ = stream.set_nodelay(true);
         let cfg = Arc::clone(&cfg);
         let handle = Arc::clone(&handle);
         tokio::spawn(async move {
@@ -241,6 +248,8 @@ pub async fn serve(cfg: GatewayConfig, handle: Arc<EngineHandle>) -> Result<(), 
 /// Headers are read before deciding anything, so a request that is not a
 /// WebSocket upgrade can be answered as plain HTTP.
 const MAX_HEAD: usize = 16 * 1024;
+/// A keep-alive connection that goes quiet must not pin a task indefinitely.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 async fn connection(
     mut stream: TcpStream,
@@ -313,42 +322,86 @@ async fn connection(
     }
 
     // Plain HTTP: now actually consume the request head.
-    let mut buf = Vec::new();
+    // Served with keep-alive. `Connection: close` forced a fresh TCP connection
+    // per asset, and on a high-RTT link each one costs a round trip before a
+    // single byte of the app arrives: four assets, four connections.
     let mut tmp = [0u8; 4096];
+    // Bytes past the end of one request head belong to the next request. Dropping
+    // them (the first version truncated) silently swallowed pipelined requests and
+    // left the client waiting for a response that would never be written.
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(());
+        let head_end = loop {
+            if let Some(pos) = find_double_crlf(&buf) {
+                break pos + 4;
+            }
+            // An unbounded header read is a memory DoS on a reachable port, and a
+            // keep-alive connection that goes quiet must not pin a task forever.
+            let n = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut tmp)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) | Err(_) => return Ok(()),
+            };
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() > MAX_HEAD {
+                let _ = respond(&mut stream, 431, "text/plain", b"headers too large", false, "no-store").await;
+                return Ok(());
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+        buf.drain(..head_end);
+        let (method, path, headers) = match parse_head(&head) {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        // HTTP/1.1 keeps the connection open unless the client says otherwise.
+        let keep_alive = headers
+            .get("connection")
+            .map(|v| !v.eq_ignore_ascii_case("close"))
+            .unwrap_or(true);
+
+        if method != "GET" && method != "HEAD" {
+            // The RPC surface is the socket, not a POST endpoint: keeping static
+            // serving read-only means a bug in the file server cannot become a way
+            // to drive the agent.
+            respond(&mut stream, 405, "text/plain", b"method not allowed", keep_alive, "no-store").await?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_double_crlf(&buf) {
-            buf.truncate(pos + 4);
-            break;
+
+        match serve_static(&cfg.dist, &path) {
+            Some((status, ctype, body)) => {
+                respond(&mut stream, status, &ctype, &body, keep_alive, cache_for(&path)).await?
+            }
+            None => {
+                eprintln!("[cwoffee] gateway {peer}: no route for {path}");
+                respond(&mut stream, 404, "text/plain", b"not found", keep_alive, "no-store").await?
+            }
         }
-        // An unbounded read here is a trivial memory DoS on a port that may be
-        // network-reachable.
-        if buf.len() > MAX_HEAD {
-            let _ = respond(&mut stream, 431, "text/plain", b"headers too large").await;
+        if !keep_alive {
             return Ok(());
         }
     }
+}
 
-    let head = String::from_utf8_lossy(&buf).to_string();
-    let (method, path, _headers) = parse_head(&head).ok_or("malformed request line")?;
-
-    if method != "GET" && method != "HEAD" {
-        // The RPC surface is the socket, not a POST endpoint: keeping static
-        // serving read-only means a bug in the file server cannot become a way
-        // to drive the agent.
-        return respond(&mut stream, 405, "text/plain", b"method not allowed").await;
-    }
-
-    match serve_static(&cfg.dist, &path) {
-        Some((status, ctype, body)) => respond(&mut stream, status, &ctype, &body).await,
-        None => {
-            eprintln!("[cwoffee] gateway {peer}: no route for {path}");
-            respond(&mut stream, 404, "text/plain", b"not found").await
-        }
+/// Cache policy per resource.
+///
+/// `no-store` everywhere was costing every real visit: the JS/CSS filenames are
+/// content-hashed, so they can never change under the same name, yet each page
+/// load re-fetched all of them. On the measured path to a phone (direct on the
+/// LAN, but ~200-400ms and lossy because iOS parks the Wi-Fi radio) that is
+/// several round trips of pure waste.
+fn cache_for(path: &str) -> &'static str {
+    if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        // index.html must revalidate, or a rebuilt app is invisible.
+        "no-cache"
     }
 }
 
@@ -446,6 +499,8 @@ async fn respond(
     status: u16,
     ctype: &str,
     body: &[u8],
+    keep_alive: bool,
+    cache: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reason = match status {
         200 => "OK",
@@ -457,8 +512,9 @@ async fn respond(
     };
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
-         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-        body.len()
+         Cache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\nConnection: {}\r\n\r\n",
+        body.len(),
+        if keep_alive { "keep-alive" } else { "close" }
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body).await?;
@@ -705,6 +761,51 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             serde_json::to_value(page).map_err(|e| e.to_string())
         }
         "migration_notes" => Ok(json!([] as [String; 0])),
+
+        // Everything a cold client needs, in one round trip.
+        //
+        // Boot used to be four RPCs. Server-side each one costs under 2ms, but a
+        // phone on the measured path pays 200-400ms per round trip, so the number
+        // of calls - not the work - is what the user experiences as "slow".
+        "bootstrap" => {
+            let state = serde_json::to_value(h.host.state()).map_err(|e| e.to_string())?;
+            let sessions =
+                serde_json::to_value(h.store.list_sessions(50).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            // A model list that fails must not blank the app; the client shows the
+            // error in the model menu instead.
+            let models = match h.host.provider().list_models().await {
+                Ok(m) => serde_json::to_value(m).unwrap_or_else(|_| json!([])),
+                Err(_) => json!([]),
+            };
+            // Same rule the client applied when it did this in four calls: the
+            // host's open session if it has one, otherwise the most recent real
+            // conversation. list_sessions is newest-first, so `find` is that rule.
+            let open = state.get("session_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let view = if open > 0 {
+                Some(open)
+            } else {
+                sessions.as_array().and_then(|a| {
+                    a.iter()
+                        .find(|s| s.get("message_count").and_then(|m| m.as_i64()).unwrap_or(0) > 0)
+                        .and_then(|s| s.get("id").and_then(|v| v.as_i64()))
+                })
+            };
+            let page = match view {
+                Some(id) => serde_json::to_value(
+                    h.store.messages_page(id, None, 60).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?,
+                None => json!({ "messages": [], "has_older": false }),
+            };
+            Ok(json!({
+                "state": state,
+                "sessions": sessions,
+                "models": models,
+                "session_id": view,
+                "page": page,
+            }))
+        }
 
         // ---- drive ---------------------------------------------------------
         "start_turn" => {
@@ -994,6 +1095,183 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hashed assets are cacheable forever; the shell must revalidate.
+    #[test]
+    fn hashed_assets_cache_and_the_shell_does_not() {
+        assert_eq!(
+            cache_for("/assets/index-DhzC1Ss8.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_for("/"), "no-cache");
+        assert_eq!(cache_for("/index.html"), "no-cache");
+        // A rebuilt app ships new hashed names, so immutability is safe; but the
+        // shell is the one file that must never be served stale.
+        assert!(!cache_for("/").contains("immutable"));
+    }
+
+    /// Static serving must answer more than one request per connection.
+    /// `Connection: close` meant a fresh TCP handshake per asset: on the measured
+    /// phone path (~200-400ms, lossy) three assets cost more than the app logic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_serving_answers_several_requests_on_one_connection() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("cwoffee_dist_ka_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("index.html"), b"<html>shell</html>").unwrap();
+        std::fs::write(dir.join("assets/app-abc.js"), b"console.log(1)").unwrap();
+
+        let cfg = Arc::new(GatewayConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            dist: dir.clone(),
+            drive_token: None,
+            watch_token: None,
+        });
+        let handle = test_handle();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, peer) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let svc = tokio::spawn(connection(
+            tokio::net::TcpStream::from_std(server).unwrap(),
+            peer,
+            cfg,
+            handle,
+        ));
+
+        client
+            .write_all(
+                b"GET /assets/app-abc.js HTTP/1.1\r\nHost: x\r\n\r\n\
+                   GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        // Bounded so a broken loop fails the test instead of hanging it.
+        client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut all = String::new();
+        client.read_to_string(&mut all).unwrap();
+        // The second request said `Connection: close`, so the task must finish.
+        tokio::time::timeout(std::time::Duration::from_secs(5), svc)
+            .await
+            .expect("connection task outlived a closing client")
+            .expect("connection task panicked")
+            .expect("connection returned an error");
+
+        assert_eq!(
+            all.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "expected two responses on one connection, got: {all}"
+        );
+        assert!(all.contains("Connection: keep-alive"), "first reply must persist: {all}");
+        assert!(all.contains("Connection: close"), "second reply must honour close: {all}");
+        assert!(all.contains("Cache-Control: public, max-age=31536000, immutable"));
+        assert!(all.contains("console.log(1)"));
+        assert!(all.contains("<html>shell</html>"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request head that never terminates must not sit on a task forever.
+    #[tokio::test]
+    async fn an_idle_connection_is_dropped_rather_than_pinned() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_dist_idle_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"<html>x</html>").unwrap();
+        let cfg = Arc::new(GatewayConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            dist: dir.clone(),
+            drive_token: None,
+            watch_token: None,
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, peer) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        // READ_TIMEOUT is 20s, far longer than this test: what matters is that a
+        // half-open peer cannot keep the task alive indefinitely.
+        assert!(READ_TIMEOUT.as_secs() >= 5);
+        let svc = tokio::spawn(connection(
+            tokio::net::TcpStream::from_std(server).unwrap(),
+            peer,
+            cfg,
+            test_handle(),
+        ));
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), svc)
+            .await
+            .expect("connection task outlived a dropped client")
+            .expect("connection task panicked")
+            .expect("connection returned an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Boot must be one call, and it must pick the session the client would have
+    /// picked: the host's open session, else the newest one with messages.
+    #[tokio::test]
+    async fn bootstrap_returns_state_sessions_models_and_a_transcript_at_once() {
+        let h = test_handle();
+        let s1 = h.store.create_session("older chat", "/tmp", "m").unwrap();
+        let s2 = h.store.create_session("newest chat", "/tmp", "m").unwrap();
+        use cwoffee_engine::provider::Message;
+        h.store.append_message(s2, &Message::user("hello there")).unwrap();
+        h.store.append_message(s1, &Message::user("older")).unwrap();
+
+        let out = run_cmd("bootstrap", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("bootstrap failed");
+        assert!(out.get("state").is_some(), "no host state");
+        assert_eq!(out["sessions"].as_array().unwrap().len(), 2);
+        assert!(out["models"].is_array(), "models must be an array even when empty");
+        // Neither session is open on the host, so the newest conversation wins.
+        assert_eq!(out["session_id"].as_i64(), Some(s2 as i64));
+        let page = out.get("page").unwrap();
+        assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(page["messages"][0]["content"], "hello there");
+
+        // An open host session outranks recency.
+        run_cmd("switch_session", serde_json::json!({"id": s1}), Role::Drive, &h)
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if h.host.state().session_id as i64 == s1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let out2 = run_cmd("bootstrap", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .unwrap();
+        assert_eq!(
+            out2["session_id"].as_i64(),
+            out2["state"]["session_id"].as_i64(),
+            "an open host session must win over recency"
+        );
+    }
+
+    /// A watch token must be able to boot: read-only is the whole point.
+    #[tokio::test]
+    async fn bootstrap_is_available_to_a_watch_only_client() {
+        let h = test_handle();
+        assert!(run_cmd("bootstrap", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .is_ok());
+    }
+
+    fn test_handle() -> Arc<EngineHandle> {
+        let p: Arc<dyn cwoffee_engine::provider::Provider> = Arc::new(FakeProvider);
+        Arc::new(EngineHandle {
+            host: Arc::new(SessionHost::spawn(
+                p,
+                cwoffee_engine::tools::Registry::new(),
+                Arc::new(Store::in_memory().unwrap()),
+                cwoffee_engine::host::HostConfig::new("m", std::env::temp_dir()),
+            )),
+            store: Arc::new(Store::in_memory().unwrap()),
+            events: broadcast::channel(8).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     #[test]
