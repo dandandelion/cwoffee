@@ -69,6 +69,11 @@ let eventHandler: ((ev: EngineEvent) => void) | null = null
 let reconnect: ReturnType<typeof setTimeout> | null = null
 let backoff = 500
 let wantSocket = false
+// Notified after a *re*connection, so the UI can re-fetch what it had lost. A
+// phone that drops wifi should come back to its session, not to a blank page.
+let reconnectedCb: (() => void) | null = null
+let everConnected = false
+let timeouts = 0
 // The in-flight handshake, shared. Without this, two concurrent callers both
 // called connect(); the second saw readyState CONNECTING and resolved early, then
 // `ws.send()` fired on a socket that was not open yet - the RPC was silently
@@ -99,9 +104,25 @@ function connect(): Promise<void> {
     ws = sock
 
     let settled = false
+    // The ceiling lives inside the executor, not around it. A Promise.race on the
+    // outside left the real socket half-open and `connecting` populated with the
+    // timed-out promise, so every later call reused that dead promise and failed
+    // instantly without ever trying a new socket - the page sat on "connecting…"
+    // and a refresh was the only way out.
+    const timer = setTimeout(() => {
+      if (!settled) {
+        try {
+          sock.close()
+        } catch {
+          /* already gone */
+        }
+        reject(new Error('gateway did not answer the handshake within 15s'))
+      }
+    }, 15000)
     const settle = (fn: () => void) => {
       if (settled) return
       settled = true
+      clearTimeout(timer)
       connecting = null
       fn()
     }
@@ -121,7 +142,14 @@ function connect(): Promise<void> {
       switch (v.type) {
         case 'auth_ok':
           role = v.role
-          settle(resolve)
+          settle(() => {
+            // Fired on every successful auth. The first boot may itself have
+            // failed, so "only on reconnect" would leave a phone that connected
+            // on the second attempt staring at a blank page.
+            reconnectedCb?.()
+            everConnected = true
+            resolve()
+          })
           break
         case 'auth_fail':
           // The server says which half of "auth failed" this is. A missing token
@@ -134,7 +162,14 @@ function connect(): Promise<void> {
           break
         case 'ready':
           role = v.role
-          settle(resolve)
+          settle(() => {
+            // Fired on every successful auth. The first boot may itself have
+            // failed, so "only on reconnect" would leave a phone that connected
+            // on the second attempt staring at a blank page.
+            reconnectedCb?.()
+            everConnected = true
+            resolve()
+          })
           break
         case 'event':
           // Engine events are pushed, not polled. The transcript already batches
@@ -183,20 +218,12 @@ function connect(): Promise<void> {
       /* onclose follows and handles it */
     }
   })
-  // A socket stuck in CONNECTING must not wedge the whole boot: nothing else
-  // settles this promise, so put a ceiling on it.
-  const guarded: Promise<void> = Promise.race([
-    p,
-    new Promise<void>((_, reject) =>
-      setTimeout(() => reject(new Error('gateway did not respond within 15s')), 15000),
-    ),
-  ])
-  connecting = guarded
+  connecting = p
   // The stored promise may be awaited by nobody if the first caller already
   // gave up; swallow the orphan rejection so it does not surface as an
   // unhandled error while still propagating to real awaiters.
-  guarded.catch(() => {})
-  return guarded
+  p.catch(() => {})
+  return p
 }
 
 export async function invoke<T = unknown>(
@@ -235,6 +262,23 @@ export async function invoke<T = unknown>(
       if (pending.has(id)) {
         pending.delete(id)
         reject(new Error(`gateway did not answer ${cmd}`))
+        // Two unanswered calls in a row means the socket is a lie: iOS Safari
+        // suspends a backgrounded tab and the peer can vanish without the browser
+        // ever reporting a close. readyState still says OPEN, so nothing else would
+        // ever reconnect. Drop it so the next call starts from a fresh socket.
+        timeouts += 1
+        if (timeouts >= 2) {
+          timeouts = 0
+          try {
+            ws?.close()
+          } catch {
+            /* already gone */
+          }
+          ws = null
+          connecting = null
+        }
+      } else {
+        timeouts = 0
       }
     }, 20000)
   })
@@ -243,4 +287,9 @@ export async function invoke<T = unknown>(
 /** Which capability the current socket has, for disabling controls in the UI. */
 export function gatewayRole(): 'drive' | 'watch' | null {
   return isTauri ? 'drive' : role
+}
+
+/** Register a callback fired after the socket reconnects (not on first connect). */
+export function onReconnect(cb: () => void): void {
+  reconnectedCb = cb
 }

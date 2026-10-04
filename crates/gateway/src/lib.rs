@@ -262,20 +262,53 @@ async fn connection(
     // request line: a GET for /ws is an upgrade whatever else arrived.
     let mut peeked = vec![0u8; 2048];
     let mut head_peek = String::new();
-    for attempt in 0..4 {
+    let mut head_complete = false;
+    // Wait for the header block to actually terminate. The first version gave up
+    // after four peeks totalling ~240ms of waiting; on a split first segment that
+    // left only "GET /ws HTTP/1.1\r\n" visible, the connection was routed to the
+    // websocket layer anyway, and accept_async answered
+    // `Junk after client request` and closed. A browser sends the handshake in one
+    // segment; a phone on a cellular link does not always.
+    for _ in 0..20 {
         let n = stream.peek(&mut peeked).await?;
         if n > 0 {
             head_peek = String::from_utf8_lossy(&peeked[..n]).to_ascii_lowercase();
-            if head_peek.contains("\r\n\r\n") || head_peek.contains("upgrade: websocket") {
+            if head_peek.contains("\r\n\r\n") {
+                head_complete = true;
+                break;
+            }
+            if head_peek.contains("upgrade: websocket") {
+                head_complete = true;
                 break;
             }
         }
-        // Nothing more has arrived yet; give the peer a moment to send the rest.
-        tokio::time::sleep(std::time::Duration::from_millis(40 * (attempt + 1))).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !head_complete && !head_peek.is_empty() {
+        eprintln!(
+            "[cwoffee/gateway] {peer} sent an incomplete request head ({} byte(s) in 2s)",
+            head_peek.len()
+        );
     }
     let wants_ws = head_peek.contains("upgrade: websocket") || request_line_targets(&head_peek, "/ws");
+    // Staged and timestamped. The first phone report ("gateway did not respond
+    // within 15s") could not be localised at all: the only logs were auth results,
+    // so a connection that died before auth left no trace, and a connection that
+    // never arrived looked identical to one that stalled mid-handshake.
+    eprintln!(
+        "[cwoffee/gateway] {peer} tcp accepted; peek saw {} byte(s); routing to {}",
+        head_peek.len(),
+        if wants_ws { "websocket" } else { "http" }
+    );
     if wants_ws {
-        let ws = tokio_tungstenite::accept_async(stream).await?;
+        let ws = match tokio_tungstenite::accept_async(stream).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                eprintln!("[cwoffee/gateway] {peer} websocket handshake failed: {e}");
+                return Ok(());
+            }
+        };
+        eprintln!("[cwoffee/gateway] {peer} websocket handshake complete");
         return websocket(ws, cfg, handle, peer.to_string()).await;
     }
 
@@ -519,12 +552,36 @@ async fn auth_handshake(
         .send(txt(serde_json::json!({ "type": "hello", "need_auth": cfg.drive_token.is_some() || cfg.watch_token.is_some() }).to_string()))
         .await;
 
-    let first = tokio::time::timeout(AUTH_TIMEOUT, stream.next()).await.ok()??;
-    let first_txt = match first.ok()? {
+    let first = match tokio::time::timeout(AUTH_TIMEOUT, stream.next()).await {
+        Ok(Some(Ok(m))) => m,
+        Ok(Some(Err(e))) => {
+            eprintln!("[cwoffee/gateway] {peer} frame read failed: {e}");
+            return None;
+        }
+        Ok(None) => {
+            eprintln!("[cwoffee/gateway] {peer} closed before sending an auth frame");
+            return None;
+        }
+        Err(_) => {
+            eprintln!(
+                "[cwoffee/gateway] {peer} sent no auth frame within {}s",
+                AUTH_TIMEOUT.as_secs()
+            );
+            return None;
+        }
+    };
+    let first_txt = match first {
         Message::Text(t) => t,
         _ => return None,
     };
-    let v: serde_json::Value = serde_json::from_str(first_txt.as_str()).ok()?;
+    let v: serde_json::Value = match serde_json::from_str(first_txt.as_str()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[cwoffee/gateway] {peer} first frame was not JSON: {e}");
+            return None;
+        }
+    };
+    eprintln!("[cwoffee/gateway] {peer} first frame type={:?}", v.get("type").and_then(|t| t.as_str()));
     if v.get("type").and_then(|t| t.as_str()) != Some("auth") {
         let _ = sink
             .send(txt(serde_json::json!({ "type": "error", "error": "expected an auth frame first" }).to_string()))

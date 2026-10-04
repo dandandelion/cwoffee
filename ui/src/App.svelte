@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
-  import { invoke, Channel, transportKind, gatewayRole } from './lib/transport'
+  import { invoke, Channel, transportKind, gatewayRole, onReconnect } from './lib/transport'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import type {
     ApprovalAnswer,
@@ -1753,6 +1753,10 @@
     // Test seam: lets a browser harness drive the transcript without an engine.
     if (import.meta.env.DEV) (window as any).__cwoffeeTranscript = transcript
     await attachChannel()
+    // A phone that drops wifi, or whose first attempt raced a sleeping machine,
+    // should come back on its own rather than sit on "connecting…" until someone
+    // reloads the tab.
+    if (transportKind === 'gateway') onReconnect(() => void retryAttach())
     // Non-blocking: a missing /models must not delay first paint.
     void loadModels()
     try {

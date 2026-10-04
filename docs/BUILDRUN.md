@@ -291,3 +291,21 @@ Related: one `peek()` is not enough to classify a request. A handshake split acr
 segments leaves a first peek holding only `GET /ws HTTP/1.1`, which is not the
 upgrade header. Decide on the header *or* the request-line path, after retrying the
 peek a few times.
+
+## Trap 16: peeking for a request head has to wait for the head
+
+Classifying a connection from a `peek()` needs the header block, not a sample of
+it. The first version tried four peeks with 40/80/120ms backoff - the last peek
+landed around 240ms - so a client whose first TCP segment held only
+`GET /ws HTTP/1.1
+` was routed to the websocket layer with an incomplete head,
+and `accept_async` answered `Junk after client request` and closed.
+
+It now waits up to 2s for `\r\n\r\n`, and the request-line fallback means a slow
+first segment still routes correctly: `accept_async` reads the rest. Verified with
+a client that sends the request line, waits 2.5s, then sends the remaining headers:
+`101 Switching Protocols`.
+
+When you reproduce a handshake by hand, be careful that your split does not insert
+a second `\r\n` - that terminates the header block early and produces a bogus
+"Junk after client request" that looks like a server bug and is a test bug.
