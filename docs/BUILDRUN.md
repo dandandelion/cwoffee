@@ -333,3 +333,20 @@ response that would never be written. Keep the buffer across iterations and
 The test that catches it pipelines two requests in one write. Sequential requests
 (a browser, `curl`, `http.client`) all pass without it, so pipelining has to be
 tested explicitly.
+
+## Trap 19: a Rust `\` line continuation written from a Python heredoc vanishes
+
+Rust strips a trailing `\` in a string literal *and* the leading whitespace of the
+next line. Python does exactly the same thing to a `\` at the end of a line inside
+a normal (non-raw) triple-quoted string. So a patch script that writes a wrapped
+Rust format string produces one long line with the indentation baked into the
+message:
+
+```text
+it must be an existing,                      writable directory
+```
+
+That is only cosmetic here, which is why it survived review, but it lands in user
+visible error text. Either write the Rust string on one line, or use a raw Python
+string (`r"""..."""`) so the backslash survives. The same trap already bit this
+project with `\u{...}` escapes - see the note on raw strings above.

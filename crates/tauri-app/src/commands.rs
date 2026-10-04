@@ -110,6 +110,26 @@ pub fn start_turn(
 
 /// Open a native folder picker. Non-blocking: the plugin hands the result to a
 /// callback, so the command awaits it rather than parking the main thread.
+/// Turn the picker's result into a filesystem path.
+///
+/// `FilePath` is either a `PathBuf` or a URL, and which one it is depends on the
+/// platform file chooser. Under Wayland/GNOME the portal hands back
+/// `file:///home/...`, and `FilePath`'s `Display` prints that URL verbatim - so
+/// `to_string()` produced a string that is not a path, `PathBuf::from` kept the
+/// `file://` prefix, `is_dir()` failed, and the engine refused a folder the user
+/// had just picked. That is the whole "I chose a folder and it went back to
+/// cwoffee-workspace" report.
+fn picked_to_path(picked: tauri_plugin_dialog::FilePath) -> Option<String> {
+    use tauri_plugin_dialog::FilePath;
+    match picked {
+        FilePath::Path(p) => Some(p.to_string_lossy().into_owned()),
+        FilePath::Url(u) => u
+            .to_file_path()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+    }
+}
+
 #[tauri::command]
 pub async fn pick_workspace(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -117,7 +137,18 @@ pub async fn pick_workspace(app: tauri::AppHandle) -> Result<Option<String>, Str
     app.dialog()
         .file()
         .pick_folder(move |p| {
-            let _ = tx.send(p.map(|f| f.to_string()));
+            // Which variant the portal hands back is platform-dependent and was
+            // the entire bug, so record it: "I picked a folder and nothing
+            // happened" is otherwise unfixable from a log.
+            eprintln!(
+                "[cwoffee] folder pick: {}",
+                match &p {
+                    Some(tauri_plugin_dialog::FilePath::Path(_)) => "path",
+                    Some(tauri_plugin_dialog::FilePath::Url(_)) => "url",
+                    None => "nothing",
+                }
+            );
+            let _ = tx.send(p.and_then(picked_to_path));
         });
     // A dialog the user never closes must not pin a task forever.
     tokio::time::timeout(std::time::Duration::from_secs(300), rx)
@@ -129,12 +160,14 @@ pub async fn pick_workspace(app: tauri::AppHandle) -> Result<Option<String>, Str
 /// Move the tools to a different workspace. The engine refuses a non-directory,
 /// a non-writable directory, and any change while a turn is running.
 #[tauri::command]
-pub fn set_workspace(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
-    if path.trim().is_empty() {
-        return Err("empty workspace path".into());
-    }
-    state.host.send(cwoffee_engine::HostCmd::SetWorkspace { path });
-    Ok(())
+pub async fn set_workspace(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
+    // Awaited rather than fire-and-forget: the caller needs to know whether the
+    // engine accepted the directory, otherwise the UI shows a workspace that is
+    // not the one the tools are using.
+    state.host.set_workspace_checked(&path).await
 }
 
 #[tauri::command]
@@ -401,4 +434,43 @@ pub fn render_report(state: tauri::State<'_, AppState>, report: RenderReport) {
         report.body_bg,
         report.device_pixel_ratio,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::picked_to_path;
+    use std::path::PathBuf;
+    use tauri_plugin_dialog::FilePath;
+
+    /// Under Wayland/GNOME the desktop portal returns a URL, not a path, and
+    /// `FilePath`'s `Display` prints that URL verbatim. `to_string()` was the
+    /// whole bug: a folder the user had just picked became `file:///home/...`,
+    /// which is not a directory, so the engine refused it and the workspace
+    /// control snapped back to whatever the config said.
+    #[test]
+    fn a_portal_url_becomes_a_real_path() {
+        let u = url::Url::parse("file:///home/dandandelion/Downloads").unwrap();
+        assert_eq!(
+            picked_to_path(FilePath::Url(u)).as_deref(),
+            Some("/home/dandandelion/Downloads")
+        );
+    }
+
+    #[test]
+    fn a_plain_path_survives_unchanged() {
+        let p = FilePath::Path(PathBuf::from("/home/dandandelion/cwoffee-workspace"));
+        assert_eq!(
+            picked_to_path(p).as_deref(),
+            Some("/home/dandandelion/cwoffee-workspace")
+        );
+    }
+
+    /// A non-file URL (Android `content://`) has no filesystem meaning here. The
+    /// caller must see "nothing usable was picked" rather than a garbage path that
+    /// the engine then rejects with a confusing message.
+    #[test]
+    fn a_non_file_url_is_not_a_path() {
+        let u = url::Url::parse("content://media/external/images/1").unwrap();
+        assert_eq!(picked_to_path(FilePath::Url(u)), None);
+    }
 }

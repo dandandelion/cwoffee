@@ -566,6 +566,39 @@ body {
 .wsrow:disabled { cursor: default; }
 .wsrow:hover:not(:disabled) { color: var(--color-ink); }
 
+/* Path entry for the gateway: a phone has no folder picker for the host's
+   filesystem, so the row turns into a field rather than doing nothing. */
+.wsrow.ws-edit { width: 100%; }
+.ws-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  border: 1px solid var(--color-hairline);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+.ws-input:focus { outline: 1px solid var(--color-hairline); }
+.ws-act {
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--color-hairline);
+  background: var(--color-paper-2);
+  color: var(--color-ink-2);
+  font-size: 11.5px;
+}
+.ws-act:hover { color: var(--color-ink); }
+.ws-err {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--color-danger);
+  /* The refusal is the whole point of the message, so it must not be clipped. */
+  white-space: normal;
+  word-break: break-word;
+}
+
 .composer {
   width: 100%;
   resize: none;

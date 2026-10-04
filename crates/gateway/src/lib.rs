@@ -947,9 +947,25 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         // almost right is worse than an error.
         "gpu_report" => Err("gpu reporting is desktop-only".into()),
         "open_file" => Err("opening files is desktop-only; the gateway cannot touch your filesystem".into()),
-        // Deliberately absent: open_file, pick_workspace, set_workspace,
-        // render_report, boot_log. The first three act on the desktop machine;
-        // a phone should not be able to point the agent at a different directory.
+        // Moving the workspace. This is a deliberate widening, and it is worth
+        // being blunt about why: the tools are confined to the workspace, so a
+        // drive token can aim them at any directory this user can write to. It is
+        // gated on the drive token, the engine validates that the path exists and
+        // is writable, and the reply names the reason when it refuses. The token
+        // is still the whole boundary, and the channel is plain HTTP.
+        "set_workspace" => {
+            need_drive(role)?;
+            let path = arg_str(&args, "path")?;
+            let applied = h.host.set_workspace_checked(&path).await?;
+            Ok(serde_json::json!(applied))
+        }
+        // A phone has no folder picker for the host's filesystem, so the client
+        // types a path. Listing the host's directories is deliberately not
+        // offered: that would turn a leaked token into a file browser.
+        "pick_workspace" => {
+            let _ = role;
+            Err("the folder picker is desktop-only; type the host path instead".into())
+        }
         other => Err(format!("unknown command {other:?}")),
     }
 }
@@ -1257,6 +1273,45 @@ mod tests {
         assert!(run_cmd("bootstrap", serde_json::json!({}), Role::Watch, &h)
             .await
             .is_ok());
+    }
+
+    /// The workspace is the sandbox boundary, so moving it is a drive-only act.
+    #[tokio::test]
+    async fn a_watch_token_cannot_move_the_workspace() {
+        let h = test_handle();
+        let err = run_cmd(
+            "set_workspace",
+            serde_json::json!({ "path": "/tmp" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watch token must not move the workspace");
+        assert!(!err.is_empty(), "refusal must say something");
+    }
+
+    #[tokio::test]
+    async fn a_drive_token_moves_the_workspace_and_a_bad_path_says_why() {
+        let h = test_handle();
+        let out = run_cmd(
+            "set_workspace",
+            serde_json::json!({ "path": "/tmp" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("a real writable directory should be accepted");
+        assert_eq!(out.as_str(), Some("/tmp"), "the reply is the applied path");
+
+        let err = run_cmd(
+            "set_workspace",
+            serde_json::json!({ "path": "/nonexistent/definitely-not" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("a non-directory must be refused");
+        assert!(err.contains("refused"), "unhelpful error: {err}");
     }
 
     fn test_handle() -> Arc<EngineHandle> {

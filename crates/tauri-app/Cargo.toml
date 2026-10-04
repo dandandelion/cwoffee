@@ -30,6 +30,9 @@ tauri-plugin-opener = "2"
 # Folder picker for the workspace control. The engine validates whatever comes
 # back; this only exists so the control is not a dead button.
 tauri-plugin-dialog = "2"
+# The folder picker can hand back a `file://` URL, and decoding it is the
+# difference between a working workspace change and a silently refused one.
+url = "2"
 serde.workspace = true
 serde_json.workspace = true
 cwoffee-engine.workspace = true

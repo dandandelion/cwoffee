@@ -295,7 +295,13 @@ impl SessionHost {
                     }
 
                     HostCmd::NewSession { title } => {
-                        match store.create_session(&title, &cfg.workspace.display().to_string(), &cfg.model) {
+                        // The agent's live values, not cfg: cfg is what the config
+                        // file said at startup. Using it here meant a workspace you
+                        // had just changed was quietly undone for the next session,
+                        // which is what "it goes back to cwoffee-workspace" was.
+                        let ws = agent.workspace().display().to_string();
+                        let model = agent.model();
+                        match store.create_session(&title, &ws, &model) {
                             Ok(id) => {
                                 session_id = id;
                                 persisted_next = 0;
@@ -383,11 +389,9 @@ impl SessionHost {
                             continue;
                         }
                         if session_id == 0 {
-                            match store.create_session(
-                                "new session",
-                                &cfg.workspace.display().to_string(),
-                                &cfg.model,
-                            ) {
+                            let ws = agent.workspace().display().to_string();
+                            let model = agent.model();
+                            match store.create_session("new session", &ws, &model) {
                                 Ok(id) => {
                                     session_id = id;
                                     persisted_next = 0;
@@ -524,6 +528,42 @@ impl SessionHost {
 
     pub fn state(&self) -> HostState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// Move the workspace and wait (bounded) for the host to accept it.
+    ///
+    /// `send()` is fire-and-forget, so the caller had no way to learn that the
+    /// engine refused the path. The UI therefore showed a label that quietly
+    /// reverted, and the only trace was a warning block in the transcript. This
+    /// turns "I picked a folder and nothing happened" into an actual reason.
+    ///
+    /// Note the command loop is sequential: while a turn is running the change
+    /// is queued behind it, which is why the timeout says so rather than
+    /// claiming the path was bad.
+    pub async fn set_workspace_checked(&self, path: &str) -> Result<String, String> {
+        let want = std::path::PathBuf::from(path);
+        if path.trim().is_empty() {
+            return Err("empty workspace path".into())
+        }
+        self.send(HostCmd::SetWorkspace { path: path.to_string() });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let st = self.state();
+            if std::path::PathBuf::from(&st.workspace) == want {
+                return Ok(st.workspace)
+            }
+            if std::time::Instant::now() >= deadline {
+                if st.busy {
+                    return Err(format!(
+                        "a turn is running, so the workspace change is queued behind it ({path} not applied yet). Stop the turn and try again."
+                    ))
+                }
+                return Err(format!(
+                    "the engine refused {path}: a workspace must be an existing, writable directory"
+                ))
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }
 
@@ -756,6 +796,65 @@ mod tests {
         assert_eq!(h.state().workspace, base.display().to_string());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A workspace move must survive the next session.
+    ///
+    /// New sessions used to be created with `cfg.workspace` - the value the config
+    /// file had at startup - so the move was quietly undone for anything you did
+    /// afterwards. That is exactly what "it goes back to cwoffee-workspace" was.
+    #[tokio::test]
+    async fn a_new_session_inherits_the_current_workspace() {
+        let base = std::env::temp_dir().join(format!("cwoffee_ws_inherit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let inner = base.join("chosen");
+        std::fs::create_dir_all(&inner).unwrap();
+
+        let (mut h, store) = host(vec![]);
+        let _rx = h.take_receivers();
+        ready(&h).await;
+
+        let got = h
+            .set_workspace_checked(&inner.display().to_string())
+            .await
+            .expect("a real writable directory should be accepted");
+        assert_eq!(got, inner.display().to_string());
+
+        h.send(HostCmd::NewSession { title: "after the move".into() });
+        wait_for("a session row".into(), || h.state().session_id != 0).await;
+        let sid = h.state().session_id;
+        let row = store.session(sid).unwrap().expect("session row");
+        assert_eq!(
+            row.workspace,
+            inner.display().to_string(),
+            "the new session reverted to the config workspace"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The command channel is fire-and-forget, so a refused path used to be
+    /// invisible to the caller: the UI showed a workspace that snapped back with
+    /// no reason. `set_workspace_checked` has to name the reason.
+    #[tokio::test]
+    async fn set_workspace_checked_names_the_refusal() {
+        let (mut h, _store) = host(vec![]);
+        let _rx = h.take_receivers();
+        ready(&h).await;
+
+        let err = h
+            .set_workspace_checked("/nonexistent/definitely-not")
+            .await
+            .expect_err("a non-directory must not be accepted");
+        assert!(err.contains("refused"), "unhelpful error: {err}");
+        assert!(
+            err.contains("/nonexistent/definitely-not"),
+            "the error should name the path: {err}"
+        );
+        assert_eq!(
+            h.state().workspace,
+            std::env::temp_dir().display().to_string(),
+            "a refused change must leave the workspace alone"
+        );
     }
 
     #[tokio::test]

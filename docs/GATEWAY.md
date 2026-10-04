@@ -196,7 +196,28 @@ Minimum before this ships:
   (self-signed plus the phone trusting it is a support burden worth naming), or
   state plainly in the UI that the connection is unencrypted.
 
+### What a drive token can reach
+
+A drive token can start turns, cancel them, answer approvals, switch sessions,
+change the model, and **move the workspace** (`set_workspace`). That last one is
+worth naming precisely, because it is the widest of them: the sandbox confines the
+tools to the workspace, so whoever can move the workspace can aim `read_file` and
+`exec` at any directory this user can write to — `~/.ssh`, mail, everything. The
+engine validates that the path exists and is writable, and a watch token cannot do
+it at all, but the drive token is still the only thing standing between a stranger
+and your home directory.
+
+So: a drive token is equivalent to "can read this user's files". Do not put it in
+a URL you screenshot, do not leave it on a shared network, and treat `?token=` in
+the address bar as a secret you have just written down. `pick_workspace` is not
+exposed on purpose — a leaked token should not also be a directory browser.
+
 ## Things that will bite
+
+- **The workspace is runtime state, not a saved preference.** Changing it moves the
+  tools for the rest of the session, and new sessions inherit the new value, but a
+  restart reads `workspace` from the config file again. To make a move permanent,
+  edit `~/.config/cwoffee/config.toml` (top-level key, before any `[table]`).
 
 - **CSP.** The Tauri CSP allows `ipc:` and `http://ipc.localhost`. A browser build
   needs `connect-src` to allow the gateway origin over `ws:`/`wss:`.

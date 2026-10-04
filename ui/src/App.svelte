@@ -510,6 +510,9 @@
   let composerEl = $state<HTMLTextAreaElement | null>(null)
   let dropping = $state(false)
   let wsBusy = $state(false)
+  let wsErr = $state('')
+  let wsEditing = $state(false)
+  let wsDraft = $state('')
   // Derived from the host, not from local UI state. It was declared and rendered
   // but never assigned anywhere, so the composer said "Choose workspace" even
   // when a workspace was configured - and on the gateway that read as "this is my
@@ -569,17 +572,63 @@
   }
 
   async function chooseWorkspace() {
-    if (!isTauri() || wsBusy) return
+    if (wsBusy) return
+    // A phone cannot open a folder picker on a machine it is not sitting at, so
+    // in gateway mode the control becomes a path field instead of doing nothing.
+    if (transportKind !== 'tauri') {
+      wsDraft = hostState?.workspace ?? ''
+      wsEditing = true
+      return
+    }
     wsBusy = true
     try {
       const picked = (await invoke('pick_workspace')) as string | null
-      if (picked) {
-        await invoke('set_workspace', { path: picked })
-      }
+      if (picked) await applyWorkspace(picked)
     } catch (e) {
+      wsErr = cleanErr(e)
+      pageLog(`pick_workspace failed: ${String(e)}`)
+    } finally {
+      wsBusy = false
+    }
+  }
+
+  /** Focus an element on mount. `autofocus` is flagged by a11y checks and is
+   * unreliable for an element that appears after the page has loaded. */
+  function focusNow(el: HTMLElement) {
+    requestAnimationFrame(() => el.focus())
+  }
+
+  /** A rejection rendered as "Error: the engine refused ..." reads like a stack
+   * trace. The reason is the useful part, and it has to fit on a phone. */
+  function cleanErr(e: unknown) {
+    return String(e).replace(/^Error:\s*/, '').replace(/\s+/g, ' ').trim()
+  }
+
+  /**
+   * Move the tools, then make the label reflect what the engine took.
+   *
+   * The command used to be fire-and-forget: the engine could refuse a path and
+   * the only trace was a warning block in the transcript, so the control snapped
+   * back to the old directory with no explanation. Now the call waits for the
+   * engine to confirm, and a refusal is shown next to the control.
+   */
+  async function applyWorkspace(path: string) {
+    if (!path) return
+    wsErr = ''
+    wsBusy = true
+    try {
+      const applied = await invoke<string>('set_workspace', { path })
+      pageLog(`workspace applied: ${applied}`)
+      wsEditing = false
+      wsDraft = ''
+    } catch (e) {
+      wsErr = cleanErr(e)
       pageLog(`set_workspace failed: ${String(e)}`)
     } finally {
       wsBusy = false
+      // Re-read the host rather than trusting the string we sent: the label has
+      // to name the directory the tools are actually confined to.
+      await refreshState()
     }
   }
 
@@ -2197,17 +2246,43 @@
 
           </div>
 
-          <button
-            class="wsrow"
-            title={isTauri()
-              ? 'Choose the directory the tools operate in'
-              : `Host workspace: ${hostState?.workspace ?? ''} (change it on the desktop)`}
-            onclick={chooseWorkspace}
-          >
-            <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
-            <span>{shortWorkspace || 'Choose workspace'}</span>
-            {#if wsBusy}<span class="ws-note">opening…</span>{/if}
-          </button>
+          {#if wsEditing}
+            <div class="wsrow ws-edit">
+              <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+              <input
+                class="ws-input"
+                bind:value={wsDraft}
+                use:focusNow
+                spellcheck="false"
+                aria-label="Host workspace path"
+                placeholder="/path/on/the/host"
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    void applyWorkspace(wsDraft.trim())
+                  } else if (e.key === 'Escape') {
+                    wsEditing = false
+                    wsErr = ''
+                  }
+                }}
+              />
+              <button class="ws-act" onclick={() => void applyWorkspace(wsDraft.trim())}>set</button>
+              <button class="ws-act" onclick={() => { wsEditing = false; wsErr = '' }}>cancel</button>
+            </div>
+          {:else}
+            <button
+              class="wsrow"
+              title={isTauri()
+                ? 'Choose the directory the tools operate in'
+                : `Host workspace: ${hostState?.workspace ?? ''} - click to type a path`}
+              onclick={chooseWorkspace}
+            >
+              <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+              <span>{shortWorkspace || 'Choose workspace'}</span>
+              {#if wsBusy}<span class="ws-note">working…</span>{/if}
+            </button>
+          {/if}
+          {#if wsErr}<div class="ws-err" role="alert">{wsErr}</div>{/if}
         </div>
       </div>
     </main>
