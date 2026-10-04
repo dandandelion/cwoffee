@@ -4,6 +4,7 @@ members = [
     "crates/engine",
     "crates/tauri-app",
     "crates/tui",
+    "crates/gateway",
 ]
 
 [workspace.package]
@@ -49,7 +50,13 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
+# `panic = "abort"` is the usual size/startup choice, but it silently voids a
+# correctness guarantee we rely on: a tool that panics is caught as a JoinError
+# and turned into a tool_result so the session survives. With abort there is no
+# unwind, no JoinError, and the whole process dies - which is exactly the crash
+# that was reported mid-session. Unwind costs a little size; the isolation is
+# worth more than that.
+panic = "unwind"
 
 # Dev builds still need to be usable; keep debug info but cut some bloat.
 [profile.dev]

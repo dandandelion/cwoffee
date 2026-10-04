@@ -26,7 +26,8 @@ use crate::gpu;
 /// hop exactly once and reuses that Channel for every turn — PLAN.md §1.4
 /// forbids an `invoke()` per token, and a long-lived channel is how we honour it.
 pub struct AppState {
-    pub host: SessionHost,
+    /// Shared so the gateway can drive the *same* host the window drives.
+    pub host: Arc<SessionHost>,
     pub store: Arc<Store>,
     /// Taken by `attach` exactly once and forwarded to the webview.
     pub queue_rx: Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>,
@@ -238,27 +239,13 @@ pub fn session_messages(
     id: i64,
     before: Option<i64>,
     limit: Option<usize>,
-) -> Result<MessagePage, String> {
+) -> Result<cwoffee_engine::store::MessagesPage, String> {
     // Bounded on purpose. A session can hold thousands of messages; loading all
     // of them costs memory and scroll performance for content nobody is reading.
-    let limit = limit.unwrap_or(80).clamp(1, 400);
-    // Fetch one extra row as a probe for `has_older` rather than a second COUNT.
-    let mut page = state
+    state
         .store
-        .messages_before(id, before, limit + 1)
-        .map_err(|e| e.to_string())?;
-    let has_older = page.len() > limit;
-    if has_older {
-        page.remove(0); // drop the probe, keeping the newest `limit`
-    }
-    Ok(MessagePage { messages: page, has_older })
-}
-
-/// One page of transcript history, newest window returned in reading order.
-#[derive(serde::Serialize)]
-pub struct MessagePage {
-    pub messages: Vec<cwoffee_engine::store::StoredMessage>,
-    pub has_older: bool,
+        .messages_page(id, before, limit.unwrap_or(80))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

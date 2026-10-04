@@ -31,7 +31,7 @@ pub use provider::{
 };
 pub use prompt::PromptBuilder;
 pub use host::{default_env_block, HostCmd, HostConfig, HostState, SessionHost};
-pub use store::{SearchHit, Session, Store, StoreError, StoredMessage, Totals};
+pub use store::{SearchHit, Session, Store, StoreError, MessagesPage, StoredMessage, Totals};
 pub use telemetry::{LiveWindow, Rolling, TelemetrySnapshot, TurnTelemetry};
 pub use tools::{ExecChunk, Registry, Risk, Tool, ToolCtx, ToolResult};
 

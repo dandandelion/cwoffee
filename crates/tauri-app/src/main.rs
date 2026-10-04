@@ -17,8 +17,37 @@ use cwoffee_engine::store::Store;
 use cwoffee_engine::tools::Registry;
 use cwoffee_engine::Config;
 use tokio::sync::{mpsc, oneshot};
+use tauri::Manager;
 
 use commands::AppState;
+
+/// Locate a built frontend to serve over the network.
+///
+/// A packaged cwoffee embeds its assets in the binary, which the webview can
+/// read and an HTTP listener cannot. So the gateway needs a real directory; the
+/// candidates cover a dev checkout and an installed copy, and CWOFFEE_UI_DIST
+/// overrides both.
+fn ui_dist_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("CWOFFEE_UI_DIST") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    for cand in [
+        exe.join("../../ui/dist"),
+        exe.join("../ui/dist"),
+        PathBuf::from("/usr/share/cwoffee/ui"),
+    ] {
+        if cand.is_dir() {
+            return cand;
+        }
+    }
+    exe.join("ui/dist")
+}
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
@@ -162,6 +191,10 @@ fn main() {
         }
         (h, adopted)
     });
+    // Receivers can only be taken once and need &mut, so take them before the
+    // host goes behind the Arc that the gateway shares.
+    let receivers = host.take_receivers();
+    let host = std::sync::Arc::new(host);
     // Read the adopted id from the return value, not host.state(): SetModel is
     // applied by the host task, so state() can still show the old value here.
     let model_label = adopted_model.unwrap_or(configured_model);
@@ -188,6 +221,11 @@ fn main() {
     );
 
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+    // A second fan-out for non-webview listeners (the gateway). The webview gets
+    // its own ordered channel; a browser tab gets a broadcast subscription, so
+    // two tabs and the window all see the same turn rather than competing for
+    // one receiver.
+    let (bcast_tx, _bcast_rx) = tokio::sync::broadcast::channel::<cwoffee_engine::EngineEvent>(512);
     // One map, shared by the pump (which parks reply senders) and the
     // respond_approval command (which resolves them). Two separate maps meant the
     // command always looked up an empty one.
@@ -197,8 +235,9 @@ fn main() {
     // The pump starts at boot, not when the webview attaches: nothing is lost
     // during startup, and if the webview goes away the gate's timeout is what
     // stops the agent — not the absence of a forwarder.
-    if let Some((mut ev_rx, mut ap_rx)) = host.take_receivers() {
+    if let Some((mut ev_rx, mut ap_rx)) = receivers {
         let qtx = queue_tx.clone();
+        let btx = bcast_tx.clone();
         tauri::async_runtime::spawn(async move {
             let (mut ev_open, mut ap_open) = (true, true);
             loop {
@@ -206,6 +245,10 @@ fn main() {
                     ev = ev_rx.recv(), if ev_open => {
                         match ev {
                             Some(e) => {
+                                // The webview queue is the load-bearing one; the
+                                // broadcast has no listeners in the common case
+                                // and its failure must not end the pump.
+                                let _ = btx.send(e.clone());
                                 if qtx.send(e).is_err() {
                                     break;
                                 }
@@ -217,6 +260,7 @@ fn main() {
                         match ap {
                             Some((req, reply)) => {
                                 let id = req.id;
+                                let _ = btx.send(approval_event(&req));
                                 if qtx.send(approval_event(&req)).is_err() {
                                     // Nobody to ask: refuse rather than run unattended.
                                     let _ = reply.send(ApprovalAnswer::Deny);
@@ -246,6 +290,38 @@ fn main() {
         migration_notes,
     };
 
+    // Optional LAN/remote access. Off unless CWOFFEE_GATEWAY_PORT is set, and
+    // the gateway itself refuses to bind a non-loopback address without a token.
+    if let Some(port) = std::env::var("CWOFFEE_GATEWAY_PORT")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        let gw = cwoffee_gateway::GatewayConfig {
+            host: env_or("CWOFFEE_GATEWAY_HOST", "127.0.0.1")
+                .parse()
+                .unwrap_or(std::net::Ipv4Addr::LOCALHOST.into()),
+            port: port.parse().unwrap_or(8099),
+            dist: ui_dist_dir(),
+            drive_token: std::env::var("CWOFFEE_GATEWAY_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            watch_token: std::env::var("CWOFFEE_GATEWAY_WATCH_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+        };
+        let handle = std::sync::Arc::new(cwoffee_gateway::EngineHandle {
+            host: Arc::clone(&state.host),
+            store: Arc::clone(&state.store),
+            events: bcast_tx.clone(),
+            pending: Arc::clone(&state.pending_approvals),
+        });
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = cwoffee_gateway::serve(gw, handle).await {
+                eprintln!("[cwoffee] gateway not running: {e}");
+            }
+        });
+    }
+
     let rendered_flag = state.rendered.clone();
     let app = tauri::Builder::default()
         // Rendered markdown contains links to pages the model fetched. Those must
@@ -259,6 +335,15 @@ fn main() {
         // symptom is a missing "render OK" line. So log what the webview was
         // actually given, at startup, before anyone has to guess.
         .setup(move |app| {
+            // The window manager and the dock ask the *window* for an icon. A
+            // frameless window built from a bare binary has none, so GNOME shows
+            // its generic gear. The bundle icons only apply once the app is
+            // installed with a .desktop file, which is not how this runs in dev.
+            if let Some(w) = app.get_webview_window("main") {
+                if let Err(e) = w.set_icon(tauri::include_image!("icons/64x64.png")) {
+                    eprintln!("[cwoffee] window icon not set: {e}");
+                }
+            }
             let cfg = app.config();
             let cfg_build = cfg.build.clone();
             eprintln!(

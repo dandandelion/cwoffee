@@ -1,0 +1,203 @@
+/**
+ * Transport shim: the same UI runs in the Tauri webview and in a browser.
+ *
+ * The point is that `App.svelte` does not change. It calls `invoke(cmd, args)`
+ * and registers a `Channel` for events; this file decides whether that goes
+ * over Tauri IPC or a WebSocket to the gateway. Two front ends would otherwise
+ * drift, and the desktop/browser split is exactly where that kind of duplication
+ * starts paying rent forever.
+ *
+ * Gateway protocol (see crates/gateway/src/lib.rs):
+ *   client -> { type: 'auth', token }
+ *   client -> { id, cmd, args }
+ *   server -> { type: 'hello' | 'auth_ok' | 'auth_fail' | 'ready' }
+ *   server -> { id, ok, data?, error? }
+ *   server -> { type: 'event', d: EngineEvent }
+ */
+import { invoke as tauriInvoke, Channel as TauriChannel } from '@tauri-apps/api/core'
+import { pageLog } from './pagelog'
+import type { EngineEvent } from './events'
+
+/**
+ * Our own Channel type, not Tauri's.
+ *
+ * Tauri's `Channel` constructor calls into `__TAURI_INTERNALS__` immediately, so
+ * `new Channel()` throws in an ordinary browser tab - which is exactly what the
+ * gateway build is. The real Tauri channel is created inside `invoke('attach')`
+ * when there is a Tauri to talk to, and wired to this one.
+ */
+export class Channel<T = unknown> {
+  onmessage: ((ev: T) => void) | null = null
+}
+
+const isTauri =
+  typeof window !== 'undefined' &&
+  ((window as any).__TAURI_INTERNALS__ !== undefined || (window as any).__TAURI__ !== undefined)
+
+export const transportKind: 'tauri' | 'gateway' = isTauri ? 'tauri' : 'gateway'
+
+const TOKEN_KEY = 'cwoffee.token.v1'
+
+/**
+ * The token is never put in the WebSocket URL - query strings end up in proxy
+ * logs and browser history. It may arrive once via `?token=` purely to bootstrap
+ * localStorage, and is stripped from the address immediately.
+ */
+function readToken(): string {
+  try {
+    const u = new URL(location.href)
+    const t = u.searchParams.get('token')
+    if (t) {
+      localStorage.setItem(TOKEN_KEY, t)
+      u.searchParams.delete('token')
+      history.replaceState(null, '', u.pathname + (u.search ? u.search : '') + u.hash)
+      return t
+    }
+    return localStorage.getItem(TOKEN_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+type Pending = { resolve: (v: unknown) => void; reject: (e: unknown) => void }
+
+let ws: WebSocket | null = null
+let role: 'drive' | 'watch' | null = null
+let nextId = 1
+const pending = new Map<number, Pending>()
+let eventHandler: ((ev: EngineEvent) => void) | null = null
+let reconnect: ReturnType<typeof setTimeout> | null = null
+let backoff = 500
+let wantSocket = false
+
+function wsUrl(): string {
+  return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
+}
+
+function failAll(msg: string) {
+  for (const [, p] of pending) p.reject(new Error(msg))
+  pending.clear()
+}
+
+function connect(): Promise<void> {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return Promise.resolve()
+  }
+  wantSocket = true
+  return new Promise((resolve, reject) => {
+    let sock: WebSocket
+    try {
+      sock = new WebSocket(wsUrl())
+    } catch (e) {
+      reject(e)
+      return
+    }
+    ws = sock
+
+    sock.onopen = () => {
+      backoff = 500
+      sock.send(JSON.stringify({ type: 'auth', token: readToken() }))
+    }
+
+    sock.onmessage = (m) => {
+      let v: any
+      try {
+        v = JSON.parse(String(m.data))
+      } catch {
+        return
+      }
+      switch (v.type) {
+        case 'auth_ok':
+          role = v.role
+          resolve()
+          break
+        case 'auth_fail':
+          failAll('gateway rejected the token')
+          reject(new Error('gateway rejected the token'))
+          break
+        case 'ready':
+          role = v.role
+          resolve()
+          break
+        case 'event':
+          // Engine events are pushed, not polled. The transcript already batches
+          // text by requestAnimationFrame, so nothing here needs throttling.
+          try {
+            eventHandler?.(v.d as EngineEvent)
+          } catch (e) {
+            pageLog(`gateway event handler threw: ${String(e)}`)
+          }
+          break
+        default:
+          if (typeof v.id === 'number') {
+            const p = pending.get(v.id)
+            if (!p) return
+            pending.delete(v.id)
+            if (v.ok) p.resolve(v.data)
+            else p.reject(new Error(v.error ?? 'gateway error'))
+          }
+      }
+    }
+
+    sock.onclose = () => {
+      ws = null
+      role = null
+      failAll('gateway connection closed')
+      // Reconnect unless the page is going away. A phone that drops wifi should
+      // pick the session back up when it returns rather than sit on a dead view.
+      if (wantSocket && reconnect == null) {
+        reconnect = setTimeout(() => {
+          reconnect = null
+          connect().catch(() => {})
+        }, backoff)
+        backoff = Math.min(backoff * 2, 8000)
+      }
+    }
+    sock.onerror = () => {
+      /* onclose follows and handles it */
+    }
+  })
+}
+
+export async function invoke<T = unknown>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  // `attach` is how the caller registers its event Channel. It has to be handled
+  // before the Tauri passthrough: the caller passes *our* Channel type, which has
+  // no `toJSON`, so handing it straight to tauriInvoke makes Rust see a JSON
+  // object where it wants a channel id - the desktop app then fails with
+  // `invalid args 'onEvent' ... invalid type: map, expected a string`.
+  if (cmd === 'attach') {
+    const ch = args?.onEvent as Channel<EngineEvent> | undefined
+    if (isTauri) {
+      // Swap in a real Tauri channel that forwards into ours.
+      const real = new TauriChannel<EngineEvent>((ev) => ch?.onmessage?.(ev))
+      return (tauriInvoke as (c: string, a?: object) => Promise<T>)('attach', { onEvent: real })
+    }
+    // Over the socket the subscription is implicit; just remember the handler.
+    eventHandler = (ev) => ch?.onmessage?.(ev)
+    await connect()
+    return undefined as T
+  }
+
+  if (isTauri) return (tauriInvoke as (c: string, a?: object) => Promise<T>)(cmd, args)
+
+  await connect()
+  return new Promise<T>((resolve, reject) => {
+    const id = nextId++
+    pending.set(id, { resolve: (v) => resolve(v as T), reject })
+    ws!.send(JSON.stringify({ id, cmd, args: args ?? {} }))
+    setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id)
+        reject(new Error(`gateway did not answer ${cmd}`))
+      }
+    }, 20000)
+  })
+}
+
+/** Which capability the current socket has, for disabling controls in the UI. */
+export function gatewayRole(): 'drive' | 'watch' | null {
+  return isTauri ? 'drive' : role
+}

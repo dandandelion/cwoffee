@@ -168,6 +168,15 @@ def main():
     )
     print(f"wrote {len(sizes) + 2} icons to {OUT}")
 
+    # The titlebar renders ui/public/icon.png. This script used to write only
+    # the bundle icons, so the titlebar kept showing the previous logo forever -
+    # the app was renamed and rebranded and the little mark beside the title was
+    # still the old one.
+    public = os.path.join(os.path.dirname(__file__), "..", "ui", "public")
+    os.makedirs(public, exist_ok=True)
+    make(64).save(os.path.join(public, "icon.png"))
+    print(f"wrote ui/public/icon.png")
+
 
 if __name__ == "__main__":
     main()

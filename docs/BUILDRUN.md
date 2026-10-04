@@ -215,3 +215,42 @@ container) run:
 
 Verified: the AppImage renders with no dev server, and the GPU pinning survives
 its `AppRun` wrapper — `cwoffee-app` still holds `renderD128` only.
+
+## Trap 11: reading the WebSocket handshake before `accept_async`
+
+The first gateway read the HTTP request head to decide whether the connection was
+a WebSocket upgrade, then handed the *already drained* `TcpStream` to
+`accept_async`. Every browser connection hung open with no response: the
+handshake parser was waiting for a request that had been consumed.
+
+Use `stream.peek(&mut buf)` for the decision. `peek` leaves the bytes in the
+socket, so `accept_async` still gets its own request.
+
+Symptom worth recognising: static files serve fine, `curl` on `/ws` gets `101
+Switching Protocols`, and the browser UI loads and looks alive but every RPC
+silently does nothing.
+
+## Trap 12: Tauri `Channel` is serialized by `toJSON`, and the constructor throws in a browser
+
+Two separate traps in one type:
+
+* `new Channel()` from `@tauri-apps/api/core` calls `transformCallback` in its
+  constructor, so it **throws in an ordinary browser tab**. A transport shim that
+  re-exports Tauri's `Channel` breaks the gateway build at `new Channel()` before
+  any socket code runs.
+* A channel reaches Rust as the string `"__CHANNEL__:<id>"`, produced by
+  `toJSON()`. If you define your own channel type and pass *that* to
+  `tauriInvoke`, Rust sees a JSON object and says
+  `invalid args 'onEvent' ... invalid type: map, expected a string`.
+
+So the shim owns its own `Channel` type and, on the Tauri path, swaps in a real
+`TauriChannel` before calling `invoke('attach')`. The swap has to happen **before**
+any blanket `if (isTauri) return tauriInvoke(cmd, args)` passthrough, or the
+passthrough wins and the desktop app cannot receive events at all.
+
+## Trap 13: Tauri wraps command arguments by name
+
+`invoke('render_report', { report })` arrives as `{ "report": { ... } }`, not as
+the flattened fields. A gateway re-implementing a command has to read the nested
+key. Logging the command name and its argument keys turns "the browser shows
+nothing" into a findable shape mismatch.

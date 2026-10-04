@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
-  import { invoke, Channel } from '@tauri-apps/api/core'
+  import { invoke, Channel, transportKind, gatewayRole } from './lib/transport'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import type {
     ApprovalAnswer,
@@ -559,11 +559,49 @@
     }
   }
 
+  /**
+   * Pull image files out of a paste event.
+   *
+   * `clipboardData.files` is the obvious source, but WebKitGTK frequently hands
+   * over an empty list and puts the image under `items` instead. Reading only
+   * `files` is why pasting a screenshot looked like nothing happened. When both
+   * are empty we log what the clipboard actually contained, because "paste does
+   * nothing" with no diagnostic is unfixable from the outside.
+   */
+  function filesFromTransfer(dt: DataTransfer | null): File[] {
+    if (!dt) return []
+    const direct = Array.from(dt.files ?? [])
+    if (direct.length) return direct
+    const fromItems: File[] = []
+    for (const it of dt.items ?? []) {
+      const kind = typeof it.kind === 'function' ? it.kind : (it as any).kind
+      const isImage = (it.type ?? '').startsWith('image/')
+      if (kind !== 'file' && !isImage) continue
+      const f = typeof it.getAsFile === 'function' ? it.getAsFile() : null
+      if (f) fromItems.push(f)
+    }
+    if (!fromItems.length && (dt.types?.length ?? 0) > 0) {
+      pageLog(`paste carried no files; clipboard types=[${Array.from(dt.types).join(',')}]`)
+    }
+    return fromItems
+  }
+
   function onPaste(e: ClipboardEvent) {
-    const files = Array.from(e.clipboardData?.files ?? [])
+    const files = filesFromTransfer(e.clipboardData)
     if (!files.length) return
     e.preventDefault()
     void addFiles(files)
+  }
+
+  let dragIdx = $state<number | null>(null)
+  let dropIdx = $state<number | null>(null)
+
+  function moveAttachment(from: number, to: number) {
+    if (from === to || from < 0 || to < 0 || from >= pending.length || to >= pending.length) return
+    const next = [...pending]
+    const [moved] = next.splice(from, 1)
+    next.splice(to, 0, moved)
+    pending = next
   }
 
   function fmtBytes(n: number) {
@@ -1912,9 +1950,40 @@
             }}
           >
             {#if pending.length || attachErr}
-              <div class="attrow">
+              <div class="attrow" role="list">
                 {#each pending as a, i}
-                  <span class="attchip">
+                  <span
+                    class="attchip"
+                    role="listitem"
+                    aria-label="{a.name}, {fmtBytes(a.bytes)} - drag to reorder"
+                    draggable="true"
+                    class:dragging={dragIdx === i}
+                    class:drop-target={dropIdx === i && dragIdx !== null && dragIdx !== i}
+                    ondragstart={(e: DragEvent) => {
+                      dragIdx = i
+                      e.dataTransfer?.setData('text/plain', String(i))
+                      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+                    }}
+                    ondragend={() => { dragIdx = null; dropIdx = null }}
+                    ondragover={(e: DragEvent) => {
+                      if (dragIdx === null) return
+                      e.preventDefault()
+                      e.stopPropagation()
+                      dropIdx = i
+                      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+                    }}
+                    ondrop={(e: DragEvent) => {
+                      if (dragIdx === null) return
+                      // The composer card also has a drop handler for incoming
+                      // files; without this a reorder would try to attach the
+                      // dragged chip as a new attachment.
+                      e.preventDefault()
+                      e.stopPropagation()
+                      moveAttachment(dragIdx, i)
+                      dragIdx = null
+                      dropIdx = null
+                    }}
+                  >
                     <img src={a.url} alt="" />
                     <span class="att-meta">
                       <span class="att-name">{a.name}</span>

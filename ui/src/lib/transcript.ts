@@ -92,6 +92,8 @@ interface ToolRefs {
   args: HTMLElement
   out: HTMLElement
   status: HTMLElement
+  /** args + output together; this is what collapses. */
+  detail: HTMLElement
   stdout: string
   stderr: string
 }
@@ -528,11 +530,17 @@ export class Transcript {
 
   // ---- tool cards ---------------------------------------------------------
 
-  private openTool(id: string, name: string) {
-    this.flushNow()
-    this.textBuf = null
-    this.textKind = null
-    this.ensureTurn()
+  /**
+   * Build a tool card. One builder for the live path and the history path:
+   * the two used to be written out separately, which is how the history view
+   * ended up with a card that could not collapse.
+   *
+   * Tool output collapses the same way a thinking block does - collapsed by
+   * default, click anywhere on the collapsed card to expand, click the label to
+   * collapse again. Most calls are one or two lines, so the collapsed height is
+   * chosen to show those in full and only clamp the long ones.
+   */
+  private buildToolCard(name: string) {
     const card = this.el('blk blk-tool')
     const head = this.el('blk-head')
     head.append(this.el('tool-name', name))
@@ -540,10 +548,39 @@ export class Transcript {
     head.appendChild(status)
     const args = this.el('tool-args')
     const out = this.el('tool-out')
-    card.append(head, args, out)
+    const detail = this.el('tool-detail clamp')
+    detail.append(args, out)
+    card.append(head, detail)
+
+    // Collapsed: the whole card is the target. Expanded: only the label, so
+    // selecting output text does not hide it.
+    card.addEventListener('click', (e) => {
+      const isHead = (e.target as HTMLElement)?.closest?.('.blk-head')
+      if (detail.classList.contains('expanded')) {
+        if (!isHead) return
+        detail.classList.remove('expanded')
+        head.classList.remove('open')
+        card.classList.remove('is-open')
+        detail.scrollTop = 0
+      } else {
+        detail.classList.add('expanded')
+        head.classList.add('open')
+        card.classList.add('is-open')
+      }
+    })
+    return { card, head, args, out, detail }
+  }
+
+  private openTool(id: string, name: string) {
+    this.flushNow()
+    this.textBuf = null
+    this.textKind = null
+    this.ensureTurn()
+    const { card, head, args, out, detail } = this.buildToolCard(name)
+    const status = head.lastElementChild as HTMLElement
     this.setLive(card)
     this.turn!.appendChild(card)
-    this.tools.set(id, { card, args, out, status, stdout: '', stderr: '' })
+    this.tools.set(id, { card, args, out, status, detail, stdout: '', stderr: '' })
     this.scrollIfNeeded()
   }
 
@@ -565,6 +602,11 @@ export class Transcript {
     // Clamp what the DOM holds; a `yes` loop must not grow the page forever.
     const shown = (t.stdout + t.stderr).slice(-8000)
     t.out.textContent = shown
+    // While collapsed and still running, pin the clamp to the tail: the newest
+    // line of a long build log is the one worth seeing. Same rule as thinking.
+    if (!t.detail.classList.contains('expanded')) {
+      t.detail.scrollTop = t.detail.scrollHeight
+    }
     this.scrollIfNeeded()
   }
 
@@ -574,6 +616,9 @@ export class Transcript {
     t.status.textContent = ok ? `ok${exit === null ? '' : ` · exit ${exit}`}` : `failed${exit === null ? '' : ` · exit ${exit}`}`
     t.status.className = `tool-status ${ok ? 'ok' : 'bad'}`
     t.card.classList.add(ok ? 'tool-ok' : 'tool-bad')
+    // Snap back to the start once it is done, so a scanned card begins where a
+    // reader expects rather than mid-log.
+    if (!t.detail.classList.contains('expanded')) t.detail.scrollTop = 0
   }
 
   private toolFail(id: string, msg: string) {
@@ -663,13 +708,8 @@ export class Transcript {
           this.turn!.appendChild(this.fileRow(m.files))
         }
         for (const call of parseCalls(m.tool_calls_json)) {
-          const card = this.el('blk blk-tool')
-          const head = this.el('blk-head')
-          head.append(this.el('tool-name', call.name))
-          head.append(this.el('tool-status', ''))
-          const args = this.el('tool-args')
-          const out = this.el('tool-out')
-          card.append(head, args, out)
+          const { card, head, args, out, detail } = this.buildToolCard(call.name)
+          ;(head.lastElementChild as HTMLElement).textContent = ''
           frag.appendChild(card)
           args.textContent = call.arguments
           const ref = { out }
@@ -679,6 +719,7 @@ export class Transcript {
             card,
             args,
             out,
+            detail,
             status: head.lastElementChild as HTMLElement,
             stdout: '',
             stderr: '',

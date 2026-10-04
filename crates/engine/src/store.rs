@@ -65,6 +65,13 @@ pub struct Session {
     pub message_count: i64,
 }
 
+/// One bounded page of transcript history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MessagesPage {
+    pub messages: Vec<StoredMessage>,
+    pub has_older: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub id: i64,
@@ -326,6 +333,26 @@ impl Store {
         out.reverse();
         attach_meta(&conn, &mut out)?;
         Ok(out)
+    }
+
+    /// One bounded page of transcript history, newest window in reading order.
+    ///
+    /// Lives in the store rather than in each shell so the desktop and the
+    /// gateway cannot drift on what "the newest 60 messages" means.
+    pub fn messages_page(
+        &self,
+        session_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<MessagesPage, StoreError> {
+        let limit = limit.clamp(1, 400);
+        // Fetch one extra row as a probe for `has_older` rather than a second COUNT.
+        let mut page = self.messages_before(session_id, before_id, limit + 1)?;
+        let has_older = page.len() > limit;
+        if has_older {
+            page.remove(0); // drop the probe, keeping the newest `limit`
+        }
+        Ok(MessagesPage { messages: page, has_older })
     }
 
     pub fn message_count(&self, session_id: i64) -> Result<usize, StoreError> {

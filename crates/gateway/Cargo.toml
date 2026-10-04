@@ -1,0 +1,26 @@
+[package]
+name = "cwoffee-gateway"
+version = "0.0.0"
+edition = "2021"
+description = "LAN/remote access to a running cwoffee session host: static UI, RPC, and an event stream."
+
+[lib]
+name = "cwoffee_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cwoffee-gateway"
+path = "src/main.rs"
+
+[dependencies]
+cwoffee-engine = { path = "../engine" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -14,14 +14,14 @@
 //!     output, and call it again identically. `max_tool_iters` is a hard stop,
 //!     reported as such rather than silently continuing.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
 
 use crate::approval::{ApprovalGate, GateOutcome};
-use crate::event::{EngineEvent, FinishReason};
+use crate::event::{EngineEvent, ExecStream, FinishReason};
 use crate::prompt::PromptBuilder;
 use crate::provider::{ChatRequest, Delta, Provider, Reasoning, ToolCall};
 use crate::telemetry::TurnTelemetry;
@@ -462,11 +462,18 @@ impl Agent {
         // rule as stream_once: the task owns the receiver, and we drop the
         // sender once the tool returns, or the bridge never finishes.
         let (etchunk, mut erx) = mpsc::unbounded_channel::<ExecChunk>();
+        // Did this tool stream anything of its own? exec does; web_fetch,
+        // web_search, read_file and friends do not - they only return a result.
+        // Without this, those cards stay blank until the session is reopened and
+        // the stored tool message is rendered from the store.
+        let streamed = Arc::new(AtomicUsize::new(0));
         let bridge = tokio::spawn({
             let out = out.clone();
             let id = call.id.clone();
+            let streamed = Arc::clone(&streamed);
             async move {
                 while let Some(c) = erx.recv().await {
+                    streamed.fetch_add(1, Ordering::Relaxed);
                     let _ = out.send(EngineEvent::ToolExecOutput {
                         id: id.clone(),
                         stream: c.stream,
@@ -507,6 +514,20 @@ impl Agent {
         };
         drop(etchunk);
         let _ = bridge.await;
+
+        // A tool that streamed nothing still has to show its outcome. Sent after
+        // the bridge is joined so the ordering on the event channel is: chunks,
+        // then this, then ToolExecEnd.
+        if streamed.load(Ordering::Relaxed) == 0 {
+            let shown = render_result(&result);
+            if !shown.is_empty() {
+                let _ = out.send(EngineEvent::ToolExecOutput {
+                    id: call.id.clone(),
+                    stream: ExecStream::Stdout,
+                    chunk: shown,
+                });
+            }
+        }
 
         if !result.files.is_empty() {
             self.turn_files.extend(result.files.iter().cloned());
@@ -684,6 +705,72 @@ mod tests {
         let a = h.iter().find(|m| matches!(m.role, crate::provider::Role::Assistant)).expect("assistant message");
         assert_eq!(a.reasoning, None);
         assert_eq!(a.reasoning_ms, None);
+    }
+
+    /// A tool that returns a result but streams nothing, which is what every
+    /// non-exec tool does. The transcript rendered only streamed chunks, so a
+    /// web_fetch card stayed blank until the session was closed and reopened -
+    /// the result had been in the store the whole time.
+    #[derive(Default)]
+    struct Quiet;
+
+    #[async_trait]
+    impl crate::tools::Tool for Quiet {
+        fn name(&self) -> &str { "quiet" }
+        fn description(&self) -> &str { "returns output without streaming it" }
+        fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
+        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::ReadOnly }
+        async fn run(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+            _sink: &crate::tools::ExecSink,
+        ) -> crate::tools::ToolResult {
+            ToolResult::ok("fetched: the price is 42")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_streaming_tool_still_shows_its_result_live() {
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Quiet::default()));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "q1".into(),
+                            name: "quiet".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        Delta::Text("done".into()),
+                        Delta::Done(FinishReason::Stop),
+                    ],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        agent.run_turn("go", vec![], &etx).await;
+
+        let mut seen: Vec<String> = Vec::new();
+        while let Ok(ev) = erx.try_recv() {
+            if let EngineEvent::ToolExecOutput { id, chunk, .. } = ev {
+                seen.push(format!("{id}:{chunk}"));
+            }
+        }
+        assert!(
+            seen.iter().any(|s| s.contains("fetched: the price is 42")),
+            "the result never reached the UI: {seen:?}"
+        );
     }
 
     /// A tool that panics. Real example: the HTML stripper sliced a string at a

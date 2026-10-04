@@ -1,0 +1,872 @@
+//! LAN / remote access to a running cwoffee session host.
+//!
+//! This is a transport, not a second engine. It is handed the *same*
+//! `SessionHost` the desktop window drives, so a phone shows the turn that is
+//! actually running and an approval answered from a phone is the same approval
+//! the desktop is waiting on. A separate gateway process with its own host would
+//! have looked identical on the surface and been a different conversation.
+//!
+//! ## What is exposed
+//!
+//!   * static files: the built `ui/dist`, so the normal UI runs in a browser
+//!   * `/ws`: JSON RPC plus a pushed event stream
+//!
+//! ## Security posture, and its limits
+//!
+//! A cwoffee session has a sandboxed shell and file writes in a workspace. A
+//! network listener on that is not a read-only dashboard, so:
+//!
+//!   * the default bind is loopback. Binding anywhere else requires a token and
+//!     refuses to start without one - there is no "oops, it was open" state.
+//!   * tokens are compared without early exit.
+//!   * a *watch* token can read; only a *drive* token can send a turn, cancel,
+//!     change mode, or answer an approval. Reading and driving are separate
+//!     capabilities because the watch token is the one you are likely to type on
+//!     a phone in a coffee shop.
+//!   * the token is never in a URL. A browser cannot set headers on a WebSocket,
+//!     so the token goes in the first frame after connect, and nothing is
+//!     streamed and no RPC is served before that frame is accepted. Query
+//!     strings end up in proxy logs and browser history.
+//!   * approvals still fail closed on the engine's own timeout. A phone that
+//!     drops its connection cannot leave the agent waiting forever.
+//!
+//! What this does **not** do: it is plain HTTP. On a network you do not control,
+//! the token and the whole transcript are visible to anyone on the path. Use
+//! loopback plus a tunnel (Tailscale, SSH -L) rather than exposing this port.
+//! That is a real limitation, stated rather than papered over.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, oneshot};
+use cwoffee_engine::approval::ApprovalAnswer;
+use cwoffee_engine::event::EngineEvent;
+use cwoffee_engine::host::{HostCmd, SessionHost};
+use cwoffee_engine::store::Store;
+
+/// Everything `serve` needs to reach the live engine.
+pub struct EngineHandle {
+    pub host: Arc<SessionHost>,
+    pub store: Arc<Store>,
+    /// Fan-out of the same events the desktop webview receives.
+    pub events: broadcast::Sender<EngineEvent>,
+    /// The same pending map the desktop's `respond_approval` uses, so an
+    /// approval answered from either side resolves the one the engine awaits.
+    pub pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    pub host: IpAddr,
+    pub port: u16,
+    /// Absolute path to a built `ui/dist`.
+    pub dist: PathBuf,
+    /// Grants read *and* drive. This is the token you use yourself.
+    pub drive_token: Option<String>,
+    /// Grants read only. Optional; a deployment can have no watch token at all.
+    pub watch_token: Option<String>,
+}
+
+impl GatewayConfig {
+    pub fn is_loopback(&self) -> bool {
+        self.host.is_loopback()
+    }
+}
+
+#[derive(Debug)]
+pub enum GatewayError {
+    /// Refusing to start rather than opening an unauthenticated agent to a LAN.
+    Refused(String),
+    Other(String),
+}
+
+impl std::fmt::Display for GatewayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GatewayError::Refused(m) => write!(f, "refused: {m}"),
+            GatewayError::Other(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Constant-time string comparison. `==` on strings returns at the first
+/// differing byte, which turns a timing attack from theoretical into practical
+/// against a token of any length.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    // Lengths differ: still compare the full shorter side and fold the length
+    // difference into the result, so the early return is not a timing signal.
+    let n = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
+fn role_for(token: &str, cfg: &GatewayConfig) -> Option<Role> {
+    if let Some(t) = &cfg.drive_token {
+        if ct_eq(token, t) {
+            return Some(Role::Drive);
+        }
+    }
+    if let Some(t) = &cfg.watch_token {
+        if ct_eq(token, t) {
+            return Some(Role::Watch);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Watch,
+    Drive,
+}
+
+impl Role {
+    fn can_drive(self) -> bool {
+        matches!(self, Role::Drive)
+    }
+}
+
+/// Wire format. One struct with optional fields keeps the browser side simple:
+/// there is no framing to get wrong, just JSON objects with a `type`.
+#[derive(Debug, Deserialize)]
+struct RpcReq {
+    /// Client-generated id, echoed on the response so the browser can match.
+    id: u64,
+    cmd: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct RpcRes {
+    id: u64,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+pub async fn serve(cfg: GatewayConfig, handle: Arc<EngineHandle>) -> Result<(), GatewayError> {
+    // The whole security story rests on this check. An agent with a sandboxed
+    // shell must not be reachable by default from anything but this machine.
+    if !cfg.is_loopback() && cfg.drive_token.is_none() {
+        return Err(GatewayError::Refused(format!(
+            "binding {} requires a drive token; refusing to expose a tool-using \
+             agent to the network unauthenticated",
+            cfg.host
+        )));
+    }
+    if !cfg.dist.is_dir() {
+        return Err(GatewayError::Other(format!(
+            "no built frontend at {}; run `npm --prefix ui run build`",
+            cfg.dist.display()
+        )));
+    }
+
+    let addr = SocketAddr::new(cfg.host, cfg.port);
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| GatewayError::Other(format!("cannot bind {addr}: {e}")))?;
+
+    eprintln!(
+        "[cwoffee] gateway: http://{}:{} ({})",
+        cfg.host,
+        cfg.port,
+        if cfg.is_loopback() {
+            "loopback only"
+        } else {
+            "NETWORK-REACHABLE; plain HTTP, no TLS - use a tunnel"
+        }
+    );
+
+    let cfg = Arc::new(cfg);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[cwoffee] gateway accept failed: {e}");
+                continue;
+            }
+        };
+        let cfg = Arc::clone(&cfg);
+        let handle = Arc::clone(&handle);
+        tokio::spawn(async move {
+            if let Err(e) = connection(stream, peer, cfg, handle).await {
+                // Per-connection failures are routine: a browser tab closing
+                // mid-response, a scanner probing the port. Loud enough to
+                // diagnose, quiet enough not to bury real errors.
+                eprintln!("[cwoffee] gateway {peer}: {e}");
+            }
+        });
+    }
+}
+
+/// Headers are read before deciding anything, so a request that is not a
+/// WebSocket upgrade can be answered as plain HTTP.
+const MAX_HEAD: usize = 16 * 1024;
+
+async fn connection(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    cfg: Arc<GatewayConfig>,
+    handle: Arc<EngineHandle>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Decide from a *peek*, not a read. The first version read the header block
+    // and then handed the drained stream to accept_async, which sat waiting for a
+    // handshake that had already been consumed: every WebSocket connection hung
+    // open with no response. peek() leaves the bytes in the socket, so the
+    // websocket layer can read its own request.
+    let mut peeked = vec![0u8; 2048];
+    let n = stream.peek(&mut peeked).await?;
+    let head_peek = String::from_utf8_lossy(&peeked[..n]).to_ascii_lowercase();
+    if head_peek.contains("upgrade: websocket") {
+        let ws = tokio_tungstenite::accept_async(stream).await?;
+        return websocket(ws, cfg, handle).await;
+    }
+
+    // Plain HTTP: now actually consume the request head.
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_double_crlf(&buf) {
+            buf.truncate(pos + 4);
+            break;
+        }
+        // An unbounded read here is a trivial memory DoS on a port that may be
+        // network-reachable.
+        if buf.len() > MAX_HEAD {
+            let _ = respond(&mut stream, 431, "text/plain", b"headers too large").await;
+            return Ok(());
+        }
+    }
+
+    let head = String::from_utf8_lossy(&buf).to_string();
+    let (method, path, _headers) = parse_head(&head).ok_or("malformed request line")?;
+
+    if method != "GET" && method != "HEAD" {
+        // The RPC surface is the socket, not a POST endpoint: keeping static
+        // serving read-only means a bug in the file server cannot become a way
+        // to drive the agent.
+        return respond(&mut stream, 405, "text/plain", b"method not allowed").await;
+    }
+
+    match serve_static(&cfg.dist, &path) {
+        Some((status, ctype, body)) => respond(&mut stream, status, &ctype, &body).await,
+        None => {
+            eprintln!("[cwoffee] gateway {peer}: no route for {path}");
+            respond(&mut stream, 404, "text/plain", b"not found").await
+        }
+    }
+}
+
+fn find_double_crlf(b: &[u8]) -> Option<usize> {
+    b.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_head(head: &str) -> Option<(String, String, HashMap<String, String>)> {
+    let mut lines = head.split("\r\n");
+    let request = lines.next()?;
+    let mut parts = request.splitn(3, ' ');
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+    Some((method, path, headers))
+}
+
+/// Minimal percent-decoding. Only used on the path component, and it deliberately
+/// leaves invalid escapes as-is rather than failing, so a stray `%` in a filename
+/// does not break asset loading.
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Map a URL path to a file under `dist`, refusing anything that escapes it.
+///
+/// The SPA is a single page, so an unknown path that is not an asset returns
+/// index.html - that is what makes a client-side route survive a reload.
+fn serve_static(dist: &std::path::Path, url_path: &str) -> Option<(u16, String, Vec<u8>)> {
+    let clean = url_path.split('?').next().unwrap_or("/");
+    // Decode before confining. Confining first would let `%2e%2e` walk out after
+    // the check, because the checked string and the opened string would differ.
+    let rel = pct_decode(clean).trim_start_matches('/').to_string();
+
+    let candidate = if rel.is_empty() {
+        dist.join("index.html")
+    } else {
+        // Reject any traversal before touching the filesystem. `Path::join`
+        // happily accepts `..`; confine() is what makes it safe.
+        match cwoffee_engine::tools::path::confine(dist, rel.as_str()) {
+            Ok(p) => p,
+            Err(_) => return Some((400, "text/plain".into(), b"bad path".to_vec())),
+        }
+    };
+
+    if candidate.is_dir() || !candidate.exists() {
+        let index = dist.join("index.html");
+        let body = std::fs::read(&index).ok()?;
+        return Some((200, "text/html; charset=utf-8".into(), body));
+    }
+
+    let ext = candidate.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ctype = match ext {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "json" => "application/json",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+    .to_string();
+    let body = std::fs::read(&candidate).ok()?;
+    Some((200, ctype, body))
+}
+
+async fn respond(
+    stream: &mut TcpStream,
+    status: u16,
+    ctype: &str,
+    body: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        431 => "Request Header Fields Too Large",
+        _ => "Error",
+    };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+/// tungstenite 0.26 stores text frames as `Utf8Bytes`, not `String`, so every
+/// construction needs the conversion. One helper rather than `.into()` scattered
+/// across the file.
+fn txt(s: String) -> Message {
+    Message::Text(s.into())
+}
+
+/// How long a socket may sit unauthenticated. Anything that connects and says
+/// nothing gets dropped rather than holding a slot and an event subscription.
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn websocket(
+    ws: tokio_tungstenite::WebSocketStream<TcpStream>,
+    cfg: Arc<GatewayConfig>,
+    handle: Arc<EngineHandle>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (mut sink, mut stream) = ws.split();
+
+    // Nothing is read or streamed until a role is established.
+    let role = match auth_handshake(&mut sink, &mut stream, &cfg).await {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let mut rx = handle.events.subscribe();
+    // Replay nothing: a late joiner gets the live tail and then loads stored
+    // history over RPC. Replaying a turn's events to a second client would mean
+    // buffering them, and the transcript is already the durable record.
+    let _ = sink
+        .send(txt(serde_json::json!({ "type": "ready", "role": if role.can_drive() { "drive" } else { "watch" } }).to_string()))
+        .await;
+
+    let mut ping = tokio::time::interval(std::time::Duration::from_secs(25));
+    loop {
+        tokio::select! {
+            ev = rx.recv() => {
+                match ev {
+                    Ok(e) => {
+                        let payload = serde_json::to_string(&serde_json::json!({ "type": "event", "d": e })).unwrap_or_default();
+                        if sink.send(txt(payload)).await.is_err() { return Ok(()); }
+                    }
+                    // The engine's event channel closed; nothing left to stream.
+                    Err(_) => return Ok(()),
+                }
+            }
+            msg = stream.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    // Closed or a protocol error: the browser will reconnect.
+                    Some(Err(_)) | None => return Ok(()),
+                };
+                match msg {
+                    Message::Text(t) => {
+                        let reply = dispatch(t.as_str(), role, &handle).await;
+                        if let Some(payload) = reply {
+                            if sink.send(txt(payload)).await.is_err() { return Ok(()); }
+                        }
+                    }
+                    Message::Close(_) => return Ok(()),
+                    Message::Ping(p) => {
+                        if sink.send(Message::Pong(p)).await.is_err() { return Ok(()); }
+                    }
+                    _ => {}
+                }
+            }
+            _ = ping.tick() => {
+                if sink.send(Message::Ping(Default::default())).await.is_err() { return Ok(()); }
+            }
+        }
+    }
+}
+
+async fn auth_handshake(
+    sink: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
+    stream: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>,
+    cfg: &GatewayConfig,
+) -> Option<Role> {
+    let _ = sink
+        .send(txt(serde_json::json!({ "type": "hello", "need_auth": cfg.drive_token.is_some() || cfg.watch_token.is_some() }).to_string()))
+        .await;
+
+    let first = tokio::time::timeout(AUTH_TIMEOUT, stream.next()).await.ok()??;
+    let first_txt = match first.ok()? {
+        Message::Text(t) => t,
+        _ => return None,
+    };
+    let v: serde_json::Value = serde_json::from_str(first_txt.as_str()).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("auth") {
+        let _ = sink
+            .send(txt(serde_json::json!({ "type": "error", "error": "expected an auth frame first" }).to_string()))
+            .await;
+        return None;
+    }
+    let token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
+    // No tokens configured (loopback-only dev): the connection is accepted as
+    // drive, because the bind address is already the boundary.
+    if cfg.drive_token.is_none() && cfg.watch_token.is_none() {
+        return Some(Role::Drive);
+    }
+    match role_for(token, cfg) {
+        Some(r) => {
+            let _ = sink
+                .send(txt(serde_json::json!({ "type": "auth_ok", "role": if r.can_drive() { "drive" } else { "watch" } }).to_string()))
+                .await;
+            Some(r)
+        }
+        None => {
+            let _ = sink
+                .send(txt(serde_json::json!({ "type": "auth_fail" }).to_string()))
+                .await;
+            None
+        }
+    }
+}
+
+/// Run one RPC. Returns the serialized response, or None for anything we
+/// deliberately do not answer.
+async fn dispatch(raw: &str, role: Role, handle: &EngineHandle) -> Option<String> {
+    let req: RpcReq = match serde_json::from_str(raw) {
+        Ok(r) => r,
+        Err(e) => {
+            return Some(
+                serde_json::json!({ "type": "rpc_error", "error": format!("malformed frame: {e}") })
+                    .to_string(),
+            )
+        }
+    };
+    let id = req.id;
+    // Tauri passes command arguments as a named map, so `invoke('x', { report })`
+    // arrives as `{ report: ... }`. Logging the command and its keys is what
+    // turned a "the browser shows nothing" report into a findable shape mismatch.
+    if std::env::var("CWOFFEE_GATEWAY_TRACE").is_ok() {
+        eprintln!(
+            "[cwoffee/gateway] rpc {:#?}",
+            req.cmd
+        );
+    }
+    let out = run_cmd(&req.cmd, req.args, role, handle).await;
+    Some(
+        serde_json::to_string(&RpcRes {
+            id,
+            ok: out.is_ok(),
+            data: out.clone().ok(),
+            error: out.err().map(|e| e.to_string()),
+        })
+        .unwrap_or_default(),
+    )
+}
+
+type CmdResult = Result<serde_json::Value, String>;
+
+fn need_drive(role: Role) -> CmdResult {
+    if role.can_drive() {
+        Ok(serde_json::Value::Null)
+    } else {
+        Err("this token can watch, not drive".into())
+    }
+}
+
+fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("missing string argument `{key}`"))
+}
+
+fn arg_i64(args: &serde_json::Value, key: &str) -> Result<i64, String> {
+    args.get(key)
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| format!("missing integer argument `{key}`"))
+}
+
+async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandle) -> CmdResult {
+    use serde_json::json;
+    match cmd {
+        // ---- read-only: available to a watch token -------------------------
+        "session_state" => serde_json::to_value(h.host.state()).map_err(|e| e.to_string()),
+        "list_sessions" => {
+            serde_json::to_value(h.store.list_sessions(50).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())
+        }
+        "search_messages" => serde_json::to_value(
+            h.store
+                .search(&arg_str(&args, "query")?, 25)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string()),
+        "session_messages" => {
+            let id = arg_i64(&args, "id")?;
+            let before = args.get("before").and_then(|v| v.as_i64());
+            let page = h
+                .store
+                .messages_page(id, before, 60)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(page).map_err(|e| e.to_string())
+        }
+        "migration_notes" => Ok(json!([] as [String; 0])),
+
+        // ---- drive ---------------------------------------------------------
+        "start_turn" => {
+            need_drive(role)?;
+            let text = arg_str(&args, "text")?;
+            // Attachments are deliberately not accepted over the gateway in this
+            // slice: an image is a large base64 blob on an unauthenticated-by-
+            // default channel, and the phone case is watching and answering, not
+            // composing with images.
+            h.host.submit(text);
+            Ok(json!(true))
+        }
+        "cancel_turn" => {
+            need_drive(role)?;
+            h.host.cancel();
+            Ok(json!(true))
+        }
+        "set_mode" => {
+            need_drive(role)?;
+            let m = match arg_str(&args, "mode")?.as_str() {
+                "ask" => cwoffee_engine::ApprovalMode::Ask,
+                "session" => cwoffee_engine::ApprovalMode::Session,
+                "auto" => cwoffee_engine::ApprovalMode::Auto,
+                other => return Err(format!("unknown mode {other:?}")),
+            };
+            h.host.send(HostCmd::SetMode { mode: m });
+            Ok(json!(true))
+        }
+        "set_reasoning" => {
+            need_drive(role)?;
+            let r = match arg_str(&args, "level")?.as_str() {
+                "off" => cwoffee_engine::Reasoning::Off,
+                "low" => cwoffee_engine::Reasoning::Low,
+                "medium" => cwoffee_engine::Reasoning::Medium,
+                "high" => cwoffee_engine::Reasoning::High,
+                "xhigh" => cwoffee_engine::Reasoning::XHigh,
+                other => return Err(format!("unknown reasoning level {other:?}")),
+            };
+            h.host.send(HostCmd::SetReasoning { reasoning: r });
+            Ok(json!(true))
+        }
+        "respond_approval" => {
+            need_drive(role)?;
+            let id = arg_i64(&args, "id")? as u64;
+            let answer = match arg_str(&args, "answer")?.as_str() {
+                "allow" => ApprovalAnswer::Allow,
+                "allow_session" => ApprovalAnswer::AllowSession,
+                "deny" => ApprovalAnswer::Deny,
+                other => return Err(format!("unknown answer {other:?}")),
+            };
+            let tx = h.pending.lock().unwrap().remove(&id);
+            match tx {
+                Some(tx) => tx
+                    .send(answer)
+                    .map(|_| json!(true))
+                    .map_err(|_| "the engine no longer wants this answer".to_string()),
+                None => Err(format!("no pending approval with id {id}")),
+            }
+        }
+        "new_session" => {
+            need_drive(role)?;
+            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let id = h
+                .store
+                .create_session(title, &h.host.state().workspace, &h.host.state().model)
+                .map_err(|e| e.to_string())?;
+            h.host.send(HostCmd::SwitchSession { id });
+            Ok(json!(id))
+        }
+        "switch_session" => {
+            need_drive(role)?;
+            let id = arg_i64(&args, "id")?;
+            h.host.send(HostCmd::SwitchSession { id });
+            Ok(json!(true))
+        }
+        "clear_session" => {
+            need_drive(role)?;
+            h.host.send(HostCmd::ClearSession);
+            Ok(json!(true))
+        }
+        "rename_session" => {
+            need_drive(role)?;
+            h.store
+                .rename_session(arg_i64(&args, "id")?, &arg_str(&args, "title")?)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(true))
+        }
+        "delete_session" => {
+            need_drive(role)?;
+            let id = arg_i64(&args, "id")?;
+            let active = h.host.state().session_id;
+            if active == id && h.host.state().busy {
+                return Err("cannot delete the session while its turn is running".into());
+            }
+            h.store.delete_session(id).map_err(|e| e.to_string())?;
+            if active == id {
+                h.host.send(HostCmd::ClearSession);
+            }
+            Ok(json!(true))
+        }
+        "set_model" => {
+            need_drive(role)?;
+            h.host.send(HostCmd::SetModel { model: arg_str(&args, "model")? });
+            Ok(json!(true))
+        }
+        "list_models" => serde_json::to_value(
+            h.host
+                .provider()
+                .list_models()
+                .await
+                .map_err(|e| format!("{e}"))?,
+        )
+        .map_err(|e| e.to_string()),
+
+        // Diagnostics the UI calls on every boot. Answering them is what keeps a
+        // browser session's health badge honest instead of permanently red: the
+        // first gateway build failed `render_report`, and the UI reasonably read
+        // that as "the transport is broken".
+        "render_report" => {
+            // Tauri passes named arguments as a map, so the payload lives under
+            // `report`, not at the top level.
+            let r = args.get("report").cloned().unwrap_or(args.clone());
+            eprintln!(
+                "[cwoffee/gateway] render report titlebar={:?} footer={:?} empty={:?} text={:?}",
+                r.get("titlebar").and_then(|v| v.as_bool()),
+                r.get("footer").and_then(|v| v.as_bool()),
+                r.get("empty_mode").and_then(|v| v.as_bool()),
+                r.get("text_len").and_then(|v| v.as_i64())
+            );
+            Ok(json!(true))
+        }
+        "boot_log" => {
+            eprintln!("[cwoffee/gateway/page] {}", arg_str(&args, "msg")?);
+            Ok(json!(true))
+        }
+        "gpu_report" => Ok(json!({ "note": "gpu reporting is desktop-only" })),
+        "open_file" => Err("opening files is desktop-only; the gateway cannot touch your filesystem".into()),
+        // Deliberately absent: open_file, pick_workspace, set_workspace,
+        // render_report, boot_log. The first three act on the desktop machine;
+        // a phone should not be able to point the agent at a different directory.
+        other => Err(format!("unknown command {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_comparison_accepts_equal_and_rejects_different() {
+        assert!(ct_eq("hunter2", "hunter2"));
+        assert!(!ct_eq("hunter2", "hunter3"));
+        assert!(!ct_eq("hunter2", "hunter22"));
+        assert!(!ct_eq("", "x"));
+        assert!(ct_eq("", ""));
+    }
+
+    /// A watch token must never satisfy a drive check. This is the whole
+    /// separation between "see what the agent is doing" and "make it do things".
+    #[test]
+    fn watch_and_drive_tokens_grant_different_roles() {
+        let cfg = GatewayConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 8099,
+            dist: PathBuf::from("."),
+            drive_token: Some("drive-me".into()),
+            watch_token: Some("watch-me".into()),
+        };
+        assert_eq!(role_for("drive-me", &cfg), Some(Role::Drive));
+        assert_eq!(role_for("watch-me", &cfg), Some(Role::Watch));
+        assert_eq!(role_for("nope", &cfg), None);
+        assert!(!Role::Watch.can_drive());
+        assert!(Role::Drive.can_drive());
+    }
+
+    /// The two tokens must not be interchangeable by prefix either: a shorter
+    /// watch token that is a prefix of the drive token must not match.
+    #[test]
+    fn a_prefix_of_the_drive_token_is_not_accepted() {
+        let cfg = GatewayConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 8099,
+            dist: PathBuf::from("."),
+            drive_token: Some("superlongdrivetoken".into()),
+            watch_token: None,
+        };
+        assert_eq!(role_for("superlong", &cfg), None);
+    }
+
+    /// Refusing to start is the security boundary for a non-loopback bind. If
+    /// this ever regresses, the default deployment is an open agent.
+    #[tokio::test]
+    async fn binding_a_non_loopback_address_without_a_token_is_refused() {
+        let cfg = GatewayConfig {
+            host: "0.0.0.0".parse().unwrap(),
+            port: 8099,
+            dist: PathBuf::from("."),
+            drive_token: None,
+            watch_token: None,
+        };
+        let handle = Arc::new(EngineHandle {
+            host: {
+                // Never used: serve() must fail before it touches the engine.
+                let p: Arc<dyn cwoffee_engine::provider::Provider> = Arc::new(FakeProvider);
+                let store = Arc::new(Store::in_memory().unwrap());
+                let h = SessionHost::spawn(
+                    p,
+                    cwoffee_engine::tools::Registry::new(),
+                    Arc::clone(&store),
+                    cwoffee_engine::host::HostConfig::new("m", std::env::temp_dir()),
+                );
+                Arc::new(h)
+            },
+            store: Arc::new(Store::in_memory().unwrap()),
+            events: broadcast::channel(8).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let err = serve(cfg, handle).await.unwrap_err();
+        assert!(matches!(err, GatewayError::Refused(_)), "got {err:?}");
+    }
+
+    struct FakeProvider;
+    #[async_trait::async_trait]
+    impl cwoffee_engine::provider::Provider for FakeProvider {
+        fn id(&self) -> &str { "fake" }
+        fn label(&self) -> &str { "fake" }
+        async fn stream(
+            &self,
+            _req: &cwoffee_engine::provider::ChatRequest,
+            _sink: &cwoffee_engine::provider::DeltaSink,
+        ) -> Result<(), cwoffee_engine::provider::ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// Path traversal against the static file server.
+    #[test]
+    fn static_serving_cannot_escape_the_dist_directory() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_dist_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("index.html"), b"<html>ok</html>").unwrap();
+        std::fs::write(dir.join("assets/app.js"), b"console.log(1)").unwrap();
+
+        let (status, ctype, body) = serve_static(&dir, "/assets/app.js").unwrap();
+        assert_eq!(status, 200);
+        assert!(ctype.starts_with("text/javascript"));
+        assert_eq!(body, b"console.log(1)");
+
+        // Unknown route -> the SPA shell, so a client-side route survives reload.
+        let (status, ctype, body) = serve_static(&dir, "/session/12").unwrap();
+        assert_eq!(status, 200);
+        assert!(ctype.starts_with("text/html"));
+        assert_eq!(body, b"<html>ok</html>");
+
+        // Traversal attempts are refused, not resolved.
+        for attack in [
+            "/../secret.txt",
+            "/assets/../../etc/passwd",
+            "/%2e%2e/%2e%2e/etc/passwd",
+        ] {
+            let (status, _, _) = serve_static(&dir, attack).unwrap();
+            assert_ne!(status, 200, "served content for {attack}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_parsing_handles_a_normal_request() {
+        let (method, path, headers) =
+            parse_head("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n").unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/ws");
+        // Header names are lower-cased on lookup, so the browser's casing does
+        // not decide whether the upgrade is recognised.
+        assert_eq!(headers.get("upgrade").map(|s| s.as_str()), Some("websocket"));
+        assert!(find_double_crlf(b"GET / HTTP/1.1\r\nA: b\r\n\r\nrest").is_some());
+        assert!(find_double_crlf(b"GET / HTTP/1.1\r\nA: b\r\n").is_none());
+    }
+}

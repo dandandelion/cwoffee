@@ -1,7 +1,65 @@
-# LAN gateway (not built yet)
+# LAN gateway
 
 Goal: open Cwoffee from a phone on the same network to watch progress and answer
 approvals when you are not at the machine.
+
+## What is built now
+
+`crates/gateway` is a small axum-free HTTP + WebSocket server that mirrors the
+**same running `SessionHost`** as the desktop window. It is not a second engine:
+a turn started from a phone shows up in the desktop transcript, and vice versa.
+
+Start it by pointing the desktop app at a port:
+
+```sh
+CWOFFEE_GATEWAY_PORT=8099 cwoffee                     # loopback only, read+write
+CWOFFEE_GATEWAY_HOST=0.0.0.0 CWOFFEE_GATEWAY_TOKEN=... cwoffee   # network-reachable
+```
+
+| env | meaning |
+|---|---|
+| `CWOFFEE_GATEWAY_PORT` | set at all to enable the gateway |
+| `CWOFFEE_GATEWAY_HOST` | bind address, defaults to `127.0.0.1` |
+| `CWOFFEE_GATEWAY_TOKEN` | the *drive* token: full control |
+| `CWOFFEE_GATEWAY_WATCH_TOKEN` | separate read-only token |
+| `CWOFFEE_GATEWAY_TRACE` | log every RPC command (debugging) |
+| `CWOFFEE_UI_DIST` | override where `ui/dist` is read from |
+
+Then open `http://<host>:8099/` in any browser. The frontend is the same Svelte
+app; `ui/src/lib/transport.ts` picks the transport, so there is no second UI to
+maintain. A `?token=` in the URL is consumed once, moved to `localStorage`, and
+stripped from the address bar.
+
+Two roles, enforced server-side per command:
+
+* **watch** - `session_state`, `list_sessions`, `session_messages`,
+  `search_messages`, `migration_notes`. Read-only.
+* **drive** - everything that changes state: `start_turn`, `cancel_turn`,
+  `respond_approval`, `set_mode`, `new_session`, `switch_session`, `rename_session`,
+  `delete_session`, `clear_session`, `set_model`, `set_reasoning`.
+
+Never exposed over the socket at all: `open_file`, `pick_workspace`,
+`set_workspace`, `list_models` (desktop-only), and the window controls. A browser
+tab cannot reach your filesystem through this.
+
+Verified behaviour, from the LAN address rather than from a unit test:
+
+* no token while a drive token is configured -> `auth_fail` and the socket closes.
+  It does **not** fall back to read-only. Fail closed.
+* wrong token -> same.
+* correct token -> `drive`, and `list_sessions` / `session_state` answer.
+* a turn driven from the browser streams into the browser *and* the desktop window.
+
+### The part that is not done
+
+* **No TLS.** The startup line says so out loud. A bearer token over plain HTTP
+  on a network you do not own is a bearer token anyone on that network holds.
+  For anything beyond a trusted LAN, tunnel it (Tailscale, SSH, WireGuard) and
+  bind loopback.
+* **No rate limiting, no lockout, no per-role session expiry.**
+* Approvals still **fail closed** on timeout, exactly as on the desktop.
+* The gateway shares one `SessionHost`, so there is no multi-user story: two
+  browsers drive the same agent.
 
 ## What exists today
 

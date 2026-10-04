@@ -205,7 +205,11 @@ body {
 
 .blk {
   display: grid;
-  grid-template-columns: 62px 1fr;
+  /* The label column has to fit the longest label plus the live dot. "CWOFFEE"
+     is ~53px at this size and the dot adds 11px, so the old 62px column pushed
+     the dot onto its own line - the rename made the label one character longer
+     and the whole thing wrapped. */
+  grid-template-columns: 74px 1fr;
   gap: 10px;
   align-items: start;
 }
@@ -216,6 +220,7 @@ body {
   color: var(--color-ink-3);
   padding-top: 3px;
   text-align: right;
+  white-space: nowrap;
 }
 /* The block that is currently producing output carries a live marker in its
    label column: one pulsing dot, on one block, removed at turn end. A spinner
@@ -364,6 +369,31 @@ body {
   font-size: 12px;
   color: var(--color-ink-2);
   word-break: break-all;
+}
+/* Collapse behaves exactly like a thinking block: clamped by default, the whole
+   card expands it, the label collapses it again. 3.5 lines shows the common
+   one-or-two-line call in full and only clamps the genuinely long ones. */
+.tool-detail {
+  overflow: hidden;
+}
+.blk-tool:not(.is-open) .tool-detail.clamp:not(.expanded) {
+  max-height: 5.4em;
+  -webkit-mask-image: linear-gradient(to bottom, #000 62%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 62%, transparent 100%);
+}
+.blk-tool .tool-detail.expanded {
+  max-height: none;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.blk-tool { cursor: pointer; }
+.blk-tool.is-open { cursor: default; }
+.blk-tool .blk-head::after {
+  content: ' \25B8';
+  opacity: 0.6;
+}
+.blk-tool .blk-head.open::after {
+  content: ' \25BE';
 }
 .tool-out {
   margin-top: 6px;
@@ -1229,3 +1259,12 @@ body {
 .pv-frame { flex: 1; width: 100%; height: 100%; border: 0; background: #fff; }
 .pv-svg { max-width: 100%; max-height: 100%; margin: auto; }
 .pv-err { font-size: 12px; color: var(--color-danger); padding: 16px; }
+
+/* Pending attachments can be reordered by dragging one onto another. */
+.attchip { cursor: grab; }
+.attchip:active { cursor: grabbing; }
+.attchip.dragging { opacity: 0.45; }
+.attchip.drop-target {
+  outline: 2px dashed var(--color-shell-deep);
+  outline-offset: 2px;
+}
