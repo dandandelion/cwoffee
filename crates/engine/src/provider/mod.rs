@@ -110,6 +110,47 @@ pub struct AttachmentMeta {
     pub bytes: usize,
 }
 
+/// What an endpoint says about one model.
+///
+/// Everything except `id` is optional because it is whatever the server chose to
+/// publish. llama.cpp is unusually forthcoming; a hand-written endpoint may say
+/// nothing, and the UI then says "not reported" rather than guessing on the
+/// user's behalf.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Context window in tokens, when the server states it.
+    pub context_tokens: Option<u64>,
+    /// Input modalities as the server spells them: "text", "image", "audio".
+    pub input_modalities: Vec<String>,
+    /// Tool calling. `None` means the endpoint never said.
+    ///
+    /// llama.cpp has no flag for this; the value is inferred from whether the
+    /// served chat template can render tool calls. That is a detection, not a
+    /// promise, and the UI labels it as such.
+    pub tools: Option<bool>,
+    /// True when the tools value came from the chat template rather than from a
+    /// capability the endpoint stated outright.
+    pub tools_inferred: bool,
+    /// Underlying file or repo name, when the server reveals it.
+    pub source: Option<String>,
+    /// Server build string, e.g. llama.cpp's `build_info`.
+    pub server: Option<String>,
+    /// Concurrent slots the endpoint advertises.
+    pub slots: Option<u64>,
+    /// True if the endpoint published at least one capability for this model.
+    pub advertised: bool,
+}
+
+impl ModelInfo {
+    pub fn vision(&self) -> Option<bool> {
+        if self.input_modalities.is_empty() {
+            return None;
+        }
+        Some(self.input_modalities.iter().any(|m| m == "image"))
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -298,6 +339,23 @@ pub trait Provider: Send + Sync {
     /// failure.
     async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
         Err(ProviderError::Unsupported("model listing".into()))
+    }
+
+    /// The model list plus whatever the endpoint advertises about each model.
+    ///
+    /// The default degrades to bare ids, which is the honest answer for a server
+    /// that publishes nothing else.
+    async fn list_models_info(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(|id| ModelInfo {
+                id,
+                advertised: false,
+                ..Default::default()
+            })
+            .collect())
     }
 
     /// Cheap local token estimate used for the context-usage bar. Exact only if

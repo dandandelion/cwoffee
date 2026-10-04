@@ -774,7 +774,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                     .map_err(|e| e.to_string())?;
             // A model list that fails must not blank the app; the client shows the
             // error in the model menu instead.
-            let models = match h.host.provider().list_models().await {
+            let models = match h.host.provider().list_models_info().await {
                 Ok(m) => serde_json::to_value(m).unwrap_or_else(|_| json!([])),
                 Err(_) => json!([]),
             };
@@ -914,7 +914,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         "list_models" => serde_json::to_value(
             h.host
                 .provider()
-                .list_models()
+                .list_models_info()
                 .await
                 .map_err(|e| format!("{e}"))?,
         )

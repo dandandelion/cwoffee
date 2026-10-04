@@ -70,6 +70,34 @@ impl OpenAiProvider {
         self
     }
 
+    /// GET a JSON document with the usual auth and error shape.
+    async fn fetch_json(&self, url: &str) -> Result<serde_json::Value, ProviderError> {
+        let mut req = self.http.get(url);
+        if let Some(k) = &self.api_key {
+            req = req.bearer_auth(k);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                url: url.to_string(),
+                body: body.chars().take(400).collect(),
+            });
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// llama.cpp's out-of-band capability document. Optional: an ordinary
+    /// OpenAI-compatible server 404s on it, and that is a normal answer rather
+    /// than a failure to show the user.
+    async fn props(&self) -> Option<serde_json::Value> {
+        // base_url is `.../v1/`, and /props lives at the server root.
+        let url = self.base_url.join("../props").ok()?;
+        self.fetch_json(url.as_str()).await.ok()
+    }
+
     fn models_url(&self) -> String {
         self.base_url
             .join("models")
@@ -369,23 +397,14 @@ impl ToolAccum {
 
 
 impl Provider for OpenAiProvider {
+    async fn list_models_info(&self) -> Result<Vec<crate::provider::ModelInfo>, ProviderError> {
+        let v = self.fetch_json(&self.models_url()).await?;
+        Ok(model_infos(&v, self.props().await.as_ref()))
+    }
+
     async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
         let url = self.models_url();
-        let mut req = self.http.get(&url);
-        if let Some(k) = &self.api_key {
-            req = req.bearer_auth(k);
-        }
-        let resp = req.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http {
-                status: status.as_u16(),
-                url,
-                body: body.chars().take(400).collect(),
-            });
-        }
-        let v: serde_json::Value = resp.json().await?;
+        let v = self.fetch_json(&url).await?;
         // OpenAI-shaped {"data":[{"id":...}]}; llama.cpp answers the same.
         let arr = v
             .get("data")
@@ -734,5 +753,180 @@ mod tests {
         assert_eq!(begin.unwrap(), ("call_1".to_string(), "exec".to_string()));
         assert_eq!(ready.unwrap().2, "{\"cmd\":\"echo hi\"}");
         assert!(!args.is_empty());
+    }
+}
+
+/// Turn a `/v1/models` document, plus llama.cpp's optional `/props`, into the
+/// capability rows the picker shows.
+///
+/// Split out from the network call so the parsing is testable against captured
+/// server responses: the shapes here are what llama-server actually answers, and
+/// a silent rename upstream would otherwise only show up as a picker that lost
+/// its chips.
+fn model_infos(
+    v: &serde_json::Value,
+    props: Option<&serde_json::Value>,
+) -> Vec<crate::provider::ModelInfo> {
+    use crate::provider::ModelInfo;
+    let Some(arr) = v.get("data").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    // /props describes the model that is *loaded*, so its capabilities are only
+    // applied to the model it names. Attaching them to every id in the list would
+    // be a guess dressed up as a fact.
+    let alias = props
+        .and_then(|p| p.get("model_alias"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let mut out: Vec<ModelInfo> = Vec::new();
+    for m in arr {
+        let Some(id) = m.get("id").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let mut info = ModelInfo {
+            id: id.to_string(),
+            context_tokens: m
+                .get("meta")
+                .and_then(|x| x.get("n_ctx"))
+                .and_then(|v| v.as_u64()),
+            input_modalities: m
+                .get("architecture")
+                .and_then(|a| a.get("input_modalities"))
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        if alias.as_deref() == Some(id) {
+            if let Some(p) = props {
+                info.context_tokens = info.context_tokens.or_else(|| {
+                    p.get("default_generation_settings")
+                        .and_then(|d| d.get("n_ctx"))
+                        .and_then(|v| v.as_u64())
+                });
+                info.slots = p.get("total_slots").and_then(|v| v.as_u64());
+                info.server = p.get("build_info").and_then(|v| v.as_str()).map(str::to_string);
+                info.source = p
+                    .get("model_path")
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| p.rsplit('/').next())
+                    .map(str::to_string);
+                if p.get("modalities")
+                    .and_then(|m| m.get("vision"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                    && !info.input_modalities.iter().any(|x| x == "image")
+                {
+                    info.input_modalities.push("image".into());
+                }
+                // No server states tool support as a flag. The chat template is
+                // the only place it is expressed, so this is a detection and it
+                // is marked as one.
+                if let Some(t) = p.get("chat_template").and_then(|t| t.as_str()) {
+                    info.tools = Some(
+                        t.contains("tool_call")
+                            || t.contains("tool_response")
+                            || t.contains("tool_name"),
+                    );
+                    info.tools_inferred = true;
+                }
+            }
+        }
+        info.advertised = info.context_tokens.is_some()
+            || !info.input_modalities.is_empty()
+            || info.tools.is_some();
+        out.push(info);
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    out
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    fn models() -> serde_json::Value {
+        // Captured from llama-server: meta.n_ctx and architecture.input_modalities
+        // are the two fields that make the picker useful.
+        serde_json::json!({
+            "object": "list",
+            "data": [{
+                "id": "qwen3.8-flash-next-iq3_s",
+                "object": "model",
+                "status": { "value": "loaded" },
+                "meta": { "n_ctx": 262144 },
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"]
+                }
+            }]
+        })
+    }
+
+    fn props() -> serde_json::Value {
+        serde_json::json!({
+            "default_generation_settings": { "n_ctx": 262144 },
+            "total_slots": 2,
+            "model_alias": "qwen3.8-flash-next-iq3_s",
+            "chat_template": "{% if tools %}...{{ tool_call.name }}...{% endif %}",
+            "modalities": { "vision": true },
+            "model_path": "/models/Qwen3.8-Flash-Next-IQ3_S.gguf",
+            "build_info": "b1234"
+        })
+    }
+
+    #[test]
+    fn reads_context_modalities_and_tools_from_a_llama_cpp_endpoint() {
+        let out = model_infos(&models(), Some(&props()));
+        assert_eq!(out.len(), 1);
+        let m = &out[0];
+        assert_eq!(m.context_tokens, Some(262144));
+        assert_eq!(m.vision(), Some(true));
+        assert_eq!(m.tools, Some(true));
+        assert!(m.tools_inferred, "tool support is detected, not stated");
+        assert_eq!(m.slots, Some(2));
+        assert_eq!(m.source.as_deref(), Some("Qwen3.8-Flash-Next-IQ3_S.gguf"));
+        assert_eq!(m.server.as_deref(), Some("b1234"));
+        assert!(m.advertised);
+    }
+
+    /// /props describes the loaded model. Applying its capabilities to a different
+    /// id would be a guess presented as a fact.
+    #[test]
+    fn capabilities_are_not_borrowed_from_a_different_loaded_model() {
+        let mut p = props();
+        p["model_alias"] = serde_json::json!("some_other_model");
+        let out = model_infos(&models(), Some(&p));
+        let m = &out[0];
+        assert_eq!(m.tools, None, "tools were inherited from another model");
+        assert_eq!(m.slots, None);
+        // Still honest about what /v1/models itself said.
+        assert_eq!(m.context_tokens, Some(262144));
+        assert_eq!(m.vision(), Some(true));
+    }
+
+    /// An ordinary OpenAI-compatible server: ids only, and the UI must be able to
+    /// tell that nothing was reported rather than showing empty chips.
+    #[test]
+    fn a_server_that_advertises_nothing_yields_ids_only() {
+        let v = serde_json::json!({ "data": [{ "id": "gpt-ish" }, { "id": "gpt-ish" }] });
+        let out = model_infos(&v, None);
+        assert_eq!(out.len(), 1, "duplicate ids collapse");
+        assert!(!out[0].advertised);
+        assert_eq!(out[0].context_tokens, None);
+        assert_eq!(out[0].vision(), None, "unknown must not become false");
+        assert_eq!(out[0].tools, None);
+    }
+
+    #[test]
+    fn a_text_only_model_reports_no_vision() {
+        let mut m = models();
+        m["data"][0]["architecture"]["input_modalities"] = serde_json::json!(["text"]);
+        let mut p = props();
+        p["modalities"]["vision"] = serde_json::json!(false);
+        let out = model_infos(&m, Some(&p));
+        assert_eq!(out[0].vision(), Some(false));
     }
 }

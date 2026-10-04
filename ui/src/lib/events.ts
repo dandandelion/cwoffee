@@ -29,6 +29,33 @@ export interface TurnTelemetry {
   draft_accepted: number
 }
 
+/** Live mid-turn estimates. Mirrors `TurnStats` in the engine.
+ *
+ * These are estimates: the server reports token counts only at the end of the
+ * turn, so anything shown while a turn is running is derived from characters.
+ */
+export interface TurnStats {
+  ttft_ms: number
+  streaming_ms: number
+  chars: number
+  est_tokens: number
+  est_decode_tps: number
+  thinking: boolean
+}
+
+/** One row of the model picker, as the endpoint describes it. */
+export interface ModelInfo {
+  id: string
+  context_tokens: number | null
+  input_modalities: string[]
+  tools: boolean | null
+  tools_inferred: boolean
+  source: string | null
+  server: string | null
+  slots: number | null
+  advertised: boolean
+}
+
 export type EngineEvent =
   | { kind: 'sessionChanged'; d: { session_id: number; title: string } }
   | { kind: 'turnStart'; d: { turn_id: number; model: string } }
@@ -46,6 +73,7 @@ export type EngineEvent =
       kind: 'approvalRequested'
       d: { id: number; tool: string; risk: Risk; summary: string; args: unknown }
     }
+  | { kind: 'turnStats'; d: TurnStats }
   | { kind: 'usage'; d: TurnTelemetry }
   | { kind: 'turnEnd'; d: { turn_id: number; finish: FinishReason } }
   | { kind: 'note'; d: { message: string } }

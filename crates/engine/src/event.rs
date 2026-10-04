@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::telemetry::TurnTelemetry;
+use crate::telemetry::{TurnStats, TurnTelemetry};
 use crate::tools::Risk;
 
 /// Why a turn stopped.
@@ -131,6 +131,13 @@ pub enum EngineEvent {
         summary: String,
         args: serde_json::Value,
     },
+
+    /// Live progress, emitted a few times a second while a turn streams.
+    ///
+    /// These are estimates: the server reports token counts only at the end of
+    /// the turn, so mid-turn rates come from character counts. `Usage` follows
+    /// with the real numbers, and front ends should prefer those when present.
+    TurnStats(TurnStats),
 
     /// Per-turn telemetry. Emitted once, just before `TurnEnd`.
     Usage(TurnTelemetry),

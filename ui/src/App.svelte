@@ -7,6 +7,7 @@
     EngineEvent,
     GpuReport,
     HostState,
+    ModelInfo,
     SearchHit,
     Session,
   } from './lib/events'
@@ -57,7 +58,7 @@
     clearTimeout(sidebarAnimTimer)
     sidebarAnimTimer = setTimeout(() => (sidebarAnimating = false), 320)
   }
-  let models = $state<string[]>([])
+  let models = $state<ModelInfo[]>([])
 
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
@@ -258,6 +259,19 @@
     if (!m) return 'no model'
     return m.length > 22 ? m.slice(0, 21) + '\u2026' : m
   }
+
+  /** 262144 -> "262k". The picker shows several of these side by side. */
+  function fmtTokens(n: number) {
+    if (n >= 1_000_000) return `${Math.round(n / 1_000_000)}M`
+    if (n >= 1000) return `${Math.round(n / 1000)}k`
+    return `${n}`
+  }
+
+  /** null means the endpoint never said, which is not the same as "no". */
+  function visionOf(m: ModelInfo): boolean | null {
+    if (!m.input_modalities?.length) return null
+    return m.input_modalities.includes('image')
+  }
   async function pickMode(m: 'ask' | 'session' | 'auto') {
     menu = null
     await setMode(m)
@@ -299,6 +313,11 @@
   let promptTokens = $state(0)
   let specPct = $state(0)
   let ttft = $state(0)
+  // True while the decode figure is a character-derived estimate rather than the
+  // server's own count. Labelling it is the difference between a live bar and a
+  // lying one.
+  let liveEstimate = $state(false)
+  let thinkingLive = $state(false)
 
   // ---- jank meter ---------------------------------------------------------
   // Kept from M0: it is the only number that tells us the streaming path is
@@ -405,6 +424,12 @@
         model = ev.d.model
         if (turnSessionId === null) turnSessionId = viewId
         busy = true
+        // Clear the previous turn's numbers. Leaving them up is how a bar reads
+        // as "measuring" while nothing has arrived yet for this turn.
+        curDecode = 0
+        ttft = 0
+        liveEstimate = false
+        thinkingLive = false
         frames = 0
         dropped = 0
         worstFrame = 0
@@ -434,9 +459,23 @@
         }
         pageLog(`approval ${ev.d.id}: ${ev.d.summary}`)
         break
+      case 'turnStats': {
+        // Live estimates. The server's own token counts only land with `usage`,
+        // so without these the bar sits at em-dashes through the whole of a long
+        // first turn - which is exactly when it is being looked at.
+        const st = ev.d
+        if (st.ttft_ms > 0) ttft = st.ttft_ms
+        if (st.est_decode_tps > 0) curDecode = st.est_decode_tps
+        liveEstimate = true
+        thinkingLive = st.thinking
+        break
+      }
       case 'usage': {
         const s = statsFromTurn(ev.d)
         rolling.push(s)
+        // The server has spoken: stop labelling the rate as an estimate.
+        liveEstimate = false
+        thinkingLive = false
         curPrefill = s.effectivePrefillTps
         avgPrefill = rolling.avgRawPrefillTps()
         avgDecode = rolling.avgDecodeTps()
@@ -885,7 +924,7 @@
       const b = await invoke<{
         state: HostState
         sessions: Session[]
-        models: string[]
+        models: ModelInfo[]
         session_id: number | null
         page: { messages: any[]; has_older: boolean }
       }>('bootstrap')
@@ -1058,7 +1097,7 @@
 
   async function loadModels() {
     try {
-      models = await invoke<string[]>('list_models')
+      models = await invoke<ModelInfo[]>('list_models')
       modelErr = ''
     } catch (e) {
       pageLog(`list_models: ${e}`)
@@ -1191,9 +1230,17 @@
 
       // Model picker: the endpoint should offer a list, and switching must be
       // observable in session_state rather than only in the DOM.
-      const ms = await invoke<string[]>('list_models')
+      const ms = await invoke<ModelInfo[]>('list_models')
       if (!ms.length) fail('list_models returned nothing')
-      const pick = ms[0]
+      const pick = ms[0].id
+      // The capabilities are the point of the richer picker: an endpoint that
+      // reports them must surface them, and one that does not must be honest
+      // about it rather than showing blank chips.
+      const caps = ms.map((m) => {
+        const v = visionOf(m)
+        return `${m.id}[ctx=${m.context_tokens ?? '?'} vision=${v === null ? '?' : v ? 'yes' : 'no'} tools=${m.tools === null ? '?' : m.tools ? 'yes' : 'no'}]`
+      })
+      pageLog(`models: ${caps.join(' ')}`)
       await invoke('set_model', { model: pick })
       const st = await invoke<HostState>('session_state')
       if (st.model !== pick) fail(`set_model did not stick: state=${st.model} wanted=${pick}`)
@@ -2318,11 +2365,48 @@
       {:else if menu.kind === 'model'}
         <div class="pop-title">Model</div>
         {#if models.length}
-          {#each models as m}
-            <button class="pop-item {model === m ? 'on' : ''}" onclick={() => pickModel(m)} role="menuitemradio" aria-checked={model === m}>
-              <span class="pop-lbl pop-mono">{m}</span>
+          {#each models as m (m.id)}
+            <button
+              class="pop-item pop-model {model === m.id ? 'on' : ''}"
+              onclick={() => pickModel(m.id)}
+              role="menuitemradio"
+              aria-checked={model === m.id}
+            >
+              <span class="pop-lbl pop-mono">{m.id}</span>
+              <span class="mchips">
+                {#if m.context_tokens}
+                  <span class="mchip" title="Context window reported by the endpoint">{fmtTokens(m.context_tokens)} ctx</span>
+                {/if}
+                {#if visionOf(m) !== null}
+                  <span class="mchip {visionOf(m) ? 'yes' : 'dim'}" title="Input modalities reported by the endpoint: {m.input_modalities.join(', ')}">
+                    {visionOf(m) ? 'vision' : 'text only'}
+                  </span>
+                {/if}
+                {#if m.tools !== null}
+                  <span
+                    class="mchip {m.tools ? 'yes' : 'dim'}"
+                    title={m.tools_inferred
+                      ? 'Detected from the chat template this server serves; the endpoint does not state tool support outright'
+                      : 'Stated by the endpoint'}
+                  >{m.tools ? 'tool calling' : 'no tools'}{#if m.tools_inferred}<span class="mchip-mark">*</span>{/if}</span>
+                {/if}
+                {#if m.slots}
+                  <span class="mchip" title="Concurrent slots the endpoint advertises">{m.slots} slot{m.slots === 1 ? '' : 's'}</span>
+                {/if}
+                {#if !m.advertised}
+                  <span class="mchip dim" title="The endpoint published no capabilities for this model">not reported</span>
+                {/if}
+              </span>
+              {#if m.source || m.server}
+                <span class="msub pop-mono" title={`${m.source ?? ''} ${m.server ?? ''}`.trim()}>
+                  {#if m.source}{m.source}{/if}{#if m.server}{#if m.source}{' \u00b7 '}{/if}{m.server}{/if}
+                </span>
+              {/if}
             </button>
           {/each}
+          {#if models.some((m) => m.tools_inferred)}
+            <div class="pop-note">* detected from the served chat template; the endpoint does not state it.</div>
+          {/if}
         {:else}
           <div class="pop-empty">
             {#if !ipc.ok}
@@ -2388,12 +2472,12 @@
       prefill <b class="text-ink">{fmt.rate(curPrefill)}</b>
       <span class="text-ink-3">eff · avg {fmt.rate(avgPrefill)} raw</span>
     </span>
-    <span title="live arrival rate vs session average">
-      decode <b class="text-ink">{fmt.rate(curDecode)}</b>
-      <span class="text-ink-3">· avg {fmt.rate(avgDecode)}</span>
+    <span title="live arrival rate vs session average. While a turn is running this is an estimate: the server reports token counts only when the turn ends.">
+      decode <b class="text-ink">{liveEstimate ? '\u2248 ' : ''}{fmt.rate(curDecode)}</b>
+      <span class="text-ink-3">{liveEstimate && thinkingLive ? ' · thinking' : `· avg ${fmt.rate(avgDecode)}`}</span>
     </span>
     <span class="telem-extra">spec <b class="text-ink">{fmt.pct(specPct)}</b></span>
-    <span class="telem-extra">ttft <b class="text-ink">{ttft}</b>ms</span>
+    <span class="telem-extra">ttft <b class="text-ink">{ttft || '—'}</b>ms</span>
     {#if hostState?.context_tokens}
       <span>ctx <b class="text-ink">{hostState.context_tokens}</b></span>
     {/if}

@@ -306,13 +306,15 @@ pub fn switch_session(state: tauri::State<'_, AppState>, id: i64) {
 /// Model ids offered by the endpoint. A provider that exposes no list returns
 /// an empty vec rather than an error: "no picker" is a normal state.
 #[tauri::command]
-pub async fn list_models(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+pub async fn list_models(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<cwoffee_engine::provider::ModelInfo>, String> {
     // An endpoint with no /models is a normal configuration, not a failure the
     // user should see as an error banner.
     state
         .host
         .provider()
-        .list_models()
+        .list_models_info()
         .await
         .inspect_err(|e| eprintln!("[cwoffee] list_models: {e}"))
         .map(Ok)

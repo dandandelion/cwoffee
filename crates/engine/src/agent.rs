@@ -24,7 +24,7 @@ use crate::approval::{ApprovalGate, GateOutcome};
 use crate::event::{EngineEvent, ExecStream, FinishReason};
 use crate::prompt::PromptBuilder;
 use crate::provider::{ChatRequest, Delta, Provider, Reasoning, ToolCall};
-use crate::telemetry::TurnTelemetry;
+use crate::telemetry::{TurnStats, TurnTelemetry};
 use crate::tools::repair::{self, RepairError};
 use crate::tools::{ExecChunk, Registry, ToolCtx, ToolResult};
 
@@ -301,18 +301,33 @@ impl Agent {
             let mut think: String = String::new();
             let mut think_start: Option<Instant> = None;
             let mut think_end: Option<Instant> = None;
+            // Live status-bar numbers. The server's own token counts only arrive
+            // with the final chunk, so mid-turn these are character-derived
+            // estimates - which is still far more useful than a bar that reads
+            // zero through the whole of a long first turn.
+            let t0 = Instant::now();
+            let mut first_delta: Option<Instant> = None;
+            let mut chars_out: u64 = 0;
+            let mut last_stats = Instant::now();
+            let mut thinking_now = false;
             while let Some(d) = rx.recv().await {
                 // Stop forwarding as soon as the user asks to stop: otherwise the
                 // transcript keeps filling in for the rest of the generation.
                 if cancel_consume.load(Ordering::Relaxed) {
                     break;
                 }
+                // Computed before the match: the arms move out of `d`.
+                let just_text_or_reasoning = matches!(&d, Delta::Text(_) | Delta::Reasoning(_));
                 match d {
                     Delta::Text(t) => {
+                        chars_out += t.chars().count() as u64;
+                        thinking_now = false;
                         text.push_str(&t);
                         let _ = out2.send(EngineEvent::Text(t));
                     }
                     Delta::Reasoning(r) => {
+                        chars_out += r.chars().count() as u64;
+                        thinking_now = true;
                         think_start.get_or_insert_with(Instant::now);
                         think_end = Some(Instant::now());
                         think.push_str(&r);
@@ -336,6 +351,26 @@ impl Agent {
                     }
                     Delta::Telemetry(t) => tel = t,
                     Delta::Done(f) => finish = f,
+                }
+                // First delta out immediately (that is the TTFT the user is
+                // waiting for); after that, a few times a second.
+                if just_text_or_reasoning {
+                    let first = first_delta.is_none();
+                    let fd = first_delta.get_or_insert_with(Instant::now);
+                    // The first delta goes out immediately: TTFT is the number the
+                    // user is waiting for, and waiting another 400ms to say so is
+                    // exactly the "it measures nothing" complaint.
+                    if first || last_stats.elapsed() >= std::time::Duration::from_millis(400) {
+                        last_stats = Instant::now();
+                        let mut st = TurnStats {
+                            ttft_ms: fd.duration_since(t0).as_millis() as u64,
+                            chars: chars_out,
+                            thinking: thinking_now,
+                            ..Default::default()
+                        };
+                        st.derive(fd.elapsed().as_millis() as u64);
+                        let _ = out2.send(EngineEvent::TurnStats(st));
+                    }
                 }
             }
             let reasoning_ms = match (think_start, think_end) {

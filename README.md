@@ -88,6 +88,26 @@ channels, which is also the seam for a future daemon/remote mode.
    batched once per animation frame. 0 dropped frames over 209 frames at 50 tok/s.
 3. **Plain text while streaming, markdown on stream end** — never re-parse per token.
 
+## What the status bar actually measures
+
+The server reports token counts only when a turn finishes, so a bar bound to those
+numbers sits at em-dashes through the entire turn the user is watching. The engine
+therefore emits `TurnStats` a few times a second while a turn streams: TTFT the
+moment the first delta lands, then a character-derived token rate, marked `≈` in
+the bar and replaced by the server's own numbers when `Usage` arrives.
+
+Measured against llama.cpp on this machine: live estimate 30.3/s then 28.0/s,
+server-reported 28.2/s. The estimate is close enough to act on and is labelled as
+an estimate rather than presented as a measurement.
+
+The model picker shows what the endpoint says about each model rather than a bare
+id: context window, input modalities, tool calling, slots, and the model file and
+server build when the server reveals them. Everything is optional and the UI says
+"not reported" when the endpoint is silent — `unknown` is never rendered as `no`.
+Tool support is the one inferred value (llama.cpp has no capability flag; it is
+detected from the served chat template), so the row carries a `*` and a footnote
+saying so.
+
 ## Two things that are security, not polish
 
 - **`exec` runs inside `bwrap`** — read-only root, workspace-only writes, no network,

@@ -110,6 +110,10 @@ impl App {
                     if title.is_empty() { String::new() } else { format!(" · {title}") }
                 )));
             }
+            // Live mid-turn estimates. The TUI prints its telemetry line when the
+            // turn ends; redrawing a status line a few times a second would fight
+            // the transcript for no information the final line does not carry.
+            EngineEvent::TurnStats(_) => {}
             EngineEvent::TurnStart { turn_id, model } => {
                 self.busy = true;
                 self.tel = TurnTelemetry::default();

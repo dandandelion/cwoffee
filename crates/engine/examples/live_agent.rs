@@ -108,6 +108,8 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
             EngineEvent::SessionChanged { session_id, .. } => {
                 println!("(session changed -> {session_id})");
             }
+            // Live mid-turn estimates: the examples print the final telemetry line.
+            EngineEvent::TurnStats(_) => {}
             EngineEvent::TurnStart { turn_id, model } => {
                 println!("=== turn {turn_id} ({model}) ===");
             }

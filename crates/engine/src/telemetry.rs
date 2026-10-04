@@ -44,6 +44,49 @@ pub struct TurnTelemetry {
     pub draft_accepted: u64,
 }
 
+/// Rough characters-per-token for the live estimate.
+///
+/// The server reports token counts only when the turn finishes, so anything the
+/// status bar shows *during* a turn has to be derived from characters. 4 is the
+/// usual figure for Latin text; CJK is nearer 1, so the UI labels these numbers
+/// as estimates rather than presenting them as measurements.
+pub const CHARS_PER_TOKEN: f64 = 4.0;
+
+/// Live progress for the status bar, emitted while a turn streams.
+///
+/// Without it the bar sits at zero through the one turn the user is actually
+/// watching - a long first prefill plus thinking looks like "nothing is being
+/// measured" even while the model is generating at full speed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TurnStats {
+    /// ms from request start to the first delta; 0 until one arrives.
+    pub ttft_ms: u64,
+    /// ms since that first delta.
+    pub streaming_ms: u64,
+    /// Characters generated so far, answer and reasoning together.
+    pub chars: u64,
+    /// `chars / CHARS_PER_TOKEN`.
+    pub est_tokens: u64,
+    /// `est_tokens / streaming_ms`; 0 before the first delta.
+    pub est_decode_tps: f64,
+    /// True while reasoning deltas are still arriving, so the bar can say that
+    /// the rate it shows is thinking, not the answer.
+    pub thinking: bool,
+}
+
+impl TurnStats {
+    /// Recompute the derived fields from the raw counters.
+    pub fn derive(&mut self, since_first_delta_ms: u64) {
+        self.streaming_ms = since_first_delta_ms;
+        self.est_tokens = (self.chars as f64 / CHARS_PER_TOKEN).round() as u64;
+        self.est_decode_tps = if since_first_delta_ms > 0 {
+            self.est_tokens as f64 / (since_first_delta_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+    }
+}
+
 impl TurnTelemetry {
     /// Fold another provider round-trip into this turn's totals.
     ///

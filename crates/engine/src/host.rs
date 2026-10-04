@@ -798,6 +798,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The status bar must show something *during* a turn.
+    ///
+    /// Reported as "at the first turn, thinking, the performance stats are not
+    /// measuring anything": the server only reports token counts at the end of a
+    /// turn, so every number in the bar sat at zero while the model was working -
+    /// which is precisely when the user is looking at it.
+    #[tokio::test]
+    async fn a_streaming_turn_reports_live_stats_before_usage() {
+        let (mut h, _store) = host(vec!["alpha beta gamma delta epsilon".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        h.submit("go");
+        let mut stats: Vec<crate::telemetry::TurnStats> = Vec::new();
+        let mut saw_stats_before_usage = false;
+        for _ in 0..200 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), ev.recv()).await {
+                Ok(Some(EngineEvent::TurnStats(st))) => stats.push(st),
+                Ok(Some(EngineEvent::Usage(_))) => {
+                    saw_stats_before_usage = !stats.is_empty();
+                    break;
+                }
+                Ok(Some(EngineEvent::TurnEnd { .. })) => break,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(!stats.is_empty(), "no live stats were emitted during the turn");
+        let last = stats.last().unwrap();
+        assert!(last.chars > 0, "live stats reported no characters");
+        assert!(last.est_tokens > 0, "live stats estimated zero tokens");
+        assert!(
+            saw_stats_before_usage,
+            "live stats must arrive before Usage, not after it"
+        );
+    }
+
     /// A workspace move must survive the next session.
     ///
     /// New sessions used to be created with `cfg.workspace` - the value the config
