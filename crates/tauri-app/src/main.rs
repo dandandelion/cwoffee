@@ -4,6 +4,7 @@
 //! wires one up and gets out of the way.
 
 mod commands;
+mod gateway_ctl;
 mod gpu;
 
 use std::collections::HashMap;
@@ -281,6 +282,19 @@ fn main() {
         });
     }
 
+    // The gateway controller exists whether or not the gateway is on. The footer
+    // has to answer "is it running?" and "how many devices are on it?", and that
+    // question has to be answerable about a gateway started from the environment
+    // as well as one started by clicking the footer.
+    let gw_handle = Arc::new(cwoffee_gateway::EngineHandle {
+        host: Arc::clone(&host),
+        store: Arc::clone(&store),
+        events: bcast_tx.clone(),
+        pending: Arc::clone(&pending),
+        clients: gateway_ctl::client_gauge(),
+    });
+    let gateway = Arc::new(gateway_ctl::GatewayCtl::new(gw_handle));
+
     let state = AppState {
         host,
         store,
@@ -288,35 +302,28 @@ fn main() {
         pending_approvals: Arc::clone(&pending),
         rendered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         migration_notes,
+        gateway: Arc::clone(&gateway),
     };
 
-    // Optional LAN/remote access. Off unless CWOFFEE_GATEWAY_PORT is set, and
-    // the gateway itself refuses to bind a non-loopback address without a token.
+    // Boot-time gateway: off unless CWOFFEE_GATEWAY_PORT is set. Started through
+    // the same controller the footer toggle uses, so the status line reports the
+    // truth about an environment-started gateway too - port, bind address, token
+    // source and live client count.
     if let Some(port) = std::env::var("CWOFFEE_GATEWAY_PORT")
         .ok()
         .filter(|s| !s.is_empty())
     {
-        let gw = cwoffee_gateway::GatewayConfig {
-            host: env_or("CWOFFEE_GATEWAY_HOST", "127.0.0.1")
-                .parse()
-                .unwrap_or(std::net::Ipv4Addr::LOCALHOST.into()),
-            port: port.parse().unwrap_or(8099),
-            dist: ui_dist_dir(),
-            drive_token: std::env::var("CWOFFEE_GATEWAY_TOKEN")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            watch_token: std::env::var("CWOFFEE_GATEWAY_WATCH_TOKEN")
-                .ok()
-                .filter(|s| !s.is_empty()),
-        };
-        let handle = std::sync::Arc::new(cwoffee_gateway::EngineHandle {
-            host: Arc::clone(&state.host),
-            store: Arc::clone(&state.store),
-            events: bcast_tx.clone(),
-            pending: Arc::clone(&state.pending_approvals),
-        });
+        let bind: std::net::IpAddr = env_or("CWOFFEE_GATEWAY_HOST", "127.0.0.1")
+            .parse()
+            .unwrap_or_else(|_| std::net::Ipv4Addr::LOCALHOST.into());
+        let port = port.parse().unwrap_or(8099);
+        let (drive, source) = gateway_ctl::drive_token();
+        let watch = std::env::var("CWOFFEE_GATEWAY_WATCH_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let ctl = Arc::clone(&gateway);
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = cwoffee_gateway::serve(gw, handle).await {
+            if let Err(e) = ctl.start(bind, port, drive, watch, source).await {
                 eprintln!("[cwoffee] gateway not running: {e}");
             }
         });
@@ -378,6 +385,9 @@ fn main() {
             commands::set_reasoning,
             commands::list_models,
             commands::migration_notes,
+            commands::gateway_status,
+            commands::gateway_start,
+            commands::gateway_stop,
             commands::set_model,
             commands::session_state,
             commands::list_sessions,

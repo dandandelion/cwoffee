@@ -153,10 +153,19 @@ impl OpenAiProvider {
 
         match flavor {
             Flavor::LlamaCpp => {
-                // Qwen3-family chat templates read this. There is no low/medium/
-                // high on this backend, so we degrade to a boolean rather than
-                // silently pretending the level was honoured.
-                body["chat_template_kwargs"] = json!({ "enable_thinking": req.reasoning.enabled() });
+                // The real knob is a template variable, not just a switch. This
+                // server's chat template reads `reasoning_effort` and injects a
+                // matching instruction ("think carefully through the task..." vs
+                // "keep your thinking brief"), so sending only enable_thinking
+                // leaves the effort at the template's own default and makes the
+                // level menu a no-op. Values are low | medium | xhigh; `high` is
+                // folded to xhigh by the template itself, so we do the same
+                // rather than sending a value it would reject.
+                let mut kwargs = json!({ "enable_thinking": req.reasoning.enabled() });
+                if req.reasoning.enabled() {
+                    kwargs["reasoning_effort"] = json!(llama_effort(req.reasoning));
+                }
+                body["chat_template_kwargs"] = kwargs;
             }
             Flavor::OpenAi => {
                 if req.reasoning != Reasoning::Off {
@@ -756,7 +765,55 @@ mod tests {
     }
 }
 
-/// Turn a `/v1/models` document, plus llama.cpp's optional `/props`, into the
+/// Map our five-level effort onto the values this template accepts.
+///
+/// Keeping the mapping in one place is what lets the test assert that `high`
+/// never reaches the server as the string "high": the template raises an
+/// exception for anything outside (xhigh, medium, low), which would fail the
+/// whole request rather than degrade.
+fn llama_effort(r: Reasoning) -> &'static str {
+    match r {
+        Reasoning::Low => "low",
+        Reasoning::Medium => "medium",
+        // No `high` in this vocabulary; the template folds it the same way.
+        Reasoning::High | Reasoning::XHigh => "xhigh",
+        Reasoning::Off => "low",
+    }
+}
+
+/// The thinking levels a chat template accepts, read from the template itself.
+///
+/// The template enumerates them in its own rejection branch, e.g.
+/// `resolved_reasoning_effort not in ('xhigh', 'medium', 'low')`. If that shape
+/// is not present we report nothing rather than inventing a menu.
+fn parse_reasoning_efforts(t: &str) -> Vec<String> {
+    let key = "reasoning_effort not in (";
+    let Some(i) = t.find(key) else {
+        return Vec::new();
+    };
+    let after = &t[i + key.len()..];
+    let Some(close) = after.find(')') else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = after[..close]
+        .split(',')
+        .map(|p| p.trim().trim_matches('\'').trim_matches('"').to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Which effort the template falls back to: `reasoning_effort|default('xhigh')`.
+fn parse_reasoning_default(t: &str) -> Option<String> {
+    let key = "reasoning_effort|default(";
+    let i = t.find(key)?;
+    let rest = &t[i + key.len()..];
+    let close = rest.find(')')?;
+    Some(rest[..close].trim().trim_matches('\'').trim_matches('"').to_string())
+}
+
+/// Map our five-level effort onto the values this template accepts.
 /// capability rows the picker shows.
 ///
 /// Split out from the network call so the parsing is testable against captured
@@ -830,6 +887,8 @@ fn model_infos(
                             || t.contains("tool_name"),
                     );
                     info.tools_inferred = true;
+                    info.reasoning_efforts = parse_reasoning_efforts(t);
+                    info.reasoning_default = parse_reasoning_default(t);
                 }
             }
         }
@@ -870,7 +929,7 @@ mod cap_tests {
             "default_generation_settings": { "n_ctx": 262144 },
             "total_slots": 2,
             "model_alias": "qwen3.8-flash-next-iq3_s",
-            "chat_template": "{% if tools %}...{{ tool_call.name }}...{% endif %}",
+            "chat_template": "{% if tools %}...{{ tool_call.name }}...{% endif %} {% if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}raise{% endif %} {% set e = reasoning_effort|default('xhigh') %}",
             "modalities": { "vision": true },
             "model_path": "/models/Qwen3.8-Flash-Next-IQ3_S.gguf",
             "build_info": "b1234"
@@ -889,7 +948,20 @@ mod cap_tests {
         assert_eq!(m.slots, Some(2));
         assert_eq!(m.source.as_deref(), Some("Qwen3.8-Flash-Next-IQ3_S.gguf"));
         assert_eq!(m.server.as_deref(), Some("b1234"));
+        assert_eq!(m.reasoning_efforts, vec!["low", "medium", "xhigh"]);
+        assert_eq!(m.reasoning_default.as_deref(), Some("xhigh"));
         assert!(m.advertised);
+    }
+
+    /// The template rejects anything outside (xhigh, medium, low), so a wrong
+    /// string fails the whole request rather than degrading quietly.
+    #[test]
+    fn effort_levels_map_onto_what_the_template_accepts() {
+        use crate::provider::Reasoning as R;
+        assert_eq!(llama_effort(R::Low), "low");
+        assert_eq!(llama_effort(R::Medium), "medium");
+        assert_eq!(llama_effort(R::High), "xhigh");
+        assert_eq!(llama_effort(R::XHigh), "xhigh");
     }
 
     /// /props describes the loaded model. Applying its capabilities to a different

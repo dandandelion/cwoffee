@@ -287,6 +287,87 @@ ok('59s stays in seconds', fmtThink(59_400) === 'thought for 59s', fmtThink(59_4
 ok('hours drop seconds', fmtThink(3_723_000) === 'thought for 1h02m', fmtThink(3_723_000))
 ok('negative input is clamped', fmtThink(-5_000) === 'thought for 0s', fmtThink(-5_000))
 
+// ---- streaming reveal (.tin) -------------------------------------------
+// The reveal is the difference between text appearing and text arriving. The
+// invariant that matters: strip the animation wrapper and the animated paint is
+// identical to the plain paint of the same state. An earlier version parsed the
+// already-shown and new halves separately, which turned a growing paragraph into
+// two paragraphs and let a bullet's continuation escape its list - both found by
+// looking at screenshots of the running app rather than at the code.
+{
+  // Remove the single .tin span, leaving every other span (code head, copy
+  // button) intact. Removing all </span> instead mangles the comparison.
+  const stripTin = (h: string) => {
+    const open = '<span class="tin">'
+    const i = h.indexOf(open)
+    if (i < 0) return h
+    const j = h.indexOf('</span>', i + open.length)
+    return j < 0 ? h : h.slice(0, i) + h.slice(i + open.length, j) + h.slice(j + 7)
+  }
+
+  // Two renderers fed the identical token stream, one animated and one not.
+  const sameStream = (pieces: string[]) => {
+    const plain = new LiveMarkdown()
+    const anim = new LiveMarkdown()
+    let plainOut = ''
+    let animOut = ''
+    let wrapped = 0
+    for (const piece of pieces) {
+      plain.push(piece)
+      plainOut = plain.render()
+      anim.push(piece)
+      animOut = anim.renderAnimated()
+      if (animOut.includes('class="tin"')) wrapped++
+    }
+    return { plainOut, animOut, wrapped }
+  }
+  const words = (text: string) => text.split(/(?<=\s)/)
+
+  for (const [name, text] of [
+    ['prose', 'one two three four five six seven'],
+    ['bullet', '- **first** item that keeps going and wraps on and on\n'],
+    ['two bullets', '- one item\n- a second item that also runs on\n'],
+    ['code', '```python\ndef f():\n    return 1\n```\n'],
+    ['table', '| a | b |\n| - | - |\n| 1 | 2 |\n'],
+    ['mixed', 'Lead paragraph.\n\n- bullet one\n- bullet two\n\n```js\nlet x = 1\n```\n'],
+  ] as [string, string][]) {
+    const { plainOut, animOut, wrapped } = sameStream(words(text))
+    eq(`reveal preserves structure: ${name}`, stripTin(animOut), plainOut)
+    // A reveal that quietly switched itself off would also pass the equality
+    // check above, so the effect's presence is asserted separately.
+    ok(`reveal actually runs: ${name}`, wrapped > 0, `  wrapped=${wrapped}`)
+  }
+
+  // Only the newest words are wrapped, and settled words are not re-wrapped.
+  const a = new LiveMarkdown()
+  a.push('one two three')
+  ok('first paint is not wrapped', a.renderAnimated() === '<p>one two three</p>')
+  a.push(' four five')
+  ok(
+    'new words are wrapped inline',
+    a.renderAnimated() === '<p>one two three <span class="tin">four five</span></p>',
+  )
+  a.push(' six')
+  const third = a.renderAnimated()
+  ok(
+    'settled words are not re-wrapped',
+    third === '<p>one two three four five <span class="tin">six</span></p>',
+    `\n  got: ${third}`,
+  )
+  // A single span at most, so the strip above cannot be hiding a pile of them.
+  ok('one span per paint', (third.match(/class="tin"/g) || []).length === 1, `\n  got: ${third}`)
+  // Repainting without new text must not invent a new wrapper.
+  ok('repaint with no new text adds no span', !a.renderAnimated().includes('class="tin"'))
+
+  // finish() must be byte-identical to a single pass, animation or not.
+  const f = new LiveMarkdown()
+  for (const w of words('a simple answer with **bold** and a list\n- one\n- two\n')) {
+    f.push(w)
+    f.renderAnimated()
+  }
+  eq('animation does not leak into the final DOM', f.finish(), renderMarkdown(f.text))
+}
+
 if (failed) {
   console.log(`\n${failed} markdown test(s) failed`)
   process.exit(1)

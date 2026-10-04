@@ -138,6 +138,13 @@ pub struct ModelInfo {
     pub server: Option<String>,
     /// Concurrent slots the endpoint advertises.
     pub slots: Option<u64>,
+    /// Reasoning effort values this model accepts, e.g. ["low","medium","xhigh"].
+    ///
+    /// Read out of the served chat template, because no endpoint states it as
+    /// data. Empty means the endpoint does not expose thinking levels at all.
+    pub reasoning_efforts: Vec<String>,
+    /// The effort the template applies when none is given.
+    pub reasoning_default: Option<String>,
     /// True if the endpoint published at least one capability for this model.
     pub advertised: bool,
 }

@@ -38,6 +38,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,20 @@ pub struct EngineHandle {
     /// The same pending map the desktop's `respond_approval` uses, so an
     /// approval answered from either side resolves the one the engine awaits.
     pub pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>>,
+    /// Authenticated connections right now. The desktop app shows this so the
+    /// user can see that the phone is actually attached rather than guessing
+    /// from "it started without an error".
+    pub clients: Arc<AtomicUsize>,
+}
+
+/// Decrements the client gauge when a connection task ends, including on panic
+/// during unwind in the connection handler.
+struct ClientGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +564,10 @@ async fn websocket(
         Some(r) => r,
         None => return Ok(()),
     };
+
+    // Count from here, not from the TCP accept: scanners and probes hit this
+    // port constantly, and a gauge that counts them is a gauge nobody trusts.
+    let _clients = ClientGuard(handle.clients.clone());
 
     let mut rx = handle.events.subscribe();
     // Replay nothing: a late joiner gets the live tail and then loads stored
@@ -1062,6 +1081,7 @@ mod tests {
             store: Arc::new(Store::in_memory().unwrap()),
             events: broadcast::channel(8).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
+        clients: Arc::new(AtomicUsize::new(0)),
         });
         let err = serve(cfg, handle).await.unwrap_err();
         assert!(matches!(err, GatewayError::Refused(_)), "got {err:?}");
@@ -1326,6 +1346,7 @@ mod tests {
             store: Arc::new(Store::in_memory().unwrap()),
             events: broadcast::channel(8).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
+        clients: Arc::new(AtomicUsize::new(0)),
         })
     }
 

@@ -409,6 +409,32 @@ export function splitBlocks(src: string): string[] {
  * single pass over the stored text produces, or a reload would show something
  * different from what the user just watched.
  */
+/**
+ * Wrap the trailing `k` characters of the last text run in an inline span.
+ *
+ * "Last text run" means the characters between two tags at the end of the
+ * fragment, so the insert cannot cut a tag, an attribute or an entity: the
+ * split is always made at a space, and no HTML construct contains one.
+ */
+function wrapLastText(html: string, k: number): string {
+  // The run must contain a non-space: a fragment usually ends with inter-tag
+  // whitespace ("</li>\n</ul>"), and wrapping that animates nothing while
+  // silently disabling the effect for every list.
+  const m = /([^<>]*\S[^<>]*)((?:<[^<>]+>[ \t\n]*)*)$/.exec(html)
+  if (!m || !m[1]) return html
+  const text = m[1]
+  const at = m.index + text.length
+  // Align to a word boundary: an animation that starts mid-word looks like a
+  // rendering fault rather than an effect.
+  let cut = text.lastIndexOf(' ', Math.max(0, text.length - Math.max(1, k)))
+  if (cut < 0) cut = 0
+  else cut += 1
+  const head = text.slice(0, cut)
+  const fresh = text.slice(cut)
+  if (!fresh.trim()) return html
+  return `${html.slice(0, at - fresh.length)}<span class="tin">${fresh}</span>${html.slice(at)}`
+}
+
 export class LiveMarkdown {
   private src = ''
   private frozenHtml = ''
@@ -424,7 +450,8 @@ export class LiveMarkdown {
     return this.src
   }
 
-  render(): string {
+  /** Bookkeeping shared by render() and renderAnimated(). */
+  private parts(): { frozen: string; tail: string } {
     const blocks = splitBlocks(this.src)
     const complete = Math.max(0, blocks.length - 1)
     if (complete > this.frozenCount) {
@@ -441,9 +468,58 @@ export class LiveMarkdown {
       this.frozenCount = 0
       this.refrozen++
     }
-    const tail = blocks.slice(this.frozenCount).join('')
-    if (!tail) return this.frozenHtml
-    return this.frozenHtml + (this.frozenHtml ? '\n' : '') + renderMarkdown(tail)
+    return { frozen: this.frozenHtml, tail: blocks.slice(this.frozenCount).join('') }
+  }
+
+  render(): string {
+    const { frozen, tail } = this.parts()
+    if (!tail) return frozen
+    return frozen + (frozen ? '\n' : '') + renderMarkdown(tail)
+  }
+
+  /** Where the source was at the previous animated paint. */
+  private shownSrcLen = 0
+  private shownFrozen = -1
+
+  /**
+   * Like render(), but the newest characters come back inside
+   * `<span class="tin">` so CSS can blur and fade them in.
+   *
+   * The wrap is *inline* and applied after a single parse of the tail. The
+   * earlier design parsed the already-shown and the new halves separately,
+   * which is cheaper to write and wrong to look at: this parser emits one <p>
+   * per call, so a growing paragraph split into two paragraphs with a gap
+   * mid-stream, and a growing bullet lost its continuation outside the list.
+   * Both showed up in screenshots of the running app, which is the only reason
+   * anyone ever finds these.
+   *
+   * Properties that follow from the inline approach:
+   *   * Strip the span and the output is byte-identical to one pass over the
+   *     tail. There is a test for exactly that.
+   *   * The tail is parsed once per paint, not twice.
+   *   * Only the newest window is wrapped, so settled text never re-fades -
+   *     which is the difference between "flowing in" and "flickering".
+   */
+  renderAnimated(): string {
+    const { frozen, tail } = this.parts()
+    const sep = frozen ? '\n' : ''
+    if (!tail) {
+      this.markPainted()
+      return frozen
+    }
+    const html = renderMarkdown(tail)
+    // Measured on the source: splitBlocks appends newlines to blocks, so tails
+    // are not prefix-comparable ("one two\n" against "one two x\n").
+    const grew =
+      this.shownFrozen === this.frozenCount ? this.src.length - this.shownSrcLen : 0
+    this.markPainted()
+    if (grew <= 0) return frozen + sep + html
+    return frozen + sep + wrapLastText(html, grew)
+  }
+
+  private markPainted() {
+    this.shownSrcLen = this.src.length
+    this.shownFrozen = this.frozenCount
   }
 
   finish(): string {

@@ -100,13 +100,46 @@ Measured against llama.cpp on this machine: live estimate 30.3/s then 28.0/s,
 server-reported 28.2/s. The estimate is close enough to act on and is labelled as
 an estimate rather than presented as a measurement.
 
-The model picker shows what the endpoint says about each model rather than a bare
+The footer does not spell every number out: one **metrics** button carries the two
+that explain most latency (cache hit, token rate, context used against the
+endpoint's stated ceiling) and opens a popover with the rest — prefill effective
+and raw, decode now and session average, first-token time, turn length,
+speculative acceptance, tokens in and out, compactions, frame drops, IPC and GPU
+state. Context gets a bar because "1,432" on its own answers no question.
+
+Next to it sits the **gateway** pill: off / on with the port and a live device
+count, and a panel that turns remote access on and off, chooses loopback or LAN,
+and lists copyable URLs. `docs/GATEWAY.md` explains what that costs in security
+terms, because it is the one control in the app that widens what a stranger could
+reach.
+
+### Thinking levels, measured
+
+The picker also shows what the endpoint says about each model rather than a bare
 id: context window, input modalities, tool calling, slots, and the model file and
 server build when the server reveals them. Everything is optional and the UI says
 "not reported" when the endpoint is silent — `unknown` is never rendered as `no`.
-Tool support is the one inferred value (llama.cpp has no capability flag; it is
+Tool support is the one inferred value (there is no capability flag anywhere; it is
 detected from the served chat template), so the row carries a `*` and a footnote
 saying so.
+
+Thinking effort used to be one bit on llama.cpp (`enable_thinking`). It now sends
+the template's own `reasoning_effort`, and at `high`/`xhigh` the system prompt adds
+one line that this model actually responds to: reasoning went from 603 to 1426
+characters on an identical question. It does **not** reach the 40k-token marathons
+the server's own web UI produces, and the reason is in `docs/BENCHMARKS.md`: on this
+checkpoint, *any* system prompt collapses thinking from "runs to the token cap" to
+about 250 tokens. The web UI thinks more because it sends no system prompt at all.
+
+### Motion
+
+Everything moves on one curve (`cubic-bezier(.2,.7,.2,1)`) with three durations, and
+each transition answers a question: a new block eases in because it just arrived, a
+tool card expands rather than snaps because you asked it to, the metrics bar slides
+because a value changed, the send button's ring appears because you are about to
+press it. Streaming text blurs and fades in — the newest window only, so settled
+text never re-fades. `prefers-reduced-motion` turns all of it off. The one looping
+animation in the app is the steam on the empty screen's cup.
 
 ## Two things that are security, not polish
 

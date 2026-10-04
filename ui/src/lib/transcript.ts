@@ -306,7 +306,9 @@ export class Transcript {
       return
     }
     this.lastLiveRender = now
-    this.liveEl.innerHTML = this.live.render()
+    // Animated variant: only the characters that arrived since the last paint
+    // come back wrapped, so older text never re-fades under a 120ms repaint.
+    this.liveEl.innerHTML = this.live.renderAnimated()
   }
 
   /** Start a fresh live-render target. */

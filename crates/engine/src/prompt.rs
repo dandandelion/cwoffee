@@ -30,6 +30,8 @@ pub struct PromptBuilder {
     /// Byte-stable across the whole session. Bump `SYSTEM_VERSION` on change so
     /// the cost is at least attributable.
     system: String,
+    /// Thinking level the prompt argues for. Part of the system bytes.
+    reasoning: crate::provider::Reasoning,
     history: Vec<Message>,
     /// Environment block appended to the newest user message only.
     env_block: String,
@@ -54,7 +56,40 @@ pub const SYSTEM_VERSION: &str = "cwoffee-v1";
 /// The stable system prompt. Deliberately contains no clock, no path, no git
 /// state — see the module comment.
 pub fn system_prompt() -> String {
-    format!("{SYSTEM_VERSION}\n{}", system_body())
+    system_prompt_for(crate::provider::Reasoning::default())
+}
+
+/// The system prompt for a given thinking level.
+///
+/// The level is part of the prompt bytes, not just a request parameter, and
+/// that is a deliberate cost: changing effort invalidates the llama.cpp prefix
+/// cache for the session. It is a cost we were already paying, because this
+/// server's chat template injects its own effort-dependent instruction into the
+/// system message, so the prefix changes on any level switch whether we write
+/// anything or not. docs/MODELS.md carries the measurements.
+pub fn system_prompt_for(reasoning: crate::provider::Reasoning) -> String {
+    match deliberation_line(reasoning) {
+        Some(line) => format!("{SYSTEM_VERSION}\n{}\n{}", system_body(), line),
+        None => format!("{SYSTEM_VERSION}\n{}", system_body()),
+    }
+}
+
+/// What the top thinking levels actually ask for.
+///
+/// Measured on qwen3.8-flash-next with this prompt: reasoning came out at 603
+/// characters without this line and 1426 with it, on an identical question. The
+/// template's own "please think carefully through the task" wording produced no
+/// measurable change, so if the user asked for xhigh we say it in words this
+/// model responds to. Low and medium are left alone: the template already
+/// covers those, and adding a "think briefly" line would argue with the user.
+pub fn deliberation_line(reasoning: crate::provider::Reasoning) -> Option<&'static str> {
+    use crate::provider::Reasoning as R;
+    match reasoning {
+        R::High | R::XHigh => Some(
+            "Deliberation: reason at length. Use as much thinking as the problem needs; do not stop early.",
+        ),
+        _ => None,
+    }
 }
 
 /// The instructions, kept separate from the version tag so the "no volatile
@@ -81,12 +116,25 @@ impl PromptBuilder {
     pub fn new() -> Self {
         Self {
             system: system_prompt(),
+            reasoning: crate::provider::Reasoning::default(),
             history: Vec::new(),
             env_block: String::new(),
             token_budget: 8_000,
             compactions: 0,
             first_seq: 0,
         }
+    }
+
+    /// Set the thinking level the prompt should argue for.
+    ///
+    /// Only call this when the level actually changes: it rewrites the system
+    /// message, and a rewritten system message drops the whole prefix.
+    pub fn set_reasoning(&mut self, r: crate::provider::Reasoning) {
+        if self.reasoning == r {
+            return;
+        }
+        self.reasoning = r;
+        self.system = system_prompt_for(r);
     }
 
     /// Volatile context (date, cwd, model). Appended to the newest user message,
@@ -352,6 +400,25 @@ mod tests {
     }
 
     /// A clock in the system prompt is a performance bug, not a style choice.
+    #[test]
+    fn thinking_level_changes_the_prompt_only_when_it_should() {
+        use crate::provider::Reasoning as R;
+        let base = system_prompt_for(R::Off);
+        assert_eq!(system_prompt_for(R::Medium), base);
+        assert_eq!(system_prompt_for(R::Low), base);
+        assert_ne!(system_prompt_for(R::XHigh), base);
+        assert!(system_prompt_for(R::XHigh).contains("reason at length"));
+
+        let mut p = PromptBuilder::new();
+        let before = p.build("m").messages[0].content.clone();
+        p.set_reasoning(R::XHigh);
+        let after = p.build("m").messages[0].content.clone();
+        assert_ne!(before, after);
+        // Setting the same level twice must not churn the bytes.
+        p.set_reasoning(R::XHigh);
+        assert_eq!(after, p.build("m").messages[0].content);
+    }
+
     #[test]
     fn system_prompt_body_contains_no_volatile_data() {
         let body = system_body();

@@ -169,6 +169,47 @@ is the safe half:
 
 Monitor mode alone answers most of the use case and cannot cause anything.
 
+## Turning it on and off from the app
+
+The footer has a `gateway` pill: grey dot when off, green when something is
+attached, with the port and a live device count (`:8099 · 2 devices`). Clicking it
+opens a panel with a switch, a scope choice, and copyable URLs for every
+non-loopback address on the machine.
+
+What that implies, in order of how likely it is to matter:
+
+- **The desktop app owns the listener.** `gateway_ctl::GatewayCtl` holds the task
+  and the bound address, so status is not a guess. The boot-time
+  `CWOFFEE_GATEWAY_PORT` path starts through the same controller, which is why the
+  pill tells the truth about an environment-started gateway.
+- **Scope is a bind address, so changing it restarts the listener.** "This machine"
+  is 127.0.0.1; "Any device" is 0.0.0.0. Switching while running stops and starts
+  the accept loop; connected clients reconnect.
+- **No token, no LAN bind.** The refusal is stated in the panel rather than logged
+  somewhere nobody reads. `~/.config/cwoffee/gateway.token` is read if present,
+  and created with mode 0600 if it is not — so clicking "any device" on a laptop
+  you intend to reach from a phone does the whole thing, and the panel names the
+  file the token came from.
+- **`gateway_status` is Tauri-only on purpose.** Its payload contains the token
+  inside ready-to-open URLs. It is not in the gateway's RPC allowlist: a remote
+  client learns the gateway is up from the fact that it is talking to it, never
+  the secret. In a browser tab the same panel says "You are on it" and offers no
+  switch — turning off the thing you are riding on is not a button worth having.
+- **Stopping is an abort.** The listener and every connection on it drop. That is
+  the right shape for "off", and it is why the client's reconnect path (see
+  "Why the first load took a while") matters: a phone whose link blips while you
+  restart the gateway comes back on its own.
+- **Start failures reach the UI.** `serve` returns immediately on a bind failure,
+  so `start` waits 600ms for the task: if it has finished, that error is the
+  reason, and it is shown in the panel instead of the toggle flipping back by
+  itself. A `#[tokio]` note: the state lock is never held across an await there,
+  because a future carrying a `std::sync::MutexGuard` past a suspension point is
+  not `Send` and fails to compile.
+
+Covered by the in-app self-test (`VITE_SELFTEST=1`, desktop only): status →
+start on a private port (8123, never the one in use) → status agrees → stop →
+status agrees → a second stop must error rather than pretend.
+
 ## Security — read this before binding 0.0.0.0
 
 Cwoffee runs commands in a sandbox and writes files in a workspace. An unauthenticated

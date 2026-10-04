@@ -47,7 +47,14 @@ impl Default for AgentConfig {
             model: "default".into(),
             max_tool_iters: 8,
             reasoning: Reasoning::Low,
-            max_tokens: Some(2048),
+            // None means "whatever the server defaults to", which for llama.cpp
+            // is -1: generate until the model stops or the context fills.
+            // This used to be Some(2048), and that single number was the reason
+            // thinking looked weak here and lavish in the server's own web UI:
+            // the cap applies to reasoning and answer *together*, so a 2k budget
+            // truncates thinking before the model has finished, and finish_reason
+            // comes back as `length` rather than the model ever stopping.
+            max_tokens: None,
         }
     }
 }
@@ -75,10 +82,14 @@ impl Agent {
         cfg: AgentConfig,
         ctx: ToolCtx,
     ) -> Self {
+        // The prompt must argue for the same level the request will carry, so
+        // seed it here rather than leaving PromptBuilder at its default.
+        let mut prompt = PromptBuilder::new();
+        prompt.set_reasoning(cfg.reasoning);
         Self {
             provider,
             registry,
-            prompt: PromptBuilder::new(),
+            prompt,
             gate,
             cfg,
             ctx,
@@ -154,6 +165,11 @@ impl Agent {
     }
 
     pub fn set_reasoning(&mut self, r: crate::provider::Reasoning) {
+        // The prompt carries a line for the top levels, so a level change also
+        // rewrites the system message. Doing both here is the point: a request
+        // that says xhigh while the prompt says nothing is the bug this whole
+        // change is about.
+        self.prompt.set_reasoning(r);
         self.cfg.reasoning = r;
     }
 

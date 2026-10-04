@@ -44,6 +44,48 @@ pub struct AppState {
     /// Shown in the UI: "left both alone" in a log file the user never opens is
     /// indistinguishable from "your history is gone".
     pub migration_notes: Vec<String>,
+    /// Owns the LAN gateway task, so the UI can show and change whether remote
+    /// access is on. See gateway_ctl.
+    pub gateway: std::sync::Arc<crate::gateway_ctl::GatewayCtl>,
+}
+
+/// Is remote access on, on what address, and how many devices are attached.
+///
+/// Deliberately a Tauri-only command: the payload contains the token inside the
+/// ready-to-open URLs, and the gateway's own RPC allowlist does not expose this.
+/// A remote client learns the gateway is up from the fact that it is talking to
+/// it; it never learns the token from here.
+#[tauri::command]
+pub fn gateway_status(state: tauri::State<'_, AppState>) -> crate::gateway_ctl::GatewayStatus {
+    state.gateway.status()
+}
+
+/// Turn remote access on. `lan` = bind every interface, which requires a token;
+/// with no token anywhere this refuses rather than exposing a tool-using agent.
+#[tauri::command]
+pub async fn gateway_start(
+    state: tauri::State<'_, AppState>,
+    port: Option<u16>,
+    lan: Option<bool>,
+) -> Result<crate::gateway_ctl::GatewayStatus, String> {
+    let port = port.unwrap_or(8099);
+    let bind: std::net::IpAddr = if lan.unwrap_or(false) {
+        std::net::Ipv4Addr::UNSPECIFIED.into()
+    } else {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    };
+    let (drive, source) = crate::gateway_ctl::drive_token();
+    let watch = std::env::var("CWOFFEE_GATEWAY_WATCH_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    state.gateway.start(bind, port, drive, watch, source).await
+}
+
+/// Turn it off. Aborting the task drops the listener and every connection on
+/// it; clients reconnect when it is turned back on.
+#[tauri::command]
+pub fn gateway_stop(state: tauri::State<'_, AppState>) -> Result<crate::gateway_ctl::GatewayStatus, String> {
+    state.gateway.stop()
 }
 
 /// Register the webview's event channel. Called once at startup.

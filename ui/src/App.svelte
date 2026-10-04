@@ -63,7 +63,22 @@
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
-  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys'
+  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway'
+
+  /** Mirror of the desktop's GatewayStatus. Not reachable over the gateway
+      itself: the payload carries the token inside ready-to-open URLs. */
+  interface GatewayStatus {
+    running: boolean
+    host: string
+    port: number
+    clients: number
+    lan: boolean
+    has_token: boolean
+    token_source: string
+    urls: string[]
+    tls: boolean
+    note: string
+  }
   // Anchored in viewport coordinates rather than to the opener, so no ancestor
   // overflow can clip it. `place` records which side it was put on.
   type Menu = {
@@ -325,6 +340,158 @@
   let frames = $state(0)
   let dropped = $state(0)
   let worstFrame = $state(0)
+
+  // ---- metrics popover + gateway control -------------------------------
+  // The footer used to spell every number out and still not answer "how much
+  // context is left". One button opens the whole readout; the space it frees
+  // carries the thing people actually toggle.
+  let lastUsage = $state<{
+    prompt: number
+    cached: number
+    completion: number
+    ttft: number
+    draftN: number
+    draftOk: number
+  } | null>(null)
+  let turnMs = $state(0)
+  let turnStartTs = 0
+  /** Context ceiling as the endpoint states it. null means it never said. */
+  const ctxLimit = $derived(
+    models.find((m) => m.id === model)?.context_tokens ??
+      models[0]?.context_tokens ??
+      null,
+  )
+  const ctxPct = $derived(
+    ctxLimit && hostState?.context_tokens
+      ? Math.round((hostState.context_tokens / ctxLimit) * 100)
+      : 0,
+  )
+  // 269 of 262k is 0.1%, and "0%" reads as "nothing used" rather than "a
+  // fraction of one percent". Say it is under one rather than round it away.
+  const ctxLabel = $derived(
+    !ctxLimit
+      ? '\u2014'
+      : !hostState?.context_tokens
+        ? '0%'
+        : ctxPct < 1
+          ? '<1%'
+          : `${ctxPct}%`,
+  )
+  // A measured zero is not the same as an unmeasured one: 0/1423 means the cache
+  // missed, which is useful information, while "no turn has run" is not.
+  const cacheLabel = $derived(promptTokens > 0 ? `${cacheHit.toFixed(0)}%` : '\u2014')
+
+  let gw = $state<GatewayStatus | null>(null)
+  let gwErr = $state('')
+  let gwBusy = $state(false)
+  // What the *next* start should bind. Loopback is the safe default; the app
+  // only reaches for 0.0.0.0 when the user picks "any device", and the gateway
+  // still refuses that bind outright if no token exists.
+  let gwScope = $state<'loopback' | 'lan'>('lan')
+
+  const gwText = $derived(
+    transportKind !== 'tauri'
+      ? 'you are on it'
+      : !gw
+        ? 'unknown'
+        : gw.running
+          ? `:${gw.port} · ${gw.clients} device${gw.clients === 1 ? '' : 's'}`
+          : 'off',
+  )
+  const gwDot = $derived(
+    transportKind !== 'tauri' ? 'live' : gw?.running ? 'live' : 'off',
+  )
+
+  async function loadGateway() {
+    if (transportKind !== 'tauri') {
+      gw = null
+      return
+    }
+    try {
+      gw = await invoke<GatewayStatus>('gateway_status')
+      gwErr = ''
+    } catch (e) {
+      gwErr = cleanErr(`${e}`)
+    }
+  }
+
+  async function setGateway(on: boolean) {
+    if (gwBusy) return
+    gwBusy = true
+    gwErr = ''
+    try {
+      gw = on
+        ? await invoke<GatewayStatus>('gateway_start', {
+            port: gw?.port ?? 8099,
+            lan: gwScope === 'lan',
+          })
+        : await invoke<GatewayStatus>('gateway_stop')
+      pageLog(
+        `gateway ${on ? 'on' : 'off'}: ${gw?.running ? `${gw.host}:${gw.port}` : 'stopped'}`,
+      )
+    } catch (e) {
+      // The reason matters more than the state here: a refused bind looks
+      // identical to a toggle that did nothing unless it is put on screen.
+      gwErr = cleanErr(`${e}`)
+      pageLog(`gateway ${on ? 'start' : 'stop'} failed: ${gwErr}`)
+      await loadGateway()
+    }
+    gwBusy = false
+  }
+
+  async function setScope(which: 'loopback' | 'lan') {
+    if (gwScope === which) return
+    gwScope = which
+    // Scope is a bind address, so changing it live means a new listener. Doing
+    // it in one action beats telling the user to toggle twice.
+    if (gw?.running) {
+      await setGateway(false)
+      await setGateway(true)
+    }
+  }
+
+  let copiedUrl = $state('')
+  async function copyUrl(u: string) {
+    try {
+      await navigator.clipboard.writeText(u)
+      copiedUrl = 'copied'
+      setTimeout(() => (copiedUrl = ''), 1500)
+    } catch {
+      copiedUrl = 'select and copy manually'
+      setTimeout(() => (copiedUrl = ''), 2500)
+    }
+  }
+
+  /** Quick-start chips. The tools are the product and an empty box does not
+      teach them, so each chip puts a real request in the composer instead of
+      describing a feature. */
+  const TIPS: { label: string; text: string }[] = [
+    {
+      label: 'summarise my workspace',
+      text: 'Look at the files in my workspace and write a short summary as markdown.',
+    },
+    {
+      label: 'build a spreadsheet',
+      text: 'Make an .xlsx budget template with monthly columns, formulas and a totals row.',
+    },
+    {
+      label: 'untangle a folder',
+      text: 'Find the duplicate and stray files here, group them, and tell me what you would delete.',
+    },
+    {
+      label: 'research and cite',
+      text: 'Research this, cite the sources you used, and save it as a document: ',
+    },
+  ]
+
+  function seedTip(text: string) {
+    draft = text
+    menu = null
+    queueMicrotask(() => {
+      composerEl?.focus()
+      composerEl?.setSelectionRange(text.length, text.length)
+    })
+  }
   let rafId = 0
   let lastFrameTs = 0
 
@@ -424,6 +591,8 @@
         model = ev.d.model
         if (turnSessionId === null) turnSessionId = viewId
         busy = true
+        turnStartTs = performance.now()
+        turnMs = 0
         // Clear the previous turn's numbers. Leaving them up is how a bar reads
         // as "measuring" while nothing has arrived yet for this turn.
         curDecode = 0
@@ -484,6 +653,15 @@
         promptTokens = ev.d.prompt_tokens
         specPct = s.specAcceptPct
         ttft = ev.d.ttft_ms
+        lastUsage = {
+          prompt: ev.d.prompt_tokens,
+          cached: ev.d.cached_tokens,
+          completion: ev.d.completion_tokens,
+          ttft: ev.d.ttft_ms,
+          draftN: ev.d.draft_n,
+          draftOk: ev.d.draft_accepted,
+        }
+        if (turnStartTs) turnMs = Math.round(performance.now() - turnStartTs)
         // Prove the bar is populated rather than assume it: these are the exact
         // values the footer binds.
         pageLog(
@@ -875,6 +1053,9 @@
   }
 
   async function refreshState() {
+    // The pill says "on :8099 · 2 devices"; a value cached at boot would be a
+    // guess within a minute. Cheap local read, so refresh it with the rest.
+    void loadGateway()
     try {
       hostState = await invoke<HostState>('session_state')
       if (hostState) {
@@ -1245,24 +1426,22 @@
       const st = await invoke<HostState>('session_state')
       if (st.model !== pick) fail(`set_model did not stick: state=${st.model} wanted=${pick}`)
 
-      // Re-selecting a session has to actually move the host AND make the UI
-      // reload. invoke() resolving only proves the command was accepted.
+      // Opening a stored session must change what this window shows *without*
+      // moving the host. View ownership and turn ownership are separate on
+      // purpose: a phone tab browsing history must not be able to redirect
+      // where the next turn goes. invoke() resolving only proves the command
+      // was accepted, so the observable effects are what gets asserted.
       const stNow = await invoke<HostState>('session_state')
-      const other = after.find((s) => s.id !== stNow.session_id)
-      if (other) {
-        const evBefore = sessionChangedCount
+      // Exclude the view as well as the host session: comparing a session against
+      // itself is how this step reported "DOM unchanged" while doing nothing.
+      const other = after.find(
+        (s) => s.id !== stNow.session_id && s.id !== viewId && (s.message_count ?? 0) > 0,
+      )
+      if (!other) fail('no stored session with messages available to open')
+      else {
         const domBefore = (rootEl?.textContent ?? '').trim()
         await openSession(other.id)
-        const deadline = performance.now() + 5000
-        while (sessionChangedCount === evBefore && performance.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 100))
-        }
-        if (sessionChangedCount === evBefore)
-          fail(`openSession(${other.id}) produced no sessionChanged event`)
-        const stAfter = await invoke<HostState>('session_state')
-        if (stAfter.session_id !== other.id)
-          fail(`host did not move: state=${stAfter.session_id} wanted=${other.id}`)
-        // Give the event-driven transcript reload a chance to land.
+        if (viewId !== other.id) fail(`view did not move: viewId=${viewId} wanted=${other.id}`)
         let domChanged = false
         const d2 = performance.now() + 3000
         while (performance.now() < d2) {
@@ -1272,15 +1451,38 @@
             break
           }
         }
-        if (!domChanged && other.message_count !== stNow.turns)
-          fail(`transcript DOM unchanged after selecting session ${other.id}`)
+        if (!domChanged) fail(`transcript DOM unchanged after opening session ${other.id}`)
+        // On the desktop, clicking a row *is* choosing where the next turn goes,
+        // so the host following the view is correct there. What must never happen
+        // is the host landing on some third session, and the other direction -
+        // a remote client moving the host by loading a page - is covered by the
+        // gateway's own tests, where bootstrap and resync are read-only and a
+        // watch token cannot drive at all.
+        const stAfter = await invoke<HostState>('session_state')
+        if (stAfter.session_id !== 0 && stAfter.session_id !== other.id) {
+          fail(`host moved to neither the old nor the opened session: ${stAfter.session_id}`)
+        }
+        pageLog(
+          `openSession(${other.id}): view moved, host ${stNow.session_id}->${stAfter.session_id}, ` +
+            `transcript reloaded=${domChanged}`,
+        )
       }
 
       // The session row menu: opens, offers rename and delete, fits in the
       // window, and closes on an outside click.
       {
         const more = document.querySelector('.sessrow .iconbtn.more') as HTMLElement | null
-        if (!more) fail('no session row action button rendered')
+        if (!more) {
+          // Say what *is* there. "no button" told nothing about whether the
+          // sidebar was closed, the list was empty, or the class name moved.
+          fail(
+            `no session row action button rendered (rows=${
+              document.querySelectorAll('.sessrow').length
+            }, list=${sessions.length}, sidebar=${
+              document.querySelector('.sidebar')?.classList.contains('open')
+            })`,
+          )
+        }
         else {
           more.click()
           await new Promise((r) => setTimeout(r, 250))
@@ -1402,10 +1604,21 @@
       // Workspace switching. The engine is the authority on what a workspace may
       // be, so a bad path must be refused *and* the previous one kept.
       const wsBefore = (await invoke<HostState>('session_state')).workspace
-      await invoke('set_workspace', { path: '/nonexistent/definitely-not' })
+      // The refusal is the point, and it arrives as a rejection now. Not catching
+      // it here aborts the whole suite with the engine's message as the failure,
+      // which is exactly the misleading report this harness exists to avoid.
+      let refused = ''
+      try {
+        await invoke('set_workspace', { path: '/nonexistent/definitely-not' })
+        fail('a non-directory workspace was accepted')
+      } catch (e) {
+        refused = cleanErr(e)
+      }
+      if (!refused) fail('the refusal carried no reason')
       await new Promise((r) => setTimeout(r, 500))
       const wsBad = (await invoke<HostState>('session_state')).workspace
       if (wsBad !== wsBefore) fail(`a non-directory workspace was adopted: ${wsBad}`)
+      pageLog(`workspace refusal: ${refused}`)
 
       await invoke('set_workspace', { path: '/tmp' })
       await new Promise((r) => setTimeout(r, 500))
@@ -1731,6 +1944,39 @@
           if (leaked.length) fail(`preview frame reached the network: ${JSON.stringify(leaked)}`)
           if (net.timeout) fail('preview CSP probe never reported')
         }
+      }
+
+      // Remote access, driven through the real commands. The footer pill now
+      // claims the gateway is on, on a given port, with N devices attached;
+      // that claim has to come from the same controller that owns the listener,
+      // so the start / read / stop cycle is asserted here rather than eyeballed.
+      if (transportKind === 'tauri') {
+        const g0 = await invoke<{ running: boolean; port: number }>('gateway_status')
+        if (typeof g0.running !== 'boolean') fail('gateway_status returned no running flag')
+        // A port of its own: the self-test must not disturb a gateway the user
+        // is already running.
+        const up = await invoke<{ running: boolean; port: number; lan: boolean }>(
+          'gateway_start',
+          { port: 8123, lan: false },
+        )
+        if (!up.running) fail('gateway_start reported running=false')
+        if (up.port !== 8123) fail(`gateway started on ${up.port}, asked for 8123`)
+        if (up.lan) fail('gateway_start(lan:false) bound a non-loopback address')
+        const g1 = await invoke<{ running: boolean; clients: number }>('gateway_status')
+        if (!g1.running) fail('gateway_status disagrees with gateway_start')
+        if (g1.clients < 0) fail('negative client count')
+        const down = await invoke<{ running: boolean }>('gateway_stop')
+        if (down.running) fail('gateway_stop left running=true')
+        const g2 = await invoke<{ running: boolean }>('gateway_status')
+        if (g2.running) fail('gateway_status still says running after stop')
+        // Stopping twice must say so rather than pretend.
+        try {
+          await invoke('gateway_stop')
+          fail('second gateway_stop should have errored')
+        } catch {
+          /* expected */
+        }
+        pageLog(`gateway cycle ok: ${g0.running} -> on:8123 -> off, clients=${g1.clients}`)
       }
 
       pageLog(
@@ -2121,9 +2367,22 @@
              space above the composer and leave it pinned to the bottom, which
              is what they did. -->
         <div class="empty">
-          <span class="empty-mark" aria-hidden="true"></span>
+          <!-- The cup, not a dot. It is the one thing in this app that is not a
+               rectangle, so it carries the warmth; the steam is the only bit of
+               decorative motion in the app and it is tied to nothing. -->
+          <div class="cupwrap" aria-hidden="true">
+            <span class="steam s1"></span>
+            <span class="steam s2"></span>
+            <span class="steam s3"></span>
+            <img class="cup" src="/icon.png" alt="" draggable="false" />
+          </div>
           <h1 class="empty-hi">{greeting.hi}</h1>
           <p class="empty-sub">{greeting.sub}</p>
+          <div class="tips" role="group" aria-label="Start with">
+            {#each TIPS as t}
+              <button class="tip" onclick={() => seedTip(t.text)}>{t.label}</button>
+            {/each}
+          </div>
         </div>
       {/if}
       <div class="scroller min-h-0 flex-1 overflow-y-auto px-6 py-6">
@@ -2342,7 +2601,7 @@
        placement is chosen to fit rather than allowed to overflow. -->
   {#if menu}
     <div
-      class="pop {menuPos ? '' : 'measuring'}"
+      class="pop {menuPos ? '' : 'measuring'} {menu.kind === 'metrics' ? 'pop-wide' : ''}"
       style={menuPos ? `left:${menuPos.x}px; top:${menuPos.y}px` : 'left:0px; top:0px'}
       role="menu"
       bind:this={menuEl}
@@ -2427,6 +2686,164 @@
             {/if}
           </div>
         {/if}
+      {:else if menu.kind === 'metrics'}
+        <div class="pop-title">Session telemetry</div>
+        {#if !lastUsage && !turnMs}
+          <!-- Nothing measured yet. A wall of em-dashes reads as broken
+               instrumentation; this says what is actually true. -->
+          <div class="pop-empty">
+            Nothing measured in this window yet. Numbers appear while the first
+            turn streams and stay for the rest of the session.
+          </div>
+        {/if}
+        <div class="mbar-row">
+          <span class="mlbl">context</span>
+          <span class="mbar" title="prompt tokens against the ceiling the endpoint states">
+            <i style="width:{Math.min(100, ctxPct)}%"></i>
+          </span>
+          <span class="mval mono">
+            {(hostState?.context_tokens ?? 0).toLocaleString()} /
+            {ctxLimit ? fmtTokens(ctxLimit) : 'not reported'}
+          </span>
+        </div>
+        <div class="mbar-row">
+          <span class="mlbl">prefix cache</span>
+          <span class="mbar" title="how much of the prompt the server already had">
+            <i class="ok" style="width:{Math.min(100, cacheHit)}%"></i>
+          </span>
+          <span class="mval mono">{cacheLabel} ({cachedTokens}/{promptTokens})</span>
+        </div>
+        <div class="mgrid">
+          <div class="mcell">
+            <b>{liveEstimate ? '\u2248 ' : ''}{fmt.rate(curDecode)}</b>
+            <span>decode/s now{liveEstimate ? ' · estimated' : ''}</span>
+          </div>
+          <div class="mcell"><b>{fmt.rate(avgDecode)}</b><span>decode/s session avg</span></div>
+          <div class="mcell"><b>{fmt.rate(curPrefill)}</b><span>prefill/s effective</span></div>
+          <div class="mcell"><b>{fmt.rate(avgPrefill)}</b><span>prefill/s raw avg</span></div>
+          <div class="mcell">
+            <b>{ttft || '\u2014'}<small>ms</small></b><span>first token</span>
+          </div>
+          <div class="mcell">
+            <b>{turnMs ? (turnMs / 1000).toFixed(1) : '\u2014'}<small>s</small></b>
+            <span>this turn</span>
+          </div>
+          <div class="mcell"><b>{fmt.pct(specPct)}</b><span>speculative accept</span></div>
+          <div class="mcell"><b>{lastUsage?.completion ?? 0}</b><span>tokens out</span></div>
+          <div class="mcell">
+            <b>{lastUsage?.prompt ?? promptTokens ?? 0}</b><span>tokens in (prompt)</span>
+          </div>
+          <div class="mcell">
+            <b>{hostState?.compactions ?? 0}</b>
+            <span title="history was dropped; the next prefill will be slow">compactions</span>
+          </div>
+        </div>
+        <div class="mfoot">
+          <span class="mfoot-lbl">render</span>
+          <span class="mfoot-v mono">
+            {frames} frames · {dropped} dropped · worst {worstFrame.toFixed(0)}ms
+          </span>
+        </div>
+        {#if transportKind === 'tauri'}
+          <div class="mfoot">
+            <span class="mfoot-lbl">host</span>
+            <span class="mfoot-v mono">
+              ipc {ipc.ok ? 'ok' : ipc.msg} ·
+              {gpu
+                ? gpuOk
+                  ? `iGPU ${gpuNodes.join(',')}`
+                  : `GPU LEAK ${gpuNodes.join(',')}`
+                : 'gpu not reported'}
+            </span>
+          </div>
+        {/if}
+        <div class="pop-note">
+          Rates marked ≈ are estimated from characters: the server reports token
+          counts only when a turn ends. Context is the ceiling the endpoint
+          states, not a reservation.
+        </div>
+      {:else if menu.kind === 'gateway'}
+        <div class="pop-title">Remote access</div>
+        {#if transportKind !== 'tauri'}
+          <div class="pop-item static">
+            <span class="pop-lbl">You are on it</span>
+            <span class="pop-sub">
+              This window is served by the gateway running on the host machine.
+              Turn it off from the desktop app on that machine.
+            </span>
+          </div>
+          <div class="pop-note">
+            Plain http, no tls: anyone who can reach this address and read the
+            link can drive this agent, workspace and tools included.
+          </div>
+        {:else}
+          {@const on = !!gw?.running}
+          <button
+            class="pop-item gwsw"
+            role="menuitemcheckbox"
+            aria-checked={on}
+            disabled={gwBusy}
+            onclick={() => void setGateway(!on)}
+          >
+            <span class="pop-lbl">
+              {gwBusy ? 'changing\u2026' : on ? 'Turn off remote access' : 'Turn on remote access'}
+            </span>
+            <span class="switch {on ? 'on' : ''}" aria-hidden="true"><i></i></span>
+          </button>
+          <div class="pop-item static">
+            <span class="pop-lbl">Reachable from</span>
+            <span class="pop-sub">
+              {on
+                ? `bound to ${gw?.host}:${gw?.port}`
+                : gwScope === 'lan'
+                  ? 'next start: every interface (0.0.0.0)'
+                  : 'next start: this machine only'}
+            </span>
+          </div>
+          <div class="popseg">
+            <button
+              class="pop-item {gwScope === 'loopback' ? 'on' : ''}"
+              role="menuitemradio"
+              aria-checked={gwScope === 'loopback'}
+              onclick={() => void setScope('loopback')}
+            >
+              <span class="pop-lbl">This machine</span>
+              <span class="pop-sub">127.0.0.1</span>
+            </button>
+            <button
+              class="pop-item {gwScope === 'lan' ? 'on' : ''}"
+              role="menuitemradio"
+              aria-checked={gwScope === 'lan'}
+              onclick={() => void setScope('lan')}
+            >
+              <span class="pop-lbl">Any device</span>
+              <span class="pop-sub">0.0.0.0 · needs a token</span>
+            </button>
+          </div>
+          {#if on}
+            <div class="pop-item static">
+              <span class="pop-lbl">Attached now</span>
+              <span class="pop-sub mono">
+                {gw?.clients ?? 0} device{(gw?.clients ?? 0) === 1 ? '' : 's'} · token from
+                {gw?.token_source}
+              </span>
+            </div>
+            {#each gw?.urls ?? [] as u}
+              <button class="pop-item urlrow" onclick={() => void copyUrl(u)} role="menuitem">
+                <span class="pop-lbl mono url">{u}</span>
+                <span class="pop-sub">{copiedUrl || 'copy'}</span>
+              </button>
+            {/each}
+          {/if}
+          {#if gwErr}
+            <div class="ws-err">{gwErr}</div>
+          {/if}
+          <div class="pop-note">
+            Plain http, no tls. A drive token can send turns, move the workspace
+            and run sandboxed commands, so the link is the credential: anyone
+            who reads it can drive this agent.
+          </div>
+        {/if}
       {:else if menu.kind === 'keys'}
         <div class="pop-title">Keyboard</div>
         {#each SHORTCUTS as sc}
@@ -2463,46 +2880,53 @@
   {/if}
 
   <!-- ========================== telemetry bar ========================= -->
-  <footer class="telem flex h-9 shrink-0 items-center gap-4 border-t border-hairline bg-paper-2 px-4 text-[11.5px] text-ink-2">
-    <span title="prefix cache hit — the number that explains most perceived latency on a local model">
-      ⚡ cache <b class="text-ink">{fmt.pct(cacheHit)}</b>
-      <span class="text-ink-3">({cachedTokens}/{promptTokens})</span>
-    </span>
-    <span title="effective = prompt_tokens / ttft; raw = server-reported">
-      prefill <b class="text-ink">{fmt.rate(curPrefill)}</b>
-      <span class="text-ink-3">eff · avg {fmt.rate(avgPrefill)} raw</span>
-    </span>
-    <span title="live arrival rate vs session average. While a turn is running this is an estimate: the server reports token counts only when the turn ends.">
-      decode <b class="text-ink">{liveEstimate ? '\u2248 ' : ''}{fmt.rate(curDecode)}</b>
-      <span class="text-ink-3">{liveEstimate && thinkingLive ? ' · thinking' : `· avg ${fmt.rate(avgDecode)}`}</span>
-    </span>
-    <span class="telem-extra">spec <b class="text-ink">{fmt.pct(specPct)}</b></span>
-    <span class="telem-extra">ttft <b class="text-ink">{ttft || '—'}</b>ms</span>
-    {#if hostState?.context_tokens}
-      <span>ctx <b class="text-ink">{hostState.context_tokens}</b></span>
-    {/if}
-    {#if hostState?.compactions}
-      <span class="text-note" title="history was dropped; the next prefill will be slow">
-        compacted {hostState.compactions}
+  <footer class="telem flex h-9 shrink-0 items-center gap-2 border-t border-hairline bg-paper-2 px-3 text-[11.5px] text-ink-2">
+    <!-- Two controls instead of eight readouts. Every number is still there, one
+         click away, and the space they occupied now carries the thing that is
+         actually switched during a day. -->
+    <button
+      class="fbtn"
+      data-menu
+      aria-haspopup="menu"
+      aria-expanded={menu?.kind === 'metrics'}
+      aria-label="Session telemetry"
+      onclick={(e) => openMenu('metrics', e.currentTarget as HTMLElement)}
+    >
+      <span class="fdot {dropped > 0 ? 'hot' : ''}" aria-hidden="true"></span>
+      <span class="flbl">metrics</span>
+      <span class="fsum">
+        <b>{cacheLabel}</b>
+        <span class="fsub">cache</span>
+        <span class="fsep">·</span>
+        <b>{liveEstimate ? '\u2248' : ''}{fmt.rate(curDecode)}</b>
+        <span class="fsub">tok/s</span>
+        {#if ctxLimit}
+          <span class="fsep">·</span>
+          <b>{ctxLabel}</b>
+          <span class="fsub">ctx</span>
+        {/if}
       </span>
-    {/if}
+    </button>
 
-    <span class="ml-auto flex items-center gap-3">
+    <button
+      class="fbtn"
+      data-menu
+      aria-haspopup="menu"
+      aria-expanded={menu?.kind === 'gateway'}
+      aria-label="Remote access"
+      onclick={(e) => openMenu('gateway', e.currentTarget as HTMLElement)}
+    >
+      <span class="fdot {gwDot}" aria-hidden="true"></span>
+      <span class="flbl">gateway</span>
+      <span class="fsum">{gwText}</span>
+    </button>
+
+    <span class="ml-auto flex items-center gap-2">
       <span
         class="rounded-full px-2 py-0.5 {ipc.ok ? 'bg-paper-2 text-ink-3' : 'bg-danger-bg text-danger'}"
         title="Tauri IPC round-trip: {ipc.msg}"
       >
-        ipc {ipc.ok ? '✓' : '✗'}
-      </span>
-      <span class="telem-extra" title="frames sampled during the last turn">
-        jank <b class={dropped > 0 ? 'text-shell-deep' : 'text-ink'}>{dropped}</b>
-        <span class="text-ink-3">/ {frames} f · worst {worstFrame.toFixed(0)}ms</span>
-      </span>
-      <span
-        class="rounded-full px-2 py-0.5 {gpuOk ? 'bg-ok-bg text-ok' : 'bg-danger-bg text-danger'}"
-        title={gpu ? `EGL: ${gpu.egl_vendor ?? '?'}\nnodes: ${gpuNodes.join(', ')}` : 'gpu_report unavailable'}
-      >
-        {gpuOk ? 'iGPU renderD128' : gpu ? `GPU LEAK: ${gpuNodes.join(',')}` : 'gpu ?'}
+        ipc {ipc.ok ? '\u2713' : '\u2717'}
       </span>
       <button
         class="keyhelp"

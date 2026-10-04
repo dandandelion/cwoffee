@@ -187,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         store: Arc::clone(&store),
         events: ev_tx.clone(),
         pending,
+        clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     cwoffee_gateway::serve(gw, handle).await.map_err(|e| anyhow::anyhow!("{e}"))

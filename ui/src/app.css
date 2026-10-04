@@ -303,9 +303,15 @@ body {
   mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
 }
 .blk-reasoning .blk-body.expanded {
-  max-height: none;
+  /* A number, not `none`: max-height cannot interpolate to none, so the
+     expansion would jump. 2400px is above any real thinking block, and the
+     curve front-loads the growth so the visible part still lands in ~200ms. */
+  max-height: 2400px;
   -webkit-mask-image: none;
   mask-image: none;
+}
+.blk-reasoning .blk-body, .blk-tool .tool-detail {
+  transition: max-height var(--d3) var(--ease);
 }
 /* Reasoning keeps its own layout rather than the shared 62px label column.
    That column fits "THINKING" but not "THOUGHT FOR 2M34S", and the chevron was
@@ -382,7 +388,7 @@ body {
   mask-image: linear-gradient(to bottom, #000 62%, transparent 100%);
 }
 .blk-tool .tool-detail.expanded {
-  max-height: none;
+  max-height: 2400px;
   -webkit-mask-image: none;
   mask-image: none;
 }
@@ -1355,4 +1361,320 @@ body {
 .attchip.drop-target {
   outline: 2px dashed var(--color-shell-deep);
   outline-offset: 2px;
+}
+
+/* ================================================================ motion ==
+   One curve and three durations, used everywhere. Purposeful motion has a job:
+   it says where a thing came from and whether a state change was the one you
+   asked for. Nothing here loops except the cup's steam, and nothing here moves
+   more than 6px.
+
+   A note on the streaming reveal (.tin): the answer is re-rendered from the
+   markdown state machine every 120ms, so the animation is applied only to the
+   slice that arrived since the last paint. 170ms against a 120ms repaint means
+   a word is essentially at rest by the time the boundary moves past it - which
+   is what stops it reading as flicker. */
+:root {
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease-out: cubic-bezier(0.16, 0.84, 0.24, 1);
+  --d1: 120ms;
+  --d2: 200ms;
+  --d3: 340ms;
+}
+
+@keyframes cwoffee-pop {
+  from { opacity: 0; transform: translateY(5px) scale(0.985); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes cwoffee-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+/* No transform here: the wrapper is an inline span, and transforms do not apply
+   to non-replaced inline boxes. blur+opacity is also the part that reads as
+   "arriving" rather than "moving". */
+@keyframes cwoffee-tin {
+  from { opacity: 0; filter: blur(2.2px); }
+  to   { opacity: 1; filter: blur(0); }
+}
+
+.pop { animation: cwoffee-pop var(--d2) var(--ease-out) both; }
+.pop.measuring { animation: none; }
+
+.tin { animation: cwoffee-tin 170ms var(--ease-out) both; }
+
+/* Only blocks created during a live turn ease in. Stored transcripts are
+   rendered outside .turn, so opening an old session does not play 40 entrances
+   at once - that reads as a loading bug, not as polish. */
+.turn > * {
+  animation: cwoffee-rise var(--d3) var(--ease-out) both;
+}
+.turn > .blk-tool { animation-duration: var(--d2); }
+
+/* Controls acknowledge a press. Before this the only feedback was the result
+   arriving two round trips later, which on a local model can be a second. */
+.pop-item, .btn-go, .btn-ghost, .btn-bad, .keyhelp, .fbtn, .tip, .filechip,
+.sessrow, .wsrow, .cbtn, .att-x {
+  transition:
+    background-color var(--d1) var(--ease),
+    color var(--d1) var(--ease),
+    border-color var(--d1) var(--ease),
+    box-shadow var(--d2) var(--ease),
+    transform var(--d1) var(--ease),
+    opacity var(--d1) var(--ease);
+}
+.pop-item:active:not(:disabled), .fbtn:active, .tip:active, .keyhelp:active {
+  transform: translateY(1px);
+}
+.btn-go:active:not(:disabled), .btn-ghost:active, .btn-bad:active {
+  transform: translateY(1px);
+}
+
+/* Anything that appears because you did something fades in rather than
+   snapping in: the row you just created, the chip you just attached. */
+.filechip { animation: cwoffee-fade var(--d2) var(--ease-out) both; }
+
+/* ------------------------------------------------------- footer controls -- */
+.fbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-ink-2);
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.fbtn:hover { background: var(--color-tint); color: var(--color-ink); }
+.fbtn[aria-expanded='true'] {
+  background: var(--color-paper);
+  border-color: var(--color-hairline-2);
+  color: var(--color-ink);
+  box-shadow: 0 1px 0 rgb(0 0 0 / 4%);
+}
+.fbtn .flbl { font-weight: 600; letter-spacing: 0.01em; }
+.fbtn .fsum { color: var(--color-ink-3); font-variant-numeric: tabular-nums; }
+.fbtn .fsum b { color: var(--color-ink); font-weight: 600; }
+.fbtn .fsub { font-size: 10.5px; }
+.fbtn .fsep { margin: 0 3px; color: var(--color-hairline-2); }
+
+/* A dot that means something: green only when something is actually attached
+   or arriving, amber when the frame budget was missed, grey when idle. */
+.fdot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-hairline-2);
+  flex: none;
+}
+.fdot.live { background: var(--color-ok); box-shadow: 0 0 0 2px var(--color-ok-bg); }
+.fdot.hot { background: var(--color-warn); box-shadow: 0 0 0 2px var(--color-warn-bg); }
+
+/* ------------------------------------------------------ metrics popover -- */
+.pop.pop-wide { min-width: 340px; max-height: min(74vh, 520px); }
+.mbar-row {
+  display: grid;
+  grid-template-columns: 74px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px;
+}
+.mbar-row .mlbl {
+  font-size: 11px;
+  color: var(--color-ink-3);
+  letter-spacing: 0.01em;
+}
+.mbar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--color-paper);
+  border: 1px solid var(--color-hairline);
+  overflow: hidden;
+}
+.mbar i {
+  display: block;
+  height: 100%;
+  background: var(--color-shell);
+  /* The bar is the only part that moves; the numbers beside it do not need to. */
+  transition: width var(--d3) var(--ease);
+}
+.mbar i.ok { background: var(--color-ok); }
+.mbar-row .mval { font-size: 11px; color: var(--color-ink-2); white-space: nowrap; }
+.mgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  margin: 6px 0 0;
+  background: var(--color-hairline);
+  border-top: 1px solid var(--color-hairline);
+  border-bottom: 1px solid var(--color-hairline);
+}
+.mcell {
+  background: var(--color-paper-2);
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mcell b {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-ink);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+.mcell b small { font-size: 10px; font-weight: 500; color: var(--color-ink-3); margin-left: 2px; }
+.mcell span { font-size: 10.5px; color: var(--color-ink-3); letter-spacing: 0.01em; }
+.mfoot {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 8px 2px;
+  font-size: 11px;
+}
+.mfoot-lbl { color: var(--color-ink-3); text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; }
+.mfoot-v { color: var(--color-ink-2); }
+
+/* ----------------------------------------------------- gateway popover -- */
+.switch {
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--color-hairline-2);
+  position: relative;
+  flex: none;
+  transition: background-color var(--d2) var(--ease);
+}
+.switch i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-paper);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 18%);
+  transition: transform var(--d2) var(--ease-out);
+}
+.switch.on { background: var(--color-ok); }
+.switch.on i { transform: translateX(14px); }
+.pop-item:disabled { opacity: 0.55; cursor: default; }
+.popseg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 4px 0 2px;
+}
+.popseg .pop-item { border: 1px solid var(--color-hairline); border-radius: 8px; }
+.popseg .pop-item.on { background: var(--color-tint); border-color: var(--color-shell); }
+.urlrow .url { font-size: 11px; word-break: break-all; }
+.urlrow:hover .pop-sub { color: var(--color-ink-2); }
+
+/* ------------------------------------------------------ empty session --- */
+/* The cup is the app's face, so the empty screen uses it at a size where the
+   hand-drawn face actually reads. Steam is drawn rather than baked into the
+   PNG so it can move, and it is the only looping animation in the app. */
+.cupwrap {
+  position: relative;
+  width: 108px;
+  height: 108px;
+  margin-bottom: 4px;
+  animation: cwoffee-bob 5.5s var(--ease) infinite;
+}
+.cupwrap .cup {
+  width: 108px;
+  height: 108px;
+  display: block;
+  /* The PNG is rendered at 8 sizes; at this size the 128px variant is used. */
+  image-rendering: auto;
+  filter: drop-shadow(0 6px 14px rgb(120 90 40 / 14%));
+}
+.steam {
+  position: absolute;
+  /* Sitting just above the rim, not floating: measured, at top:-14px the wisp
+     bottoms ended ~30px clear of the cup and read as three stray dashes. */
+  top: -2px;
+  width: 5px;
+  height: 22px;
+  border-radius: 999px;
+  background: linear-gradient(to top, transparent, var(--color-shell-deep));
+  opacity: 0;
+  animation: cwoffee-steam 3.4s var(--ease) infinite;
+}
+.steam.s1 { left: 34px; animation-delay: 0s; }
+.steam.s2 { left: 52px; height: 27px; animation-delay: 0.9s; }
+.steam.s3 { left: 70px; animation-delay: 1.8s; }
+@keyframes cwoffee-steam {
+  0%   { opacity: 0; transform: translateY(9px) scaleY(0.55); }
+  22%  { opacity: 0.9; }
+  70%  { opacity: 0.45; transform: translateY(-10px) scaleY(1.05) translateX(2px); }
+  100% { opacity: 0; transform: translateY(-17px) scaleY(1.1) translateX(3px); }
+}
+@keyframes cwoffee-bob {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50%      { transform: translateY(-4px) rotate(-1.2deg); }
+}
+
+/* Rounded stack where the platform has one. No webfont: a 40 KB download that
+   blocks the first paint costs more than the type is worth, and on Linux this
+   falls back to the UI face, which is already the app's voice. */
+.empty-hi {
+  font-family: ui-rounded, 'SF Pro Rounded', 'Hiragino Maru Gothic ProN', Quicksand,
+    Comfortaa, 'Nunito', Varela Round, system-ui, sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--color-ink);
+}
+.empty-hi::after {
+  /* A soft underline, drawn not typed: it makes the line feel hand-lettered
+     without needing a display face. */
+  content: '';
+  display: block;
+  width: 68%;
+  height: 7px;
+  margin: 4px auto 0;
+  border-radius: 999px;
+  /* Drawn as the bottom edge of a rounded box, which gives a real single arc.
+     A gradient "arc" rendered as two blobs at this height - visible in the
+     screenshot, and a good example of a flourish that needs eyes on it. */
+  border-bottom: 2.5px solid var(--color-shell);
+  border-radius: 0 0 100% 100%;
+  transform: rotate(-0.8deg);
+  opacity: 0.5;
+}
+.tips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 7px;
+  margin-top: 6px;
+  max-width: 52ch;
+}
+.tip {
+  border: 1px solid var(--color-hairline-2);
+  background: var(--color-paper-2);
+  color: var(--color-ink-2);
+  border-radius: 999px;
+  padding: 5px 11px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.tip:hover {
+  background: var(--color-tint);
+  border-color: var(--color-shell);
+  color: var(--color-ink);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pop, .filechip, .tin, .turn > * { animation: none; }
+  .blk-reasoning .blk-body, .blk-tool .tool-detail { transition: none; }
+  .pop-item, .btn-go, .btn-ghost, .btn-bad, .keyhelp, .fbtn, .tip, .filechip,
+  .sessrow, .wsrow, .cbtn, .att-x, .switch i, .mbar i { transition: none; }
+  .cupwrap, .steam { animation: none; }
+  .steam { opacity: 0.35; }
+  .switch i, .mbar i { transition: none; }
 }

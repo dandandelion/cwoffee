@@ -180,3 +180,68 @@ Two dependency decisions worth keeping:
   path into a file the user opens in Word.
 - PDF is not generated from scratch. That is a font-metrics project, and the
   honest alternative is a "PDF" that is really a bad text dump.
+
+## Thinking effort: what actually controls it
+
+Reported symptom: the llama.cpp web UI thinks for ~40k tokens on `high`/`xhigh`
+while Cwoffee thinks far less on any setting. Both halves of that are true, and
+the cause is not the setting.
+
+The knob, for this server (a llama.cpp-lineage server, `/props` build
+`Strata 0.1.27`), is a **chat template variable**, not a request parameter:
+
+```jinja
+{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+{%- if resolved_reasoning_effort == 'high' %} ... fold to 'xhigh' ...
+{%- if resolved_reasoning_effort == 'xhigh' %}
+    {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think
+     carefully through the task, validate key assumptions, consider plausible
+     alternatives, and prioritize correctness ...' %}
+{%- elif resolved_reasoning_effort == 'low' %}
+    {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your
+     thinking brief and focused ...' %}
+```
+
+Two findings, both measured on the same question (`/v1/chat/completions`,
+`max_tokens=1500`, model `qwen3.8-flash-next-iq3_s`):
+
+| prompt shape | reasoning chars | completion tokens | finish |
+| --- | --- | --- | --- |
+| user message only, no tools | 5260 (hit the 1500 cap) | 1500 | `length` |
+| + Cwoffee system prompt, + tools | 603 | 266 | `stop` |
+| + system prompt without "Be concise" | 709 | 380 | `stop` |
+| + system prompt, no tools | 680 | 308 | `stop` |
+| + system prompt + "reason at length …" | 1426 | 513 | `stop` |
+
+So:
+
+- **Any system message collapses thinking on this model.** Bare request thinks
+  until the token cap; add a system prompt — any system prompt, tools or not —
+  and it settles in ~250 tokens. The web UI thinks more because it sends no
+  system prompt. This is a property of the checkpoint, not a Cwoffee bug, and
+  Cwoffee is not going to drop its system prompt to win a thinking-length chart.
+- **The effort menu was half-wired.** `Flavor::LlamaCpp` sent only
+  `chat_template_kwargs.enable_thinking`, a boolean. Low/medium/high/xhigh were
+  one bit. It now sends `reasoning_effort` too, mapped onto the values the
+  template accepts (`low | medium | xhigh`, with `high` folded the same way the
+  template folds it — sending `high` would hit the template's `raise_exception`
+  and fail the request outright).
+- **The levels now do something on this backend.** At `high`/`xhigh` the system
+  prompt gains one line, "Deliberation: reason at length. Use as much thinking
+  as the problem needs; do not stop early." That line is measured above: 603 →
+  1426 reasoning characters. The template's own xhigh sentence produced *no*
+  measurable change, which is why the wording here is ours.
+- The effort is part of the prompt bytes, so switching levels drops the prefix
+  cache. That cost was already being paid: the template injects an
+  effort-dependent sentence into the system message, so the rendered prompt
+  changes on any level switch whether we write anything or not.
+- `AgentConfig::default()` capped output at `max_tokens: Some(2048)`, thinking
+  included. The desktop path passed `None` (server default, `n_predict=-1`) so
+  the cap was invisible there, but any path using the default silently truncated
+  thinking. It is `None` now.
+
+Honesty rules that came out of this: the endpoint's capabilities are read from
+`/v1/models` and `/props` where it states them, `/props` capabilities are
+attached only to the model its `model_alias` names, unknown is rendered as "not
+reported" rather than "no", and tool support is marked as inferred (it is
+detected from the served chat template because no endpoint states it).

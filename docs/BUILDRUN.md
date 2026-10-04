@@ -350,3 +350,69 @@ That is only cosmetic here, which is why it survived review, but it lands in use
 visible error text. Either write the Rust string on one line, or use a raw Python
 string (`r"""..."""`) so the backslash survives. The same trap already bit this
 project with `\u{...}` escapes - see the note on raw strings above.
+
+## Trap 20: a release webview loads embedded assets, not `ui/dist`
+
+`npm run build` changes what the **gateway** serves (it reads `ui_dist_dir()` from
+disk on every request), but the Tauri window serves the frontend **embedded in the
+binary** when built with `custom-protocol`. So the usual "rebuild the UI, reload"
+loop silently tests the old UI in the desktop window while the browser tab shows
+the new one.
+
+The case that made this visible: a `VITE_SELFTEST=1` build written to
+`ui/dist-selftest` and pointed at with `CWOFFEE_UI_DIST` ran no self-test at all,
+because `frontendDist` is a compile-time value. To exercise a UI-flag build in the
+desktop window, temporarily point `build.frontendDist` at the alternate directory
+and rebuild the binary — which also keeps the flag build away from the `ui/dist`
+the gateway is serving to a phone.
+
+## Trap 21: `std::fs::read("/dev/urandom")` never returns
+
+urandom is not a file with a size; `fs::read` reads until EOF, which does not
+arrive. A token generator written that way hangs the caller. Read a fixed buffer:
+
+```rust
+let mut buf = [0u8; 24];
+let mut f = std::fs::File::open("/dev/urandom")?;
+f.read_exact(&mut buf)?;
+```
+
+## Trap 22: `pkill -f` matches the shell that runs it
+
+`pkill -f XDG_DATA_HOME` to kill a test instance also matches the command line of
+the shell issuing it, and the harness dies with 143 halfway through a script —
+leaving the app in an unknown state. Kill by exact name or by pid:
+
+```bash
+pgrep -x cwoffee-app            # names only
+for p in $(pgrep -x cwoffee-app); do [ "$p" = "$KEEP" ] || kill "$p"; done
+```
+
+## Trap 23: the streaming reveal must not re-parse the tail in halves
+
+Animating "the text that just arrived" looks like it has a cheap implementation:
+render what was already shown and the new suffix separately, and wrap the second
+one. It does not survive contact with the parser. Each call opens its own block
+elements, so a growing paragraph became two paragraphs with a gap, and a growing
+bullet lost its continuation outside the list — both only noticed by screenshotting
+the running app.
+
+The working shape is: parse the tail **once**, then wrap the trailing characters of
+the last *text run* in an inline `<span>`. Inline keeps structure, and the
+guarantee is stated as a test invariant — strip the span and the animated paint is
+byte-identical to the plain paint of the same state (`ui/scripts/md_test.ts`
+asserts that for prose, bullets, code, tables and mixed documents, and separately
+asserts that the reveal actually ran, because a reveal that silently switched
+itself off also passes the equality test).
+
+Two related details: the wrapper must skip trailing inter-tag whitespace
+(`</li>\n</ul>` is a "text run" that animates nothing, which quietly disabled the
+effect for every list), and the animation is `opacity` + `filter: blur()` only —
+transforms do not apply to non-replaced inline boxes.
+
+## Trap 24: `max-height: none` cannot be transitioned
+
+Collapsing tool output and thinking blocks is a `max-height` toggle. Transitioning
+to `none` does nothing, so expansion stayed instant. Use a large concrete value
+(`2400px`); the easing front-loads the growth so the visible part still lands in
+about 200ms.
