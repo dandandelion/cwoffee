@@ -388,6 +388,27 @@ body {
 }
 .blk-tool { cursor: pointer; }
 .blk-tool.is-open { cursor: default; }
+
+/* Transport failure, stated where it will be seen. Kept warm rather than red: it
+   is usually "you did not pass a token", not a catastrophe. */
+.connbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 24px 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-hairline);
+  border-left: 3px solid var(--color-warn);
+  border-radius: 8px;
+  background: var(--color-paper-2);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.connbar-txt {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
 .blk-tool .blk-head::after {
   content: ' \25B8';
   opacity: 0.6;

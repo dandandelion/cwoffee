@@ -125,6 +125,20 @@ fn role_for(token: &str, cfg: &GatewayConfig) -> Option<Role> {
     None
 }
 
+/// Why an auth attempt was refused, in words the client can show.
+///
+/// "no token" and "wrong token" need completely different fixes, and a phone on
+/// Safari has no console to check which one happened. Collapsing both into
+/// "gateway rejected the token" is what sent the first report off to edit a
+/// config file on the wrong machine.
+fn auth_refusal_reason(token: &str) -> &'static str {
+    if token.is_empty() {
+        "no token supplied: open the URL with ?token=<CWOFFEE_GATEWAY_TOKEN>"
+    } else {
+        "token does not match CWOFFEE_GATEWAY_TOKEN"
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Watch,
@@ -233,7 +247,7 @@ async fn connection(
     let head_peek = String::from_utf8_lossy(&peeked[..n]).to_ascii_lowercase();
     if head_peek.contains("upgrade: websocket") {
         let ws = tokio_tungstenite::accept_async(stream).await?;
-        return websocket(ws, cfg, handle).await;
+        return websocket(ws, cfg, handle, peer.to_string()).await;
     }
 
     // Plain HTTP: now actually consume the request head.
@@ -408,11 +422,12 @@ async fn websocket(
     ws: tokio_tungstenite::WebSocketStream<TcpStream>,
     cfg: Arc<GatewayConfig>,
     handle: Arc<EngineHandle>,
+    peer: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut sink, mut stream) = ws.split();
 
     // Nothing is read or streamed until a role is established.
-    let role = match auth_handshake(&mut sink, &mut stream, &cfg).await {
+    let role = match auth_handshake(&mut sink, &mut stream, &cfg, &peer).await {
         Some(r) => r,
         None => return Ok(()),
     };
@@ -469,6 +484,7 @@ async fn auth_handshake(
     sink: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
     stream: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>,
     cfg: &GatewayConfig,
+    peer: &str,
 ) -> Option<Role> {
     let _ = sink
         .send(txt(serde_json::json!({ "type": "hello", "need_auth": cfg.drive_token.is_some() || cfg.watch_token.is_some() }).to_string()))
@@ -494,14 +510,27 @@ async fn auth_handshake(
     }
     match role_for(token, cfg) {
         Some(r) => {
+            eprintln!("[cwoffee/gateway] {peer} joined as {}", if r.can_drive() { "drive" } else { "watch" });
             let _ = sink
                 .send(txt(serde_json::json!({ "type": "auth_ok", "role": if r.can_drive() { "drive" } else { "watch" } }).to_string()))
                 .await;
             Some(r)
         }
         None => {
+            // The first phone attempt failed and the server said nothing at all,
+            // which turned a mistyped token into an hours-worth of "the gateway
+            // is broken". Distinguish "no token arrived" from "wrong token": the
+            // fixes are completely different, and the client can only show a
+            // useful message if the server says which one happened.
+            // The token itself is never logged.
+            let reason = auth_refusal_reason(token);
+            eprintln!(
+                "[cwoffee/gateway] {peer} auth refused ({}, {} chars sent)",
+                if token.is_empty() { "no token" } else { "wrong token" },
+                token.chars().count()
+            );
             let _ = sink
-                .send(txt(serde_json::json!({ "type": "auth_fail" }).to_string()))
+                .send(txt(serde_json::json!({ "type": "auth_fail", "reason": reason }).to_string()))
                 .await;
             None
         }
@@ -725,7 +754,11 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             eprintln!("[cwoffee/gateway/page] {}", arg_str(&args, "msg")?);
             Ok(json!(true))
         }
-        "gpu_report" => Ok(json!({ "note": "gpu reporting is desktop-only" })),
+        // Honest failure, not a plausible-looking stub. Returning `{note: ...}`
+        // here satisfied the call but the UI dereferenced `render_nodes` on it and
+        // threw during render, which blanked the whole app: a stub that is shaped
+        // almost right is worse than an error.
+        "gpu_report" => Err("gpu reporting is desktop-only".into()),
         "open_file" => Err("opening files is desktop-only; the gateway cannot touch your filesystem".into()),
         // Deliberately absent: open_file, pick_workspace, set_workspace,
         // render_report, boot_log. The first three act on the desktop machine;
@@ -767,6 +800,14 @@ mod tests {
 
     /// The two tokens must not be interchangeable by prefix either: a shorter
     /// watch token that is a prefix of the drive token must not match.
+    #[test]
+    fn an_absent_token_is_reported_differently_from_a_wrong_one() {
+        // Same symptom in the UI, opposite causes.
+        assert!(auth_refusal_reason("").contains("no token supplied"));
+        assert!(auth_refusal_reason("typo").contains("does not match"));
+        assert!(!auth_refusal_reason("typo").contains("no token supplied"));
+    }
+
     #[test]
     fn a_prefix_of_the_drive_token_is_not_accepted() {
         let cfg = GatewayConfig {

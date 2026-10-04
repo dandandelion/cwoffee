@@ -39,8 +39,35 @@ Two roles, enforced server-side per command:
   `delete_session`, `clear_session`, `set_model`, `set_reasoning`.
 
 Never exposed over the socket at all: `open_file`, `pick_workspace`,
-`set_workspace`, `list_models` (desktop-only), and the window controls. A browser
-tab cannot reach your filesystem through this.
+`set_workspace`, `gpu_report`, and the window controls. A browser tab cannot reach
+your filesystem through this.
+
+### The browser shows the host, not a local session
+
+There is no client-side state worth speaking of: the session list, the transcript,
+the model and the workspace all come from the running desktop process. On load the
+page opens the session the host is on; if the host is on a fresh draft it shows the
+most recent real conversation. That is a **view**, not a `switch_session` - a
+watch-only client cannot move the host's session by loading a page. The sidebar
+highlights what you are looking at (`viewId`), not what the host last switched to.
+
+The workspace chip shows the host's workspace and is read-only in the browser; the
+tooltip says so and points at the desktop to change it.
+
+### When auth fails
+
+The server distinguishes the two cases, logs the peer without the token, and the
+client renders the reason as a banner rather than only writing it to a console a
+phone cannot open:
+
+```
+[cwoffee/gateway] 192.168.100.42 auth refused (no token, 0 chars sent)
+no token supplied: open the URL with ?token=<CWOFFEE_GATEWAY_TOKEN>
+```
+
+A wrong token says `token does not match CWOFFEE_GATEWAY_TOKEN` instead. Before
+this, both read as `no model (!)` plus a hint to edit `config.toml` - on the wrong
+machine.
 
 Verified behaviour, from the LAN address rather than from a unit test:
 

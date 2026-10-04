@@ -283,6 +283,10 @@
   // IPC health is surfaced in the footer. An empty catch here once hid a CSP
   // misconfiguration that killed every invoke, and every other gate still passed.
   let ipc = $state<{ ok: boolean; msg: string }>({ ok: false, msg: 'not tried' })
+  // Why the transport failed, in words the server chose. A rejected token and an
+  // unreachable endpoint need different fixes and the UI used to report both as
+  // "no model".
+  let connNote = $state('')
 
   // ---- telemetry ----------------------------------------------------------
   const rolling = new Rolling(10)
@@ -482,8 +486,12 @@
     try {
       await invoke('attach', { onEvent: ch })
       ipc = { ok: true, msg: 'ok' }
+      connNote = ''
     } catch (e) {
       ipc = { ok: false, msg: String(e).slice(0, 140) }
+      // On a phone there is no devtools. Whatever the server said has to be on
+      // the screen, or "no model" sends you off to debug the wrong thing.
+      connNote = String(e)
       pageLog(`attach FAILED: ${String(e)} | internals=${typeof (window as any).__TAURI_INTERNALS__}`)
     }
   }
@@ -502,7 +510,13 @@
   let composerEl = $state<HTMLTextAreaElement | null>(null)
   let dropping = $state(false)
   let wsBusy = $state(false)
-  let shortWorkspace = $state('')
+  // Derived from the host, not from local UI state. It was declared and rendered
+  // but never assigned anywhere, so the composer said "Choose workspace" even
+  // when a workspace was configured - and on the gateway that read as "this is my
+  // own separate session with no workspace".
+  const shortWorkspace = $derived(
+    hostState?.workspace ? hostState.workspace.replace(/\/+$/, '').split('/').pop() || hostState.workspace : '',
+  )
   let theme = $state<'light' | 'dark'>('light')
   let attachErr = $state('')
 
@@ -543,6 +557,17 @@
   // non-directory, a non-writable one, and any change while a turn is running.
   // The browser preview has no Tauri, so every native call needs this guard.
   const isTauri = () => typeof (window as any).__TAURI_INTERNALS__ !== 'undefined'
+
+  /** Retry the socket after a failure, without reloading the page. */
+  async function retryAttach() {
+    connNote = ''
+    await attachChannel()
+    if (!connNote) {
+      await refreshState()
+      await loadSessions()
+      await adoptHostSession()
+    }
+  }
 
   async function chooseWorkspace() {
     if (!isTauri() || wsBusy) return
@@ -773,6 +798,29 @@
     } catch (e) {
       ipc = { ok: false, msg: String(e).slice(0, 140) }
     }
+  }
+
+  /**
+   * Show the session the host is actually on.
+   *
+   * Deliberately does NOT call switch_session: a watch-only client must not be
+   * able to move the host's session by loading a page, and opening a view is not
+   * a state change. The host's session is the one the phone should be looking at.
+   */
+  async function adoptHostSession() {
+    const open = hostState?.session_id ?? 0
+    // The host has a session open: look at that one.
+    if (open > 0) {
+      await resyncView(open)
+      return
+    }
+    // The host is on a fresh draft (right after a restart, session_id is 0).
+    // Showing the most recent real conversation is the faithful reading of "use
+    // the host": a phone that opens onto a blank screen looks like its own
+    // separate empty session, which is exactly what it was reported as. Still
+    // read-only - viewing is not switching.
+    const recent = sessions.find((s) => s.message_count > 0)
+    if (recent) await resyncView(recent.id)
   }
 
   async function loadSessions() {
@@ -1712,6 +1760,10 @@
     }
     await refreshState()
     await loadSessions()
+    // Open the host's current session rather than a blank draft. On a phone this
+    // was the whole "it's using its own session" impression: the list was there
+    // but the transcript was the empty screen.
+    await adoptHostSession()
     if (winErr) pageLog(`getCurrentWindow FAILED: ${winErr}`)
     pageLog(`mounted text=${document.body.innerText.trim().length}`)
     setTimeout(() => void reportRender('mount'), 400)
@@ -1769,7 +1821,11 @@
     }
   }
 
-  const gpuOk = $derived(!!gpu && gpu.render_nodes.includes('renderD128') && !gpu.leaked_nvidia)
+  // Guarded field by field on purpose. One missing key in a telemetry struct must
+  // not take down the whole render: a gateway gpu_report stub that returned
+  // `{note: ...}` threw here and blanked the app before it could load a session.
+  const gpuNodes = $derived(gpu?.render_nodes ?? [])
+  const gpuOk = $derived(!!gpu && gpuNodes.includes('renderD128') && !gpu.leaked_nvidia)
 </script>
 
 <div class="flex h-full flex-col bg-paper text-ink">
@@ -1847,7 +1903,7 @@
         <div class="sesshead mt-2"><span>Sessions</span></div>
         {#each sessions as s}
           <div
-            class="sessrow {hostState?.session_id === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''}"
+            class="sessrow {viewId === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''}"
           >
             {#if editingId === s.id}
               <input
@@ -1885,6 +1941,14 @@
 
     <!-- main -->
     <main class="flex min-w-0 flex-1 flex-col min-h-0" class:empty-mode={showEmpty}>
+      {#if connNote}
+        <!-- Rendered, not logged: a phone cannot open a console, and "no model"
+             was sending people to fix a config file on the wrong machine. -->
+        <div class="connbar" role="alert">
+          <span class="connbar-txt">{connNote}</span>
+          <button class="btn-ghost text-[11px]" onclick={() => void retryAttach()}>retry</button>
+        </div>
+      {/if}
       {#if showEmpty}
         <!-- Sibling of the composer, not a wrapper around it: `main` centres
              them as one group in empty mode. Spacer divs would absorb the free
@@ -2065,7 +2129,9 @@
 
           <button
             class="wsrow"
-            title="Choose the directory the tools operate in"
+            title={isTauri()
+              ? 'Choose the directory the tools operate in'
+              : `Host workspace: ${hostState?.workspace ?? ''} (change it on the desktop)`}
             onclick={chooseWorkspace}
           >
             <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
@@ -2118,7 +2184,8 @@
               <strong>Cannot reach the endpoint.</strong><br />
               <span class="pop-mono">{modelErr}</span><br />
               Start the server, or fix the URL in
-              <span class="pop-mono">~/.config/cwoffee/config.toml</span>.
+              <span class="pop-mono">{transportKind === 'gateway' ? 'the host\'s ~/.config/cwoffee/config.toml' : '~/.config/cwoffee/config.toml'}</span>.
+              {#if transportKind === 'gateway'}<br />This page talks to the desktop's engine; it has no endpoint of its own.{/if}
             {:else}
               This endpoint does not list models.<br />
               Using <span class="pop-mono">{model || '\u2014'}</span>
@@ -2198,9 +2265,9 @@
       </span>
       <span
         class="rounded-full px-2 py-0.5 {gpuOk ? 'bg-ok-bg text-ok' : 'bg-danger-bg text-danger'}"
-        title={gpu ? `EGL: ${gpu.egl_vendor}\nnodes: ${gpu.render_nodes.join(', ')}` : 'gpu_report unavailable'}
+        title={gpu ? `EGL: ${gpu.egl_vendor ?? '?'}\nnodes: ${gpuNodes.join(', ')}` : 'gpu_report unavailable'}
       >
-        {gpuOk ? 'iGPU renderD128' : gpu ? `GPU LEAK: ${gpu.render_nodes.join(',')}` : 'gpu ?'}
+        {gpuOk ? 'iGPU renderD128' : gpu ? `GPU LEAK: ${gpuNodes.join(',')}` : 'gpu ?'}
       </span>
       <button
         class="keyhelp"

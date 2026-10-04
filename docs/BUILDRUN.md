@@ -254,3 +254,18 @@ passthrough wins and the desktop app cannot receive events at all.
 the flattened fields. A gateway re-implementing a command has to read the nested
 key. Logging the command name and its argument keys turns "the browser shows
 nothing" into a findable shape mismatch.
+
+## Trap 14: a stub response shaped *almost* right is worse than an error
+
+The gateway had no GPU to report, so `gpu_report` returned `{note: "..."}`. The
+call succeeded, the UI stored it, and the telemetry bar dereferenced
+`gpu.render_nodes.join(...)` during render - which threw inside Svelte's flush and
+blanked the app before it could load a session. Symptom: the page renders its
+chrome, the session list appears, and the transcript never does, with a
+`Cannot read properties of undefined (reading 'join')` in the console.
+
+Two rules:
+
+* a command that cannot be honoured should return an error, not a plausible object;
+* anything rendered from a remote struct gets guarded field by field. One missing
+  key must not take down the whole view.

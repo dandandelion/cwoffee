@@ -69,6 +69,11 @@ let eventHandler: ((ev: EngineEvent) => void) | null = null
 let reconnect: ReturnType<typeof setTimeout> | null = null
 let backoff = 500
 let wantSocket = false
+// The in-flight handshake, shared. Without this, two concurrent callers both
+// called connect(); the second saw readyState CONNECTING and resolved early, then
+// `ws.send()` fired on a socket that was not open yet - the RPC was silently
+// dropped, and on a slow phone link that looked like "the gateway ignores me".
+let connecting: Promise<void> | null = null
 
 function wsUrl(): string {
   return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
@@ -80,11 +85,10 @@ function failAll(msg: string) {
 }
 
 function connect(): Promise<void> {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    return Promise.resolve()
-  }
+  if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve()
+  if (connecting) return connecting
   wantSocket = true
-  return new Promise((resolve, reject) => {
+  const p: Promise<void> = new Promise<void>((resolve, reject) => {
     let sock: WebSocket
     try {
       sock = new WebSocket(wsUrl())
@@ -93,6 +97,11 @@ function connect(): Promise<void> {
       return
     }
     ws = sock
+
+    const settle = (fn: () => void) => {
+      connecting = null
+      fn()
+    }
 
     sock.onopen = () => {
       backoff = 500
@@ -109,15 +118,20 @@ function connect(): Promise<void> {
       switch (v.type) {
         case 'auth_ok':
           role = v.role
-          resolve()
+          settle(resolve)
           break
         case 'auth_fail':
-          failAll('gateway rejected the token')
-          reject(new Error('gateway rejected the token'))
+          // The server says which half of "auth failed" this is. A missing token
+          // and a wrong token need completely different fixes, and a phone on
+          // Safari cannot open devtools to find out.
+          settle(() =>
+            reject(new Error(v.reason ?? 'gateway rejected the token')),
+          )
+          failAll(v.reason ?? 'gateway rejected the token')
           break
         case 'ready':
           role = v.role
-          resolve()
+          settle(resolve)
           break
         case 'event':
           // Engine events are pushed, not polled. The transcript already batches
@@ -142,6 +156,7 @@ function connect(): Promise<void> {
     sock.onclose = () => {
       ws = null
       role = null
+      connecting = null
       failAll('gateway connection closed')
       // Reconnect unless the page is going away. A phone that drops wifi should
       // pick the session back up when it returns rather than sit on a dead view.
@@ -157,6 +172,12 @@ function connect(): Promise<void> {
       /* onclose follows and handles it */
     }
   })
+  connecting = p
+  // The stored promise may be awaited by nobody if the first caller already
+  // gave up; swallow the orphan rejection so it does not surface as an
+  // unhandled error while still propagating to real awaiters.
+  p.catch(() => {})
+  return p
 }
 
 export async function invoke<T = unknown>(
@@ -184,6 +205,9 @@ export async function invoke<T = unknown>(
   if (isTauri) return (tauriInvoke as (c: string, a?: object) => Promise<T>)(cmd, args)
 
   await connect()
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    throw new Error('gateway socket is not open')
+  }
   return new Promise<T>((resolve, reject) => {
     const id = nextId++
     pending.set(id, { resolve: (v) => resolve(v as T), reject })
