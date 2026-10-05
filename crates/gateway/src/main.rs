@@ -102,6 +102,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let provider = appcfg.build_provider().map_err(anyhow::Error::msg)?;
+    // Same relocation the desktop and the TUI do, before the database is opened:
+    // a headless gateway left running for a week should not be the one client that
+    // never re-homed its own sessions.
+    let migration_notes = cwoffee_engine::legacy::migrate_legacy_dirs();
+    for note in &migration_notes {
+        eprintln!("[cwoffee/gateway] migration: {note}");
+    }
     let store = Arc::new(Store::open(&db)?);
 
     let configured_model = appcfg.provider.model.clone();
@@ -207,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
         pending,
         pending_questions: Arc::clone(&pending_q),
         clients: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        migration_notes,
     });
 
     cwoffee_gateway::serve(gw, handle).await.map_err(|e| anyhow::anyhow!("{e}"))

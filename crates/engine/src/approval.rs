@@ -542,7 +542,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn an_edit_approval_names_the_file_rather_than_the_patch() {
         // The old summary printed `edit_file {"new_text":"- Tea shares coffee's
         // origin ...` and cut off mid-sentence: an approver saw the payload and

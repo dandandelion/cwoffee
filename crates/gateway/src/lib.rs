@@ -69,6 +69,11 @@ pub struct EngineHandle {
     /// address because the question the panel answers is "how many *devices*",
     /// and two tabs on one phone is one device.
     pub clients: Arc<Mutex<BTreeMap<String, usize>>>,
+    /// What the one-time path relocation did (or refused to do), so a phone can be
+    /// told the same thing the desktop window says. Returning `[]` here would be a
+    /// stub that looks like "nothing needed migrating", which is a claim, not a
+    /// fact: the desktop knows and this side did not.
+    pub migration_notes: Vec<String>,
 }
 
 impl EngineHandle {
@@ -911,7 +916,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .map_err(|e| e.to_string())?;
             serde_json::to_value(page).map_err(|e| e.to_string())
         }
-        "migration_notes" => Ok(json!([] as [String; 0])),
+        "migration_notes" => Ok(json!(h.migration_notes)),
 
         // Everything a cold client needs, in one round trip.
         //
@@ -1300,6 +1305,7 @@ mod tests {
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
         clients: Arc::new(Mutex::new(BTreeMap::new())),
+            migration_notes: Vec::new(),
         });
         let err = serve(cfg, handle).await.unwrap_err();
         assert!(matches!(err, GatewayError::Refused(_)), "got {err:?}");
@@ -1696,28 +1702,43 @@ mod tests {
         let url = format!("ws://127.0.0.1:{port}/ws");
         let mut ws = attach(&url).await;
 
-        // Enough volume to fill the socket buffers, which is what stops the pump
-        // from polling its broadcast receiver, which is what makes it lag.
-        for i in 0..600u32 {
-            let _ = h.events.send(EngineEvent::Note {
-                message: "x".repeat(2048) + &i.to_string(),
-            });
+        // Enough volume to overflow the broadcast capacity (8) and the socket
+        // buffers, which is what makes the pump lag. Yielding between chunks is
+        // not decoration: on a loaded machine the connection's write task may
+        // never be scheduled during a synchronous flood of 600 sends, and then
+        // the client sits on a queue nobody has drained and the first read times
+        // out - which reads as "the resync never arrived" when the real problem is
+        // that nothing was written yet.
+        use futures_util::StreamExt;
+        for chunk in 0..6u32 {
+            for i in 0..100u32 {
+                let _ = h.events.send(EngineEvent::Note {
+                    message: "x".repeat(2048) + &(chunk * 100 + i).to_string(),
+                });
+            }
+            tokio::task::yield_now().await;
         }
 
         let mut saw_resync = false;
-        for _ in 0..400 {
-            use futures_util::StreamExt;
-            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await {
-                Ok(Some(Ok(f))) => f,
-                _ => break,
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(20));
+        tokio::pin!(deadline);
+        let mut got = 0u32;
+        while !saw_resync {
+            let frame = tokio::select! {
+                _ = &mut deadline => break,
+                f = ws.next() => match f {
+                    Some(Ok(f)) => Some(f),
+                    _ => None,
+                }
             };
+            let Some(frame) = frame else { break };
+            got += 1;
             let text = frame.to_text().unwrap_or_default().to_string();
             if text.contains("\"resync\"") {
                 saw_resync = true;
-                break;
             }
         }
-        assert!(saw_resync, "a client that lagged was never told about it");
+        assert!(saw_resync, "a client that lagged was never told about it (read {got} frames)");
 
         // And the socket must still be usable: a resync that arrives just before
         // the server drops the connection is a fancier way of hanging up.
@@ -1875,6 +1896,10 @@ mod tests {
     }
 
     fn test_handle() -> Arc<EngineHandle> {
+        test_handle_with_notes(Vec::new())
+    }
+
+    fn test_handle_with_notes(notes: Vec<String>) -> Arc<EngineHandle> {
         let p: Arc<dyn cwoffee_engine::provider::Provider> = Arc::new(FakeProvider);
         // One store, shared. It used to be two, which quietly made every
         // store-backed RPC in these tests read a database the host had never
@@ -1892,7 +1917,29 @@ mod tests {
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
         clients: Arc::new(Mutex::new(BTreeMap::new())),
+            migration_notes: notes,
         })
+    }
+
+    /// `migration_notes` used to answer `[]` from the gateway no matter what the
+    /// desktop knew. An empty list is a *claim* - "nothing needed relocating" - and
+    /// on a phone that is the difference between "your old folders were followed"
+    /// and "this side is not telling you".
+    #[tokio::test]
+    async fn migration_notes_reports_what_the_host_was_actually_given() {
+        let h = test_handle();
+        let out = run_cmd("migration_notes", serde_json::json!({}), Role::Watch, &h).await;
+        assert_eq!(out.unwrap(), serde_json::json!([] as [String; 0]));
+
+        let h = test_handle_with_notes(vec![
+            "re-homed 3 session(s) from /home/me/cowry-workspace to /home/me/cwoffee-workspace"
+                .into(),
+        ]);
+        let out = run_cmd("migration_notes", serde_json::json!({}), Role::Watch, &h).await;
+        let arr = out.unwrap();
+        let arr = arr.as_array().expect("an array");
+        assert_eq!(arr.len(), 1, "{arr:?}");
+        assert!(arr[0].as_str().unwrap().contains("re-homed 3 session"), "{arr:?}");
     }
 
     #[test]

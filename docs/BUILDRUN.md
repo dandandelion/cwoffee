@@ -639,3 +639,34 @@ Two self-inflicted wounds from patching Rust with Python string surgery:
 Both were caught by compiling immediately after patching, which is the point: a
 scripted edit that is not compiled in the same breath is a claim, not a change.
 When a patch touches a struct literal, patch and `cargo check` in one command.
+## Trap 35: renaming the workspace folder strands sessions, and the sidebar tells the truth about it
+
+`~/cowry-workspace` became `~/cwoffee-workspace` in the rebrand, but a session row
+stores its folder **as a string**. Twelve sessions kept pointing at a directory that
+no longer existed, which produced two honest-but-useless symptoms: a sidebar group
+named `cowry-workspace` for a folder that is not on disk, and every tool call in those
+sessions being refused, because the workspace follows the session and that workspace is
+gone.
+
+`legacy::rehome_session_workspaces` rewrites the prefix on `sessions.workspace` and
+`workspaces.path` when, and only when, the rename signature holds: the old folder is
+absent and the new one exists. If both exist it does nothing — someone may genuinely be
+using the old name (a second install, a symlink), and moving their files under a folder
+they never chose is a worse bug than a phantom group. Subfolders follow by prefix, so a
+session in `old/repo/` becomes `new/repo/`.
+
+Two things to expect afterwards, both correct:
+
+- `list_workspaces()` unions registered rows with folders that hold sessions, so a
+  subfolder shows as its own group. That is the feature, not a duplicate row.
+- `/tmp` may keep a group of one, because a session really does live there. The sidebar
+  groups by where the session's tools actually write, and that is the claim it makes.
+
+## Trap 36: a gateway stub that returns the empty value is a claim, not an absence
+
+`migration_notes` over the gateway answered `[]` unconditionally. Same mistake as the
+`gpu_report` stub in Trap 22, only quieter: an empty list *reads* as "nothing needed
+migrating" when the truth is that this process never knew. The notes now travel into
+`EngineHandle` from whichever process started the gateway (desktop or standalone), and
+the test asserts both directions — empty when nothing was reported, present when
+something was.

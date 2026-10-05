@@ -15,6 +15,112 @@ use std::path::{Path, PathBuf};
 const OLD: &str = "cowry";
 const NEW: &str = "cwoffee";
 
+/// The default workspace folder was renamed with everything else, and that rename
+/// happened *outside* the database: sessions created before it still name
+/// `~/cowry-workspace`. Since the workspace now follows the session, every open of
+/// one of those rows would be refused ("...which the engine refused: is not a
+/// directory") and the sidebar would carry a group for a folder that no longer
+/// exists. Rewriting the prefix is only safe under the signature of the rename
+/// itself: the old folder is gone and the new one is there. If both exist, or the
+/// old one is still a real directory someone is using, nothing is touched.
+pub fn rehome_session_workspaces(db: &Path, old_dir: &Path, new_dir: &Path) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !db.is_file() {
+        return notes;
+    }
+    if old_dir.exists() || !new_dir.exists() {
+        return notes;
+    }
+    let (old, new) = (old_dir.display().to_string(), new_dir.display().to_string());
+    let conn = match rusqlite::Connection::open(db) {
+        Ok(c) => c,
+        Err(e) => {
+            notes.push(format!("could not re-home session workspaces in {}: {e}", db.display()));
+            return notes;
+        }
+    };
+    let _ = conn.pragma_update(None, "busy_timeout", 8000);
+
+    // `LIKE old || '/%'` would treat `_` and `%` inside the path as wildcards, so
+    // the prefix test is done with substrings instead.
+    // `LIKE old || '/%'` would treat `_` and `%` inside the path as wildcards, so
+    // the prefix test is done with substrings instead.
+    let count = |table: &str, col: &str| -> i64 {
+        let sql = format!(
+            "SELECT count(*) FROM {table} WHERE {col} = ?1 \
+             OR (substr({col}, 1, length(?1)) = ?1 AND substr({col}, length(?1) + 1, 1) = '/')"
+        );
+        conn.query_row(&sql, rusqlite::params![old], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+    };
+    let sess_before = count("sessions", "workspace");
+    let ws_before = count("workspaces", "path");
+
+    // A row for the destination may already exist (`workspaces` keys on `path`), so
+    // drop the doomed one first rather than failing the statement on a unique
+    // constraint.
+    conn.execute(
+        "DELETE FROM workspaces WHERE path = ?2 AND EXISTS (SELECT 1 FROM workspaces WHERE path = ?1)",
+        rusqlite::params![old, new],
+    ).ok();
+    if let Err(e) = conn.execute(
+        "UPDATE sessions SET workspace = ?2 || substr(workspace, length(?1) + 1) \
+         WHERE substr(workspace, 1, length(?1)) = ?1 AND substr(workspace, length(?1) + 1, 1) = '/'",
+        rusqlite::params![old, new],
+    )
+    .and_then(|_| {
+        conn.execute(
+            "UPDATE sessions SET workspace = ?2 WHERE workspace = ?1",
+            rusqlite::params![old, new],
+        )
+    }) {
+        notes.push(format!("re-homing session workspaces failed: {e}"));
+        return notes;
+    }
+    if let Err(e) = conn.execute(
+        "UPDATE workspaces SET path = ?2 || substr(path, length(?1) + 1) \
+         WHERE substr(path, 1, length(?1)) = ?1 AND substr(path, length(?1) + 1, 1) = '/'",
+        rusqlite::params![old, new],
+    )
+    .and_then(|_| {
+        conn.execute(
+            "UPDATE workspaces SET path = ?2 WHERE path = ?1",
+            rusqlite::params![old, new],
+        )
+    }) {
+        notes.push(format!("re-homing workspace rows failed: {e}"));
+        return notes;
+    }
+    if sess_before > 0 {
+        notes.push(format!(
+            "re-homed {sess_before} session(s) from {old} to {new}: the folder was renamed, \
+             so their tools now point at the folder that exists"
+        ));
+    }
+    if ws_before > 0 {
+        notes.push(format!("renamed {ws_before} sidebar workspace row(s) {old} -> {new}"));
+    }
+    let _ = conn;
+    notes
+}
+
+/// Env-reading wrapper: the default workspace lives under `$HOME`, and the pair is
+/// only offered when the rename is the explanation.
+pub fn rehome_default_workspaces() -> Vec<String> {
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => return Vec::new(),
+    };
+    let old_dir = home.join(format!("{OLD}-workspace"));
+    let new_dir = home.join(format!("{NEW}-workspace"));
+    let data_base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    rehome_session_workspaces(&data_base.join(NEW).join("sessions.db"), &old_dir, &new_dir)
+}
+
 /// Move `cowry` -> `cwoffee` under the config and data roots. Returns human
 /// readable notes for the caller to log.
 pub fn migrate_legacy_dirs() -> Vec<String> {
@@ -33,6 +139,9 @@ pub fn migrate_legacy_dirs() -> Vec<String> {
             });
         notes.extend(migrate_under(&base, label));
     }
+    // The directories first: the database has to exist under the new name before
+    // rows inside it can be pointed at the renamed workspace folder.
+    notes.extend(rehome_default_workspaces());
     notes
 }
 
@@ -123,9 +232,9 @@ fn reconcile(old_dir: &Path, new_dir: &Path, label: &str) -> Vec<String> {
                     let _ = std::fs::rename(&src, &dst);
                 }
             }
+            let dst = new_dir.display().to_string();
             notes.push(format!(
-                "{label}: the new database was empty and the legacy one held {o} session(s);                  moved the legacy database into {}. The empty copy is kept aside as                  *.pre-cwoffee-{stamp}.",
-                new_dir.display(),
+                "{label}: the new database was empty and the legacy one held {o} session(s); moved the legacy database into {dst}. The empty copy is kept aside as *.pre-cwoffee-{stamp}."
             ));
         }
         (Some(o), Some(n)) => notes.push(format!(
@@ -173,6 +282,88 @@ mod tests {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("cwoffee_{tag}_{}_{}", std::process::id(), n))
+    }
+
+    /// The workspace rename left session rows pointing at a folder that no longer
+    /// exists, and since the workspace follows the session, that turns every open
+    /// into a refusal and puts a phantom group in the sidebar.
+    #[test]
+    fn sessions_left_behind_by_the_workspace_rename_follow_the_folder() {
+        let base = root("wsmove");
+        let old_dir = base.join("home/cowry-workspace");
+        let new_dir = base.join("home/cwoffee-workspace");
+        let db = base.join("data/cwoffee/sessions.db");
+        std::fs::create_dir_all(new_dir.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        // The new folder exists, the old one does not: the signature of the rename.
+        std::fs::create_dir_all(&new_dir).unwrap();
+
+        {
+            let st = crate::store::Store::open(&db).unwrap();
+            st.create_session("one", new_dir.to_str().unwrap(), "m").unwrap();
+            st.create_session("two", old_dir.to_str().unwrap(), "m").unwrap();
+            st.create_session("three", &format!("{}/notes", old_dir.display()), "m")
+                .unwrap();
+            st.add_workspace(old_dir.to_str().unwrap()).unwrap();
+        }
+
+        let notes = rehome_session_workspaces(&db, &old_dir, &new_dir);
+        assert!(
+            notes.iter().any(|n| n.contains("re-homed 2 session")),
+            "{notes:?}"
+        );
+
+        let st = crate::store::Store::open(&db).unwrap();
+        let mut ws: Vec<String> = st
+            .list_sessions(500)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.workspace)
+            .collect();
+        ws.sort();
+        let want = vec![
+            new_dir.to_str().unwrap().to_string(),
+            new_dir.to_str().unwrap().to_string(),
+            format!("{}/notes", new_dir.display()),
+        ];
+        assert_eq!(ws, want, "{notes:?}");
+        // `list_workspaces` unions registered rows with folders that hold sessions,
+        // so the `notes` subfolder shows up as its own group once a session lives
+        // there. What must not survive is the old name.
+        let paths: Vec<String> = st.list_workspaces().unwrap().into_iter().map(|w| w.path).collect();
+        assert!(
+            !paths.iter().any(|p| p.contains("cowry-workspace")),
+            "the old folder is still in the sidebar: {paths:?} {notes:?}"
+        );
+        assert!(
+            paths.contains(&new_dir.to_str().unwrap().to_string()),
+            "{paths:?} {notes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Both folders present means someone is *using* the old one - maybe a
+    /// separate install, maybe a symlink. Rewriting rows would move their files
+    /// under a folder they never chose.
+    #[test]
+    fn a_workspace_that_still_exists_is_left_alone() {
+        let base = root("wskeep");
+        let old_dir = base.join("home/cowry-workspace");
+        let new_dir = base.join("home/cwoffee-workspace");
+        let db = base.join("data/cwoffee/sessions.db");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        {
+            let st = crate::store::Store::open(&db).unwrap();
+            st.create_session("one", old_dir.to_str().unwrap(), "m").unwrap();
+        }
+        let notes = rehome_session_workspaces(&db, &old_dir, &new_dir);
+        assert!(notes.is_empty(), "{notes:?}");
+        let st = crate::store::Store::open(&db).unwrap();
+        let rows = st.list_sessions(500).unwrap();
+        assert_eq!(rows[0].workspace, old_dir.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The whole point of the module: an existing history must still be there

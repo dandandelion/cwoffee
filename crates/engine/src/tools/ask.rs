@@ -352,7 +352,7 @@ mod tests {
             events: Some(etx),
             permits: Vec::new(),
         };
-        let (idx, mut iqx) = oneshot::channel::<u64>();
+        let (idx, iqx) = oneshot::channel::<u64>();
         // Deliberately not awaited: the watcher holds the reply sender open past
         // the tool's timeout, which is the whole point. Dropping the sender would
         // put the tool on the *cancelled* arm and this would measure something

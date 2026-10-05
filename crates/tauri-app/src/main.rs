@@ -317,6 +317,7 @@ fn main() {
         pending: Arc::clone(&pending),
         pending_questions: Arc::clone(&pending_q),
         clients: gateway_ctl::client_gauge(),
+        migration_notes: migration_notes.clone(),
     });
     let gateway = Arc::new(gateway_ctl::GatewayCtl::new(gw_handle));
 
