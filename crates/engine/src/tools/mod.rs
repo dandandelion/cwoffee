@@ -1,10 +1,11 @@
 //! Tools and the tool loop's view of them (PLAN.md §6).
 //!
-//! v1 ships four: `exec`, `read_file`, `write_file`, `web_fetch`, plus
+//! v1 ships `exec`, `read_file`, `write_file`, `edit_file`, `web_fetch` and
 //! `web_search`. Deliberately few: every extra tool is more schema in the prompt
 //! (which costs prefill on a slow local model) and more chances for a quantized
 //! model to emit a call it shouldn't.
 
+pub mod ask;
 pub mod docs;
 pub mod exec;
 pub mod files;
@@ -161,6 +162,10 @@ pub struct ToolCtx {
     pub workspace: std::path::PathBuf,
     /// Hard cap on bytes returned to the model.
     pub max_output_bytes: usize,
+    /// Route a question to whoever is watching. `None` means this client cannot
+    /// answer, and `ask_user` says so rather than waiting for a reply that can
+    /// never come.
+    pub ask: Option<ask::QuestionTx>,
 }
 
 impl Default for ToolCtx {
@@ -168,6 +173,7 @@ impl Default for ToolCtx {
         Self {
             workspace: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             max_output_bytes: 32 * 1024,
+            ask: None,
         }
     }
 }
@@ -258,6 +264,12 @@ impl Registry {
         // prompt, and reordering it invalidates the llama.cpp prefix cache for
         // every existing session.
         r.register(Box::new(web::DownloadTool::default()));
+        // Also appended. Adding a tool costs prompt bytes and gives a small
+        // quantized model one more choice to get wrong, which is why edit_file
+        // exists at all only because write_file's answer to a one-line change
+        // is to re-emit the entire file.
+        r.register(Box::new(files::EditFileTool));
+        r.register(Box::new(ask::AskUserTool::default()));
         r
     }
 
@@ -383,6 +395,11 @@ mod cfg_tests {
     }
 
     /// Order is load-bearing for the prefix cache; assert it rather than trust it.
+    ///
+    /// `edit_file` is appended at the end rather than slotted next to
+    /// `write_file`: inserting would re-render the tool list in the system prompt
+    /// and invalidate every existing session's prefix. A new tool changes those
+    /// bytes either way, but appending keeps the diff a pure suffix.
     #[test]
     fn tool_order_is_fixed() {
         let r = Registry::with_v1_tools();
@@ -397,6 +414,8 @@ mod cfg_tests {
                 "web_fetch",
                 "web_search",
                 "download_file",
+                "edit_file",
+                "ask_user",
             ]
         );
     }

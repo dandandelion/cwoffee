@@ -357,6 +357,27 @@ body {
   padding: 10px 12px;
   background: var(--color-paper-2);
 }
+.tool-subject {
+  /* Hidden until there is something to say, so tools with no single subject
+     keep the layout they had. */
+  display: none;
+}
+.tool-subject:not(:empty) {
+  display: inline;
+}
+.tool-name + .tool-subject:not(:empty)::before {
+  content: " \00b7 ";
+  color: var(--color-line-strong);
+}
+.tool-subject {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--color-ink-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .tool-name {
   font-size: 12.5px;
   font-weight: 600;
@@ -1415,9 +1436,129 @@ body {
 .tin { animation: cwoffee-tin 320ms cubic-bezier(0.32, 0.02, 0.28, 1) both; }
 /* The streaming paragraph is assembled from a static head plus chunk spans, so
    it has to sit exactly where a markdown paragraph would sit. */
+/* ---- the model asking the user ----------------------------------------
+   A question stops the turn, so this block is the most important thing on the
+   screen while it is up. Question first, choices one click away, and a typed
+   answer alongside them rather than instead of them. */
+.blk-ask {
+  border: 1px solid var(--color-hairline-2);
+  border-left: 3px solid var(--color-shell);
+  background: var(--color-paper-2);
+  border-radius: 10px;
+  padding: 12px 14px 14px;
+  margin: 4px 0 10px;
+}
+.ask-q {
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--color-ink);
+  margin: 2px 0 12px;
+}
+.ask-opts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+.ask-opt {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 8px;
+  background: var(--color-paper);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color var(--d1) var(--ease-out),
+    background var(--d1) var(--ease-out),
+    transform var(--d1) var(--ease-out);
+}
+.ask-opt:hover {
+  border-color: var(--color-shell);
+  background: var(--color-tint);
+}
+.ask-opt:active {
+  transform: translateY(1px);
+}
+.ask-opt:focus-visible {
+  outline: 2px solid var(--color-shell);
+  outline-offset: 2px;
+}
+/* The recommendation is shown, not imposed: a badge and a wash, never a
+   preselected state the user has to notice and undo. */
+.ask-opt.is-rec {
+  background: var(--color-tint);
+  border-color: var(--color-shell);
+}
+.ask-badge {
+  align-self: flex-start;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-shell-deep);
+  background: color-mix(in srgb, var(--color-shell) 24%, var(--color-paper));
+  border-radius: 999px;
+  padding: 2px 7px;
+  margin-bottom: 2px;
+}
+.ask-lbl {
+  font-size: 14px;
+  color: var(--color-ink);
+}
+.ask-detail {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--color-ink-2);
+}
+.ask-custom {
+  margin-top: 10px;
+}
+.ask-input {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 14px;
+  color: var(--color-ink);
+  background: var(--color-paper);
+  border: 1px dashed var(--color-hairline-2);
+  border-radius: 8px;
+  padding: 8px 10px;
+  transition: border-color var(--d1) var(--ease-out);
+}
+.ask-input:focus {
+  outline: none;
+  border-style: solid;
+  border-color: var(--color-shell);
+}
+.ask-input::placeholder {
+  color: var(--color-ink-3);
+}
+.blk-ask.answered .ask-opts,
+.blk-ask.answered .ask-custom {
+  opacity: 0.45;
+  pointer-events: none;
+}
+.ask-answered {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--color-ok);
+}
+.blk-ask.answered.by-other .ask-answered {
+  color: var(--color-ink-2);
+}
+
 /* The assembled paragraph is a real <p> inside .blk-body, so the app's own
    paragraph rules give it its spacing - measured, not re-declared here. Only
    the empty case needs saying. */
+/* Put the whole streaming paragraph on one compositing layer. Text inside a
+   filtered element is rasterised differently from text outside it, so without
+   this a chunk still changes glyph rendering at the moment its span is folded
+   away - a blink at the end of an animation that had already finished. */
+.tin-para {
+  transform: translateZ(0);
+}
 .tin-frozen:empty { display: none; }
 
 /* Only blocks created during a live turn ease in. Stored transcripts are

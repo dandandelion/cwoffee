@@ -390,7 +390,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        (ToolCtx { workspace: dir, max_output_bytes: 4096 }, WsGuard(std::env::temp_dir().join(format!("cwoffee_exec_test_{}_{n}", std::process::id()))))
+        (ToolCtx { workspace: dir, max_output_bytes: 4096, ..Default::default() }, WsGuard(std::env::temp_dir().join(format!("cwoffee_exec_test_{}_{n}", std::process::id()))))
     }
 
     #[tokio::test]

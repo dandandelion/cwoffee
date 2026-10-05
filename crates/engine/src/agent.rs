@@ -134,6 +134,23 @@ impl Agent {
         std::mem::take(&mut self.turn_files)
     }
 
+    /// Record a file this turn produced.
+    ///
+    /// Keyed by path: a model that writes a report and then edits it has
+    /// produced *one* file, and the transcript used to show two identical chips
+    /// for it. The first position is kept so the strip does not reshuffle as the
+    /// turn goes on, while the metadata (size, mime) is the latest one.
+    fn note_turn_file(&mut self, f: &crate::tools::OutputFile) {
+        match self
+            .turn_files
+            .iter_mut()
+            .find(|e| e.path == f.path)
+        {
+            Some(existing) => *existing = f.clone(),
+            None => self.turn_files.push(f.clone()),
+        }
+    }
+
     fn emit_turn_files(&mut self, turn: u64, out: &EngineSink) {
         if self.turn_files.is_empty() {
             return;
@@ -580,8 +597,8 @@ impl Agent {
             }
         }
 
-        if !result.files.is_empty() {
-            self.turn_files.extend(result.files.iter().cloned());
+        for f in result.files.iter() {
+            self.note_turn_file(f);
         }
 
         let _ = out.send(EngineEvent::ToolExecEnd {
@@ -779,6 +796,78 @@ mod tests {
         ) -> crate::tools::ToolResult {
             ToolResult::ok("fetched: the price is 42")
         }
+    }
+
+    #[derive(Default)]
+    struct Producer {
+        bytes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for Producer {
+        fn name(&self) -> &str { "producer" }
+        fn description(&self) -> &str { "writes a file" }
+        fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
+        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::Mutating }
+        async fn run(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+            _sink: &crate::tools::ExecSink,
+        ) -> crate::tools::ToolResult {
+            let n = self.bytes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ToolResult::ok("wrote").with_file(crate::tools::OutputFile {
+                path: "report.md".into(),
+                name: "report.md".into(),
+                mime: "text/markdown".into(),
+                bytes: (100 * (n as u64 + 1)) as u64,
+            })
+        }
+    }
+
+    /// A model that writes a file and then edits it has produced one file. Two
+    /// identical chips under the answer read as a bug in the app, not as work.
+    #[tokio::test]
+    async fn the_same_file_produced_twice_is_one_attachment() {
+        let (etx, _erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Producer::default()));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "p1".into(),
+                            name: "producer".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "p2".into(),
+                            name: "producer".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        agent.run_turn("go", vec![], &etx).await;
+
+        let files = agent.take_turn_files();
+        assert_eq!(files.len(), 1, "one file, seen twice: {files:?}");
+        // Metadata is the latest write, so the size the chip shows is the size
+        // of what is on disk now.
+        assert_eq!(files[0].bytes, 200, "kept the wrong revision: {files:?}");
     }
 
     #[tokio::test]

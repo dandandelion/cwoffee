@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (areq, mut ars) = mpsc::unbounded_channel();
     let gate = ApprovalGate::new(ApprovalMode::Auto, areq);
 
-    let ctx = ToolCtx { workspace: workspace.clone(), max_output_bytes: 16 * 1024 };
+    let ctx = ToolCtx { workspace: workspace.clone(), max_output_bytes: 16 * 1024, ..Default::default() };
 
     let mut agent = Agent::new(
         std::sync::Arc::new(provider),

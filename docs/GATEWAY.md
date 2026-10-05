@@ -35,12 +35,14 @@ Two roles, enforced server-side per command:
 * **watch** - `session_state`, `list_sessions`, `session_messages`,
   `search_messages`, `migration_notes`. Read-only.
 * **drive** - everything that changes state: `start_turn`, `cancel_turn`,
-  `respond_approval`, `set_mode`, `new_session`, `switch_session`, `rename_session`,
-  `delete_session`, `clear_session`, `set_model`, `set_reasoning`.
+  `respond_approval`, `respond_question`, `set_mode`, `set_reasoning`, `new_session`,
+  `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
+  `set_workspace`.
 
-Never exposed over the socket at all: `open_file`, `pick_workspace`,
-`set_workspace`, `gpu_report`, and the window controls. A browser tab cannot reach
-your filesystem through this.
+Never exposed over the socket at all: `open_file`, `pick_workspace`, `gpu_report`,
+and the window controls. A browser tab cannot open a file or a dialog on your
+desktop through this. `set_workspace` *is* exposed, drive-only, and is the widest
+command in the list - see "What a drive token can reach" below.
 
 ### The browser shows the host, not a local session
 
@@ -255,6 +257,20 @@ exposed on purpose — a leaked token should not also be a directory browser.
 
 ## Things that will bite
 
+- **Questions park the turn, in both directions.** When the agent calls
+  `ask_user`, every attached client gets a `questionRequested` event and the turn
+  waits. Answering is `respond_question` with the event's `id` - a watch-only
+  client can see the question and cannot answer it. Cancelling releases the parked
+  tool with a "cancelled" result instead of leaving one of the four tool workers
+  idle until the question times out.
+- **"Devices" means addresses, not sockets.** The footer pill counts devices keyed
+  by peer address and names them: `2 devices: 100.86.160.103, 172.20.10.2
+  (3 connections)`. Two tabs on one laptop are one device and three connections,
+  so both numbers are shown. A socket that has not authenticated yet is neither.
+  If the address list is not what you expect, someone else is on your network -
+  revoke the token. (The first version of this counter decremented a value nothing
+  had incremented, and the pill cheerfully reported 18,446,744,073,709,551,615
+  devices. See Trap 26 in `docs/BUILDRUN.md`.)
 - **The workspace is runtime state, not a saved preference.** Changing it moves the
   tools for the rest of the session, and new sessions inherit the new value, but a
   restart reads `workspace` from the config file again. To make a move permanent,

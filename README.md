@@ -21,9 +21,9 @@ sandboxed image loaders in the heavier sample. The same code without a browser �
 TUI — is **7.0 MB PSS**. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 > Status: M0–M2 built and running. The engine, both clients, the sandbox, the store,
-> document output and image attachments are live and verified against a real local
-> model. Packaging produces an installable RPM. Not yet done: Knowledge Center,
-> browser module, LAN gateway (designed in `docs/GATEWAY.md`, deliberately not built).
+> document output, image attachments and the token-guarded remote-access gateway are
+> live and verified against a real local model. Packaging produces an installable
+> RPM and an AppImage. Not yet done: Knowledge Center, browser module, MCP.
 
 ## Run it
 
@@ -147,6 +147,32 @@ cadence detail is the whole effect — the live block repaints every 120ms, so a
 effect wrapped in re-written text lives one paint and is invisible no matter what
 the computed styles say. Prose reveals; lists, code and tables paint whole,
 because a mis-parsed structure is worse than no animation.
+
+## Files, and asking instead of guessing
+
+The agent's file tools are `read_file`, `write_file`, `edit_file`, `write_xlsx`,
+`download_file`. Two decisions there are worth knowing about:
+
+**`edit_file` is search-and-replace, not a diff.** A 4-bit local model copying a
+line it can see does far better than one generating hunks with correct line
+numbers. An exact single match is applied. No match returns the line that *looks*
+most like what was asked for, which turns the model's usual
+"almost right, wrong indentation" failure into a one-iteration correction.
+Multiple matches are refused unless the call says `replace_all`. Text is written
+to a sibling temp file and renamed over the original, so a failure partway cannot
+truncate your file. Anything that can be edited - text, markdown, code - should
+go through `edit_file`, which changes a few lines instead of re-emitting the whole
+document and rewriting your whole chat window for it.
+
+**`ask_user` stops the agent guessing.** One question, one to six options, one
+marked recommended, and a typed answer always available. In the TUI you answer
+with number keys. The turn parks while it waits; cancel does not make the question
+disappear but releases the parked tool with a "cancelled" result the model can act
+on. Over the gateway, a watch-only client sees the question and cannot answer it.
+
+Every file a turn produces appears once as an attachment however many times it was
+written, and file tools show the path they act on in the card header, so you can
+see what a call touched without expanding it.
 
 ## Two things that are security, not polish
 

@@ -911,7 +911,7 @@ mod tests {
         mpsc::unbounded_channel().0
     }
     fn ctx() -> ToolCtx {
-        ToolCtx { workspace: ".".into(), max_output_bytes: 4096 }
+        ToolCtx { workspace: ".".into(), max_output_bytes: 4096, ..Default::default() }
     }
 
     // ---- url policy -------------------------------------------------------

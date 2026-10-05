@@ -62,7 +62,7 @@ function markCopied(btn: HTMLElement) {
     btn.classList.remove('done')
   }, 1200)
 }
-import type { OutputFile } from './events'
+import type { OutputFile, QuestionRequested } from './events'
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`
@@ -89,6 +89,10 @@ export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'war
 
 interface ToolRefs {
   card: HTMLElement
+  /** The tool this card belongs to; the header subject is derived from it. */
+  name: string
+  /** Path / url / query the call is about, shown in the header. */
+  subject: HTMLElement
   args: HTMLElement
   out: HTMLElement
   status: HTMLElement
@@ -120,6 +124,11 @@ export class Transcript {
   private answerEls: HTMLElement[] = []
   // Live markdown state for the answer block currently streaming.
   private liveEl: HTMLElement | null = null
+  /** Files produced so far this turn, deduped by path, and the one row that
+   *  shows them. */
+  private turnFiles: OutputFile[] = []
+  private questionCards = new Map<number, HTMLElement>()
+  private fileStrip: HTMLElement | null = null
   private live = new LiveMarkdown()
   // Nodes owned by the reveal: not rewritten while they are animating.
   private revealFrozen: HTMLElement | null = null
@@ -204,6 +213,8 @@ export class Transcript {
     this.liveEl = null
     this.setLive(null)
     this.live = new LiveMarkdown()
+    this.turnFiles = []
+    this.fileStrip = null
   }
 
   /**
@@ -335,15 +346,25 @@ export class Transcript {
       els.frozenHost.dataset.src = r.frozen
       els.frozenHost.innerHTML = r.frozen
     }
-    if (els.head.innerHTML !== r.head) els.head.innerHTML = r.head
 
     const live = new Set(r.chunks.map((c) => c.id))
     for (const [id, el] of this.revealNodes) {
-      if (!live.has(id)) {
-        el.remove()
-        this.revealNodes.delete(id)
-      }
+      if (live.has(id)) continue
+      // Fold, do not rewrite. The chunk's finished nodes move into the settled
+      // run; the rest of the paragraph is left exactly as it is.
+      while (el.firstChild) els.head.append(el.firstChild)
+      el.remove()
+      this.revealNodes.delete(id)
     }
+
+    // Re-parsing the settled run on every paint was the flash. Rewriting
+    // innerHTML tears down and re-rasters text that did not change, and the
+    // folded text simultaneously leaves the animation's compositing layer - so
+    // the newest words visibly blinked once more, ~520ms after arriving.
+    // Accumulating nodes instead means this only fires when the inline markup
+    // genuinely changes: a `**bold**` that straddled two chunks.
+    if (els.head.innerHTML !== r.head) els.head.innerHTML = r.head
+
     for (const c of r.chunks) {
       if (this.revealNodes.has(c.id)) continue
       const el = document.createElement('span')
@@ -582,11 +603,104 @@ export class Transcript {
    * The path is workspace-relative and the shell re-validates it before
    * opening anything, so a model-authored name cannot escape the workspace.
    */
+  /**
+   * Show the files this turn has produced.
+   *
+   * The event carries the *cumulative* list and fires whenever a tool produces
+   * something, so appending a row per event used to print the same file two and
+   * three times under one answer. One row per turn, keyed by path: a file that
+   * is written and then edited is one attachment, showing the latest size.
+   */
+  /**
+   * Show a question the model asked, and park the card until it is answered.
+   *
+   * The turn is genuinely stopped while this is up, so the card is the whole
+   * point of the screen: the question first, the choices one click away, and a
+   * typed answer offered alongside them. The recommended option is badged rather
+   * than preselected - the model's opinion is information, not a default the
+   * user has to notice and undo.
+   */
+  showQuestion(
+    q: QuestionRequested,
+    onAnswer: (r: { text: string; option: number | null }) => void,
+  ) {
+    this.flushNow()
+    this.ensureTurn()
+    const card = this.el('blk blk-ask')
+    const head = this.el('blk-head')
+    head.append(this.el('blk-label', 'asking'))
+    card.append(head)
+    card.append(this.el('ask-q', q.question))
+
+    const opts = this.el('ask-opts')
+    q.options.forEach((o, i) => {
+      const b = this.el('ask-opt')
+      b.setAttribute('role', 'button')
+      b.tabIndex = 0
+      if (q.recommended === i) {
+        b.classList.add('is-rec')
+        b.append(this.el('ask-badge', 'recommended'))
+      }
+      b.append(this.el('ask-lbl', o.label))
+      if (o.detail) b.append(this.el('ask-detail', o.detail))
+      const pick = () => answer(i, o.label)
+      b.addEventListener('click', pick)
+      b.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          pick()
+        }
+      })
+      opts.append(b)
+    })
+    card.append(opts)
+
+    if (q.allow_custom) {
+      const row = this.el('ask-custom')
+      const input = document.createElement('input')
+      input.className = 'ask-input'
+      input.placeholder = 'or type your own answer'
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && input.value.trim()) answer(null, input.value.trim())
+      })
+      row.append(input)
+      card.append(row)
+    }
+
+    const answer = (option: number | null, text: string) => {
+      if (card.classList.contains('answered')) return
+      // The click is the answer; a second one must not send a second reply.
+      card.classList.add('answered')
+      card.append(this.el('ask-answered', `answered: ${text}`))
+      onAnswer({ text, option })
+    }
+
+    this.turn!.appendChild(card)
+    this.questionCards.set(q.id, card)
+    this.scrollIfNeeded()
+  }
+
+  /** Close a question card answered elsewhere - another tab, another device. */
+  settleQuestion(id: number) {
+    const card = this.questionCards.get(id)
+    if (!card || card.classList.contains('answered')) return
+    card.classList.add('answered', 'by-other')
+    card.append(this.el('ask-answered', 'answered elsewhere'))
+  }
+
   addFiles(files: OutputFile[]) {
     if (!files.length) return
     this.flushNow()
     this.ensureTurn()
-    this.turn!.appendChild(this.fileRow(files))
+    for (const f of files) {
+      const at = this.turnFiles.findIndex((e) => e.path === f.path)
+      if (at >= 0) this.turnFiles[at] = f
+      else this.turnFiles.push(f)
+    }
+    this.fileStrip?.remove()
+    this.fileStrip = this.fileRow(this.turnFiles)
+    this.turn!.appendChild(this.fileStrip)
+    this.scrollIfNeeded()
   }
 
   private fileRow(files: OutputFile[]): HTMLElement {
@@ -623,6 +737,8 @@ export class Transcript {
     const card = this.el('blk blk-tool')
     const head = this.el('blk-head')
     head.append(this.el('tool-name', name))
+    const subject = this.el('tool-subject')
+    head.append(subject)
     const status = this.el('tool-status', 'running…')
     head.appendChild(status)
     const args = this.el('tool-args')
@@ -647,19 +763,33 @@ export class Transcript {
         card.classList.add('is-open')
       }
     })
-    return { card, head, args, out, detail }
+    return { card, head, args, out, detail, subject }
   }
 
   private openTool(id: string, name: string) {
+    // ask_user renders as the question card, not as a tool card. Two cards for
+    // one question - "ask_user running" next to the actual question - reads as
+    // a bug, and the second one carries no information.
+    if (name === 'ask_user') return
     this.flushNow()
     this.textBuf = null
     this.textKind = null
     this.ensureTurn()
-    const { card, head, args, out, detail } = this.buildToolCard(name)
+    const { card, head, args, out, detail, subject } = this.buildToolCard(name)
     const status = head.lastElementChild as HTMLElement
     this.setLive(card)
     this.turn!.appendChild(card)
-    this.tools.set(id, { card, args, out, status, detail, stdout: '', stderr: '' })
+    this.tools.set(id, {
+      card,
+      args,
+      out,
+      status,
+      detail,
+      subject,
+      name,
+      stdout: '',
+      stderr: '',
+    })
     this.scrollIfNeeded()
   }
 
@@ -669,8 +799,13 @@ export class Transcript {
 
   private setToolArgs(id: string, args: unknown) {
     const t = this.refs(id)
-    if (!t) return
+    if (!t) return  // ask_user has no card; its question card carries the text
     t.args.textContent = typeof args === 'string' ? args : JSON.stringify(args)
+    const subject = subjectFor(t.name, args)
+    if (subject) {
+      t.subject.textContent = subject
+      t.subject.title = subject
+    }
   }
 
   private appendToolOut(id: string, stream: ExecStream, chunk: string) {
@@ -787,10 +922,15 @@ export class Transcript {
           this.turn!.appendChild(this.fileRow(m.files))
         }
         for (const call of parseCalls(m.tool_calls_json)) {
-          const { card, head, args, out, detail } = this.buildToolCard(call.name)
+          const { card, head, args, out, detail, subject } = this.buildToolCard(call.name)
           ;(head.lastElementChild as HTMLElement).textContent = ''
           frag.appendChild(card)
           args.textContent = call.arguments
+          const subj = subjectFor(call.name, call.arguments)
+          if (subj) {
+            subject.textContent = subj
+            subject.title = subj
+          }
           const ref = { out }
           cards.set(call.id, ref)
           lastCard = ref
@@ -799,6 +939,8 @@ export class Transcript {
             args,
             out,
             detail,
+            subject,
+            name: call.name,
             status: head.lastElementChild as HTMLElement,
             stdout: '',
             stderr: '',
@@ -824,4 +966,41 @@ function parseCalls(jsonStr: string): Array<{ id: string; name: string; argument
   } catch {
     return []
   }
+}
+
+/**
+ * What a tool call is about, shown in its header.
+ *
+ * "write_file · ok" tells you nothing you care about; which file changed is the
+ * one fact you want without expanding the card. `exec` is deliberately left
+ * out: its argument is a whole command, and putting it here would just move the
+ * noise into the header and make every row resize.
+ */
+const SUBJECT_KEYS = ['path', 'file', 'url', 'query']
+
+export function subjectFor(name: string, raw: unknown): string {
+  if (name === 'exec') return ''
+  if (typeof raw === 'string') {
+    // Tool arguments arrive as a stream, so this is often a fragment. Match a
+    // *closed* string value only: a half-written path would resize the header
+    // on every token and look like a rendering fault.
+    for (const k of SUBJECT_KEYS) {
+      const m = new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw)
+      if (m) {
+        try {
+          return JSON.parse(`"${m[1]}"`) as string
+        } catch {
+          return m[1]
+        }
+      }
+    }
+    return ''
+  }
+  if (!raw || typeof raw !== 'object') return ''
+  const obj = raw as Record<string, unknown>
+  for (const k of SUBJECT_KEYS) {
+    const v = obj[k]
+    if (typeof v === 'string' && v.trim()) return v
+  }
+  return ''
 }

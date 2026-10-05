@@ -1,4 +1,4 @@
-//! File tools: `read_file` and `write_file`.
+//! File tools: `read_file`, `write_file` and `edit_file`.
 //!
 //! Both route every path through `super::path::confine`. There is no code path
 //! in this module that opens a path the containment check has not seen.
@@ -319,6 +319,192 @@ impl Tool for WriteFileTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+
+/// Largest file `edit_file` will load and rewrite. Above this the model is
+/// almost certainly editing the wrong thing, and the honest answer is exec.
+const EDIT_LIMIT: u64 = 4 * 1024 * 1024;
+
+pub struct EditFileTool;
+
+#[async_trait]
+impl Tool for EditFileTool {
+    fn name(&self) -> &str {
+        "edit_file"
+    }
+
+    fn description(&self) -> &str {
+        "Change part of an existing text file in place. old_text must match the file \
+         exactly, including indentation and spacing. Prefer this over write_file for \
+         small changes - write_file replaces the whole file. Fails if old_text matches \
+         zero times or more than once; add surrounding lines to make it unique, or set \
+         replace_all."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path":    { "type": "string", "description": "Existing file, relative to the workspace root" },
+                "old_text":{ "type": "string", "description": "Exact text to replace, copied from the file" },
+                "new_text":{ "type": "string", "description": "Replacement text" },
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)" }
+            },
+            "required": ["path", "old_text", "new_text"]
+        })
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Mutating
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {
+        let raw = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return ToolResult::err("edit_file: missing required string field \"path\""),
+        };
+        let old = match args.get("old_text").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return ToolResult::err("edit_file: missing required string field \"old_text\""),
+        };
+        let new = match args.get("new_text").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return ToolResult::err("edit_file: missing required string field \"new_text\""),
+        };
+        let all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if old.is_empty() {
+            return ToolResult::err(
+                "edit_file: old_text is empty. Give the exact text to replace.",
+            );
+        }
+
+        let path = match confine(&ctx.workspace, raw) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::err(e),
+        };
+        if path == ctx.workspace || path.is_dir() {
+            return ToolResult::err(format!("{} is a directory, not a file", path.display()));
+        }
+        if !path.exists() {
+            return ToolResult::err(format!(
+                "{} does not exist. edit_file changes an existing file; use write_file \
+                 to create one.",
+                display_rel(&ctx.workspace, &path)
+            ));
+        }
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => return ToolResult::err(format!("cannot stat {}: {e}", path.display())),
+        };
+        if meta.len() > EDIT_LIMIT {
+            return ToolResult::err(format!(
+                "{} is {} bytes, too large to rewrite here. Use exec with sed/patch, or \
+                 work on a smaller file.",
+                display_rel(&ctx.workspace, &path),
+                meta.len()
+            ));
+        }
+
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return ToolResult::err(format!("cannot read {}: {e}", path.display())),
+        };
+        if looks_binary(&bytes) {
+            return ToolResult::err(format!(
+                "{} looks binary. edit_file works on text; for a binary format write the \
+                 whole file with write_file/write_xlsx.",
+                display_rel(&ctx.workspace, &path)
+            ));
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+
+        let hits = text.matches(old).count();
+        if hits == 0 {
+            let mut msg = format!(
+                "old_text was not found in {} ({} lines). Copy it from the file exactly - \
+                 indentation and spacing are part of the match. Use read_file first.",
+                display_rel(&ctx.workspace, &path),
+                text.lines().count()
+            );
+            if let Some(hint) = near_miss(&text, old) {
+                msg.push_str(&format!("\nnear miss: {hint}"));
+            }
+            return ToolResult::err(msg);
+        }
+        if hits > 1 && !all {
+            return ToolResult::err(format!(
+                "old_text matches {hits} places in {}. Include more surrounding lines so \
+                 the edit is unambiguous, or set replace_all to change every one.",
+                display_rel(&ctx.workspace, &path)
+            ));
+        }
+
+        let edited = text.replace(old, new);
+        // Write beside the original and move it into place, so an interrupted
+        // write cannot leave a half-written file where a whole one used to be.
+        let tmp = sibling_tmp(&path);
+        if let Err(e) = std::fs::write(&tmp, edited.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            return ToolResult::err(format!("cannot write {}: {e}", path.display()));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return ToolResult::err(format!("cannot replace {}: {e}", path.display()));
+        }
+
+        let before = text.lines().count();
+        let after = edited.lines().count();
+        ToolResult::ok(format!(
+            "{} edited: {hits} replacement(s), {before} -> {after} lines, {} -> {} bytes",
+            display_rel(&ctx.workspace, &path),
+            bytes.len(),
+            edited.len()
+        ))
+        .with_file(OutputFile::from_path(&ctx.workspace, &path))
+    }
+}
+
+/// Point at the line the model probably meant, because "not found" alone sends
+/// it back through the same paraphrase. Wrong leading whitespace is the common
+/// case: read_file renders "12\ttext", and the tab is not part of the file.
+fn near_miss(file: &str, old: &str) -> Option<String> {
+    let want = old.trim();
+    if want.is_empty() {
+        return None;
+    }
+    for (i, line) in file.lines().enumerate() {
+        if line.trim() == want {
+            return Some(format!(
+                "line {} holds the same text with different leading whitespace: {:?}",
+                i + 1,
+                line
+            ));
+        }
+    }
+    let first = old.lines().next().unwrap_or("").trim();
+    if !first.is_empty() {
+        for (i, line) in file.lines().enumerate() {
+            if line.trim() == first {
+                return Some(format!(
+                    "the snippet's first line matches line {}, but the rest does not \
+                     match exactly",
+                    i + 1
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn sibling_tmp(path: &std::path::Path) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    path.with_file_name(format!(".{name}.cwoffee-tmp"))
+}
+
 /// Convert markdown into a binary document and place it at `path`.
 async fn write_document(path: &Path, markdown: &str, ext: &str, ctx: &ToolCtx) -> ToolResult {
     match ext {
@@ -358,7 +544,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn ctx_in(dir: &Path) -> ToolCtx {
-        ToolCtx { workspace: dir.to_path_buf(), max_output_bytes: 4096 }
+        ToolCtx { workspace: dir.to_path_buf(), max_output_bytes: 4096, ..Default::default() }
     }
 
     fn tmp(label: &str) -> std::path::PathBuf {
@@ -520,6 +706,152 @@ mod tests {
         let mut s = vec![b'a'; 9000];
         s[8500] = 0;
         assert!(!looks_binary(&s));
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_one_occurrence_and_reports_the_file() {
+        let d = tmp("edit");
+        std::fs::write(d.join("notes.md"), "# Title\n\nfirst line\nlast line\n").unwrap();
+        let r = EditFileTool
+            .run(
+                json!({"path": "notes.md", "old_text": "first line", "new_text": "opened line"}),
+                &ctx_in(&d),
+                &sink(),
+            )
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(
+            std::fs::read_to_string(d.join("notes.md")).unwrap(),
+            "# Title\n\nopened line\nlast line\n"
+        );
+        assert!(r.output.contains("1 replacement(s)"), "{}", r.output);
+        assert!(r.output.contains("4 -> 4 lines"), "{}", r.output);
+        // The card header and the attachment both come from this; the path is
+        // workspace-relative so the UI can never be talked into opening /etc.
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(r.files[0].path, "notes.md");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_an_ambiguous_match_and_says_what_to_do() {
+        let d = tmp("edit-ambig");
+        std::fs::write(d.join("a.txt"), "dup\ndup\ndup\n").unwrap();
+        let r = EditFileTool
+            .run(json!({"path": "a.txt", "old_text": "dup", "new_text": "x"}), &ctx_in(&d), &sink())
+            .await;
+        assert!(!r.ok, "an ambiguous match must not be guessed at");
+        assert!(r.text().contains("3 places"), "not actionable: {}", r.text());
+        assert!(r.text().contains("replace_all"), "no way out offered: {}", r.text());
+        assert_eq!(
+            std::fs::read_to_string(d.join("a.txt")).unwrap(),
+            "dup\ndup\ndup\n",
+            "a refused edit must not touch the file"
+        );
+        let r = EditFileTool
+            .run(
+                json!({"path": "a.txt", "old_text": "dup", "new_text": "x", "replace_all": true}),
+                &ctx_in(&d),
+                &sink(),
+            )
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "x\nx\nx\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn edit_that_matches_nothing_points_at_the_real_mistake() {
+        let d = tmp("edit-miss");
+        std::fs::write(d.join("p.py"), "def f():\n    return 1\n").unwrap();
+        // The model read the file with read_file, which renders "2\treturn 1",
+        // and quoted it without the indentation. "not found" alone would send it
+        // around the same loop; the hint names the line and shows the spacing.
+        // The model quoted the snippet with the indentation dropped. A bare
+        // substring like "return 1" would still match; a multi-line snippet
+        // without the leading spaces will not, and that is the common mistake.
+        let r = EditFileTool
+            .run(
+                json!({"path": "p.py", "old_text": "def f():\nreturn 1", "new_text": "def f():\nreturn 2"}),
+                &ctx_in(&d),
+                &sink(),
+            )
+            .await;
+        assert!(!r.ok, "a snippet with the wrong indentation must not match");
+        let msg = r.text();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("near miss"), "no hint: {msg}");
+        assert!(msg.contains("line 1"), "hint does not name the line: {msg}");
+
+        // The same snippet quoted correctly does match.
+        let r = EditFileTool
+            .run(
+                json!({"path": "p.py", "old_text": "def f():\n    return 1", "new_text": "def f():\n    return 2"}),
+                &ctx_in(&d),
+                &sink(),
+            )
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert!(std::fs::read_to_string(d.join("p.py")).unwrap().contains("return 2"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_missing_files_escapes_and_binaries() {
+        let d = tmp("edit-bad");
+        let c = ctx_in(&d);
+        let r = EditFileTool
+            .run(json!({"path": "nope.txt", "old_text": "a", "new_text": "b"}), &c, &sink())
+            .await;
+        assert!(!r.ok && r.text().contains("write_file"), "unhelpful: {}", r.text());
+
+        let r = EditFileTool
+            .run(json!({"path": "../evil", "old_text": "a", "new_text": "b"}), &c, &sink())
+            .await;
+        assert!(!r.ok, "escape allowed");
+        assert!(!d.parent().unwrap().join("evil").exists());
+
+        std::fs::write(d.join("b.bin"), [0u8, 1, 2, 3]).unwrap();
+        let r = EditFileTool
+            .run(json!({"path": "b.bin", "old_text": "a", "new_text": "b"}), &c, &sink())
+            .await;
+        assert!(!r.ok && r.text().contains("binary"), "unhelpful: {}", r.text());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn edit_leaves_no_temp_file_behind() {
+        let d = tmp("edit-tmp");
+        std::fs::write(d.join("t.txt"), "one\n").unwrap();
+        EditFileTool
+            .run(json!({"path": "t.txt", "old_text": "one", "new_text": "two"}), &ctx_in(&d), &sink())
+            .await;
+        let left = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(left, vec!["t.txt".to_string()], "stray entries: {left:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn missing_arguments_are_correctable_by_the_model() {
+        let d = tmp("edit-args");
+        let c = ctx_in(&d);
+        std::fs::write(d.join("f.txt"), "x\n").unwrap();
+        for args in [
+            json!({"old_text": "x", "new_text": "y"}),
+            json!({"path": "f.txt", "new_text": "y"}),
+            json!({"path": "f.txt", "old_text": "x"}),
+            json!({"path": "f.txt", "old_text": "", "new_text": "y"}),
+        ] {
+            let r = EditFileTool.run(args.clone(), &c, &sink()).await;
+            assert!(!r.ok, "accepted {args}");
+            assert!(!r.text().is_empty(), "silent refusal for {args}");
+        }
+        assert_eq!(std::fs::read_to_string(d.join("f.txt")).unwrap(), "x\n");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]

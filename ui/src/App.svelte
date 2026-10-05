@@ -12,7 +12,7 @@
     Session,
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
-  import { Transcript, linkProbe } from './lib/transcript'
+  import { Transcript, linkProbe, subjectFor } from './lib/transcript'
   import { pageLog } from './lib/pagelog'
 
   // ---- state --------------------------------------------------------------
@@ -71,7 +71,10 @@
     running: boolean
     host: string
     port: number
+    /** Devices, not connections: two tabs on one phone is one device. */
     clients: number
+    connections: number
+    peers: string[]
     lan: boolean
     has_token: boolean
     token_source: string
@@ -451,6 +454,17 @@
   }
 
   let copiedUrl = $state('')
+  /** The honest sentence behind the number. A count nobody can check is a
+      count nobody should trust - so the addresses are printed next to it. */
+  function attachedLine(g: GatewayStatus | null): string {
+    const devs = g?.clients ?? 0
+    const conns = g?.connections ?? 0
+    if (!devs) return 'nothing attached'
+    const who = (g?.peers ?? []).join(', ')
+    const extra = conns !== devs ? ` (${conns} connections)` : ''
+    return `${devs} device${devs === 1 ? '' : 's'}${who ? `: ${who}` : ''}${extra}`
+  }
+
   async function copyUrl(u: string) {
     try {
       await navigator.clipboard.writeText(u)
@@ -615,6 +629,23 @@
       case 'turnFiles':
         pageLog(`turn files: ${ev.d.files.map((f) => f.path).join(', ')}`)
         transcript?.addFiles(ev.d.files)
+        break
+      case 'questionRequested':
+        // The turn is parked until this is answered, so the answer goes straight
+        // back; nothing else in the UI needs to know.
+        pageLog(`question asked: ${ev.d.question}`)
+        transcript?.showQuestion(ev.d, (r) => {
+          void invoke('respond_question', {
+            id: ev.d.id,
+            text: r.text,
+            option: r.option,
+          }).catch((e) => {
+            pageLog(`respond_question failed: ${cleanErr(String(e))}`)
+          })
+        })
+        break
+      case 'questionAnswered':
+        transcript?.settleQuestion(ev.d.id)
         break
       case 'approvalRequested':
         approval = { id: ev.d.id, tool: ev.d.tool, risk: ev.d.risk, summary: ev.d.summary }
@@ -979,13 +1010,19 @@
     return false
   }
 
-  async function waitTurnDone(prevTurns: number, budgetMs = 90000): Promise<boolean> {
+  async function waitTurnDone(prevTurns: number, budgetMs = 150000): Promise<boolean> {
     const dl = performance.now() + budgetMs
     while (performance.now() < dl) {
       const st = await invoke<HostState>('session_state')
       if (st.turns > prevTurns) return true
       await new Promise((r) => setTimeout(r, 250))
     }
+    // Say what was waited for and for how long. Two checks used to fail here with
+    // "turn never finished" and no way to tell a hang from a slow model; the
+    // endpoint serves one slot and a 60s first token has been measured under
+    // contention, so the budget has to sit above that and the timeout has to name
+    // itself when it still trips.
+    pageLog(`waitTurnDone: no new turn after ${budgetMs}ms (turns=${prevTurns})`)
     return false
   }
 
@@ -1352,7 +1389,41 @@
       fails++
       pageLog(`SELFTEST FAIL: ${m}`)
     }
+      // Sessions created lazily by a check's `newSession(); send()` pair are not
+      // the `selftest` session this harness deletes by id, and auto-titling renames
+      // them anyway, so an exact-title delete never found them. Ten rows of debris
+      // per run was the result. Sweep by the marker every prompt here starts with.
+      async function sweepSelftest(where: string) {
+        const all = await invoke<Session[]>('list_sessions')
+        const junk = all.filter((s) => /^selftest/i.test(s.title))
+        for (const s of junk) await invoke('delete_session', { id: s.id }).catch(() => {})
+        if (junk.length) pageLog(`selftest sweep (${where}): removed ${junk.length} row(s)`)
+        return junk.length
+      }
+
+      // Pin the settings the harness depends on, and put them back afterwards.
+      // Two problems this closes: a check that runs under the user's `ask` mode
+      // parks on an approval nobody answers (the model sometimes calls `exec` for
+      // "count from one to five", and that turned a passing gate into a 150s
+      // timeout), and the harness used to leave `mode` and `reasoning` changed
+      // after itself, quietly demoting whatever the user was running.
+      let mode0 = 'ask'
+      let reasoning0 = 'xhigh'
+      async function restoreSettings() {
+        await invoke('set_mode', { mode: mode0 }).catch(() => {})
+        await invoke('set_reasoning', { level: reasoning0 }).catch(() => {})
+        pageLog(`selftest restored mode=${mode0} reasoning=${reasoning0}`)
+      }
+
     try {
+      {
+        const st0 = await invoke<HostState>('session_state')
+        mode0 = st0.mode
+        reasoning0 = st0.reasoning
+        await invoke('set_mode', { mode: 'auto' })
+        pageLog(`selftest pinned mode=auto (was ${mode0}, reasoning ${reasoning0})`)
+      }
+      await sweepSelftest('start')
       const before = await invoke<Session[]>('list_sessions')
       await invoke('new_session', { title: 'selftest' })
       await new Promise((r) => setTimeout(r, 400))
@@ -1600,6 +1671,11 @@
         // has even started the turn.
         if (!(await waitTurnDone(approvalTurnsBefore))) fail('approval turn never ended')
       }
+      // That block needed `ask`; nothing after it does. Leaving the mode there
+      // means the next check that happens to make the model reach for `exec`
+      // parks on an approval nobody is listening for, and the check reads as a
+      // hung turn rather than a harness that changed the rules three steps back.
+      await invoke('set_mode', { mode: 'auto' })
 
       // Workspace switching. The engine is the authority on what a workspace may
       // be, so a bad path must be refused *and* the previous one kept.
@@ -1951,34 +2027,119 @@
       // that claim has to come from the same controller that owns the listener,
       // so the start / read / stop cycle is asserted here rather than eyeballed.
       if (transportKind === 'tauri') {
-        const g0 = await invoke<{ running: boolean; port: number }>('gateway_status')
-        if (typeof g0.running !== 'boolean') fail('gateway_status returned no running flag')
-        // A port of its own: the self-test must not disturb a gateway the user
-        // is already running.
-        const up = await invoke<{ running: boolean; port: number; lan: boolean }>(
-          'gateway_start',
-          { port: 8123, lan: false },
+        const g0 = await invoke<{ running: boolean; port: number; clients: number }>(
+          'gateway_status',
         )
-        if (!up.running) fail('gateway_start reported running=false')
-        if (up.port !== 8123) fail(`gateway started on ${up.port}, asked for 8123`)
-        if (up.lan) fail('gateway_start(lan:false) bound a non-loopback address')
-        const g1 = await invoke<{ running: boolean; clients: number }>('gateway_status')
-        if (!g1.running) fail('gateway_status disagrees with gateway_start')
-        if (g1.clients < 0) fail('negative client count')
-        const down = await invoke<{ running: boolean }>('gateway_stop')
-        if (down.running) fail('gateway_stop left running=true')
-        const g2 = await invoke<{ running: boolean }>('gateway_status')
-        if (g2.running) fail('gateway_status still says running after stop')
-        // Stopping twice must say so rather than pretend.
+        if (typeof g0.running !== 'boolean') fail('gateway_status returned no running flag')
+        if (!Number.isFinite(g0.clients) || g0.clients < 0 || g0.clients > 1000)
+          fail(`implausible device count before the cycle: ${g0.clients}`)
+        if (g0.running) {
+          // The pill is meant to be used, so a gateway is often already up when the
+          // self-test runs. Driving it down would fight the user's own listener -
+          // and cut a phone off mid-session - so with one already live only the
+          // read path is asserted here; the start/stop cycle runs when none is.
+          pageLog(
+            `gateway already on :${g0.port} with ${g0.clients} device(s); skipped the start/stop cycle`,
+          )
+        } else {
+          // A port of its own, so the cycle never touches a gateway the user is on.
+          const up = await invoke<{ running: boolean; port: number; lan: boolean }>(
+            'gateway_start',
+            { port: 8123, lan: false },
+          )
+          if (!up.running) fail('gateway_start reported running=false')
+          if (up.port !== 8123) fail(`gateway started on ${up.port}, asked for 8123`)
+          if (up.lan) fail('gateway_start(lan:false) bound a non-loopback address')
+          const g1 = await invoke<{ running: boolean; clients: number }>('gateway_status')
+          if (!g1.running) fail('gateway_status disagrees with gateway_start')
+          if (!Number.isFinite(g1.clients) || g1.clients > 1000)
+            fail(`implausible device count ${g1.clients}`)
+          const down = await invoke<{ running: boolean }>('gateway_stop')
+          if (down.running) fail('gateway_stop left running=true')
+          const g2 = await invoke<{ running: boolean }>('gateway_status')
+          if (g2.running) fail('gateway_status still says running after stop')
+          // Stopping twice must say so rather than pretend.
+          try {
+            await invoke('gateway_stop')
+            fail('second gateway_stop should have errored')
+          } catch {
+            /* expected */
+          }
+          pageLog(`gateway cycle ok: false -> on:8123 -> off, clients=${g1.clients}`)
+        }
+      }
+
+      // The question card: the turn stops while it is up, so the card has to
+      // carry the question, the choices, the recommendation and a typed answer -
+      // and must not fire twice.
+      {
+        // In an object, not a bare local: TypeScript narrows a closure-assigned
+        // local to never and the assertions stop type-checking.
+        const got: { v: { text: string; option: number | null } | null } = { v: null }
+        transcript?.showQuestion(
+          {
+            id: 900_001,
+            question: 'Which output should this produce?',
+            options: [
+              { label: 'Markdown', detail: 'editable' },
+              { label: 'PDF', detail: 'prints well' },
+            ],
+            recommended: 1,
+            allow_custom: true,
+          },
+          (r) => (got.v = r),
+        )
+        const card = document.querySelector('.blk-ask')
+        if (!card) fail('question card did not render')
+        else {
+          if (!card.textContent?.includes('Which output should this produce?'))
+            fail('question card is missing the question')
+          const opts = card.querySelectorAll('.ask-opt')
+          if (opts.length !== 2) fail(`question card shows ${opts.length} options, expected 2`)
+          const rec = card.querySelectorAll('.ask-opt.is-rec')
+          if (rec.length !== 1) fail('exactly one option must be badged as recommended')
+          if (!card.querySelector('.ask-input')) fail('no typed-answer affordance')
+          opts[1]?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+          if (!got.v || got.v.option !== 1 || got.v.text !== 'PDF')
+            fail(`option click produced ${JSON.stringify(got.v)}`)
+          // A second click must not send a second answer: the engine has already
+          // dropped the reply sender, and a second call is an error to the user.
+          opts[0]?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+          if (got.v?.option !== 1) fail('a second option overwrote the first answer')
+          card.remove()
+        }
+        // An answer for a question nobody asked is an error, not a shrug.
         try {
-          await invoke('gateway_stop')
-          fail('second gateway_stop should have errored')
+          await invoke('respond_question', { id: 900_999, text: 'x', option: null })
+          fail('respond_question accepted an id that was never asked')
         } catch {
           /* expected */
         }
-        pageLog(`gateway cycle ok: ${g0.running} -> on:8123 -> off, clients=${g1.clients}`)
+        pageLog('question card ok')
       }
 
+      // Tool headers carry the path/url/query a call is about; exec deliberately
+      // does not, because its argument is a whole command.
+      {
+        const cases: [string, unknown, string][] = [
+          ['write_file', { path: 'reports/q3.xlsx' }, 'reports/q3.xlsx'],
+          ['edit_file', '{"path":"notes.md","old_text":"a"', 'notes.md'],
+          ['read_file', '{"path":"deep/nested/file.py"}', 'deep/nested/file.py'],
+          ['web_search', { query: 'rust tokio' }, 'rust tokio'],
+          ['exec', { cmd: 'rm -rf /' }, ''],
+        ]
+        for (const [name, args, want] of cases) {
+          const got = subjectFor(name, args)
+          if (got !== want) fail(`subjectFor(${name}) = ${JSON.stringify(got)}, want ${JSON.stringify(want)}`)
+        }
+        // A half-streamed path must not paint a partial name and resize the row.
+        if (subjectFor('write_file', '{"path":"no') !== '')
+          fail('subjectFor matched an unterminated path')
+        pageLog('tool header subject ok')
+      }
+
+      await sweepSelftest('end')
+      await restoreSettings()
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +
@@ -1987,6 +2148,7 @@
     } catch (e) {
       fail(String(e))
       pageLog(`SELFTEST FAILED (${fails}): aborted before the summary`)
+      await restoreSettings()
     }
   }
 
@@ -2824,8 +2986,7 @@
             <div class="pop-item static">
               <span class="pop-lbl">Attached now</span>
               <span class="pop-sub mono">
-                {gw?.clients ?? 0} device{(gw?.clients ?? 0) === 1 ? '' : 's'} · token from
-                {gw?.token_source}
+                {attachedLine(gw)} · token from {gw?.token_source ?? 'none'}
               </span>
             </div>
             {#each gw?.urls ?? [] as u}

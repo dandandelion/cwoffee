@@ -8,6 +8,21 @@
 
 export type FinishReason = 'stop' | 'toolCalls' | 'length' | 'cancelled' | 'error' | 'other'
 export type ExecStream = 'stdout' | 'stderr'
+export type QuestionOption = {
+  label: string
+  detail?: string
+}
+
+/** The model asked the user to choose, and the turn is parked until someone
+   answers. `recommended` indexes into `options`; it is badged, not forced. */
+export type QuestionRequested = {
+  id: number
+  question: string
+  options: QuestionOption[]
+  recommended?: number
+  allow_custom: boolean
+}
+
 export type OutputFile = {
   path: string
   name: string
@@ -73,6 +88,8 @@ export type EngineEvent =
       kind: 'approvalRequested'
       d: { id: number; tool: string; risk: Risk; summary: string; args: unknown }
     }
+  | { kind: 'questionRequested'; d: QuestionRequested }
+  | { kind: 'questionAnswered'; d: { id: number } }
   | { kind: 'turnStats'; d: TurnStats }
   | { kind: 'usage'; d: TurnTelemetry }
   | { kind: 'turnEnd'; d: { turn_id: number; finish: FinishReason } }

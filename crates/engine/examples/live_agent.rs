@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gate = ApprovalGate::new(mode, areq);
 
     let workspace = std::env::current_dir()?;
-    let ctx = ToolCtx { workspace: workspace.clone(), max_output_bytes: 16 * 1024 };
+    let ctx = ToolCtx { workspace: workspace.clone(), max_output_bytes: 16 * 1024, ..Default::default() };
 
     let mut agent = Agent::new(
         std::sync::Arc::new(provider),
@@ -110,6 +110,12 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
             }
             // Live mid-turn estimates: the examples print the final telemetry line.
             EngineEvent::TurnStats(_) => {}
+            // The example has no UI to answer with, so the tool's own timeout
+            // is what ends the wait.
+            EngineEvent::QuestionRequested { question, .. } => {
+                println!("(the model asks: {question} - nobody here to answer)")
+            }
+            EngineEvent::QuestionAnswered { .. } => {}
             EngineEvent::TurnStart { turn_id, model } => {
                 println!("=== turn {turn_id} ({model}) ===");
             }

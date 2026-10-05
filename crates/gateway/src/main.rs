@@ -127,6 +127,10 @@ async fn main() -> anyhow::Result<()> {
     // Receivers can only be taken once and need &mut, so take them before the
     // host goes behind the Arc that the gateway shares.
     let receivers = host.take_receivers();
+    // Both receivers must be taken before the host becomes an Arc: they are
+    // `Option`s moved out of it, and a second consumer would silently split one
+    // event stream.
+    let questions = host.take_questions();
     let host = Arc::new(host);
     if configured_model.is_empty() {
         if let Some(m) = host.adopt_first_model().await {
@@ -139,12 +143,16 @@ async fn main() -> anyhow::Result<()> {
     let (ev_tx, _ev_rx_unused) = broadcast::channel::<cwoffee_engine::EngineEvent>(512);
     let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let pending_q: Arc<Mutex<HashMap<u64, oneshot::Sender<cwoffee_engine::tools::ask::Answer>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     if let Some((mut ev_rx, mut ap_rx)) = receivers {
         let tx = ev_tx.clone();
         let pending = Arc::clone(&pending);
+        let pending_q = Arc::clone(&pending_q);
+        let mut q_rx = questions.expect("question receiver");
         tokio::spawn(async move {
-            let (mut ev_open, mut ap_open) = (true, true);
+            let (mut ev_open, mut ap_open, mut q_open) = (true, true, true);
             loop {
                 tokio::select! {
                     ev = ev_rx.recv(), if ev_open => {
@@ -164,6 +172,16 @@ async fn main() -> anyhow::Result<()> {
                                 pending.lock().unwrap().insert(id, reply);
                             }
                             None => ap_open = false,
+                        }
+                    }
+                    q = q_rx.recv(), if q_open => {
+                        match q {
+                            Some((question, reply)) => {
+                                let id = question.id;
+                                let _ = tx.send(cwoffee_engine::host::question_event(&question));
+                                pending_q.lock().unwrap().insert(id, reply);
+                            }
+                            None => q_open = false,
                         }
                     }
                 }
@@ -187,7 +205,8 @@ async fn main() -> anyhow::Result<()> {
         store: Arc::clone(&store),
         events: ev_tx.clone(),
         pending,
-        clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pending_questions: Arc::clone(&pending_q),
+        clients: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
     });
 
     cwoffee_gateway::serve(gw, handle).await.map_err(|e| anyhow::anyhow!("{e}"))

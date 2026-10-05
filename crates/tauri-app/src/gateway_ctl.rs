@@ -17,7 +17,6 @@ use cwoffee_gateway::{EngineHandle, GatewayConfig};
 use serde::Serialize;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct GatewayCtl {
@@ -45,7 +44,11 @@ pub struct GatewayStatus {
     pub running: bool,
     pub host: String,
     pub port: u16,
+    /// Devices attached, not connections: two tabs on one phone is one device.
     pub clients: usize,
+    pub connections: usize,
+    /// Addresses behind that count, so the number can be checked by eye.
+    pub peers: Vec<String>,
     /// True when the bind is anything but loopback.
     pub lan: bool,
     pub has_token: bool,
@@ -72,10 +75,6 @@ impl GatewayCtl {
                 starting: false,
             }),
         }
-    }
-
-    pub fn clients(&self) -> usize {
-        self.handle.clients.load(Ordering::Relaxed)
     }
 
     /// Bind and serve. Returns an error naming the reason when the gateway
@@ -212,7 +211,9 @@ impl GatewayCtl {
             running,
             host: st.host.to_string(),
             port: st.port,
-            clients: self.clients(),
+            clients: self.handle.devices(),
+            connections: self.handle.connections(),
+            peers: self.handle.peers(),
             lan,
             has_token: st.drive.is_some(),
             watch_only: st.watch.as_ref().map(|_| st.drive.is_none()),
@@ -327,8 +328,10 @@ fn random_token() -> String {
 }
 
 /// Shared client gauge, so the ctl and the gateway task see one number.
-pub fn client_gauge() -> Arc<AtomicUsize> {
-    Arc::new(AtomicUsize::new(0))
+/// The shared "who is attached" table. The gateway task fills it in as
+/// connections authenticate and leave; the desktop reads it for the panel.
+pub fn client_gauge() -> Arc<Mutex<std::collections::BTreeMap<String, usize>>> {
+    Arc::new(Mutex::new(std::collections::BTreeMap::new()))
 }
 
 #[cfg(test)]

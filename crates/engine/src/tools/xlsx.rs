@@ -233,6 +233,7 @@ mod tests {
             ToolCtx {
                 workspace: ws.clone(),
                 max_output_bytes: 4096,
+                ..Default::default()
             },
             ws,
         )

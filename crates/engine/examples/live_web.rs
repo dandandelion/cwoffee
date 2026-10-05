@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let ctx = ToolCtx { workspace: ".".into(), max_output_bytes: 1200 };
+    let ctx = ToolCtx { workspace: ".".into(), max_output_bytes: 1200, ..Default::default() };
 
     let fetch = WebFetchTool::default();
     let search = WebSearchTool::default();

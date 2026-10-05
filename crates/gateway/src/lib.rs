@@ -35,10 +35,9 @@
 //! loopback plus a tunnel (Tailscale, SSH -L) rather than exposing this port.
 //! That is a real limitation, stated rather than papered over.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -59,19 +58,66 @@ pub struct EngineHandle {
     /// The same pending map the desktop's `respond_approval` uses, so an
     /// approval answered from either side resolves the one the engine awaits.
     pub pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>>,
-    /// Authenticated connections right now. The desktop app shows this so the
-    /// user can see that the phone is actually attached rather than guessing
-    /// from "it started without an error".
-    pub clients: Arc<AtomicUsize>,
+    /// ask_user round trips, shared with the desktop the same way approvals are:
+    /// whichever client answers first resolves the one the engine awaits.
+    pub pending_questions:
+        Arc<Mutex<HashMap<u64, oneshot::Sender<cwoffee_engine::tools::ask::Answer>>>>,
+    /// Who is attached right now: peer address -> live connections from it.
+    ///
+    /// The desktop panel shows this so the user can confirm the phone is really
+    /// on it rather than guessing from "it started without an error". Keyed by
+    /// address because the question the panel answers is "how many *devices*",
+    /// and two tabs on one phone is one device.
+    pub clients: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
-/// Decrements the client gauge when a connection task ends, including on panic
-/// during unwind in the connection handler.
-struct ClientGuard(Arc<AtomicUsize>);
+impl EngineHandle {
+    pub fn devices(&self) -> usize {
+        self.clients.lock().unwrap().len()
+    }
+
+    pub fn connections(&self) -> usize {
+        self.clients.lock().unwrap().values().sum()
+    }
+
+    pub fn peers(&self) -> Vec<String> {
+        self.clients.lock().unwrap().keys().cloned().collect()
+    }
+}
+
+/// One authenticated connection.
+///
+/// This gauge used to be an `AtomicUsize` with a `fetch_sub` in `Drop` and no
+/// matching increment anywhere, so each connection that closed pushed the count
+/// below zero and the panel printed 18446744073709552000 devices - usize::MAX,
+/// formatted as fact. A guard whose constructor takes the ticket is the fix:
+/// holding one without having been counted is not expressible.
+struct ClientGuard {
+    table: Arc<Mutex<BTreeMap<String, usize>>>,
+    peer: String,
+}
+
+impl ClientGuard {
+    fn attach(table: &Arc<Mutex<BTreeMap<String, usize>>>, peer: &str) -> ClientGuard {
+        {
+            let mut t = table.lock().unwrap();
+            *t.entry(peer.to_string()).or_insert(0) += 1;
+        }
+        ClientGuard { table: table.clone(), peer: peer.to_string() }
+    }
+}
 
 impl Drop for ClientGuard {
+    /// Also runs on panic unwind, so a tool that takes the connection task down
+    /// cannot leave a ghost device on the panel.
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        let mut t = self.table.lock().unwrap();
+        if let Some(n) = t.get_mut(&self.peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                t.remove(&self.peer);
+            }
+        }
     }
 }
 
@@ -333,7 +379,9 @@ async fn connection(
             }
         };
         eprintln!("[cwoffee/gateway] {peer} websocket handshake complete");
-        return websocket(ws, cfg, handle, peer.to_string()).await;
+        // The address rather than addr:port: the panel counts devices, and a
+        // device that reconnects gets a new ephemeral port every time.
+        return websocket(ws, cfg, handle, peer.to_string(), peer.ip().to_string()).await;
     }
 
     // Plain HTTP: now actually consume the request head.
@@ -556,6 +604,7 @@ async fn websocket(
     cfg: Arc<GatewayConfig>,
     handle: Arc<EngineHandle>,
     peer: String,
+    addr: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut sink, mut stream) = ws.split();
 
@@ -567,7 +616,7 @@ async fn websocket(
 
     // Count from here, not from the TCP accept: scanners and probes hit this
     // port constantly, and a gauge that counts them is a gauge nobody trusts.
-    let _clients = ClientGuard(handle.clients.clone());
+    let _clients = ClientGuard::attach(&handle.clients, &addr);
 
     let mut rx = handle.events.subscribe();
     // Replay nothing: a late joiner gets the live tail and then loads stored
@@ -884,6 +933,25 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 None => Err(format!("no pending approval with id {id}")),
             }
         }
+        "respond_question" => {
+            need_drive(role)?;
+            use cwoffee_engine::tools::ask::Answer;
+            let id = arg_i64(&args, "id")? as u64;
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let option = args.get("option").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let tx = h.pending_questions.lock().unwrap().remove(&id);
+            match tx {
+                Some(tx) => tx
+                    .send(Answer { text, option })
+                    .map(|_| json!(true))
+                    .map_err(|_| "the engine no longer wants this answer".to_string()),
+                None => Err(format!("no pending question with id {id}")),
+            }
+        }
         "new_session" => {
             need_drive(role)?;
             let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -1081,7 +1149,8 @@ mod tests {
             store: Arc::new(Store::in_memory().unwrap()),
             events: broadcast::channel(8).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
-        clients: Arc::new(AtomicUsize::new(0)),
+            pending_questions: Arc::new(Mutex::new(HashMap::new())),
+        clients: Arc::new(Mutex::new(BTreeMap::new())),
         });
         let err = serve(cfg, handle).await.unwrap_err();
         assert!(matches!(err, GatewayError::Refused(_)), "got {err:?}");
@@ -1334,6 +1403,149 @@ mod tests {
         assert!(err.contains("refused"), "unhelpful error: {err}");
     }
 
+    /// The gauge is a claim about the world, printed as fact in the footer, so
+    /// it is tested against real connections rather than against the type.
+    /// It used to print 18446744073709552000 devices: the guard decremented an
+    /// `AtomicUsize` that nothing had ever incremented.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_attached_gauge_counts_devices_and_returns_to_zero() {
+        let h = test_handle();
+        let (port, _srv) = serve_on_free_port(&h).await;
+        let url = format!("ws://127.0.0.1:{port}/ws");
+
+        let a = attach(&url).await;
+        // Poll rather than sleep-and-hope: the guard is taken inside the
+        // connection task, which is scheduled on the other worker.
+        wait_for(|| h.connections() == 1).await;
+        assert_eq!(h.devices(), 1, "one connection should be one device");
+
+        let b = attach(&url).await;
+        wait_for(|| h.connections() == 2).await;
+        assert_eq!(h.devices(), 1, "two connections from one address is one device");
+        assert_eq!(h.peers(), vec!["127.0.0.1".to_string()]);
+
+        drop(a);
+        wait_for(|| h.connections() == 1).await;
+        assert_eq!(h.devices(), 1, "the other tab is still attached");
+
+        drop(b);
+        wait_for(|| h.connections() == 0).await;
+        assert_eq!(h.devices(), 0, "nobody is attached");
+        assert_eq!(h.connections(), 0, "the gauge must not go negative");
+    }
+
+    /// Scanners and probes hit this port constantly. They are not devices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_socket_that_never_authenticates_is_not_a_device() {
+        let h = test_handle();
+        let (port, _srv) = serve_on_free_port(&h).await;
+        let raw = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(h.devices(), 0, "an unauthenticated socket was counted");
+        assert_eq!(h.connections(), 0);
+        drop(raw);
+    }
+
+    /// Open a websocket, do the auth handshake, and return the handle so the
+    /// test controls when the connection ends.
+    async fn attach(url: &str) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>> {
+        use futures_util::StreamExt;
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        // "hello" first, then our auth frame, then auth_ok + ready.
+        let _ = ws.next().await.unwrap().unwrap();
+        ws.send(txt(serde_json::json!({ "type": "auth", "token": "tok" }).to_string()))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            let frame = ws.next().await.unwrap().unwrap();
+            if frame.to_string().contains("\"ready\"") {
+                return ws;
+            }
+        }
+        panic!("auth never completed");
+    }
+
+    async fn wait_for(f: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Bind a probe port, release it, then serve on it, retrying while the port
+    /// is taken. Each call gets its own hundred-port block: two tests that
+    /// both reached for 21000 ended up talking to each other's server, and one
+    /// reported "an unauthenticated socket was counted" when the count was
+    /// actually a genuine attach from the *other* test.
+    async fn serve_on_free_port(
+        handle: &Arc<EngineHandle>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static NEXT_BLOCK: AtomicU16 = AtomicU16::new(21_000);
+        let base = NEXT_BLOCK.fetch_add(100, Ordering::Relaxed);
+        for port in base..base + 100 {
+            if TcpListener::bind(("127.0.0.1", port)).await.is_err() {
+                continue;
+            }
+            let cfg = GatewayConfig {
+                host: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+                dist: std::env::temp_dir(),
+                drive_token: Some("tok".into()),
+                watch_token: None,
+            };
+            let h = handle.clone();
+            let task = tokio::spawn(async move {
+                let _ = serve(cfg, h).await;
+            });
+            for _ in 0..50 {
+                if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    return (port, task);
+                }
+                if task.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        panic!("could not bind a test port");
+    }
+
+    /// A question is the model asking the *user*. A watch token can see it, but
+    /// only a drive token may answer on the user's behalf.
+    #[tokio::test]
+    async fn a_watch_token_cannot_answer_a_question() {
+        let h = test_handle();
+        let err = run_cmd(
+            "respond_question",
+            serde_json::json!({ "id": 1, "text": "yes", "option": 0 }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watch token must not answer for the user");
+        assert!(!err.is_empty());
+    }
+
+    /// An unknown id is an error, not a silent success: a UI that thinks it
+    /// answered while the engine is still parked will otherwise wait out the
+    /// timeout with no clue why.
+    #[tokio::test]
+    async fn answering_a_question_nobody_asked_says_so() {
+        let h = test_handle();
+        let err = run_cmd(
+            "respond_question",
+            serde_json::json!({ "id": 999, "text": "yes" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("id 999 was never asked");
+        assert!(err.contains("999"), "unhelpful: {err}");
+    }
+
     fn test_handle() -> Arc<EngineHandle> {
         let p: Arc<dyn cwoffee_engine::provider::Provider> = Arc::new(FakeProvider);
         Arc::new(EngineHandle {
@@ -1346,7 +1558,8 @@ mod tests {
             store: Arc::new(Store::in_memory().unwrap()),
             events: broadcast::channel(8).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
-        clients: Arc::new(AtomicUsize::new(0)),
+            pending_questions: Arc::new(Mutex::new(HashMap::new())),
+        clients: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 

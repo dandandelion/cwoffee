@@ -465,3 +465,68 @@ fence, table, heading or raw HTML paints whole, because chunk-level inline
 rendering cannot reproduce a `<li>` and a wrong structure is worse than no
 effect. `paraOnly()` is the gate and has its own tests, so the structure tests
 cannot pass by accident.
+
+## Trap 26: an `Arc<AtomicUsize>` counter that is only ever decremented
+
+The gateway pill displayed `18446744073709552000 devices`. That is
+`usize::MAX`: `ClientGuard`'s `Drop` did `fetch_sub(1)` and nothing ever did
+`fetch_add`. The count went negative on the first disconnect and wrapped.
+
+Two fixes, both structural rather than a clamp:
+
+- the increment moved into `ClientGuard::attach`, so holding a guard *is* being
+  counted and there is no way to construct the uncounted case;
+- the counter became a table keyed by peer address, so the pill can name the
+  devices it claims. It now reads "2 devices: 100.86.160.103, 172.20.10.2
+  (3 connections)" - a number a person can check by looking at the list.
+
+The self-test asserts the count is finite and plausible. The engine tests cover
+both directions (attach to a named peer, release back to zero) and the case that
+mattered for privacy: **a socket that never authenticated is not a device.**
+
+## Trap 27: adding a tool invalidates every prefix cache behind it
+
+`ToolRegistry::names()` is asserted in `prompt.rs` on purpose. Inserting a tool
+in the middle of `register_builtins()` reorders every later tool definition,
+which changes the prompt bytes and throws away the llama.cpp prefix cache for
+every existing session. `edit_file` and `ask_user` were therefore **appended**,
+and the expected order updated. When that test fails it is the cost of the
+change being surfaced, not a bug in the test.
+
+## Trap 28: `ask_user` renders as a question card, not a tool card
+
+`ask_user` is an ordinary tool call, so it arrives through the same tool stream
+as `exec` - and the engine also emits `questionRequested`. Without a special
+case the user sees a collapsed `ask_user` card *and* the question card.
+`openTool()` returns null for `ask_user`.
+
+The reply sender is parked in each shell keyed by the call id, which is the same
+id the card is drawn with, so `respond_question(id)` addresses exactly what is on
+screen. Cancellation drops the parked senders: the tool wakes immediately with a
+"cancelled" tool_result instead of holding one of the four tool workers until the
+question timeout expires.
+
+## Trap 29: the reveal flashed because settled text was rewritten every paint
+
+Trap 25 made the animation long enough to see and introduced a new artefact: the
+newest words blinked once more ~520ms after arriving, just as the turn ended.
+
+Two things happened on *every* paint (~125ms), not just at fold time:
+
+- `els.head.innerHTML = r.head` re-parsed and re-rastered the entire settled
+  paragraph, every frame, to add a few words at its end;
+- a chunk finishing its animation left the compositing layer that the `filter`
+  had put it in, and text rasterises differently inside a layer than outside it.
+
+Fix: **fold, don't rewrite.** Moving the finished span's child nodes into the
+settled run touches only those nodes. The head rewrite stays, but now fires only
+when the accumulated markup genuinely disagrees with a single pass over the text
+- which happens when inline markdown straddles a chunk boundary, not on every
+  frame. `.tin-para` gets `transform: translateZ(0)` so the whole streaming
+  paragraph is one layer and text never changes rasterisation mode.
+
+Measured, in the running app over a whole turn: **0** text nodes removed from the
+settled run (previously one full rewrite per paint), and the first settled line
+was **pixel-identical across 14 frames** sampled during streaming - while 17
+chunks still animated from opacity 0 / blur 3px upward and `**bold**`/`` `code` ``
+still rendered correctly.

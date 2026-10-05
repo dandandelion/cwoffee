@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cwoffee_engine::approval::ApprovalAnswer;
-use cwoffee_engine::host::{approval_event, HostConfig, SessionHost};
+use cwoffee_engine::host::{approval_event, question_event, HostConfig, SessionHost};
 use cwoffee_engine::provider::Provider;
 use cwoffee_engine::store::Store;
 use cwoffee_engine::tools::Registry;
@@ -195,6 +195,7 @@ fn main() {
     // Receivers can only be taken once and need &mut, so take them before the
     // host goes behind the Arc that the gateway shares.
     let receivers = host.take_receivers();
+    let questions = host.take_questions();
     let host = std::sync::Arc::new(host);
     // Read the adopted id from the return value, not host.state(): SetModel is
     // applied by the host task, so state() can still show the old value here.
@@ -232,15 +233,22 @@ fn main() {
     // command always looked up an empty one.
     let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_pump = Arc::clone(&pending);
+    // ask_user works the same way: the pump parks the reply sender, and
+    // respond_question (from the webview or the gateway) resolves it.
+    let pending_q: Arc<Mutex<HashMap<u64, oneshot::Sender<cwoffee_engine::tools::ask::Answer>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pending_q_pump = Arc::clone(&pending_q);
 
     // The pump starts at boot, not when the webview attaches: nothing is lost
     // during startup, and if the webview goes away the gate's timeout is what
     // stops the agent — not the absence of a forwarder.
+    let mut question_rx = questions.expect("question receiver");
     if let Some((mut ev_rx, mut ap_rx)) = receivers {
         let qtx = queue_tx.clone();
         let btx = bcast_tx.clone();
+        let pending_q_pump = Arc::clone(&pending_q_pump);
         tauri::async_runtime::spawn(async move {
-            let (mut ev_open, mut ap_open) = (true, true);
+            let (mut ev_open, mut ap_open, mut q_open) = (true, true, true);
             loop {
                 tokio::select! {
                     ev = ev_rx.recv(), if ev_open => {
@@ -272,9 +280,25 @@ fn main() {
                             None => ap_open = false,
                         }
                     }
+                    qu = question_rx.recv(), if q_open => {
+                        match qu {
+                            Some((question, reply)) => {
+                                let id = question.id;
+                                let _ = btx.send(question_event(&question));
+                                if qtx.send(question_event(&question)).is_err() {
+                                    // Nobody to ask: tell the model that rather
+                                    // than parking the turn until the timeout.
+                                    drop(reply);
+                                    continue;
+                                }
+                                pending_q_pump.lock().unwrap().insert(id, reply);
+                            }
+                            None => q_open = false,
+                        }
+                    }
                     else => break,
                 }
-                if !ev_open && !ap_open {
+                if !ev_open && !ap_open && !q_open {
                     break;
                 }
             }
@@ -291,6 +315,7 @@ fn main() {
         store: Arc::clone(&store),
         events: bcast_tx.clone(),
         pending: Arc::clone(&pending),
+        pending_questions: Arc::clone(&pending_q),
         clients: gateway_ctl::client_gauge(),
     });
     let gateway = Arc::new(gateway_ctl::GatewayCtl::new(gw_handle));
@@ -300,6 +325,7 @@ fn main() {
         store,
         queue_rx: Mutex::new(Some(queue_rx)),
         pending_approvals: Arc::clone(&pending),
+        pending_questions: Arc::clone(&pending_q),
         rendered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         migration_notes,
         gateway: Arc::clone(&gateway),
@@ -381,6 +407,7 @@ fn main() {
             commands::set_workspace,
             commands::cancel_turn,
             commands::respond_approval,
+            commands::respond_question,
             commands::set_mode,
             commands::set_reasoning,
             commands::list_models,

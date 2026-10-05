@@ -122,6 +122,7 @@ pub struct SessionHost {
     /// `take_receivers` once and owns them; the TUI does the same.
     events: Option<mpsc::UnboundedReceiver<EngineEvent>>,
     approvals: Option<mpsc::UnboundedReceiver<ApprovalRx>>,
+    questions: Option<mpsc::UnboundedReceiver<crate::tools::ask::QuestionRx>>,
     state: Arc<Mutex<HostState>>,
     cancel: Arc<AtomicBool>,
     /// The host keeps a handle so the shell can ask the endpoint questions that
@@ -144,6 +145,11 @@ impl SessionHost {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
         let (ap_tx, ap_rx) =
             mpsc::unbounded_channel::<(ApprovalRequest, oneshot::Sender<ApprovalAnswer>)>();
+        // ask_user's round trip. Deliberately a separate channel from
+        // approvals: an approval is the gate permitting an action, a question is
+        // the model asking for input, and conflating them means a "yes" answers
+        // both.
+        let (ask_tx, ask_rx) = mpsc::unbounded_channel::<crate::tools::ask::QuestionRx>();
         let state = Arc::new(Mutex::new(HostState {
             session_id: 0,
             workspace: cfg.workspace.display().to_string(),
@@ -176,6 +182,7 @@ impl SessionHost {
         let ctx = ToolCtx {
             workspace: cfg.workspace.clone(),
             max_output_bytes: 24 * 1024,
+            ask: Some(ask_tx),
         };
         let mut agent = Agent::new(
             provider,
@@ -471,6 +478,7 @@ impl SessionHost {
             cmd: cmd_tx,
             events: Some(ev_rx),
             approvals: Some(ap_rx),
+            questions: Some(ask_rx),
             state,
             cancel,
             provider: host_provider,
@@ -503,6 +511,15 @@ impl SessionHost {
         let ev = self.events.take()?;
         let ap = self.approvals.take()?;
         Some((ev, ap))
+    }
+
+    /// Move the question receiver out, once. The shell that owns it turns each
+    /// question into a `QuestionRequested` event and parks the reply sender
+    /// until a client answers.
+    pub fn take_questions(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<crate::tools::ask::QuestionRx>> {
+        self.questions.take()
     }
 
     pub fn send(&self, cmd: HostCmd) {
@@ -582,6 +599,20 @@ pub fn approval_event(req: &ApprovalRequest) -> EngineEvent {
         risk: req.risk,
         summary: req.summary.clone(),
         args: req.args.clone(),
+    }
+}
+
+/// Convert a pending question into the wire event every front end renders.
+///
+/// Like `approval_event`, shared so the desktop, the gateway and the TUI cannot
+/// drift into asking the same question in three different shapes.
+pub fn question_event(q: &crate::tools::ask::Question) -> EngineEvent {
+    EngineEvent::QuestionRequested {
+        id: q.id,
+        question: q.question.clone(),
+        options: q.options.clone(),
+        recommended: q.recommended,
+        allow_custom: q.allow_custom,
     }
 }
 

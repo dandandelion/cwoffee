@@ -132,6 +132,28 @@ pub enum EngineEvent {
         args: serde_json::Value,
     },
 
+    /// The model asked the user to choose something, and the turn is parked
+    /// until someone answers.
+    ///
+    /// CONTRACT: the front end answers with `respond_question(id, text, option)`.
+    /// Not answering is allowed - the tool times out and tells the model to
+    /// decide for itself and say so - but a front end that *can* answer should,
+    /// because the turn is doing nothing until it does.
+    QuestionRequested {
+        id: u64,
+        question: String,
+        options: Vec<crate::tools::ask::QuestionOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recommended: Option<usize>,
+        allow_custom: bool,
+    },
+
+    /// A question was answered or cleared, from any client. Every view gets
+    /// this so a card cannot sit there offering a choice that is already made.
+    QuestionAnswered {
+        id: u64,
+    },
+
     /// Live progress, emitted a few times a second while a turn streams.
     ///
     /// These are estimates: the server reports token counts only at the end of

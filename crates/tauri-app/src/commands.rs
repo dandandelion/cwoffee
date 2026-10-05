@@ -37,6 +37,11 @@ pub struct AppState {
     /// so every answer looked up an empty map and every gated tool call failed
     /// closed - approvals had never worked in the desktop app.
     pub pending_approvals: Arc<Mutex<HashMap<u64, oneshot::Sender<ApprovalAnswer>>>>,
+    /// ask_user round trips. Shared with the gateway handle, so a question asked
+    /// while the phone is open can be answered from either side - first answer
+    /// wins, and the other view closes its card on the QuestionAnswered event.
+    pub pending_questions:
+        Arc<Mutex<HashMap<u64, oneshot::Sender<cwoffee_engine::tools::ask::Answer>>>>,
     /// Set the first time the page reports its own DOM state. A webview that
     /// never paints is otherwise indistinguishable from one that is fine.
     pub rendered: Arc<std::sync::atomic::AtomicBool>,
@@ -214,7 +219,57 @@ pub async fn set_workspace(
 
 #[tauri::command]
 pub fn cancel_turn(state: tauri::State<'_, AppState>) {
+    // Drop the parked question senders first. The tool holding the turn wakes on
+    // the channel closing and tells the model the question was cancelled; if we
+    // only cancelled the turn, the tool would sit until its timeout holding a
+    // turn the user already stopped.
+    let queued: Vec<u64> = state
+        .pending_questions
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    if !queued.is_empty() {
+        let mut map = state.pending_questions.lock().unwrap();
+        for id in &queued {
+            map.remove(id);
+        }
+        eprintln!("[cwoffee] cancelled with {} question(s) pending", queued.len());
+    }
     state.host.cancel();
+}
+
+/// Answer a question the model asked.
+///
+/// `option` is the index of the choice clicked, or None for a typed answer; the
+/// distinction is reported to the model so it knows whether it got a choice from
+/// its own list or something the user wrote.
+#[tauri::command]
+pub fn respond_question(
+    state: tauri::State<'_, AppState>,
+    id: u64,
+    text: String,
+    option: Option<usize>,
+) -> Result<(), String> {
+    use cwoffee_engine::tools::ask::Answer;
+    let reply = state.pending_questions.lock().unwrap().remove(&id);
+    match reply {
+        Some(r) => {
+            eprintln!(
+                "[cwoffee] question {id} answered by {}",
+                option.map(|i| format!("option {}", i + 1)).unwrap_or_else(|| "free text".into())
+            );
+            r.send(Answer { text, option })
+                .map_err(|_| "turn already ended".to_string())
+        }
+        None => {
+            eprintln!(
+                "[cwoffee] question {id} answer dropped: no pending question with that id (already answered, timed out, or the turn ended)"
+            );
+            Err(format!("no pending question with id {id}"))
+        }
+    }
 }
 
 /// Answer an approval prompt.
@@ -238,7 +293,7 @@ pub fn respond_approval(
         // timeout - which reads to the user as "I allowed it and it ran anyway".
         None => {
             eprintln!(
-                "[cwoffee] approval {id} answer dropped: no pending request with that id                  (already answered, timed out, or the turn ended)"
+                "[cwoffee] approval {id} answer dropped: no pending request with that id (already answered, timed out, or the turn ended)"
             );
             Err(format!("no pending approval with id {id}"))
         }

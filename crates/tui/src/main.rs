@@ -22,6 +22,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use cwoffee_engine::approval::{ApprovalAnswer, ApprovalMode, ApprovalRequest};
+use cwoffee_engine::tools::ask::{Answer, Question};
 use cwoffee_engine::event::{EngineEvent, ExecStream, FinishReason};
 use cwoffee_engine::host::{default_env_block, HostCmd, HostConfig, SessionHost};
 use cwoffee_engine::provider::Reasoning;
@@ -70,6 +71,9 @@ struct App {
     busy: bool,
     session_id: i64,
     pending: Option<(ApprovalRequest, oneshot::Sender<ApprovalAnswer>)>,
+    /// A question from `ask_user`. It owns the keyboard the same way an
+    /// approval does: the turn is parked until someone answers.
+    pending_q: Option<(Question, oneshot::Sender<Answer>)>,
     quit: bool,
     model: String,
 }
@@ -89,6 +93,7 @@ impl App {
             busy: false,
             session_id: 0,
             pending: None,
+            pending_q: None,
             quit: false,
             model,
         }
@@ -181,6 +186,9 @@ impl App {
             // The TUI answers approvals from `ap_rx` directly; this variant
             // exists for front ends that consume a single merged stream.
             EngineEvent::ApprovalRequested { .. } => {}
+            // Same for questions: they arrive on their own channel, where the
+            // reply sender is attached. The event copy carries no way to answer.
+            EngineEvent::QuestionRequested { .. } | EngineEvent::QuestionAnswered { .. } => {}
             EngineEvent::Usage(u) => {
                 self.avg.push(u.clone());
                 self.tel = u;
@@ -399,6 +407,7 @@ async fn run(
     // The receivers move out of the host once: recv() needs &mut, and two
     // consumers would silently split one event stream.
     let (mut ev_rx, mut ap_rx) = host.take_receivers().expect("event receivers");
+    let mut q_rx = host.take_questions().expect("question receiver");
 
     // Keyboard on a blocking thread: crossterm's read() is blocking, and running
     // it on the async runtime would stall the stream.
@@ -428,6 +437,10 @@ async fn run(
                 app.pending = Some((req, reply));
                 app.busy = true;
             }
+            Some((q, reply)) = q_rx.recv() => {
+                app.pending_q = Some((q, reply));
+                app.busy = true;
+            }
             else => break,
         }
 
@@ -447,6 +460,33 @@ async fn run(
 // ---------------------------------------------------------------------------
 
 fn handle_key(k: KeyEvent, app: &mut App, host: &SessionHost) {
+    // A question owns the keyboard while it is up: 1-9 pick an option, Enter
+    // takes the recommended one, Esc declines. Declining sends an empty answer,
+    // which the tool reports to the model as "dismissed without answering"
+    // rather than as a choice it can invent.
+    if app.pending_q.is_some() {
+        let recommended = app.pending_q.as_ref().and_then(|(q, _)| q.recommended);
+        let pick: Option<usize> = match k.code {
+            KeyCode::Char(c @ '1'..='9') => c.to_digit(10).map(|d| d as usize - 1),
+            KeyCode::Enter => recommended,
+            KeyCode::Esc | KeyCode::Char('c') => Some(usize::MAX),
+            _ => None,
+        };
+        if let Some(p) = pick {
+            let (q, reply) = app.pending_q.take().expect("checked above");
+            let answer = if p == usize::MAX {
+                Answer { text: String::new(), option: None }
+            } else if p < q.options.len() {
+                Answer { text: q.options[p].label.clone(), option: Some(p) }
+            } else {
+                return; // a digit past the last option does nothing
+            };
+            let _ = reply.send(answer);
+            return;
+        }
+        return;
+    }
+
     // An approval prompt owns the keyboard while it is up.
     if app.pending.is_some() {
         let answer = match k.code {
@@ -567,11 +607,18 @@ fn dbg_tick(app: &App, terminal: &DefaultTerminal) {
 
 fn render(f: &mut Frame, app: &App) {
     let has_approval = app.pending.is_some();
+    let has_question = app.pending_q.is_some();
+    let question_height = app
+        .pending_q
+        .as_ref()
+        .map(|(q, _)| (q.options.len() + 4).min(14) as u16)
+        .unwrap_or(0);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),             // header
             Constraint::Min(1),                // transcript
+            Constraint::Length(if has_question { question_height } else { 0 }),
             Constraint::Length(if has_approval { 5 } else { 0 }),
             Constraint::Length(3),             // input
             Constraint::Length(1),             // telemetry
@@ -580,11 +627,72 @@ fn render(f: &mut Frame, app: &App) {
 
     draw_header(f, app, chunks[0]);
     draw_transcript(f, app, chunks[1]);
-    if has_approval {
-        draw_approval(f, app, chunks[2]);
+    if has_question {
+        draw_question(f, app, chunks[2]);
     }
-    draw_input(f, app, chunks[3]);
-    draw_telemetry(f, app, chunks[4]);
+    if has_approval {
+        draw_approval(f, app, chunks[3]);
+    }
+    draw_input(f, app, chunks[4]);
+    draw_telemetry(f, app, chunks[5]);
+}
+
+/// The `ask_user` prompt. Options are numbered so the choice is one keystroke,
+/// and the recommended one is marked - the model's opinion is shown, not
+/// imposed, and Enter takes it.
+fn draw_question(f: &mut Frame, app: &App, area: Rect) {
+    let Some((q, _)) = &app.pending_q else { return };
+    let mut lines = vec![Line::from(Span::styled(
+        format!(" {} ", q.question),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    for (i, o) in q.options.iter().enumerate() {
+        let star = q.recommended == Some(i);
+        let mut spans = vec![
+            Span::styled(
+                format!("   {}). ", i + 1),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                o.label.clone(),
+                if star {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC)
+                } else {
+                    Style::default()
+                },
+            ),
+        ];
+        if star {
+            spans.push(Span::styled(
+                "  <- recommended",
+                Style::default().fg(Color::Green),
+            ));
+        }
+        lines.push(Line::from(spans));
+        if let Some(d) = &o.detail {
+            lines.push(Line::from(Span::styled(
+                format!("       {d}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    let mut keys = "1-9 choose".to_string();
+    if q.recommended.is_some() {
+        keys.push_str(" · Enter takes the recommendation");
+    }
+    if q.allow_custom {
+        keys.push_str(" · type instead");
+    }
+    keys.push_str(" · Esc decline");
+    lines.push(Line::from(Span::styled(
+        format!("   {keys}"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title(" the model is asking ")),
+        area,
+    );
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
