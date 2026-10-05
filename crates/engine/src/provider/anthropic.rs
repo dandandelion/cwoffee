@@ -517,6 +517,7 @@ pub fn assistant_message(
         reasoning_ms: None,
         tool_calls,
         tool_call_id: None,
+        changes: Vec::new(),
     }
 }
 

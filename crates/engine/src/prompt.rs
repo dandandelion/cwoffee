@@ -218,10 +218,22 @@ impl PromptBuilder {
     }
 
     pub fn push_tool_result(&mut self, call_id: &str, output: impl Into<String>) {
+        self.push_tool_result_with(call_id, output, Vec::new())
+    }
+
+    /// `changes` is UI-only (see `Message::changes`): it rides along to the store
+    /// and never enters the bytes sent to the model.
+    pub fn push_tool_result_with(
+        &mut self,
+        call_id: &str,
+        output: impl Into<String>,
+        changes: Vec<crate::tools::changes::FileChange>,
+    ) {
         self.history.push(Message {
             role: Role::Tool,
             content: output.into(),
             tool_call_id: Some(call_id.to_string()),
+            changes,
             ..Default::default()
         });
     }

@@ -165,14 +165,79 @@ go through `edit_file`, which changes a few lines instead of re-emitting the who
 document and rewriting your whole chat window for it.
 
 **`ask_user` stops the agent guessing.** One question, one to six options, one
-marked recommended, and a typed answer always available. In the TUI you answer
-with number keys. The turn parks while it waits; cancel does not make the question
+marked recommended, and a typed answer always available. The TUI answers with
+number keys. The turn parks while it waits; cancel does not make the question
 disappear but releases the parked tool with a "cancelled" result the model can act
 on. Over the gateway, a watch-only client sees the question and cannot answer it.
+
+Three rules the question card follows, because a card that answers on contact is a
+card that answers by accident:
+
+- **Clicking an option selects it; Send answer sends it.** A misclick on a question
+  about deleting something has a real cost, so the click is provisional and the
+  submit is explicit.
+- **The model decides whether several answers are allowed** (`multi`). When it does,
+  the rows become checkboxes, second clicks untick, and the button counts what is
+  going: "Send 3 answers".
+- **The answer restates the question.** A quantized local model two tool calls
+  later has no idea that "PDF" was an answer to anything, so the tool result carries
+  the question and the options it offered alongside what you chose or typed.
+
+A question that closes with no answer - the timeout expired, or you cancelled the
+turn while it was parked - closes in every window as "no answer in time". Left
+alone it would sit there offering Send, and the answer would aim at a tool call that
+has already returned.
+
+## What an approval actually gates
+
+Every tool call is classified per call, not per tool, because the same tool is not
+equally dangerous twice:
+
+| class | example | `ask` mode |
+|---|---|---|
+| `harmless` | reading a file inside the workspace, a new file, a web search, asking you a question | runs |
+| `workspace` | overwriting an existing file, editing a file in place | asks |
+| `sensitive` | `exec`, any path that leaves the workspace | asks |
+
+The interesting column is the one that says *where*. A call that reaches outside the
+workspace is reported with the resolved absolute path - "allow reading
+/home/you/.ssh/id_ed25519?" - and the permission you grant covers **that call**, not
+the rest of the session. "Allow for session" grants a tool; it has never granted an
+escape, and that is deliberate: one yes to `read_file` should not be open access to
+your home directory.
+
+Approval prompts name the file rather than dumping the call: `edit in place:
+notes.md (find and replace inside the file)`. The raw argument blob is the one thing
+you cannot weigh a decision on.
+
+## Workspaces
+
+The sidebar groups sessions by the folder they live in, and the folder the tools
+write into follows the session you open. That is not decoration: without it
+`write_file` lands wherever the *last* session pointed, and a session that says it
+lives in `~/Projects` quietly writes into `~/cwoffee-workspace`.
+
+- A stored workspace that no longer exists (or is not writable) is **refused**: the
+  engine says which session, which path and why, and the tools stay where they were.
+  Silently falling back would write your files into the wrong tree.
+- The engine is the authority on what a workspace may be: a path has to exist, be a
+  directory, and be writable, and the writability is proved by writing a probe file
+  rather than by trusting the mode bits.
+- `+` on a workspace row opens a draft that already knows its folder. Nothing is
+  written and no session row appears until you send the first message.
+- Renaming a group changes the label, never the path.
 
 Every file a turn produces appears once as an attachment however many times it was
 written, and file tools show the path they act on in the card header, so you can
 see what a call touched without expanding it.
+
+A file tool also reports the size of its own edit: `edit_file · notes.md  +1 -1` in
+the header, and expanding the card shows a real unified diff - hunk header, context
+lines, red removals, green additions. The counts come from the lines that actually
+changed rather than from the model's description of what it did, and they are stored
+with the message, so a session reopened next week still says what that edit cost.
+For an edit the diff replaces the raw argument blob: showing the same change twice,
+once as 400 characters of JSON, is noise.
 
 ## Two things that are security, not polish
 

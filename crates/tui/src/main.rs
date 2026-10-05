@@ -74,6 +74,9 @@ struct App {
     /// A question from `ask_user`. It owns the keyboard the same way an
     /// approval does: the turn is parked until someone answers.
     pending_q: Option<(Question, oneshot::Sender<Answer>)>,
+    /// Indices picked in the question that is up. Kept apart from the question
+    /// itself so a digit toggles a choice without touching the engine's copy.
+    q_sel: Vec<usize>,
     quit: bool,
     model: String,
 }
@@ -94,6 +97,7 @@ impl App {
             session_id: 0,
             pending: None,
             pending_q: None,
+            q_sel: Vec::new(),
             quit: false,
             model,
         }
@@ -189,6 +193,17 @@ impl App {
             // Same for questions: they arrive on their own channel, where the
             // reply sender is attached. The event copy carries no way to answer.
             EngineEvent::QuestionRequested { .. } | EngineEvent::QuestionAnswered { .. } => {}
+            // The tool stopped waiting: its timeout expired, or the turn was
+            // cancelled with the question parked. The prompt on screen cannot be
+            // answered any more, so drop it. Holding the sender would leave a
+            // key handler that sends into a closed channel.
+            EngineEvent::QuestionExpired { id } => {
+                if self.pending_q.as_ref().is_some_and(|(q, _)| q.id == id) {
+                    self.pending_q = None;
+                    self.items
+                        .push(Item::Note("the question closed without an answer".into()));
+                }
+            }
             EngineEvent::Usage(u) => {
                 self.avg.push(u.clone());
                 self.tel = u;
@@ -438,6 +453,14 @@ async fn run(
                 app.busy = true;
             }
             Some((q, reply)) = q_rx.recv() => {
+                app.q_sel = match q.recommended {
+                    // Pre-selection is a courtesy, not a decision: Enter still has
+                    // to be pressed, and a multi-select question that arrives with
+                    // the recommendation already ticked is one keystroke from an
+                    // answer instead of three.
+                    Some(r) if q.multi => vec![r],
+                    _ => Vec::new(),
+                };
                 app.pending_q = Some((q, reply));
                 app.busy = true;
             }
@@ -460,29 +483,67 @@ async fn run(
 // ---------------------------------------------------------------------------
 
 fn handle_key(k: KeyEvent, app: &mut App, host: &SessionHost) {
-    // A question owns the keyboard while it is up: 1-9 pick an option, Enter
-    // takes the recommended one, Esc declines. Declining sends an empty answer,
-    // which the tool reports to the model as "dismissed without answering"
-    // rather than as a choice it can invent.
+    // A question owns the keyboard while it is up: 1-9 choose (or toggle, when
+    // the question allows several), Enter sends, Esc declines. Declining sends an
+    // empty answer, which the tool reports to the model as "dismissed without
+    // answering" rather than as a choice it can invent.
     if app.pending_q.is_some() {
-        let recommended = app.pending_q.as_ref().and_then(|(q, _)| q.recommended);
-        let pick: Option<usize> = match k.code {
-            KeyCode::Char(c @ '1'..='9') => c.to_digit(10).map(|d| d as usize - 1),
-            KeyCode::Enter => recommended,
-            KeyCode::Esc | KeyCode::Char('c') => Some(usize::MAX),
-            _ => None,
-        };
-        if let Some(p) = pick {
+        // Nothing is sent until Enter. Submit-on-keypress sounded quick and was a
+        // misclick machine: the answer to a question about deleting files should
+        // not be one slip of the finger away.
+        let submit = |app: &mut App| {
             let (q, reply) = app.pending_q.take().expect("checked above");
-            let answer = if p == usize::MAX {
-                Answer { text: String::new(), option: None }
-            } else if p < q.options.len() {
-                Answer { text: q.options[p].label.clone(), option: Some(p) }
-            } else {
-                return; // a digit past the last option does nothing
-            };
-            let _ = reply.send(answer);
-            return;
+            let sel = app.q_sel.clone();
+            app.q_sel.clear();
+            let labels: Vec<String> = sel
+                .iter()
+                .filter_map(|i| q.options.get(*i).map(|o| o.label.clone()))
+                .collect();
+            let _ = reply.send(Answer {
+                text: labels.join(", "),
+                options: sel,
+            });
+        };
+        match k.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = c.to_digit(10).unwrap() as usize - 1;
+                let q = app.pending_q.as_ref().expect("checked above").0.clone();
+                if idx >= q.options.len() {
+                    return; // a digit past the last option does nothing
+                }
+                if q.multi {
+                    if let Some(at) = app.q_sel.iter().position(|x| *x == idx) {
+                        app.q_sel.remove(at);
+                    } else {
+                        app.q_sel.push(idx);
+                        app.q_sel.sort();
+                    }
+                } else {
+                    app.q_sel = vec![idx];
+                }
+            }
+            KeyCode::Enter => {
+                if app.q_sel.is_empty() {
+                    // Enter with nothing picked takes the recommendation, which is
+                    // the whole point of marking one.
+                    let recommended = app.pending_q.as_ref().and_then(|(q, _)| q.recommended);
+                    if let Some(r) = recommended {
+                        app.q_sel = vec![r];
+                    } else {
+                        return;
+                    }
+                }
+                submit(app);
+            }
+            // Declining is explicit and sends an empty answer, which the tool
+            // reports as "dismissed without answering" rather than as a choice the
+            // model is free to invent.
+            KeyCode::Esc | KeyCode::Char('c') => {
+                let (_, reply) = app.pending_q.take().expect("checked above");
+                app.q_sel.clear();
+                let _ = reply.send(Answer::default());
+            }
+            _ => {}
         }
         return;
     }
@@ -648,14 +709,17 @@ fn draw_question(f: &mut Frame, app: &App, area: Rect) {
     ))];
     for (i, o) in q.options.iter().enumerate() {
         let star = q.recommended == Some(i);
+        let picked = app.q_sel.contains(&i);
         let mut spans = vec![
             Span::styled(
-                format!("   {}). ", i + 1),
+                format!("   {}) {}. ", if q.multi { if picked {"[x]"} else {"[ ]"} } else if picked {"(*)"} else {"( )"}, i + 1),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 o.label.clone(),
-                if star {
+                if picked {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else if star {
                     Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC)
                 } else {
                     Style::default()
@@ -676,13 +740,18 @@ fn draw_question(f: &mut Frame, app: &App, area: Rect) {
             )));
         }
     }
-    let mut keys = "1-9 choose".to_string();
+    let mut keys = if q.multi {
+        "1-9 toggle (several allowed)".to_string()
+    } else {
+        "1-9 choose".to_string()
+    };
+    keys.push_str(" · Enter sends");
     if q.recommended.is_some() {
-        keys.push_str(" · Enter takes the recommendation");
+        keys.push_str(" (no choice = the recommendation)");
     }
-    if q.allow_custom {
-        keys.push_str(" · type instead");
-    }
+    // No "type instead" here on purpose: the TUI has no text entry while a
+    // question is up, and advertising an affordance that is not wired would be a
+    // lie in the one place a user is reading carefully.
     keys.push_str(" · Esc decline");
     lines.push(Line::from(Span::styled(
         format!("   {keys}"),

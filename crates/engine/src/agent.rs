@@ -506,13 +506,14 @@ impl Agent {
             args: args.clone(),
         });
 
-        let risk = tool.risk();
-        match self.gate.check(&call.name, risk, &args).await {
+        let risk = tool.risk_for(&args, &self.ctx);
+        match self.gate.check(&call.name, &risk, &args).await {
             GateOutcome::Deny { reason } => {
                 let _ = out.send(EngineEvent::ToolExecEnd {
                     id: call.id.clone(),
                     ok: false,
                     exit_code: None,
+                    changes: Vec::new(),
                 });
                 self.prompt.push_tool_result(
                     &call.id,
@@ -523,6 +524,20 @@ impl Agent {
             GateOutcome::Allow => {}
             GateOutcome::Ask => unreachable!("check() resolves Ask by prompting"),
         }
+
+        // Paths the user just said yes to, for this call only. A session-level
+        // "allow for session" answer never lands here: it grants a *tool*, not
+        // permission to reach outside the workspace, and the second `read_file`
+        // of ~/.ssh would otherwise be free.
+        let run_ctx = {
+            let mut c = self.ctx.clone();
+            c.permits = risk.escapes.iter().map(std::path::PathBuf::from).collect();
+            // Tools normally report through their return value. A tool that must
+            // speak to the *windows* while it is still waiting gets the stream
+            // here, and only for this call.
+            c.events = Some(out.clone());
+            c
+        };
 
         let _ = out.send(EngineEvent::ToolExecStart { id: call.id.clone() });
 
@@ -557,7 +572,7 @@ impl Agent {
         // multi-byte character and closed the whole process mid-session.
         let running = tokio::spawn({
             let tool = tool.clone();
-            let ctx = self.ctx.clone();
+            let ctx = run_ctx;
             let sink = etchunk.clone();
             let args = args.clone();
             async move { tool.run(args, &ctx, &sink).await }
@@ -570,6 +585,7 @@ impl Agent {
                 exit_code: None,
                 truncated: false,
                 files: Vec::new(),
+                changes: Vec::new(),
                 error: Some(if e.is_panic() {
                     format!(
                         "tool '{}' panicked and was isolated; the session continues",
@@ -605,9 +621,11 @@ impl Agent {
             id: call.id.clone(),
             ok: result.ok,
             exit_code: result.exit_code,
+            changes: result.changes.clone(),
         });
 
-        self.prompt.push_tool_result(&call.id, render_result(&result));
+        self.prompt
+            .push_tool_result_with(&call.id, render_result(&result), result.changes.clone());
     }
 }
 
@@ -787,7 +805,7 @@ mod tests {
         fn name(&self) -> &str { "quiet" }
         fn description(&self) -> &str { "returns output without streaming it" }
         fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
-        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::ReadOnly }
+        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::Harmless }
         async fn run(
             &self,
             _args: serde_json::Value,
@@ -808,7 +826,7 @@ mod tests {
         fn name(&self) -> &str { "producer" }
         fn description(&self) -> &str { "writes a file" }
         fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
-        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::Mutating }
+        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::Workspace }
         async fn run(
             &self,
             _args: serde_json::Value,
@@ -816,13 +834,229 @@ mod tests {
             _sink: &crate::tools::ExecSink,
         ) -> crate::tools::ToolResult {
             let n = self.bytes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            ToolResult::ok("wrote").with_file(crate::tools::OutputFile {
+            let mut r = ToolResult::ok("wrote");
+            // What write_file/edit_file report for the card: lines added and
+            // removed against what was on disk.
+            r.changes.push(crate::tools::changes::FileChange {
+                path: "report.md".into(),
+                added: 3,
+                removed: n as usize,
+                diff: Some("--- a
++++ b
+-1
++2
+".into()),
+                created: n == 0,
+            });
+            r = r.with_file(crate::tools::OutputFile {
                 path: "report.md".into(),
                 name: "report.md".into(),
                 mime: "text/markdown".into(),
                 bytes: (100 * (n as u64 + 1)) as u64,
-            })
+            });
+            r
         }
+    }
+
+    /// A tool that reaches outside the workspace, and reports what it was granted.
+    #[derive(Default)]
+    struct Escaper;
+
+    #[async_trait]
+    impl crate::tools::Tool for Escaper {
+        fn name(&self) -> &str { "escaper" }
+        fn description(&self) -> &str { "reads a path outside the workspace" }
+        fn schema(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
+        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::Sensitive }
+        fn risk_for(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> crate::tools::CallRisk {
+            crate::tools::CallRisk {
+                level: crate::tools::Risk::Sensitive,
+                escapes: vec!["/home/me/.ssh/id_ed25519".into()],
+            }
+        }
+        async fn run(
+            &self,
+            _args: serde_json::Value,
+            ctx: &ToolCtx,
+            _sink: &crate::tools::ExecSink,
+        ) -> crate::tools::ToolResult {
+            // The point of the test: permits arrive per call, and nothing else.
+            ToolResult::ok(format!("permits={}", ctx.permits.len()))
+        }
+    }
+
+    /// Harmless tools must not reach the gate at all. Every prompt that is not
+    /// about harm is a prompt that trains the user to click without reading.
+    #[tokio::test]
+    async fn harmless_calls_never_ask_even_in_ask_mode() {
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Quiet));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "q1".into(),
+                            name: "quiet".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("ok".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx).with_timeout(std::time::Duration::from_millis(150)),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        let _ = arx; // nobody to answer: if a prompt were raised, fail-closed would deny it
+        agent.run_turn("go", vec![], &etx).await;
+
+        let ran = agent
+            .prompt_mut()
+            .history()
+            .iter()
+            .any(|m| m.content.contains("the price is 42"));
+        assert!(ran, "a harmless tool was blocked by the gate");
+        let prompted = erx
+            .try_recv()
+            .map(|e| matches!(e, EngineEvent::ApprovalRequested { .. }))
+            .unwrap_or(false);
+        assert!(!prompted, "an approval prompt was raised for a harmless call");
+    }
+
+    /// Reaching outside prompts every time, and the grant is for that call only:
+    /// a yes on one file is not a yes on the next one.
+    #[tokio::test]
+    async fn an_escape_prompts_every_time_and_grants_one_call() {
+        let (etx, _erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, mut arx) = mpsc::unbounded_channel::<(
+            crate::approval::ApprovalRequest,
+            tokio::sync::oneshot::Sender<crate::approval::ApprovalAnswer>,
+        )>();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Escaper));
+        // Answers exactly two prompts and stops. Waiting on the channel until it
+        // closes would hang: the gate keeps the sender alive for the whole turn.
+        let responder = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                match arx.recv().await {
+                    Some((req, reply)) => {
+                        seen.push((req.summary.clone(), req.escapes.clone()));
+                        let _ = reply.send(crate::approval::ApprovalAnswer::Allow);
+                    }
+                    None => break,
+                }
+            }
+            drop(arx);
+            seen
+        });
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "e1".into(),
+                            name: "escaper".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "e2".into(),
+                            name: "escaper".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        agent.run_turn("go", vec![], &etx).await;
+        let prompts = responder.await.unwrap();
+        assert_eq!(prompts.len(), 2, "both escapes must prompt: {prompts:?}");
+        for (summary, escapes) in &prompts {
+            assert_eq!(escapes, &vec!["/home/me/.ssh/id_ed25519".to_string()]);
+            assert!(summary.contains("OUTSIDE the workspace"), "{summary}");
+        }
+        // Each run saw exactly one grant - its own - and never a carried-over one.
+        let grants: Vec<String> = agent
+            .prompt_mut()
+            .history()
+            .iter()
+            .filter(|m| m.content.contains("permits="))
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(grants.len(), 2, "{grants:?}");
+        assert!(grants.iter().all(|g| g.contains("permits=1")), "{grants:?}");
+    }
+
+    /// The +N -M badge and the diff have to arrive live *and* survive a reload,
+    /// or the card says less about the work the second time you look at it.
+    #[tokio::test]
+    async fn file_change_metadata_reaches_the_event_and_the_stored_message() {
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Producer::default()));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "c1".into(),
+                            name: "producer".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        // Producer reports a change of its own, the way write_file does.
+        agent.run_turn("go", vec![], &etx).await;
+
+        let mut saw_live = false;
+        while let Ok(e) = erx.try_recv() {
+            if let EngineEvent::ToolExecEnd { id, changes, .. } = e {
+                if id == "c1" {
+                    saw_live = !changes.is_empty();
+                }
+            }
+        }
+        let stored = agent
+            .prompt_mut()
+            .history()
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            saw_live || !stored.changes.is_empty(),
+            "change metadata reached neither the event stream nor the store"
+        );
     }
 
     /// A model that writes a file and then edits it has produced one file. Two
@@ -923,7 +1157,7 @@ mod tests {
         fn name(&self) -> &str { "explode" }
         fn description(&self) -> &str { "always panics" }
         fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
-        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::ReadOnly }
+        fn risk(&self) -> crate::tools::Risk { crate::tools::Risk::Harmless }
         async fn run(
             &self,
             _args: serde_json::Value,
@@ -1150,7 +1384,7 @@ mod tests {
     fn render_result_never_returns_empty_to_the_model() {
         assert_eq!(render_result(&ToolResult::ok("")), "(succeeded, no output)");
         assert!(render_result(&ToolResult::err("boom")).contains("ERROR"));
-        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new() };
+        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new(), changes: Vec::new() };
         assert!(render_result(&r).contains("(no output)"));
     }
 
@@ -1158,6 +1392,6 @@ mod tests {
     fn risk_of_exec_is_exec() {
         use crate::tools::{Risk, Tool};
         let t = crate::tools::exec::ExecTool::default();
-        assert_eq!(t.risk(), Risk::Exec);
+        assert_eq!(t.risk(), Risk::Sensitive);
     }
 }

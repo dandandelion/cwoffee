@@ -383,6 +383,57 @@ body {
   font-weight: 600;
   color: var(--color-ink);
 }
+/* `+12 -3`: what the call did to the files. Hidden until the engine reports a
+   change, which it only does for calls that touch a file. */
+.tool-stat {
+  display: none;
+}
+.tool-stat:not(:empty) {
+  display: inline-block;
+  margin-left: 8px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  border-radius: 999px;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+}
+.tool-stat.add {
+  color: var(--color-ok);
+  background: var(--color-ok-bg);
+}
+.tool-stat.mix {
+  color: var(--color-warn);
+  background: var(--color-warn-bg);
+}
+/* The diff, shown when the card is expanded. Colours carry no meaning on their
+   own: the leading +/- is kept in the text, so it survives a colour-blind theme
+   and a screenshot. */
+.tool-diff {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--color-paper);
+  border: 1px solid var(--color-hairline-2);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+.diff-path {
+  display: block;
+  color: var(--color-ink-2);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.diff-line { display: block; }
+.diff-add { color: var(--color-ok); background: var(--color-ok-bg); }
+.diff-del { color: var(--color-danger); background: var(--color-danger-bg); }
+.diff-hunk { color: var(--color-ink-3); }
+.diff-file { color: var(--color-ink-2); font-weight: 600; }
+.diff-ctx { color: var(--color-ink-3); }
 .tool-status {
   margin-left: 8px;
   font-size: 11.5px;
@@ -412,6 +463,9 @@ body {
   max-height: 2400px;
   -webkit-mask-image: none;
   mask-image: none;
+}
+.blk-tool.has-diff .tool-args {
+  display: none;
 }
 .blk-tool { cursor: pointer; }
 .blk-tool.is-open { cursor: default; }
@@ -1105,6 +1159,114 @@ body {
   text-transform: uppercase;
   color: var(--color-ink-3);
 }
+/* ---- workspace groups in the sidebar ------------------------------- */
+.wsadd {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 4px 4px;
+}
+.wsgrp {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.wsrow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 4px;
+  border-radius: 8px;
+}
+.wsrow:hover {
+  background: color-mix(in srgb, var(--color-paper-2) 70%, transparent);
+}
+.wsbtn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  color: var(--color-ink-2);
+  font-size: 12.5px;
+  text-align: left;
+}
+.ws-chev {
+  flex: none;
+  color: var(--color-ink-3);
+}
+.ws-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 550;
+  color: var(--color-ink);
+}
+.ws-n {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+  font-variant-numeric: tabular-nums;
+}
+/* The `+` is always laid out but quiet until the row is attended to: a control
+   that only exists on hover cannot be found on a phone, and one that shouts
+   turns a folder list into a row of buttons. */
+.ws-plus,
+.ws-addall {
+  opacity: 0.35;
+  flex: none;
+}
+.wsrow:hover .ws-plus,
+.wsrow:focus-within .ws-plus,
+.wsbtn[aria-expanded] + .ws-plus:focus-visible,
+.sesshead:hover .ws-addall,
+.ws-addall:focus-visible,
+.ws-plus:focus-visible {
+  opacity: 1;
+}
+.wsgrp.closed .ws-n {
+  color: var(--color-ink-2);
+}
+.wsgrp.closed > .wsrow .ws-name {
+  color: var(--color-ink-2);
+}
+/* Sessions sit inside the folder they belong to. Indentation is the whole
+   hierarchy cue - rules and trees in a 248px sidebar read as noise. */
+.wsgrp .sessrow {
+  padding-left: 16px;
+}
+
+/* Which folder a session that does not exist yet will write into. */
+.empty-ws {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px dashed color-mix(in srgb, var(--color-shell) 45%, var(--color-hairline-2));
+  background: var(--color-tint);
+  color: var(--color-shell-deep);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color var(--d1) var(--ease-out), background var(--d1) var(--ease-out);
+}
+.empty-ws:hover {
+  border-style: solid;
+  border-color: var(--color-shell);
+}
+.empty-ws-x {
+  color: var(--color-ink-3);
+  font-size: 11px;
+}
+
 .sesshead-toggle {
   font-size: 11px;
   text-transform: none;
@@ -1448,6 +1610,13 @@ body {
   padding: 12px 14px 14px;
   margin: 4px 0 10px;
 }
+.blk-ask .ask-body {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
 .ask-q {
   font-size: 15px;
   line-height: 1.45;
@@ -1455,15 +1624,20 @@ body {
   margin: 2px 0 12px;
 }
 .ask-opts {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 8px;
+  /* Stacked rows, not a grid of columns. Auto-fit columns squashed each option
+     to its 150px floor and wrapped the text into unreadable slivers as soon as
+     an option had a description. A choice needs a title line and a description
+     line, which is what the rest of the app's cards look like. */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 .ask-opt {
   position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  align-items: start;
+  gap: 10px;
   padding: 10px 12px;
   border: 1px solid var(--color-hairline-2);
   border-radius: 8px;
@@ -1473,7 +1647,31 @@ body {
   transition:
     border-color var(--d1) var(--ease-out),
     background var(--d1) var(--ease-out),
-    transform var(--d1) var(--ease-out);
+    transform var(--d1) var(--ease-out),
+    box-shadow var(--d1) var(--ease-out);
+}
+.ask-mark {
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--color-ink-3);
+}
+.ask-opt.is-sel {
+  border-color: var(--color-shell);
+  background: var(--color-tint);
+  box-shadow: 0 0 0 1px var(--color-shell) inset;
+}
+.ask-opt.is-sel .ask-mark { color: var(--color-shell-deep); }
+.ask-opt-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.ask-opt-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .ask-opt:hover {
   border-color: var(--color-shell);
@@ -1486,14 +1684,11 @@ body {
   outline: 2px solid var(--color-shell);
   outline-offset: 2px;
 }
-/* The recommendation is shown, not imposed: a badge and a wash, never a
-   preselected state the user has to notice and undo. */
-.ask-opt.is-rec {
-  background: var(--color-tint);
-  border-color: var(--color-shell);
-}
+/* The recommendation is shown, not imposed: a badge, never a preselected state
+   the user has to notice and undo (multi-select excepted, where ticking the
+   recommended box is one keystroke saved rather than a decision made for you). */
+.ask-opt.is-rec .ask-lbl { font-weight: 600; }
 .ask-badge {
-  align-self: flex-start;
   font-size: 10px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1535,9 +1730,90 @@ body {
 .ask-input::placeholder {
   color: var(--color-ink-3);
 }
+.ask-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.ask-submit,
+.ask-decline {
+  font: inherit;
+  font-size: 13px;
+  border-radius: 8px;
+  padding: 7px 14px;
+  cursor: pointer;
+  transition:
+    background var(--d1) var(--ease-out),
+    border-color var(--d1) var(--ease-out),
+    transform var(--d1) var(--ease-out);
+}
+.ask-submit {
+  border: 1px solid var(--color-shell);
+  background: var(--color-shell);
+  color: #fffdf9;
+}
+.ask-submit:hover:not(:disabled) {
+  background: var(--color-shell-deep);
+  border-color: var(--color-shell-deep);
+}
+.ask-submit:disabled {
+  /* Disabled must still be a shape, not a ghost: the button is how you finish
+     answering, so it should be legible while it waits for a choice. */
+  opacity: 0.55;
+  cursor: default;
+}
+.ask-decline {
+  border: 1px solid var(--color-hairline-2);
+  background: transparent;
+  color: var(--color-ink-2);
+}
+.ask-decline:hover:not(:disabled) {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+  background: var(--color-danger-bg);
+}
+.ask-submit:active:not(:disabled),
+.ask-decline:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.ask-hist-q {
+  color: var(--color-ink);
+}
+.ask-hist-a {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--color-ink-2);
+}
+.ask-hist-a::before {
+  content: 'you said: ';
+  opacity: 0.7;
+}
+.ask-hist-a:empty::before {
+  content: '(no answer was recorded)';
+  opacity: 0.6;
+}
+.ask-hist-a:empty {
+  font-style: normal;
+}
+.ask-hist-a:empty::before {
+  font-style: italic;
+}
+.blk-ask.expired {
+  border-left-color: var(--color-warn);
+}
+.ask-expired {
+  font-size: 12px;
+  color: var(--color-warn);
+  line-height: 1.45;
+}
+.blk-ask.expired .ask-opt {
+  cursor: default;
+  opacity: 0.6;
+}
 .blk-ask.answered .ask-opts,
 .blk-ask.answered .ask-custom {
-  opacity: 0.45;
+  opacity: 0.55;
   pointer-events: none;
 }
 .ask-answered {
@@ -1547,6 +1823,20 @@ body {
 }
 .blk-ask.answered.by-other .ask-answered {
   color: var(--color-ink-2);
+}
+
+/* Thinking gets the same arrival animation as the answer. It previously had
+   none, because thinking is rendered as plain text and never went through the
+   markdown reveal path - so reasoning snapped in fully formed while the answer
+   below it faded in. */
+.think-run {
+  /* One compositing layer for the whole block, so folded text does not change
+     rasterisation mode when it leaves an animated span. */
+  transform: translateZ(0);
+}
+.think-tin {
+  /* .tin carries the keyframes; this only marks it as thinking. */
+  white-space: pre-wrap;
 }
 
 /* The assembled paragraph is a real <p> inside .blk-body, so the app's own

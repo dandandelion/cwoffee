@@ -599,6 +599,19 @@ fn txt(s: String) -> Message {
 /// nothing gets dropped rather than holding a slot and an event subscription.
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Every way a client connection can end, logged with a reason.
+///
+/// A phone does not get to tell you why its socket died: it just stops updating.
+/// Before, twelve separate `return Ok(())` paths were indistinguishable, and the
+/// one that mattered - a client that fell behind its event stream - looked like
+/// the engine shutting down.
+macro_rules! gw_bye {
+    ($addr:expr, $why:expr) => {{
+        eprintln!("[cwoffee/gateway] {} connection ended: {}", $addr, $why);
+        return Ok(());
+    }};
+}
+
 async fn websocket(
     ws: tokio_tungstenite::WebSocketStream<TcpStream>,
     cfg: Arc<GatewayConfig>,
@@ -633,34 +646,56 @@ async fn websocket(
                 match ev {
                     Ok(e) => {
                         let payload = serde_json::to_string(&serde_json::json!({ "type": "event", "d": e })).unwrap_or_default();
-                        if sink.send(txt(payload)).await.is_err() { return Ok(()); }
+                        if sink.send(txt(payload)).await.is_err() { gw_bye!(addr, "write to client failed"); }
+                    }
+                    // A slow client - a phone on a lossy link, a backgrounded tab
+                    // with the socket throttled - falls behind the broadcast. It
+                    // used to be treated exactly like a closed channel and the
+                    // socket hung up, which lost the `turnEnd` that was the whole
+                    // point of the stream: the phone kept `busy = true` from a
+                    // `turnStart` it had already received and left the composer
+                    // disabled until someone reloaded the page.
+                    //
+                    // So say so instead: the client re-reads authoritative state
+                    // (which carries `busy`) and keeps its connection.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!(
+                            "[cwoffee/gateway] {addr} fell {n} event(s) behind; asked it to resync"
+                        );
+                        let payload = serde_json::to_string(&serde_json::json!({
+                            "type": "resync",
+                            "d": { "missed": n },
+                        }))
+                        .unwrap_or_default();
+                        if sink.send(txt(payload)).await.is_err() { gw_bye!(addr, "write to client failed"); }
                     }
                     // The engine's event channel closed; nothing left to stream.
-                    Err(_) => return Ok(()),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => gw_bye!(addr, "engine event stream closed"),
                 }
             }
             msg = stream.next() => {
                 let msg = match msg {
                     Some(Ok(m)) => m,
                     // Closed or a protocol error: the browser will reconnect.
-                    Some(Err(_)) | None => return Ok(()),
+                    Some(Err(e)) => gw_bye!(addr, &format!("client frame error: {e}")),
+                    None => gw_bye!(addr, "client stopped sending"),
                 };
                 match msg {
                     Message::Text(t) => {
-                        let reply = dispatch(t.as_str(), role, &handle).await;
+                        let reply = dispatch(t.as_str(), role, &handle, &addr).await;
                         if let Some(payload) = reply {
-                            if sink.send(txt(payload)).await.is_err() { return Ok(()); }
+                            if sink.send(txt(payload)).await.is_err() { gw_bye!(addr, "write to client failed"); }
                         }
                     }
-                    Message::Close(_) => return Ok(()),
+                    Message::Close(r) => gw_bye!(addr, &format!("client closed: {r:?}")),
                     Message::Ping(p) => {
-                        if sink.send(Message::Pong(p)).await.is_err() { return Ok(()); }
+                        if sink.send(Message::Pong(p)).await.is_err() { gw_bye!(addr, "pong write failed"); }
                     }
                     _ => {}
                 }
             }
             _ = ping.tick() => {
-                if sink.send(Message::Ping(Default::default())).await.is_err() { return Ok(()); }
+                if sink.send(Message::Ping(Default::default())).await.is_err() { gw_bye!(addr, "ping write failed"); }
             }
         }
     }
@@ -749,7 +784,48 @@ async fn auth_handshake(
 
 /// Run one RPC. Returns the serialized response, or None for anything we
 /// deliberately do not answer.
-async fn dispatch(raw: &str, role: Role, handle: &EngineHandle) -> Option<String> {
+/// Commands that change what the agent does or what it can reach. Everything on
+/// this list gets a line in the server log naming the peer that asked, because
+/// this endpoint can run a shell and this socket can be reachable from a network.
+/// Without it, "the agent ran a command I did not ask for" is unanswerable.
+const AUDITED: &[&str] = &[
+    "start_turn",
+    "cancel_turn",
+    "new_session",
+    "switch_session",
+    "clear_session",
+    "rename_session",
+    "delete_session",
+    "set_model",
+    "set_mode",
+    "set_reasoning",
+    "set_workspace",
+    "add_workspace",
+    "remove_workspace",
+    "respond_approval",
+    "respond_question",
+];
+
+/// Args rendered without their payloads: the fact that a turn was started and of
+/// what size matters in a log; the user's message text does not belong in one.
+fn arg_hint(args: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(map) = args.as_object() {
+        for (k, v) in map {
+            let v = match v {
+                serde_json::Value::String(s) => format!("len {}", s.chars().count()),
+                serde_json::Value::Array(a) => format!("{} item(s)", a.len()),
+                serde_json::Value::Null => "unset".to_string(),
+                other => other.to_string(),
+            };
+            parts.push(format!("{k}={v}"));
+        }
+    }
+    parts.sort();
+    parts.join(" ")
+}
+
+async fn dispatch(raw: &str, role: Role, handle: &EngineHandle, peer: &str) -> Option<String> {
     let req: RpcReq = match serde_json::from_str(raw) {
         Ok(r) => r,
         Err(e) => {
@@ -758,6 +834,13 @@ async fn dispatch(raw: &str, role: Role, handle: &EngineHandle) -> Option<String
                     .to_string(),
             )
         }
+    };
+    if AUDITED.contains(&req.cmd.as_str()) {
+        eprintln!(
+            "[cwoffee/gateway] {peer} {} ({})",
+            req.cmd,
+            arg_hint(&req.args)
+        );
     };
     let id = req.id;
     // Tauri passes command arguments as a named map, so `invoke('x', { report })`
@@ -859,6 +942,14 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                         .and_then(|s| s.get("id").and_then(|v| v.as_i64()))
                 })
             };
+            // The sidebar is grouped by folder, so the folder list is part of
+            // "everything a cold client needs". Omitting it would cost a fourth
+            // round trip on a phone link, which is the whole reason this command
+            // exists.
+            let workspaces = match h.store.list_workspaces() {
+                Ok(w) => serde_json::to_value(w).unwrap_or_else(|_| json!([])),
+                Err(_) => json!([]),
+            };
             let page = match view {
                 Some(id) => serde_json::to_value(
                     h.store.messages_page(id, None, 60).map_err(|e| e.to_string())?,
@@ -872,6 +963,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 "models": models,
                 "session_id": view,
                 "page": page,
+                "workspaces": workspaces,
             }))
         }
 
@@ -942,11 +1034,27 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let option = args.get("option").and_then(|v| v.as_u64()).map(|n| n as usize);
+            // `options` is a list because a question can allow several answers.
+            // A single `option` number is still accepted so an older page does not
+            // silently send an empty answer.
+            let mut options: Vec<usize> = args
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if options.is_empty() {
+                if let Some(one) = args.get("option").and_then(|v| v.as_u64()) {
+                    options.push(one as usize);
+                }
+            }
             let tx = h.pending_questions.lock().unwrap().remove(&id);
             match tx {
                 Some(tx) => tx
-                    .send(Answer { text, option })
+                    .send(Answer { text, options })
                     .map(|_| json!(true))
                     .map_err(|_| "the engine no longer wants this answer".to_string()),
                 None => Err(format!("no pending question with id {id}")),
@@ -955,12 +1063,53 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         "new_session" => {
             need_drive(role)?;
             let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            // A browser can start a session inside a named workspace; the engine
+            // is the one that decides whether that path is usable, and switching
+            // into the row moves the tools to where the row says it lives.
+            let ws = match args.get("workspace").and_then(|v| v.as_str()) {
+                Some(raw) => cwoffee_engine::host::check_workspace(raw)
+                    .map_err(|e| format!("{raw:?}: {e}"))?
+                    .display()
+                    .to_string(),
+                None => h.host.state().workspace,
+            };
             let id = h
                 .store
-                .create_session(title, &h.host.state().workspace, &h.host.state().model)
+                .create_session(title, &ws, &h.host.state().model)
                 .map_err(|e| e.to_string())?;
+            h.store.add_workspace(&ws).ok();
             h.host.send(HostCmd::SwitchSession { id });
             Ok(json!(id))
+        }
+        "list_workspaces" => {
+            // Read-only: the sidebar needs the grouping before it is allowed to
+            // touch anything in it.
+            Ok(serde_json::to_value(h.store.list_workspaces().map_err(|e| e.to_string())?)
+                .unwrap_or(json!([])))
+        }
+        "add_workspace" => {
+            need_drive(role)?;
+            let raw = arg_str(&args, "path")?;
+            let p = cwoffee_engine::host::check_workspace(&raw).map_err(|e| format!("{raw:?}: {e}"))?;
+            h.store.add_workspace(&p.display().to_string()).map_err(|e| e.to_string())?;
+            Ok(json!(p.display().to_string()))
+        }
+        "set_workspace_label" => {
+            need_drive(role)?;
+            let raw = arg_str(&args, "path")?;
+            let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let n = h
+                .store
+                .set_workspace_label(&raw, label)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(n > 0))
+        }
+        "remove_workspace" => {
+            need_drive(role)?;
+            let raw = arg_str(&args, "path")?;
+            // Drops the sidebar entry only. The sessions that live there are not
+            // touched, so the folder reappears as long as they exist.
+            Ok(json!(h.store.remove_workspace(&raw).map_err(|e| e.to_string())?))
         }
         "switch_session" => {
             need_drive(role)?;
@@ -1403,6 +1552,185 @@ mod tests {
         assert!(err.contains("refused"), "unhelpful error: {err}");
     }
 
+    /// The sidebar list is read-only, so a watch token - which exists so a
+    /// colleague can follow a session without being able to touch it - must be
+    /// able to read it.
+    #[tokio::test]
+    async fn the_sidebar_list_reads_the_store_and_a_watch_token_can_see_it() {
+        let h = test_handle();
+        let out = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("listing folders is read-only");
+        // The test host starts in a real directory, so its workspace is listed
+        // whether or not anybody added it by hand.
+        let ws = h.host.state().workspace;
+        assert!(
+            out.as_array()
+                .map(|a| a.iter().any(|w| w["path"].as_str() == Some(ws.as_str())))
+                .unwrap_or(false),
+            "the workspace a session lives in must appear: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_folder_to_the_sidebar_is_drive_only_and_validated() {
+        let h = test_handle();
+        let err = run_cmd(
+            "add_workspace",
+            serde_json::json!({ "path": "/tmp" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watch token must not edit the sidebar");
+        assert!(!err.is_empty());
+
+        let out = run_cmd(
+            "add_workspace",
+            serde_json::json!({ "path": "/tmp" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("/tmp is a real writable directory");
+        assert_eq!(out.as_str(), Some("/tmp"));
+
+        // The engine decides what is a workspace, so a file is not one and the
+        // sidebar cannot be filled with junk from a browser.
+        let err = run_cmd(
+            "add_workspace",
+            serde_json::json!({ "path": "/nonexistent/definitely-not" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("a non-directory must be refused");
+        assert!(err.contains("not a directory"), "unhelpful error: {err}");
+
+        let out = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .unwrap();
+        assert!(
+            out.as_array()
+                .map(|a| a.iter().any(|w| w["path"].as_str() == Some("/tmp")))
+                .unwrap_or(false),
+            "the added folder must come back: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_label_names_the_row_and_not_the_folder() {
+        let h = test_handle();
+        run_cmd("add_workspace", serde_json::json!({ "path": "/tmp" }), Role::Drive, &h)
+            .await
+            .unwrap();
+        let ok = run_cmd(
+            "set_workspace_label",
+            serde_json::json!({ "path": "/tmp", "label": "scratch" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("renaming a row the client can see is allowed");
+        assert_eq!(ok.as_bool(), Some(true));
+        let out = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .unwrap();
+        assert!(
+            out.as_array()
+                .map(|a| a.iter().any(|w| w["label"].as_str() == Some("scratch")))
+                .unwrap_or(false),
+            "the label must survive the round trip: {out}"
+        );
+        // A name for a folder nobody registered is a no-op, not a new row.
+        let ghost = run_cmd(
+            "set_workspace_label",
+            serde_json::json!({ "path": "/nope", "label": "ghost" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("an unknown path is a valid request");
+        assert_eq!(ghost.as_bool(), Some(false));
+    }
+
+    /// Drive one RPC over an already-attached socket, skipping pushed events.
+    async fn rpc_over(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+        cmd: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        use futures_util::StreamExt;
+        ws.send(txt(serde_json::json!({ "id": 4242, "cmd": cmd, "args": args }).to_string()))
+            .await
+            .map_err(|e| format!("send: {e}"))?;
+        for _ in 0..500 {
+            let frame = match ws.next().await {
+                None => return Err("socket closed".into()),
+                Some(Err(e)) => return Err(format!("frame error: {e}")),
+                Some(Ok(f)) => f,
+            };
+            let text = frame.to_text().map_err(|e| format!("to_text: {e}"))?;
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            if v.get("id").and_then(|x| x.as_i64()) == Some(4242) {
+                if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+                    return Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null));
+                }
+                return Err(v.get("error").and_then(|x| x.as_str()).unwrap_or("error").to_string());
+            }
+        }
+        Err("no reply to id 4242".into())
+    }
+
+    /// A client that cannot keep up used to be hung up on, exactly as if the
+    /// engine had shut down. That is the worst possible thing to do to a phone:
+    /// it has usually already received the `turnStart`, so it comes back with a
+    /// composer disabled by a turn that finished long ago.
+    ///
+    /// The contract now is: say "you missed N events", keep the socket, and let
+    /// the client re-read state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_client_that_falls_behind_is_told_and_kept() {
+        let h = test_handle();
+        let (port, _srv) = serve_on_free_port(&h).await;
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut ws = attach(&url).await;
+
+        // Enough volume to fill the socket buffers, which is what stops the pump
+        // from polling its broadcast receiver, which is what makes it lag.
+        for i in 0..600u32 {
+            let _ = h.events.send(EngineEvent::Note {
+                message: "x".repeat(2048) + &i.to_string(),
+            });
+        }
+
+        let mut saw_resync = false;
+        for _ in 0..400 {
+            use futures_util::StreamExt;
+            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await {
+                Ok(Some(Ok(f))) => f,
+                _ => break,
+            };
+            let text = frame.to_text().unwrap_or_default().to_string();
+            if text.contains("\"resync\"") {
+                saw_resync = true;
+                break;
+            }
+        }
+        assert!(saw_resync, "a client that lagged was never told about it");
+
+        // And the socket must still be usable: a resync that arrives just before
+        // the server drops the connection is a fancier way of hanging up.
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rpc_over(&mut ws, "list_sessions", serde_json::json!({})),
+        )
+        .await
+        .expect("the socket stopped answering after a resync")
+        .expect("list_sessions failed after a resync");
+        assert!(ok.is_array(), "list_sessions should return an array");
+    }
+
     /// The gauge is a claim about the world, printed as fact in the footer, so
     /// it is tested against real connections rather than against the type.
     /// It used to print 18446744073709552000 devices: the guard decremented an
@@ -1548,14 +1876,18 @@ mod tests {
 
     fn test_handle() -> Arc<EngineHandle> {
         let p: Arc<dyn cwoffee_engine::provider::Provider> = Arc::new(FakeProvider);
+        // One store, shared. It used to be two, which quietly made every
+        // store-backed RPC in these tests read a database the host had never
+        // written to - the assertions still passed, just about nothing.
+        let store = Arc::new(Store::in_memory().unwrap());
         Arc::new(EngineHandle {
             host: Arc::new(SessionHost::spawn(
                 p,
                 cwoffee_engine::tools::Registry::new(),
-                Arc::new(Store::in_memory().unwrap()),
+                Arc::clone(&store),
                 cwoffee_engine::host::HostConfig::new("m", std::env::temp_dir()),
             )),
-            store: Arc::new(Store::in_memory().unwrap()),
+            store,
             events: broadcast::channel(8).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),

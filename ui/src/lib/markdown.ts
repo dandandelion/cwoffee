@@ -445,7 +445,7 @@ export const REVEAL_HOLD_MS = 520
  * asked for reduced motion, and a page (or a test runner) with no matchMedia at
  * all should get the animation rather than lose it to a missing API.
  */
-function revealOn(): boolean {
+export function revealOn(): boolean {
   return !(
     typeof matchMedia === 'function' &&
     matchMedia('(prefers-reduced-motion: reduce)').matches

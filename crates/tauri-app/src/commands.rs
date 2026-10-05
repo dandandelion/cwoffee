@@ -148,6 +148,13 @@ pub fn start_turn(
             name: a.name,
         })
         .collect();
+    // Audit line, same idea as the gateway's: a turn that nobody remembers
+    // starting should be traceable to whoever started it. Lengths, not content.
+    eprintln!(
+        "[cwoffee] start_turn (desktop): text={} attachments={}",
+        text.chars().count(),
+        atts.len()
+    );
     if text.trim().is_empty() && atts.is_empty() {
         return Err("empty message".into());
     }
@@ -250,17 +257,23 @@ pub fn respond_question(
     state: tauri::State<'_, AppState>,
     id: u64,
     text: String,
-    option: Option<usize>,
+    options: Vec<usize>,
 ) -> Result<(), String> {
     use cwoffee_engine::tools::ask::Answer;
     let reply = state.pending_questions.lock().unwrap().remove(&id);
     match reply {
         Some(r) => {
-            eprintln!(
-                "[cwoffee] question {id} answered by {}",
-                option.map(|i| format!("option {}", i + 1)).unwrap_or_else(|| "free text".into())
-            );
-            r.send(Answer { text, option })
+            let picked = if options.is_empty() {
+                "free text".to_string()
+            } else {
+                options
+                    .iter()
+                    .map(|i| format!("{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            };
+            eprintln!("[cwoffee] question {id} answered by {picked}");
+            r.send(Answer { text, options })
                 .map_err(|_| "turn already ended".to_string())
         }
         None => {
@@ -385,14 +398,84 @@ pub fn session_messages(
 /// the UI had no id to show: the click appeared to do nothing, and the session
 /// the user was in seemed to vanish. The host is still told to move there, so
 /// the next message lands in the new session once the current turn finishes.
-pub fn new_session(state: tauri::State<'_, AppState>, title: String) -> Result<i64, String> {
+pub fn new_session(
+    state: tauri::State<'_, AppState>,
+    title: String,
+    workspace: Option<String>,
+) -> Result<i64, String> {
     let st = state.host.state();
+    // The sidebar can open a session inside a particular folder. The engine, not
+    // the UI, decides whether that folder is usable, and switching to the row
+    // moves the tools there - a session filed under a folder that then runs its
+    // tools somewhere else is a lie in the list and a surprise on disk.
+    let ws = match workspace.as_deref() {
+        Some(raw) => cwoffee_engine::host::check_workspace(raw)
+            .map_err(|e| format!("{raw:?}: {e}"))?,
+        None => std::path::PathBuf::from(&st.workspace),
+    };
+    let ws = ws.display().to_string();
     let id = state
         .store
-        .create_session(&title, &st.workspace, &st.model)
+        .create_session(&title, &ws, &st.model)
         .map_err(|e| e.to_string())?;
+    state.store.add_workspace(&ws).ok();
     state.host.send(HostCmd::SwitchSession { id });
     Ok(id)
+}
+
+/// Folders the sidebar offers: everything registered, plus everything that holds
+/// sessions. The engine owns the fact; this is the list.
+#[tauri::command]
+pub fn list_workspaces(state: tauri::State<'_, AppState>) -> Result<Vec<WorkspaceRow>, String> {
+    let rows = state.store.list_workspaces().map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|w| WorkspaceRow {
+            path: w.path,
+            label: w.label,
+            sessions: w.sessions,
+        })
+        .collect())
+}
+
+#[derive(serde::Serialize)]
+pub struct WorkspaceRow {
+    pub path: String,
+    pub label: String,
+    pub sessions: i64,
+}
+
+/// Add a folder to the sidebar. Validated by the engine, so the UI cannot offer a
+/// path it would later refuse to run tools in.
+#[tauri::command]
+pub fn add_workspace(state: tauri::State<'_, AppState>, path: String) -> Result<String, String> {
+    let p = cwoffee_engine::host::check_workspace(&path).map_err(|e| format!("{path:?}: {e}"))?;
+    let p = p.display().to_string();
+    state.store.add_workspace(&p).map_err(|e| e.to_string())?;
+    eprintln!("[cwoffee] workspace added: {p}");
+    Ok(p)
+}
+
+/// Name a workspace row. The path never changes: it is what the sandbox is
+/// confined to, and renaming a folder in the sidebar must not move anyone's work.
+#[tauri::command]
+pub fn set_workspace_label(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    label: String,
+) -> Result<bool, String> {
+    let n = state
+        .store
+        .set_workspace_label(&path, &label)
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// Drop a folder from the sidebar. Sessions that live in it are untouched, so it
+/// comes back if they do.
+#[tauri::command]
+pub fn remove_workspace(state: tauri::State<'_, AppState>, path: String) -> Result<usize, String> {
+    Ok(state.store.remove_workspace(&path).map_err(|e| e.to_string())?)
 }
 
 #[tauri::command]

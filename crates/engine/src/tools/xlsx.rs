@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 
 use rust_xlsxwriter::{Format, Workbook, Worksheet};
 
-use super::path::confine;
-use super::{Risk, Tool, ToolCtx, ToolResult};
+use super::path::{confine_permitted, lexical_resolve};
+use super::{CallRisk, Risk, Tool, ToolCtx, ToolResult};
 
 pub struct WriteXlsxTool;
 
@@ -73,7 +73,26 @@ impl Tool for WriteXlsxTool {
     }
 
     fn risk(&self) -> Risk {
-        Risk::Mutating
+        Risk::Workspace
+    }
+
+    /// A new spreadsheet is the agent doing its job; replacing one the user
+    /// already has is not, and outside the workspace needs the path named.
+    fn risk_for(&self, args: &Value, ctx: &ToolCtx) -> CallRisk {
+        let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let resolved = lexical_resolve(&ctx.workspace, raw);
+        let ws = lexical_resolve(&ctx.workspace, ".");
+        if resolved != ws && !resolved.starts_with(&ws) {
+            return CallRisk {
+                level: Risk::Sensitive,
+                escapes: vec![resolved.display().to_string()],
+            };
+        }
+        if resolved.exists() {
+            CallRisk::at(Risk::Workspace)
+        } else {
+            CallRisk::harmless()
+        }
     }
 
     fn schema(&self) -> Value {
@@ -115,7 +134,7 @@ impl Tool for WriteXlsxTool {
         let Some(raw) = args.get("path").and_then(|p| p.as_str()) else {
             return ToolResult::err("write_xlsx needs a `path` string");
         };
-        let path = match confine(&ctx.workspace, raw) {
+        let path = match confine_permitted(&ctx.workspace, raw, &ctx.permits) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };

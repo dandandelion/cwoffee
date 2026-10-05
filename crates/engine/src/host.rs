@@ -67,6 +67,31 @@ impl HostConfig {
     }
 }
 
+/// The engine's one definition of "a workspace this app will run tools in": an
+/// existing, writable directory. Every client needs the same answer, because a
+/// sidebar that accepts a path the engine later refuses is a UI that lies about
+/// where your files are about to be written.
+pub fn check_workspace(raw: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("a workspace path cannot be empty".into());
+    }
+    let expanded = crate::config::Config::expand_tilde(trimmed);
+    let p = std::path::PathBuf::from(&expanded);
+    if !p.is_dir() {
+        return Err("is not a directory".into());
+    }
+    // The sandbox confines writes to this directory, so an unwritable one is a
+    // configuration mistake worth saying out loud rather than discovering on the
+    // first exec.
+    let probe = p.join(".cwoffee-write-test");
+    if std::fs::File::create(&probe).is_err() {
+        return Err("is not writable; the tools could not create a file there".into());
+    }
+    let _ = std::fs::remove_file(&probe);
+    Ok(std::fs::canonicalize(&p).unwrap_or(p))
+}
+
 /// Commands the UI sends. Everything the agent does on its own goes out over
 /// `events`, so the UI never has to poll for state.
 pub enum HostCmd {
@@ -150,6 +175,10 @@ impl SessionHost {
         // the model asking for input, and conflating them means a "yes" answers
         // both.
         let (ask_tx, ask_rx) = mpsc::unbounded_channel::<crate::tools::ask::QuestionRx>();
+        // The folder you start in is a workspace too. Registering it means the
+        // sidebar shows where a brand-new session would write, instead of an
+        // empty list until the first message happens to create a row.
+        let _ = store.add_workspace(&cfg.workspace.display().to_string());
         let state = Arc::new(Mutex::new(HostState {
             session_id: 0,
             workspace: cfg.workspace.display().to_string(),
@@ -183,6 +212,8 @@ impl SessionHost {
             workspace: cfg.workspace.clone(),
             max_output_bytes: 24 * 1024,
             ask: Some(ask_tx),
+            events: None,
+            permits: Vec::new(),
         };
         let mut agent = Agent::new(
             provider,
@@ -247,26 +278,20 @@ impl SessionHost {
                         // code: `Send` runs the turn inline in this loop, so no
                         // command - including this one - can be processed while
                         // a tool holds the previous ToolCtx.
-                        let p = std::path::PathBuf::from(&path);
-                        if !p.is_dir() {
-                            let _ = ev_tx.send(EngineEvent::Error {
-                                message: format!("workspace {path:?} is not a directory"),
-                                fatal: false,
-                            });
-                            continue;
-                        }
-                        // The sandbox confines writes to this directory, so an
-                        // unreadable one is a configuration mistake worth saying
-                        // out loud rather than discovering on the first exec.
-                        if std::fs::File::create(p.join(".cwoffee-write-test")).is_err() {
-                            let _ = ev_tx.send(EngineEvent::Error {
-                                message: format!("workspace {path:?} is not writable"),
-                                fatal: false,
-                            });
-                            continue;
-                        } else {
-                            let _ = std::fs::remove_file(p.join(".cwoffee-write-test"));
-                        }
+                        let p = match check_workspace(&path) {
+                            Ok(p) => p,
+                            Err(reason) => {
+                                let _ = ev_tx.send(EngineEvent::Error {
+                                    message: format!("the engine refused {path:?}: {reason}"),
+                                    fatal: false,
+                                });
+                                continue;
+                            }
+                        };
+                        // Moving the tools into a folder registers it, so the
+                        // sidebar shows where you now work without you having to
+                        // add it by hand.
+                        let _ = store.add_workspace(&p.display().to_string());
                         agent.set_workspace(p.clone());
                         // The env block rides on the newest user message only, so
                         // changing it does not disturb the cached prefix.
@@ -352,16 +377,57 @@ impl SessionHost {
                                 // the reported state, or the resumed session's new
                                 // messages land in whichever session was active.
                                 session_id = id;
+                                // A session lives where its row says it lives. The
+                                // sidebar groups sessions by folder, so the tools
+                                // have to follow when one is clicked - and a folder
+                                // that has gone missing has to say so rather than
+                                // quietly run tools in the last good place, which
+                                // is how a file ends up written in the wrong tree.
+                                //
+                                // Done before taking the state lock: this branch
+                                // already holds it further down, and a nested lock
+                                // on the same mutex deadlocks the host loop. (It
+                                // did, in this very arm.)
+                                let row = store.session(id).ok().flatten();
+                                let mut follow_ws: Option<std::path::PathBuf> = None;
+                                if let Some(row) = row.as_ref() {
+                                    if row.workspace != agent.workspace().display().to_string() {
+                                        match check_workspace(&row.workspace) {
+                                            Ok(p) => {
+                                                agent.set_workspace(p.clone());
+                                                agent
+                                                    .prompt_mut()
+                                                    .set_env(default_env_block(&p, "linux"));
+                                                let _ = ev_tx.send(EngineEvent::Note {
+                                                    message: format!(
+                                                        "workspace is now {} (from this session)",
+                                                        p.display()
+                                                    ),
+                                                });
+                                                follow_ws = Some(p);
+                                            }
+                                            Err(reason) => {
+                                                let msg = format!(
+                                                    "session {id} lives in {:?}, which the engine refused: {reason}. Tools stay in {}",
+                                                    row.workspace,
+                                                    agent.workspace().display()
+                                                );
+                                                let _ = ev_tx.send(EngineEvent::Error {
+                                                    message: msg,
+                                                    fatal: false,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
                                 let mut s = state_bg.lock().unwrap();
                                 s.session_id = id;
                                 s.context_tokens = agent.prompt_mut().estimate_tokens("");
                                 s.compactions = 0;
-                                let title = store
-                                    .session(id)
-                                    .ok()
-                                    .flatten()
-                                    .map(|x| x.title)
-                                    .unwrap_or_default();
+                                if let Some(p) = follow_ws {
+                                    s.workspace = p.display().to_string();
+                                }
+                                let title = row.map(|x| x.title).unwrap_or_default();
                                 let _ = ev_tx.send(EngineEvent::SessionChanged {
                                     session_id: id,
                                     title,
@@ -397,6 +463,7 @@ impl SessionHost {
                         }
                         if session_id == 0 {
                             let ws = agent.workspace().display().to_string();
+                            let _ = store.add_workspace(&ws);
                             let model = agent.model();
                             match store.create_session("new session", &ws, &model) {
                                 Ok(id) => {
@@ -826,6 +893,85 @@ mod tests {
         turns_done(&h, 1).await;
         assert_eq!(h.state().workspace, base.display().to_string());
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A session lives where its row says it lives, so clicking one in the
+    /// sidebar's grouping has to move the tools with it. Otherwise the folder
+    /// label is decoration and `write_file` lands wherever the last session
+    /// happened to point.
+    #[tokio::test]
+    async fn switching_a_session_moves_the_tools_to_that_sessions_folder() {
+        let base = std::env::temp_dir().join(format!("cwoffee_ws_switch_{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let (mut h, store) = host(vec!["first reply".into()]);
+        let (_ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        let sa = store.create_session("in a", &a.display().to_string(), "m").unwrap();
+        let sb = store.create_session("in b", &b.display().to_string(), "m").unwrap();
+
+        h.send(HostCmd::SwitchSession { id: sa });
+        wait_for("into a".into(), || h.state().workspace == a.display().to_string()).await;
+        h.send(HostCmd::SwitchSession { id: sb });
+        wait_for("into b".into(), || h.state().workspace == b.display().to_string()).await;
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A folder that no longer exists must be refused out loud. Falling back to
+    /// the previous workspace silently is how a file ends up written somewhere the
+    /// user did not intend.
+    #[tokio::test]
+    async fn a_session_in_a_vanished_folder_says_so_and_stays_put() {
+        let base = std::env::temp_dir().join(format!("cwoffee_ws_gone_{}", std::process::id()));
+        let here = base.join("here");
+        let gone = base.join("gone");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&gone).unwrap();
+
+        let (mut h, store) = host(vec!["first reply".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+        let keep = h.state().workspace.clone();
+
+        let sid = store.create_session("orphan", &gone.display().to_string(), "m").unwrap();
+        let _ = std::fs::remove_dir_all(&gone);
+
+        h.send(HostCmd::SwitchSession { id: sid });
+        assert!(
+            await_error(&mut ev, "refused").await,
+            "the engine stayed silent about a missing workspace"
+        );
+        assert_eq!(
+            h.state().workspace, keep,
+            "tools moved to a folder that does not exist"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Moving into a folder registers it, so the sidebar shows where you work
+    /// without a second step nobody remembers to take.
+    #[tokio::test]
+    async fn a_workspace_move_registers_the_folder_for_the_sidebar() {
+        let base = std::env::temp_dir().join(format!("cwoffee_ws_reg_{}", std::process::id()));
+        let target = base.join("project");
+        std::fs::create_dir_all(&target).unwrap();
+        let (mut h, store) = host(vec!["x".into()]);
+        let (_ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        h.send(HostCmd::SetWorkspace { path: target.display().to_string() });
+        wait_for("moved".into(), || h.state().workspace == target.display().to_string()).await;
+        let listed = store.list_workspaces().unwrap();
+        assert!(
+            listed.iter().any(|w| w.path == target.display().to_string()),
+            "the folder was not registered: {listed:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

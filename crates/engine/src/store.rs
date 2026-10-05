@@ -52,7 +52,17 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Current schema version. Bump with a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 10;
+
+/// A workspace the user has registered (or that holds sessions).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEntry {
+    pub path: String,
+    /// Optional display name. Empty means "show the folder name", which is what
+    /// people want nine times out of ten and why it is not a required field.
+    pub label: String,
+    pub sessions: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -90,6 +100,10 @@ pub struct StoredMessage {
     /// Files this message produced in the workspace, for the UI. Never sent to
     /// the model.
     pub files: Vec<crate::tools::OutputFile>,
+    /// What a file tool changed, for the tool card: `+N -M` in the header and the
+    /// diff when it is expanded. Persisted so a reopened session shows the same
+    /// card as the live one; never sent to the model.
+    pub changes: Vec<crate::tools::changes::FileChange>,
     /// Metadata only: mime, filename, decoded size. The payload lives in the
     /// attachments table and is loaded by `history()`, never by transcript reads.
     pub attachments: Vec<crate::provider::AttachmentMeta>,
@@ -138,6 +152,66 @@ impl Store {
     }
 
     // ---- sessions ---------------------------------------------------------
+
+    // ---- workspaces -------------------------------------------------------
+
+    /// Register a workspace so it shows in the sidebar even with no sessions in
+    /// it. Idempotent: the sidebar calls this on every session move.
+    pub fn add_workspace(&self, path: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO workspaces (path, label, added_at) VALUES (?1, '', ?2)",
+            params![path, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the sidebar entry. Sessions that live in the workspace are untouched -
+    /// removing a folder from the list must not delete anybody's work, and the
+    /// sessions still say where they live, so it reappears if they do.
+    pub fn remove_workspace(&self, path: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM workspaces WHERE path = ?1", params![path])?)
+    }
+
+    /// Name a workspace for the sidebar. Empty means "show the folder name",
+    /// which is what people want nine times out of ten.
+    pub fn set_workspace_label(&self, path: &str, label: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE workspaces SET label = ?2 WHERE path = ?1",
+            params![path, label.trim()],
+        )?;
+        Ok(n)
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<WorkspaceEntry>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // Registered paths unioned with paths that actually hold sessions: the
+        // list must reflect reality, so a workspace you never added but have
+        // sessions in still shows up, and one you added and emptied still shows
+        // too.
+        let mut stmt = conn.prepare(
+            "SELECT p.path,
+                    COALESCE((SELECT label FROM workspaces w WHERE w.path = p.path), '') AS label,
+                    (SELECT COUNT(*) FROM sessions s WHERE s.workspace = p.path) AS n
+             FROM (
+                 SELECT DISTINCT workspace AS path FROM sessions WHERE workspace <> ''
+                 UNION
+                 SELECT path FROM workspaces
+             ) p
+             ORDER BY COALESCE((SELECT added_at FROM workspaces w WHERE w.path = p.path), 0) ASC,
+                      p.path ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(WorkspaceEntry {
+                path: r.get(0)?,
+                label: r.get(1)?,
+                sessions: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 
     pub fn create_session(&self, title: &str, workspace: &str, model: &str) -> Result<i64, StoreError> {
         let title = title_or_default(title);
@@ -245,10 +319,15 @@ impl Store {
         } else {
             serde_json::to_string(&m.tool_calls).unwrap_or_default()
         };
+        let tool_meta = if m.changes.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(&m.changes).unwrap_or_default()
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, reasoning, reasoning_signature, reasoning_ms, tool_call_id, tool_calls_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO messages (session_id, role, content, reasoning, reasoning_signature, reasoning_ms, tool_call_id, tool_calls_json, tool_meta_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 session_id,
                 role_str(&m.role),
@@ -258,6 +337,7 @@ impl Store {
                 m.reasoning_ms.unwrap_or(0) as i64,
                 m.tool_call_id,
                 tool_calls,
+                tool_meta,
                 now
             ],
         )?;
@@ -308,7 +388,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
-                    reasoning_signature, reasoning_ms, files, created_at
+                    reasoning_signature, reasoning_ms, files, tool_meta_json, created_at
              FROM messages
              WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2)
              ORDER BY id DESC LIMIT ?3",
@@ -325,8 +405,9 @@ impl Store {
                 reasoning_signature: r.get(7)?,
                 reasoning_ms: r.get(8)?,
                 files: decode_files(r.get(9)?),
+                changes: decode_changes(r.get(10)?),
                 attachments: Vec::new(),
-                created_at: r.get(10)?,
+                created_at: r.get(11)?,
             })
         })?;
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
@@ -369,7 +450,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
-                    reasoning_signature, reasoning_ms, files, created_at
+                    reasoning_signature, reasoning_ms, files, tool_meta_json, created_at
              FROM messages WHERE session_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
@@ -384,8 +465,9 @@ impl Store {
                 reasoning_signature: r.get(7)?,
                 reasoning_ms: r.get(8)?,
                 files: decode_files(r.get(9)?),
+                changes: decode_changes(r.get(10)?),
                 attachments: Vec::new(),
-                created_at: r.get(10)?,
+                created_at: r.get(11)?,
             })
         })?;
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
@@ -465,6 +547,9 @@ impl Store {
                 // Must survive the round trip: a tool_result whose call id is
                 // missing is rejected outright by every provider.
                 tool_call_id: s.tool_call_id,
+                // Change metadata is UI-only and is deliberately not replayed
+                // into the prompt; the model already has the tool's own text.
+                changes: Vec::new(),
                 reasoning: if s.reasoning.is_empty() { None } else { Some(s.reasoning) },
                 reasoning_ms: if s.reasoning_ms == 0 { None } else { Some(s.reasoning_ms) },
                 reasoning_signature: if s.reasoning_signature.is_empty() {
@@ -693,6 +778,15 @@ fn derive_title(text: &str) -> String {
 /// situation into a hard open failure. Check first.
 /// A corrupt or legacy value degrades to "no files" rather than failing the
 /// whole transcript read.
+fn decode_changes(raw: String) -> Vec<crate::tools::changes::FileChange> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    // A row written by an older build, or a corrupt blob, degrades to "no change
+    // metadata" rather than failing the whole transcript read.
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
 fn decode_files(raw: String) -> Vec<crate::tools::OutputFile> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
@@ -850,6 +944,32 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
             "messages",
             "reasoning_ms",
             "reasoning_ms INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    if from < 10 {
+        // v10: workspaces became things you can add, not just side effects of the
+        // last path you typed. The sidebar groups sessions by workspace and lets
+        // you attach a folder before it has any sessions in it, which needs a row
+        // of its own. Sessions keep their own workspace column: this table is the
+        // list, that column is the fact.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS workspaces (
+                 path TEXT PRIMARY KEY,
+                 label TEXT NOT NULL DEFAULT '',
+                 added_at INTEGER NOT NULL
+             );",
+        )?;
+    }
+    if from < 9 {
+        // v9: what a file tool changed. The +N -M badge and the diff view are
+        // UI metadata about a tool call, exactly like the files a turn produced,
+        // and they belong in the row: a reopened session that lost them is a
+        // transcript that quietly got less informative.
+        add_column_if_missing(
+            conn,
+            "messages",
+            "tool_meta_json",
+            "tool_meta_json TEXT NOT NULL DEFAULT ''",
         )?;
     }
     if from < 8 {
@@ -1240,6 +1360,64 @@ mod tests {
         assert!(s.session(id).unwrap().is_none());
         assert!(s.messages(id).unwrap().is_empty());
         assert!(s.search("x", 5).unwrap().is_empty(), "fts row survived deletion");
+    }
+
+    #[test]
+    fn a_workspace_can_be_registered_before_it_has_sessions() {
+        let s = Store::in_memory().unwrap();
+        s.add_workspace("/home/me/projects/thing").unwrap();
+        s.add_workspace("/home/me/projects/thing").unwrap(); // idempotent
+        let ws = s.list_workspaces().unwrap();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].path, "/home/me/projects/thing");
+        assert_eq!(ws[0].sessions, 0, "an empty folder is still a workspace");
+    }
+
+    /// A workspace you never added but have sessions in must show anyway: the
+    /// sidebar that hides where your work lives is worse than no sidebar.
+    #[test]
+    fn a_workspace_holding_sessions_lists_itself() {
+        let s = Store::in_memory().unwrap();
+        s.create_session("a", "/home/me/ws-a", "m").unwrap();
+        s.create_session("b", "/home/me/ws-a", "m").unwrap();
+        s.create_session("c", "/home/me/ws-b", "m").unwrap();
+        let mut ws = s.list_workspaces().unwrap();
+        ws.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            ws.iter().map(|w| (w.path.as_str(), w.sessions)).collect::<Vec<_>>(),
+            vec![("/home/me/ws-a", 2), ("/home/me/ws-b", 1)]
+        );
+    }
+
+    /// Removing a folder from the list is not deleting anyone's work.
+    #[test]
+    fn removing_a_workspace_takes_the_entry_not_the_sessions() {
+        let s = Store::in_memory().unwrap();
+        let id = s.create_session("keep me", "/home/me/ws-a", "m").unwrap();
+        s.remove_workspace("/home/me/ws-a").unwrap();
+        // The entry was never explicitly added, so removing it changes nothing
+        // about the fact that sessions live there.
+        assert_eq!(s.list_workspaces().unwrap().len(), 1);
+        s.add_workspace("/home/me/empty").unwrap();
+        assert_eq!(s.remove_workspace("/home/me/empty").unwrap(), 1);
+        assert_eq!(s.list_workspaces().unwrap().len(), 1);
+        assert!(s.session(id).unwrap().is_some(), "the session survived, as it must");
+    }
+
+    /// A label names the folder in the sidebar without touching the path the
+    /// tools are confined to - the path is the fact, the label is decoration.
+    #[test]
+    fn a_workspace_label_renames_the_row_and_not_the_folder() {
+        let s = Store::in_memory().unwrap();
+        let id = s.create_session("a", "/home/me/projects/inventory-app", "m").unwrap();
+        s.add_workspace("/home/me/projects/inventory-app").unwrap();
+        assert_eq!(s.set_workspace_label("/home/me/projects/inventory-app", "  inventory  ").unwrap(), 1);
+        let ws = s.list_workspaces().unwrap();
+        assert_eq!(ws[0].label, "inventory", "surrounding spaces are not part of a name");
+        assert_eq!(ws[0].path, "/home/me/projects/inventory-app");
+        assert_eq!(s.session(id).unwrap().unwrap().workspace, "/home/me/projects/inventory-app");
+        // An unknown path renames nothing, rather than creating a stray row.
+        assert_eq!(s.set_workspace_label("/home/me/nope", "ghost").unwrap(), 0);
     }
 
     #[test]

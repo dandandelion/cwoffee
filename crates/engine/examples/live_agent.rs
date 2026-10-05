@@ -116,6 +116,9 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
                 println!("(the model asks: {question} - nobody here to answer)")
             }
             EngineEvent::QuestionAnswered { .. } => {}
+            EngineEvent::QuestionExpired { id } => {
+                println!("[ask] question {id} closed without an answer");
+            }
             EngineEvent::TurnStart { turn_id, model } => {
                 println!("=== turn {turn_id} ({model}) ===");
             }

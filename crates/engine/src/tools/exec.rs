@@ -78,7 +78,7 @@ impl Tool for ExecTool {
     }
 
     fn risk(&self) -> Risk {
-        Risk::Exec
+        Risk::Sensitive
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx, sink: &ExecSink) -> ToolResult {
@@ -202,6 +202,7 @@ impl Tool for ExecTool {
                 output: combine(&out, &err),
                 exit_code: None,
                 truncated: false,
+                changes: Vec::new(),
                 error: Some(timeout_error(timeout_secs)),
                 files: Vec::new(),
             };
@@ -214,6 +215,7 @@ impl Tool for ExecTool {
                 output: combine(&out, &err),
                 exit_code: code,
                 truncated: false,
+                changes: Vec::new(),
                 error: Some(timeout_error(timeout_secs)),
                 files: Vec::new(),
             };
@@ -227,6 +229,10 @@ impl Tool for ExecTool {
             truncated: combined.1,
             error: None,
             files: Vec::new(),
+            // exec can of course change files, but not through a path this layer
+            // knows about, so there is no honest +N -M to show. The card shows the
+            // command and its output instead.
+            changes: Vec::new(),
         }
     }
 }

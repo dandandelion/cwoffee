@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{ExecSink, OutputFile, Risk, Tool, ToolCtx, ToolResult};
+use super::{CallRisk, ExecSink, OutputFile, Risk, Tool, ToolCtx, ToolResult};
 use tokio::io::AsyncWriteExt;
 
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) Cwoffee/0.1 (+local agent)";
@@ -140,9 +140,13 @@ impl Tool for WebFetchTool {
     }
 
     fn risk(&self) -> Risk {
-        // Network egress is gated like exec: the user should see which URL is
-        // being fetched before it happens.
-        Risk::Exec
+        // Reading a public web page changes nothing on this machine, and research
+        // is a core use of the product. It used to be gated like exec, which meant
+        // every browsing task interrupted the user several times - the opposite of
+        // a prompt people can weigh, because the fortieth prompt is clicked without
+        // being read. The URL is still shown, in the tool card rather than in a
+        // dialog, and the sandbox is what protects the machine.
+        Risk::Harmless
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {
@@ -276,7 +280,37 @@ impl Tool for DownloadTool {
     }
 
     fn risk(&self) -> Risk {
-        Risk::Mutating
+        Risk::Workspace
+    }
+
+    /// Fetching is harmless; *putting a file on disk over one that already
+    /// exists* is not, and neither is writing outside the workspace. Same split
+    /// as write_file: creating is the job, replacing needs a yes.
+    fn risk_for(&self, args: &Value, ctx: &ToolCtx) -> CallRisk {
+        let raw = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        if raw.is_empty() {
+            // No path given means "the URL's file name, inside the workspace",
+            // which confine will resolve; be conservative and treat it as a write.
+            return CallRisk::at(Risk::Workspace);
+        }
+        let resolved = super::path::lexical_resolve(&ctx.workspace, &raw);
+        if resolved != super::path::lexical_resolve(&ctx.workspace, ".")
+            && !resolved.starts_with(super::path::lexical_resolve(&ctx.workspace, "."))
+        {
+            return CallRisk {
+                level: Risk::Sensitive,
+                escapes: vec![resolved.display().to_string()],
+            };
+        }
+        if resolved.exists() {
+            CallRisk::at(Risk::Workspace)
+        } else {
+            CallRisk::harmless()
+        }
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {
@@ -292,7 +326,7 @@ impl Tool for DownloadTool {
             Some(p) => p.to_string(),
             None => default_filename(&url),
         };
-        let dest = match super::path::confine(&ctx.workspace, &requested) {
+        let dest = match super::path::confine_permitted(&ctx.workspace, &requested, &ctx.permits) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
@@ -696,7 +730,7 @@ impl Tool for WebSearchTool {
     }
 
     fn risk(&self) -> Risk {
-        Risk::Exec
+        Risk::Harmless
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {

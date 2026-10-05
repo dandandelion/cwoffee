@@ -63,6 +63,50 @@ pub fn confine(workspace: &Path, raw: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Like `confine`, but paths the user explicitly approved for this call are
+/// allowed through.
+///
+/// The permission list comes from the approval gate, never from the model, and it
+/// is matched against the **resolved** path so `../secret/./x` cannot slip past a
+/// permit written for `/home/u/secret/x`. A permit on a directory covers its
+/// subtree, because approving a directory the user named and then refusing every
+/// file in it would be a strange reading of "yes".
+pub fn confine_permitted(workspace: &Path, raw: &str, permits: &[PathBuf]) -> Result<PathBuf, String> {
+    match confine(workspace, raw) {
+        Ok(p) => Ok(p),
+        Err(_) => {
+            let p = match resolve_for_permits(workspace, raw) {
+                Some(p) => p,
+                None => return Err("path was rejected".into()),
+            };
+            let allowed = permits.iter().any(|permit| {
+                let permit = lexical_resolve(workspace, &permit.display().to_string());
+                p == permit || p.starts_with(&permit)
+            });
+            if allowed {
+                Ok(p)
+            } else {
+                Err(format!(
+                    "{raw:?} resolves to {}, which is outside the workspace {}.                      Use a path relative to the workspace root.",
+                    p.display(),
+                    lexical_resolve(workspace, ".").display()
+                ))
+            }
+        }
+    }
+}
+
+/// Resolve a path for permit matching. Reuses the same lexer as `confine` so the
+/// path that gets compared is the path that would have been opened, and refuses
+/// the same malformed inputs.
+fn resolve_for_permits(workspace: &Path, raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains('\0') {
+        return None;
+    }
+    Some(lexical_resolve(&lexical_resolve(workspace, "."), raw))
+}
+
 /// Relative path for display, so tool cards do not print the whole absolute path.
 pub fn display_rel(workspace: &Path, p: &Path) -> String {
     let ws = lexical_resolve(workspace, ".");

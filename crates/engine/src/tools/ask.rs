@@ -45,15 +45,24 @@ pub struct Question {
     pub recommended: Option<usize>,
     /// Whether a free-text answer is offered alongside the options.
     pub allow_custom: bool,
+    /// Whether more than one option may be chosen. The model decides, because
+    /// only it knows whether the question is "which one" or "which of these".
+    #[serde(default)]
+    pub multi: bool,
 }
 
-/// The answer. `text` is what the model reads; `option` records that the user
-/// picked one of the offered choices rather than typing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The answer, as the front end sent it.
+///
+/// `options` indexes into `Question::options` and may be empty when the user
+/// typed something instead. `text` is the resolved answer either way: the label
+/// of what was picked, or what was typed. Keeping both matters because the model
+/// needs to know whether it got a choice from its own list or words of the
+/// user's own - the second usually carries constraints the model did not think of.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Answer {
     pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub option: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<usize>,
 }
 
 pub type QuestionRx = (Question, oneshot::Sender<Answer>);
@@ -115,7 +124,8 @@ impl Tool for AskUserTool {
                     }
                 },
                 "recommended": { "type": "integer", "description": "Index into options of the choice you recommend" },
-                "allow_custom": { "type": "boolean", "description": "Offer a free-text answer too (default true)" }
+                "allow_custom": { "type": "boolean", "description": "Offer a free-text answer too (default true)" },
+                "multi": { "type": "boolean", "description": "Let the user pick more than one option. Only set this when the answers genuinely combine." }
             },
             "required": ["question", "options"]
         })
@@ -124,7 +134,7 @@ impl Tool for AskUserTool {
     /// Asking is not a side effect, and a second confirmation on top of a
     /// question would be absurd.
     fn risk(&self) -> Risk {
-        Risk::ReadOnly
+        Risk::Harmless
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {
@@ -178,6 +188,7 @@ impl Tool for AskUserTool {
             .get("allow_custom")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        let multi = args.get("multi").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let Some(tx) = ctx.ask.as_ref() else {
             // Not a stub: this client genuinely has no way to ask, and the
@@ -198,6 +209,7 @@ impl Tool for AskUserTool {
                     options: options.clone(),
                     recommended,
                     allow_custom,
+                    multi,
                 },
                 reply_tx,
             ))
@@ -209,18 +221,34 @@ impl Tool for AskUserTool {
             );
         }
 
+        // Tell every window when the question closes on its own. The reply
+        // channel is dead by then, so the shells cannot report it: they are the
+        // ones holding the sender, and a sender whose receiver is gone says
+        // nothing until someone tries to use it.
+        let expire = |ev: &super::ToolCtx, id: u64| {
+            if let Some(tx) = &ev.events {
+                let _ = tx.send(crate::event::EngineEvent::QuestionExpired { id });
+            }
+        };
+
         match tokio::time::timeout(self.timeout, reply_rx).await {
-            Err(_) => ToolResult::err(format!(
-                "ask_user: the user did not answer within {}s. Pick the option you \
-                 recommended (or the most sensible one), say in your reply that you \
-                 asked and got no answer, and continue.",
-                self.timeout.as_secs()
-            )),
+            Err(_) => {
+                expire(ctx, id);
+                ToolResult::err(format!(
+                    "ask_user: the user did not answer within {}s. Pick the option you \
+                     recommended (or the most sensible one), say in your reply that you \
+                     asked and got no answer, and continue.",
+                    self.timeout.as_secs()
+                ))
+            }
             // The turn was cancelled, or the pending question was cleared.
-            Ok(Err(_)) => ToolResult::err(
-                "ask_user: the question was cancelled before it was answered. Stop and \
-                 let the user know you were waiting on it.",
-            ),
+            Ok(Err(_)) => {
+                expire(ctx, id);
+                ToolResult::err(
+                    "ask_user: the question was cancelled before it was answered. Stop and \
+                     let the user know you were waiting on it.",
+                )
+            }
             Ok(Ok(answer)) => {
                 let text = answer.text.trim();
                 if text.is_empty() {
@@ -230,18 +258,69 @@ impl Tool for AskUserTool {
                          need it.",
                     );
                 }
-                let _ = id;
-                ToolResult::ok(match answer.option {
-                    Some(i) => format!(
-                        "User chose option {} ({}) for \"{question}\": {text}",
-                        i + 1,
-                        options[i].label
-                    ),
-                    None => format!("User answered \"{question}\": {text}"),
-                })
+                // A single-select answer that arrived with several picks is a
+                // client bug; keep the first rather than failing a turn over it.
+                let picks: Vec<usize> = answer
+                    .options
+                    .into_iter()
+                    .filter(|i| *i < options.len())
+                    .take(if multi { usize::MAX } else { 1 })
+                    .collect();
+                ToolResult::ok(restate(&question, &options, recommended, &picks, text))
             }
         }
     }
+}
+
+/// Put the question back in the answer.
+///
+/// The model asked this question one tool-call ago, and a bare "PDF" is enough
+/// for a human reading the log. It is not enough for a quantized local model, and
+/// this is not hypothetical: the first version of this tool replied with the
+/// answer alone and the model came back confused about which question it was
+/// answering, because a chat template that renders tool results without the
+/// matching call leaves the answer floating. Restating costs a couple of dozen
+/// tokens once per question and removes the ambiguity.
+fn restate(
+    question: &str,
+    options: &[QuestionOption],
+    recommended: Option<usize>,
+    picks: &[usize],
+    text: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Question you asked: \"{question}\"\n"));
+    let offered: Vec<String> = options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let detail = o.detail.as_deref().map(|d| format!(" - {d}")).unwrap_or_default();
+            let rec = if recommended == Some(i) { " (you recommended)" } else { "" };
+            format!("{}: {}{detail}{rec}", i + 1, o.label)
+        })
+        .collect();
+    out.push_str(&format!("Options you offered: {}\n", offered.join(" | ")));
+    if picks.is_empty() {
+        out.push_str(&format!("User typed their own answer, not one of the options: \"{text}\""));
+    } else {
+        let chosen: Vec<String> = picks
+            .iter()
+            .map(|i| format!("{}: {}", i + 1, options[*i].label))
+            .collect();
+        out.push_str(&format!("User chose: {}", chosen.join(" + ")));
+        // Typed text alongside a pick is the interesting case: the user accepted
+        // an option and added a constraint the model has to honour.
+        let typed = text.trim();
+        let labels: String = picks
+            .iter()
+            .map(|i| options[*i].label.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !typed.is_empty() && typed != labels {
+            out.push_str(&format!("\nUser also said: \"{typed}\""));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -258,6 +337,211 @@ mod tests {
         AskUserTool::default().with_timeout(std::time::Duration::from_millis(120))
     }
 
+    /// A question that times out has to close in *every* window. The reply
+    /// channel is dead by then, so the shells holding the sender cannot report
+    /// it, and the card would keep offering an answer to a tool call that has
+    /// already returned.
+    #[tokio::test]
+    async fn an_unanswered_question_tells_the_front_ends_it_closed() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: Some(etx),
+            permits: Vec::new(),
+        };
+        let (idx, mut iqx) = oneshot::channel::<u64>();
+        // Deliberately not awaited: the watcher holds the reply sender open past
+        // the tool's timeout, which is the whole point. Dropping the sender would
+        // put the tool on the *cancelled* arm and this would measure something
+        // else. The runtime reclaims it when the test ends.
+        tokio::spawn(async move {
+            let (q, reply) = rx.recv().await.unwrap();
+            let _ = idx.send(q.id);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(reply);
+        });
+        let r = tool()
+            .run(json!({"question": "Which format?", "options": [{"label": "PDF"}]}), &ctx, &sink())
+            .await;
+        let qid = iqx.await.unwrap();
+        let said = format!("{}{}", r.output, r.error.clone().unwrap_or_default());
+        assert!(said.contains("did not answer within"), "{said}");
+        let ev = erx.recv().await.expect("the expiry must be announced");
+        match ev {
+            crate::event::EngineEvent::QuestionExpired { id } => assert_eq!(id, qid),
+            other => panic!("expected QuestionExpired, got {other:?}"),
+        }
+        assert!(erx.try_recv().is_err(), "exactly one expiry per question");
+    }
+
+    /// An answered question gets no expiry: the front end already settled the
+    /// card, and a second "closed" signal would read as a contradiction.
+    #[tokio::test]
+    async fn an_answered_question_is_not_reported_as_expired() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: Some(etx),
+            permits: Vec::new(),
+        };
+        tokio::spawn(async move {
+            let (_q, reply) = rx.recv().await.unwrap();
+            reply.send(Answer { text: "PDF".into(), options: vec![0] }).unwrap();
+        });
+        let r = tool()
+            .run(json!({"question": "Which format?", "options": [{"label": "PDF"}]}), &ctx, &sink())
+            .await;
+        assert!(r.ok, "{}", r.output);
+        assert!(erx.try_recv().is_err(), "an answer is not an expiry");
+    }
+
+    /// The answer has to name the question it answers. A quantized local model
+    /// that receives a bare "PDF" two tool calls later does not know which
+    /// question it was.
+    #[tokio::test]
+    async fn the_answer_carries_the_question_and_the_offered_options() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
+        };
+        let h = tokio::spawn(async move {
+            let (q, reply) = rx.recv().await.unwrap();
+            reply
+                .send(Answer { text: "Markdown".into(), options: vec![0] })
+                .unwrap();
+            q.question
+        });
+        let r = tool()
+            .run(
+                json!({
+                    "question": "Which output format?",
+                    "options": [
+                        {"label": "Markdown", "detail": "editable"},
+                        {"label": "PDF", "detail": "prints well"}
+                    ],
+                    "recommended": 1
+                }),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        assert!(r.ok, "{}", r.text());
+        let q = h.await.unwrap();
+        let out = r.text();
+        assert!(out.contains(&format!("Question you asked: \"{q}\"")), "{out}");
+        assert!(out.contains("1: Markdown - editable"), "{out}");
+        assert!(out.contains("(you recommended)"), "{out}");
+        assert!(out.contains("User chose: 1: Markdown"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_multi_answer_reports_every_choice() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
+        };
+        let h = tokio::spawn(async move {
+            let (q, reply) = rx.recv().await.unwrap();
+            assert!(q.multi, "the multi flag did not reach the front end");
+            reply
+                .send(Answer {
+                    text: "Charts, Summary".into(),
+                    options: vec![2, 0],
+                })
+                .unwrap();
+        });
+        let r = tool()
+            .run(
+                json!({
+                    "question": "Which sections?",
+                    "multi": true,
+                    "options": [{"label": "Summary"}, {"label": "Notes"}, {"label": "Charts"}]
+                }),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        assert!(r.ok, "{}", r.text());
+        h.await.unwrap();
+        let out = r.text();
+        assert!(out.contains("3: Charts + 1: Summary"), "{out}");
+    }
+
+    /// A typed answer is not a choice from the model's list, and saying so is how
+    /// the model learns it missed a constraint.
+    #[tokio::test]
+    async fn a_typed_answer_is_labelled_as_typed() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
+        };
+        let h = tokio::spawn(async move {
+            let (_q, reply) = rx.recv().await.unwrap();
+            reply
+                .send(Answer { text: "make it landscape".into(), options: vec![] })
+                .unwrap();
+        });
+        let r = tool()
+            .run(
+                json!({"question": "Paper size?", "options": [{"label": "A4"}, {"label": "Letter"}]}),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        assert!(r.ok, "{}", r.text());
+        h.await.unwrap();
+        assert!(r.text().contains("User typed their own answer"), "{}", r.text());
+    }
+
+    /// Picking an option and adding a note is the common real case: honour both.
+    #[tokio::test]
+    async fn a_pick_with_a_note_keeps_both() {
+        let out = restate(
+            "Which format?",
+            &[QuestionOption { label: "PDF".into(), detail: None }],
+            None,
+            &[0],
+            "PDF, but landscape",
+        );
+        assert!(out.contains("User chose: 1: PDF"), "{out}");
+        assert!(out.contains("User also said: \"PDF, but landscape\""), "{out}");
+    }
+
+    /// A single-select client that sends several picks is a client bug; take the
+    /// first rather than failing the turn.
+    #[test]
+    fn single_select_collapses_extra_picks() {
+        let out = restate(
+            "Which?",
+            &[
+                QuestionOption { label: "A".into(), detail: None },
+                QuestionOption { label: "B".into(), detail: None },
+            ],
+            None,
+            &[1],
+            "B",
+        );
+        assert!(out.contains("User chose: 2: B"), "{out}");
+    }
+
     /// The happy path, and the shape the model sees: an option pick is reported
     /// as a choice, not as a bare string.
     #[tokio::test]
@@ -267,6 +551,8 @@ mod tests {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
         };
         let t = tool();
         let h = tokio::spawn(async move {
@@ -276,7 +562,7 @@ mod tests {
             assert_eq!(q.recommended, Some(1));
             assert!(q.allow_custom);
             reply
-                .send(Answer { text: "PDF".into(), option: Some(1) })
+                .send(Answer { text: "PDF".into(), options: vec![1] })
                 .unwrap();
         });
         let r = t
@@ -292,7 +578,10 @@ mod tests {
             .await;
         h.await.unwrap();
         assert!(r.ok, "{:?}", r.error);
-        assert!(r.output.contains("User chose option 2 (PDF)"), "{}", r.output);
+        // The new wording, asserted here too so both tests describe the same
+        // contract: choice, label, and the question the choice answers.
+        assert!(r.output.contains("User chose: 2: PDF"), "{}", r.output);
+        assert!(r.output.contains("Question you asked:"), "{}", r.output);
         assert!(r.output.contains("PDF"), "{}", r.output);
     }
 
@@ -304,11 +593,13 @@ mod tests {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
         };
         let h = tokio::spawn(async move {
             let (_, reply) = rx.recv().await.unwrap();
             reply
-                .send(Answer { text: "make it landscape".into(), option: None })
+                .send(Answer { text: "make it landscape".into(), options: vec![] })
                 .unwrap();
         });
         let r = tool()
@@ -320,7 +611,7 @@ mod tests {
             .await;
         h.await.unwrap();
         assert!(r.ok);
-        assert!(r.output.contains("User answered"), "{}", r.output);
+        assert!(r.output.contains("User typed their own answer"), "{}", r.output);
         assert!(r.output.contains("make it landscape"), "{}", r.output);
     }
 
@@ -343,6 +634,8 @@ mod tests {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
         };
         let r = tool()
             .run(json!({"question": "Which?", "options": [{"label": "a"}]}), &ctx, &sink())
@@ -360,6 +653,8 @@ mod tests {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
         };
         let r = tool()
             .run(json!({"question": "Which?", "options": [{"label": "a"}]}), &ctx, &sink())
@@ -376,6 +671,8 @@ mod tests {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
         };
         let t = AskUserTool::default().with_timeout(std::time::Duration::from_secs(60));
         let h = tokio::spawn(async move {
@@ -424,11 +721,13 @@ mod tests {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
         };
         let h = tokio::spawn(async move {
             let (q, reply) = rx.recv().await.unwrap();
             assert_eq!(q.recommended, None, "bad index survived");
-            reply.send(Answer { text: "a".into(), option: Some(0) }).unwrap();
+            reply.send(Answer { text: "a".into(), options: vec![0] }).unwrap();
         });
         let r = tool()
             .run(

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
-  import { invoke, Channel, transportKind, gatewayRole, onReconnect } from './lib/transport'
+  import { invoke, Channel, transportKind, gatewayRole, onReconnect, onResync } from './lib/transport'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import type {
     ApprovalAnswer,
@@ -10,6 +10,8 @@
     ModelInfo,
     SearchHit,
     Session,
+    StoredMessage,
+    WorkspaceRow,
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
   import { Transcript, linkProbe, subjectFor } from './lib/transcript'
@@ -27,6 +29,23 @@
   let hostState = $state<HostState | null>(null)
 
   let sessions = $state<Session[]>([])
+  /**
+   * Folders the sidebar offers. The store owns this list: it is the set of
+   * folders that were added unioned with the set that hold sessions, so a
+   * folder you never added but have work in still shows, and an empty one you
+   * did add stays.
+   */
+  let workspaces = $state<WorkspaceRow[]>([])
+  /** Which groups are folded up. Per-client, not on the host: it says how much
+   * of your own screen you want to spend on folders. */
+  let wsCollapsed = $state<Set<string>>(loadWsCollapsed())
+  /** The folder a not-yet-created session will use. Set by a workspace's `+`. */
+  let draftWorkspace = $state('')
+  let wsAdding = $state(false)
+  let wsAddDraft = $state('')
+  let wsAddErr = $state('')
+  let wsRenaming = $state('')
+  let wsLabelDraft = $state('')
   let query = $state('')
   let hits = $state<SearchHit[]>([])
   let searchErr = $state('')
@@ -63,7 +82,7 @@
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
-  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway'
+  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws'
 
   /** Mirror of the desktop's GatewayStatus. Not reachable over the gateway
       itself: the payload carries the token inside ready-to-open URLs. */
@@ -87,6 +106,8 @@
   type Menu = {
     kind: MenuKind
     sessionId?: number
+    /** Which folder a 'ws' menu is about. */
+    wsPath?: string
     left: number
     right: number
     top: number
@@ -133,8 +154,197 @@
     return sessions.find((x) => x.id === id)?.title ?? 'session'
   }
 
-  function openMenu(kind: MenuKind, anchor: HTMLElement, sessionId?: number) {
-    if (menu && menu.kind === kind && menu.sessionId === sessionId) {
+  const WS_KEY = 'cwoffee.wsCollapsed.v1'
+
+  function loadWsCollapsed(): Set<string> {
+    try {
+      const raw = localStorage.getItem(WS_KEY)
+      return new Set<string>(raw ? (JSON.parse(raw) as string[]) : [])
+    } catch {
+      return new Set()
+    }
+  }
+
+  function saveWsCollapsed() {
+    try {
+      localStorage.setItem(WS_KEY, JSON.stringify([...wsCollapsed]))
+    } catch {
+      /* private mode: a lost fold preference is not worth an error banner */
+    }
+  }
+
+  function basenameOf(p: string): string {
+    const parts = p.replace(/\/+$/, '').split('/')
+    return parts[parts.length - 1] || p
+  }
+
+  function wsLabelOf(w: { label: string; path: string }): string {
+    // An empty label means "show the folder name", which is the store's
+    // convention and what people want nine times out of ten.
+    return w.label || basenameOf(w.path)
+  }
+
+  type WsGroup = { path: string; label: string; list: Session[] }
+
+  /// `new_session` reserves a row before anything has been said in it, so that a
+  /// `+` click has somewhere to write the first message. A row like that is not a
+  /// conversation, and showing it turned "the session is created lazily" back into
+  /// a sidebar full of "new session" clutter as soon as anyone pressed `+`,
+  /// Cmd-N, or a harness. It becomes visible when it gets its first message.
+  function isBareDraft(s: Session) {
+    return s.message_count === 0 && /^new session$/i.test(s.title)
+  }
+
+  const wsGroups = $derived.by((): WsGroup[] => {
+    const byPath = new Map<string, Session[]>()
+    for (const s of sessions) {
+      if (isBareDraft(s)) continue
+      const k = s.workspace ?? ''
+      const arr = byPath.get(k) ?? []
+      arr.push(s)
+      byPath.set(k, arr)
+    }
+    const out: WsGroup[] = []
+    const seen = new Set<string>()
+    for (const w of workspaces) {
+      out.push({ path: w.path, label: wsLabelOf(w), list: byPath.get(w.path) ?? [] })
+      seen.add(w.path)
+    }
+    // A session in a folder that is not on the list still has to be reachable.
+    // Hiding work because the sidebar had no row for it is the failure mode.
+    for (const [path, list] of byPath) {
+      if (seen.has(path)) continue
+      out.push({ path, label: path ? basenameOf(path) : 'No workspace', list })
+      seen.add(path)
+    }
+    return out
+  })
+
+  const draftWsLabel = $derived(
+    draftWorkspace
+      ? wsLabelOf(workspaces.find((w) => w.path === draftWorkspace) ?? {
+          label: '',
+          path: draftWorkspace,
+        })
+      : '',
+  )
+
+  function isOpen(path: string) {
+    return !wsCollapsed.has(path)
+  }
+
+  function expandWs(path: string) {
+    const next = new Set(wsCollapsed)
+    next.delete(path)
+    wsCollapsed = next
+    saveWsCollapsed()
+  }
+
+  function toggleWs(path: string) {
+    if (wsCollapsed.has(path)) expandWs(path)
+    else {
+      wsCollapsed = new Set([...wsCollapsed, path])
+      saveWsCollapsed()
+    }
+  }
+
+  async function loadWorkspaces() {
+    try {
+      workspaces = await invoke<WorkspaceRow[]>('list_workspaces')
+    } catch (e) {
+      // The grouping still works from the sessions themselves; this list only
+      // adds the empty folders nobody has written to yet.
+      workspaces = []
+      pageLog(`list_workspaces failed: ${cleanErr(e)}`)
+    }
+  }
+
+  /**
+   * `+` on a workspace row. No session row is created: the greeting opens with
+   * the folder preselected, and the session comes into existence when the first
+   * message is sent. Creating a row on click is how sidebars fill up with
+   * "new session" rows that were never used.
+   */
+  function newSessionIn(path: string) {
+    newSession()
+    draftWorkspace = path
+    expandWs(path)
+  }
+
+  async function addFolderFor(path: string) {
+    wsAddErr = ''
+    try {
+      const added = await invoke<string>('add_workspace', { path })
+      await loadWorkspaces()
+      expandWs(added)
+    } catch (e) {
+      wsAddErr = cleanErr(e)
+      pageLog(`add_workspace failed: ${String(e)}`)
+    }
+  }
+
+  async function addFolderTyped() {
+    const path = wsAddDraft.trim()
+    if (!path) return
+    await addFolderFor(path)
+    if (!wsAddErr) {
+      wsAddDraft = ''
+      wsAdding = false
+    }
+  }
+
+  /**
+   * Desktop only. Picking is deliberately separate from applying: adding a
+   * folder to the list must not move the tools out from under the session you
+   * are standing in.
+   */
+  async function addFolderPicked() {
+    wsAddErr = ''
+    try {
+      const picked = (await invoke('pick_workspace')) as string | null
+      if (picked) await addFolderFor(picked)
+    } catch (e) {
+      wsAddErr = cleanErr(e)
+      pageLog(`pick_workspace for add failed: ${String(e)}`)
+    }
+  }
+
+  async function removeFolder(path: string) {
+    menu = null
+    wsAddErr = ''
+    try {
+      await invoke('remove_workspace', { path })
+      await loadWorkspaces()
+    } catch (e) {
+      wsAddErr = cleanErr(e)
+    }
+  }
+
+  function startWsRename(path: string, current: string) {
+    menu = null
+    wsRenaming = path
+    wsLabelDraft = current
+  }
+
+  async function commitWsRename() {
+    if (!wsRenaming) return
+    const path = wsRenaming
+    wsRenaming = ''
+    try {
+      await invoke('set_workspace_label', { path, label: wsLabelDraft })
+      await loadWorkspaces()
+    } catch (e) {
+      wsAddErr = cleanErr(e)
+    }
+  }
+
+  function openMenu(
+    kind: MenuKind,
+    anchor: HTMLElement,
+    sessionId?: number,
+    wsPath?: string,
+  ) {
+    if (menu && menu.kind === kind && menu.sessionId === sessionId && menu.wsPath === wsPath) {
       menu = null
       return
     }
@@ -145,6 +355,7 @@
     menu = {
       kind,
       sessionId,
+      wsPath,
       left: r.left,
       right: r.right,
       top: r.top,
@@ -537,6 +748,10 @@
   // to be on screen, which read as "this conversation lost its history".
   let viewId = $state<number | null>(null)
   let turnSessionId = $state<number | null>(null)
+  /// Whether the turn currently in flight is one *this* client started. Only
+  /// that case is allowed to hold `busy` against the host's answer: see
+  /// `syncBusy`.
+  let turnOurs = false
   // Events of the in-flight turn, kept so returning to its session restores the
   // partial answer instead of showing a truncated one. Bounded: a runaway stream
   // must not grow this without limit.
@@ -638,14 +853,23 @@
           void invoke('respond_question', {
             id: ev.d.id,
             text: r.text,
-            option: r.option,
+            options: r.options,
           }).catch((e) => {
             pageLog(`respond_question failed: ${cleanErr(String(e))}`)
+            // The engine stopped waiting before we answered. Close the card the
+            // same way the expiry event would, rather than leaving a button that
+            // fails every time it is pressed.
+            transcript?.expireQuestion(ev.d.id)
           })
         })
         break
       case 'questionAnswered':
         transcript?.settleQuestion(ev.d.id)
+        break
+      case 'questionExpired':
+        // The tool stopped waiting: timeout, or the turn was cancelled with the
+        // question still parked. Left alone, the card looks answerable forever.
+        transcript?.expireQuestion(ev.d.id)
         break
       case 'approvalRequested':
         approval = { id: ev.d.id, tool: ev.d.tool, risk: ev.d.risk, summary: ev.d.summary }
@@ -705,6 +929,7 @@
       case 'turnEnd':
         if (viewId === turnSessionId) transcript?.flushNow()
         busy = false
+        turnOurs = false
         turnSessionId = null
         liveBuf = []
         sentDraft = null
@@ -1044,8 +1269,14 @@
     // command queue preserves the order, so start_turn lands after it.
     if (viewId === null) {
       try {
-        const id = await invoke<number>('new_session', { title: 'new session' })
+        // The folder the `+` on a workspace row preselected. Empty means "wherever
+        // the host is now", which is the old behaviour.
+        const id = await invoke<number>('new_session', {
+          title: 'new session',
+          workspace: draftWorkspace || null,
+        })
         viewId = id
+        draftWorkspace = ''
       } catch (e) {
         pageLog(`new_session on first send failed: ${e}`)
         return
@@ -1058,6 +1289,7 @@
     // is recorded, the resync it triggers wipes the message and cannot put it
     // back.
     turnSessionId = viewId
+    turnOurs = true
     sentDraft = { text, atts: shown }
     liveBuf = []
     transcript?.addUser(text, shown)
@@ -1071,6 +1303,10 @@
       pageLog(`turn sent with ${atts.length} attachment(s)`)
     } catch (e) {
       pageLog(`start_turn failed: ${e}`)
+      // Nothing is running, so this client must stop claiming otherwise: with
+      // `turnOurs` left set, `syncBusy` refuses to correct `busy` and a later
+      // host-state read cannot undo the mistake.
+      turnOurs = false
     }
   }
 
@@ -1089,6 +1325,31 @@
     }
   }
 
+  /**
+   * Reconcile the local "a turn is running" flag with the host's.
+   *
+   * A client can end up believing a turn is still running when it is not: it
+   * received `turnStart`, then the socket hiccuped or it fell behind the event
+   * stream and never got the `turnEnd`. The symptom is a composer that stays
+   * disabled with nothing computing, which reads as a frozen app. Only the host
+   * knows whether a turn is up, so for any turn this client did not start, the
+   * host's answer wins.
+   */
+  function syncBusy(h: HostState) {
+    // A turn this client started is trusted locally: the host flips `busy` a
+    // command-queue hop after we send, and reading false in that window would
+    // re-enable the composer mid-send.
+    if (turnOurs) return
+    if (busy !== h.busy) {
+      pageLog(`busy corrected ${busy}->${h.busy} from host state`)
+      // A stale `turnSessionId` misroutes the live buffer, so a client that
+      // missed the end of a turn has to let go of it too.
+      turnSessionId = null
+      liveBuf = []
+      busy = h.busy
+    }
+  }
+
   async function refreshState() {
     // The pill says "on :8099 · 2 devices"; a value cached at boot would be a
     // guess within a minute. Cheap local read, so refresh it with the rest.
@@ -1099,6 +1360,7 @@
         mode = hostState.mode
         thinking = hostState.reasoning
         model = hostState.model
+        syncBusy(hostState)
       }
     } catch (e) {
       ipc = { ok: false, msg: String(e).slice(0, 140) }
@@ -1145,16 +1407,20 @@
         models: ModelInfo[]
         session_id: number | null
         page: { messages: any[]; has_older: boolean }
+        workspaces?: WorkspaceRow[]
       }>('bootstrap')
       hostState = b.state
       if (hostState) {
         mode = hostState.mode
         thinking = hostState.reasoning
         model = hostState.model
+        syncBusy(hostState)
       }
       sessions = b.sessions ?? []
       recordSeen(sessions)
       applyUnread(sessions)
+      // The folder list arrives with the sessions rather than as a fifth call.
+      workspaces = b.workspaces ?? []
       models = b.models ?? []
       modelErr = ''
       const page = b.page ?? { messages: [], has_older: false }
@@ -1176,6 +1442,10 @@
   }
 
   async function loadSessions() {
+    // Fired alongside, not awaited: the folder list is a second read of the same
+    // store, and on a phone link waiting for it in series would add a whole round
+    // trip to every refresh for information that is not on the critical path.
+    void loadWorkspaces()
     try {
       sessions = await invoke<Session[]>('list_sessions')
       // Order matters: record what the open session looks like, then decide who
@@ -1256,6 +1526,7 @@
     viewMsgCount = 0
     hasOlder = false
     oldestId = null
+    draftWorkspace = ''
     transcript?.clear()
     try {
       invoke('clear_session')
@@ -1393,9 +1664,16 @@
       // the `selftest` session this harness deletes by id, and auto-titling renames
       // them anyway, so an exact-title delete never found them. Ten rows of debris
       // per run was the result. Sweep by the marker every prompt here starts with.
-      async function sweepSelftest(where: string) {
+      async function sweepSelftest(where: string, overId = 0) {
         const all = await invoke<Session[]>('list_sessions')
-        const junk = all.filter((s) => /^selftest/i.test(s.title))
+        // Titles are useless for this: a session renames itself from its first
+        // message, so the harness's own sessions end up titled "Use the exec tool
+        // to ..." and a title filter quietly sweeps nothing while leaving
+        // turn-after-turn of debris in the user's sidebar. Ids are monotonic, so
+        // everything created after the run started is the run's own doing.
+        const junk = all.filter(
+          (s) => s.id > overId || /^selftest/i.test(s.title),
+        )
         for (const s of junk) await invoke('delete_session', { id: s.id }).catch(() => {})
         if (junk.length) pageLog(`selftest sweep (${where}): removed ${junk.length} row(s)`)
         return junk.length
@@ -1423,7 +1701,8 @@
         await invoke('set_mode', { mode: 'auto' })
         pageLog(`selftest pinned mode=auto (was ${mode0}, reasoning ${reasoning0})`)
       }
-      await sweepSelftest('start')
+      const idFloor = Math.max(0, ...(await invoke<Session[]>('list_sessions')).map((s) => s.id))
+      await sweepSelftest('start', idFloor)
       const before = await invoke<Session[]>('list_sessions')
       await invoke('new_session', { title: 'selftest' })
       await new Promise((r) => setTimeout(r, 400))
@@ -1702,6 +1981,11 @@
       if (wsTmp !== '/tmp') fail(`workspace switch did not land: ${wsTmp}`)
 
       await invoke('set_workspace', { path: wsBefore })
+      // Undo the sidebar entry the /tmp switch created. A check that leaves a
+      // "tmp" folder in the user's sidebar forever is the same mistake as the
+      // one that left their thinking effort set to low: the harness borrowed
+      // state, so it has to give it back.
+      await invoke('remove_workspace', { path: '/tmp' }).catch(() => {})
       await new Promise((r) => setTimeout(r, 500))
       const wsBack = (await invoke<HostState>('session_state')).workspace
       if (wsBack !== wsBefore) fail(`workspace was not restored: ${wsBack}`)
@@ -2075,7 +2359,11 @@
       {
         // In an object, not a bare local: TypeScript narrows a closure-assigned
         // local to never and the assertions stop type-checking.
-        const got: { v: { text: string; option: number | null } | null } = { v: null }
+        const click = (n: Element | undefined | null) =>
+          n?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+
+        // --- single choice: nothing is sent until Send is pressed -------------
+        const got: { v: { text: string; options: number[] } | null } = { v: null }
         transcript?.showQuestion(
           {
             id: 900_001,
@@ -2086,31 +2374,96 @@
             ],
             recommended: 1,
             allow_custom: true,
+            multi: false,
           },
           (r) => (got.v = r),
         )
-        const card = document.querySelector('.blk-ask')
+        let card = document.querySelector('.blk-ask')
         if (!card) fail('question card did not render')
+        else if (!card.isConnected) fail('the question card was built but never attached')
         else {
           if (!card.textContent?.includes('Which output should this produce?'))
             fail('question card is missing the question')
           const opts = card.querySelectorAll('.ask-opt')
           if (opts.length !== 2) fail(`question card shows ${opts.length} options, expected 2`)
-          const rec = card.querySelectorAll('.ask-opt.is-rec')
-          if (rec.length !== 1) fail('exactly one option must be badged as recommended')
+          if (card.querySelectorAll('.ask-opt.is-rec').length !== 1)
+            fail('exactly one option must be badged as recommended')
+          // The badge sits with the option it describes, not in its own band.
+          const badge = card.querySelector('.ask-badge')
+          if (!badge?.closest('.ask-opt-title')) fail('the recommended badge is not inline with its option title')
           if (!card.querySelector('.ask-input')) fail('no typed-answer affordance')
-          opts[1]?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-          if (!got.v || got.v.option !== 1 || got.v.text !== 'PDF')
-            fail(`option click produced ${JSON.stringify(got.v)}`)
-          // A second click must not send a second answer: the engine has already
+          const send = card.querySelector<HTMLButtonElement>('.ask-submit')
+          if (!send) fail('no explicit submit on the question card')
+          if (send?.disabled !== true) fail('send must start disabled - a question with no choice is not an answer')
+
+          click(opts[1])
+          if (got.v) fail('clicking an option answered the model on its own')
+          if (send!.disabled) fail('send stayed disabled after a choice was made')
+          click(send)
+          if (!got.v || got.v.options.join(',') !== '1' || got.v.text !== 'PDF')
+            fail(`send produced ${JSON.stringify(got.v)}`)
+          // A second submit must not send a second answer: the engine has already
           // dropped the reply sender, and a second call is an error to the user.
-          opts[0]?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-          if (got.v?.option !== 1) fail('a second option overwrote the first answer')
+          click(opts[0])
+          click(send)
+          if (got.v?.options.join(',') !== '1') fail('a second choice overwrote the first answer')
+          if (!card.querySelector('.ask-answered')) fail('the answered card does not say what was sent')
           card.remove()
         }
+
+        // --- multi choice: several boxes, and picks are kept separate ----------
+        const multi: { v: { text: string; options: number[] } | null } = { v: null }
+        transcript?.showQuestion(
+          {
+            id: 900_002,
+            question: 'Which formats do you want?',
+            options: [{ label: 'PDF' }, { label: 'DOCX' }, { label: 'XLSX' }],
+            recommended: 0,
+            allow_custom: true,
+            multi: true,
+          },
+          (r) => (multi.v = r),
+        )
+        card = document.querySelector('.blk-ask')
+        if (!card) fail('multi question card did not render')
+        else {
+          const opts = card.querySelectorAll('.ask-opt')
+          click(opts[0])
+          click(opts[2])
+          click(opts[2]) // toggles back off
+          click(card.querySelector('.ask-submit'))
+          if (!multi.v || multi.v.options.join(',') !== '0')
+            fail(`multi select produced ${JSON.stringify(multi.v)}`)
+          if (card.querySelectorAll('.ask-opt.is-sel').length !== 1)
+            fail('a second click must untick an option, not add it twice')
+          card.remove()
+        }
+
+        // A question that closed with no answer must close in the view too.
+        transcript?.showQuestion(
+          {
+            id: 900_003,
+            question: 'Still there?',
+            options: [{ label: 'Yes' }, { label: 'No' }],
+            allow_custom: false,
+            multi: false,
+          },
+          () => fail('an expired question must not send an answer'),
+        )
+        card = document.querySelector('.blk-ask:last-of-type')
+        if (!card) fail('expiry question card did not render')
+        else {
+          transcript?.expireQuestion(900_003)
+          if (!card.classList.contains('expired')) fail('an expired card does not say so')
+          if (!(card.querySelector('.ask-submit') as HTMLButtonElement).disabled)
+            fail('an expired card still offers Send')
+          click(card.querySelector('.ask-submit'))
+          card.remove()
+        }
+
         // An answer for a question nobody asked is an error, not a shrug.
         try {
-          await invoke('respond_question', { id: 900_999, text: 'x', option: null })
+          await invoke('respond_question', { id: 900_999, text: 'x', options: [] })
           fail('respond_question accepted an id that was never asked')
         } catch {
           /* expected */
@@ -2138,7 +2491,210 @@
         pageLog('tool header subject ok')
       }
 
-      await sweepSelftest('end')
+      // The `+N -M` chip and the diff inside the card. Rendered from stored
+      // history rather than from a live model turn: the engine tests cover where
+      // the numbers come from, and this covers what the card does with them -
+      // including the reload path, which is where a card that only works live
+      // shows up as "the numbers disappeared".
+      {
+        transcript?.clear()
+        const history: StoredMessage[] = [
+          {
+            id: 90_001,
+            session_id: 0,
+            role: 'assistant',
+            content: 'editing the note',
+            reasoning: '',
+            tool_call_id: null,
+            tool_calls_json: JSON.stringify([
+              {
+                id: 'c1',
+                name: 'edit_file',
+                arguments: '{"path":"notes.md","old_text":"one","new_text":"two"}',
+              },
+            ]),
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+          },
+          {
+            id: 90_002,
+            session_id: 0,
+            role: 'tool',
+            content: '1 replacement, 12 -> 13 lines',
+            tool_call_id: 'c1',
+            tool_calls_json: '',
+            reasoning: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+            changes: [
+              {
+                path: 'notes.md',
+                added: 2,
+                removed: 1,
+                created: false,
+                diff: '@@ -1,3 +1,4 @@\n alpha\n-bravo\n+bravo two\n+charlie\n delta\n',
+              },
+            ],
+          },
+          {
+            id: 90_003,
+            session_id: 0,
+            role: 'assistant',
+            content: 'and a new file',
+            reasoning: '',
+            tool_call_id: null,
+            tool_calls_json: JSON.stringify([
+              { id: 'c2', name: 'write_file', arguments: '{"path":"fresh.md","content":"x"}' },
+            ]),
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+          },
+          {
+            id: 90_004,
+            session_id: 0,
+            role: 'tool',
+            content: 'wrote 4 lines',
+            tool_call_id: 'c2',
+            tool_calls_json: '',
+            reasoning: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+            changes: [{ path: 'fresh.md', added: 4, removed: 0, created: true }],
+          },
+        ]
+        // ask_user gets no tool card in history either. A card headed `ASK_USER`
+        // is a mechanism with the question missing.
+        transcript?.loadHistory([
+          {
+            id: 90_010,
+            session_id: 0,
+            role: 'assistant',
+            content: 'one question first',
+            reasoning: '',
+            tool_call_id: null,
+            tool_calls_json: JSON.stringify([
+              {
+                id: 'c3',
+                name: 'ask_user',
+                arguments: '{"question":"Which format?","options":[{"label":"PDF"}],"multi":false}',
+              },
+            ]),
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+          },
+          {
+            id: 90_011,
+            session_id: 0,
+            role: 'tool',
+            content: 'User chose: PDF',
+            tool_call_id: 'c3',
+            tool_calls_json: '',
+            reasoning: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+          },
+        ])
+        {
+          const asked = [...document.querySelectorAll('.blk-note')].filter(
+            (n) => n.textContent?.includes('Which format?'),
+          )
+          if (!asked.length) fail('a stored ask_user did not render as the question')
+          const asTool = [...document.querySelectorAll('.blk-tool')].filter(
+            (n) => n.querySelector('.tool-name')?.textContent === 'ask_user',
+          )
+          if (asTool.length) fail('ask_user rendered as a tool card in history')
+          // The answer belongs to the same block, so it must not be dropped.
+          if (!asked[0]?.textContent?.includes('User chose'))
+            fail('the stored answer to ask_user went nowhere')
+        }
+        transcript?.clear()
+        transcript?.loadHistory(history)
+        const cards = document.querySelectorAll('.blk-tool')
+        if (cards.length !== 2) fail(`expected 2 tool cards, saw ${cards.length}`)
+        const edited = cards[0]?.querySelector('.tool-stat')
+        if (!edited) fail('the edit card shows no +N -M chip')
+        else if (edited.textContent !== '+2 -1')
+          fail(`edit chip reads ${JSON.stringify(edited.textContent)}, want "+2 -1"`)
+        if (edited && !edited.closest('.blk-tool')?.classList.contains('has-changes'))
+          fail('a card with changes is not marked, so it cannot be styled')
+        const adds = cards[0]?.querySelectorAll('.tool-diff .diff-add')
+        if (adds?.length !== 2) fail(`diff shows ${adds?.length} added lines, want 2`)
+        if (!cards[0]?.querySelector('.tool-diff .diff-del')) fail('diff shows no removed line')
+        if (!cards[0]?.querySelector('.tool-diff .diff-hunk')) fail('diff has no hunk header')
+        // A created file is `+4`, not `+4 -0`: there was nothing to remove.
+        const created = cards[1]?.querySelector('.tool-stat')
+        if (!created || created.textContent !== '+4')
+          fail(`created-file chip reads ${JSON.stringify(created?.textContent)}, want "+4"`)
+        if (cards[1]?.querySelector('.tool-diff'))
+          fail('a brand new file should not render a diff of nothing')
+        transcript?.clear()
+        pageLog('file change chip ok')
+      }
+
+      // Sidebar grouping. The claim being tested is the one the user sees: every
+      // session is inside a folder group, the folder the host is in is one of
+      // them, and the `+` on a row preselects that folder without creating a
+      // session row - sessions come into existence on the first message.
+      {
+        await loadWorkspaces()
+        const groups = wsGroups
+        if (!groups.length) fail('the sidebar has no workspace groups')
+        const inside = groups.reduce((n, g) => n + g.list.length, 0)
+        if (inside !== sessions.length)
+          fail(`grouping holds ${inside} of ${sessions.length} sessions`)
+        const cur = hostState?.workspace ?? ''
+        if (cur && !groups.some((g) => g.path === cur))
+          fail(`no group for the folder the tools are in (${cur})`)
+        if (document.querySelectorAll('.wsgrp').length !== groups.length)
+          fail('the rendered groups do not match the derived ones')
+
+        const before = await invoke<Session[]>('list_sessions')
+        const plus = document.querySelector('.ws-plus') as HTMLElement | null
+        if (!plus) fail('no inline + on a workspace row')
+        else {
+          plus.click()
+          if (!draftWorkspace) fail('the + did not preselect a folder')
+          if (viewId !== null) fail('the + switched to a session instead of opening a draft')
+          // Svelte flushes on a microtask, so the DOM a click produces is not
+          // there on the next statement. Reading it too early is a test bug, not
+          // a product bug, and it reads as one.
+          await new Promise<void>((r) => requestAnimationFrame(() => r()))
+          if (!document.querySelector('.empty-ws'))
+            fail('the greeting does not say which folder the draft will use')
+          const after = await invoke<Session[]>('list_sessions')
+          if (after.length !== before.length)
+            fail(`the + created ${after.length - before.length} session row(s); rows appear on first message`)
+          draftWorkspace = ''
+        }
+        pageLog('workspace sidebar ok')
+
+      // `busy` is client state, so it can go stale: a client that received a
+      // turnStart and then lost or fell behind the event stream never sees the
+      // turnEnd, and the composer stays disabled with nothing computing. That
+      // reads as a frozen app, and it is invisible until someone tries to type.
+      if (hostState && !hostState.busy && composerEl?.disabled)
+        fail('composer is disabled while the host says no turn is running')
+      }
+
+      await sweepSelftest('end', idFloor)
       await restoreSettings()
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
@@ -2307,7 +2863,12 @@
     // A phone that drops wifi, or whose first attempt raced a sleeping machine,
     // should come back on its own rather than sit on "connecting…" until someone
     // reloads the tab.
-    if (transportKind === 'gateway') onReconnect(() => void retryAttach())
+    if (transportKind === 'gateway') {
+      onReconnect(() => void retryAttach())
+      // The server said "you missed events". Some of them matter - `turnEnd`
+      // most of all - so re-read state instead of leaving a half-truth on screen.
+      onResync(() => void retryAttach())
+    }
     // One round trip in gateway mode; on a phone link this is the difference
     // between "a moment" and a wait you notice. Desktop keeps the parallel
     // calls because they are sub-millisecond over IPC.
@@ -2474,39 +3035,125 @@
           </button>
         {/each}
       {:else}
-        <div class="sesshead mt-2"><span>Sessions</span></div>
-        {#each sessions as s}
-          <div
-            class="sessrow {viewId === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''}"
+        <!-- Folders first, sessions underneath. The folder is what people
+             actually navigate by ("where did that spreadsheet go"), and a flat
+             list of sessions hides it. A group with no sessions still shows: a
+             folder you added and have not written in yet is information, not
+             clutter. -->
+        <div class="sesshead mt-2">
+          <span>Workspaces</span>
+          <button
+            class="iconbtn ws-addall"
+            aria-label="Add a folder"
+            title="Add a folder to the sidebar"
+            onclick={() => (wsAdding = !wsAdding)}
           >
-            {#if editingId === s.id}
-              <input
-                class="pill px-2 py-1 text-[12.5px] w-full"
-                bind:value={editTitle}
-                onkeydown={(e) => {
-                  if (e.key === 'Enter') commitRename()
-                  else if (e.key === 'Escape') editingId = null
-                }}
-                onblur={() => commitRename()}
-              />
-            {:else}
-              <!-- One line per session, no message count: the row is a target,
-                   not a report. Rename/delete live in a menu so the row stays
-                   quiet, and the dot is always laid out (invisible until unread)
-                   so titles do not shift when one arrives. -->
-              <button class="sessbtn" onclick={() => openSession(s.id)}>
-                <span class="sess-dot" aria-hidden="true"></span>
-                <span class="sess-title">{s.title}</span>
-              </button>
-              <button
-                class="iconbtn more"
-                data-menu
-                aria-label="More actions"
-                onclick={(e) => openMenu('row', e.currentTarget as HTMLElement, s.id)}
-              >
-                <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="2.6" cy="6" r="1.05" fill="currentColor"/><circle cx="6" cy="6" r="1.05" fill="currentColor"/><circle cx="9.4" cy="6" r="1.05" fill="currentColor"/></svg>
+            <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2.6v6.8M2.6 6h6.8" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
+          </button>
+        </div>
+        {#if wsAdding}
+          <div class="wsadd">
+            {#if transportKind === 'tauri'}
+              <button class="pill px-2 py-1 text-[12px]" onclick={() => void addFolderPicked()}>
+                Choose a folder…
               </button>
             {/if}
+            <input
+              class="pill px-2 py-1 text-[12px] w-full"
+              placeholder={transportKind === 'tauri' ? 'or type a path' : 'host path, e.g. ~/code/app'}
+              bind:value={wsAddDraft}
+              onkeydown={(e) => {
+                if (e.key === 'Enter') void addFolderTyped()
+                else if (e.key === 'Escape') {
+                  wsAdding = false
+                  wsAddDraft = ''
+                }
+              }}
+            />
+            {#if wsAddErr}<div class="ws-err">{wsAddErr}</div>{/if}
+          </div>
+        {/if}
+        {#each wsGroups as g (g.path || '\u0000none')}
+          {@const open = isOpen(g.path)}
+          <div class="wsgrp {open ? 'open' : 'closed'}">
+            <div class="wsrow">
+              {#if wsRenaming === g.path}
+                <input
+                  class="pill px-2 py-1 text-[12px] w-full"
+                  placeholder={basenameOf(g.path)}
+                  bind:value={wsLabelDraft}
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter') commitWsRename()
+                    else if (e.key === 'Escape') wsRenaming = ''
+                  }}
+                  onblur={() => commitWsRename()}
+                />
+              {:else}
+                <!-- The chevron is part of the label button: folding a folder is
+                     a navigation act and needs a target a thumb can hit. -->
+                <button class="wsbtn" onclick={() => toggleWs(g.path)} aria-expanded={open}>
+                  <svg class="ws-chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+                    <path d={open ? 'M2 3.5L5 6.5L8 3.5' : 'M3.5 2L6.5 5L3.5 8'} stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+                  </svg>
+                  <span class="ws-name" title={g.path}>{g.label}</span>
+                  <span class="ws-n">{g.list.length}</span>
+                </button>
+                {#if g.path}
+                  <button
+                    class="iconbtn ws-plus"
+                    aria-label="New session in {g.label}"
+                    title="New session in {g.label}"
+                    onclick={() => newSessionIn(g.path)}
+                  >
+                    <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2.6v6.8M2.6 6h6.8" stroke="currentColor" stroke-width="1.4" fill="none"/></svg>
+                  </button>
+                {/if}
+                <button
+                  class="iconbtn more"
+                  data-menu
+                  aria-label="Folder actions"
+                  onclick={(e) => openMenu('ws', e.currentTarget as HTMLElement, undefined, g.path)}
+                >
+                  <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="2.6" cy="6" r="1.05" fill="currentColor"/><circle cx="6" cy="6" r="1.05" fill="currentColor"/><circle cx="9.4" cy="6" r="1.05" fill="currentColor"/></svg>
+                </button>
+              {/if}
+            </div>
+            {#if open}
+              {#each g.list as s (s.id)}
+                <div
+                  class="sessrow {viewId === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''}"
+                >
+                  {#if editingId === s.id}
+                    <input
+                      class="pill px-2 py-1 text-[12.5px] w-full"
+                      bind:value={editTitle}
+                      onkeydown={(e) => {
+                        if (e.key === 'Enter') commitRename()
+                        else if (e.key === 'Escape') editingId = null
+                      }}
+                      onblur={() => commitRename()}
+                    />
+                  {:else}
+                    <!-- One line per session, no message count: the row is a target,
+                         not a report. Rename/delete live in a menu so the row stays
+                         quiet, and the dot is always laid out (invisible until unread)
+                         so titles do not shift when one arrives. -->
+                    <button class="sessbtn" onclick={() => openSession(s.id)}>
+                      <span class="sess-dot" aria-hidden="true"></span>
+                      <span class="sess-title">{s.title}</span>
+                    </button>
+                    <button
+                      class="iconbtn more"
+                      data-menu
+                      aria-label="More actions"
+                      onclick={(e) => openMenu('row', e.currentTarget as HTMLElement, s.id)}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="2.6" cy="6" r="1.05" fill="currentColor"/><circle cx="6" cy="6" r="1.05" fill="currentColor"/><circle cx="9.4" cy="6" r="1.05" fill="currentColor"/></svg>
+                    </button>
+                  {/if}
+                </div>
+              {/each}
+              {/if}
           </div>
         {/each}
       {/if}
@@ -2540,6 +3187,16 @@
           </div>
           <h1 class="empty-hi">{greeting.hi}</h1>
           <p class="empty-sub">{greeting.sub}</p>
+          {#if draftWsLabel}
+            <!-- Saying which folder an unwritten session belongs to is the
+                 difference between "a session in reports/" and a guess. Click it
+                 to drop the preselection and go back to the default. -->
+            <button class="empty-ws" title={draftWorkspace} onclick={() => (draftWorkspace = '')}>
+              <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 3.2h3l1 1.3h5v4.8h-9z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+              <span>in {draftWsLabel}</span>
+              <span class="empty-ws-x" aria-hidden="true">✕</span>
+            </button>
+          {/if}
           <div class="tips" role="group" aria-label="Start with">
             {#each TIPS as t}
               <button class="tip" onclick={() => seedTip(t.text)}>{t.label}</button>
@@ -2847,6 +3504,44 @@
               Using <span class="pop-mono">{model || '\u2014'}</span>
             {/if}
           </div>
+        {/if}
+      {:else if menu.kind === 'ws'}
+        {@const wp = menu.wsPath ?? ''}
+        {@const wrow = workspaces.find((w) => w.path === wp)}
+        {@const wlabel = wrow ? wsLabelOf(wrow) : wp ? basenameOf(wp) : 'No workspace'}
+        <div class="pop-title">{wlabel}</div>
+        <div class="pop-mono pop-sub">{wp || 'sessions with no folder'}</div>
+        {#if wp}
+          <button
+            class="pop-item"
+            role="menuitem"
+            onclick={() => newSessionIn(wp)}
+          >
+            <span class="pop-lbl">New session here</span>
+            <span class="pop-sub">Opens the greeting with this folder selected</span>
+          </button>
+          <button
+            class="pop-item"
+            role="menuitem"
+            onclick={() => startWsRename(wp, wrow?.label ?? '')}
+          >
+            <span class="pop-lbl">Rename</span>
+            <span class="pop-sub">Changes the name in the list, never the folder</span>
+          </button>
+          {#if gatewayRole() !== 'watch'}
+            <button
+              class="pop-item danger"
+              role="menuitem"
+              onclick={() => void removeFolder(wp)}
+            >
+              <span class="pop-lbl">Remove from sidebar</span>
+              <span class="pop-sub">
+                {sessions.filter((x) => x.workspace === wp).length
+                  ? 'Sessions that live here stay, so the folder comes back'
+                  : 'The folder has no sessions in it'}
+              </span>
+            </button>
+          {/if}
         {/if}
       {:else if menu.kind === 'metrics'}
         <div class="pop-title">Session telemetry</div>

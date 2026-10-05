@@ -33,11 +33,25 @@ stripped from the address bar.
 Two roles, enforced server-side per command:
 
 * **watch** - `session_state`, `list_sessions`, `session_messages`,
-  `search_messages`, `migration_notes`. Read-only.
+  `search_messages`, `migration_notes`, `list_workspaces`. Read-only.
 * **drive** - everything that changes state: `start_turn`, `cancel_turn`,
   `respond_approval`, `respond_question`, `set_mode`, `set_reasoning`, `new_session`,
   `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
-  `set_workspace`.
+  `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`.
+
+`new_session` takes an optional `workspace`, which the engine validates before the
+session is created; a browser can therefore start a session inside a named folder
+rather than inheriting wherever the host happened to be pointing. `add_workspace`
+registers a folder for the sidebar (validated the same way) and `remove_workspace`
+drops that registration only - it never deletes sessions, and a folder that still
+contains sessions keeps its row in the sidebar because hiding a session is worse
+than showing a folder twice.
+
+Every drive command is logged server-side with the peer that asked and the shape of
+its arguments - `172.20.10.2:51044 set_workspace (path len 24)`,
+`start_turn (attachments unset text=len 142)` - and never the content. This exists
+because the socket can run a shell on this machine, and "the agent ran a command I
+did not ask for" has to be answerable from the log.
 
 Never exposed over the socket at all: `open_file`, `pick_workspace`, `gpu_report`,
 and the window controls. A browser tab cannot open a file or a dialog on your
@@ -259,10 +273,18 @@ exposed on purpose — a leaked token should not also be a directory browser.
 
 - **Questions park the turn, in both directions.** When the agent calls
   `ask_user`, every attached client gets a `questionRequested` event and the turn
-  waits. Answering is `respond_question` with the event's `id` - a watch-only
-  client can see the question and cannot answer it. Cancelling releases the parked
-  tool with a "cancelled" result instead of leaving one of the four tool workers
-  idle until the question times out.
+  waits. Answering is `respond_question` with the event's `id`, `text`, and
+  `options` - the list of chosen indices, empty when the user typed instead. A
+  single legacy `option` number is still accepted so an older page cannot silently
+  send an empty answer. A watch-only client can see the question and cannot answer
+  it. Cancelling releases the parked tool with a "cancelled" result instead of
+  leaving one of the four tool workers idle until the question times out.
+- **A question can close without an answer, and every client must hear about it.**
+  If the timeout expires, the tool emits `questionExpired {id}`. The shells cannot
+  report this themselves: they hold the `oneshot::Sender`, and a sender whose
+  receiver is gone says nothing until someone tries to use it. A browser that never
+  hears it keeps showing a card whose Send button fails forever, and the answer it
+  eventually sends aims at a tool call that already returned.
 - **"Devices" means addresses, not sockets.** The footer pill counts devices keyed
   by peer address and names them: `2 devices: 100.86.160.103, 172.20.10.2
   (3 connections)`. Two tabs on one laptop are one device and three connections,

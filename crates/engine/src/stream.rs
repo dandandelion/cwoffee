@@ -79,7 +79,12 @@ pub fn fake_turn<F: FnMut(EngineEvent)>(turn_id: u64, script: &FakeScript, mut e
             });
             sleep(gap);
         }
-        emit(EngineEvent::ToolExecEnd { id, ok: true, exit_code: Some(0) });
+        emit(EngineEvent::ToolExecEnd {
+            id,
+            ok: true,
+            exit_code: Some(0),
+            changes: Vec::new(),
+        });
     }
 
     // ---- answer deltas ----

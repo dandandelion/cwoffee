@@ -366,6 +366,17 @@ desktop window, temporarily point `build.frontendDist` at the alternate director
 and rebuild the binary — which also keeps the flag build away from the `ui/dist`
 the gateway is serving to a phone.
 
+The reverse foot-gun is the one that cost an hour of chasing a phantom: build the
+selftest UI into `ui/dist`, then `cargo build --release`, and the *production*
+binary ships the self-test. The app then runs turns by itself a minute after
+launch — "Use the exec tool to run `echo cwoffee-ok`", an approval card, an answer
+about an image that was never attached — and the log lines say
+`[cwoffee/page] turn 1 start` with no send in front of them. **Order matters:
+`npm run build` (no flags) and then `cargo build --release`.** The audit line in
+`start_turn` (see Trap 32) is what settles arguments like this: a turn with no
+`start_turn (desktop)` or gateway `start_turn` line in front of it did not come
+from a user.
+
 ## Trap 21: `std::fs::read("/dev/urandom")` never returns
 
 urandom is not a file with a size; `fs::read` reads until EOF, which does not
@@ -530,3 +541,101 @@ settled run (previously one full rewrite per paint), and the first settled line
 was **pixel-identical across 14 frames** sampled during streaming - while 17
 chunks still animated from opacity 0 / blur 3px upward and `**bold**`/`` `code` ``
 still rendered correctly.
+
+## Trap 30: a nested lock on `state_bg` inside a host command arm
+
+`SessionHost` runs one task that owns the agent, the store and the approval map.
+The command loop holds `state_bg` for part of several arms. Adding "follow this
+session's workspace" to `SwitchSession` looked like a three-line change and
+deadlocked the host loop, because the code called `state_bg.lock()` again while
+the same arm already held it:
+
+```
+test host::tests::switching_a_session_moves_the_tools_to_that_sessions_folder has been running for over 60 seconds
+```
+
+Nothing else in the app recovers from that: the host task is the only thing that
+drains the command queue, so from the outside the app looks like a UI that stopped
+answering, not a deadlock. Read the workspace off the store **before** taking the
+state lock, apply the change inside the guard that already exists, and leave a
+comment at the site — the shape is invisible in the diff.
+
+Related, same file: `check_workspace` distinguishes "is not a directory" from "is
+not writable; the tools could not create a file there" because they are different
+mistakes with different fixes, and one merged message made both of them unreadable
+(and broke a test that asserts on the substring).
+
+## Trap 31: `.blk` is a two-column grid — append to it and your content gets 74px
+
+`buildToolCard`, the reasoning block and the answer block all append a `.blk-head`
+and then a body element to a `.blk` card, whose grid is `74px 1fr`. The rewritten
+question card appended `.ask-q`, `.ask-opts`, `.ask-custom` and `.ask-actions`
+straight onto the card, so the option list landed in the **label column** — 74px —
+and every sentence wrapped at about five characters:
+
+```
+  ○  (2) a csv
+     of three
+     espresso
+     drinks
+```
+
+Sane-looking CSS (`display: flex`, `grid-template-columns: 20px 1fr`, sensible
+padding) cannot fix a child that was placed in the wrong grid cell. One wrapper
+element with `grid-column: 1 / -1` put the whole card back in one continuous
+column. The check that catches it is a width assertion, not a screenshot:
+`.ask-opts` must be within a few px of the card's inner width.
+
+## Trap 32: a question nobody answered, and the shells that cannot say so
+
+`ask_user` parks on a `oneshot::Sender<Answer>`. The desktop, the gateway and the
+TUI each keep that sender in a map so the UI can answer later. When the tool's
+timeout expires, the **receiver** is gone — and a `oneshot::Sender` whose receiver
+has vanished stays quiet until someone tries to `send()` on it. So:
+
+- the card stays live in every window, still offering Send;
+- pressing Send aims an answer at a tool call that already returned;
+- nobody can tell from the shells that the question is over.
+
+The tool is the only party that knows, so the tool now emits
+`EngineEvent::QuestionExpired {id}` on the timeout and cancel paths (via
+`ToolCtx::events`, which the agent fills in per call), and every front end closes
+the card as "no answer in time". Two tests pin it: an unanswered question emits the
+event exactly once, and an **answered** one emits nothing — a second "closed"
+signal after an answer reads as a contradiction.
+
+The gateway side gained the matching audit line (`AUDITED` in `dispatch`): drive
+commands log the peer and argument *shapes*, never message text.
+
+## Trap 33: the engine renamed a wire enum and TypeScript did not notice
+
+Risk went from `readOnly | mutating | exec` to `harmless | workspace | sensitive`,
+`Answer.option: number` became `Answer.options: number[]`, and `Question` gained
+`multi`. `cargo check` was green the whole time and `svelte-check` stayed green
+until the handler types were mirrored by hand, because engine events cross the
+boundary as JSON and the UI's event union is a *copy* of the Rust enum, not a
+generated type.
+
+The rules that keep this from recurring: the Rust doc comment in `event.rs` states
+the wire contract (adjacent tagging, camelCase variant names, snake_case fields);
+`ui/src/lib/events.ts` mirrors it and comments each field; and the desktop
+self-test asserts on the *strings* — that an approval card renders the risk label,
+that answering a multi question sends `options: [0]` and not `option: 0`. The old
+`respond_question(id, text, option)` signature survived in the gateway as a tolerated
+legacy alias, and only there: one place accepts the old shape, and it is the place
+where an old client is actually expected.
+
+## Trap 34: a scripted patch is a code review you skipped
+
+Two self-inflicted wounds from patching Rust with Python string surgery:
+
+- a `\` line continuation inside a `format!` written from a heredoc swallowed the
+  newline and the leading spaces, so the emitted text lost its formatting and the
+  diff looked fine (Trap 19, and it came back);
+- a script that inserted `events: None,` into every `ToolCtx { ... }` literal
+  corrupted the ones that end in `..Default::default()` on a single line, producing
+  `error: expected ;, found events` in three files.
+
+Both were caught by compiling immediately after patching, which is the point: a
+scripted edit that is not compiled in the same breath is a claim, not a change.
+When a patch touches a struct literal, patch and `cargo check` in one command.

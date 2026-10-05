@@ -6,6 +6,7 @@
 //! model to emit a call it shouldn't.
 
 pub mod ask;
+pub mod changes;
 pub mod docs;
 pub mod exec;
 pub mod files;
@@ -33,16 +34,55 @@ pub struct ExecChunk {
 
 /// Live output while a tool runs (stdout/stderr lines, progress).
 pub type ExecSink = mpsc::UnboundedSender<ExecChunk>;
-/// How much a tool is allowed to hurt you. Drives the approval gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What a call could do to the user. This drives the approval gate, and the
+/// split is deliberately about **harm the user would notice**, not about which
+/// syscall gets made:
+///
+///   Harmless  - nothing the user did not ask for changes. Reading a file inside
+///               the workspace, searching or fetching the web, asking the user a
+///               question. Never prompts, in any mode: an approval prompt on
+///               `web_search` trains people to click through prompts without
+///               reading them, which is worse than no prompt at all.
+///   Workspace - changes a file inside the workspace that already exists. The
+///               agent creating its own output is the point of the product;
+///               overwriting something the user wrote is a different thing.
+///   Sensitive - arbitrary code, or a path **outside** the workspace. Prompts in
+///               ask and session modes.
+///
+/// `Tool::risk_for` decides this per call, because for file tools the answer
+/// depends on the path and on what is already on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Risk {
-    /// No side effects at all. Always allowed.
-    ReadOnly,
-    /// Writes inside the workspace.
-    Mutating,
-    /// Runs arbitrary code, or reaches the network.
-    Exec,
+    /// The default because "assume nothing dangerous until a tool says so" is
+    /// the wrong way round; it is the *gate* that defaults to Harmless for
+    /// tools which never implement `risk_for`, and those are read-only helpers.
+    #[default]
+    Harmless,
+    Workspace,
+    Sensitive,
+}
+
+/// Risk of one specific call, plus the paths outside the workspace it wants.
+///
+/// Escapes are carried separately from the level because they need a different
+/// grant: "yes to exec" may be remembered for the session, "yes to reading
+/// ~/.ssh/id_ed25519" may not. The approved paths are handed to the tool for
+/// this call only.
+#[derive(Debug, Clone, Default)]
+pub struct CallRisk {
+    pub level: Risk,
+    /// Absolute, already-resolved paths outside the workspace this call needs.
+    pub escapes: Vec<String>,
+}
+
+impl CallRisk {
+    pub fn harmless() -> Self {
+        Self::default()
+    }
+    pub fn at(level: Risk) -> Self {
+        Self { level, escapes: Vec::new() }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +103,11 @@ pub struct ToolResult {
     /// prompt bytes and cannot invalidate the prefix cache.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<OutputFile>,
+    /// What the call did to files, for the tool card: `+N -M` in the header and
+    /// a diff when expanded. UI-only, like `files` - a diff of what the model
+    /// just wrote is the most expensive possible thing to put back in a prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<changes::FileChange>,
 }
 
 /// A file the agent produced, described for the UI rather than the model.
@@ -130,11 +175,27 @@ pub fn mime_for(path: &std::path::Path) -> &'static str {
 
 impl ToolResult {
     pub fn ok(output: impl Into<String>) -> Self {
-        Self { ok: true, output: output.into(), exit_code: None, truncated: false, error: None, files: Vec::new() }
+        Self {
+            ok: true,
+            output: output.into(),
+            exit_code: None,
+            truncated: false,
+            error: None,
+            files: Vec::new(),
+            changes: Vec::new(),
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
         let m = msg.into();
-        Self { ok: false, output: String::new(), exit_code: None, truncated: false, error: Some(m), files: Vec::new() }
+        Self {
+            ok: false,
+            output: String::new(),
+            exit_code: None,
+            truncated: false,
+            error: Some(m),
+            files: Vec::new(),
+            changes: Vec::new(),
+        }
     }
 
     /// Attach a produced file. Returns self so call sites read in one chain.
@@ -166,6 +227,15 @@ pub struct ToolCtx {
     /// answer, and `ask_user` says so rather than waiting for a reply that can
     /// never come.
     pub ask: Option<ask::QuestionTx>,
+    /// The engine event stream, for tools that have to tell every front end
+    /// something on their own initiative. `ask_user` uses it to say a question
+    /// closed without an answer: the reply channel it was waiting on is gone, so
+    /// nothing else can report that to the window still showing the card.
+    pub events: Option<tokio::sync::mpsc::UnboundedSender<crate::event::EngineEvent>>,
+    /// Paths outside the workspace the **user approved for this one call**.
+    /// Rebuilt per call by the agent loop; never inherited by the next call, and
+    /// never widened by a session-level "allow for session" answer.
+    pub permits: Vec<std::path::PathBuf>,
 }
 
 impl Default for ToolCtx {
@@ -174,6 +244,8 @@ impl Default for ToolCtx {
             workspace: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             max_output_bytes: 32 * 1024,
             ask: None,
+            events: None,
+            permits: Vec::new(),
         }
     }
 }
@@ -183,7 +255,19 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
+    /// Worst case for this tool, used when a call cannot be inspected (and as
+    /// the default for `risk_for`).
     fn risk(&self) -> Risk;
+
+    /// Risk of *this* call. File tools lower it for reading inside the workspace
+    /// and raising it to Sensitive when the path lands outside; the gate needs
+    /// the paths so the prompt can name them.
+    ///
+    /// The default is deliberately the tool's worst case: a tool that does not
+    /// think about this gets the conservative answer rather than the free pass.
+    fn risk_for(&self, _args: &Value, _ctx: &ToolCtx) -> CallRisk {
+        CallRisk::at(self.risk())
+    }
 
     /// `args` has already been through `repair::parse_or_repair`.
     async fn run(&self, args: Value, ctx: &ToolCtx, sink: &ExecSink) -> ToolResult;
@@ -366,7 +450,7 @@ mod tests {
             fn name(&self) -> &str { &self.0 }
             fn description(&self) -> &str { "stub" }
             fn schema(&self) -> Value { serde_json::json!({"type":"object"}) }
-            fn risk(&self) -> Risk { Risk::ReadOnly }
+            fn risk(&self) -> Risk { Risk::Harmless }
             async fn run(&self, _a: Value, _c: &ToolCtx, _s: &ExecSink) -> ToolResult {
                 ToolResult::ok("stub")
             }

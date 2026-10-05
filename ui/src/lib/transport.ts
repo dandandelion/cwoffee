@@ -72,6 +72,9 @@ let wantSocket = false
 // Notified after a *re*connection, so the UI can re-fetch what it had lost. A
 // phone that drops wifi should come back to its session, not to a blank page.
 let reconnectedCb: (() => void) | null = null
+// Fired when the server reports this client missed events (a slow phone, a
+// throttled background tab). Same remedy as a reconnect, different diagnosis.
+let resyncCb: (() => void) | null = null
 let everConnected = false
 let timeouts = 0
 // The in-flight handshake, shared. Without this, two concurrent callers both
@@ -170,6 +173,14 @@ function connect(): Promise<void> {
             everConnected = true
             resolve()
           })
+          break
+        case 'resync':
+          // The server noticed this client fell behind its event stream. Some
+          // events - notably `turnEnd` - are the difference between a working
+          // composer and one stuck disabled, so the only honest response is to
+          // re-read authoritative state rather than guess what was missed.
+          pageLog(`gateway asked to resync (missed ${v?.d?.missed ?? '?'} event(s))`)
+          resyncCb?.()
           break
         case 'event':
           // Engine events are pushed, not polled. The transcript already batches
@@ -292,4 +303,15 @@ export function gatewayRole(): 'drive' | 'watch' | null {
 /** Register a callback fired after the socket reconnects (not on first connect). */
 export function onReconnect(cb: () => void): void {
   reconnectedCb = cb
+}
+
+/**
+ * Register a callback for the server saying "you missed events".
+ *
+ * Distinct from onReconnect: the socket never died here, the client simply could
+ * not keep up. The fix is the same - re-read state - but the cause is different
+ * enough that the log line should say which one happened.
+ */
+export function onResync(cb: () => void): void {
+  resyncCb = cb
 }

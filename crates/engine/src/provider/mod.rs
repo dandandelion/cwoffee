@@ -182,6 +182,14 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// What a file tool changed, for the tool card: `+N -M` in the header and a
+    /// diff when expanded. UI metadata on the same footing as `reasoning_ms` -
+    /// persisted so a reopened session still shows it, never sent to the model.
+    /// A diff of what the model just wrote is the most expensive possible thing
+    /// to put back into a prompt, and it would move the prompt bytes the prefix
+    /// cache is keyed on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<crate::tools::changes::FileChange>,
 }
 
 impl Message {

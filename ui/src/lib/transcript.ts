@@ -47,8 +47,8 @@ async function openExternal(href: string) {
  * markdown per token is how you get a UI that visibly reflows mid-sentence.
  */
 
-import type { AttachmentMeta, EngineEvent, ExecStream, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, type InlineReveal } from './markdown'
+import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
+import { renderMarkdown, LiveMarkdown, revealOn, REVEAL_HOLD_MS, type InlineReveal } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -98,6 +98,8 @@ interface ToolRefs {
   status: HTMLElement
   /** args + output together; this is what collapses. */
   detail: HTMLElement
+  /** `+12 -3`: what this call did to the files, filled in when it finishes. */
+  stat: HTMLElement
   stdout: string
   stderr: string
 }
@@ -135,6 +137,17 @@ export class Transcript {
   private revealPara: HTMLElement | null = null
   private revealHead: HTMLElement | null = null
   private revealNodes = new Map<number, HTMLElement>()
+  /**
+   * Streaming state for the thinking block, mirroring the answer reveal.
+   * Thinking was the one place text still popped in fully formed: it is
+   * rendered as plain text, so it never went through the reveal path at all.
+   */
+  private thinkEl: HTMLElement | null = null
+  private thinkRun: HTMLElement | null = null
+  private thinkSettled: Text | null = null
+  private thinkNodes = new Map<number, HTMLElement>()
+  private thinkSeq = 0
+  private thinkTimer = 0
   private lastLiveRender = 0
   private liveTimer = 0
 
@@ -215,6 +228,7 @@ export class Transcript {
     this.live = new LiveMarkdown()
     this.turnFiles = []
     this.fileStrip = null
+    this.dropRevealNodes()
   }
 
   /**
@@ -292,12 +306,14 @@ export class Transcript {
       // finished blocks are rendered exactly once.
       this.live.push(joined)
       this.renderLive(false)
+    } else if (this.textKind === 'reasoning') {
+      this.pushThink(joined)
     } else {
       this.textBuf.appendChild(document.createTextNode(joined))
+    }
     if (this.textKind === 'reasoning' && this.textBuf.classList.contains('clamp')
         && !this.textBuf.classList.contains('expanded')) {
       this.textBuf.scrollTop = this.textBuf.scrollHeight
-    }
     }
     this.scrollIfNeeded()
   }
@@ -401,10 +417,83 @@ export class Transcript {
   }
 
   private dropRevealNodes() {
+    this.foldThink()
+    this.thinkEl = null
+    this.thinkRun = null
+    this.thinkSettled = null
     this.revealFrozen = null
     this.revealPara = null
     this.revealHead = null
     this.revealNodes = new Map()
+  }
+
+  /**
+   * Append the newest thinking text as a chunk of its own, then fold the chunks
+   * that have finished animating into the settled run.
+   *
+   * Same rule as the answer reveal: an animation is only visible if the node it
+   * runs on outlives the paint cadence, so each arrival becomes a `<span>` that
+   * is created once and folded after `REVEAL_HOLD_MS` - never rewritten.
+   */
+  private pushThink(s: string) {
+    const host = this.textBuf
+    if (!host) return
+    if (!revealOn()) {
+      host.appendChild(document.createTextNode(s))
+      return
+    }
+    if (this.thinkEl !== host || !this.thinkRun?.isConnected) {
+      host.innerHTML = ''
+      const run = this.el('think-run')
+      const settled = document.createTextNode('')
+      run.append(settled)
+      host.append(run)
+      this.thinkEl = host
+      this.thinkRun = run
+      this.thinkSettled = settled
+      this.thinkNodes = new Map()
+    }
+    const id = this.thinkSeq++
+    const span = this.el('tin think-tin')
+    // Plain text, never markup: reasoning arrives with asterisks, angle brackets
+    // and half-written tags in it, and it is not markdown.
+    span.textContent = s
+    span.dataset.at = String(performance.now())
+    this.thinkRun.append(span)
+    this.thinkNodes.set(id, span)
+
+    const fold = () => {
+      this.thinkTimer = 0
+      const now = performance.now()
+      for (const [key, el] of this.thinkNodes) {
+        if (now - Number(el.dataset.at ?? 0) < REVEAL_HOLD_MS) continue
+        this.foldThinkNode(el)
+        this.thinkNodes.delete(key)
+      }
+      // The last chunks arrive at the end of the block, when no further paint
+      // will come to fold them. Without this they would stay blurred mid-flight
+      // in a block the user then collapses and reopens.
+      if (this.thinkNodes.size && !this.thinkTimer) {
+        this.thinkTimer = window.setTimeout(fold, REVEAL_HOLD_MS + 40)
+      }
+    }
+    fold()
+  }
+
+  /** Fold one finished chunk into the settled text. Unwraps, does not rewrite. */
+  private foldThinkNode(el: HTMLElement) {
+    if (this.thinkSettled) this.thinkSettled.appendData(el.textContent ?? '')
+    el.remove()
+  }
+
+  /** Settle every in-flight chunk: block ended, collapsed, or view switched. */
+  private foldThink() {
+    if (this.thinkTimer) {
+      clearTimeout(this.thinkTimer)
+      this.thinkTimer = 0
+    }
+    for (const el of this.thinkNodes.values()) this.foldThinkNode(el)
+    this.thinkNodes.clear()
   }
 
   /** Start a fresh live-render target. */
@@ -421,6 +510,7 @@ export class Transcript {
       // appended, so a tool call in the middle of an answer cannot truncate the
       // formatting of the part already on screen.
       if (this.textKind === 'answer') this.finalizeAnswer()
+      if (this.textKind === 'reasoning') this.foldThink()
       const label = kind === 'reasoning' ? 'thinking' : kind === 'user' ? 'you' : 'cwoffee'
       this.textBuf = this.block(kind, label)
       this.textKind = kind
@@ -488,6 +578,7 @@ export class Transcript {
         break
       case 'toolExecEnd':
         this.closeTool(ev.d.id, ev.d.ok, ev.d.exit_code)
+        this.noteChanges(ev.d.id, ev.d.changes)
         break
       case 'approvalRequested':
         // rendered by the composer overlay, not inline: it needs the keyboard
@@ -622,59 +713,166 @@ export class Transcript {
    */
   showQuestion(
     q: QuestionRequested,
-    onAnswer: (r: { text: string; option: number | null }) => void,
+    onAnswer: (r: { text: string; options: number[] }) => void,
   ) {
     this.flushNow()
     this.ensureTurn()
     const card = this.el('blk blk-ask')
     const head = this.el('blk-head')
     head.append(this.el('blk-label', 'asking'))
-    card.append(head)
-    card.append(this.el('ask-q', q.question))
+    // `.blk` is a two-column grid (label column, content column). Appending the
+    // question, the options and the buttons straight onto the card put them in
+    // *column order*, so the option list landed in the 74 px label gutter and
+    // every sentence wrapped at five characters. One wrapper, spanning both
+    // columns, keeps the content in one continuous width.
+    const body = this.el('ask-body')
+    card.append(head, body)
+    body.append(this.el('ask-q', q.question))
 
+    // Selection is provisional until Send. Clicking an option used to answer the
+    // model on the spot, which made a misclick an answer - and on a question
+    // about deleting something that is a real cost.
+    const sel = new Set<number>()
     const opts = this.el('ask-opts')
-    q.options.forEach((o, i) => {
-      const b = this.el('ask-opt')
-      b.setAttribute('role', 'button')
-      b.tabIndex = 0
-      if (q.recommended === i) {
-        b.classList.add('is-rec')
-        b.append(this.el('ask-badge', 'recommended'))
-      }
-      b.append(this.el('ask-lbl', o.label))
-      if (o.detail) b.append(this.el('ask-detail', o.detail))
-      const pick = () => answer(i, o.label)
-      b.addEventListener('click', pick)
-      b.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          pick()
-        }
-      })
-      opts.append(b)
-    })
-    card.append(opts)
+    opts.setAttribute('role', q.multi ? 'group' : 'radiogroup')
+    const rows: HTMLElement[] = []
 
+    q.options.forEach((o, i) => {
+      const row = this.el('ask-opt')
+      row.setAttribute('role', q.multi ? 'checkbox' : 'radio')
+      row.setAttribute('aria-checked', 'false')
+      row.tabIndex = 0
+      if (q.multi) row.classList.add('is-multi')
+      row.append(this.el('ask-mark', q.multi ? '☐' : '○'))
+
+      const main = this.el('ask-opt-main')
+      // The recommendation belongs with the option it describes: on its own line
+      // it read like a caption for the whole list.
+      const title = this.el('ask-opt-title')
+      title.append(this.el('ask-lbl', o.label))
+      if (q.recommended === i) {
+        // A text node, not just the pill: without the gap the accessible name of
+        // the row reads "Markdownrecommended".
+        title.append(document.createTextNode(' '))
+        title.append(this.el('ask-badge', 'recommended'))
+        row.classList.add('is-rec')
+      }
+      main.append(title)
+      if (o.detail) main.append(this.el('ask-detail', o.detail))
+      row.append(main)
+      rows.push(row)
+      opts.append(row)
+    })
+    body.append(opts)
+
+    let input: HTMLInputElement | null = null
     if (q.allow_custom) {
       const row = this.el('ask-custom')
-      const input = document.createElement('input')
+      input = document.createElement('input')
       input.className = 'ask-input'
-      input.placeholder = 'or type your own answer'
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && input.value.trim()) answer(null, input.value.trim())
-      })
+      input.placeholder = q.multi
+        ? 'or type your own answer (it is sent with any boxes you tick)'
+        : 'or type your own answer instead'
       row.append(input)
-      card.append(row)
+      body.append(row)
     }
 
-    const answer = (option: number | null, text: string) => {
+    const actions = this.el('ask-actions')
+    const send = document.createElement('button')
+    send.type = 'button'
+    send.className = 'ask-submit'
+    send.textContent = 'Send answer'
+    send.disabled = true
+    const decline = document.createElement('button')
+    decline.type = 'button'
+    decline.className = 'ask-decline'
+    decline.textContent = 'Decline'
+    actions.append(send, decline)
+    body.append(actions)
+
+    const paint = () => {
+      rows.forEach((row, i) => {
+        const on = sel.has(i)
+        row.classList.toggle('is-sel', on)
+        row.setAttribute('aria-checked', on ? 'true' : 'false')
+        const mark = row.querySelector('.ask-mark')
+        if (mark) mark.textContent = q.multi ? (sel.has(i) ? '☑' : '☐') : sel.has(i) ? '●' : '○'
+      })
+      send.disabled = sel.size === 0 && !(input?.value.trim() ?? '')
+      send.textContent = q.multi && sel.size > 1 ? `Send ${sel.size} answers` : 'Send answer'
+    }
+
+    const finish = (options: number[], text: string) => {
       if (card.classList.contains('answered')) return
-      // The click is the answer; a second one must not send a second reply.
       card.classList.add('answered')
-      card.append(this.el('ask-answered', `answered: ${text}`))
-      onAnswer({ text, option })
+      // Say what was actually sent, so a reload or a second look answers
+      // "what did I pick?".
+      const labels = options.map((i) => q.options[i]?.label ?? `#${i + 1}`).join(' + ')
+      const shown = [labels, text].filter((x) => x && (!labels || x !== text))
+      body.append(
+        this.el(
+          'ask-answered',
+          options.length ? `sent: ${[labels, text].filter((x) => x && x !== labels).join(' · ') || labels}` : text ? `sent: ${text}` : shown.length ? `sent: ${shown.join(' · ')}` : 'declined',
+        ),
+      )
+      card.querySelectorAll('.ask-opt, .ask-input, .ask-submit, .ask-decline').forEach((n) => {
+        n.classList.add('is-done')
+        if (n instanceof HTMLInputElement || n instanceof HTMLButtonElement) n.disabled = true
+      })
+      onAnswer({ text, options })
     }
 
+    const submit = () => {
+      const picked = [...sel].sort((a, b) => a - b)
+      const typed = (input?.value ?? '').trim()
+      const labels = picked.map((i) => q.options[i].label)
+      // With both a pick and typed words, the typed words go in `text`: the
+      // engine already has the picks separately, and it reports text as "User
+      // also said", which is what a constraint added beside a choice is.
+      const text = picked.length ? (typed && typed !== labels.join(', ') ? typed : labels.join(', ')) : typed
+      if (!picked.length && !text) return
+      finish(picked, text)
+    }
+
+    rows.forEach((row, i) => {
+      const toggle = () => {
+        if (card.classList.contains('answered')) return
+        if (q.multi) {
+          if (sel.has(i)) sel.delete(i)
+          else sel.add(i)
+        } else {
+          sel.clear()
+          sel.add(i)
+        }
+        paint()
+      }
+      row.addEventListener('click', toggle)
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          toggle()
+        }
+      })
+    })
+    if (input) {
+      input.addEventListener('input', paint)
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault()
+          submit()
+        }
+      })
+    }
+    send.addEventListener('click', submit)
+    // Declining is an explicit button, not a guess at what Esc meant. It sends an
+    // empty answer, which the tool reports as "dismissed without answering".
+    decline.addEventListener('click', () => finish([], ''))
+
+    paint()
+    // The build above is all detached. Without this the card exists, is wired
+    // up, answers correctly when driven by a test that reaches it by id - and is
+    // never on screen. A rewrite of this method lost exactly these three lines,
+    // and the self-test caught it as "question card did not render".
     this.turn!.appendChild(card)
     this.questionCards.set(q.id, card)
     this.scrollIfNeeded()
@@ -686,6 +884,29 @@ export class Transcript {
     if (!card || card.classList.contains('answered')) return
     card.classList.add('answered', 'by-other')
     card.append(this.el('ask-answered', 'answered elsewhere'))
+  }
+
+  /**
+   * Close a question that closed *without* an answer. The engine says so when its
+   * tool stops waiting: the reply channel is gone, so clicking Send from here
+   * aims an answer at a call that has already returned, and the turn has moved on
+   * having been told to decide for itself. Saying "no answer in time" is the
+   * difference between a dead button and an explained one.
+   */
+  expireQuestion(id: number) {
+    const card = this.questionCards.get(id)
+    if (!card || card.classList.contains('answered') || card.classList.contains('expired')) return
+    card.classList.add('expired')
+    card.append(
+      this.el('ask-expired', 'no answer in time — the model was told to decide for itself'),
+    )
+    card
+      .querySelectorAll('.ask-opt, .ask-input, .ask-submit, .ask-decline')
+      .forEach((n) => {
+        n.classList.add('is-done')
+        if (n instanceof HTMLInputElement || n instanceof HTMLButtonElement) n.disabled = true
+      })
+    card.querySelectorAll('.ask-opt').forEach((n) => (n as HTMLElement).setAttribute('aria-disabled', 'true'))
   }
 
   addFiles(files: OutputFile[]) {
@@ -739,8 +960,11 @@ export class Transcript {
     head.append(this.el('tool-name', name))
     const subject = this.el('tool-subject')
     head.append(subject)
+    // The change count sits between the subject and the status so a scan of a
+    // long list of cards answers "did this touch anything?" without opening one.
+    const stat = this.el('tool-stat')
     const status = this.el('tool-status', 'running…')
-    head.appendChild(status)
+    head.append(stat, status)
     const args = this.el('tool-args')
     const out = this.el('tool-out')
     const detail = this.el('tool-detail clamp')
@@ -763,7 +987,7 @@ export class Transcript {
         card.classList.add('is-open')
       }
     })
-    return { card, head, args, out, detail, subject }
+    return { card, head, args, out, detail, subject, stat }
   }
 
   private openTool(id: string, name: string) {
@@ -775,8 +999,8 @@ export class Transcript {
     this.textBuf = null
     this.textKind = null
     this.ensureTurn()
-    const { card, head, args, out, detail, subject } = this.buildToolCard(name)
-    const status = head.lastElementChild as HTMLElement
+    const { card, head, args, out, detail, subject, stat } = this.buildToolCard(name)
+    const status = head.querySelector('.tool-status') as HTMLElement
     this.setLive(card)
     this.turn!.appendChild(card)
     this.tools.set(id, {
@@ -786,6 +1010,7 @@ export class Transcript {
       status,
       detail,
       subject,
+      stat,
       name,
       stdout: '',
       stderr: '',
@@ -822,6 +1047,67 @@ export class Transcript {
       t.detail.scrollTop = t.detail.scrollHeight
     }
     this.scrollIfNeeded()
+  }
+
+  /**
+   * Put `+N -M` on the card, and the diff inside it.
+   *
+   * The counts come from the engine comparing what was on disk a moment before
+   * the call with what is on disk after, not from anything the model claimed.
+   * The diff is UI metadata: it deliberately never enters the prompt, because a
+   * diff of a file the model just wrote is the most expensive possible thing to
+   * put in front of it, and the prompt bytes are what the prefix cache keys on.
+   */
+  private noteChanges(id: string, changes: FileChange[]) {
+    const t = this.refs(id)
+    if (t) this.noteChangesInto(t, changes)
+  }
+
+  private noteChangesInto(
+    t: { stat: HTMLElement; detail: HTMLElement; card: HTMLElement },
+    changes: FileChange[],
+  ) {
+    if (!changes?.length) return
+    const added = changes.reduce((n, c) => n + c.added, 0)
+    const removed = changes.reduce((n, c) => n + c.removed, 0)
+    if (added || removed) {
+      const created = changes.filter((c) => c.created)
+      t.stat.textContent = created.length === changes.length && !removed
+        ? `+${added}`
+        : `+${added} -${removed}`
+      t.stat.className = `tool-stat ${removed ? 'mix' : 'add'}`
+      t.stat.title = changes
+        .map((c) => `${c.path}: ${c.created ? 'new file' : `+${c.added} -${c.removed}`}`)
+        .join('\n')
+      t.card.classList.add('has-changes')
+    }
+    let diffShown = false
+    for (const c of changes) {
+      if (!c.diff) continue
+      diffShown = true
+      const pre = this.el('tool-diff')
+      if (changes.length > 1) pre.append(this.el('diff-path', c.path))
+      for (const line of c.diff.split('\n')) {
+        if (!line) continue
+        const cls = line.startsWith('@@')
+          ? 'diff-hunk'
+          : line.startsWith('+++') || line.startsWith('---')
+            ? 'diff-file'
+            : line.startsWith('+')
+              ? 'diff-add'
+              : line.startsWith('-')
+                ? 'diff-del'
+                : 'diff-ctx'
+        pre.append(this.el(`diff-line ${cls}`, line))
+      }
+      t.detail.append(pre)
+    }
+    if (diffShown) {
+      // The diff *is* the arguments, restated as what actually changed. Keeping
+      // the raw call JSON above it means reading the same edit twice, once as a
+      // 400-character blob and once in a form a person can scan.
+      t.card.classList.add('has-diff')
+    }
   }
 
   private closeTool(id: string, ok: boolean, exit: number | null) {
@@ -892,8 +1178,8 @@ export class Transcript {
     const frag = document.createDocumentFragment()
     // Tool results are separate rows; match them to their card by id rather than
     // "the most recent card", which is wrong across page boundaries.
-    const cards = new Map<string, { out: HTMLElement }>()
-    let lastCard: { out: HTMLElement } | undefined
+    const cards = new Map<string, { out: HTMLElement; stat: HTMLElement; detail: HTMLElement; card: HTMLElement }>()
+    let lastCard: { out: HTMLElement; stat: HTMLElement; detail: HTMLElement; card: HTMLElement } | undefined
 
     const blk = (kind: string, label: string) => {
       const wrap = this.el(`blk blk-${kind}`)
@@ -922,8 +1208,34 @@ export class Transcript {
           this.turn!.appendChild(this.fileRow(m.files))
         }
         for (const call of parseCalls(m.tool_calls_json)) {
-          const { card, head, args, out, detail, subject } = this.buildToolCard(call.name)
-          ;(head.lastElementChild as HTMLElement).textContent = ''
+          if (call.name === 'ask_user') {
+            // No tool card, live or in history: a card headed `ASK_USER` names the
+            // mechanism and hides the only interesting part, which is the question
+            // the agent actually asked. The answer (the tool result) lands in the
+            // same block, so the exchange reads as one exchange.
+            const body = blk('note', 'asked you')
+            let q = ''
+            try {
+              const a = JSON.parse(call.arguments)
+              if (a && typeof a.question === 'string') q = a.question
+            } catch {
+              /* half-streamed arguments; fall back to the generic line */
+            }
+            // Two children, not one: the tool result is written into `out`, and
+            // sharing a single text node would overwrite the question with the
+            // answer, which loses the half of the exchange worth keeping.
+            const qEl = this.el('ask-hist-q')
+            qEl.textContent = q || 'the agent asked you something and kept the answer to itself'
+            const ansEl = this.el('ask-hist-a')
+            body.append(qEl, ansEl)
+            const wrap = body.closest('.blk') as HTMLElement
+            const ref = { out: ansEl, stat: ansEl, detail: body, card: wrap }
+            cards.set(call.id, ref)
+            lastCard = ref
+            continue
+          }
+          const { card, head, args, out, detail, subject, stat } = this.buildToolCard(call.name)
+          ;(head.querySelector('.tool-status') as HTMLElement).textContent = '' 
           frag.appendChild(card)
           args.textContent = call.arguments
           const subj = subjectFor(call.name, call.arguments)
@@ -931,7 +1243,7 @@ export class Transcript {
             subject.textContent = subj
             subject.title = subj
           }
-          const ref = { out }
+          const ref = { out, stat, detail, card }
           cards.set(call.id, ref)
           lastCard = ref
           this.tools.set(call.id, {
@@ -940,15 +1252,21 @@ export class Transcript {
             out,
             detail,
             subject,
+            stat,
             name: call.name,
-            status: head.lastElementChild as HTMLElement,
+            status: head.querySelector('.tool-status') as HTMLElement,
             stdout: '',
             stderr: '',
           })
         }
       } else if (m.role === 'tool') {
         const ref = (m.tool_call_id && cards.get(m.tool_call_id)) || lastCard
-        if (ref) ref.out.textContent = m.content.slice(0, 8000)
+        if (ref) {
+          ref.out.textContent = m.content.slice(0, 8000)
+          // Counts and diff are stored with the result, so a reloaded session
+          // shows the same `+N -M` it showed live.
+          if (m.changes?.length) this.noteChangesInto(ref, m.changes)
+        }
       }
     }
     return frag

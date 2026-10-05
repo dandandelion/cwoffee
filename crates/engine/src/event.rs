@@ -116,6 +116,9 @@ pub enum EngineEvent {
         id: String,
         ok: bool,
         exit_code: Option<i32>,
+        /// What file tools changed, for the `+N -M` badge and the diff view.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<crate::tools::changes::FileChange>,
     },
 
     /// The gate wants permission before a tool runs.
@@ -135,9 +138,10 @@ pub enum EngineEvent {
     /// The model asked the user to choose something, and the turn is parked
     /// until someone answers.
     ///
-    /// CONTRACT: the front end answers with `respond_question(id, text, option)`.
-    /// Not answering is allowed - the tool times out and tells the model to
-    /// decide for itself and say so - but a front end that *can* answer should,
+    /// CONTRACT: the front end answers with `respond_question(id, text, options)`,
+    /// where `options` is the list of chosen indices (empty when the user typed
+    /// instead). Not answering is allowed - the tool times out and tells the model
+    /// to decide for itself and say so - but a front end that *can* answer should,
     /// because the turn is doing nothing until it does.
     QuestionRequested {
         id: u64,
@@ -151,6 +155,15 @@ pub enum EngineEvent {
     /// A question was answered or cleared, from any client. Every view gets
     /// this so a card cannot sit there offering a choice that is already made.
     QuestionAnswered {
+        id: u64,
+    },
+
+    /// A question closed *without* an answer: the timeout expired, or the turn
+    /// was cancelled while it was parked. Without this the card stays live in
+    /// every window - and clicking Send on it then aims an answer at a tool call
+    /// that has already returned, which is how a five-minute-old question ends up
+    /// answering nothing.
+    QuestionExpired {
         id: u64,
     },
 

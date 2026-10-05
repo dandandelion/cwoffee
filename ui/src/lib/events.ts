@@ -21,6 +21,16 @@ export type QuestionRequested = {
   options: QuestionOption[]
   recommended?: number
   allow_custom: boolean
+  /** The model allows more than one answer, so the card ticks boxes. */
+  multi: boolean
+}
+
+export type FileChange = {
+  path: string
+  added: number
+  removed: number
+  diff?: string
+  created: boolean
 }
 
 export type OutputFile = {
@@ -30,7 +40,9 @@ export type OutputFile = {
   bytes: number
 }
 
-export type Risk = 'readOnly' | 'mutating' | 'exec'
+// Mirrors engine `Risk`. Harmless never prompts; Workspace changes a file that
+// already exists inside the workspace; Sensitive runs code or reaches outside it.
+export type Risk = 'harmless' | 'workspace' | 'sensitive'
 export type ApprovalAnswer = 'allow' | 'allowSession' | 'deny'
 
 export interface TurnTelemetry {
@@ -83,13 +95,16 @@ export type EngineEvent =
   | { kind: 'toolExecStart'; d: { id: string } }
   | { kind: 'toolExecOutput'; d: { id: string; stream: ExecStream; chunk: string } }
   | { kind: 'turnFiles'; d: { turn_id: number; files: OutputFile[] } }
-  | { kind: 'toolExecEnd'; d: { id: string; ok: boolean; exit_code: number | null } }
+  | { kind: 'toolExecEnd'; d: { id: string; ok: boolean; exit_code: number | null; changes: FileChange[] } }
   | {
       kind: 'approvalRequested'
       d: { id: number; tool: string; risk: Risk; summary: string; args: unknown }
     }
   | { kind: 'questionRequested'; d: QuestionRequested }
   | { kind: 'questionAnswered'; d: { id: number } }
+  // The question closed with no answer: the tool timed out, or the turn was
+  // cancelled while it was parked. The card must stop offering a choice.
+  | { kind: 'questionExpired'; d: { id: number } }
   | { kind: 'turnStats'; d: TurnStats }
   | { kind: 'usage'; d: TurnTelemetry }
   | { kind: 'turnEnd'; d: { turn_id: number; finish: FinishReason } }
@@ -126,6 +141,12 @@ export interface Session {
   message_count: number
 }
 
+export interface WorkspaceRow {
+  path: string
+  label: string
+  sessions: number
+}
+
 export interface SearchHit {
   session_id: number
   message_id: number
@@ -155,4 +176,6 @@ export interface StoredMessage {
   files: OutputFile[]
   created_at: number
   attachments: AttachmentMeta[]
+  /** Line counts / diff for a file call; UI metadata, never sent to the model. */
+  changes?: FileChange[]
 }
