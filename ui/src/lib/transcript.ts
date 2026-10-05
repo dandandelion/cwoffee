@@ -48,7 +48,7 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown } from './markdown'
+import { renderMarkdown, LiveMarkdown, type InlineReveal } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -121,6 +121,11 @@ export class Transcript {
   // Live markdown state for the answer block currently streaming.
   private liveEl: HTMLElement | null = null
   private live = new LiveMarkdown()
+  // Nodes owned by the reveal: not rewritten while they are animating.
+  private revealFrozen: HTMLElement | null = null
+  private revealPara: HTMLElement | null = null
+  private revealHead: HTMLElement | null = null
+  private revealNodes = new Map<number, HTMLElement>()
   private lastLiveRender = 0
   private liveTimer = 0
 
@@ -306,9 +311,79 @@ export class Transcript {
       return
     }
     this.lastLiveRender = now
-    // Animated variant: only the characters that arrived since the last paint
-    // come back wrapped, so older text never re-fades under a 120ms repaint.
-    this.liveEl.innerHTML = this.live.renderAnimated()
+    const r = this.live.renderReveal()
+    if (!r || r.mode === 'block') {
+      const html = r ? r.html : ''
+      this.dropRevealNodes()
+      if (this.liveEl.innerHTML !== html) this.liveEl.innerHTML = html
+      return
+    }
+    this.paintReveal(r)
+  }
+
+  /**
+   * Streaming paint with the newest arrivals kept as their own nodes.
+   *
+   * The reveal animation needs ~320ms per chunk and the paint cadence is 120ms,
+   * so anything rewritten on each paint is replaced before it can finish. Only
+   * the static head is rewritten; each chunk span is created once, animates
+   * once, and is removed when its text has been folded into the head.
+   */
+  private paintReveal(r: InlineReveal) {
+    const els = this.ensureRevealNodes()
+    if (els.frozenHost.dataset.src !== r.frozen) {
+      els.frozenHost.dataset.src = r.frozen
+      els.frozenHost.innerHTML = r.frozen
+    }
+    if (els.head.innerHTML !== r.head) els.head.innerHTML = r.head
+
+    const live = new Set(r.chunks.map((c) => c.id))
+    for (const [id, el] of this.revealNodes) {
+      if (!live.has(id)) {
+        el.remove()
+        this.revealNodes.delete(id)
+      }
+    }
+    for (const c of r.chunks) {
+      if (this.revealNodes.has(c.id)) continue
+      const el = document.createElement('span')
+      el.className = 'tin'
+      el.innerHTML = c.html
+      els.para.append(el)
+      this.revealNodes.set(c.id, el)
+    }
+  }
+
+  /** Finished blocks, then one paragraph holding `<head><chunk spans>`. */
+  private ensureRevealNodes() {
+    if (this.revealPara?.isConnected && this.revealHead?.isConnected) {
+      return {
+        frozenHost: this.revealFrozen as HTMLElement,
+        para: this.revealPara,
+        head: this.revealHead,
+      }
+    }
+    this.liveEl!.innerHTML = ''
+    const frozenHost = document.createElement('div')
+    frozenHost.className = 'tin-frozen'
+    const para = document.createElement('p')
+    para.className = 'tin-para'
+    const head = document.createElement('span')
+    head.className = 'tin-head'
+    para.append(head)
+    this.liveEl!.append(frozenHost, para)
+    this.revealFrozen = frozenHost
+    this.revealPara = para
+    this.revealHead = head
+    this.revealNodes = new Map()
+    return { frozenHost, para, head }
+  }
+
+  private dropRevealNodes() {
+    this.revealFrozen = null
+    this.revealPara = null
+    this.revealHead = null
+    this.revealNodes = new Map()
   }
 
   /** Start a fresh live-render target. */
@@ -316,6 +391,7 @@ export class Transcript {
     this.liveEl = el
     this.live = new LiveMarkdown()
     this.lastLiveRender = 0
+    this.dropRevealNodes()
   }
 
   private push(s: string, kind: BlockKind) {
@@ -445,6 +521,7 @@ export class Transcript {
       if (this.live.text) this.liveEl.innerHTML = this.live.finish()
       this.liveEl = null
     }
+    this.dropRevealNodes()
     this.live = new LiveMarkdown()
   }
 

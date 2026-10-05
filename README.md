@@ -137,9 +137,16 @@ Everything moves on one curve (`cubic-bezier(.2,.7,.2,1)`) with three durations,
 each transition answers a question: a new block eases in because it just arrived, a
 tool card expands rather than snaps because you asked it to, the metrics bar slides
 because a value changed, the send button's ring appears because you are about to
-press it. Streaming text blurs and fades in — the newest window only, so settled
-text never re-fades. `prefers-reduced-motion` turns all of it off. The one looping
-animation in the app is the steam on the empty screen's cup.
+press it. `prefers-reduced-motion` turns all of it off. The one looping animation in
+the app is the steam on the empty screen's cup.
+
+Streaming text **arrives** rather than appearing: each group of words that lands
+since the last repaint becomes its own node, blurs from 3px and fades from zero
+over 320ms, and is folded back into settled text only after it has finished. The
+cadence detail is the whole effect — the live block repaints every 120ms, so an
+effect wrapped in re-written text lives one paint and is invisible no matter what
+the computed styles say. Prose reveals; lists, code and tables paint whole,
+because a mis-parsed structure is worse than no animation.
 
 ## Two things that are security, not polish
 

@@ -390,6 +390,10 @@ for p in $(pgrep -x cwoffee-app); do [ "$p" = "$KEEP" ] || kill "$p"; done
 
 ## Trap 23: the streaming reveal must not re-parse the tail in halves
 
+
+( Necessary, and not sufficient: it fixed the structure and the effect was still
+invisible. See Trap 25 for the part that actually mattered. )
+
 Animating "the text that just arrived" looks like it has a cheap implementation:
 render what was already shown and the new suffix separately, and wrap the second
 one. It does not survive contact with the parser. Each call opens its own block
@@ -416,3 +420,48 @@ Collapsing tool output and thinking blocks is a `max-height` toggle. Transitioni
 to `none` does nothing, so expansion stayed instant. Use a large concrete value
 (`2400px`); the easing front-loads the growth so the visible part still lands in
 about 200ms.
+
+## Trap 25: an animation shorter than the repaint cadence is not an animation
+
+Trap 23 fixed the reveal's *structure* and left it invisible anyway. The user's
+report was blunt: "I don't see it." Measured, it was right not to.
+
+The reveal wrapped the newest characters in `<span class="tin">` inside the
+rendered string, and the live block is repainted every 120ms by replacing
+`innerHTML`. So every span lived one paint. The animation was 170ms on
+`cubic-bezier(.16,.84,.24,1)`, which is ease-out: by 33ms opacity was already
+0.70 and blur 0.65px. Three soft frames, then the text was replaced by an
+identical, un-animated copy of itself. It was working, computing, and
+reporting correct computed styles - and doing nothing a person could see.
+
+The unit has to be a **node that outlives the paint**, not a substring:
+
+- the parser hands over `head` (settled text) plus `chunks` (arrivals since the
+  last paint, each with a stable id),
+- the caller appends one span per chunk and never rewrites it,
+- a chunk folds back into `head` only after `REVEAL_HOLD_MS` (520ms), which is
+  comfortably past the 320ms animation, so the fold is invisible.
+
+After: median chunk lifetime 574ms, up to 4 chunks in flight, and a chunk spends
+~150ms between opacity 0.15/blur 2.5px and 0.78/0.66px. Visible in a 95ms
+filmstrip without squinting.
+
+Three traps inside the fix:
+
+1. **`committedChars` reset to 0 on a repaint-whole.** The head is
+   `para.slice(0, committedChars)`, so the characters painted *before* the reset
+   disappeared from the DOM: every answer lost its opening words the moment its
+   first chunk was cut. A reset means "everything seen so far is static", i.e.
+   `committedChars = para.length`.
+2. **The first paint of any answer is a block paint**, because the window has to
+   be established before it can be diffed. Tests written as "every paint is
+   inline" fail for a correct reason; assert one block paint, not zero.
+3. **`matchMedia` at module scope silently disables the effect in a test
+   runner** (no `matchMedia`, so the guard evaluated false and every paint was
+   block). Any capability probe belongs inside the function that uses it.
+
+The gate is also narrower now: only prose reveals. A tail holding a list marker,
+fence, table, heading or raw HTML paints whole, because chunk-level inline
+rendering cannot reproduce a `<li>` and a wrong structure is worse than no
+effect. `paraOnly()` is the gate and has its own tests, so the structure tests
+cannot pass by accident.

@@ -40,7 +40,7 @@ function safeUrl(u: string): string {
   return ''
 }
 
-function renderInline(text: string): string {
+export function renderInline(text: string): string {
   // text is already escaped
   let out = ''
   let i = 0
@@ -410,30 +410,56 @@ export function splitBlocks(src: string): string[] {
  * different from what the user just watched.
  */
 /**
- * Wrap the trailing `k` characters of the last text run in an inline span.
- *
- * "Last text run" means the characters between two tags at the end of the
- * fragment, so the insert cannot cut a tag, an attribute or an entity: the
- * split is always made at a space, and no HTML construct contains one.
+ * The tail as one paragraph, or null if it holds anything the per-chunk inline
+ * pass cannot reproduce: lists, fences, tables, headings, raw HTML, or more than
+ * one paragraph. Normalised exactly the way `renderMarkdown` normalises it, so
+ * `<p>` + renderInline(escapeHtml(para)) + `</p>` is byte-identical to
+ * renderMarkdown(tail) over the same text.
  */
-function wrapLastText(html: string, k: number): string {
-  // The run must contain a non-space: a fragment usually ends with inter-tag
-  // whitespace ("</li>\n</ul>"), and wrapping that animates nothing while
-  // silently disabling the effect for every list.
-  const m = /([^<>]*\S[^<>]*)((?:<[^<>]+>[ \t\n]*)*)$/.exec(html)
-  if (!m || !m[1]) return html
-  const text = m[1]
-  const at = m.index + text.length
-  // Align to a word boundary: an animation that starts mid-word looks like a
-  // rendering fault rather than an effect.
-  let cut = text.lastIndexOf(' ', Math.max(0, text.length - Math.max(1, k)))
-  if (cut < 0) cut = 0
-  else cut += 1
-  const head = text.slice(0, cut)
-  const fresh = text.slice(cut)
-  if (!fresh.trim()) return html
-  return `${html.slice(0, at - fresh.length)}<span class="tin">${fresh}</span>${html.slice(at)}`
+export function paraOnly(tail: string): string | null {
+  const lines = tail.replace(/\r\n?/g, '\n').split('\n')
+  while (lines.length && !lines[0].trim()) lines.shift()
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop()
+  if (!lines.length) return null
+  if (lines.some((l) => /^\s*(?:```|~~~)/.test(l))) return null
+  if (
+    lines.some((l) =>
+      /^\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}\s|>|\||<[a-zA-Z/!])/.test(l),
+    )
+  )
+    return null
+  if (lines.some((l) => !l.trim())) return null
+  return lines.join('\n')
 }
+
+/** The reveal animation's own duration, mirrored in app.css. A chunk folded back
+ *  into the static part before this has elapsed never finishes animating, so the
+ *  CSS and this constant are the same decision written twice. */
+export const REVEAL_ANIM_MS = 320
+/** How long a chunk stays a node of its own. Must exceed REVEAL_ANIM_MS; the
+ *  margin is what keeps the fold-back invisible instead of a snap. */
+export const REVEAL_HOLD_MS = 520
+
+/**
+ * Evaluated per paint rather than at import: it has to be false when the user
+ * asked for reduced motion, and a page (or a test runner) with no matchMedia at
+ * all should get the animation rather than lose it to a missing API.
+ */
+function revealOn(): boolean {
+  return !(
+    typeof matchMedia === 'function' &&
+    matchMedia('(prefers-reduced-motion: reduce)').matches
+  )
+}
+
+let chunkSeq = 0
+
+export type RevealChunk = { id: number; html: string }
+export type Reveal =
+  | { mode: 'inline'; frozen: string; head: string; chunks: RevealChunk[] }
+  | { mode: 'block'; html: string }
+/** The reveal after the mode has been narrowed, which is what the caller holds. */
+export type InlineReveal = Extract<Reveal, { mode: 'inline' }>
 
 export class LiveMarkdown {
   private src = ''
@@ -477,50 +503,87 @@ export class LiveMarkdown {
     return frozen + (frozen ? '\n' : '') + renderMarkdown(tail)
   }
 
-  /** Where the source was at the previous animated paint. */
-  private shownSrcLen = 0
-  private shownFrozen = -1
+  /**
+   * The streaming paint, split so the caller can keep the newest arrivals in
+   * nodes of their own.
+   *
+   * The earlier design wrapped the newest characters in a span inside the
+   * rendered string, which meant every 120ms repaint destroyed the span and
+   * rebuilt the same text un-animated. Measured: the animation runs 0 to 1 in
+   * 170ms on an ease-out curve that is already 70% opaque at 33ms, and the node
+   * lives 120ms. Three frames of softness in a 60fps stream, which is to say
+   * nothing. An effect nobody can see is not an effect.
+   *
+   * So the unit is a node, not a substring: `chunks` are the arrivals since the
+   * last paint, each with a stable id, and they are folded back into `head` only
+   * once they have outlived the animation. The caller appends them and never
+   * recreates them, so each chunk animates exactly once and exactly to the end.
+   *
+   * `mode: 'block'` means the tail cannot be split without risking a mis-parse,
+   * and comes back as a single already-rendered fragment.
+   */
+  renderReveal(): Reveal | null {
+    if (!this.src) return null
+    const { frozen, tail } = this.parts()
+    const para = tail ? paraOnly(tail) : null
+    if (!revealOn() || para === null) {
+      this.forgetPara()
+      return { mode: 'block', html: this.render() }
+    }
+    // A new frozen block, or a paragraph that re-blocked rather than grew, means
+    // the text under the chunks moved. Repaint whole and start the window over.
+    if (para !== this.paraSeen && !para.startsWith(this.paraSeen)) {
+      this.forgetPara(para)
+      return { mode: 'block', html: this.render() }
+    }
+    if (this.frozenCount !== this.frozenAtPaint) {
+      this.forgetPara(para)
+      return { mode: 'block', html: this.render() }
+    }
+
+    const now = performance.now()
+    const fresh = para.slice(this.paraSeen.length)
+    if (fresh) this.pending.push({ id: ++chunkSeq, text: fresh, at: now })
+    this.paraSeen = para
+    while (
+      this.pending.length &&
+      now - this.pending[0].at > REVEAL_HOLD_MS
+    ) {
+      this.committedChars += this.pending.shift()!.text.length
+    }
+    return {
+      mode: 'inline',
+      frozen,
+      head: renderInline(escapeHtml(para.slice(0, this.committedChars))),
+      chunks: this.pending.map((c) => ({
+        id: c.id,
+        html: renderInline(escapeHtml(c.text)),
+      })),
+    }
+  }
 
   /**
-   * Like render(), but the newest characters come back inside
-   * `<span class="tin">` so CSS can blur and fade them in.
+   * Drop the reveal window and repaint the paragraph whole.
    *
-   * The wrap is *inline* and applied after a single parse of the tail. The
-   * earlier design parsed the already-shown and the new halves separately,
-   * which is cheaper to write and wrong to look at: this parser emits one <p>
-   * per call, so a growing paragraph split into two paragraphs with a gap
-   * mid-stream, and a growing bullet lost its continuation outside the list.
-   * Both showed up in screenshots of the running app, which is the only reason
-   * anyone ever finds these.
-   *
-   * Properties that follow from the inline approach:
-   *   * Strip the span and the output is byte-identical to one pass over the
-   *     tail. There is a test for exactly that.
-   *   * The tail is parsed once per paint, not twice.
-   *   * Only the newest window is wrapped, so settled text never re-fades -
-   *     which is the difference between "flowing in" and "flickering".
+   * Everything seen so far becomes static: `committedChars` has to land on
+   * para.length, not 0. It landed on 0 first, and the head - which is
+   * para.slice(0, committedChars) - lost the characters painted before the
+   * reset, so the beginning of every answer disappeared the moment its first
+   * chunk was cut. The unit test that compares the DOM against one pass over
+   * the source is what caught it.
    */
-  renderAnimated(): string {
-    const { frozen, tail } = this.parts()
-    const sep = frozen ? '\n' : ''
-    if (!tail) {
-      this.markPainted()
-      return frozen
-    }
-    const html = renderMarkdown(tail)
-    // Measured on the source: splitBlocks appends newlines to blocks, so tails
-    // are not prefix-comparable ("one two\n" against "one two x\n").
-    const grew =
-      this.shownFrozen === this.frozenCount ? this.src.length - this.shownSrcLen : 0
-    this.markPainted()
-    if (grew <= 0) return frozen + sep + html
-    return frozen + sep + wrapLastText(html, grew)
+  private forgetPara(para = '') {
+    this.paraSeen = para
+    this.pending = []
+    this.committedChars = para.length
+    this.frozenAtPaint = this.frozenCount
   }
 
-  private markPainted() {
-    this.shownSrcLen = this.src.length
-    this.shownFrozen = this.frozenCount
-  }
+  /** Bookkeeping for the reveal window. */
+  private paraSeen = ''
+  private pending: { id: number; text: string; at: number }[] = []
+  private committedChars = 0
+  private frozenAtPaint = -1
 
   finish(): string {
     return renderMarkdown(this.src)

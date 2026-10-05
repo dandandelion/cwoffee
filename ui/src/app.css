@@ -1394,14 +1394,31 @@ body {
    to non-replaced inline boxes. blur+opacity is also the part that reads as
    "arriving" rather than "moving". */
 @keyframes cwoffee-tin {
-  from { opacity: 0; filter: blur(2.2px); }
+  from { opacity: 0; filter: blur(3px); }
   to   { opacity: 1; filter: blur(0); }
 }
 
 .pop { animation: cwoffee-pop var(--d2) var(--ease-out) both; }
 .pop.measuring { animation: none; }
 
-.tin { animation: cwoffee-tin 170ms var(--ease-out) both; }
+/*
+ * Streaming text blurs and fades in. The duration mirrors REVEAL_HOLD_MS in
+ * markdown.ts: the same decision written twice, because a chunk node pulled out
+ * before its animation finishes simply appears - which is the exact failure the
+ * chunk-node design exists to remove (170ms of animation inside a 120ms paint
+ * looked like nothing at all).
+ *
+ * The curve is deliberately not ease-out. The old one had already reached 0.70
+ * opacity by 33ms, so the visible part was three frames and the rest was the
+ * text sitting there finished. This one spends its change across the window.
+ */
+.tin { animation: cwoffee-tin 320ms cubic-bezier(0.32, 0.02, 0.28, 1) both; }
+/* The streaming paragraph is assembled from a static head plus chunk spans, so
+   it has to sit exactly where a markdown paragraph would sit. */
+/* The assembled paragraph is a real <p> inside .blk-body, so the app's own
+   paragraph rules give it its spacing - measured, not re-declared here. Only
+   the empty case needs saying. */
+.tin-frozen:empty { display: none; }
 
 /* Only blocks created during a live turn ease in. Stored transcripts are
    rendered outside .turn, so opening an old session does not play 40 entrances

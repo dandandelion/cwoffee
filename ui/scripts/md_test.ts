@@ -4,7 +4,7 @@
  * The security cases are the point. Model output quotes fetched web pages, so
  * anything that reaches this function is untrusted input from the internet.
  */
-import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks } from '../src/lib/markdown.ts'
+import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, paraOnly, REVEAL_HOLD_MS, type Reveal } from '../src/lib/markdown.ts'
 
 let failed = 0
 function eq(name: string, got: string, want: string) {
@@ -289,81 +289,137 @@ ok('negative input is clamped', fmtThink(-5_000) === 'thought for 0s', fmtThink(
 
 // ---- streaming reveal (.tin) -------------------------------------------
 // The reveal is the difference between text appearing and text arriving. The
-// invariant that matters: strip the animation wrapper and the animated paint is
-// identical to the plain paint of the same state. An earlier version parsed the
-// already-shown and new halves separately, which turned a growing paragraph into
-// two paragraphs and let a bullet's continuation escape its list - both found by
-// looking at screenshots of the running app rather than at the code.
+// The streaming reveal. Its unit is a DOM node, not a substring: a substring is
+// replaced by the next paint 120ms later, which is shorter than the animation,
+// so the animation is invisible. Measured before the redesign: opacity reaches
+// 0.70 at 33ms on an ease-out curve and the node dies at ~120ms - three soft
+// frames in a 60fps stream. So the tests are about nodes surviving, about text
+// never being lost when a node is folded back, and about block structures being
+// painted whole rather than re-rendered per chunk and mis-parsed.
 {
-  // Remove the single .tin span, leaving every other span (code head, copy
-  // button) intact. Removing all </span> instead mangles the comparison.
-  const stripTin = (h: string) => {
-    const open = '<span class="tin">'
-    const i = h.indexOf(open)
-    if (i < 0) return h
-    const j = h.indexOf('</span>', i + open.length)
-    return j < 0 ? h : h.slice(0, i) + h.slice(i + open.length, j) + h.slice(j + 7)
-  }
+  const words = (t: string) => t.split(/(?<=\s)/)
+  // What the DOM would show for a reveal: finished blocks, then one paragraph
+  // holding the static head followed by one span per pending chunk.
+  const domOf = (r: Reveal) =>
+    r.mode === 'block'
+      ? r.html
+      : (r.frozen ? r.frozen + '\n' : '') +
+        '<p>' +
+        r.head +
+        r.chunks.map((c) => `<span class="tin">${c.html}</span>`).join('') +
+        '</p>'
+  // HTML whitespace is not content; compare the words the user would read.
+  const visible = (h: string) => h.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
 
-  // Two renderers fed the identical token stream, one animated and one not.
-  const sameStream = (pieces: string[]) => {
-    const plain = new LiveMarkdown()
-    const anim = new LiveMarkdown()
-    let plainOut = ''
-    let animOut = ''
-    let wrapped = 0
-    for (const piece of pieces) {
-      plain.push(piece)
-      plainOut = plain.render()
-      anim.push(piece)
-      animOut = anim.renderAnimated()
-      if (animOut.includes('class="tin"')) wrapped++
+  // The gate itself, so the structure results above cannot pass by accident.
+  eq('gate: prose is revealable', paraOnly('one two three\n'), 'one two three')
+  eq('gate: a list is not prose', paraOnly('- one\n'), null)
+  eq('gate: a fence is not prose', paraOnly('```js\nlet x\n```\n'), null)
+  eq('gate: two paragraphs are not one', paraOnly('one\n\n   two\n'), null)
+
+  const prose =
+    'Lisbon in January is mild and bright, damp after sunset, and the trams still rattle up the hills.'
+  const live = new LiveMarkdown()
+  const htmlOf = new Map<number, string>()
+  let inline = 0
+  let blocks = 0
+  let last = ''
+  for (const w of words(prose)) {
+    live.push(w)
+    const r = live.renderReveal()!
+    if (r.mode === 'block') blocks++
+    else {
+      inline++
+      for (const c of r.chunks) {
+        // A chunk that changed its html would restart its animation, which is
+        // the flicker this whole design exists to avoid.
+        if (htmlOf.has(c.id))
+          ok('chunk html is immutable', htmlOf.get(c.id) === c.html, `id=${c.id}`)
+        htmlOf.set(c.id, c.html)
+      }
     }
-    return { plainOut, animOut, wrapped }
+    last = domOf(r)
   }
-  const words = (text: string) => text.split(/(?<=\s)/)
+  // Exactly one block paint: the first, which establishes the window. Every
+  // paint after it carries chunks.
+  ok('prose streams as inline chunks', inline > 3 && blocks === 1, ` inline=${inline} block=${blocks}`)
+  ok('chunk nodes were created', htmlOf.size > 3, ` chunks=${htmlOf.size}`)
+  eq('reveal text is exactly one pass', visible(last), visible(renderMarkdown(prose)))
+  eq(
+    'the reveal stays inside one paragraph',
+    (last.match(/<p>/g) || []).length,
+    1,
+  )
 
-  for (const [name, text] of [
-    ['prose', 'one two three four five six seven'],
-    ['bullet', '- **first** item that keeps going and wraps on and on\n'],
-    ['two bullets', '- one item\n- a second item that also runs on\n'],
-    ['code', '```python\ndef f():\n    return 1\n```\n'],
+  // Folding a finished chunk back into the head must neither drop nor duplicate
+  // text: hold still, and the head silently takes over the chunks' characters.
+  const hold = new LiveMarkdown()
+  hold.push('settling text that waits')
+  hold.renderReveal() // first paint establishes the window; it is painted whole
+  hold.push(' for the fold')
+  const early = hold.renderReveal()!
+  ok(
+    'newest text is a chunk, older text is the head',
+    early.mode === 'inline' && early.chunks.length === 1 && early.head.length > 0,
+    ` mode=${early.mode} chunks=${early.mode === 'inline' ? early.chunks.length : 'n/a'}`,
+  )
+  const beforeFold = visible(domOf(early))
+  // A real wait, because the hold is a wall-clock window and the behaviour under
+  // test is what happens when it expires with nothing new arriving.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, REVEAL_HOLD_MS + 120)
+  const late = hold.renderReveal()!
+  ok('expired chunks fold into the head', late.mode === 'inline' && late.chunks.length === 0,
+    ` chunks=${late.mode === 'inline' ? late.chunks.length : 'n/a'}`)
+  eq('folding neither adds nor drops a character', visible(domOf(late)), beforeFold)
+  eq('and the head holds the whole paragraph', visible(domOf(late)), visible(hold.text))
+
+  // Lists, fences, tables, headings and raw HTML are painted whole. Chunk-level
+  // inline rendering cannot reproduce a list marker or a code fence, and a
+  // wrong structure is worse than no animation.
+  for (const [name, src] of [
+    ['bullet', '- **first** item that keeps going on\n'],
+    ['two bullets', '- one item\n- a second item that runs on\n'],
+    ['fence', '```python\ndef f():\n    return 1\n```\n'],
     ['table', '| a | b |\n| - | - |\n| 1 | 2 |\n'],
-    ['mixed', 'Lead paragraph.\n\n- bullet one\n- bullet two\n\n```js\nlet x = 1\n```\n'],
+    ['heading', '# A title\n'],
+    ['raw html', '<div class="x">block</div>\n'],
   ] as [string, string][]) {
-    const { plainOut, animOut, wrapped } = sameStream(words(text))
-    eq(`reveal preserves structure: ${name}`, stripTin(animOut), plainOut)
-    // A reveal that quietly switched itself off would also pass the equality
-    // check above, so the effect's presence is asserted separately.
-    ok(`reveal actually runs: ${name}`, wrapped > 0, `  wrapped=${wrapped}`)
+    const lv = new LiveMarkdown()
+    let allBlock = true
+    for (const w of words(src)) {
+      lv.push(w)
+      if (lv.renderReveal()!.mode !== 'block') allBlock = false
+    }
+    ok(`structure paints whole: ${name}`, allBlock)
   }
 
-  // Only the newest words are wrapped, and settled words are not re-wrapped.
-  const a = new LiveMarkdown()
-  a.push('one two three')
-  ok('first paint is not wrapped', a.renderAnimated() === '<p>one two three</p>')
-  a.push(' four five')
+  // A completed block must not leave a chunk pointing at text that has moved:
+  // the paragraph freezes, the window resets, and the paint stays correct.
+  const two = new LiveMarkdown()
+  const modes: string[] = []
+  let twoDom = ''
+  for (const w of words('first paragraph here.\n\nsecond paragraph starts.\n')) {
+    two.push(w)
+    const r = two.renderReveal()!
+    modes.push(r.mode)
+    twoDom = domOf(r)
+  }
+  eq('completed block text is intact', visible(twoDom), visible(renderMarkdown(two.text)))
   ok(
-    'new words are wrapped inline',
-    a.renderAnimated() === '<p>one two three <span class="tin">four five</span></p>',
+    'the freeze repaints whole rather than half-parsing',
+    modes.filter((m) => m === 'block').length >= 2,
+    ` modes=${modes.join(',')}`,
   )
-  a.push(' six')
-  const third = a.renderAnimated()
   ok(
-    'settled words are not re-wrapped',
-    third === '<p>one two three four five <span class="tin">six</span></p>',
-    `\n  got: ${third}`,
+    'the frozen paragraph is in the static part',
+    two.render().includes('<p>first paragraph here.</p>'),
   )
-  // A single span at most, so the strip above cannot be hiding a pile of them.
-  ok('one span per paint', (third.match(/class="tin"/g) || []).length === 1, `\n  got: ${third}`)
-  // Repainting without new text must not invent a new wrapper.
-  ok('repaint with no new text adds no span', !a.renderAnimated().includes('class="tin"'))
 
-  // finish() must be byte-identical to a single pass, animation or not.
+  // finish() is what the stored transcript renders, animated or not.
   const f = new LiveMarkdown()
   for (const w of words('a simple answer with **bold** and a list\n- one\n- two\n')) {
     f.push(w)
-    f.renderAnimated()
+    f.renderReveal()
   }
   eq('animation does not leak into the final DOM', f.finish(), renderMarkdown(f.text))
 }
