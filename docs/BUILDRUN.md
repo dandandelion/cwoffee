@@ -567,6 +567,9 @@ mistakes with different fixes, and one merged message made both of them unreadab
 
 ## Trap 31: `.blk` is a two-column grid — append to it and your content gets 74px
 
+> Superseded by Trap 42: the grid is gone. The lesson about append order inside a block
+> still stands; only the column width does not.
+
 `buildToolCard`, the reasoning block and the answer block all append a `.blk-head`
 and then a body element to a `.blk` card, whose grid is `74px 1fr`. The rewritten
 question card appended `.ask-q`, `.ask-opts`, `.ask-custom` and `.ask-actions`
@@ -659,8 +662,9 @@ Two things to expect afterwards, both correct:
 
 - `list_workspaces()` unions registered rows with folders that hold sessions, so a
   subfolder shows as its own group. That is the feature, not a duplicate row.
-- `/tmp` may keep a group of one, because a session really does live there. The sidebar
-  groups by where the session's tools actually write, and that is the claim it makes.
+- A session in `/tmp` used to get a group of its own, because that is where its tools
+  really did write. It no longer does: the temp root is now the *no workspace* bucket and
+  buckets under `Default` with the sessions that never chose a folder. See Trap 40.
 
 ## Trap 36: a gateway stub that returns the empty value is a claim, not an absence
 
@@ -670,3 +674,375 @@ migrating" when the truth is that this process never knew. The notes now travel 
 `EngineHandle` from whichever process started the gateway (desktop or standalone), and
 the test asserts both directions — empty when nothing was reported, present when
 something was.
+
+## Trap 37: an approval answer spelled one way in the UI and another in the gateway
+
+`ApprovalAnswer` is a Rust enum with `#[serde(rename_all = "camelCase")]`, so its wire
+forms are `allow`, `allowSession`, `deny`. The UI sends exactly those. The gateway parsed
+the answer by hand — `"allow" | "allow_session" | "deny"` — so every approval answered
+from a phone as anything other than plain `allow` came back as
+`unknown answer "allowSession"` and the parked tool sat there until it timed out. The
+tool looked like it ignored the user.
+
+Two rules follow:
+
+- Parse a wire value with the same `serde` impl that defines it
+  (`serde_json::from_value::<ApprovalAnswer>`), plus the legacy spelling if old clients
+  exist. A hand-written match on strings is a second definition of the enum, and it will
+  drift the moment someone renames a variant.
+- Pin the wire spelling with a Rust test (`the_wire_spelling_of_an_approval_answer_is_pinned`)
+  *and* drive it end to end from a fake client
+  (`an_approval_answered_from_the_phone_reaches_the_engine`). The first catches a rename,
+  the second catches a transport that forgets to parse.
+
+## Trap 38: `animation-fill-mode: both` holds a filter forever
+
+The streaming reveal was reported as a blink "at the end of the token transition", which
+is the opposite of what a fade-in should feel like. The chunk span kept the last keyframe
+forever — `filter: blur(0)` — and any filter puts an element in its own raster layer. So
+the text existed twice: the layer the animation held, and the layer the folded, static
+paragraph was drawn into. Swapping between them is a re-raster of glyphs, and at the end
+of every chunk that swap is a visible pop.
+
+Use `backwards`: the animation owns only the *pre*-animation state, and at the end the
+span is ordinary text again, so folding it moves glyphs that were already rasterised.
+
+Related, and easy to get wrong twice: `transform: translateZ(0)` on an inline span does
+nothing (transforms do not apply to non-replaced inline boxes). The layer hint belongs on
+the block that contains it — `.blk-reasoning .blk-body`, `.tin-para`.
+
+## Trap 39: a `<div>` per streamed delta makes the paragraph grow down the block
+
+Thinking deltas were appended with the transcript's `el()` helper, which builds a `<div>`.
+Every delta therefore began on a new line: the thinking block was a stack of one-clause
+lines, each spanning the full width, and it got taller on every single paint. Two
+complaints came from that one line of code — "tokens grow vertically instead of filling
+the width" and "the whole thing flashes", because the transcript pins to the tail and so
+nudged the entire view on each delta.
+
+Chunks that belong inside a paragraph have to be inline. Measured in the running app:
+thinking body 780px, chunk width 768px each — the numbers that made it obvious. The
+self-test now asserts `getComputedStyle(chunk).display === 'inline'` and that the run's
+bounding width is at least 70% of the block's, which fails exactly the way the bug looks.
+
+## Trap 40: the harness leaned on `/tmp` as a workspace
+
+A workspace check in the self-test did `set_workspace('/tmp')` and asserted it landed,
+because `/tmp` is always writable and needs no cleanup. The moment the engine started
+treating the temp root as "no workspace" — it is where sessions live *before* anyone
+chooses a folder, so drawing it as a folder group beside `No workspace` was the same
+thing in two rows — the check failed, and because the call was not inside `try/catch`
+the rejection escaped and aborted the whole suite ("aborted before the summary"), with
+the engine's message as the only report.
+
+So:
+
+- Tests that need a real folder make one (`unique_dir(tag)` in the gateway tests, a
+  registered project folder in the self-test), never the temp root.
+- Every `set_workspace` in the harness is inside `try/catch` and asserts the *reason*
+  (`/temp folder/`, `/keeps its folder/`), not just that it threw.
+- The engine refuses `/tmp` in `check_workspace`, the UI buckets it as `Default`, and
+  the UI surfaces the refusal as a toast rather than an inline error in a panel that is
+  usually already closed.
+
+## Trap 41: the label column was a tax on every block, and `$derived` reads ahead
+
+The transcript's `.blk` grid gave every block a 74px label column. The assistant's text
+started 74px right of nothing, the user's message started somewhere else, and the two
+never lined up — which is why the request was "let the CWOFFEE label protrude to the
+left". The fix is one column plus a gutter: the scroller gets the padding
+(`.scroller { padding-left: 80px }`, written after the Tailwind import so it beats
+`px-6` without `!important`), and `.blk > .blk-head` hangs in it with
+`position: absolute; left: -66px`.
+
+Two traps inside the fix:
+
+- Any block that keeps its own full-width header row (thinking, tool cards) must opt out
+  with `position: static`, or its header is outdented into the gutter and truncated at
+  58px. The narrow-window media query does the same for every block, because below 860px
+  there is no gutter to protrude into and the label would be clipped by the scroller.
+- A `$derived` that reads a `let` declared further down the module is a temporal dead
+  zone error, not a hoisted reference: `Block-scoped variable 'viewId' used before its
+  declaration`. `$derived.by(() => ...)` is fine because the read happens on the first
+  reactive update, after the module has finished initialising.
+
+## Trap 42: a gate that waits on the model's whims fails for reasons that are not bugs
+
+The approval check asked the model to `exec echo cwoffee-ok` and waited 90s for an
+approval request. It passed for months, then began failing — not because the approval
+path broke (it does not: a live probe gets `read_file → sensitive → allowSession → ok`
+in a few seconds) but because a quantized local model will sometimes spend minutes
+emitting tool-call JSON that never completes. Three runs of the same suite measured
+7.5k, 11k and 24k delta frames with `chars=0`: no tool call parsed, so no approval ever
+arrived, and *every check after it* failed with a message about the previous turn
+("cannot delete the active session while a turn is running", "a turn is running, so the
+workspace change is queued behind it").
+
+What made it survivable:
+
+- **Ask for the cheapest thing that exercises the wire.** A `read_file` of a path
+  outside the workspace is one line of arguments, is gated in `ask` mode, and asserts
+  the risk class (`sensitive`) and the escape (`OUTSIDE the workspace: /etc/hostname`)
+  in the same step. `exec` remains covered by the Rust tests and the sandbox probe.
+- **Pin the reasoning level per step, and restore it.** The suite pins `medium` overall
+  and `off` for the steps whose subject is wiring. Thinking is still asserted where it
+  is the thing under test. A gate that costs twenty minutes of inference on a
+  single-slot endpoint does not get run, and an unrun gate is not a gate.
+- **Never leave a turn running into the next check.** `settleTurn(what, budget)` waits a
+  bounded time and then cancels, logging that it did. Before it, one slow turn produced
+  seven failures and the summary blamed the wrong step every time.
+- Say what was waited for and for how long (`waitTurnDone: no turnEnd after 150000ms
+  (turns=3->3)`, `settleTurn: before the move check was cancelled (attempt 1) instead of
+  waited out`). A timeout that does not name itself is indistinguishable from a hang.
+
+The two oracles the harness uses now, because the old ones were wrong:
+
+- **`turnEnds`, not `HostState.turns`.** `turns` is a per-session counter, so a check
+  that switched sessions waited on a counter belonging to a different conversation and
+  reported "turn never ended" about a turn that had plainly finished and streamed. The
+  webview counts `turnEnd` events; the store counter is kept only as a fallback for a
+  turn that ended during a reconnect.
+- **Idle must persist.** The first `busy == false` sample is not the end of a turn: a
+  turn queued behind a cancelled one starts a moment later. `settleTurn` requires six
+  consecutive idle polls (~1.5s) and cancels up to three times, because the queue
+  re-fills.
+
+## Trap 43: "Stop does nothing" - a turn parked on an approval outranks the Stop button
+
+`cancel_turn` set the agent's cancel flag, and the flag interrupts the provider
+stream. It did nothing to a tool sitting in `ApprovalGate::check`, waiting on a
+`oneshot` whose sender lived in a front end. The Tauri command dropped parked
+*questions* on cancel; nobody dropped parked *approvals*; the gateway dropped
+neither. Result: press Stop on a turn that is waiting for you to answer a prompt, and
+the host stays `busy` for the whole approval timeout - 300s by default. The desktop
+self-test caught this by accident: an answered `read_file` prompt, then an unanswered
+`exec` one, and six failures downstream all complaining that a turn was running.
+
+The fix belongs in the engine, not in each front end, because the engine is the only
+place that knows a cancel happened:
+
+```rust
+let gate = if already_stopped {
+    // Asking now puts a card on screen that the user has already refused.
+    GateOutcome::Deny { reason: "the turn was stopped before the approval was asked".into() }
+} else {
+    tokio::select! {
+        biased;
+        _ = Self::wait_cancel(cancel_wait) => GateOutcome::Deny {
+            reason: "the turn was stopped while the approval was pending".into(),
+        },
+        o = self.gate.check(&call.name, &risk, &args) => o,
+    }
+};
+```
+
+`biased` matters: without it a prompt answered in the same tick as the Stop press can
+win, which is the opposite of what a Stop press means. The front ends still drop
+their senders on cancel - that releases the park on the spot instead of on the next
+poll, and the count is worth logging - but they are no longer load-bearing.
+
+The test that pins it (`a_stop_press_releases_a_parked_approval`) takes the prompt and
+**holds the sender open**. Dropping it would let the "approval UI disconnected" branch
+release the park and the test would pass while cancel did nothing.
+
+## Trap 44: "my conversation is being mutated" - one host, no addressee
+
+A harness run put its turns - including a 650-word essay and a file chip for it - into
+the conversation the user had open. The transcript looked like it was editing itself.
+
+There was no corruption. `HostCmd::Send` carried text and attachments and no session id,
+so it ran in *whichever conversation the host happened to have active*. That is correct
+for a single-window app and indefensible for one that also serves a phone tab and its own
+test harness: every client was writing into whoever's turn was last.
+
+The id is an **assertion**, not a hint, because a mismatch means the client and host
+disagree about what is on screen:
+
+| client says | host does |
+|---|---|
+| nothing | runs in the active session, as before |
+| `0` ("my view is a draft") | drops to draft, so the send opens a new conversation |
+| `512` | runs there, or refuses |
+
+```
+the turn asked for session 512, but the host is on session 508: nothing was sent.
+```
+
+Refuse rather than reroute: appending a message to a session the sender cannot see is
+the bug with a nicer error string, and it also silently moves the host's active session
+under everyone else's feet.
+
+The refusal is an `error` **event**, not an rpc error: the command parsed and was
+understood, the engine declined to execute it. Clients that only look at rpc errors -
+which is every client here until this change - stay silent while the engine says no. The
+desktop now renders those messages as a toast.
+
+Tests: `a_turn_named_for_another_session_is_refused`, `a_draft_send_starts_its_own_conversation`,
+and gateway `a_turn_for_a_stale_view_is_refused_over_the_wire` - which pins the event-not-error
+part, because that is the half a client can get wrong on its own.
+
+The harness was the perpetrator, so it also lost the habit: every `start_turn` in the
+self-test names its session, the run captures the session that was open before it started,
+and it switches back to that one at the end.
+
+## Trap 45: "you can't switch sessions mid-conversation" - a UI waiting on a busy host
+
+The click was never blocked by policy. The host runs **one** command loop, and while a
+turn is running that loop is inside the turn, so `switch_session` queued behind it and the
+`await` in `openSession()` froze the view until the model finished.
+
+The view and the host are separate things and only the view has to move now: the command is
+still sent, but not awaited while `busy`. The transcript is already addressed by session id
+(so a running turn never paints into another session) and the sidebar row of the working
+session gets a spinner.
+
+Two sidebar markers that used to mean whatever the moment wanted: a pulse for *answering*
+and a pulse for *unread*. They are different questions - "is it working?" vs "did something
+arrive while I was away?" - and are now different marks: a turning arc while a turn is in
+flight, the pulse only for a turn that ended while you were looking elsewhere.
+
+## Trap 46: "the file wasn't attached" - a strip that belonged to the live turn
+
+A turn wrote a 650-word paragraph, the engine recorded the file, the store kept it, and
+the transcript showed nothing.
+
+The live path was fine. The *history* path appended the chip row with `ensureTurn()`,
+which attaches to the live `.turn` group - and on a reload that group is created before
+the history fragment is appended, so the chips landed at the **top** of the transcript,
+above every message, off screen. A session reopened after producing a file looked like a
+session that had produced nothing.
+
+Rendering against a detached fragment has to keep every node inside that fragment:
+
+```ts
+const strip = this.fileRow(m.files)
+frag.insertBefore(strip, lastWrap ? lastWrap.nextSibling : null)
+```
+
+The assertion now checks DOM *order*, not existence: the chip must follow the answer
+block that produced it. `document.querySelector('.filechip')` passes on the broken build.
+
+## Trap 47: the harness was refused by its own safety rule
+
+Addressing turns (`start_turn { session }`) is what stopped the harness writing into the
+user's conversation. It then broke the harness in a way that looked like a hang:
+
+```
+the turn asked for session 601, but the host is on session 512: nothing was sent.
+```
+
+A previous step had opened a real session, moving the host. The harness had moved only its
+*view* (`resyncView`), which by design never calls `switch_session` - a watch-only client
+must not steal the host. So the harness sat in a session it was not addressed to and
+waited 150s for a turn the engine had already declined.
+
+Two changes, and they are different in kind:
+
+* **harness**: `useSession(id)` - switch the host *and* the view, then assert they agree,
+  before anything sends.
+* **product**: `send()` moves the host to the session this window is looking at, and logs
+  it. If you are staring at conversation X and press send, "the host moved because a
+  phone tab switched it five minutes ago" is not a useful answer. The engine's refusal
+  stays as the backstop for a turn that is *addressed* somewhere else.
+
+## Trap 48: layout assertions on a hidden tree measure zero
+
+```
+the CWOFFEE label is not outdented ... (label 0, body 0, gutter 80)
+```
+
+`label 0` is the tell. Empty mode hides the scroller (`.empty-mode .scroller { display:
+none }`), so every `getBoundingClientRect()` inside it is zero and a suite of layout
+assertions - outdent, bubble width, bubble alignment - turns into theatre that fails for
+reasons of state, not of CSS.
+
+A layout check now pins the state it assumes:
+
+```ts
+await useSession(target.id)
+if (getComputedStyle(document.querySelector('.scroller')).display === 'none')
+  fail('the transcript is hidden (empty mode) while the layout checks ran')
+```
+
+and the outdent check reads the layout actually in force: in a narrow window the label
+legitimately returns above its block, so it asserts the gutter it can see rather than the
+gutter the design prefers.
+
+## Trap 49: `HostState` grew fields the TypeScript type never heard of
+
+The engine added `workspace_refusal` / `refusal_seq` and has shipped `reasoning: "xhigh"`
+for a while; the UI's `HostState` had neither, so a diagnostic that printed `refusal_seq`
+would not compile and a reasoning comparison against `xhigh` silently narrowed to
+`never`. Wire shapes are one contract in two languages: `ReasoningLevel` is now exported
+from `lib/events.ts` and used by the picker, the state type and the harness alike.
+
+## Trap 50: the harness deleted the conversation it was built on
+
+Seven failures in one run, and they looked like four product bugs:
+
+```
+the move check ran on a session with no stored folder
+the move refusal does not explain itself: ""
+a refused move still landed: /home/dandandelion/Projects
+the attachment survived the turn but not the reload
+the transcript is hidden (empty mode) while the layout checks ran
+```
+
+The sessions-CRUD test does `delete_session(target.id)` to prove deletion works, and every
+later step kept naming `target.id` - a session row that no longer existed. Each symptom is
+what that state looks like from one vantage point:
+
+* the engine's folder lock reads the session row, finds nothing, and so has nothing to
+  protect - the move applies;
+* the view has no stored rows, so `session_messages` returns none and empty mode hides the
+  scroller;
+* every layout assertion then measures a hidden tree, where all rects are 0.
+
+Fixes, in the order that matters: the suite re-opens a scratch session and re-anchors
+(`useSession`) after that delete; `loadTranscript` names the session it loaded (a bare
+"loaded 0 messages" cannot distinguish "wrong session" from "empty session"); and store
+truth is asserted separately from screen truth, so a missing attachment says either "the
+engine did not stamp it" or "it is in the store but not on screen" rather than one
+ambiguous line.
+
+Also learned the hard way: `list_sessions` is bounded (`LIMIT 50`), so "the row is not in
+the list" is not evidence that the row does not exist - check the store directly.
+
+## Trap 51: the suite wrote its probes into real conversations
+
+`sqlite3 sessions.db "select ... where content like '%What colour is this image%'"`
+returned 60+ hits across sessions the user actually cares about: every self-test run
+before the addressed-turn fix appended its probe turns to whatever conversation the
+host happened to be in. The user's report was literally "my conversation is being
+mutated", and the turns that proved it were ours.
+
+Cleaning that up is not one `DELETE`:
+
+* a probe turn is a user message **plus** everything the engine appended after it
+  until the next user message; deleting only the user row leaves answers with no
+  question;
+* `messages_fts` is a standalone fts5 table, not a content mirror, so its rows are
+  removed by `message_id` - skip that and search still offers text that is gone;
+* sessions deleted long ago by hand (`DELETE FROM sessions WHERE id IN (...)`) left
+  198 orphan messages, and those still join into search results whose `session_id`
+  has no row in the sidebar. `delete_session` deletes `messages`, `messages_fts` and
+  `turns`; manual surgery has to do the same.
+
+`scripts/probe-cleanup.py` does all three, prints what it would remove, and needs
+`--apply`. Run it against a checkpointed database with the app stopped.
+
+## Trap 52: hover lightened an ink button until the icon vanished
+
+The send button is filled with `--color-ink` and drawn with a `--color-paper` glyph.
+Its hover rule said `background: var(--color-ink-2)` - a mid grey - while the generic
+`.cbtn:hover` repainted the glyph `--color-ink`. Fill and glyph swapped ends: a grey
+square with a dark arrow at 2.6:1 contrast, which is the "hovering erases the button"
+report. Two rules, one visual result, and neither is wrong in isolation.
+
+Hover now keeps the fill solid and only warms it
+(`color-mix(in srgb, var(--color-ink) 82%, var(--color-shell))`), restates
+`color: var(--color-paper)` so the generic rule cannot win by specificity, and the
+approval-waiting `.warn` variant has its own hover so it does not lose its meaning
+under the cursor. Measured on the running app: normal 14:1, hover 9.7:1, glyph inside
+the button box in both states. `clip-path`/`mask` are `none` in both states, which is
+what distinguishes "faded" from "erased" when the complaint is a screenshot.

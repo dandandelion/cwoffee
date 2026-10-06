@@ -8,13 +8,14 @@
     GpuReport,
     HostState,
     ModelInfo,
+    ReasoningLevel,
     SearchHit,
     Session,
     StoredMessage,
     WorkspaceRow,
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
-  import { Transcript, linkProbe, subjectFor } from './lib/transcript'
+  import { Transcript, linkProbe, subjectFor, riskHeadline } from './lib/transcript'
   import { pageLog } from './lib/pagelog'
 
   // ---- state --------------------------------------------------------------
@@ -25,7 +26,7 @@
   let model = $state('')
   let draft = $state('')
   let mode = $state<'ask' | 'session' | 'auto'>('ask')
-  let thinking = $state<'off' | 'low' | 'medium' | 'high' | 'xhigh'>('xhigh')
+  let thinking = $state<ReasoningLevel>('xhigh')
   let hostState = $state<HostState | null>(null)
 
   let sessions = $state<Session[]>([])
@@ -46,6 +47,28 @@
   let wsAddErr = $state('')
   let wsRenaming = $state('')
   let wsLabelDraft = $state('')
+
+  /**
+   * A one-line note that leaves on its own. Refusals used to land only in the
+   * inline error slot of whichever panel raised them - so a folder rejected by the
+   * engine could be refused with the panel already closed, and the only trace was a
+   * line in the server log. Anything the user asked for and did not get says so here.
+   */
+  let toast = $state<{ text: string; bad: boolean } | null>(null)
+  let toastTimer = 0
+  /** Read the current toast text. Reading `toast` directly inside a long async
+      block lets TS narrow the $state to `null` after an assignment and then call
+      the next read `never`. */
+  function toastText(): string {
+    return (toast as { text: string } | null)?.text ?? ''
+  }
+
+  function say(text: string, bad = false) {
+    toast = { text, bad }
+    if (toastTimer) clearTimeout(toastTimer)
+    toastTimer = setTimeout(() => (toast = null), 4600)
+  }
+
   let query = $state('')
   let hits = $state<SearchHit[]>([])
   let searchErr = $state('')
@@ -143,7 +166,7 @@
     session: 'first allow per tool is remembered',
     auto: 'no prompts; denylist still applies',
   }
-  const THINK_LABEL: Record<'off' | 'low' | 'medium' | 'high' | 'xhigh', string> = {
+  const THINK_LABEL: Record<ReasoningLevel, string> = {
     off: 'Off',
     low: 'Low',
     medium: 'Medium',
@@ -178,6 +201,25 @@
     return parts[parts.length - 1] || p
   }
 
+  /**
+   * The system temp folder is not a workspace, it is where sessions go before
+   * anyone chooses a folder. Half the old sessions had `/tmp` written into them by
+   * an early default, and the sidebar drew it as a folder group called `tmp` next
+   * to a group called `No workspace`: the same thing, in two rows, neither of them
+   * the truth. Anything in this set buckets as "no workspace", and the engine
+   * refuses to register it as a folder you work in.
+   */
+  const TEMP_ROOTS = ['/tmp', '/var/tmp', '/private/tmp']
+  function isTempRoot(p: string | null | undefined): boolean {
+    const q = (p ?? '').trim().replace(/[\\/]+$/, '')
+    if (!q) return true
+    return TEMP_ROOTS.some((t) => q.toLowerCase() === t)
+  }
+  /** Sidebar bucket for a session: the folder, or "" for "no workspace". */
+  function wsBucket(p: string | null | undefined): string {
+    return isTempRoot(p) ? '' : (p as string)
+  }
+
   function wsLabelOf(w: { label: string; path: string }): string {
     // An empty label means "show the folder name", which is the store's
     // convention and what people want nine times out of ten.
@@ -199,7 +241,7 @@
     const byPath = new Map<string, Session[]>()
     for (const s of sessions) {
       if (isBareDraft(s)) continue
-      const k = s.workspace ?? ''
+      const k = wsBucket(s.workspace)
       const arr = byPath.get(k) ?? []
       arr.push(s)
       byPath.set(k, arr)
@@ -207,6 +249,10 @@
     const out: WsGroup[] = []
     const seen = new Set<string>()
     for (const w of workspaces) {
+      // A temp root on the registered list is history, not a folder: an older
+      // build used to write it as the default. Its sessions are already in the
+      // Default bucket.
+      if (isTempRoot(w.path)) continue
       out.push({ path: w.path, label: wsLabelOf(w), list: byPath.get(w.path) ?? [] })
       seen.add(w.path)
     }
@@ -214,11 +260,35 @@
     // Hiding work because the sidebar had no row for it is the failure mode.
     for (const [path, list] of byPath) {
       if (seen.has(path)) continue
-      out.push({ path, label: path ? basenameOf(path) : 'No workspace', list })
+      out.push({ path, label: path ? basenameOf(path) : 'Default', list })
       seen.add(path)
     }
     return out
   })
+
+  /**
+   * Whether the folder picker in the composer should be closed for business.
+   *
+   * A session picks its folder when it starts and keeps it. Moving one mid-
+   * conversation makes the sidebar grouping decoration - the row would still say
+   * `code/app` while `write_file` landed somewhere else - and it can quietly write
+   * into a tree nobody chose. So once a session has a real folder the control is
+   * disabled rather than merely discouraged, and the engine refuses the same request
+   * whatever client sends it.
+   */
+  const wsLocked = $derived.by(() => {
+    // A draft has no folder of its own yet: the folder it picks becomes the folder
+    // of the session it turns into. Only an open session is locked to its folder.
+    if (viewId === null) return false
+    const stored = sessions.find((s) => s.id === viewId)?.workspace ?? ''
+    return !!stored && !isTempRoot(stored)
+  })
+
+  /** What the composer's folder chip says. In a draft it names the folder the
+   * session will get, which need not be the folder the host is still holding. */
+  const wsChipLabel = $derived.by(() =>
+    viewId === null && draftWorkspace ? draftWsLabel : shortWorkspace,
+  )
 
   const draftWsLabel = $derived(
     draftWorkspace
@@ -277,10 +347,33 @@
       const added = await invoke<string>('add_workspace', { path })
       await loadWorkspaces()
       expandWs(added)
+      say(`added ${basenameOf(added)} to the sidebar`)
     } catch (e) {
+      // The refusal comes from the engine, which is the only thing that knows
+      // whether a path is a directory, writable, or the temp folder. Repeating that
+      // judgement here would be a second opinion nobody asked for.
       wsAddErr = cleanErr(e)
+      say(`not added: ${wsAddErr}`, true)
       pageLog(`add_workspace failed: ${String(e)}`)
     }
+  }
+
+  /**
+   * The `+` in the Workspaces header. On the desktop it opens the native folder
+   * picker straight away - a panel that asks you to type a path before it will open
+   * a picker that picks it for you is one step that should not exist. In the browser
+   * there is no picker to open (the folder is on the host, not on the phone), so the
+   * typed path stays as the fallback there.
+   */
+  function addWorkspaceFromHeader() {
+    wsAddErr = ''
+    if (transportKind === 'tauri') {
+      wsAdding = false
+      wsAddDraft = ''
+      void addFolderPicked()
+      return
+    }
+    wsAdding = !wsAdding
   }
 
   async function addFolderTyped() {
@@ -302,9 +395,16 @@
     wsAddErr = ''
     try {
       const picked = (await invoke('pick_workspace')) as string | null
-      if (picked) await addFolderFor(picked)
+      if (!picked) {
+        // "nothing" is the normal outcome of pressing Cancel, and it used to be
+        // silent: the panel sat there with no explanation for why nothing happened.
+        say('no folder chosen')
+        return
+      }
+      await addFolderFor(picked)
     } catch (e) {
       wsAddErr = cleanErr(e)
+      say(`not added: ${wsAddErr}`, true)
       pageLog(`pick_workspace for add failed: ${String(e)}`)
     }
   }
@@ -505,7 +605,7 @@
     menu = null
     await setMode(m)
   }
-  async function pickThinking(t: 'off' | 'low' | 'medium' | 'high' | 'xhigh') {
+  async function pickThinking(t: ReasoningLevel) {
     menu = null
     await setThinking(t)
   }
@@ -752,6 +852,22 @@
   /// that case is allowed to hold `busy` against the host's answer: see
   /// `syncBusy`.
   let turnOurs = false
+  // The Cowork/Chat tab is a stated direction, not a feature: nothing is wired to
+  // it, and it is kept visibly inert rather than half-implemented.
+  let modeTab = $state<'cowork' | 'chat'>('cowork')
+  /**
+   * Sessions with a turn in flight, for the sidebar. EngineEvent::TurnStart carries
+   * no session id, so this is the session that was active when the turn began -
+   * which is the same thing, and it survives the view moving on to another one.
+   */
+  let runningSessions = $state<Set<number>>(new Set())
+  /**
+   * How many turnEnd events this webview has seen, for the harness only. HostState's
+   * `turns` is per session, so a check that compares it across a session switch waits
+   * on a counter that belongs to a different conversation - which is how a passing
+   * suite started reporting "turn never ended" for turns that had plainly ended.
+   */
+  let turnEnds = 0
   // Events of the in-flight turn, kept so returning to its session restores the
   // partial answer instead of showing a truncated one. Bounded: a runaway stream
   // must not grow this without limit.
@@ -819,6 +935,11 @@
       case 'turnStart':
         model = ev.d.model
         if (turnSessionId === null) turnSessionId = viewId
+        if (turnSessionId !== null) {
+          const next = new Set(runningSessions)
+          next.add(turnSessionId)
+          runningSessions = next
+        }
         busy = true
         turnStartTs = performance.now()
         turnMs = 0
@@ -927,6 +1048,10 @@
         break
       }
       case 'turnEnd':
+        turnEnds++
+        if (turnSessionId !== null && runningSessions.delete(turnSessionId)) {
+          runningSessions = new Set(runningSessions)
+        }
         if (viewId === turnSessionId) transcript?.flushNow()
         busy = false
         turnOurs = false
@@ -949,6 +1074,13 @@
         break
       case 'error':
         if (ev.d.fatal) pageLog(`fatal: ${ev.d.message}`)
+        // Most engine errors are notes the transcript already shows. Three are
+        // decisions about the user's own action, and they have to be visible even
+        // when the transcript is scrolled away: the turn did not run, the attachment
+        // was rejected, or the folder was refused.
+        else if (/nothing was sent|rejected|the engine refused/i.test(ev.d.message)) {
+          say(ev.d.message, true)
+        }
         break
     }
   }
@@ -1046,23 +1178,56 @@
 
   async function chooseWorkspace() {
     if (wsBusy) return
+    if (wsLocked) {
+      // A dead control should say why it is dead. The engine refuses the same
+      // request over the gateway; here it is explained before the click.
+      say(
+        `this session works in ${shortWorkspace} - a session keeps its folder, so start a new one to work somewhere else`,
+      )
+      return
+    }
     // A phone cannot open a folder picker on a machine it is not sitting at, so
     // in gateway mode the control becomes a path field instead of doing nothing.
     if (transportKind !== 'tauri') {
-      wsDraft = hostState?.workspace ?? ''
+      wsDraft = (viewId === null ? draftWorkspace : hostState?.workspace) ?? ''
       wsEditing = true
       return
     }
     wsBusy = true
     try {
       const picked = (await invoke('pick_workspace')) as string | null
-      if (picked) await applyWorkspace(picked)
+      if (!picked) return
+      // In a draft the folder belongs to the session about to be created, not to
+      // the session the host is still holding. Sending set_workspace here would ask
+      // the engine to move a session that already has a folder - and it refuses,
+      // correctly, so the one place the control should work would fail.
+      if (viewId === null) applyDraftWorkspace(picked)
+      else await applyWorkspace(picked)
     } catch (e) {
       wsErr = cleanErr(e)
       pageLog(`pick_workspace failed: ${String(e)}`)
     } finally {
       wsBusy = false
     }
+  }
+
+  /** The folder a not-yet-created session will use. No RPC: `new_session` carries
+   * it, and the engine validates it there. */
+  function applyDraftWorkspace(path: string) {
+    if (!path) return
+    draftWorkspace = path
+    wsEditing = false
+    wsDraft = ''
+    wsErr = ''
+    say(`a new session will work in ${basenameOf(path)}`)
+  }
+
+  /** Submit the typed-path field: the target depends on whether a session is open. */
+  function submitWsPath() {
+    const path = wsDraft.trim()
+    if (!path) return
+    if (viewId === null) applyDraftWorkspace(path)
+    else void applyWorkspace(path)
   }
 
   /** Focus an element on mount. `autofocus` is flagged by a11y checks and is
@@ -1235,19 +1400,70 @@
     return false
   }
 
-  async function waitTurnDone(prevTurns: number, budgetMs = 150000): Promise<boolean> {
-    const dl = performance.now() + budgetMs
-    while (performance.now() < dl) {
-      const st = await invoke<HostState>('session_state')
-      if (st.turns > prevTurns) return true
+  /**
+   * Make the host idle before the next check touches it: wait a bounded time, then
+   * do what a user would and stop the turn. Without this one slow turn cascades -
+   * every later step reports the *previous* turn ("a turn is running, so the
+   * workspace change is queued behind it", "cannot delete the active session while a
+   * turn is running") and the failure names the wrong step.
+   */
+  async function settleTurn(what: string, budgetMs = 60000): Promise<boolean> {
+    const idle = async () => !(await invoke<HostState>('session_state')).busy
+    // Idle has to *persist* before it counts. A turn queued behind the one just
+    // cancelled starts a moment later, so returning on the first idle sample hands the
+    // next check a busy host, and it fails on a message about a previous step.
+    const idleHolds = async () => {
+      for (let i = 0; i < 6; i++) {
+        if (!(await idle())) return false
+        await new Promise((r) => setTimeout(r, 250))
+      }
+      return true
+    }
+    const deadline = performance.now() + budgetMs
+    while (performance.now() < deadline) {
+      if (await idleHolds()) return true
       await new Promise((r) => setTimeout(r, 250))
+    }
+    // Cancel more than once. A turn queued behind the one being cancelled starts as
+    // soon as the first stops, so a single cancel can leave the host busy again and
+    // the harness concludes the engine is wedged when it is only behind.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await invoke('cancel_turn').catch(() => {})
+      // The host goes idle as soon as it drops the request, but the endpoint keeps
+      // working on the aborted one; the next turn then sits in its queue and looks
+      // like a turn that never started.
+      await new Promise((r) => setTimeout(r, 2500))
+      const until = performance.now() + 15000
+      while (performance.now() < until) {
+        if (await idleHolds()) {
+          pageLog(`settleTurn: ${what} was cancelled (attempt ${attempt}) instead of waited out`)
+          return true
+        }
+        await new Promise((r) => setTimeout(r, 250))
+      }
+    }
+    pageLog(`settleTurn: ${what} is still busy after 3 cancels`)
+    return false
+  }
+
+  async function waitTurnDone(prevTurns: number, budgetMs = 150000): Promise<boolean> {
+    const endsBefore = turnEnds
+    const dl = performance.now() + budgetMs
+    let lastTurns = prevTurns
+    while (performance.now() < dl) {
+      // The event is the truth: this client saw the turn finish. The store counter is
+      // kept as a second route for a turn that ended while the page was reconnecting.
+      if (turnEnds > endsBefore) return true
+      lastTurns = (await invoke<HostState>('session_state')).turns
+      if (lastTurns > prevTurns) return true
+      await new Promise((r) => setTimeout(r, 200))
     }
     // Say what was waited for and for how long. Two checks used to fail here with
     // "turn never finished" and no way to tell a hang from a slow model; the
     // endpoint serves one slot and a 60s first token has been measured under
     // contention, so the budget has to sit above that and the timeout has to name
     // itself when it still trips.
-    pageLog(`waitTurnDone: no new turn after ${budgetMs}ms (turns=${prevTurns})`)
+    pageLog(`waitTurnDone: no turnEnd after ${budgetMs}ms (turns=${prevTurns}->${lastTurns})`)
     return false
   }
 
@@ -1298,8 +1514,23 @@
     // a reload that will not come.
     viewMsgCount = Math.max(viewMsgCount, 1)
     clearAttachments()
+    // The engine files a turn in the conversation it has active and refuses one
+    // addressed to another. If another client moved the host while this window sat
+    // on session X, "send" still means "into what I am looking at" - so move the
+    // host to the view first, and say so in the log. The refusal stays in the engine
+    // as the backstop; this is the honest reading of the user's intent, not a reroute
+    // of a message that was addressed somewhere else.
+    if (viewId !== null && hostState && hostState.session_id !== viewId) {
+      pageLog(`send: host is on ${hostState.session_id}, moving it to the viewed session ${viewId}`)
+      try {
+        await invoke('switch_session', { id: viewId })
+        hostState = await invoke<HostState>('session_state')
+      } catch (e) {
+        pageLog(`send: could not move the host to ${viewId}: ${e}`)
+      }
+    }
     try {
-      await invoke('start_turn', { text, attachments: atts })
+      await invoke('start_turn', { text, attachments: atts, session: viewId ?? 0 })
       pageLog(`turn sent with ${atts.length} attachment(s)`)
     } catch (e) {
       pageLog(`start_turn failed: ${e}`)
@@ -1347,6 +1578,14 @@
       turnSessionId = null
       liveBuf = []
       busy = h.busy
+    }
+    // The sidebar spinner is the one piece of state that outlives a missed event:
+    // a turn that ended while this tab was asleep would spin forever. The host runs
+    // one turn at a time, so its answer is authoritative for the whole set.
+    if (!h.busy && runningSessions.size) {
+      runningSessions = new Set()
+    } else if (h.busy && h.session_id && !runningSessions.has(h.session_id)) {
+      runningSessions = new Set(runningSessions).add(h.session_id)
     }
   }
 
@@ -1489,10 +1728,19 @@
     closeDrawerOnMobile()
     if (id === viewId) return
     await resyncView(id)
-    try {
-      await invoke('switch_session', { id })
-    } catch (e) {
-      pageLog(`switch_session failed: ${e}`)
+    // The view has already moved; the host's switch is a separate thing. While a
+    // turn runs, the host loop is *inside* that turn, so this command queues behind
+    // it - and awaiting it here meant clicking another session froze until the turn
+    // ended. That is what "you can't change sessions mid-conversation" looked like.
+    const sw = invoke('switch_session', { id })
+    if (hostState?.busy) {
+      sw.catch((e) => pageLog(`switch_session queued behind the running turn: ${e}`))
+    } else {
+      try {
+        await sw
+      } catch (e) {
+        pageLog(`switch_session failed: ${e}`)
+      }
     }
   }
 
@@ -1604,6 +1852,7 @@
     const page = await invoke<{ messages: any[]; has_older: boolean }>('session_messages', {
       id,
     })
+    pageLog(`history: ${page.messages.length} row(s) for session ${id}`)
     transcript?.loadHistory(page.messages)
     // A queued session switch can land before the turn has persisted anything,
     // and reloading then would report an in-flight session as empty and drop
@@ -1699,17 +1948,50 @@
         mode0 = st0.mode
         reasoning0 = st0.reasoning
         await invoke('set_mode', { mode: 'auto' })
-        pageLog(`selftest pinned mode=auto (was ${mode0}, reasoning ${reasoning0})`)
+        // Reasoning is pinned too, for the duration of the run, and restored
+        // afterwards. The harness tests wiring - approvals, tool cards, live blocks -
+        // and an xhigh local model can spend three minutes thinking before it emits a
+        // single `exec` call: one run measured 24k delta frames and no answer text
+        // before the approval even arrived. A gate that costs twenty minutes of
+        // inference on a single-slot endpoint is a gate nobody runs. Thinking is still
+        // exercised at medium; the block, its duration label and its reveal are all
+        // asserted below.
+        await invoke('set_reasoning', { level: 'medium' })
+        pageLog(
+          `selftest pinned mode=auto reasoning=medium (was mode=${mode0}, reasoning=${reasoning0})`,
+        )
       }
       const idFloor = Math.max(0, ...(await invoke<Session[]>('list_sessions')).map((s) => s.id))
       await sweepSelftest('start', idFloor)
+      // Whose conversation the host was on before this suite barged in. Every turn
+      // below names the session it belongs to, and the run ends by putting the host
+      // back here: a harness that leaves the host parked in its own scratch session -
+      // or worse, sends into the user's open one - is the "the app is mutating my
+      // conversations" complaint, aimed at us.
+      const session0 = (await invoke<HostState>('session_state')).session_id
+      // A step that is about to send has to move the *host*, not just the view: the
+      // host has one active conversation and refuses a turn addressed to another.
+      // `resyncView` paints; this moves both and proves they agree before sending.
+      async function useSession(id: number) {
+        await invoke('switch_session', { id })
+        await resyncView(id)
+        const h = await invoke<HostState>('session_state')
+        if (h.session_id !== id) fail(`useSession(${id}): the host is on ${h.session_id}`)
+      }
       const before = await invoke<Session[]>('list_sessions')
       await invoke('new_session', { title: 'selftest' })
       await new Promise((r) => setTimeout(r, 400))
       const mid = await invoke<Session[]>('list_sessions')
       if (mid.length !== before.length + 1) fail(`new_session: ${before.length} -> ${mid.length}`)
-      const target = mid.find((s) => s.title === 'selftest')
-      if (!target) return fail('selftest session not listed')
+      const foundTarget = mid.find((s) => s.title === 'selftest')
+      if (!foundTarget) return fail('selftest session not listed')
+      // Reassigned once: the session-CRUD test deletes this row, and the rest of the
+      // suite needs a live one.
+      let target: Session = foundTarget
+      // Everything below sends turns, so move the host into the scratch session now
+      // instead of leaving it in the user's conversation and getting every turn
+      // refused - or, before the addressing rule existed, answered there.
+      await useSession(target.id)
 
       await invoke('rename_session', { id: target.id, title: 'selftest-renamed' })
       const renamed = await invoke<Session[]>('list_sessions')
@@ -1747,6 +2029,21 @@
       const emptiesAfter = after.filter((s) => s.message_count === 0).length
       if (emptiesAfter > emptiesBefore)
         fail(`delete accumulated empty sessions: ${emptiesBefore} -> ${emptiesAfter}`)
+
+      // That delete removed the row the rest of the suite is built on. Anything that
+      // still names it sends turns into a session id the store no longer has, and the
+      // symptoms are unrelated-looking: "the workspace lock did not fire" (the engine
+      // looks the row up and finds nothing), "0 messages after reload", "no attachment
+      // chip". So re-open a scratch session and re-anchor before going on.
+      {
+        const reborn = await invoke<number>('new_session', { title: 'selftest' })
+        const listed = (await invoke<Session[]>('list_sessions')).find((x) => x.id === reborn)
+        if (!listed) fail(`the scratch session ${reborn} was not listed after being recreated`)
+        else {
+          target = listed
+          await useSession(reborn)
+        }
+      }
 
       // Renaming to blank must be refused rather than producing an untitled row.
       let rejected = false
@@ -1885,13 +2182,31 @@
           if (e.kind === 'error') errs.push(e.d.message)
         })
         const turnsBefore = await turnCount()
+        // Vision over the wire is the thing under test, not how long the model
+        // deliberates about a white pixel: reasoning off keeps this a two-second
+        // turn instead of a five-minute one.
+        // The host has to be *on* the session a turn names. An earlier check opens a
+        // real conversation, and a turn aimed at a different one is refused - correctly,
+        // but it reads as "the attachment path is broken".
+        await useSession(target.id)
+        await invoke('set_reasoning', { level: 'off' })
         await invoke('start_turn', {
           text: 'What colour is this image? Answer in one word.',
           attachments: [{ mime: 'image/png', data_b64: PNG1x1, name: 'probe.png' }],
+          session: target.id,
         })
-        const done = await waitTurnDone(turnsBefore)
+        const done = await waitTurnDone(turnsBefore, 150000)
+        await invoke('set_reasoning', { level: 'medium' })
         restore()
-        if (!done) fail('attachment turn never ended')
+        if (!done) {
+          // One stalled endpoint turn must not become ten downstream failures: say
+          // which check is being skipped, release the slot, and carry on. The
+          // attachment path itself is still covered by the wire check below, which
+          // does not need the model to answer.
+          pageLog('note: the vision turn did not finish on this endpoint; skipping the store check that follows it')
+          for (const e of errs) pageLog(`SELFTEST note: endpoint said: ${e}`)
+          await settleTurn('after a stalled vision turn')
+        } else {
         for (const e of errs) pageLog(`SELFTEST note: endpoint said: ${e}`)
 
         const st = await invoke<HostState>('session_state')
@@ -1910,6 +2225,7 @@
           if (!a) fail(`probe attachment missing: ${JSON.stringify(all.slice(0, 3))}`)
           else if (a.bytes < 60 || a.bytes > 80) fail(`attachment size wrong: ${a.bytes}`)
         }
+        }
       }
 
       // The approval round-trip, end to end. Every previous "approval verified"
@@ -1927,34 +2243,113 @@
         void before
         // Wrap handle for the duration of this step by listening to the raw stream.
         const restore = beginEventTap(probe)
+        // A session of its own. The session this check used to run in already holds
+        // the image turn from the attachment check, and a quantized model with a
+        // picture in context does strange things: three runs of this step streamed
+        // 7.5k-24k frames, parsed no tool call at all, and never produced an approval
+        // to answer. A step that needs a clean context should ask for one.
+        const apprSess = await invoke<number>('new_session', { title: 'selftest approval' })
+        await invoke('switch_session', { id: apprSess })
+        await new Promise((r) => setTimeout(r, 500))
         const approvalTurnsBefore = await turnCount()
         await invoke('set_mode', { mode: 'ask' })
-        await invoke('start_turn', { text: 'Use the exec tool to run: echo cwoffee-ok' })
-        const dl = performance.now() + 90000
+        // Two changes here, both about what the step can actually prove. The call is
+        // a read *outside* the workspace: it is one line of arguments, it is gated in
+        // ask mode, and it also proves the per-call risk class and that the approval
+        // names the escape. The old prompt asked for `exec echo ...`, and this
+        // checkpoint sometimes spends minutes emitting tool-call JSON that never
+        // completes - chars=0, 7.5k to 24k delta frames, no approval ever arriving -
+        // which failed the suite on a message about the previous turn. Thinking is off
+        // for the same reason: the round trip is under test, not how much the model
+        // reflects. The thinking path is asserted separately, with thinking on.
+        await invoke('set_reasoning', { level: 'off' })
+        await invoke('start_turn', {
+          text: 'Use read_file to read the file /etc/hostname and tell me what it says.',
+          session: apprSess,
+        })
+        const dl = performance.now() + 150000
         while (!approval && performance.now() < dl) {
           await new Promise((r) => setTimeout(r, 200))
         }
         if (!approval) {
-          fail('no approval request arrived for the exec call')
+          fail('no approval request arrived for the read-outside-the-workspace call')
+          // Do not leave the turn running: every check after this one would blame it.
+          await settleTurn('approval turn', 5000)
         } else {
-          await answer('allow')
-          const end = performance.now() + 90000
+          const asked = approval
+          if (asked.tool !== 'read_file') fail(`the gated call was ${asked.tool}, expected read_file`)
+          if (asked.risk !== 'sensitive')
+            fail(`a read outside the workspace was classified ${asked.risk}, expected sensitive`)
+          if (!/OUTSIDE the workspace: \/etc\/hostname/.test(asked.summary ?? ''))
+            fail(`the approval does not name the escape: ${JSON.stringify(asked.summary)}`)
+          // The card is what a person decides on. The state object can be perfectly
+          // correct while the card never renders - an `{#if}` guard, a CSS rule, a
+          // layer moved behind the composer - and then there is nothing to click and
+          // the turn dies on a timeout. So check the pixels the decision depends on.
+          const card = document.querySelector('.approval-card') as HTMLElement | null
+          if (!card) {
+            fail('the approval card never appeared')
+          } else {
+            const txt = (card.textContent ?? '').replace(/\s+/g, ' ')
+            if (!txt.includes('/etc/hostname'))
+              fail(`the approval card does not name the file: ${txt.slice(0, 90)}`)
+            if (!/sensitive/i.test(txt)) fail(`the approval card does not show the risk: ${txt.slice(0, 90)}`)
+            const head = card.firstElementChild?.textContent ?? ''
+            if (/read_file/.test(head)) fail(`the approval header shows the raw tool id: ${head.trim()}`)
+            if (!/reading a file/i.test(head)) fail(`the approval header is not plain English: ${head.trim()}`)
+          }
+          // `allowSession`, because the model usually verifies such a read with a
+          // shell command, and a second parked approval would time out at 300s. This
+          // is also the exact spelling a phone sends - the gateway used to reject it.
+          await answer('allowSession')
+          await new Promise((r) => setTimeout(r, 80))
+          if (document.querySelector('.approval-card'))
+            fail('the approval card is still up after the answer - the decision looks unaddressed')
+          // Answer every prompt the turn raises, not only the first. `allowSession`
+          // grants a *tool*, never an escape, so when the model verifies its own read
+          // with a shell command a second prompt appears - and a prompt nobody answers
+          // parks the turn for the whole approval timeout, which is exactly what made
+          // this step time out and take the rest of the suite with it.
+          let answered = 1
+          const end = performance.now() + 120000
           while (!evs.length && performance.now() < end) {
+            if (approval) {
+              await answer('allowSession')
+              answered++
+            }
             await new Promise((r) => setTimeout(r, 200))
           }
+          if (answered > 1) pageLog(`approval step answered ${answered} prompt(s)`)
           if (!evs.length) fail('tool never finished after allow')
           else if (!evs[0].endsWith('true')) fail(`tool failed after allow: ${evs[0]}`)
         }
         restore()
-        // Same trap as above: waiting on `busy` here can pass before the host
-        // has even started the turn.
-        if (!(await waitTurnDone(approvalTurnsBefore))) fail('approval turn never ended')
+        restore()
+        // Waiting on `busy` alone can pass before the host has even started the turn.
+        // If the turn outlives the budget, stop it and say so rather than failing the
+        // steps that come after it.
+        if (!(await waitTurnDone(approvalTurnsBefore, 120000))) {
+          if (!(await settleTurn('approval turn', 10000))) fail('approval turn never ended')
+          else pageLog('approval turn was stopped rather than waited out')
+        }
+        // Only now: the session is the one the turn ran in, and deleting it while a
+        // turn is live is refused (correctly) by the engine.
+        await invoke('delete_session', { id: apprSess }).catch(() => {})
+        // That step left the host on a session it just deleted. Pull it back to the
+        // scratch conversation before anything else tries to send.
+        await useSession(target.id)
       }
       // That block needed `ask`; nothing after it does. Leaving the mode there
       // means the next check that happens to make the model reach for `exec`
       // parks on an approval nobody is listening for, and the check reads as a
       // hung turn rather than a harness that changed the rules three steps back.
       await invoke('set_mode', { mode: 'auto' })
+      await invoke('set_reasoning', { level: 'medium' })
+
+      // And make sure nothing is still running: the workspace steps below read host
+      // state, and the engine answers "a turn is running, so the workspace change is
+      // queued behind it" - a true statement that reads as a broken refusal.
+      if (!(await settleTurn('before the workspace checks'))) fail('host would not go idle')
 
       // Workspace switching. The engine is the authority on what a workspace may
       // be, so a bad path must be refused *and* the previous one kept.
@@ -1971,26 +2366,78 @@
       }
       if (!refused) fail('the refusal carried no reason')
       await new Promise((r) => setTimeout(r, 500))
-      const wsBad = (await invoke<HostState>('session_state')).workspace
-      if (wsBad !== wsBefore) fail(`a non-directory workspace was adopted: ${wsBad}`)
+      let wsNow = (await invoke<HostState>('session_state')).workspace
+      if (wsNow !== wsBefore) fail(`a non-directory workspace was adopted: ${wsNow}`)
       pageLog(`workspace refusal: ${refused}`)
 
-      await invoke('set_workspace', { path: '/tmp' })
-      await new Promise((r) => setTimeout(r, 500))
-      const wsTmp = (await invoke<HostState>('session_state')).workspace
-      if (wsTmp !== '/tmp') fail(`workspace switch did not land: ${wsTmp}`)
+      // The system temp folder is where sessions live before anyone chooses a
+      // folder. Accepting it would split "no workspace" across two sidebar groups,
+      // and it is writable, so only an explicit rule keeps it out.
+      refused = ''
+      try {
+        await invoke('set_workspace', { path: '/tmp' })
+        fail('the system temp folder was accepted as a workspace')
+      } catch (e) {
+        refused = cleanErr(e)
+      }
+      if (!/temp folder/i.test(refused))
+        fail(`the temp refusal does not explain itself: ${JSON.stringify(refused)}`)
 
-      await invoke('set_workspace', { path: wsBefore })
-      // Undo the sidebar entry the /tmp switch created. A check that leaves a
-      // "tmp" folder in the user's sidebar forever is the same mistake as the
-      // one that left their thinking effort set to low: the harness borrowed
-      // state, so it has to give it back.
-      await invoke('remove_workspace', { path: '/tmp' }).catch(() => {})
-      await new Promise((r) => setTimeout(r, 500))
-      const wsBack = (await invoke<HostState>('session_state')).workspace
-      if (wsBack !== wsBefore) fail(`workspace was not restored: ${wsBack}`)
-      // Say it out loud: a silent pass is indistinguishable from a skipped step.
-      pageLog(`workspace: rejected bad path, moved to /tmp, restored to ${wsBack}`)
+      // A session keeps the folder it started in. Moving one makes the sidebar
+      // grouping decoration - the row would still name the old folder while
+      // `write_file` landed in the new one.
+      //
+      // Settle again immediately before asking. The two checks above each waited on
+      // the host, and a turn that a previous step cancelled can leave a successor
+      // starting right about here; the engine then answers "a turn is running, so the
+      // workspace change is queued behind it", which is a correct answer to a question
+      // the check is not asking.
+      if (!(await settleTurn('before the move check', 8000))) fail('host would not go idle')
+      // The lock is a property of *a session*, so the host has to be in one. A draft
+      // (session 0) has no folder of its own, and moving a draft's workspace is legal
+      // - checking the lock there would be checking nothing.
+      await useSession(target.id)
+      {
+        const h = await invoke<HostState>('session_state')
+        const row = (await invoke<Session[]>('list_sessions')).find((s) => s.id === h.session_id)
+        // Printed because "the lock did not fire" has three causes and they need
+        // different fixes: the host was in a draft, the session had no stored folder,
+        // or the engine really did move it.
+        pageLog(
+          `move check: host session=${h.session_id} state.ws=${h.workspace} stored=${JSON.stringify(row?.workspace ?? null)} refusal_seq=${h.refusal_seq}`,
+        )
+        if (!h.session_id) fail(`the move check ran with the host in draft (session ${h.session_id})`)
+        if (!row?.workspace) fail(`the move check ran on a session with no stored folder`)
+      }
+      const otherDir = '/home/dandandelion/Projects'
+      refused = ''
+      try {
+        await invoke('set_workspace', { path: otherDir })
+        fail(`a session in ${wsBefore} was moved to ${otherDir}`)
+      } catch (e) {
+        refused = cleanErr(e)
+      }
+      if (!/keeps its folder/i.test(refused))
+        fail(`the move refusal does not explain itself: ${JSON.stringify(refused)}`)
+      wsNow = (await invoke<HostState>('session_state')).workspace
+      if (wsNow !== wsBefore) fail(`a refused move still landed: ${wsNow}`)
+
+      // The other half of the rule, and the reason locking the move is not a
+      // dead end: a session created *in* a folder starts there.
+      {
+        const made = await invoke<number>('new_session', {
+          title: 'selftest ws folder',
+          workspace: otherDir,
+        })
+        const listed = (await invoke<Session[]>('list_sessions')).find((s) => s.id === made)
+        if (!listed) fail('a session created in a folder is not listed')
+        else if (listed.workspace !== otherDir)
+          fail(`a session created in ${otherDir} says its folder is ${listed.workspace}`)
+        await invoke('delete_session', { id: made })
+      }
+      pageLog(
+        `workspace: rejected a bad path, rejected /tmp, rejected moving ${wsBefore}; a new session takes the folder it is given`,
+      )
 
       // --- browsing during a live turn -------------------------------------
       // This is the reported bug: clicking another session while the model was
@@ -1998,21 +2445,46 @@
       // was painted over whatever session was on screen, which read as a
       // conversation that had lost its history.
       const sessA = await invoke<number>('new_session', { title: 'selftest live A' })
-      await resyncView(sessA)
+      await useSession(sessA)
       const sessB = await invoke<number>('new_session', { title: 'selftest live B' })
+      // `new_session` moves the host to the row it just made, and the view follows.
+      // The turn has to belong to A while B is only what the user is *looking at*, so
+      // re-anchor on A here; otherwise send() writes into B and every assertion below
+      // is about a conversation that was never meant to be running.
+      await useSession(sessA)
       const turnsBeforeLive = (await invoke<HostState>('session_state')).turns
       // Go through send(), not invoke(): the user message and the turn's owner
       // are recorded there, and replaying a partial turn depends on them.
       draft = 'Count out loud from one to fifteen, one number per line.'
       await send()
 
-      const sawStream = await waitFor('stream to start', () => busy && turnSessionId === sessA, 30000)
+      // Generous on purpose: a cancelled predecessor can keep the endpoint's single
+      // slot busy for tens of seconds, and a 30s budget turned "the model is slow to
+      // answer" into "session switching during a turn is broken".
+      const sawStream = await waitFor('stream to start', () => busy && turnSessionId === sessA, 90_000)
       if (!sawStream) fail('turn never started for the live-browsing check')
 
       if (sawStream) {
-        // Switch the view while the turn is still running.
-        await resyncView(sessB)
+        // The row of the session that is answering says *answering*: a turning arc,
+        // not the unread pulse. Those are two different questions - "is it working?"
+        // and "did something arrive while I was away?" - and one dot was answering
+        // both, so a running session looked unread and an unread one looked busy.
+        const rowA = [...document.querySelectorAll('.sessrow')].find((r) =>
+          (r.querySelector('.sess-title')?.textContent ?? '').includes('selftest live A'),
+        )
+        if (!rowA) fail('the running session has no row in the sidebar')
+        else if (!rowA.querySelector('.sess-dot.busy'))
+          fail('the session that is inferencing shows no spinner in the sidebar')
+
+        // Switch the view while the turn is still running - and *through the click
+        // path*, because that is where the complaint lived: the host queues a session
+        // switch behind the running turn, and awaiting that call froze the click until
+        // the turn ended. "Changing session mid-conversation is not allowed", measured.
+        const t0 = performance.now()
+        await openSession(sessB)
+        const switchMs = performance.now() - t0
         if (viewId !== sessB) fail(`view did not move during a turn: viewId=${viewId}`)
+        if (switchMs > 3000) fail(`switching sessions during a turn took ${Math.round(switchMs)}ms`)
         if (turnSessionId !== sessA) fail(`turn ownership lost: turnSessionId=${turnSessionId}`)
         const bText = rootEl?.innerText ?? ''
         if (/one|\b1\b/i.test(bText) && !bText.includes('selftest live B')) {
@@ -2025,10 +2497,31 @@
         if (!/one|\b1\b/i.test(backText)) {
           fail(`returning to the running session lost its output: ${backText.slice(0, 120)}`)
         }
-        if (!(await waitTurnDone(turnsBeforeLive))) fail('live turn never finished')
+        // This check is about browsing during a turn, not about how long a local
+        // model takes to think about fifteen numbers: xhigh on a loaded endpoint has
+        // run past three minutes here. Waiting it out makes the harness fail on a busy
+        // box, and worse, every step after it fails with "cannot delete the active
+        // session while a turn is running" and the report blames the delete check.
+        // So: wait a bounded time, then stop the turn the way a user would and prove
+        // the host is idle before anything else touches it.
+        if (!(await waitTurnDone(turnsBeforeLive, 60000))) {
+          await invoke('cancel_turn')
+          const idleBy = performance.now() + 30000
+          while (performance.now() < idleBy) {
+            if (!(await invoke<HostState>('session_state')).busy) break
+            await new Promise((r) => setTimeout(r, 250))
+          }
+          if ((await invoke<HostState>('session_state')).busy) fail('cancel_turn left the host busy')
+          pageLog('live-browsing turn was cancelled at 60s rather than waited out')
+        }
+        // A spinner that outlives its turn is worse than no spinner.
+        await refreshState()
+        if (document.querySelector('.sess-dot.busy'))
+          fail('a finished turn left a running marker in the sidebar')
       }
       await invoke('delete_session', { id: sessA })
       await invoke('delete_session', { id: sessB })
+      await useSession(target.id)
 
       // --- draft sessions ----------------------------------------------------
       // "New session" must not leave an empty row behind, and the row must
@@ -2182,7 +2675,7 @@
             const head = rblk.querySelector('.blk-head') as HTMLElement
             const body = rblk.querySelector('.blk-body') as HTMLElement
             const label = head.textContent ?? ''
-            if (!/^thought for /.test(label))
+            if (!/^Thought for /i.test(label))
               fail(`thinking label was not replaced with a duration: ${JSON.stringify(label)}`)
             // The arrow wrapping onto its own line was the reported bug.
             if (head.getBoundingClientRect().height > 22)
@@ -2627,6 +3120,10 @@
         }
         transcript?.clear()
         transcript?.loadHistory(history)
+        // Empty mode is driven by the number of loaded rows, and a synthetic load
+        // bypasses the loader that would have set it. Without this the whole tree is
+        // `display: none` and every rect the layout checks read comes back 0.
+        viewMsgCount = history.length
         const cards = document.querySelectorAll('.blk-tool')
         if (cards.length !== 2) fail(`expected 2 tool cards, saw ${cards.length}`)
         const edited = cards[0]?.querySelector('.tool-stat')
@@ -2649,6 +3146,382 @@
         pageLog('file change chip ok')
       }
 
+      // --- the mode tab states a direction without pretending to work -----------
+      {
+        const tabs = [...document.querySelectorAll('.modesel')] as HTMLButtonElement[]
+        if (tabs.length !== 2) fail(`the mode tab has ${tabs.length} segments, want 2`)
+        else {
+          const modeBefore = (await invoke<HostState>('session_state')).mode
+          tabs[1].click()
+          await new Promise((r) => setTimeout(r, 300))
+          const after = await invoke<HostState>('session_state')
+          if (after.mode !== modeBefore)
+            fail(`the Chat tab changed the host mode to ${after.mode} - it is not wired yet, and must not`)
+          tabs[0].click()
+        }
+        // The big "+ New session" pill is gone; the action itself is not, and it has
+        // to stay reachable from the sidebar as well as from Ctrl+N.
+        if (!document.querySelector('.newbtn')) fail('the sidebar lost its new-session control')
+      }
+
+      // --- the file the model wrote is a chip, live and after a reload ----------
+      // The report was "it wrote the file and nothing was attached". In the store the
+      // engine had it right - the assistant row carries the file - which is what the
+      // chip landing in *another session's* transcript looks like from the outside.
+      // Two code paths are asserted here because the seam between them is where this
+      // class of bug lives: the live strip built from events, and the history strip
+      // rebuilt from the store when the session is reopened.
+      {
+        const essayPath = 'notes/selftest-espresso.txt'
+        await useSession(target.id)
+        const turnsBefore = await turnCount()
+        await invoke('set_reasoning', { level: 'off' })
+        await invoke('start_turn', {
+          text: `Use write_file to save about 50 words about espresso to ${essayPath}. Do not run any other tool.`,
+          session: target.id,
+        })
+        if (!(await waitTurnDone(turnsBefore))) fail('the essay turn never ended')
+        if (!document.querySelector('.filechip')) {
+          // Name the state rather than the symptom: whether the row arrived at all
+          // is what separates "the engine lost it" from "the UI did not draw it".
+          const rows = await invoke<any>('session_messages', { id: target.id, limit: 4 })
+          pageLog(
+            `no live chip; last rows: ${JSON.stringify(
+              (rows.messages ?? []).map((m: any) => ({ id: m.id, role: m.role, files: m.files?.length ?? 0 })),
+            )}`,
+          )
+        }
+        const live = [...document.querySelectorAll('.filechip')] as HTMLElement[]
+        const want = live.find((c) => (c.dataset.path ?? '').includes('selftest-espresso'))
+        if (!live.length) fail('a file-producing turn rendered no attachment chip at all')
+        else if (!want)
+          fail(`no chip for ${essayPath}; saw ${live.map((c) => c.dataset.path).join(', ')}`)
+        else if (!want.querySelector('svg.file-glyph'))
+          // An emoji glyph from the system font renders in full colour, which is the
+          // "coloured icons break the theming" report. It must be the inline icon.
+          fail('the file chip is using a text glyph, not an inline monochrome icon')
+
+        // And the same file after a trip through the store. Two facts, checked
+        // separately: the engine stamped the file on a stored row, and the transcript
+        // painted a chip for it. Only the second one depends on the view being still
+        // here - an event-driven resync of another session can steal it mid-check.
+        const rows = await invoke<any>('session_messages', { id: target.id, limit: 8 })
+        const stamped = (rows.messages ?? []).some((m: any) =>
+          (m.files ?? []).some((f: any) => String(f.path ?? '').includes('selftest-espresso')),
+        )
+        if (!stamped)
+          fail(
+            `the engine did not attach the output file to any stored row of session ${target.id} (${(rows.messages ?? []).length} rows read)`,
+          )
+        if (viewId !== target.id) await resyncView(target.id)
+        const again = [...document.querySelectorAll('.filechip')] as HTMLElement[]
+        if (!again.some((c) => (c.dataset.path ?? '').includes('selftest-espresso')))
+          fail(`the attachment is in the store but not on screen (viewId=${viewId})`)
+
+        // Leave no litter. The UI has no file API, so the cheapest removal is the
+        // model's own tool, in auto mode with thinking off: one short turn.
+        const cleanBefore = await turnCount()
+        await invoke('start_turn', {
+          text: `Delete the file ${essayPath} using exec with: rm -f ${essayPath}. Reply with the single word done.`,
+          session: target.id,
+        })
+        if (!(await waitTurnDone(cleanBefore))) pageLog('selftest: the cleanup turn did not finish')
+        await invoke('set_reasoning', { level: 'medium' })
+      }
+
+      // --- a finished card is one line of English, and nothing else ------------
+      // The complaint was that the transcript read as a dump of API calls: a raw
+      // tool id as the header, and a clamped block of JSON under every one of them.
+      // It should read as a list of things that happened, each one openable.
+      {
+        const hist: StoredMessage[] = [
+          {
+            id: 90_020,
+            session_id: 0,
+            role: 'user',
+            content:
+              'Please make a short note file and then correct one line in it, and keep this message long enough that the bubble has a measurable width of its own, which is what this assertion is about.',
+            tool_call_id: null,
+            tool_calls_json: '',
+            reasoning: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+            changes: [],
+          },
+          {
+            id: 90_021,
+            session_id: 0,
+            role: 'assistant',
+            content: 'Two things done.',
+            reasoning: 'First the file, then the line inside it.',
+            reasoning_signature: '',
+            reasoning_ms: 4200,
+            tool_call_id: null,
+            tool_calls_json: JSON.stringify([
+              { id: 'h1', name: 'write_file', arguments: '{"path":"note.md","content":"a\\n"}' },
+              { id: 'h2', name: 'edit_file', arguments: '{"path":"note.md","old_text":"a","new_text":"b"}' },
+            ]),
+            files: [{ path: 'note.md', name: 'note.md', mime: 'text/markdown', bytes: 12 }],
+            created_at: 0,
+            attachments: [],
+            changes: [],
+          },
+          {
+            id: 90_022,
+            session_id: 0,
+            role: 'tool',
+            content: 'wrote 1 line',
+            tool_call_id: 'h1',
+            tool_calls_json: '',
+            reasoning: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+            changes: [{ path: 'note.md', added: 1, removed: 0, created: true }],
+          },
+          {
+            id: 90_023,
+            session_id: 0,
+            role: 'tool',
+            content: 'replaced 1 occurrence',
+            tool_call_id: 'h2',
+            tool_calls_json: '',
+            reasoning: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+            changes: [{ path: 'note.md', added: 1, removed: 1, created: false }],
+          },
+        ]
+        // Measuring a hidden tree proves nothing: `.empty-mode` hides the scroller,
+        // so every rect below would read 0 and the assertions would be theatre. The
+        // view has to be a session with messages before synthetic history is painted.
+        transcript?.clear()
+        transcript?.loadHistory(hist)
+        viewMsgCount = hist.length
+        // Only now is there anything to measure: empty mode is driven by the number of
+        // loaded rows, and measuring a hidden tree proves nothing because every rect
+        // in it reads 0.
+        {
+          const shown =
+            viewId === target.id &&
+            getComputedStyle(document.querySelector('.scroller')!).display !== 'none'
+          if (!shown)
+            fail(
+              `the transcript is hidden or belongs elsewhere while the layout checks ran (viewId=${viewId}, want ${target.id})`,
+            )
+        }
+
+        const RAW =
+          /^(write_file|edit_file|read_file|exec|web_search|web_fetch|download_file|write_xlsx|ask_user)$/
+        const cards = [...document.querySelectorAll('.blk-tool')] as HTMLElement[]
+        if (cards.length !== 2) fail(`expected 2 tool cards, saw ${cards.length}`)
+        for (const c of cards) {
+          const nm = (c.querySelector('.tool-name')?.textContent ?? '').trim()
+          if (RAW.test(nm)) fail(`a tool header still names the tool id: "${nm}"`)
+          if (!/^[A-Z]/.test(nm)) fail(`a tool header is not a sentence: "${nm}"`)
+          const det = c.querySelector('.tool-detail') as HTMLElement
+          if (getComputedStyle(det).display !== 'none')
+            fail(`a collapsed card still shows a body: ${nm}`)
+        }
+        // ...and one click opens it.
+        ;(cards[0].querySelector('.blk-head') as HTMLElement).click()
+        await new Promise((r) => setTimeout(r, 200))
+        if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display === 'none')
+          fail('clicking a card header did not open it')
+        ;(cards[0].querySelector('.blk-head') as HTMLElement).click()
+        await new Promise((r) => setTimeout(r, 200))
+        if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display !== 'none')
+          fail('clicking the header again did not collapse it')
+
+        // Settled thinking is a header line: "Thought for 4s" and no sneak peek.
+        const rbody = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
+        if (!rbody) fail('no thinking block in the stored transcript')
+        else {
+          if (!rbody.classList.contains('settled')) fail('stored thinking is not marked settled')
+          if (getComputedStyle(rbody).display !== 'none')
+            fail('settled thinking shows a body nobody asked for')
+          const rlabel = document.querySelector('.blk-reasoning .blk-head')?.textContent ?? ''
+          if (!/^Thought for /i.test(rlabel))
+            fail(`thinking header is not a duration: ${JSON.stringify(rlabel)}`)
+        }
+
+        // Outdented label, aligned content, right-side bubble for your own turn.
+        const col = (document.querySelector('.transcript') ?? document.body) as HTMLElement
+        const ab = document.querySelector('.blk-answer > .blk-body') as HTMLElement
+        const ub = document.querySelector('.blk-user > .blk-body') as HTMLElement
+        if (!ab || !ub) fail('missing answer or user body to measure')
+        else {
+          const abr = ab.getBoundingClientRect()
+          const ubr = ub.getBoundingClientRect()
+          const cr = col.getBoundingClientRect()
+          if (Math.abs(abr.left - (cr.left + parseFloat(getComputedStyle(col).paddingLeft || '0'))) > 4)
+            fail(`the answer no longer starts on the column edge: ${Math.round(abr.left)} vs ${Math.round(cr.left)}`)
+          if (Math.abs(ubr.right - abr.right) > 3)
+            fail(`the user bubble does not end where the answer ends: ${Math.round(ubr.right)} vs ${Math.round(abr.right)}`)
+          const share = ubr.width / Math.max(1, ab.getBoundingClientRect().width)
+          if (ubr.width > col.clientWidth * 0.78)
+            fail(`the user bubble is ${(share * 100).toFixed(0)}% of the column, want <= 78%`)
+          if (getComputedStyle(ub).textAlign === 'right')
+            fail('text inside the user bubble is right-aligned')
+          const lab = document.querySelector('.blk-answer .blk-head') as HTMLElement
+          // The gutter only exists in a wide layout; in a narrow window the label
+          // legitimately goes back above its block, so assert the layout that is
+          // actually in force rather than the one the design prefers.
+          const gutter = parseFloat(getComputedStyle(document.querySelector('.scroller')!).paddingLeft || '0')
+          if (gutter >= 40 && lab.getBoundingClientRect().left > abr.left - 20)
+            fail(
+              `the CWOFFEE label is not outdented, so the content is still indented (label ${Math.round(lab.getBoundingClientRect().left)}, body ${Math.round(abr.left)}, gutter ${gutter})`,
+            )
+        }
+
+        // Every control says it is one.
+        for (const sel of ['.fbtn', '.sessrow', '.wsbtn', '.ws-plus', '.cbtn', '.btn-go']) {
+          const el = document.querySelector(sel) as HTMLElement | null
+          if (el && getComputedStyle(el).cursor !== 'pointer' && getComputedStyle(el).cursor !== 'not-allowed')
+            fail(`${sel} does not advertise a pointer: ${getComputedStyle(el).cursor}`)
+        }
+        // A stored attachment belongs *under the answer that produced it*. It used to
+        // be appended to the live turn, which on a reload put the chip above every
+        // message in the session - off screen, so a session reopened after writing a
+        // file looked like it had no attachment at all.
+        const chip = document.querySelector('.filechip') as HTMLElement | null
+        const answerWrap = document.querySelector('.blk-answer') as HTMLElement | null
+        if (!chip) fail('a stored attachment did not render after reload')
+        else if (!answerWrap) fail('no answer block to anchor the attachment to')
+        else if (!(answerWrap.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING))
+          fail('the stored attachment is not below the answer it belongs to')
+        else if (!chip.querySelector('svg.file-glyph'))
+          fail('the stored attachment chip has no inline icon')
+
+        transcript?.clear()
+        pageLog('collapsed cards, english headers and bubbles ok')
+      }
+
+      // --- thinking fills the block instead of growing down it -----------------
+      // Each streamed delta used to become its own <div>, so a thinking block was a
+      // stack of one-clause lines, full width and half-empty, and the block got
+      // taller on every paint - which read as a flicker as well as a layout bug.
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        for (const p of [
+          'thinking about the first clause, ',
+          'then the second clause carries on ',
+          'and a third arrives so the line has to wrap ',
+          'across the block rather than down it.',
+        ]) {
+          transcript?.apply({ kind: 'reasoning', d: p })
+          // One chunk per repaint is the design: the reveal unit is whatever landed
+          // since the last paint. Applying four deltas in the same microtask makes one
+          // chunk, and a check that expects four is a check that misunderstands it.
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 30)))
+        }
+        transcript?.flushNow()
+        const tins = [...document.querySelectorAll('.think-tin')] as HTMLElement[]
+        if (tins.length < 2) fail(`streaming thinking made ${tins.length} reveal chunks`)
+        const disp = tins.map((t) => getComputedStyle(t).display)
+        if (disp.some((d) => d !== 'inline'))
+          fail(`thinking chunks are block-level: ${disp.join(',')}`)
+        const run = document.querySelector('.think-run') as HTMLElement
+        const body = run?.closest('.blk-body') as HTMLElement
+        if (!run || !body) fail('no thinking run to measure')
+        else {
+          const rr = run.getBoundingClientRect()
+          const br = body.getBoundingClientRect()
+          if (rr.width < br.width * 0.7)
+            fail(`thinking grows down instead of across: run ${Math.round(rr.width)}px inside ${Math.round(br.width)}px`)
+        }
+        transcript?.clear()
+        pageLog('thinking reveal is inline ok')
+      }
+
+      // --- the temp folder is "no workspace", not a folder ---------------------
+      // Early builds wrote /tmp into sessions as the default. The sidebar drew it as
+      // a group called `tmp` beside one called `No workspace`: the same thing twice,
+      // neither of them true. It now buckets as Default, and registering it is
+      // refused by the engine and said out loud in the UI.
+      {
+        if (!isTempRoot('/tmp') || !isTempRoot('/tmp/') || !isTempRoot(''))
+          fail('the temp folder is not recognised as "no workspace"')
+        if (!isTempRoot('/var/tmp')) fail('/var/tmp is the temp folder too')
+        if (isTempRoot('/tmp/cwoffee-project'))
+          fail('a folder inside the temp folder is a real project folder')
+
+        const fake: Session = {
+          id: 990_001,
+          title: 'selftest temp bucket',
+          workspace: '/tmp',
+          model: '',
+          created_at: 0,
+          updated_at: 0,
+          message_count: 2,
+        }
+        const saved = sessions
+        sessions = [...saved, fake]
+        const bucket = wsGroups.find((g) => g.path === '')
+        if (!bucket || !bucket.list.some((s) => s.id === fake.id))
+          fail('a session in /tmp is not bucketed under Default')
+        if (wsGroups.some((g) => g.path === '/tmp'))
+          fail('/tmp is drawn as a workspace group of its own')
+        const labels = wsGroups.map((g) => g.label)
+        if (bucket && bucket.label !== 'Default')
+          fail(`the no-workspace group is labelled ${JSON.stringify(bucket.label)}, want "Default"`)
+        sessions = saved
+
+        await addFolderFor('/tmp')
+        if (!toastText()) fail('adding the temp folder produced no message')
+        else if (!/temp folder/i.test(toastText()))
+          fail(`the refusal does not explain itself: ${JSON.stringify(toastText())}`)
+        await loadWorkspaces()
+        if (workspaces.some((w) => isTempRoot(w.path)))
+          fail('the temp folder ended up registered as a workspace')
+        toast = null
+        pageLog('temp folder bucketed and refused ok')
+      }
+
+      // --- a session keeps the folder it started in ----------------------------
+      // The engine refuses the move; the control has to look refused too, or every
+      // session that cannot move invites a click that can only fail.
+      {
+        const home = hostState?.session_id ?? 0
+        const real = sessions.find(
+          (s) => !isBareDraft(s) && !isTempRoot(s.workspace) && !!s.workspace,
+        )
+        if (!real) {
+          pageLog('no session with a real folder to test the workspace lock against')
+        } else {
+          if (!(await settleTurn('before the workspace lock check'))) fail('host would not go idle')
+          await openSession(real.id)
+          await refreshState()
+          await new Promise((r) => setTimeout(r, 300))
+          if (!wsLocked) fail(`session ${real.id} in ${real.workspace} is not reported as locked`)
+          // `button.wsrow`, not `.wsrow`: the sidebar's workspace group header is also
+          // a `.wsrow`, it comes first in the DOM, and a div has no `disabled`.
+          const row = document.querySelector('button.wsrow') as HTMLButtonElement | null
+          if (!row) fail('no workspace row in the composer')
+          else if (!row.disabled) fail('the folder control is live for a session that has a folder')
+          const before = hostState?.workspace ?? ''
+          await chooseWorkspace()
+          if ((hostState?.workspace ?? '') !== before)
+            fail('a locked session still moved its workspace')
+          if (!/keeps its folder/i.test(toastText()))
+            fail(`the locked control did not say why it is locked: ${JSON.stringify(toastText())}`)
+          toast = null
+          newSession()
+          await new Promise((r) => setTimeout(r, 200))
+          if (wsLocked) fail('a fresh draft should be able to choose a folder')
+          pageLog('workspace lock ok')
+        }
+      }
+
       // Sidebar grouping. The claim being tested is the one the user sees: every
       // session is inside a folder group, the folder the host is in is one of
       // them, and the `+` on a row preselects that folder without creating a
@@ -2658,8 +3531,13 @@
         const groups = wsGroups
         if (!groups.length) fail('the sidebar has no workspace groups')
         const inside = groups.reduce((n, g) => n + g.list.length, 0)
-        if (inside !== sessions.length)
-          fail(`grouping holds ${inside} of ${sessions.length} sessions`)
+        // Bare drafts are deliberately not in the sidebar, so the invariant is
+        // "every session that the sidebar chooses to show is in a group". Comparing
+        // against the full list made this fail whenever another check had left a
+        // draft behind, which read as a grouping bug.
+        const shown = sessions.filter((s) => !isBareDraft(s)).length
+        if (inside !== shown)
+          fail(`grouping holds ${inside} of ${shown} sessions the sidebar shows (${sessions.length} rows total)`)
         const cur = hostState?.workspace ?? ''
         if (cur && !groups.some((g) => g.path === cur))
           fail(`no group for the folder the tools are in (${cur})`)
@@ -2695,6 +3573,14 @@
       }
 
       await sweepSelftest('end', idFloor)
+      // Hand the host back to the conversation the user was in. The sweep deleted the
+      // scratch sessions; leaving the host pointed at one of them meant the desktop
+      // came back showing a harness title.
+      if (session0) {
+        await invoke('switch_session', { id: session0 }).catch((e) =>
+          pageLog(`selftest could not return to session ${session0}: ${e}`),
+        )
+      }
       await restoreSettings()
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
@@ -3009,9 +3895,29 @@
       class:animating={sidebarAnimating}
       style="background: linear-gradient(160deg, var(--color-wash-1), var(--color-wash-2) 55%, var(--color-wash-3));"
     >
-      <button class="pill px-2.5 py-1 text-left text-[12.5px] font-medium" onclick={newSession}>
-        + New session
-      </button>
+      <!-- A tab strip, not a headline button. It is not wired to anything yet:
+           Chat mode does not exist, and a control that lies about what the app can
+           do is worse than one that is missing. New session keeps a key on the
+           shortcut, a `+` here, and the `+` on each workspace row. -->
+      <div class="flex items-center gap-1.5">
+        <div class="modegrid flex-1" class:chat={modeTab === 'chat'}>
+          <button
+            class="modesel"
+            role="tab"
+            aria-selected={modeTab === 'cowork'}
+            onclick={() => (modeTab = 'cowork')}
+          >Cowork</button>
+          <button
+            class="modesel"
+            role="tab"
+            aria-selected={modeTab === 'chat'}
+            onclick={() => (modeTab = 'chat')}
+          >Chat</button>
+        </div>
+        <button class="newbtn" title="New session (Ctrl+N)" aria-label="New session" onclick={newSession}>
+          <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 2.6v8.8M2.6 7h8.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>
+        </button>
+      </div>
 
       <input
         class="pill px-2.5 py-1 text-[12.5px]"
@@ -3045,8 +3951,10 @@
           <button
             class="iconbtn ws-addall"
             aria-label="Add a folder"
-            title="Add a folder to the sidebar"
-            onclick={() => (wsAdding = !wsAdding)}
+            title={transportKind === 'tauri'
+              ? 'Add a folder to the sidebar (opens the folder picker)'
+              : 'Add a folder on the host by path'}
+            onclick={addWorkspaceFromHeader}
           >
             <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2.6v6.8M2.6 6h6.8" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
           </button>
@@ -3139,7 +4047,11 @@
                          quiet, and the dot is always laid out (invisible until unread)
                          so titles do not shift when one arrives. -->
                     <button class="sessbtn" onclick={() => openSession(s.id)}>
-                      <span class="sess-dot" aria-hidden="true"></span>
+                      <span
+                        class="sess-dot"
+                        class:busy={runningSessions.has(s.id)}
+                        aria-hidden="true"
+                        title={runningSessions.has(s.id) ? 'answering' : ''}></span>
                       <span class="sess-title">{s.title}</span>
                     </button>
                     <button
@@ -3180,10 +4092,48 @@
                rectangle, so it carries the warmth; the steam is the only bit of
                decorative motion in the app and it is tied to nothing. -->
           <div class="cupwrap" aria-hidden="true">
-            <span class="steam s1"></span>
-            <span class="steam s2"></span>
-            <span class="steam s3"></span>
             <img class="cup" src="/icon.png" alt="" draggable="false" />
+            <!-- Drawn in the artwork's own 256-unit space, so the feet of the
+                 wisps stay on the coffee surface at every render size. -->
+            <svg class="steamart" viewBox="0 0 256 256" aria-hidden="true">
+              <defs>
+                <!-- Ink at the rim, nothing at the top: a puff that thins out as it
+                     rises reads as dispersing smoke instead of a moving line. -->
+                <linearGradient id="cwoffee-steam-fade" x1="0" y1="1" x2="0" y2="0">
+                  <!-- Soft at both ends: densest a little above the rim. An ink that is
+                       strongest *at* the surface puts a smudge on the coffee itself. -->
+                  <stop offset="0" stop-color="currentColor" stop-opacity="0.25" />
+                  <stop offset="0.22" stop-color="currentColor" stop-opacity="0.95" />
+                  <stop offset="0.6" stop-color="currentColor" stop-opacity="0.5" />
+                  <stop offset="1" stop-color="currentColor" stop-opacity="0" />
+                </linearGradient>
+              </defs>
+              <defs>
+                <!-- Feet at y=56..60: the coffee surface in the artwork's own space (the
+                     mouth spans y=52..78, the liquid x=62..178), so the steam starts
+                     inside the cup and the anchoring survives any render size. -->
+                <!-- Feet at y=50..52: the far edge of the coffee's surface in the
+                     artwork's own space (the mouth spans y=52..78, the liquid x=62..178).
+                     Starting inside the ellipse put ink on the drink, which read as a
+                     smudge on the coffee rather than something leaving it. -->
+                <path id="cwoffee-wisp-a" pathLength="100" d="M96 52 C86 38 104 28 96 10 C88 -8 106 -20 98 -40" />
+                <path id="cwoffee-wisp-b" pathLength="100" d="M124 50 C114 32 134 20 126 0 C118 -20 138 -34 130 -58" />
+                <path id="cwoffee-wisp-c" pathLength="100" d="M154 52 C146 36 164 26 156 8 C148 -8 166 -20 158 -42" />
+              </defs>
+              <!-- Each curve is drawn twice: a wide blurred body and a narrow brighter
+                   thread inside it. One stroked curve reads as a wire; two read as
+                   something soft with a hot centre, which is what smoke looks like. -->
+              <g class="wisps">
+                <use class="wisp body w1" href="#cwoffee-wisp-a" />
+                <use class="wisp body w2" href="#cwoffee-wisp-b" />
+                <use class="wisp body w3" href="#cwoffee-wisp-c" />
+              </g>
+              <g class="cores">
+                <use class="wisp core c1" href="#cwoffee-wisp-a" />
+                <use class="wisp core c2" href="#cwoffee-wisp-b" />
+                <use class="wisp core c3" href="#cwoffee-wisp-c" />
+              </g>
+            </svg>
           </div>
           <h1 class="empty-hi">{greeting.hi}</h1>
           <p class="empty-sub">{greeting.sub}</p>
@@ -3219,8 +4169,11 @@
       {#if approval}
         <div class="approval mx-auto w-full max-w-[780px] px-6">
           <div class="card approval-card">
-            <div class="text-[12px] font-semibold uppercase tracking-wide text-warn">
-              Approve · {approval.tool} ({approval.risk})
+            <div
+              class="text-[12px] font-semibold uppercase tracking-wide text-warn"
+              title={approval.tool}
+            >
+              Approve · {riskHeadline(approval.tool)} ({approval.risk})
             </div>
             <div class="mt-1 font-mono text-[13px]">{approval.summary}</div>
             <div class="mt-3 flex items-center gap-2">
@@ -3326,7 +4279,7 @@
                 onchange={pickFiles}
               />
               <button class="cbtn sq" title="Attach images (png, jpeg, webp, gif)" onclick={() => fileInput?.click()}>
-                <svg width="14" height="14" viewBox="0 0 14 14"><path d="M9.2 4.3 5 8.5a1.9 1.9 0 0 0 2.7 2.7l4.2-4.2a3.4 3.4 0 0 0-4.8-4.8L2.8 6.5a4.9 4.9 0 0 0 6.9 6.9" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+                <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
               </button>
 
               <button class="cbtn chip" data-menu onclick={(e) => openMenu('mode', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'mode'}>
@@ -3371,7 +4324,7 @@
 
           </div>
 
-          {#if wsEditing}
+          {#if wsEditing && !wsLocked}
             <div class="wsrow ws-edit">
               <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
               <input
@@ -3384,27 +4337,32 @@
                 onkeydown={(e) => {
                   if (e.key === 'Enter') {
                     e.preventDefault()
-                    void applyWorkspace(wsDraft.trim())
+                    submitWsPath()
                   } else if (e.key === 'Escape') {
                     wsEditing = false
                     wsErr = ''
                   }
                 }}
               />
-              <button class="ws-act" onclick={() => void applyWorkspace(wsDraft.trim())}>set</button>
+              <button class="ws-act" onclick={submitWsPath}>set</button>
               <button class="ws-act" onclick={() => { wsEditing = false; wsErr = '' }}>cancel</button>
             </div>
           {:else}
             <button
-              class="wsrow"
-              title={isTauri()
-                ? 'Choose the directory the tools operate in'
-                : `Host workspace: ${hostState?.workspace ?? ''} - click to type a path`}
+              class="wsrow {wsLocked ? 'ws-locked' : ''}"
+              disabled={wsLocked}
+              title={wsLocked
+                ? `This session works in ${hostState?.workspace ?? ''}. A session keeps its folder: start a new session to work somewhere else.`
+                : isTauri()
+                  ? 'Choose the directory the tools operate in'
+                  : `Host workspace: ${hostState?.workspace ?? ''} - click to type a path`}
               onclick={chooseWorkspace}
             >
               <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
-              <span>{shortWorkspace || 'Choose workspace'}</span>
-              {#if wsBusy}<span class="ws-note">working…</span>{/if}
+              <span>{wsChipLabel || 'Choose workspace'}</span>
+              {#if wsBusy}<span class="ws-note">working…</span>
+              {:else if wsLocked}<span class="ws-note">this session’s folder</span>
+              {:else if viewId === null && draftWorkspace}<span class="ws-note">new session here</span>{/if}
             </button>
           {/if}
           {#if wsErr}<div class="ws-err" role="alert">{wsErr}</div>{/if}
@@ -3508,7 +4466,7 @@
       {:else if menu.kind === 'ws'}
         {@const wp = menu.wsPath ?? ''}
         {@const wrow = workspaces.find((w) => w.path === wp)}
-        {@const wlabel = wrow ? wsLabelOf(wrow) : wp ? basenameOf(wp) : 'No workspace'}
+        {@const wlabel = wrow ? wsLabelOf(wrow) : wp && !isTempRoot(wp) ? basenameOf(wp) : 'Default'}
         <div class="pop-title">{wlabel}</div>
         <div class="pop-mono pop-sub">{wp || 'sessions with no folder'}</div>
         {#if wp}
@@ -3803,4 +4761,16 @@
       </button>
     </span>
   </footer>
+
+  <!-- Refusals and outcomes that used to be invisible: a folder the engine declined
+       while its panel was closed, a picker cancelled, a session whose folder cannot
+       change. `role=status` so a screen reader hears it, and dismissible by hand. -->
+  {#if toast}
+    <div class="toast {toast.bad ? 'bad' : ''}" role="status" aria-live="polite">
+      <span>{toast.text}</span>
+      <button class="toast-x" aria-label="Dismiss" onclick={() => (toast = null)}>
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.6 2.6l4.8 4.8M7.4 2.6l-4.8 4.8" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  {/if}
 </div>

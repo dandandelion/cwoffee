@@ -811,6 +811,18 @@ const AUDITED: &[&str] = &[
     "respond_question",
 ];
 
+/// Empty a pending map and report how many waiters were released.
+///
+/// Dropping a `oneshot::Sender` is the language both the approval gate and `ask_user`
+/// understand for "nobody is going to answer this": the awaiting side wakes on a
+/// closed channel instead of sitting until its timeout.
+fn drain<T>(map: &Arc<Mutex<HashMap<u64, oneshot::Sender<T>>>>) -> usize {
+    let mut m = map.lock().unwrap();
+    let n = m.len();
+    m.clear();
+    n
+}
+
 /// Args rendered without their payloads: the fact that a turn was started and of
 /// what size matters in a log; the user's message text does not belong in one.
 fn arg_hint(args: &serde_json::Value) -> String {
@@ -980,11 +992,32 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             // slice: an image is a large base64 blob on an unauthenticated-by-
             // default channel, and the phone case is watching and answering, not
             // composing with images.
-            h.host.submit(text);
+            // `session` is the sender's view, and it is not optional in practice:
+            // two clients share one host, and a turn without an address lands in
+            // whichever conversation the last switch left active. The engine refuses
+            // a mismatch, so a phone tab that has gone stale gets an error instead of
+            // appending to the desktop's chat.
+            let session = args.get("session").and_then(|v| v.as_i64());
+            h.host.send_turn_to(text, Vec::new(), session);
             Ok(json!(true))
         }
         "cancel_turn" => {
             need_drive(role)?;
+            // Release what the turn is parked on before cancelling. The engine
+            // releases a parked approval on its own now, and a parked question's tool
+            // wakes when its sender drops, but doing it here makes Stop take effect on
+            // the spot rather than on the engine's next poll - and it is the one place
+            // that can say how many prompts were outstanding when the user gave up.
+            let approvals = drain(&h.pending);
+            let questions = drain(&h.pending_questions);
+            if approvals + questions > 0 {
+                // No peer here: `run_cmd` does not know who asked. The audit line
+                // dispatch logs for every drive command names the address, and it
+                // always precedes this one.
+                println!(
+                    "[gateway] cancel_turn released {approvals} approval(s), {questions} question(s)"
+                );
+            }
             h.host.cancel();
             Ok(json!(true))
         }
@@ -1015,11 +1048,22 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         "respond_approval" => {
             need_drive(role)?;
             let id = arg_i64(&args, "id")? as u64;
-            let answer = match arg_str(&args, "answer")?.as_str() {
-                "allow" => ApprovalAnswer::Allow,
-                "allow_session" => ApprovalAnswer::AllowSession,
-                "deny" => ApprovalAnswer::Deny,
-                other => return Err(format!("unknown answer {other:?}")),
+            let raw = arg_str(&args, "answer")?;
+            // Parsed with the engine's own Deserialize, not a hand-written list of
+            // spellings. `ApprovalAnswer` is `rename_all = "camelCase"`, so the
+            // wire form the UI sends is "allowSession"; this match asked for
+            // "allow_session", which no client ever sent. Plain "allow" happened to
+            // agree, so approving from a phone worked for the one button and failed
+            // for every other answer - and the failure text named an answer the
+            // user had never seen.
+            let answer = match serde_json::from_value::<ApprovalAnswer>(serde_json::json!(&raw)) {
+                Ok(a) => a,
+                Err(_) if raw == "allow_session" => ApprovalAnswer::AllowSession,
+                Err(_) => {
+                    return Err(format!(
+                        "unknown answer {raw:?}; expected allow | allowSession | deny"
+                    ))
+                }
             };
             let tx = h.pending.lock().unwrap().remove(&id);
             match tx {
@@ -1534,18 +1578,34 @@ mod tests {
         assert!(!err.is_empty(), "refusal must say something");
     }
 
+    /// A real, writable directory that is *not* the system temp root: the engine
+    /// refuses the root itself (it is the "no workspace" bucket), so tests that
+    /// want a valid folder have to make one.
+    fn unique_dir(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("cwoffee_gw_{tag}_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::canonicalize(&p)
+            .unwrap_or(p)
+            .display()
+            .to_string()
+    }
+
     #[tokio::test]
     async fn a_drive_token_moves_the_workspace_and_a_bad_path_says_why() {
         let h = test_handle();
+        let dir = unique_dir("move");
         let out = run_cmd(
             "set_workspace",
-            serde_json::json!({ "path": "/tmp" }),
+            serde_json::json!({ "path": &dir }),
             Role::Drive,
             &h,
         )
         .await
         .expect("a real writable directory should be accepted");
-        assert_eq!(out.as_str(), Some("/tmp"), "the reply is the applied path");
+        assert_eq!(out.as_str(), Some(dir.as_str()), "the reply is the applied path");
 
         let err = run_cmd(
             "set_workspace",
@@ -1555,7 +1615,14 @@ mod tests {
         )
         .await
         .expect_err("a non-directory must be refused");
-        assert!(err.contains("refused"), "unhelpful error: {err}");
+        assert!(err.contains("not a directory"), "unhelpful error: {err}");
+
+        // The system temp root is the "no workspace" bucket, so setting it is
+        // refused rather than silently accepted: the mobile UI offers this path.
+        let err = run_cmd("set_workspace", serde_json::json!({ "path": "/tmp" }), Role::Drive, &h)
+            .await
+            .expect_err("the temp root is not a workspace");
+        assert!(err.contains("temp folder"), "unhelpful error: {err}");
     }
 
     /// The sidebar list is read-only, so a watch token - which exists so a
@@ -1581,9 +1648,10 @@ mod tests {
     #[tokio::test]
     async fn adding_a_folder_to_the_sidebar_is_drive_only_and_validated() {
         let h = test_handle();
+        let dir = unique_dir("add");
         let err = run_cmd(
             "add_workspace",
-            serde_json::json!({ "path": "/tmp" }),
+            serde_json::json!({ "path": &dir }),
             Role::Watch,
             &h,
         )
@@ -1593,13 +1661,20 @@ mod tests {
 
         let out = run_cmd(
             "add_workspace",
-            serde_json::json!({ "path": "/tmp" }),
+            serde_json::json!({ "path": &dir }),
             Role::Drive,
             &h,
         )
         .await
-        .expect("/tmp is a real writable directory");
-        assert_eq!(out.as_str(), Some("/tmp"));
+        .expect("a real writable directory should be accepted");
+        assert_eq!(out.as_str(), Some(dir.as_str()));
+
+        // Adding /tmp is refused with a reason the UI can toast: it is the bucket
+        // sessions with no workspace live in, not a folder you can add.
+        let err = run_cmd("add_workspace", serde_json::json!({ "path": "/tmp" }), Role::Drive, &h)
+            .await
+            .expect_err("the temp root is not a workspace");
+        assert!(err.contains("temp folder"), "unhelpful error: {err}");
 
         // The engine decides what is a workspace, so a file is not one and the
         // sidebar cannot be filled with junk from a browser.
@@ -1627,12 +1702,13 @@ mod tests {
     #[tokio::test]
     async fn a_workspace_label_names_the_row_and_not_the_folder() {
         let h = test_handle();
-        run_cmd("add_workspace", serde_json::json!({ "path": "/tmp" }), Role::Drive, &h)
+        let dir = unique_dir("label");
+        run_cmd("add_workspace", serde_json::json!({ "path": &dir }), Role::Drive, &h)
             .await
             .unwrap();
         let ok = run_cmd(
             "set_workspace_label",
-            serde_json::json!({ "path": "/tmp", "label": "scratch" }),
+            serde_json::json!({ "path": &dir, "label": "scratch" }),
             Role::Drive,
             &h,
         )
@@ -1702,14 +1778,30 @@ mod tests {
         let url = format!("ws://127.0.0.1:{port}/ws");
         let mut ws = attach(&url).await;
 
-        // Enough volume to overflow the broadcast capacity (8) and the socket
-        // buffers, which is what makes the pump lag. Yielding between chunks is
-        // not decoration: on a loaded machine the connection's write task may
-        // never be scheduled during a synchronous flood of 600 sends, and then
-        // the client sits on a queue nobody has drained and the first read times
-        // out - which reads as "the resync never arrived" when the real problem is
-        // that nothing was written yet.
+        // Prove the connection's write pump has subscribed to the broadcast before
+        // flooding it. A subscriber registered *after* these sends starts at the
+        // tail and sees none of them, which is not a lag and produces no resync -
+        // and that race, not the mechanism, is what made this test flaky under load.
         use futures_util::StreamExt;
+        let _ = h.events.send(EngineEvent::Note {
+            message: "warm-up: the pump is subscribed".into(),
+        });
+        let warmed = tokio::time::timeout(
+            // Generous, and it costs nothing when healthy: this is a ceiling on a
+            // first frame, not a sleep. The box running these tests is also running
+            // inference, and 10s of scheduler starvation is ordinary here.
+            std::time::Duration::from_secs(30),
+            StreamExt::next(&mut ws),
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|f| f.map(|f| f.to_text().unwrap_or_default().contains("warm-up")).unwrap_or(false))
+        .unwrap_or(false);
+        assert!(warmed, "the connection never forwarded a plain event");
+
+        // Enough volume to overflow the broadcast capacity (8) and the socket
+        // buffers while the client is not reading, which is what makes the pump lag.
         for chunk in 0..6u32 {
             for i in 0..100u32 {
                 let _ = h.events.send(EngineEvent::Note {
@@ -1720,7 +1812,7 @@ mod tests {
         }
 
         let mut saw_resync = false;
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(20));
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(40));
         tokio::pin!(deadline);
         let mut got = 0u32;
         while !saw_resync {
@@ -1742,14 +1834,37 @@ mod tests {
 
         // And the socket must still be usable: a resync that arrives just before
         // the server drops the connection is a fancier way of hanging up.
-        let ok = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            rpc_over(&mut ws, "list_sessions", serde_json::json!({})),
+        //
+        // Drained without a frame budget and on a generous deadline. The flood is
+        // 600 events, and the reply queues behind whatever the kernel has not
+        // shipped yet, so the shared helper's 500-frame window and 5s timeout made
+        // *this* assertion the flaky one while the mechanism under test was fine.
+        ws.send(txt(
+            serde_json::json!({ "id": 4242, "cmd": "list_sessions", "args": {} }).to_string(),
+        ))
+        .await
+        .expect("send after resync");
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            async {
+                loop {
+                    let frame = ws.next().await.expect("socket closed after a resync");
+                    let text = frame.expect("frame after a resync").to_text().unwrap_or_default().to_string();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if v.get("id").and_then(|x| x.as_i64()) == Some(4242) {
+                            return v;
+                        }
+                    }
+                }
+            },
         )
         .await
-        .expect("the socket stopped answering after a resync")
-        .expect("list_sessions failed after a resync");
-        assert!(ok.is_array(), "list_sessions should return an array");
+        .expect("the socket stopped answering after a resync");
+        assert_eq!(reply.get("ok").and_then(|x| x.as_bool()), Some(true), "{reply}");
+        assert!(
+            reply.get("data").map(|d| d.is_array()).unwrap_or(false),
+            "list_sessions should return an array: {reply}"
+        );
     }
 
     /// The gauge is a claim about the world, printed as fact in the footer, so
@@ -1925,6 +2040,106 @@ mod tests {
     /// desktop knew. An empty list is a *claim* - "nothing needed relocating" - and
     /// on a phone that is the difference between "your old folders were followed"
     /// and "this side is not telling you".
+    /// The web UI sends the engine's own spelling, `allowSession`. This dispatch
+    /// used to compare against `"allow_session"`, which no client has ever sent, so
+    /// a phone could approve the "Allow" button and nothing else - the turn stayed
+    /// parked, and the error named an answer nobody had seen.
+    #[tokio::test]
+    async fn an_approval_answered_from_the_phone_reaches_the_engine() {
+        let h = test_handle();
+        for answer in ["allow", "allowSession", "deny"] {
+            let (tx, rx) = oneshot::channel();
+            h.pending.lock().unwrap().insert(7, tx);
+            let out = run_cmd(
+                "respond_approval",
+                serde_json::json!({ "id": 7, "answer": answer }),
+                Role::Drive,
+                &h,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{answer} was refused: {e}"));
+            assert_eq!(out, serde_json::json!(true));
+            let got = rx.await.expect("the parked sender was dropped, not answered");
+            let want = match answer {
+                "allow" => ApprovalAnswer::Allow,
+                "allowSession" => ApprovalAnswer::AllowSession,
+                _ => ApprovalAnswer::Deny,
+            };
+            assert_eq!(got, want, "{answer} resolved as {got:?}");
+        }
+        // A legacy snake_case client is still understood, and a typo is refused by
+        // name rather than by "no pending approval".
+        let (tx, _rx) = oneshot::channel();
+        h.pending.lock().unwrap().insert(8, tx);
+        run_cmd(
+            "respond_approval",
+            serde_json::json!({ "id": 8, "answer": "allow_session" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("the old spelling should still resolve");
+        let err = run_cmd(
+            "respond_approval",
+            serde_json::json!({ "id": 9, "answer": "yes" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("yes is not an answer");
+        assert!(err.contains("allowSession"), "unhelpful: {err}");
+    }
+
+    /// A stale view cannot append to someone else's conversation.
+    ///
+    /// The desktop switched on, the phone tab did not, and the phone sends. Without
+    /// an address on the turn that message lands in whatever session is active -
+    /// which reads to the person at the keyboard as "my transcript changed by
+    /// itself". Over the wire the refusal arrives as an error *event* (the rpc itself
+    /// was well formed), so the client must render it; what this asserts is that
+    /// nothing ran.
+    #[tokio::test]
+    async fn a_turn_for_a_stale_view_is_refused_over_the_wire() {
+        let h = test_handle();
+        let turns_before = h.host.state().turns;
+        let stale_view = h.host.state().session_id + 424_242;
+        run_cmd(
+            "start_turn",
+            serde_json::json!({ "text": "hello from a stale phone tab", "session": stale_view }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("the command is well formed; the refusal is an event, not an rpc error");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            h.host.state().turns,
+            turns_before,
+            "a turn addressed to a session the host is not on still ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_releases_what_the_turn_is_parked_on() {
+        let h = test_handle();
+        let (atx, mut arx) = oneshot::channel::<ApprovalAnswer>();
+        let (qtx, mut qrx) = oneshot::channel::<cwoffee_engine::tools::ask::Answer>();
+        h.pending.lock().unwrap().insert(11, atx);
+        h.pending_questions.lock().unwrap().insert(12, qtx);
+
+        run_cmd("cancel_turn", serde_json::json!({}), Role::Drive, &h)
+            .await
+            .expect("cancel should be honoured");
+
+        // Closed channel, not a value: that is how the approval gate reads "nobody is
+        // going to answer" and refuses to run, and how ask_user tells the model the
+        // question was cancelled.
+        assert!(arx.await.is_err(), "the parked approval was left waiting");
+        assert!(qrx.await.is_err(), "the parked question was left waiting");
+        assert!(h.pending.lock().unwrap().is_empty(), "the approval map still holds a sender");
+        assert!(h.pending_questions.lock().unwrap().is_empty(), "the question map still holds a sender");
+    }
+
     #[tokio::test]
     async fn migration_notes_reports_what_the_host_was_actually_given() {
         let h = test_handle();

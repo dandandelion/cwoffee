@@ -118,17 +118,26 @@ export interface GpuReport {
   leaked_nvidia: boolean
 }
 
+export type ReasoningLevel = 'off' | 'low' | 'medium' | 'high' | 'xhigh'
+
 export interface HostState {
   session_id: number
   model: string
   mode: 'ask' | 'session' | 'auto'
-  reasoning: 'off' | 'low' | 'medium' | 'high'
+  reasoning: ReasoningLevel
   busy: boolean
   turns: number
   context_tokens: number
   compactions: number
   approval_timeout_secs: number
   workspace: string
+  /**
+   * Why the last workspace change was refused, and a counter so a caller can tell a
+   * fresh refusal from an old one. `set_workspace` returns this text; a UI that only
+   * watches `workspace` sees a change that did not happen and blames itself.
+   */
+  workspace_refusal?: string | null
+  refusal_seq: number
 }
 
 export interface Session {

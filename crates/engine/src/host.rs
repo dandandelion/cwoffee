@@ -81,6 +81,12 @@ pub fn check_workspace(raw: &str) -> Result<std::path::PathBuf, String> {
     if !p.is_dir() {
         return Err("is not a directory".into());
     }
+    if is_temp_root(&expanded) {
+        return Err(
+            "is the system temp folder, which is where sessions with no workspace live; pick a real project folder"
+                .into(),
+        );
+    }
     // The sandbox confines writes to this directory, so an unwritable one is a
     // configuration mistake worth saying out loud rather than discovering on the
     // first exec.
@@ -92,6 +98,39 @@ pub fn check_workspace(raw: &str) -> Result<std::path::PathBuf, String> {
     Ok(std::fs::canonicalize(&p).unwrap_or(p))
 }
 
+/// Is this path the system temp folder itself?
+///
+/// Not merely a *use* of it: a session under `/tmp/build/output` is fine. The root
+/// is the case that matters, because it is the bucket this app calls "no
+/// workspace" - the default a session sits in before a folder is chosen, and the
+/// place older sessions were left in. Letting it also be a workspace would split
+/// those same sessions across two sidebar groups and make the grouping a guess.
+pub fn is_temp_root(raw: &str) -> bool {
+    let p = std::path::Path::new(raw.trim());
+    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    [std::env::temp_dir(), std::path::PathBuf::from("/tmp"), std::path::PathBuf::from("/var/tmp"), std::path::PathBuf::from("/private/tmp")]
+        .iter()
+        .any(|t| std::fs::canonicalize(t).map(|c| c == canon).unwrap_or(false))
+}
+
+/// Refuse a workspace change in a way the caller can read.
+fn refuse_workspace(
+    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+    state: &Arc<Mutex<HostState>>,
+    path: &str,
+    reason: &str,
+) {
+    {
+        let mut st = state.lock().unwrap();
+        st.refusal_seq += 1;
+        st.workspace_refusal = Some(format!("{path}: {reason}"));
+    }
+    let _ = ev_tx.send(EngineEvent::Error {
+        message: format!("the engine refused {path:?}: {reason}"),
+        fatal: false,
+    });
+}
+
 /// Commands the UI sends. Everything the agent does on its own goes out over
 /// `events`, so the UI never has to poll for state.
 pub enum HostCmd {
@@ -101,6 +140,19 @@ pub enum HostCmd {
     Send {
         text: String,
         attachments: Vec<crate::provider::Attachment>,
+        /// Which conversation this turn belongs to.
+        ///
+        /// `None` means "wherever the host is" - correct for the desktop's own
+        /// composer, which *is* the host's view. A number is an assertion: "I am
+        /// looking at this conversation". `0` means "I am on a draft", so the host
+        /// drops to draft state and the send creates the row. Any other number that
+        /// does not match the host's session is **refused**.
+        ///
+        /// The refusal is the point. With one host and many clients - desktop,
+        /// phone, harness - an untargeted send lands in whichever conversation the
+        /// last switch left active. From the user's chair that is indistinguishable
+        /// from the transcript being edited behind their back.
+        session: Option<i64>,
     },
     SetMode { mode: ApprovalMode },
     SetReasoning { reasoning: Reasoning },
@@ -138,6 +190,16 @@ pub struct HostState {
     /// countdown: a turn blocked on a human looks identical to a turn still
     /// working, and that difference is the entire message.
     pub approval_timeout_secs: u64,
+    /// Why the last workspace change was refused, and a counter so a caller that
+    /// polls `state()` can tell a fresh refusal from an old one.
+    ///
+    /// `send()` is fire-and-forget, so without this the only trace of a refusal is
+    /// an error block in the transcript, and `set_workspace_checked` has to guess
+    /// the reason from the fact that the path did not apply.
+    #[serde(default)]
+    pub workspace_refusal: Option<String>,
+    #[serde(default)]
+    pub refusal_seq: u64,
 }
 
 pub struct SessionHost {
@@ -190,6 +252,8 @@ impl SessionHost {
             context_tokens: 0,
             compactions: 0,
             approval_timeout_secs: cfg.approval_timeout.as_secs(),
+            workspace_refusal: None,
+            refusal_seq: 0,
         }));
         let limits = AttachmentLimits {
             max_count: cfg.max_attachments,
@@ -281,13 +345,41 @@ impl SessionHost {
                         let p = match check_workspace(&path) {
                             Ok(p) => p,
                             Err(reason) => {
-                                let _ = ev_tx.send(EngineEvent::Error {
-                                    message: format!("the engine refused {path:?}: {reason}"),
-                                    fatal: false,
-                                });
+                                refuse_workspace(&ev_tx, &state_bg, &path, &reason);
                                 continue;
                             }
                         };
+                        // A session keeps the folder it was started in. The tools
+                        // are confined to that folder and the sidebar groups the
+                        // session under it, so moving it mid-session makes the
+                        // grouping a decoration and writes files into a tree the
+                        // user never chose for this conversation. Folders are
+                        // changed by starting a session in one, not by moving one
+                        // out from under a session that already has one.
+                        if session_id != 0 {
+                            let current = store
+                                .session(session_id)
+                                .ok()
+                                .flatten()
+                                .map(|s| s.workspace.trim().to_string())
+                                .unwrap_or_default();
+                            if !current.is_empty() && !is_temp_root(&current) {
+                                let same = std::fs::canonicalize(&current)
+                                    .map(|c| c == p)
+                                    .unwrap_or_else(|_| std::path::PathBuf::from(&current) == p);
+                                if !same {
+                                    refuse_workspace(
+                                        &ev_tx,
+                                        &state_bg,
+                                        &path,
+                                        &format!(
+                                            "this session works in {current}; a session keeps its folder, so start a new session to work somewhere else"
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         // Moving the tools into a folder registers it, so the
                         // sidebar shows where you now work without you having to
                         // add it by hand.
@@ -447,7 +539,7 @@ impl SessionHost {
                         }
                     }
 
-                    HostCmd::Send { text, attachments } => {
+                    HostCmd::Send { text, attachments, session } => {
                         let attachments = match check_attachments(&attachments, limits) {
                             Ok(()) => attachments,
                             Err(reason) => {
@@ -460,6 +552,36 @@ impl SessionHost {
                         };
                         if text.trim().is_empty() && attachments.is_empty() {
                             continue;
+                        }
+                        // "I am on a draft" - even though the host is not. Without
+                        // this, a client whose view is empty sends into the
+                        // conversation the host happens to be on, which is the bug
+                        // this whole branch exists to kill.
+                        if session == Some(0) && session_id != 0 {
+                            session_id = 0;
+                            persisted_next = 0;
+                            agent.replace_prompt(PromptBuilder::new());
+                            agent.prompt_mut().set_env(cfg.env_block.clone());
+                            {
+                                let mut s = state_bg.lock().unwrap();
+                                s.session_id = 0;
+                                s.context_tokens = 0;
+                            }
+                            let _ = ev_tx.send(EngineEvent::SessionChanged {
+                                session_id: 0,
+                                title: String::new(),
+                            });
+                        }
+                        if let Some(want) = session {
+                            if want > 0 && want != session_id {
+                                let _ = ev_tx.send(EngineEvent::Error {
+                                    message: format!(
+                                        "the turn asked for session {want}, but the host is on session {session_id}: nothing was sent. Open that conversation, or start a new one, and try again."
+                                    ),
+                                    fatal: false,
+                                });
+                                continue;
+                            }
                         }
                         if session_id == 0 {
                             let ws = agent.workspace().display().to_string();
@@ -597,13 +719,25 @@ impl SessionHost {
         self.send_with(text, Vec::new())
     }
 
-    /// Send a message that carries attachments.
+    /// Send a message that carries attachments, into the host's current session.
     pub fn send_with(
         &self,
         text: impl Into<String>,
         attachments: Vec<crate::provider::Attachment>,
     ) {
-        self.send(HostCmd::Send { text: text.into(), attachments })
+        self.send(HostCmd::Send { text: text.into(), attachments, session: None })
+    }
+
+    /// Send a turn *into a named conversation*. Front ends should use this: it is
+    /// what stops a phone tab or a test harness from writing into the conversation
+    /// the desktop happens to be looking at.
+    pub fn send_turn_to(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<crate::provider::Attachment>,
+        session: Option<i64>,
+    ) {
+        self.send(HostCmd::Send { text: text.into(), attachments, session })
     }
 
     pub fn cancel(&self) {
@@ -629,12 +763,22 @@ impl SessionHost {
         if path.trim().is_empty() {
             return Err("empty workspace path".into())
         }
+        let seq_before = self.state().refusal_seq;
         self.send(HostCmd::SetWorkspace { path: path.to_string() });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let st = self.state();
             if std::path::PathBuf::from(&st.workspace) == want {
                 return Ok(st.workspace)
+            }
+            // The host refused it, and said why. Reading that beats the old
+            // guess, which blamed writability for refusals that were really
+            // "this session already has a folder".
+            if st.refusal_seq > seq_before {
+                return Err(st
+                    .workspace_refusal
+                    .clone()
+                    .unwrap_or_else(|| "the engine refused that folder".into()));
             }
             if std::time::Instant::now() >= deadline {
                 if st.busy {
@@ -886,12 +1030,205 @@ mod tests {
             "a workspace move should be visible in the transcript"
         );
 
-        // Ordering: a change queued behind a turn lands after it, never during
-        // it, because the command loop runs turns inline.
+        // Ordering and ownership. The command loop runs turns inline, so a change
+        // sent during a turn is processed after it, never in the middle of one. It
+        // is also refused here for a second, deliberate reason: this turn created a
+        // session, the session has a folder, and a session keeps that folder.
         h.submit("go");
         h.send(HostCmd::SetWorkspace { path: base.display().to_string() });
         turns_done(&h, 1).await;
-        assert_eq!(h.state().workspace, base.display().to_string());
+        assert_eq!(
+            h.state().workspace,
+            other.display().to_string(),
+            "a running session's folder moved out from under it"
+        );
+        assert!(
+            h.state()
+                .workspace_refusal
+                .as_deref()
+                .unwrap_or("")
+                .contains("keeps its folder"),
+            "the refusal was not stated: {:?}",
+            h.state().workspace_refusal
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The system temp root is the bucket this app calls "no workspace", so it is
+    /// not also offered as a workspace: sessions already sitting there would split
+    /// across both sidebar groups, and adding it would appear to do something.
+    #[test]
+    fn the_system_temp_folder_is_not_a_workspace() {
+        let err = check_workspace("/tmp").expect_err("/tmp must be refused as a workspace");
+        assert!(err.contains("temp folder"), "unhelpful: {err}");
+        assert!(is_temp_root("/tmp"));
+        assert!(is_temp_root("/tmp/"), "a trailing slash is the same folder");
+        assert!(
+            !is_temp_root("/tmp/cwoffee-project"),
+            "a project under /tmp is a folder like any other"
+        );
+        let sub = std::env::temp_dir().join(format!("cwoffee_temp_ok_{}", std::process::id()));
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(check_workspace(sub.to_str().unwrap()).is_ok(), "a subfolder must work");
+        let _ = std::fs::remove_dir_all(&sub);
+    }
+
+    /// A session keeps the folder it started in. The tools are confined to it and
+    /// the sidebar files the session under it, so moving it mid-life makes the
+    /// grouping a decoration and writes into a tree this conversation never chose.
+    #[tokio::test]
+    async fn a_session_keeps_the_folder_it_started_in() {
+        let base = std::env::temp_dir().join(format!("cwoffee_ws_lock_{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let (mut h, _store) = host(vec!["first reply".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        // Draft: no session row yet, so the folder is still yours to choose.
+        h.send(HostCmd::SetWorkspace { path: a.display().to_string() });
+        wait_for("into a".into(), || h.state().workspace == a.display().to_string()).await;
+
+        // The turn creates the session, and the session inherits that folder.
+        h.submit("go");
+        turns_done(&h, 1).await;
+        assert_ne!(h.state().session_id, 0, "the turn should have created a session");
+
+        h.send(HostCmd::SetWorkspace { path: b.display().to_string() });
+        assert!(
+            await_error(&mut ev, "keeps its folder").await,
+            "a session's folder was changed without a word about it"
+        );
+        assert_eq!(h.state().workspace, a.display().to_string(), "it moved anyway");
+
+        // Back to a draft and the choice is open again: the lock belongs to the
+        // session, not to the process.
+        h.send(HostCmd::ClearSession);
+        wait_for("draft".into(), || h.state().session_id == 0).await;
+        h.send(HostCmd::SetWorkspace { path: b.display().to_string() });
+        wait_for("into b".into(), || h.state().workspace == b.display().to_string()).await;
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Same lock, session row created the way the desktop command does it: a row in
+    /// the store and a switch, never a `HostCmd::NewSession`. If the lock only works
+    /// for sessions the host itself opened, then every session created from the
+    /// sidebar can have its folder moved under it - which is what the harness hit.
+    #[tokio::test]
+    async fn a_session_created_outside_the_host_still_keeps_its_folder() {
+        let base = std::env::temp_dir().join(format!("cwoffee_ws_ext_{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let (mut h, store) = host(vec!["unused".into()]);
+        let (_ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        h.send(HostCmd::SetWorkspace {
+            path: a.display().to_string(),
+        });
+        wait_for("into a".into(), || {
+            h.state().workspace == a.display().to_string()
+        })
+        .await;
+
+        let id = store
+            .create_session("made outside", &a.display().to_string(), "m")
+            .unwrap();
+        h.send(HostCmd::SwitchSession { id });
+        wait_for("switched".into(), || h.state().session_id == id).await;
+
+        let err = h
+            .set_workspace_checked(&b.display().to_string())
+            .await
+            .expect_err("a row created outside the host is still a session with a folder");
+        assert!(
+            err.contains("keeps its folder"),
+            "the refusal was: {err}"
+        );
+        assert_eq!(
+            store.session(id).unwrap().unwrap().workspace,
+            a.display().to_string(),
+            "the row's folder moved"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The desktop does not send the raw command; it calls `set_workspace_checked`
+    /// and reads the return value. A lock that only exists as an event leaves that
+    /// caller reporting success, which is the failure the harness saw: "the session
+    /// moved", with an empty reason attached to it.
+    #[tokio::test]
+    async fn the_lock_reaches_the_caller_that_asked() {
+        let base = std::env::temp_dir().join(format!("cwoffee_wslock_api_{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let (mut h, _store) = host(vec!["first reply".into()]);
+        let (_ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        h.send(HostCmd::SetWorkspace {
+            path: a.display().to_string(),
+        });
+        wait_for("into a".into(), || {
+            h.state().workspace == a.display().to_string()
+        })
+        .await;
+        h.submit("go");
+        turns_done(&h, 1).await;
+
+        let err = h
+            .set_workspace_checked(&b.display().to_string())
+            .await
+            .expect_err("a session's folder must not move out from under it");
+        assert!(
+            err.contains("keeps its folder"),
+            "the refusal did not reach the caller that asked: {err}"
+        );
+        assert_eq!(
+            h.state().workspace,
+            a.display().to_string(),
+            "the folder moved anyway"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sessions in the "no workspace" bucket - the system temp folder, or nothing
+    /// at all - are exactly the ones that should be allowed to pick a folder.
+    #[tokio::test]
+    async fn a_session_with_no_folder_can_choose_one() {
+        let base = std::env::temp_dir().join(format!("cwoffee_ws_free_{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let (mut h, store) = host(vec!["first reply".into()]);
+        let (_ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        let id = store
+            .create_session("orphan", "/tmp", "m")
+            .expect("session row in the temp bucket");
+        h.send(HostCmd::SwitchSession { id });
+        wait_for("switched".into(), || h.state().session_id == id).await;
+
+        h.send(HostCmd::SetWorkspace { path: real.display().to_string() });
+        wait_for("adopted a real folder".into(), || {
+            h.state().workspace == real.display().to_string()
+        })
+        .await;
+        assert_eq!(store.session(id).unwrap().unwrap().workspace, real.display().to_string());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1059,7 +1396,7 @@ mod tests {
             .set_workspace_checked("/nonexistent/definitely-not")
             .await
             .expect_err("a non-directory must not be accepted");
-        assert!(err.contains("refused"), "unhelpful error: {err}");
+        assert!(err.contains("not a directory"), "unhelpful error: {err}");
         assert!(
             err.contains("/nonexistent/definitely-not"),
             "the error should name the path: {err}"
@@ -1089,6 +1426,7 @@ mod tests {
         ready(&h).await;
         h.send(HostCmd::Send {
             text: "what is in this image?".into(),
+            session: None,
             attachments: vec![crate::provider::Attachment {
                 mime: "image/png".into(),
                 data_b64: "aGVsbG8=".into(),
@@ -1138,6 +1476,60 @@ mod tests {
     /// `FnMut` rather than `Fn` so a poll can drain the event channel while it
     /// waits. A condition that is already true would otherwise let the caller
     /// inspect the channel before the host has written anything to it.
+    /// A turn that names a conversation the host is not on is refused.
+    ///
+    /// The symptom this kills is "my transcript is being mutated". One host serves
+    /// several clients - desktop, phone, harness - and an untargeted send lands in
+    /// whichever conversation the last switch left active, so a harness turn can
+    /// appear in the chat the user is looking at. Naming the target, and refusing a
+    /// mismatch, makes that impossible rather than merely unlikely.
+    #[tokio::test]
+    async fn a_turn_named_for_another_session_is_refused() {
+        let ws = std::env::temp_dir().display().to_string();
+        let (mut h, store) = host(vec!["the turn ran".into()]);
+        let a = store.create_session("alpha", &ws, "test-model").unwrap();
+        let b = store.create_session("beta", &ws, "test-model").unwrap();
+        h.send(HostCmd::SwitchSession { id: a });
+        wait_for("on alpha".into(), || h.state().session_id == a).await;
+
+        h.send_turn_to("this belongs to beta", vec![], Some(b));
+        // Give the loop every chance to run it. If it does, the assertion fires.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(h.state().turns, 0, "a mis-addressed turn ran anyway");
+        assert!(store.history(a).unwrap().is_empty(), "it landed in the host's session");
+        assert!(store.history(b).unwrap().is_empty(), "it landed where it asked");
+
+        // Right target: it runs, and lands exactly where it said.
+        h.send_turn_to("this belongs to alpha", vec![], Some(a));
+        wait_for("the addressed turn ran".into(), || h.state().turns == 1).await;
+        assert_eq!(store.history(a).unwrap().len(), 2, "user + assistant in alpha");
+        assert!(store.history(b).unwrap().is_empty(), "beta still untouched");
+    }
+
+    /// `session: Some(0)` means "my view is a draft". The send has to open its own
+    /// conversation instead of appending to whatever the host left active - the same
+    /// mistake with the opposite sign.
+    #[tokio::test]
+    async fn a_draft_send_starts_its_own_conversation() {
+        let ws = std::env::temp_dir().display().to_string();
+        let (mut h, store) = host(vec!["one".into(), "two".into()]);
+        let a = store.create_session("alpha", &ws, "test-model").unwrap();
+        h.send(HostCmd::SwitchSession { id: a });
+        wait_for("on alpha".into(), || h.state().session_id == a).await;
+
+        h.send_turn_to("from a draft", vec![], Some(0));
+        wait_for("a row was created".into(), || {
+            let id = h.state().session_id;
+            id != 0 && id != a
+        })
+        .await;
+        assert!(
+            store.history(a).unwrap().is_empty(),
+            "the draft's message joined the session that was already open"
+        );
+        assert_eq!(store.history(h.state().session_id).unwrap().len(), 2);
+    }
+
     async fn wait_for(what: String, mut f: impl FnMut() -> bool) {
         for _ in 0..400 {
             if f() {

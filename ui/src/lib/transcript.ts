@@ -75,13 +75,43 @@ function shortMime(mime: string): string {
   return sub.split(';')[0]
 }
 
-function fileGlyph(mime: string): string {
-  if (mime.startsWith('image/')) return '\u{1f5bc}'
-  if (mime === 'application/pdf') return '\u{1f4c4}'
-  if (mime.includes('spreadsheet') || mime.endsWith('csv')) return '\u{1f4ca}'
-  if (mime.includes('wordprocessing') || mime === 'text/markdown' || mime === 'text/plain')
-    return '\u{1f4c4}'
-  return '\u{1f4c1}'
+/**
+ * The mark on a file chip, as inline SVG.
+ *
+ * Emoji were the obvious choice and the wrong one: they render in full colour from
+ * a system font, so a chat drawn in two warm greys suddenly carries a blue picture
+ * frame and a yellow folder. These share the composer icons' 16px box, stroke
+ * weight and round joins, and take their colour from `currentColor`.
+ */
+function fileIcon(mime: string): SVGElement {
+  const NS = 'http://www.w3.org/2000/svg'
+  const svg = document.createElementNS(NS, 'svg')
+  svg.setAttribute('viewBox', '0 0 16 16')
+  svg.setAttribute('width', '16')
+  svg.setAttribute('height', '16')
+  svg.setAttribute('class', 'file-glyph')
+  svg.setAttribute('aria-hidden', 'true')
+  const path = (d: string) => {
+    const el = document.createElementNS(NS, 'path')
+    el.setAttribute('d', d)
+    svg.appendChild(el)
+  }
+  if (mime.startsWith('image/')) {
+    path('M3.4 2.4h7.2l2.6 2.6v8.6H3.4z')
+    path('M10.6 2.4v2.6h2.6')
+    path('M4.8 11.4l2.3-2.5 1.9 2 1.6-1.7 1.4 1.6')
+  } else if (mime.includes('spreadsheet') || mime.endsWith('csv')) {
+    path('M3 2.6h10v10.8H3z')
+    path('M3 6.2h10')
+    path('M6.4 6.2v7.2')
+    path('M9.8 6.2v7.2')
+  } else {
+    path('M3.4 2.4h7.2l2.6 2.6v8.6H3.4z')
+    path('M10.6 2.4v2.6h2.6')
+    path('M5.8 8.4h4.4')
+    path('M5.8 10.8h3')
+  }
+  return svg
 }
 
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
@@ -238,7 +268,10 @@ export class Transcript {
    * transcript carries no animation at all.
    */
   private setLive(body: HTMLElement | null) {
-    const wrap = body?.parentElement ?? null
+    // A tool card is its own block, so its marker belongs on the card. Taking the
+    // parent put `live` on the turn, which matched no CSS: a running command had no
+    // indicator at all while a running answer did.
+    const wrap = body?.classList?.contains('blk') ? body : (body?.parentElement ?? null)
     if (this.liveWrap === wrap) return
     this.liveWrap?.classList.remove('live')
     this.liveWrap = wrap
@@ -444,7 +477,8 @@ export class Transcript {
     }
     if (this.thinkEl !== host || !this.thinkRun?.isConnected) {
       host.innerHTML = ''
-      const run = this.el('think-run')
+      const run = document.createElement('span')
+      run.className = 'think-run'
       const settled = document.createTextNode('')
       run.append(settled)
       host.append(run)
@@ -454,9 +488,13 @@ export class Transcript {
       this.thinkNodes = new Map()
     }
     const id = this.thinkSeq++
-    const span = this.el('tin think-tin')
-    // Plain text, never markup: reasoning arrives with asterisks, angle brackets
-    // and half-written tags in it, and it is not markdown.
+    // An inline span, deliberately. `el()` builds a <div>, and a div per arrival
+    // puts every delta on its own line: the block grew straight down the full width
+    // instead of filling lines, which is what made thinking look like a rendering
+    // fault. Plain text, never markup: reasoning arrives with asterisks, angle
+    // brackets and half-written tags in it, and it is not markdown.
+    const span = document.createElement('span')
+    span.className = 'tin think-tin'
     span.textContent = s
     span.dataset.at = String(performance.now())
     this.thinkRun.append(span)
@@ -932,7 +970,9 @@ export class Transcript {
       chip.type = 'button'
       chip.dataset.path = f.path
       chip.title = `Open ${f.path}`
-      chip.append(this.el('file-ico', fileGlyph(f.mime)))
+      const ico = this.el('file-ico')
+      ico.append(fileIcon(f.mime))
+      chip.append(ico)
       const meta = this.el('file-meta')
       meta.append(this.el('file-name', f.name))
       meta.append(this.el('file-sub', `${shortMime(f.mime)} · ${fmtSize(f.bytes)}`))
@@ -949,21 +989,26 @@ export class Transcript {
    * the two used to be written out separately, which is how the history view
    * ended up with a card that could not collapse.
    *
-   * Tool output collapses the same way a thinking block does - collapsed by
-   * default, click anywhere on the collapsed card to expand, click the label to
-   * collapse again. Most calls are one or two lines, so the collapsed height is
-   * chosen to show those in full and only clamp the long ones.
+   * Collapsed, a card is its header line and nothing else - the same shape a
+   * thinking block has. The old version clamped the arguments and output to "3.5
+   * lines" instead, so a collapsed transcript was a wall of half-visible JSON and
+   * the header, which was the only part worth reading, got lost in it.
    */
   private buildToolCard(name: string) {
     const card = this.el('blk blk-tool')
+    card.dataset.tool = name
     const head = this.el('blk-head')
-    head.append(this.el('tool-name', name))
+    const headline = this.el('tool-name', toolHeadline(name, 'run'))
+    head.append(headline)
     const subject = this.el('tool-subject')
     head.append(subject)
     // The change count sits between the subject and the status so a scan of a
     // long list of cards answers "did this touch anything?" without opening one.
     const stat = this.el('tool-stat')
-    const status = this.el('tool-status', 'running…')
+    // Empty while the call runs. "Running a command · running" says it twice, and
+    // the pulsing dot plus the peeking body already carry the state; the chip is
+    // for the verdict, which only exists afterwards.
+    const status = this.el('tool-status')
     head.append(stat, status)
     const args = this.el('tool-args')
     const out = this.el('tool-out')
@@ -1113,11 +1158,18 @@ export class Transcript {
   private closeTool(id: string, ok: boolean, exit: number | null) {
     const t = this.refs(id)
     if (!t) return
-    t.status.textContent = ok ? `ok${exit === null ? '' : ` · exit ${exit}`}` : `failed${exit === null ? '' : ` · exit ${exit}`}`
+    // Past tense, because by now it has happened.
+    const label = t.card.querySelector('.tool-name')
+    if (label) label.textContent = toolHeadline(t.name, 'done')
+    t.status.textContent = ok
+      ? exit === null || exit === 0
+        ? 'OK'
+        : `failed · exit ${exit}`
+      : `failed${exit === null ? '' : ` · exit ${exit}`}`
     t.status.className = `tool-status ${ok ? 'ok' : 'bad'}`
     t.card.classList.add(ok ? 'tool-ok' : 'tool-bad')
-    // Snap back to the start once it is done, so a scanned card begins where a
-    // reader expects rather than mid-log.
+    // A finished card collapses to its header: the transcript a user scans is a
+    // list of what happened, not of how it happened.
     if (!t.detail.classList.contains('expanded')) t.detail.scrollTop = 0
   }
 
@@ -1127,7 +1179,9 @@ export class Transcript {
       this.block('fail', 'error').textContent = msg
       return
     }
-    t.status.textContent = 'unparseable'
+    const label = t.card.querySelector('.tool-name')
+    if (label) label.textContent = toolHeadline(t.name, 'bad')
+    t.status.textContent = 'arguments unparseable'
     t.status.className = 'tool-status bad'
     t.out.textContent = msg
   }
@@ -1181,12 +1235,14 @@ export class Transcript {
     const cards = new Map<string, { out: HTMLElement; stat: HTMLElement; detail: HTMLElement; card: HTMLElement }>()
     let lastCard: { out: HTMLElement; stat: HTMLElement; detail: HTMLElement; card: HTMLElement } | undefined
 
+    let lastWrap: HTMLElement | undefined
     const blk = (kind: string, label: string) => {
       const wrap = this.el(`blk blk-${kind}`)
       const head = this.el('blk-head', label)
       const body = this.el('blk-body')
       wrap.append(head, body)
       frag.appendChild(wrap)
+      lastWrap = wrap
       return body
     }
 
@@ -1204,8 +1260,13 @@ export class Transcript {
         const body = blk('answer', 'cwoffee')
         body.innerHTML = renderMarkdown(m.content)
         if (m.files?.length) {
-          this.ensureTurn()
-          this.turn!.appendChild(this.fileRow(m.files))
+          // Into the fragment, directly under the answer that produced them. This
+          // used to call ensureTurn() and append to the live turn, which landed the
+          // chips at the *top* of a reloaded transcript, above every message: a
+          // session reopened after writing a file looked like it had no attachment,
+          // which is exactly the "the file was not shown at turn end" report.
+          const strip = this.fileRow(m.files)
+          frag.insertBefore(strip, lastWrap ? lastWrap.nextSibling : null)
         }
         for (const call of parseCalls(m.tool_calls_json)) {
           if (call.name === 'ask_user') {
@@ -1235,6 +1296,11 @@ export class Transcript {
             continue
           }
           const { card, head, args, out, detail, subject, stat } = this.buildToolCard(call.name)
+          // Stored calls have finished, so they read in the past tense; the status
+          // chip stays empty because a stored tool result does not record whether
+          // the call succeeded.
+          const label = head.querySelector('.tool-name')
+          if (label) label.textContent = toolHeadline(call.name, 'done')
           ;(head.querySelector('.tool-status') as HTMLElement).textContent = '' 
           frag.appendChild(card)
           args.textContent = call.arguments
@@ -1284,6 +1350,41 @@ function parseCalls(jsonStr: string): Array<{ id: string; name: string; argument
   } catch {
     return []
   }
+}
+
+/**
+ * What a finished or running tool call says about itself, in English.
+ *
+ * `write_file` is a name from the schema; what the user wants to know is that a
+ * file was written, and whether it is still going. The tense carries the state:
+ * "Writing a file" is live, "Wrote a file" is done, "Could not write a file" is a
+ * call whose arguments never parsed.
+ */
+const TOOL_HEAD: Record<string, { run: string; done: string; bad: string }> = {
+  write_file: { run: 'Writing a file', done: 'Wrote a file', bad: 'Could not write a file' },
+  edit_file: { run: 'Editing a file', done: 'Edited a file', bad: 'Could not edit that file' },
+  read_file: { run: 'Reading a file', done: 'Read a file', bad: 'Could not read that file' },
+  write_xlsx: { run: 'Writing a spreadsheet', done: 'Wrote a spreadsheet', bad: 'Could not write the spreadsheet' },
+  download_file: { run: 'Downloading a file', done: 'Downloaded a file', bad: 'Could not download that file' },
+  web_fetch: { run: 'Opening a page', done: 'Opened a page', bad: 'Could not open that page' },
+  web_search: { run: 'Searching the web', done: 'Searched the web', bad: 'The search did not parse' },
+  exec: { run: 'Running a command', done: 'Ran a command', bad: 'The command did not parse' },
+  ask_user: { run: 'Asked you something', done: 'Asked you something', bad: 'Asked you something' },
+}
+
+export function toolHeadline(name: string, tense: 'run' | 'done' | 'bad'): string {
+  const h = TOOL_HEAD[name]
+  if (h) return h[tense]
+  return tense === 'done' ? 'Done' : tense === 'bad' ? 'Failed' : 'Working'
+}
+
+/**
+ * The same label for an approval prompt. An unrecognised tool keeps its raw id:
+ * a name the harness has never seen is itself the information a decision turns on,
+ * and "Working" would hide it.
+ */
+export function riskHeadline(name: string): string {
+  return TOOL_HEAD[name] ? toolHeadline(name, 'run') : name
 }
 
 /**

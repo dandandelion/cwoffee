@@ -6,9 +6,9 @@
  */
 export function fmtThink(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
-  if (s < 60) return `thought for ${s}s`
+  if (s < 60) return `Thought for ${s}s`
   const m = Math.floor(s / 60)
-  if (m < 60) return `thought for ${m}m${String(s % 60).padStart(2, '0')}s`
+  if (m < 60) return `Thought for ${m}m${String(s % 60).padStart(2, '0')}s`
   const h = Math.floor(m / 60)
-  return `thought for ${h}h${String(m % 60).padStart(2, '0')}m`
+  return `Thought for ${h}h${String(m % 60).padStart(2, '0')}m`
 }

@@ -1,182 +1,124 @@
 #!/usr/bin/env python3
-"""Generate the Cwoffee app icons: a hand-drawn coffee cup with a face.
+"""Generate every icon Cwoffee ships, from one hand-drawn source.
 
-The one hard constraint carried over from the old shell design: the face has to
-still read at 16px. That is why it is two dots and an arc, and why the steam is
-drawn thin enough to disappear gracefully rather than turn into mud.
+    assets/brand/cwoffee-source.png   ->  crates/tauri-app/icons/*
+                                          ui/public/icon.png
 
-usage: python3 scripts/make-icon.py
+Nothing in here draws the logo. The artwork is drawn by hand at 1024x1024 on a
+transparent background; this script only crops it to its own bounds, pads it back
+to a square, and resamples it down. If an icon looks wrong at some size, the fix is
+the source file or the crop rule below - never a redraw inside the script, because
+then the file on disk and the file that produced it stop agreeing.
+
+Sizes, and who consumes them:
+  16/32/48/64/128/256/512 .png   scripts/install-desktop.sh (hicolor theme),
+                                 and the window icon at runtime (64x64 is embedded
+                                 into the binary by include_image! in main.rs)
+  32x32, 128x128, icon.png       crates/tauri-app/tauri.conf.json bundle list
+  icon.ico                       Windows packaging
+  ui/public/icon.png             the titlebar mark and the empty-screen cup
+
+Requires Pillow:  python3 -c "import PIL" || pip install pillow
 """
-from PIL import Image, ImageDraw
-import math
-import os
+from __future__ import annotations
 
-OUT = os.path.join(os.path.dirname(__file__), "..", "crates", "tauri-app", "icons")
-os.makedirs(OUT, exist_ok=True)
+import sys
+from pathlib import Path
 
-S = 512
+try:
+    from PIL import Image, ImageFilter, ImageOps
+except ImportError:  # pragma: no cover
+    sys.exit("Pillow is missing. Install it:  python3 -m pip install pillow")
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / "assets" / "brand" / "cwoffee-source.png"
+TAURI_ICONS = ROOT / "crates" / "tauri-app" / "icons"
+UI_ICON = ROOT / "ui" / "public" / "icon.png"
+
+# Square sizes for the tauri icons directory.
+SQUARES = [16, 32, 48, 64, 128, 256, 512]
+ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+
+# Fraction of the artwork size to leave transparent around it. App icons want air,
+# and a hand-drawn mark cropped edge-to-edge reads as a sticker pasted onto the
+# launcher tile. Small sizes get almost none: at 16px the artwork is the whole
+# point, and margin there is lost detail.
+MARGIN_LARGE = 0.07
+MARGIN_SMALL = 0.01
+SMALL_BELOW = 64
 
 
-def lerp(a, b, t):
-    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+def crop_art(img: Image.Image) -> tuple[Image.Image, int]:
+    """Trim the transparent border; return the artwork and its longest edge.
 
-
-def cup_outline(cx, top_y, bot_y, half_top, half_bot, r):
-    """A tapered cup with a genuinely rounded base.
-
-    The corners are swept as explicit arcs about their own centres. The first
-    attempt here approximated the base with a half-ellipse offset from the side
-    walls, which is how a cup grew a tongue.
+    The source artwork is not square - the cup is wider than it is tall - and the
+    padding in the original file is not centred on the art. Cropping first is what
+    makes the mark sit in the middle of the tile instead of hanging low in it.
     """
-    pts = []
-    # rim, left to right, bowing up slightly so it reads as an opening
-    steps = 20
-    for i in range(steps + 1):
-        t = i / steps
-        x = (cx - half_top) + 2 * half_top * t
-        y = top_y - 7 * math.sin(math.pi * t)
-        pts.append((x, y))
-    # right wall down to the corner start
-    pts.append((cx + half_bot, bot_y - r))
-    # bottom-right corner: right side -> bottom
-    cr = (cx + half_bot - r, bot_y - r)
-    for i in range(1, 9):
-        a = (math.pi / 2) * (i / 8)
-        pts.append((cr[0] + r * math.cos(a), cr[1] + r * math.sin(a)))
-    # base, right to left
-    pts.append((cx - half_bot + r, bot_y))
-    # bottom-left corner: bottom -> left side
-    cl = (cx - half_bot + r, bot_y - r)
-    for i in range(1, 9):
-        a = math.pi / 2 + (math.pi / 2) * (i / 8)
-        pts.append((cl[0] + r * math.cos(a), cl[1] + r * math.sin(a)))
-    # left wall back up to the rim
-    pts.append((cx - half_top, top_y))
-    return pts
+    bbox = img.getchannel("A").getbbox()
+    if bbox is None:
+        sys.exit(f"{SRC} is completely transparent - there is no artwork to use")
+    art = img.crop(bbox)
+    # The longest edge gets the margin, so the plate is art * (1 + 2*margin).
+    return art, max(art.size)
 
 
-def wavy(d, x, y0, y1, amp, k, color, width):
-    """Steam: a sine stroke, thin enough to vanish at icon sizes."""
-    steps = 26
-    pts = []
-    for i in range(steps + 1):
-        t = i / steps
-        y = y0 + (y1 - y0) * t
-        x_i = x + amp * math.sin(t * math.pi * 1.9) * (1.0 - 0.45 * t)
-        pts.append((x_i, y))
-    d.line(pts, fill=color, width=max(1, int(width * k)), joint="curve")
+def plate_at(art: Image.Image, side: int, size: int) -> Image.Image:
+    margin = MARGIN_SMALL if size < SMALL_BELOW else MARGIN_LARGE
+    plate = int(round(side * (1.0 + 2 * margin)))
+    canvas = Image.new("RGBA", (plate, plate), (0, 0, 0, 0))
+    ox = (plate - art.width) // 2
+    oy = (plate - art.height) // 2
+    canvas.paste(art, (ox, oy), art)
+    canvas = canvas.resize((size, size), Image.LANCZOS)
+    if size <= 64:
+        # Downscaling thin hand-drawn strokes to 16-48px makes them grey and soft.
+        # A light unsharp on the alpha edges is what keeps the face readable at the
+        # size the dock actually draws it at.
+        canvas = canvas.filter(ImageFilter.UnsharpMask(radius=0.6, percent=80, threshold=2))
+    return canvas
 
 
-def make(size: int) -> Image.Image:
-    s = size
-    k = s / S
-    # Below ~64px the cup is about 9px wide. Steam, crema, saucer and cheeks at
-    # that size do not degrade, they merge into a brown blob - and the blob was
-    # the first version of this file. Small sizes get a simplified drawing with
-    # proportionally larger features instead of a shrunken detailed one.
-    detail = size >= 64
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+def main() -> int:
+    if not SRC.exists():
+        sys.exit(f"missing source icon: {SRC}")
+    src = Image.open(SRC).convert("RGBA")
+    art, side = crop_art(src)
+    print(f"source {SRC.relative_to(ROOT)}: {src.width}x{src.height}, "
+          f"artwork {art.width}x{art.height}")
 
-    # --- warm latte wash behind the cup -------------------------------------
-    inner = (250, 240, 224)
-    outer = (214, 186, 150)
-    rings = 26
-    for i in range(rings, 0, -1):
-        t = i / rings
-        col = lerp(inner, outer, t) + (int(90 + 90 * t),)
-        r = (150 + 58 * t) * k
-        d.ellipse(
-            [(256 - r) * k, (258 - r * 0.94) * k, (256 + r) * k, (258 + r * 0.94) * k],
-            fill=col,
-        )
+    TAURI_ICONS.mkdir(parents=True, exist_ok=True)
+    UI_ICON.parent.mkdir(parents=True, exist_ok=True)
 
-    body = (252, 246, 235)
-    edge = (122, 92, 62)
-    foam = (236, 216, 186)
-    steam = (168, 135, 92)
+    written: list[tuple[str, int, int]] = []
 
-    if detail:
-        hx, hy, hr = 350, 272, 62
-        top_y, bot_y, half_top, half_bot, corner = 192, 398, 102, 74, 28
-        lw = max(1, int(6 * k))
-        eye_r, eye_y, eye_dx, mouth = 9, 288, 32, [222, 302, 290, 350]
-    else:
-        # fill the frame, and make the face a third of the cup's width
-        hx, hy, hr = 372, 268, 86
-        top_y, bot_y, half_top, half_bot, corner = 150, 424, 148, 112, 34
-        lw = max(1, int(11 * k))
-        eye_r, eye_y, eye_dx, mouth = 26, 300, 62, [182, 296, 330, 392]
+    def emit(path: Path, img: Image.Image) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(path, "PNG", optimize=True)
+        written.append((str(path.relative_to(ROOT)), img.width, path.stat().st_size))
 
-    # --- steam first, so the cup overlaps it cleanly -------------------------
-    if detail:
-        wavy(d, 222, 118, 186, 16, k, steam + (215,), 6)
-        wavy(d, 288, 108, 182, 14, k, steam + (185,), 5)
+    for n in SQUARES:
+        emit(TAURI_ICONS / f"{n}x{n}.png", plate_at(art, side, n))
 
-    # --- handle: two arcs with the body colour between them ------------------
-    for box, col, w in (
-        ([(hx - hr) * k, (hy - hr) * k, (hx + hr) * k, (hy + hr) * k], edge, lw),
-        ([(hx - hr + 26) * k, (hy - hr + 26) * k, (hx + hr - 26) * k, (hy + hr - 26) * k], edge, lw),
-        ([(hx - hr + 13) * k, (hy - hr + 13) * k, (hx + hr - 13) * k, (hy + hr - 13) * k], body, max(1, int(26 * k))),
-    ):
-        d.arc(box, -78, 78, fill=col, width=w)
+    # tauri.conf.json references icon.png; 512 keeps it usable as the largest tile.
+    big = plate_at(art, side, 512)
+    emit(TAURI_ICONS / "icon.png", big)
 
-    # --- saucer ---------------------------------------------------------------
-    if detail:
-        d.ellipse([142 * k, 386 * k, 370 * k, 424 * k], fill=foam, outline=edge, width=max(1, int(5 * k)))
+    # Windows: one .ico carrying the ladder, so a 16px taskbar button and a 256px
+    # explorer tile both get a native resolution rather than a resample.
+    ico = TAURI_ICONS / "icon.ico"
+    plate_at(art, side, 256).save(ico, "ICO", sizes=ICO_SIZES)
+    written.append((str(ico.relative_to(ROOT)), 0, ico.stat().st_size))
 
-    # --- cup body -------------------------------------------------------------
-    pts = cup_outline(cx=256, top_y=top_y, bot_y=bot_y, half_top=half_top, half_bot=half_bot, r=corner)
-    poly = [(x * k, y * k) for x, y in pts]
-    d.polygon(poly, fill=body)
-    d.line(poly + [poly[0]], fill=edge, width=lw, joint="curve")
+    # The in-app mark is drawn at ~20px in the titlebar and ~120px on the empty
+    # screen, so 256 is the smallest file that stays crisp in both.
+    emit(UI_ICON, plate_at(art, side, 256))
 
-    # --- crema line just under the rim ---------------------------------------
-    if detail:
-        d.arc([160 * k, 172 * k, 352 * k, 240 * k], start=14, end=166, fill=foam, width=max(1, int(15 * k)))
-        d.arc([160 * k, 172 * k, 352 * k, 240 * k], start=14, end=166, fill=edge, width=max(1, int(2 * k)))
-
-    # --- face ----------------------------------------------------------------
-    eye = (74, 58, 44)
-    er = eye_r * k
-    for cx in (256 - eye_dx, 256 + eye_dx):
-        d.ellipse(
-            [(cx - eye_r) * k, (eye_y - eye_r) * k, (cx + eye_r) * k, (eye_y + eye_r) * k],
-            fill=eye,
-        )
-    d.arc([mouth[0] * k, mouth[1] * k, mouth[2] * k, mouth[3] * k],
-          start=18, end=162, fill=eye, width=max(1, int((6 if detail else 11) * k)))
-
-    # cheeks: soft, and dropped entirely at small sizes where they would blur
-    if size >= 128:
-        blush = (226, 176, 150, 150)
-        for cx in (196, 316):
-            d.ellipse([(cx - 15) * k, (300 - 9) * k, (cx + 15) * k, (300 + 9) * k], fill=blush)
-
-    return img.resize((size, size), Image.LANCZOS) if size != S else img
-
-
-def main():
-    sizes = [16, 32, 48, 64, 128, 256, 512]
-    for n in sizes:
-        make(n).save(os.path.join(OUT, f"{n}x{n}.png"))
-    big = make(512)
-    big.save(os.path.join(OUT, "icon.png"))
-    big.save(
-        os.path.join(OUT, "icon.ico"),
-        sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
-    )
-    print(f"wrote {len(sizes) + 2} icons to {OUT}")
-
-    # The titlebar renders ui/public/icon.png. This script used to write only
-    # the bundle icons, so the titlebar kept showing the previous logo forever -
-    # the app was renamed and rebranded and the little mark beside the title was
-    # still the old one.
-    public = os.path.join(os.path.dirname(__file__), "..", "ui", "public")
-    os.makedirs(public, exist_ok=True)
-    make(64).save(os.path.join(public, "icon.png"))
-    print(f"wrote ui/public/icon.png")
+    for name, w, size in written:
+        print(f"  {name:<40} {f'{w}px' if w else 'multi':>8} {size / 1024:7.1f} KB")
+    print(f"\n{len(written)} files written from {SRC.name}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -560,6 +560,23 @@ mod tests {
         assert_eq!(r, "read: notes.md");
     }
 
+    /// The JSON spelling of an answer is a wire contract: the web UI, the gateway's
+    /// parser and the TUI all have to agree on it. Pin it here, where a rename
+    /// trips a test, rather than in a hand-written match a thousand lines away -
+    /// which is exactly how approving from a phone broke for every answer except
+    /// plain "allow".
+    #[test]
+    fn the_wire_spelling_of_an_approval_answer_is_pinned() {
+        let wire = |a: ApprovalAnswer| serde_json::to_string(&a).unwrap();
+        assert_eq!(wire(ApprovalAnswer::Allow), "\"allow\"");
+        assert_eq!(wire(ApprovalAnswer::AllowSession), "\"allowSession\"");
+        assert_eq!(wire(ApprovalAnswer::Deny), "\"deny\"");
+        for a in [ApprovalAnswer::Allow, ApprovalAnswer::AllowSession, ApprovalAnswer::Deny] {
+            let back: ApprovalAnswer = serde_json::from_str(&wire(a)).unwrap();
+            assert_eq!(back, a, "{a:?} does not survive its own wire form");
+        }
+    }
+
     #[test]
     fn summarize_is_one_line_and_bounded() {
         let s = summarize("exec", &json!({"cmd": "a".repeat(500)}));

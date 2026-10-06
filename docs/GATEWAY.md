@@ -3,7 +3,44 @@
 Goal: open Cwoffee from a phone on the same network to watch progress and answer
 approvals when you are not at the machine.
 
-## What is built now
+## Which conversation a turn belongs to
+
+`start_turn` takes an optional `session` id, and clients are expected to send it:
+
+```json
+{ "id": 7, "cmd": "start_turn", "args": { "text": "…", "session": 512 } }
+```
+
+One host serves several clients - the desktop, a phone tab, a harness. A turn with no
+address runs in *whichever conversation the last switch left active*, which from the
+other person's chair is indistinguishable from the transcript editing itself. So the
+number is an assertion, and a mismatch is refused:
+
+```
+the turn asked for session 512, but the host is on session 508: nothing was sent.
+Open that conversation, or start a new one, and try again.
+```
+
+That arrives as an `error` **event**, not an rpc error: the command was well formed and
+was understood; the engine declined to run it. Clients must render it - the desktop
+shows it as a toast.
+
+`session: 0` means "my view is a draft", and the host opens a new conversation instead
+of appending to whatever it had open.
+
+A client whose view and the host disagree fixes itself before sending: the desktop moves
+the host to the conversation it is displaying and logs `send: host is on X, moving it to
+the viewed session Y`. That is not a reroute - the message was always meant for what the
+user is looking at - and the engine's refusal remains for a turn addressed to a session
+nobody is displaying.
+
+Related, and the other half of the same complaint: switching sessions during a running
+turn is handled by the *view*. The host's command loop is inside the turn, so a
+`switch_session` issued while it thinks queues behind it; the desktop fires it and
+moves its own view immediately rather than awaiting it, and the sidebar shows a
+spinner on the session that is working.
+
+What is built now
 
 `crates/gateway` is a small axum-free HTTP + WebSocket server that mirrors the
 **same running `SessionHost`** as the desktop window. It is not a second engine:
@@ -46,6 +83,31 @@ registers a folder for the sidebar (validated the same way) and `remove_workspac
 drops that registration only - it never deletes sessions, and a folder that still
 contains sessions keeps its row in the sidebar because hiding a session is worse
 than showing a folder twice.
+
+Two workspace refusals are deliberate, and a client gets the reason rather than a
+generic error:
+
+- **A session keeps the folder it started in.** `set_workspace` for a session that
+  already has a real folder returns `this session works in <path>; a session keeps
+  its folder, so start a new session to work somewhere else`. Letting a phone move a
+  running session would make the sidebar grouping decoration: the row would name the
+  old folder while `write_file` wrote into the new one. A session with no folder yet -
+  or one stored in the temp root - can still be given one.
+- **The temp root is not a workspace.** `/tmp`, `/var/tmp` and `/private/tmp` are where
+  sessions live before anyone chooses a folder, so they are refused by `set_workspace`
+  and `add_workspace`; a folder *inside* them (`/tmp/my-project`) is a normal folder.
+
+### Answering an approval from a phone
+
+`respond_approval` takes `{ id, answer }`, and `answer` is the engine enum serialized
+by serde, not a string the gateway interprets by hand: `allow`, `allowSession`, `deny`
+(`allow_session` is accepted for older clients). Any other spelling is an error naming
+the three that work. An earlier gateway parsed these with a hand-written match that
+listed `allow_session` while the UI sent `allowSession`, so every approval answered
+from a phone except a plain "allow" came back as `unknown answer` and the parked tool
+sat until it timed out - the tool appeared to ignore the user. The enum is the
+authority on its own wire form; there is a Rust test pinning the three spellings and a
+test that drives all three through a fake client.
 
 Every drive command is logged server-side with the peer that asked and the shape of
 its arguments - `172.20.10.2:51044 set_workspace (path len 24)`,

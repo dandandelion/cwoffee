@@ -138,6 +138,10 @@ pub fn start_turn(
     state: tauri::State<'_, AppState>,
     text: String,
     attachments: Option<Vec<AttachmentIn>>,
+    // Which conversation the sender is looking at. The engine refuses a turn whose
+    // session does not match the one it has active, so a second client - a phone, a
+    // test harness - cannot write into the desktop's open conversation.
+    session: Option<i64>,
 ) -> Result<(), String> {
     let atts: Vec<cwoffee_engine::provider::Attachment> = attachments
         .unwrap_or_default()
@@ -151,14 +155,15 @@ pub fn start_turn(
     // Audit line, same idea as the gateway's: a turn that nobody remembers
     // starting should be traceable to whoever started it. Lengths, not content.
     eprintln!(
-        "[cwoffee] start_turn (desktop): text={} attachments={}",
+        "[cwoffee] start_turn (desktop): session={:?} text={} attachments={}",
+        session,
         text.chars().count(),
         atts.len()
     );
     if text.trim().is_empty() && atts.is_empty() {
         return Err("empty message".into());
     }
-    state.host.send_with(text, atts);
+    state.host.send_turn_to(text, atts, session);
     Ok(())
 }
 
@@ -243,6 +248,25 @@ pub fn cancel_turn(state: tauri::State<'_, AppState>) {
             map.remove(id);
         }
         eprintln!("[cwoffee] cancelled with {} question(s) pending", queued.len());
+    }
+    // Same for approvals. The engine now also releases a parked approval when the
+    // cancel flag lands, so a front end that forgets this is not broken - but the
+    // sender in hand releases the tool immediately instead of on the next poll, and
+    // the count is worth logging: "I pressed stop and nothing happened" is the most
+    // annoying possible bug to report without a trace.
+    let parked: Vec<u64> = state
+        .pending_approvals
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    if !parked.is_empty() {
+        let mut map = state.pending_approvals.lock().unwrap();
+        for id in &parked {
+            map.remove(id);
+        }
+        eprintln!("[cwoffee] cancelled with {} approval(s) pending", parked.len());
     }
     state.host.cancel();
 }

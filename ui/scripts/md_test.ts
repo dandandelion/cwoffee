@@ -278,14 +278,16 @@ ok('partial table renders as table once delimiter lands', partial.includes('<tab
 
 // --- thinking duration label ----------------------------------------------
 import { fmtThink } from '../src/lib/think.ts'
-ok('sub-minute seconds', fmtThink(7_000) === 'thought for 7s', fmtThink(7_000))
-ok('zero', fmtThink(0) === 'thought for 0s', fmtThink(0))
-ok('sub-second rounds, never goes negative', fmtThink(400) === 'thought for 0s', fmtThink(400))
-ok('minutes are padded', fmtThink(154_000) === 'thought for 2m34s', fmtThink(154_000))
-ok('exactly one minute', fmtThink(60_000) === 'thought for 1m00s', fmtThink(60_000))
-ok('59s stays in seconds', fmtThink(59_400) === 'thought for 59s', fmtThink(59_400))
-ok('hours drop seconds', fmtThink(3_723_000) === 'thought for 1h02m', fmtThink(3_723_000))
-ok('negative input is clamped', fmtThink(-5_000) === 'thought for 0s', fmtThink(-5_000))
+// Sentence case, because the thinking header is a sentence now ("Thought for 12s")
+// and the CSS stopped shouting it in uppercase.
+ok('sub-minute seconds', fmtThink(7_000) === 'Thought for 7s', fmtThink(7_000))
+ok('zero', fmtThink(0) === 'Thought for 0s', fmtThink(0))
+ok('sub-second rounds, never goes negative', fmtThink(400) === 'Thought for 0s', fmtThink(400))
+ok('minutes are padded', fmtThink(154_000) === 'Thought for 2m34s', fmtThink(154_000))
+ok('exactly one minute', fmtThink(60_000) === 'Thought for 1m00s', fmtThink(60_000))
+ok('59s stays in seconds', fmtThink(59_400) === 'Thought for 59s', fmtThink(59_400))
+ok('hours drop seconds', fmtThink(3_723_000) === 'Thought for 1h02m', fmtThink(3_723_000))
+ok('negative input is clamped', fmtThink(-5_000) === 'Thought for 0s', fmtThink(-5_000))
 
 // ---- streaming reveal (.tin) -------------------------------------------
 // The reveal is the difference between text appearing and text arriving. The

@@ -141,12 +141,32 @@ press it. `prefers-reduced-motion` turns all of it off. The one looping animatio
 the app is the steam on the empty screen's cup.
 
 Streaming text **arrives** rather than appearing: each group of words that lands
-since the last repaint becomes its own node, blurs from 3px and fades from zero
+since the last repaint becomes its own node, blurs from 2.2px and fades from zero
 over 320ms, and is folded back into settled text only after it has finished. The
 cadence detail is the whole effect — the live block repaints every 120ms, so an
 effect wrapped in re-written text lives one paint and is invisible no matter what
 the computed styles say. Prose reveals; lists, code and tables paint whole,
 because a mis-parsed structure is worse than no animation.
+
+The effect is measured, not asserted. Filming the answer block through the gateway
+with a fixed clip while a turn streams gives chunk nodes sitting at opacity 0.2-0.94
+with `blur(1.76px)` mid-flight, and once the text stops arriving the filmstrip is
+inert: mean per-frame difference 0.00, maximum 0.12, with the only visible change
+coinciding with new characters. Settled prose is not re-parsed, re-rastered or
+re-animated by anything.
+
+Two details that paragraph depends on, both of which used to be bugs:
+
+- A chunk is an **inline span**. Built as a block element instead, every arrival
+  starts a new line: the block grows straight down the page, gets taller on each
+  paint, and the transcript — which pins to the tail — nudges the whole view with it.
+  That is a flicker report waiting to happen, and it is why thinking once looked like
+  it "grew vertically instead of filling the width".
+- The animation fills **backwards**, not `both`. With `both`, a finished chunk keeps
+  its last keyframe, `filter: blur(0)`, forever, and a filter claims its own raster
+  layer. The text then exists twice — the layer the animation holds, and the layer the
+  folded paragraph is drawn into — and swapping between them pops at the end of every
+  transition.
 
 ## Files, and asking instead of guessing
 
@@ -210,6 +230,14 @@ Approval prompts name the file rather than dumping the call: `edit in place:
 notes.md (find and replace inside the file)`. The raw argument blob is the one thing
 you cannot weigh a decision on.
 
+**Stop beats an unanswered prompt.** A prompt the model raised and nobody answers -
+a tab that went to sleep, a picker you never opened - would otherwise hold the turn
+open for the whole approval timeout, so the Stop button looks dead for five minutes.
+The engine lets a Stop press win over a pending approval, the tool gets a
+`tool_result` saying the turn was stopped, and the model is not given another turn
+after you pressed stop. A park is released rather than left to rot: that is also why
+unanswered approvals fail closed instead of hanging.
+
 ## Workspaces
 
 The sidebar groups sessions by the folder they live in, and the folder the tools
@@ -225,19 +253,86 @@ lives in `~/Projects` quietly writes into `~/cwoffee-workspace`.
   rather than by trusting the mode bits.
 - `+` on a workspace row opens a draft that already knows its folder. Nothing is
   written and no session row appears until you send the first message.
+- The `+` in the Workspaces header opens the native folder picker immediately. A panel
+  that makes you type a path before it will open the picker that picks it for you is a
+  step that should not exist. (In the browser there is no picker to open — the folder
+  is on the host, not on the phone — so a typed host path stays as the fallback there.)
+- **A session keeps the folder it started in.** Moving one mid-conversation makes the
+  grouping a lie: the sidebar row names the old folder while `write_file` lands in the
+  new one. The engine refuses it, and the composer's folder control is disabled with
+  the reason — a thing you cannot do should not invite a click. Working somewhere else
+  means a new session in that folder, which the sidebar `+` does in one click; a draft
+  that has not been sent yet can still choose its folder.
+- `/tmp` is not a folder you work in, it is where sessions live before anyone chooses
+  one. Sessions stored there group under **Default** instead of getting a `tmp` row
+  beside a `No workspace` row, and registering the temp root as a workspace is refused
+  and said out loud in a toast rather than only written to a log.
 - Renaming a group changes the label, never the path.
 
 Every file a turn produces appears once as an attachment however many times it was
 written, and file tools show the path they act on in the card header, so you can
 see what a call touched without expanding it.
 
-A file tool also reports the size of its own edit: `edit_file · notes.md  +1 -1` in
-the header, and expanding the card shows a real unified diff - hunk header, context
-lines, red removals, green additions. The counts come from the lines that actually
-changed rather than from the model's description of what it did, and they are stored
-with the message, so a session reopened next week still says what that edit cost.
-For an edit the diff replaces the raw argument blob: showing the same change twice,
-once as 400 characters of JSON, is noise.
+A file tool also reports the size of its own edit, in the header line, in English:
+`Edited a file · notes.md · +1 −1 · OK`. Expanding the card shows a real unified
+diff — hunk header, context lines, red removals, green additions. The counts come
+from the lines that actually changed rather than from the model's description of
+what it did, and they are stored with the message, so a session reopened next week
+still says what that edit cost. For an edit the diff replaces the raw argument blob:
+showing the same change twice, once as 400 characters of JSON, is noise.
+
+### What a finished turn looks like
+
+A collapsed transcript should read as a list of things that happened, not as a log of
+API calls. So:
+
+- Tool cards are headed in English, and tense carries state: `Running a command` while
+  it runs, `Ran a command · OK` when it ends, `Could not edit that file` when the
+  arguments never parsed. Raw ids (`write_file`, `exec`) appear nowhere in a transcript.
+- A finished tool card is its header line and nothing else — no clamped block of JSON
+  underneath it. Click for the arguments, the output and the diff. While a call is live
+  the body peeks, because a command with nothing under it looks stuck.
+- Thinking collapses the same way: while it runs you see three lines of it; once it
+  settles the block is `Thought for 12s ›` and nothing more.
+- Your own message is a right-aligned bubble, at most three quarters of the measure,
+  text left-aligned inside it. The `CWOFFEE` label hangs in the left gutter instead of
+  taking 74px off every block, so the answer, the thinking blocks and the tool cards
+  all start on one edge — the edge your bubble ends on.
+
+## Which conversation a turn belongs to
+
+One engine, several screens. A desktop window, a phone tab and the app's own test harness
+can be attached at once, so a turn carries the conversation it was written in: the composer
+sends the session id you are looking at, and the host refuses a turn whose id does not
+match what it has open - and says so out loud instead of going quiet. A turn addressed to
+`0`, meaning a draft, opens a new conversation rather than appending to someone else's.
+
+Switching sessions during a turn is allowed and instant: the view moves at once while the
+host finishes the turn it is inside. In the sidebar, a turning arc means that session is
+answering; a pulse means a turn finished there while you were looking elsewhere.
+
+## The empty screen
+
+The cup, the greeting, the tips and the composer are centred as one group - centring only
+the composer left the cup glued to the top of the pane. The steam is drawn: three curves
+whose feet sit on the coffee surface in the artwork's own coordinate space, each stroked
+twice (a wide blurred body and a brighter thread inside) with a puff travelling up the
+curve and a gradient that fades it out toward the top. Anchoring it to the artwork's
+space rather than to pixel offsets is what keeps it coming out of the cup at any size.
+
+At the top of the sidebar sits a Cowork / Chat tab. It is not wired to anything: Chat mode
+does not exist yet, and a control that pretends otherwise is worse than a missing one.
+`+ New session` survives as a small `+`, plus Ctrl+N and the `+` on each workspace row.
+
+
+## Icons
+
+Every icon is inline SVG at one stroke weight, coloured by `currentColor`: composer
+controls, sidebar, file chips, code-block actions. No emoji and no icon font. An emoji
+renders in full colour from a system font, so a two-tone app sprouts a blue picture frame
+and a yellow folder, and renders differently on every platform - which is exactly what the
+file chips were doing.
+
 
 ## Two things that are security, not polish
 
@@ -259,6 +354,14 @@ once as 400 characters of JSON, is noise.
 **Cwoffee** — *cowork* with the coffee in it. A co-work agent you drink with:
 it sits at your desk, it uses your model, and the palette is a flat white in
 light mode and an espresso in dark.
+
+The mark is drawn by hand and lives at `assets/brand/cwoffee-source.png`. Nothing
+else is hand-drawn: `scripts/make-icon.py` crops that one file to its own bounds and
+resamples it into everything the app ships — the window icon embedded in the binary,
+the hicolor set the dock looks up, the bundle icons for RPM/AppImage, `icon.ico`, the
+mark in the titlebar and on the empty screen, and the favicon a gateway tab uses. If
+an icon looks wrong, the fix is the source file or the crop rule in the script, never
+a redraw somewhere else.
 
 It used to be **Cowry** (a cowrie shell, one of the oldest currencies — value
 exchanged between people, and the *cow* of *cowork*). The rename is cosmetic in

@@ -133,7 +133,6 @@ body {
   place-items: center;
   border-radius: 7px;
   color: var(--color-ink-2);
-  cursor: default;
 }
 .wbtn:hover {
   background: color-mix(in srgb, var(--color-ink) 8%, transparent);
@@ -189,6 +188,17 @@ body {
   flex-direction: column;
   gap: 14px;
 }
+/* The label gutter. Making room for the label *outside* the content column is the
+   whole point: with a 74px first column every answer started 74px to the right of
+   nothing, the user's own message started somewhere else again, and the two never
+   lined up. Here the label hangs in the scroller's left padding and every block -
+   answer, thinking, tool card, your own message - shares one left edge. Written
+   after the Tailwind import on purpose: same specificity as `px-6`, later in the
+   file, so it wins without an `!important`. */
+.scroller {
+  padding-left: 80px;
+  padding-right: 28px;
+}
 .turn {
   display: flex;
   flex-direction: column;
@@ -204,14 +214,17 @@ body {
 }
 
 .blk {
-  display: grid;
-  /* The label column has to fit the longest label plus the live dot. "CWOFFEE"
-     is ~53px at this size and the dot adds 11px, so the old 62px column pushed
-     the dot onto its own line - the rename made the label one character longer
-     and the whole thing wrapped. */
-  grid-template-columns: 74px 1fr;
-  gap: 10px;
-  align-items: start;
+  /* One column. The label hangs in the gutter instead of eating 74px of measure
+     from every block, which is what made the assistant's text look indented and
+     stopped it aligning with the user's. */
+  position: relative;
+  display: block;
+}
+.blk > .blk-head {
+  position: absolute;
+  left: -66px;
+  top: 2px;
+  width: 58px;
 }
 .blk-head {
   font-size: 11px;
@@ -221,6 +234,20 @@ body {
   padding-top: 3px;
   text-align: right;
   white-space: nowrap;
+}
+/* Narrow windows have no gutter to protrude into; there the label goes back above
+   its block rather than being clipped by the scroll container. */
+@media (max-width: 860px) {
+  .scroller {
+    padding-left: 24px;
+    padding-right: 16px;
+  }
+  .blk > .blk-head {
+    position: static;
+    width: auto;
+    display: block;
+    margin-bottom: 2px;
+  }
 }
 /* The block that is currently producing output carries a live marker in its
    label column: one pulsing dot, on one block, removed at turn end. A spinner
@@ -234,11 +261,14 @@ body {
   border-radius: 50%;
   background: var(--color-shell-deep);
   vertical-align: middle;
-  animation: cwoffee-live 1.15s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  animation: cwoffee-live 1.9s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
+/* Deliberately shallow and slow. This is a "still working" tell sitting next to a
+   paragraph of moving text; a 1.15s pulse swinging from 0.3 to 1.0 opacity in the
+   same visual field reads as a flicker, which is exactly what it was reported as. */
 @keyframes cwoffee-live {
-  0%, 100% { transform: scale(0.55); opacity: 0.3; }
-  50%      { transform: scale(1);    opacity: 1;   }
+  0%, 100% { transform: scale(0.82); opacity: 0.4; }
+  50%      { transform: scale(1);    opacity: 0.9; }
 }
 /* Reasoning sits outside the label grid, so its marker leads the line. */
 .blk-reasoning.live .blk-head::before { margin-right: 6px; }
@@ -268,16 +298,29 @@ body {
   white-space: normal;
 }
 
-/* A user turn has to survive a glance. Same ink and same size as the answer
-   above it, with only a small grey label to separate them, and consecutive
-   turns blur together. A tinted card with an accent edge makes the boundary
-   unmistakable without adding a bubble shape that fights the layout. */
+/* Your own turn goes where every other chat puts it: on the right, as a bubble,
+   no wider than the reading measure. Text inside stays left-aligned - a
+   right-aligned paragraph is unreadable - and the bubble's right edge lands on the
+   same column edge as everything else. */
 .blk-user {
-  background: var(--color-tint);
-  border-radius: 10px;
-  padding: 9px 12px 9px 0;
   margin: 16px 0 12px;
-  box-shadow: inset 2px 0 0 var(--color-shell);
+}
+.blk-user > .blk-body {
+  margin-left: auto;
+  max-width: min(74%, 620px);
+  background: var(--color-tint);
+  border-radius: 12px;
+  padding: 9px 13px;
+  box-shadow: inset 0 0 0 1px var(--color-hairline-2);
+}
+.blk-user > .blk-head {
+  /* The bubble is right-aligned; a label parked in the *left* gutter is anchored
+     to nothing. Put it above the bubble, sharing its right edge. */
+  position: static;
+  width: auto;
+  display: block;
+  text-align: right;
+  margin: 0 2px 4px 0;
 }
 .blk-user .blk-who { color: var(--color-shell-deep); font-weight: 600; }
 .blk-user .blk-body { color: var(--color-ink); font-weight: 450; }
@@ -287,8 +330,21 @@ body {
   font-style: italic;
   font-size: 13px;
   line-height: 1.55;
-  border-left: 2px solid var(--color-hairline-2);
-  padding-left: 10px;
+  /* No border-left/padding-left: that indented thinking 12px away from the answer
+     text and the tool line above it. The rule still marks the block, it just
+     hangs in the gutter where it costs the text nothing. */
+  position: relative;
+  padding-left: 0;
+}
+.blk-reasoning .blk-body::before {
+  content: '';
+  position: absolute;
+  left: -12px;
+  top: 1px;
+  bottom: 1px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--color-hairline-2);
 }
 
 /* Thinking is clamped to three lines by default. A mask fade, not a scrollbar:
@@ -296,7 +352,15 @@ body {
    transcript. While the model is thinking the box is pinned to its tail (the
    newest line is the interesting one); once the turn settles it returns to the
    start, which is where a reader scanning a finished block expects to begin. */
-.blk-reasoning .blk-body.clamp:not(.expanded) {
+.blk-reasoning .blk-body.settled:not(.expanded) {
+  /* Settled thinking is a header line and nothing else: "Thought for 12s ›", with
+     the body one click away. The old 3-line sneak peek made every finished turn
+     look half-folded. */
+  display: none;
+}
+/* While it is still thinking the peek stays: a block that says "thinking" with
+   nothing under it looks stuck, and watching a model work is the point. */
+.blk-reasoning .blk-body:not(.settled):not(.expanded) {
   max-height: 4.65em; /* 3 * 1.55 */
   overflow: hidden;
   -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
@@ -313,17 +377,21 @@ body {
 .blk-reasoning .blk-body, .blk-tool .tool-detail {
   transition: max-height var(--d3) var(--ease);
 }
-/* Reasoning keeps its own layout rather than the shared 62px label column.
-   That column fits "THINKING" but not "THOUGHT FOR 2M34S", and the chevron was
-   wrapping onto a second line. Here the head is a full-width line above the
-   body, so the label can be any length and the arrow stays inline. */
+/* Reasoning keeps its own layout rather than the shared label gutter: the head is a
+   full-width line above the body, so the label can be any length and the arrow
+   stays inline. Sentence case, because it is a sentence and not a tag. */
 .blk-reasoning {
   display: block;
   cursor: pointer;
 }
 .blk-reasoning.is-open { cursor: default; }
 .blk-reasoning .blk-head {
+  position: static;
+  width: auto;
   text-align: left;
+  text-transform: none;
+  font-size: 12px;
+  letter-spacing: 0;
   white-space: nowrap;
   padding-top: 0;
   margin-bottom: 4px;
@@ -345,18 +413,32 @@ body {
    that silently shifted .tool-args into the 62px column - arguments wrapped at
    about eight monospace characters. One column keeps args and output full width. */
 .blk-tool {
+  /* Same shape as a thinking block: one line of English, an arrow, and the body
+     only when you ask. The old always-on card put a border and padding around a
+     collapsed header, so a turn with six calls read as six boxes rather than six
+     sentences. */
   display: block;
+  /* Inset shadow, not a border: a 1px border on every card moved each header line
+     1px right of the answer text above it. Six sentences, six slightly-off
+     sentences - the kind of misalignment you feel before you can name it. */
+  box-shadow: inset 0 0 0 1px transparent;
+  border-radius: var(--radius-card);
+  padding: 0;
+  background: transparent;
+}
+.blk-tool.is-open {
+  box-shadow: inset 0 0 0 1px var(--color-hairline);
+  background: var(--color-paper-2);
+  /* The panel opens *outward*: padding on the card would slide the header line
+     12px to the right the moment you click it, so the card keeps its text flush
+     and buys the padding from the gutters instead. */
+  padding: 10px 12px;
+  margin-left: -12px;
+  margin-right: -12px;
 }
 .blk-tool .blk-head { display: flex; align-items: baseline; }
 .blk-tool > .tool-name,
 .blk-tool > .tool-status { display: inline; }
-
-.blk-tool {
-  border: 1px solid var(--color-hairline);
-  border-radius: var(--radius-card);
-  padding: 10px 12px;
-  background: var(--color-paper-2);
-}
 .tool-subject {
   /* Hidden until there is something to say, so tools with no single subject
      keep the layout they had. */
@@ -454,8 +536,16 @@ body {
 .tool-detail {
   overflow: hidden;
 }
-.blk-tool:not(.is-open) .tool-detail.clamp:not(.expanded) {
-  max-height: 5.4em;
+.blk-tool:not(.is-open) .tool-detail {
+  /* A finished call is its header line. Nothing else - the arguments, the output
+     and the diff are one click away, not three clamped lines of JSON sitting in
+     the middle of the transcript. */
+  display: none;
+}
+/* While it runs the peek comes back: an open command with no body looks stuck. */
+.blk-tool.live:not(.is-open) .tool-detail {
+  display: block;
+  max-height: 4.65em;
   -webkit-mask-image: linear-gradient(to bottom, #000 62%, transparent 100%);
   mask-image: linear-gradient(to bottom, #000 62%, transparent 100%);
 }
@@ -467,8 +557,25 @@ body {
 .blk-tool.has-diff .tool-args {
   display: none;
 }
-.blk-tool { cursor: pointer; }
+.blk-tool {
+  cursor: pointer;
+}
 .blk-tool.is-open { cursor: default; }
+.blk-tool .blk-head {
+  /* Full-width line above the body, sentence case: the header is prose now
+     ("Edited a file · notes.md · +1 −1 · OK"), not a tag, and it will not fit a
+     58px gutter. */
+  position: static;
+  width: auto;
+  text-align: left;
+  text-transform: none;
+  font-size: 12.5px;
+  letter-spacing: 0;
+  white-space: normal;
+  padding-top: 0;
+  cursor: pointer;
+  user-select: none;
+}
 
 /* Transport failure, stated where it will be seen. Kept warm rather than red: it
    is usually "you did not pass a token", not a catastrophe. */
@@ -560,13 +667,27 @@ body {
   background: var(--color-ink);
   color: var(--color-paper);
 }
-/* Hover must add presence, not remove it. This used to be `opacity: 0.85` on an
-   ink-filled button with a paper-coloured glyph: the whole control faded toward
-   the page colour, and the icon looked like it had been erased on hover. */
-.cbtn.go:hover:not(:disabled) { background: var(--color-ink-2); box-shadow: 0 0 0 3px var(--color-tint); }
+/* Hover must add presence, not remove it. Two bugs lived here: `opacity: 0.85`
+   on an ink-filled button with a paper glyph, which faded the whole control
+   toward the page colour, and then a hover that filled the button with
+   --color-ink-2 while the generic `.cbtn:hover` repainted the glyph dark - a
+   mid-grey square with a dark arrow, 2.6:1 contrast. Both read as "the icon got
+   erased". Hover now keeps the fill solid and only warms it, and it restates the
+   glyph colour so the generic rule cannot win. */
+.cbtn.go:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-ink) 82%, var(--color-shell));
+  color: var(--color-paper);
+  box-shadow: 0 0 0 3px var(--color-tint);
+}
 .cbtn.go:active:not(:disabled) { transform: translateY(1px); }
-.cbtn.go:disabled { opacity: 0.3; }
+.cbtn.go:disabled { opacity: 0.3; cursor: not-allowed; }
 .cbtn.go.warn { background: var(--color-warn); }
+/* A button waiting on an approval must still look like it is waiting when the
+   mouse is over it - the generic hover mix would repaint it in ink. */
+.cbtn.go.warn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-warn) 82%, var(--color-ink));
+  color: var(--color-paper);
+}
 
 /* popover */
 .pop {
@@ -678,7 +799,10 @@ body {
   font-size: 12.5px;
   color: var(--color-ink-3);
 }
-.wsrow:disabled { cursor: default; }
+/* A locked row is not inert chrome, it is a control that currently refuses: the
+   arrow with a bar says "you cannot do this here", where the plain arrow said
+   "this is not a control at all". */
+.wsrow:disabled { cursor: not-allowed; }
 .wsrow:hover:not(:disabled) { color: var(--color-ink); }
 
 /* Path entry for the gateway: a phone has no folder picker for the host's
@@ -879,6 +1003,22 @@ body {
 .sessrow.unread .sess-dot {
   background: var(--color-shell-deep);
   animation: cwoffee-pulse 1.7s ease-in-out infinite;
+}
+/* A turn in flight is not "unread": nothing has finished. The row says *working*
+   with an arc that turns, and the unread pulse is reserved for a turn that ended
+   while you were somewhere else - two different questions the old dot conflated. */
+.sessrow .sess-dot.busy {
+  background: transparent;
+  border: 1.4px solid color-mix(in srgb, var(--color-shell) 40%, transparent);
+  border-top-color: var(--color-shell-deep);
+  border-radius: 50%;
+  width: 8px;
+  height: 8px;
+  margin-left: -1px;
+  animation: cwoffee-spin 0.85s linear infinite;
+}
+@keyframes cwoffee-spin {
+  to { transform: rotate(360deg); }
 }
 @keyframes cwoffee-pulse {
   0%, 100% { opacity: 0.25; transform: scale(0.75); }
@@ -1267,6 +1407,57 @@ body {
   font-size: 11px;
 }
 
+/* Mode tabs. Deliberately not wired to anything yet - it states where the app is
+   going (a coworking surface vs a plain chat) without pretending the second one
+   exists. The thumb is one element that slides, not two buttons that swap
+   backgrounds, because a control that slides reads as a choice between two places
+   rather than a toggle that flashes. */
+.modegrid {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--color-paper-2);
+  box-shadow: inset 0 0 0 1px var(--color-hairline);
+}
+.modegrid::before {
+  content: '';
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc(50% - 3px);
+  border-radius: 999px;
+  background: var(--color-shell-deep);
+  transition: transform var(--d2) var(--ease-out);
+}
+.modegrid.chat::before { transform: translateX(100%); }
+.modesel {
+  position: relative;
+  z-index: 1;
+  border: 0;
+  background: transparent;
+  padding: 5px 6px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--color-ink-2);
+  transition: color var(--d1) var(--ease-out);
+}
+.modesel[aria-selected='true'] { color: var(--color-paper); }
+.newbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 9px;
+  color: var(--color-ink-2);
+}
+.newbtn:hover { background: var(--color-paper-2); color: var(--color-ink); }
+
 .sesshead-toggle {
   font-size: 11px;
   text-transform: none;
@@ -1315,13 +1506,17 @@ body {
    still in the tree, just not laid out. */
 .empty-mode {
   justify-content: center;
-  /* The workspace row sits under the composer, so centring the group leaves the
-     composer itself ~58px low. This padding compensates for that fixed height;
-     measured to put the composer's own centre on the viewport's (offset 0 in a
-     948px viewport). */
-  padding-bottom: 116px;
+  /* This used to pad the bottom by 116px, which was the right compensation when
+     the centred group was *only the composer*. The group is the cup, the greeting
+     and the tips now too, so that padding shoved the whole thing up and left the
+     composer sitting in the middle of the screen. A small optical lift instead:
+     dead-centre reads as low. */
+  /* No compensation padding. The stack that gets centred is the cup, the greeting,
+     the tips, the composer and the folder row under it: padding measured against the
+     composer alone left the whole thing ~70px above the middle of the pane. */
+  padding-bottom: 0;
 }
-.empty { margin-bottom: 30px; }
+.empty { margin-bottom: 26px; }
 
 /* Markdown tables. The model emits them for anything tabular; before this they
    rendered as one long paragraph of pipes. */
@@ -1423,9 +1618,20 @@ body {
   background: var(--color-tint);
 }
 .file-ico {
-  font-size: 17px;
-  line-height: 1;
+  display: flex;
   flex: none;
+  color: var(--color-ink-2);
+}
+/* Same 16px box, stroke weight and round joins as the composer's icons, so a file
+   chip and a composer button look like they came from one set. Colour comes from
+   currentColor: a emoji glyph in an otherwise monochrome app is a sticker on a
+   business card. */
+.file-glyph {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .file-meta { display: flex; flex-direction: column; min-width: 0; }
 .file-name {
@@ -1577,7 +1783,7 @@ body {
    to non-replaced inline boxes. blur+opacity is also the part that reads as
    "arriving" rather than "moving". */
 @keyframes cwoffee-tin {
-  from { opacity: 0; filter: blur(3px); }
+  from { opacity: 0; filter: blur(2.2px); }
   to   { opacity: 1; filter: blur(0); }
 }
 
@@ -1595,7 +1801,14 @@ body {
  * opacity by 33ms, so the visible part was three frames and the rest was the
  * text sitting there finished. This one spends its change across the window.
  */
-.tin { animation: cwoffee-tin 320ms cubic-bezier(0.32, 0.02, 0.28, 1) both; }
+/* `backwards`, not `both`. With `both`, a finished chunk keeps the last keyframe -
+   `filter: blur(0)` - forever, and a filter forces its own raster layer. Text then
+   exists twice: the layer the animation holds and the layer the folded, static
+   paragraph is drawn into, and the swap between them is the flash reported at the
+   end of each transition. With `backwards` the animation only ever owns the
+   pre-animation state: at the end the span is ordinary text again, and folding it
+   moves glyphs that are already rasterised. */
+.tin { animation: cwoffee-tin 320ms cubic-bezier(0.32, 0.02, 0.28, 1) backwards; }
 /* The streaming paragraph is assembled from a static head plus chunk spans, so
    it has to sit exactly where a markdown paragraph would sit. */
 /* ---- the model asking the user ----------------------------------------
@@ -1830,8 +2043,14 @@ body {
    markdown reveal path - so reasoning snapped in fully formed while the answer
    below it faded in. */
 .think-run {
-  /* One compositing layer for the whole block, so folded text does not change
-     rasterisation mode when it leaves an animated span. */
+  white-space: pre-wrap;
+}
+/* The layer hint goes on the block, not the inline run: transforms do not apply to
+   a non-replaced inline box, so putting it on .think-run did nothing, and folded
+   text changed rasterisation mode as it left an animated span. The peek rules below
+   also need it: `display: none` on a settled body is a layout change, not a max-height
+   animation, and without a layer the re-raster of the header line reads as a blink. */
+.blk-reasoning .blk-body {
   transform: translateZ(0);
 }
 .think-tin {
@@ -2041,26 +2260,71 @@ body {
   image-rendering: auto;
   filter: drop-shadow(0 6px 14px rgb(120 90 40 / 14%));
 }
-.steam {
+/* Steam, drawn rather than stacked. The old version was three capsules placed
+   above the *box* - measured, their bottoms landed ~30px clear of the rim, so
+   they read as stray dashes rather than something leaving the coffee. These are
+   three S-curves whose feet are on the coffee surface itself: the artwork's mouth
+   spans y=48..78 of a 256-unit box and the liquid x=62..178, so the paths start
+   at y=58 and x=90/124/156 in that same space, and `viewBox` keeps them anchored
+   no matter what size the cup is rendered at. A short dash then travels up each
+   curve, which is what makes it read as rising rather than blinking. */
+.steamart {
   position: absolute;
-  /* Sitting just above the rim, not floating: measured, at top:-14px the wisp
-     bottoms ended ~30px clear of the cup and read as three stray dashes. */
-  top: -2px;
-  width: 5px;
-  height: 22px;
-  border-radius: 999px;
-  background: linear-gradient(to top, transparent, var(--color-shell-deep));
-  opacity: 0;
-  animation: cwoffee-steam 3.4s var(--ease) infinite;
+  inset: 0;
+  width: 108px;
+  height: 108px;
+  /* The wisps are allowed to leave the artwork box - steam does. */
+  overflow: visible;
+  pointer-events: none;
+  /* Mid-grey, not the lightest ink: a wisp at 30% of near-white on cream paper is
+     invisible, which is the difference between "steam" and "nothing there". */
+  color: var(--color-ink-2);
 }
-.steam.s1 { left: 34px; animation-delay: 0s; }
-.steam.s2 { left: 52px; height: 27px; animation-delay: 0.9s; }
-.steam.s3 { left: 70px; animation-delay: 1.8s; }
-@keyframes cwoffee-steam {
-  0%   { opacity: 0; transform: translateY(9px) scaleY(0.55); }
-  22%  { opacity: 0.9; }
-  70%  { opacity: 0.45; transform: translateY(-10px) scaleY(1.05) translateX(2px); }
-  100% { opacity: 0; transform: translateY(-17px) scaleY(1.1) translateX(3px); }
+/* Soft, static blur on the group: one raster, not an animated filter, and it is
+   what stops three stroked curves from reading as three solid wires. */
+/* Two passes over the same three curves: a wide blurred body and a narrow, barely
+   blurred thread inside it. A single stroked curve reads as a wire no matter how it
+   is animated; a soft wide shape with a brighter centre reads as smoke. */
+.wisps {
+  filter: blur(2.2px);
+  animation: cwoffee-sway 5.6s ease-in-out infinite alternate;
+}
+.cores {
+  filter: blur(0.6px);
+  animation: cwoffee-sway 5.6s ease-in-out infinite alternate;
+}
+@keyframes cwoffee-sway {
+  from { transform: translateX(-2px); }
+  to { transform: translateX(3px); }
+}
+.wisp {
+  fill: none;
+  stroke: url(#cwoffee-steam-fade);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0;
+  /* pathLength is normalised to 100 on each path, so one set of dash maths drives
+     three curves of different lengths. 34 units of ink on a 100-unit path is a
+     puff, not a dash. */
+  stroke-dasharray: 34 100;
+  animation: cwoffee-wisp 4.2s var(--ease) infinite;
+}
+.w1, .c1 { animation-delay: 0s; }
+.w2, .c2 { animation-delay: 1.4s; }
+.w3, .c3 { animation-delay: 2.8s; }
+.w1 { stroke-width: 15; }
+.w2 { stroke-width: 19; }
+.w3 { stroke-width: 14; }
+.c1 { stroke-width: 6; }
+.c2 { stroke-width: 7.5; }
+.c3 { stroke-width: 5.5; }
+@keyframes cwoffee-wisp {
+  /* Falling offsets move the puff up the path, rim to air. The gradient already
+     fades it out toward the head, so the opacity curve only has to bring it in. */
+  0%   { stroke-dashoffset: 34;  opacity: 0; }
+  12%  { opacity: 1; }
+  55%  { opacity: 0.72; }
+  100% { stroke-dashoffset: -66; opacity: 0; }
 }
 @keyframes cwoffee-bob {
   0%, 100% { transform: translateY(0) rotate(0deg); }
@@ -2122,7 +2386,93 @@ body {
   .blk-reasoning .blk-body, .blk-tool .tool-detail { transition: none; }
   .pop-item, .btn-go, .btn-ghost, .btn-bad, .keyhelp, .fbtn, .tip, .filechip,
   .sessrow, .wsrow, .cbtn, .att-x, .switch i, .mbar i { transition: none; }
-  .cupwrap, .steam { animation: none; }
-  .steam { opacity: 0.35; }
+  .cupwrap, .wisp, .wisps, .cores { animation: none; }
+  /* Frozen mid-rise rather than switched off: the cup still reads as hot. */
+  .wisp { opacity: 0.45; stroke-dashoffset: -24; }
   .switch i, .mbar i { transition: none; }
+}
+
+/* Every clickable thing says so. A browser does this for <a> only; this app is
+   almost entirely buttons, so the arrow cursor over a session row, a workspace
+   header, a file chip or a code-block action reads as "nothing happens here" when
+   something does. Written last on purpose: equal specificity to the utility classes
+   but later in the cascade, so it wins without `!important`. Text targets keep the
+   I-beam, because "you can type here" should still look different from "this opens
+   something". */
+button, a, summary, label[for], [role='button'], [role='menuitem'],
+[role='menuitemradio'], [role='tab'],
+.sessrow, .wsrow, .ws-plus, .wsbtn, .filechip, .code-act, .cbtn, .fbtn, .tip,
+.att, .att-x, .keyhelp, .pop-item, .sidemenu, .swatch, .ask-opt,
+.ask-submit, .ask-decline, .ws-act, .msg-act {
+  cursor: pointer;
+}
+textarea, input, .blk-body, .tool-out, .tool-diff, .tool-args, .ask-input {
+  cursor: text;
+}
+button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
+.ask-submit:disabled, .ask-decline:disabled, [aria-disabled='true'] {
+  cursor: not-allowed;
+}
+
+/* The footer shows numbers that change several times a second. Proportional figures
+   make every update nudge its neighbours, which registers as a flicker in the corner
+   of the eye - and it is the one thing on screen moving for a reason other than text. */
+.telem, .telem b, .pop-metrics, .fsum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A refusal the user can see. It sits above the footer rather than in the panel
+   that raised it, because the panel is often closed by the time the answer comes
+   back from the engine. */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 46px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100vw - 48px));
+  padding: 9px 10px 9px 14px;
+  border: 1px solid var(--color-hairline);
+  border-left: 3px solid var(--color-shell);
+  border-radius: 10px;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-size: 12.5px;
+  line-height: 1.45;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.14);
+  z-index: 60;
+  animation: cwoffee-rise var(--d3) var(--ease-out) both;
+}
+.toast.bad { border-left-color: var(--color-warn); }
+.toast-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-ink-3);
+}
+.toast-x:hover { background: var(--color-tint); color: var(--color-ink); }
+@media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+
+/* A session that already has a folder cannot change it. The row stays legible -
+   it is information about where the work goes - but it stops looking like a
+   control, and the reason is in the title and the note. */
+.wsrow.ws-locked {
+  color: var(--color-ink-2);
+  /* Not the plain arrow: the row is a control that refuses, and the arrow with a
+     bar is the difference between "locked" and "not a button". */
+  cursor: not-allowed;
+}
+.wsrow.ws-locked:hover { background: transparent; }
+.ws-note {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--color-ink-3);
 }

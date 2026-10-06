@@ -507,7 +507,27 @@ impl Agent {
         });
 
         let risk = tool.risk_for(&args, &self.ctx);
-        match self.gate.check(&call.name, &risk, &args).await {
+        // A Stop press has to release a parked approval. The front ends drop their
+        // senders when they remember to, but the engine cannot depend on that: a phone
+        // tab that went to sleep answers nothing and drops nothing, and the turn then
+        // sits "stopping" for the whole approval timeout - five minutes of a Stop
+        // button that does nothing. Polling the flag here costs one load.
+        let already_stopped = self.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        let cancel_wait = Arc::clone(&self.cancel);
+        let gate = if already_stopped {
+            // Asking now would put a card on screen that the user has already said
+            // they do not want, and it would be answered by nobody.
+            GateOutcome::Deny { reason: "the turn was stopped before the approval was asked".into() }
+        } else {
+            tokio::select! {
+                biased;
+                _ = Self::wait_cancel(cancel_wait) => GateOutcome::Deny {
+                    reason: "the turn was stopped while the approval was pending".into(),
+                },
+                o = self.gate.check(&call.name, &risk, &args) => o,
+            }
+        };
+        match gate {
             GateOutcome::Deny { reason } => {
                 let _ = out.send(EngineEvent::ToolExecEnd {
                     id: call.id.clone(),
@@ -1253,6 +1273,77 @@ mod tests {
             "cancel did not interrupt the stream: took {dt:?}"
         );
         assert!(got < 1000, "provider ran to completion despite cancel");
+    }
+
+    /// Stop has to end a turn that is waiting on an approval, not just mark it.
+    ///
+    /// The prompt here is taken and the reply channel *held*. That is the case the
+    /// engine cannot delegate: a front end alive enough to show a card and asleep
+    /// enough never to answer it - a phone tab that went to sleep - answers nothing
+    /// and drops nothing. If the test dropped the sender instead, the "approval UI
+    /// disconnected" path would release the park and the test would pass without
+    /// cancel doing anything.
+    #[tokio::test]
+    async fn a_stop_press_releases_a_parked_approval() {
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, mut arx) = mpsc::unbounded_channel::<(
+            crate::approval::ApprovalRequest,
+            tokio::sync::oneshot::Sender<crate::approval::ApprovalAnswer>,
+        )>();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Escaper));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "e1".into(),
+                            name: "escaper".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("the model got another turn".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            // Longer than the assertion window, so a release inside 500ms can only come
+            // from the cancel; short enough that a missing release reports instead of
+            // stalling the suite.
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx)
+                .with_timeout(std::time::Duration::from_secs(3)),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        let cancel = agent.cancel_handle();
+        let run = tokio::spawn(async move { agent.run_turn("go", vec![], &etx).await });
+
+        let (req, reply) = arx.recv().await.expect("an approval prompt");
+        assert_eq!(req.tool, "escaper");
+        let t0 = std::time::Instant::now();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _tel = run.await.unwrap();
+        let dt = t0.elapsed();
+        drop(reply); // held the whole time: nothing but cancel could have woken it
+
+        assert!(
+            dt < std::time::Duration::from_millis(500),
+            "cancel did not release the parked approval: took {dt:?}"
+        );
+
+        let mut card_closed = false;
+        let mut chatter = false;
+        while let Ok(e) = erx.try_recv() {
+            if matches!(e, EngineEvent::ToolExecEnd { ok: false, .. }) {
+                card_closed = true;
+            }
+            if matches!(&e, EngineEvent::Text(t) if t.contains("another turn")) {
+                chatter = true;
+            }
+        }
+        assert!(card_closed, "the tool card was never closed after the cancel");
+        assert!(!chatter, "the model was given another turn after the user pressed stop");
     }
 
     /// The invariant that keeps providers from 400ing: every call gets a result.
