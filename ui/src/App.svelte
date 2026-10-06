@@ -3445,15 +3445,46 @@
         // text again, these references stop being connected and this fails.
         const seen: HTMLElement[] = []
         const seenText: string[] = []
+        // The host element must not be restyled paint by paint. Writing the reveal
+        // duration as a custom property on the paragraph used to re-resolve the
+        // style of every settled word inside it, every frame.
+        let restyled = 0
+        const styleHits: string[] = []
+        const bornAt = new Map<HTMLElement, number>()
+        const nowMs = () => performance.now()
+        const moRef: { o: MutationObserver | null } = { o: null }
+        let watched: Element | null = null
+        const watchHost = () => {
+          // The body element only exists once the block has been created, and it
+          // must be the same element for the whole check: attaching per paint
+          // would miss the writes it is supposed to catch.
+          const h = document.querySelector('.blk-reasoning .blk-body')
+          if (!h || h === watched) return
+          watched = h
+          const mo = new MutationObserver((recs) => {
+            // WebKitGTK delivers class records even with attributeFilter: ['style'],
+            // so the filter is applied here as well.
+            for (const r of recs)
+              if (r.attributeName === 'style')
+                styleHits.push(`${r.attributeName}: ${String(r.oldValue).slice(0, 40)}`)
+            restyled = styleHits.length
+          })
+          mo.observe(h, { attributes: true, attributeFilter: ['style', 'class'] })
+          moRef.o = mo
+        }
         for (const d of deltas) {
           transcript?.apply({ kind: 'reasoning', d })
           // One paint per delta: the reveal unit is whatever landed since the last
           // paint, and a check that applies them in one microtask tests one chunk.
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          // Spaced out so a later paint has words from an earlier one that have
+          // finished: that is exactly the population the at-rest checks need.
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 150)))
           transcript?.flushNow()
           const body = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
           const tins = [...(body?.querySelectorAll('.tin') ?? [])] as HTMLElement[]
           if (!tins.length) fail('a reasoning delta produced no reveal spans')
+          const wordsThisPaint = tins.length - seen.length
+          watchHost()
           for (const t of seen) {
             if (!t.isConnected) fail('a revealed word was removed from the DOM after arriving')
           }
@@ -3461,10 +3492,25 @@
             if (!seen.includes(t)) {
               seen.push(t)
               seenText.push(t.textContent ?? '')
+              bornAt.set(t, nowMs())
             }
           }
           const disp = new Set(tins.map((t) => getComputedStyle(t).display))
           if (disp.has('block')) fail(`reveal spans are block-level: ${[...disp].join(',')}`)
+          // Words from an earlier arrival are at rest: full opacity, and no
+          // filter, because a filter takes a word out of the text layer and puts
+          // it back when the animation ends - a pop per word, which at 40 words
+          // a second is the blink that got the blur blamed.
+          // Words that landed at least one full animation window ago. New spans
+          // are appended at the end, so "at rest" is a question about age, not
+          // about position in the list.
+          const atRest = seen.filter((t) => (bornAt.get(t) ?? nowMs()) + 300 < nowMs())
+          for (const t of atRest.slice(-8)) {
+            const cs = getComputedStyle(t)
+            if (cs.filter !== 'none') fail(`a settled word is still under a filter: ${cs.filter}`)
+            if (Number(cs.opacity) < 0.98)
+              fail(`a word from an earlier arrival sits at opacity ${cs.opacity} while new words land`)
+          }
         }
         const body = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
         const br = body.getBoundingClientRect()
@@ -3480,6 +3526,10 @@
           fail('the thinking block is one line wide, not filling the column')
         if (seen.length < deltas.length)
           fail(`${seen.length} spans for ${deltas.length} arrivals: words are being merged or dropped`)
+        moRef.o?.disconnect()
+        if (!watched) fail('no streaming paragraph to watch for style churn')
+        if (restyled)
+          fail(`${restyled} style writes on the streaming paragraph: ${styleHits.join(' | ')}`)
         // Newlines are kept in the part of the answer that is still raw text, or
         // an answer arrives as one grey wall until the block break appears. The
         // body itself must not keep pre-wrap: it holds real markdown elements
@@ -3488,9 +3538,8 @@
         await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
         transcript?.flushNow()
         const ans = document.querySelector('.blk-answer .blk-body') as HTMLElement
-        const ansTail = ans.querySelector('.live-tail') as HTMLElement | null
-        if (!ansTail || getComputedStyle(ansTail).whiteSpace !== 'pre-wrap')
-          fail('a streaming answer collapses newlines in its unfinished block')
+        const ansTail = ans.querySelector('.live-para') as HTMLElement | null
+        if (!ansTail) fail('a streamed answer block is not its own paragraph element')
         transcript?.clear()
         pageLog(`append-only reveal ok (${seen.length} word spans, none rewritten)`)
 
@@ -3529,29 +3578,141 @@
           .join(' ')
         if (/\*\*|(^|\s)#\s/.test(committed))
           fail(`committed markdown still shows its source: ${committed.slice(0, 60)}`)
+        // A committed *plain* paragraph keeps its nodes and its box. It needs no
+        // parser - the spans already sit in a `<p>` with the parser's own margins
+        // - so the commit must not replace one element or move one pixel. Both are
+        // measured here, because a commit that rewrites settled text is the
+        // flicker this design exists to avoid, and it is invisible in a screenshot.
+        {
+          transcript?.apply({
+            kind: 'text',
+            // Its own block: the text before it had not ended, and a block that
+            // contains `*` anywhere has to go through the parser.
+            d: '\n\nPlain sentences with no markup whatsoever keep their spans and their box across a commit.\n\n',
+          })
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          transcript?.flushNow()
+          const body2 = document.querySelector('.blk-answer .blk-body') as HTMLElement
+          const para = [...body2.querySelectorAll('p')].find((n) =>
+            /no markup whatsoever/.test(n.textContent ?? ''),
+          )
+          if (!para) {
+            fail('a plain committed paragraph is not a <p>')
+          } else {
+            const spans = [...para.querySelectorAll('.tin')]
+            if (!spans.length)
+              fail(
+                `a committed plain paragraph lost its word spans :: cls='${para.className}' :: ` +
+                  `bodyTins=${body2.querySelectorAll('.tin').length} :: reducedMotion=${matchMedia('(prefers-reduced-motion: reduce)').matches} :: ` +
+                  `liveParas=${body2.querySelectorAll('.live-para').length} :: ${para.innerHTML.slice(0, 120)}`,
+              )
+            const own = para.getBoundingClientRect().top - body2.getBoundingClientRect().top
+            transcript?.apply({
+              kind: 'text',
+              d: 'The next paragraph lands underneath and pushes nothing around.\n\n',
+            })
+            await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+            transcript?.flushNow()
+            const body3 = document.querySelector('.blk-answer .blk-body') as HTMLElement
+            const gone = spans.filter((n) => !n.isConnected)
+            if (gone.length)
+              fail(`${gone.length} word spans were thrown away when a paragraph committed - the commit re-rasters settled text`)
+            const para3 = [...body3.querySelectorAll('p')].find((n) =>
+              /no markup whatsoever/.test(n.textContent ?? ''),
+            )
+            if (!para3) {
+              fail('the committed paragraph disappeared')
+            } else {
+              const after = para3.getBoundingClientRect().top - body3.getBoundingClientRect().top
+              if (Math.abs(after - own) > 0.6)
+                fail(`committing a paragraph moved the one above it by ${(after - own).toFixed(1)}px`)
+              pageLog(`commit is layout-neutral ok (${spans.length} spans kept, drift ${(after - own).toFixed(1)}px)`)
+            }
+          }
+        }
         // The unfinished block is still raw, still revealing, and still one run.
-        const tail = body.querySelector('.live-tail') as HTMLElement | null
+        transcript?.apply({ kind: 'text', d: 'Dark roasts are still arriving and *not* committed yet' })
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        transcript?.flushNow()
+        const live = document.querySelector('.blk-answer .blk-body') as HTMLElement
+        const tail = live.querySelector('.live-para') as HTMLElement | null
         if (tail) {
           if (!/still arriving/.test(tail.textContent ?? ''))
             fail('the unfinished block was committed before it ended')
           if (!tail.querySelector('.tin')) fail('the tail is not revealing word by word')
         } else {
-          fail('the unfinished block has no streaming tail')
+          fail('the unfinished block has no streaming paragraph')
         }
-        // Ghost tail check: the animation must stay local to the newest words.
-        const animating = [...body.querySelectorAll('.tin')].filter(
+        // Ghost tail check: the reveal belongs to the newest words only. A span
+        // that is still half-drawn after the animation window (170ms duration +
+        // 90ms stagger cap) is text the reader has already moved past, sitting
+        // grey two lines up - the flicker that got the reveal blamed.
+        await new Promise((r) => setTimeout(r, 320))
+        const faint = [...document.querySelectorAll('.blk-answer .tin')].filter(
           (t) => Number(getComputedStyle(t).opacity) < 0.9,
         ).length
-        if (animating > 16)
-          fail(`${animating} word spans are still half-drawn: the ghost tail is back`)
-        pageLog(`markdown mid-stream ok (h1+bold+list committed, ${animating} animating)`)
+        if (faint) fail(`${faint} word spans are still half-drawn after 320ms: the ghost tail is back`)
+        pageLog('markdown mid-stream ok (h1+bold+list committed, no tail left half-drawn)')
         // Turn end leaves nothing half-rendered.
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 2, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
         const done = document.querySelector('.blk-answer .blk-body') as HTMLElement
-        if (done.querySelector('.live-tail')) fail('a streaming tail survived the end of the turn')
+        if (done.querySelector('.live-para')) fail('a streaming paragraph survived the end of the turn')
         if (/\*\*/.test(done.textContent ?? '')) fail('markdown markers survived the end of the turn')
         if (!done.querySelector('em')) fail('the final block never got its markdown')
+        transcript?.clear()
+      }
+
+      // [2b] The label in the gutter lines up with the first line of the answer
+      // *while it is being generated*. It used to be propped by a streaming-only
+      // `padding-top: 3px` on the body, so the name sat off the line for the whole
+      // turn and snapped into place at the end. Measured on an answer that starts
+      // with a paragraph, because that is what an answer usually starts with.
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest' } })
+        transcript?.apply({ kind: 'text', d: 'The first words of the answer are landing ' })
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        transcript?.flushNow()
+        const alignPx = (where: string) => {
+          const b = document.querySelector('.blk-answer .blk-body') as HTMLElement
+          const who = document.querySelector('.blk-answer .blk-head') as HTMLElement
+          const first = b?.firstElementChild
+          const walk = document.createTreeWalker(first ?? new DocumentFragment(), NodeFilter.SHOW_TEXT)
+          const tn = (first ? walk.nextNode() : null) as Text | null
+          const htn = who?.firstChild as Text | null
+          if (!who || !tn || !htn) {
+            fail(`nothing to measure for label alignment ${where}`)
+            return 0
+          }
+          // Both measured as *text* boxes: the label carries its own padding and
+          // the first paragraph sits inside block margins, so comparing element
+          // boxes would compare chrome rather than what the eye aligns.
+          const rng = document.createRange()
+          rng.setStart(tn, 0)
+          rng.setEnd(tn, 1)
+          const line = rng.getBoundingClientRect()
+          const hr = document.createRange()
+          hr.setStart(htn, 0)
+          hr.setEnd(htn, Math.min(4, htn.length))
+          const head = hr.getBoundingClientRect()
+          const d = line.top + line.height / 2 - (head.top + head.height / 2)
+          pageLog(`label alignment (${where}): ${d.toFixed(1)}px`)
+          return d
+        }
+        const mid = alignPx('while generating')
+        // 6px is the design allowance: the label hangs 2px below the block top and
+        // carries 3px of its own padding. More than that reads as a name that does
+        // not line up with the sentence beside it.
+        if (Math.abs(mid) > 6)
+          fail(`the CWOFFEE label is ${mid.toFixed(1)}px off the first line while generating`)
+        transcript?.apply({ kind: 'text', d: 'right now, and the label must not shift when they finish.' })
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 3, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        const after = alignPx('once settled')
+        if (Math.abs(after - mid) > 1.2)
+          fail(`the label moved ${(after - mid).toFixed(1)}px when the turn ended - it aligns only at the end`)
+        pageLog(`label alignment ok (${mid.toFixed(1)}px generating, ${after.toFixed(1)}px settled)`)
         transcript?.clear()
       }
 

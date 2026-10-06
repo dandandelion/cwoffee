@@ -48,7 +48,7 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, splitCommitted } from './markdown'
+import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, splitCommitted } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -226,21 +226,19 @@ export class Transcript {
    */
   private livePainted = 0
   /**
-   * The answer streams into three places at once.
+   * The answer streams one *block element* at a time.
    *
-   * `liveCommitted` characters of source have been rendered to markdown, once,
-   * and their nodes are never touched again. Everything after that lives in
-   * `liveTail` as word spans that animate and then sit still. When a paragraph
-   * finishes - the blank line arrives - its spans are removed and the same text
-   * is re-rendered as markdown exactly once, so `**bold**` stops being literal
-   * asterisks *while the model is still talking* rather than at the end.
+   * Text goes into the `<p>` that is going to be that paragraph, and when the
+   * blank line lands the element is finished **in place**: a paragraph with no
+   * markup keeps its spans, its height and its position, because a `<p>` full of
+   * word spans is already what the parser would have produced. That is what keeps
+   * the layout of everything already on screen perfectly still while the model
+   * writes - committing used to swap spans for a `<p>`, which changed the box by
+   * a line's worth of blank space and nudged the whole transcript.
    */
   private liveTail: HTMLElement | null = null
-  private liveCommitted = 0
-  /** How many finished blocks have already been rendered to markdown. */
-  private committedBlockCount = 0
-  /** Spans in the tail, in order, with the number of source characters each holds. */
-  private tailSpans: { node: HTMLElement; len: number }[] = []
+  /** Source offset where the block currently being written begins. */
+  private blockStart = 0
   /** Following the stream: pin to the bottom unless the reader scrolled away. */
   private pinned = true
   private programmatic = false
@@ -347,9 +345,7 @@ export class Transcript {
     this.turnAnswer = []
     this.livePainted = 0
     this.liveTail = null
-    this.liveCommitted = 0
-    this.committedBlockCount = 0
-    this.tailSpans = []
+    this.blockStart = 0
     this.wordRate = 0
     this.lastPaintAt = 0
   }
@@ -466,8 +462,8 @@ export class Transcript {
   /**
    * Render the streaming answer.
    *
-   * `force` is used at turn end, where correctness matters more than cost and a
-   * single full markdown pass is cheap.
+   * `force` is used at stream end, where the last block has to be closed even
+   * though no blank line will ever arrive for it.
    */
   private renderLive(force: boolean) {
     if (!this.liveEl) return
@@ -477,7 +473,7 @@ export class Transcript {
         this.liveTimer = 0
       }
       this.liveEl.classList.remove('streaming')
-      this.commitAll()
+      this.paintAnswer(performance.now(), true)
       return
     }
     const now = performance.now()
@@ -491,113 +487,110 @@ export class Transcript {
       }
       return
     }
-    this.lastLiveRender = now
-    const src = this.live.text
-    const delta = src.slice(this.livePainted)
-    if (delta) {
-      this.livePainted = src.length
-      this.appendReveal(this.ensureTail(), delta, now, true)
-    }
-    this.commitBlocks()
+    this.paintAnswer(now, false)
     // Follow even when nothing committed: a paragraph that has not ended yet
     // still grows a line at a time, and a view that only moves at blank lines
     // leaves the newest line below the fold until the next paragraph lands.
     this.follow()
   }
 
+  /** The element the block currently being written lives in. */
   private ensureTail(): HTMLElement {
     if (this.liveTail) return this.liveTail
-    const t = document.createElement('span')
-    t.className = 'live-tail'
+    const t = document.createElement('p')
+    t.className = 'live-para'
     this.liveEl!.append(t)
     this.liveTail = t
     return t
   }
 
   /**
-   * Turn the paragraphs the model has finished into markdown, once.
+   * Put everything that has arrived on screen, one block at a time.
    *
-   * A block is finished when its blank line arrives, so a heading, a list or a
-   * bold word appears formatted while the answer is still streaming, instead of
-   * the reader watching `**The Quiet Frequency**` for ten seconds and getting the
-   * real thing only when the turn ends.
+   * The block being written has its own element, and when its blank line lands
+   * the element is closed *in place*. That ordering is the whole point: the
+   * paragraph a reader has already looked at keeps the same nodes, the same
+   * height and the same position on screen, so committing a block cannot move
+   * text that is already being read.
    *
-   * The rewrite is bounded: exactly the characters up to the last blank line,
-   * exactly once, and the nodes it produces are never parsed again.
+   * Only blocks that the parser would change are rewritten - headings, lists,
+   * tables, fences, and paragraphs containing `**` or `_` or links - and each of
+   * those is parsed exactly once, ever.
    */
-  private commitBlocks() {
+  private paintAnswer(now: number, final: boolean) {
     if (!this.liveEl) return
-    const { blocks, cut } = splitCommitted(this.live.text)
-    if (cut <= this.liveCommitted) return
-    const sc = this.hookScroller()
-    const before = sc ? sc.scrollHeight - sc.scrollTop : 0
-    const host = this.liveEl
-    const anchor = this.liveTail
-    // The count is of *rendered* blocks, and splitCommitted already leaves
-    // blank-only blocks out, so the slice and the nodes stay in step. Getting
-    // this off by one would re-render a paragraph that is already on screen.
-    for (const b of blocks.slice(this.committedBlockCount)) {
-      const tpl = document.createElement('template')
-      tpl.innerHTML = renderMarkdown(b)
-      // Inserted as children of the body, not wrapped: the markdown styles are
-      // `.blk-body > p`, and a wrapper div would silently unstyle the answer.
-      while (tpl.content.firstChild) host.insertBefore(tpl.content.firstChild, anchor)
-    }
-    this.dropSpans(cut - this.liveCommitted)
-    this.liveCommitted = cut
-    this.committedBlockCount = blocks.length
-    if (sc) {
-      // Re-rendering a paragraph changes its height a little (a heading is
-      // taller than the line of text it replaced). Compensate the scroll for a
-      // reader who scrolled up, so committing never moves the text under them.
-      if (!this.pinned) {
-        const after = sc.scrollHeight - sc.scrollTop
-        sc.scrollTop += before - after
-      } else {
-        this.follow()
+    const src = this.live.text
+    this.lastLiveRender = now
+    let guard = 0
+    while (guard++ < 200) {
+      if (this.livePainted >= src.length) break
+      // Ask only about what is still open: where the block being written ends,
+      // and whether an unclosed code fence owns the rest of it.
+      const rest = src.slice(this.blockStart)
+      const rel = firstBlockEnd(rest)
+      const head = rest.split('\n', 1)[0]
+      // A paragraph's soft line breaks are joined by the parser anyway, so they
+      // are joined here too: painting them as breaks would add a line box that
+      // vanishes when the block closes and shifts the page. Lists, tables,
+      // quotes and code are meaningful per line, so those keep their newlines.
+      const structural =
+        fenceOpen(rest) || /^\s*(?:\||```|~~~|[-*+]\s|\d+\.\s|>)/.test(head)
+      if (!rel) {
+        // Unfinished block: paint what arrived and leave the element open.
+        this.appendReveal(this.ensureTail(), src.slice(this.livePainted, src.length), now, !structural)
+        this.livePainted = src.length
+        break
       }
+      // A closed block. Its text may have arrived in an earlier paint - the
+      // blank line usually lands in a later delta than the words - so "closed"
+      // is decided by the splitter, never by how far the paint has got.
+      const end = this.blockStart + rel.end
+      const upto = Math.min(end, src.length)
+      if (upto > this.livePainted)
+        this.appendReveal(this.ensureTail(), src.slice(this.livePainted, upto), now, !structural)
+      this.livePainted = Math.max(this.livePainted, upto)
+      this.closeBlock(src.slice(this.blockStart, end))
+      this.blockStart = end
     }
-  }
-
-  /** Replace the tail with its markdown at the end of the stream. */
-  private commitAll() {
-    if (!this.liveEl) return
-    const rest = this.live.text.slice(this.liveCommitted)
-    this.liveTail?.remove()
-    this.liveTail = null
-    this.tailSpans = []
-    if (rest.trim()) {
-      const tpl = document.createElement('template')
-      tpl.innerHTML = renderMarkdown(rest)
-      while (tpl.content.firstChild) this.liveEl.append(tpl.content.firstChild)
-    }
-    this.liveCommitted = this.live.text.length
-    this.livePainted = this.live.text.length
-    this.committedBlockCount = splitCommitted(this.live.text).blocks.length
+    if (final) this.closeBlock(src.slice(this.blockStart), true)
+    if (final) this.liveEl.classList.remove('streaming')
   }
 
   /**
-   * Retire the spans a committed block replaces.
+   * Close the element for a finished block.
    *
-   * Word spans carry their trailing whitespace, so a span never straddles the
-   * blank line that closes a block, and whole spans can be dropped. The trim
-   * branch is defensive: if a future splitter ever cuts mid-word, the frontier
-   * span is the newest one, still animating, so shortening it is cheap.
+   * Most blocks need nothing: a plain paragraph of word spans inside a `<p>` is
+   * already the parser's own output, so the element just stops being "live".
+   * Rewriting it anyway would re-raster settled text, and re-rastering settled
+   * text is what every "blink while streaming" report has traced back to.
    */
-  private dropSpans(chars: number) {
-    let left = chars
-    while (left > 0 && this.tailSpans.length) {
-      const first = this.tailSpans[0]
-      if (first.len <= left) {
-        first.node.remove()
-        left -= first.len
-        this.tailSpans.shift()
-      } else {
-        first.node.textContent = first.node.textContent!.slice(left)
-        first.len -= left
-        left = 0
-      }
+  private closeBlock(blockSrc: string, final = false) {
+    const el = this.liveTail
+    this.liveTail = null
+    if (!el) return
+    if (!blockSrc.trim()) {
+      el.remove()
+      return
     }
+    if (!needsMarkdown(blockSrc)) {
+      el.classList.remove('live-para', 'fenced')
+      return
+    }
+    const tpl = document.createElement('template')
+    tpl.innerHTML = renderMarkdown(blockSrc)
+    const kids = Array.from(tpl.content.childNodes) as HTMLElement[]
+    const only = kids.length === 1 ? kids[0] : null
+    if (only && only.tagName === 'P') {
+      // Same box, new inline markup: keep the element and swap its contents.
+      el.classList.remove('live-para', 'fenced')
+      el.replaceChildren(...Array.from(only.childNodes))
+      return
+    }
+    // A heading, list, table or fence is a different box; replace the element.
+    // `final` keeps the last block's chrome (a code block's copy button) even
+    // when the stream stopped mid-block.
+    el.replaceWith(...kids)
+    if (!final && !kids.length) el.remove()
   }
 
   /**
@@ -611,28 +604,38 @@ export class Transcript {
    * that rewrites settled text will do that, however carefully the rewrite is
    * guarded, because the guard has to compare markup it has to regenerate.
    *
-   * So nothing here is ever rewritten. The stream is appended as spans, one per
-   * word, each animated once with a small stagger; markdown arrives exactly once,
-   * at stream end, as a single pass that replaces the whole block.
+   * `joinNewlines` renders a paragraph's raw line breaks as spaces, which is
+   * what the parser will do with them anyway; doing it here means the paragraph
+   * occupies the same number of lines before and after it is committed.
    */
-  private appendReveal(host: HTMLElement, delta: string, now: number, track = false) {
-    const words = revealWords(delta)
+  private appendReveal(host: HTMLElement, delta: string, now: number, joinNewlines = false) {
+    // `fenced` belongs to the streaming paragraph only. Toggling a class on a
+    // body that is not streaming is an attribute write on a node full of settled
+    // text, and every attribute write invalidates that text's style.
+    if (host.classList.contains('live-para')) {
+      if (joinNewlines) host.classList.remove('fenced')
+      else host.classList.add('fenced')
+    }
+    const words = revealWords(delta).map((w) => (joinNewlines ? w.replace(/\n/g, ' ') : w))
     if (!revealOn() || !words.length) {
-      const t = document.createTextNode(delta)
-      host.appendChild(t)
-      if (track) this.tailSpans.push({ node: t as unknown as HTMLElement, len: delta.length })
+      host.appendChild(document.createTextNode(words.join('')))
       return
     }
     const gap = this.lastPaintAt ? now - this.lastPaintAt : LIVE_RENDER_MS
     this.lastPaintAt = now
     const inst = gap > 0 ? (words.length * 1000) / gap : 0
     this.wordRate = this.wordRate ? this.wordRate * 0.7 + inst * 0.3 : inst
-    host.style.setProperty('--tin-dur', `${revealDuration(this.wordRate)}ms`)
+    const dur = revealDuration(this.wordRate)
     const frag = document.createDocumentFragment()
     for (let i = 0; i < words.length; i++) {
       const span = document.createElement('span')
       span.className = 'tin'
       span.textContent = words[i]
+      // The duration goes on the span, never on the paragraph. A custom property
+      // on the parent re-resolves the style of every settled span inside it, on
+      // every paint: an animation that costs the *neighbours* their paint is not
+      // an animation, it is flicker with extra steps.
+      span.style.animationDuration = `${dur}ms`
       // Stagger inside one arrival so a burst of six words reads as six words
       // arriving, not one block fading in. Capped hard: with a long cap the
       // newest line sits at half-opacity while the model has moved on two lines
@@ -640,7 +643,6 @@ export class Transcript {
       const delay = Math.min(i * 18, 90)
       if (delay) span.style.animationDelay = `${delay}ms`
       frag.append(span)
-      if (track) this.tailSpans.push({ node: span, len: words[i].length })
     }
     host.append(frag)
   }
@@ -692,15 +694,13 @@ export class Transcript {
     })
   }
 
-  /** Streaming blocks render as plain text with newlines kept; see appendReveal. */
+  /** Start a streaming block region: one element per markdown block. */
   private beginLive(el: HTMLElement) {
     this.liveEl = el
     this.live = new LiveMarkdown()
     this.livePainted = 0
     this.liveTail = null
-    this.liveCommitted = 0
-    this.committedBlockCount = 0
-    this.tailSpans = []
+    this.blockStart = 0
     this.lastLiveRender = 0
     this.lastPaintAt = 0
     el.classList.add('streaming')
@@ -831,11 +831,12 @@ export class Transcript {
   }
 
   /**
-   * Final full markdown pass over the streaming answer.
+   * Close out the streaming answer.
    *
-   * During streaming only the tail block is re-parsed; at the end one pass over
-   * the whole source guarantees the displayed result matches what
-   * `renderMarkdown` would produce for the stored text.
+   * Every block the model finished has already been committed as it landed;
+   * this closes the one block that never got its blank line, so the live result
+   * matches what `renderMarkdown` would produce for the stored text - without a
+   * second pass over blocks that are already correct.
    */
   private finalizeAnswer() {
     if (this.liveTimer) {

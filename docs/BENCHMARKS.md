@@ -82,25 +82,30 @@ changes layout; that is expected and bounded.
 
 ### The reveal is append-only, and that is what the harness measures
 
-The animation gives each arriving word its own inline span (blur 1.6px → 0, opacity
-0 → 1) with duration derived from the observed word rate, `600 / words_per_second`
-clamped to 110–300ms, and a per-group stagger capped at 168ms. Nothing rewrites a
-span once created.
+The animation gives each arriving word its own inline span (**opacity 0 → 1, no
+filter**) with duration derived from the observed word rate, `600 / words_per_second`
+clamped to **110–170ms**, written on the span itself, and a per-group stagger capped
+at **90ms**. Nothing rewrites a span once created, and nothing re-rasters one: the
+blur this used to animate lifted each word onto its own layer and dropped it back at
+the end of its animation, which at 30–45 tok/s is a pop every ~25ms.
 
 What the in-app harness asserts, in the app's own webview:
 
 ```
 append-only reveal ok (28 word spans, none rewritten)
-label gap holds through the turn (8px, drift 0px)
+commit is layout-neutral ok (15 spans kept, drift 0.0px)
+label alignment ok (-1.7px generating, -1.7px settled)
+markdown mid-stream ok (h1+bold+list committed, no tail left half-drawn)
+stream follow ok (worst step 0px, off-bottom 0px)
 ```
 
 Every span created during a streamed reasoning block is still connected to the
 document after later paints, the spans' text concatenates back to exactly what the
-model sent, none of them is block-level, and the horizontal gap between the
-`CWOFFEE` label and the first glyph is the same 8px mid-stream as after the
-Markdown pass. Those are the two complaints this design answers: text that blinked
-again half a second after arriving (a fold step rewriting settled text), and a label
-that sat too close to the answer until the turn ended.
+model sent, none of them is block-level, and words from an earlier arrival sit at
+`opacity: 1` with `filter: none` while new words land — no style write is recorded
+on the streaming paragraph at any point in the turn. The vertical offset between the
+`CWOFFEE` label and the first line of the answer is **-1.7px while generating and
+-1.7px once settled**, so the name no longer snaps into place at turn end.
 
 Filmstrip diffing of the answer block through the gateway (fixed clip, real model
 at ~50 tok/s) shows settled frames inert: mean per-frame pixel difference 0.00,
@@ -134,6 +139,36 @@ viewport was being rewritten rather than scrolled. A plain per-frame diff cannot
 apart; the shift search can.
 
 Memory after all of it: PSS **259.5 MB** against the 400 MB ceiling.
+
+### Committing a block in place: the numbers behind "it still blinks"
+
+A plain paragraph that finishes streaming is closed without being re-rendered, so
+the claim under test is that nothing already on screen changes. Measured in the
+app's own webview (WebKitGTK, the engine the complaint is about):
+
+| what | measured |
+|---|---|
+| word spans kept by a committed plain paragraph | **15 of 15**, still connected |
+| movement of the paragraph above a commit | **0.0px** (assert fails above 0.6px) |
+| `characterData` rewrites outside the block being written | **0** |
+| style writes on the streaming paragraph per turn | **0** |
+| settled words at opacity < 0.98 or under a filter | **0** |
+| spans mid-reveal at any instant (max / mean) | **11 / 3.5** |
+| distance from the bottom of the view (max / median / p95) | **0px / 0px / 0px** |
+| largest single-frame scroll step | **34px** (one line + margin) |
+| structural re-commits per turn (list, table replacing raw text) | **2** |
+
+Those two structural re-commits are the only remaining whole-block reflows, and
+they are deliberate: a `<ul>` is not the same box as five lines beginning with `-`,
+so it is re-laid-out once instead of being animated into place.
+
+A pixel-level pass over 798 screencast frames of the same turn found 5 frame pairs
+whose settled crop changed after vertical shift alignment; on inspection each was
+the streaming frontier entering the crop band, not settled text being redrawn.
+Comparing crops without a shift search reports ~19k changed pixels for a one-line
+scroll, which is why the shift search is part of the method and not an optimisation.
+
+Memory after this batch: PSS **264.6 MB** against the 400 MB ceiling.
 
 ## Prefix caching (why the prompt builder is append-only)
 

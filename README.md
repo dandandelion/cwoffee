@@ -86,9 +86,10 @@ channels, which is also the seam for a future daemon/remote mode.
    Measured: 92% cache hit on turn two, 452 tok/s effective prefill against 38 tok/s raw.
 2. **Imperative transcript, never a reactive list** — deltas become text nodes
    batched once per animation frame. 0 dropped frames over 209 frames at 50 tok/s.
-3. **Markdown is parsed once per block, not once per token** — a paragraph is
-   rendered the moment its blank line arrives, and the block that is still
-   arriving stays plain text.
+3. **Markdown is parsed once per block, not once per token** — each block gets
+   its own element while it streams, and is closed *in place* when its blank line
+   arrives. A plain paragraph keeps its word spans and its box, so committing one
+   moves nothing; only blocks the parser would change are rendered, once.
 
 ## What the status bar actually measures
 
@@ -190,12 +191,20 @@ rewrite, and a rewrite re-rasters: every already-settled word blinked again roug
 second after it landed, which reads as the animation "playing catch up" with the text. The
 append-only version has no fold step to blink in.
 
-**Markdown arrives with the answer, not after it.** A paragraph is committed to markdown
+**Markdown arrives with the answer, and committing it moves nothing.** A paragraph is closed
 the moment its blank line lands: headings become headings, `**bold**` stops being asterisks,
 lists become lists, all while the model is still talking. Only the last, unfinished block
-stays raw text in `white-space: pre-wrap`, and it is committed once at stream end. That is
-one markdown pass per block — never one per token — and blocks that are already rendered are
-never re-parsed, which is the same append-only rule the prompt builder follows.
+stays raw text, and it is closed once at stream end. That is one markdown pass per block —
+never one per token — and blocks that are already rendered are never re-parsed, which is the
+same append-only rule the prompt builder follows.
+
+The block being written has **its own element**, which is what makes the commit free: a plain
+paragraph of word spans inside a `<p>` is already what the parser would have produced, so the
+element just stops being "live" and keeps every node. A paragraph with markup in it, a heading,
+a list, a table or a fence is rendered once, in place. A paragraph's soft line breaks are joined
+as they are painted, because the parser joins them anyway — painting them as breaks reserves a
+line box that disappears at commit, and that one-line collapse is the "blink" a reader sees two
+paragraphs later.
 
 The frame-by-frame version of the bug this fixes: a 500-word story streamed for fifteen
 seconds with `**The Quiet Frequency**` on screen the entire time, and `#` markers and pipe
@@ -207,10 +216,12 @@ later paints, their `textContent` concatenating back to exactly what the model s
 span block-level. That is the whole contract — an animation that is invisible in the computed
 styles but rewrites settled text is still a bug, and a check on node identity catches it.
 
-Two more checks sit next to it: a streamed answer that must contain a real `h2`, a `strong`
-and an `li` **before** `turnEnd` while its tail is still raw text, and a follow check that
-fails if any single paint moves the transcript more than 60px or leaves the newest line more
-than 40px below the fold.
+Three more checks sit next to it. A streamed answer must contain a real `h2`, a `strong` and
+an `li` **before** `turnEnd` while its tail is still raw text. A committed plain paragraph must
+keep **all** of its word spans connected and must not move the paragraph above it by more than
+0.6px — measured at **0.0px**, with 15 of 15 spans kept. And a follow check fails if any single
+paint moves the transcript more than 60px or leaves the newest line more than 40px below the
+fold.
 
 ### The view follows, it does not lurch
 
@@ -234,10 +245,15 @@ Two details that paragraph depends on:
   transcript — which pins to the tail — nudges the whole view with it. That is a flicker
   report waiting to happen, and it is why thinking once looked like it "grew vertically
   instead of filling the width".
-- The animation fills **backwards**, not `both`. With `both`, a finished span keeps its last
-  keyframe, `filter: blur(0)`, forever, and a filter claims its own raster layer. The text
-  then exists twice — the layer the animation holds, and the layer the paragraph is drawn
-  into — and swapping between them pops at the end of every transition.
+- The animation is **opacity only**, and fills `backwards`, not `both`. A `filter` — the blur
+  this reveal used to animate — makes WebKit lift the word onto its own layer and drop it back
+  when the animation ends, so every word pops at the end of its own animation. At 30-45 tokens
+  a second that is a pop every 25ms for the whole turn, which is what "it still blinks a little"
+  turned out to be. `both` has the same fault in slower form: it keeps an animation-owned end
+  state on text that has already landed.
+- The duration is written on **each span**, never as a custom property on the paragraph. An
+  attribute write on the parent re-resolves the style of every settled span inside it, on every
+  paint; a `MutationObserver` on the streaming paragraph fails the self-test if it sees one.
 
 ## Files, and asking instead of guessing
 

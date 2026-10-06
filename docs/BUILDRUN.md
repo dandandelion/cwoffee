@@ -1220,3 +1220,121 @@ adoption or workspace move. One site, one order — the pinning test captures th
 message in `Scripted::seen_wire` and asserts it names the new folder *and not* the old one.
 The general shape: a volatile block that is refreshed by a snapshot of when the process
 started is a stale value with a fresh timestamp.
+
+## Trap 63: committing a paragraph moved the paragraph above it
+
+The block-granular commit (Trap 59) fixed the *content* problem - markdown now
+appears while the model is still writing - and left a *layout* problem behind.
+Committing removed the paragraph's word spans and inserted the parser's nodes in
+their place. Those two representations of the same sentence are not the same box:
+the spans sat in a `<span>` with the body's own line rhythm, the parser produced a
+`<p>` with block margins, and the difference - one line's worth of blank space -
+landed on everything already on screen. The reader watched a sentence they had
+finished reading slide sideways-ish a quarter of a line. Reported, correctly, as
+"it still blinks a bit while generating".
+
+The fix is to stop treating a commit as a replacement. **Each block gets its own
+element while it is being written**, and when its blank line lands the element is
+closed *in place*:
+
+- a plain paragraph is already the parser's output - word spans inside a `<p>`
+  carrying the parser's own margins - so it keeps every node. Nothing is
+  rewritten, nothing re-rasters, nothing moves;
+- only blocks the parser would change (`needsMarkdown`: markup characters or a
+  block-level opener) are rendered, and each is rendered exactly once.
+
+Two supporting details make the box identical before and after:
+
+- A paragraph's **soft line breaks are joined to spaces by the paint**, because
+  the parser joins them anyway. Painting them as breaks reserves a line box that
+  vanishes at commit, which is a shift of exactly one line height - the jump
+  people were seeing. Lists, tables, quotes and code keep their newlines, because
+  there the line structure is the content (`white-space: pre-wrap` lives on
+  `.live-para.fenced`, not on the body).
+- The closing blank line is painted as spaces, so it costs no box; the margin the
+  parser would have added is already there.
+
+Measured in the app's own webview, by identity and by geometry rather than by
+screenshot: a committed paragraph keeps **15 of 15** word spans connected, and the
+paragraph above it moves **0.0px**. The check fails if a single span is thrown away.
+
+## Trap 64: the live paint needed the *first* block boundary, not the last
+
+`splitCommitted(src).cut` answers "how much of this source is finished" - the end
+of the **last** complete block. The streaming paint asks a different question:
+"where does the block I am writing end", because it wants one element per block.
+Fed the wrong answer, the paint closed one element over *two* paragraphs, which
+produced two bugs at once: a paragraph that had already been painted was treated
+as unfinished and stayed open across its own blank line, so the next paragraph
+merged into it; and a plain paragraph that should have kept its spans went
+through the parser because the block it belonged to contained a `*` from its
+neighbour.
+
+`firstBlockEnd(src)` answers the real question, and returns `null` while the block
+is open. `fenceOpen(src)` answers "am I inside a code fence" separately, because
+the boundary function must *not* treat an unclosed fence as a finished block:
+doing so rendered half a code block, then started a second one for the remainder,
+and the second one lost the language - `data-lang=""`, no preview button, a code
+block split in the middle.
+
+The general shape: a helper written for one question is not free to answer a
+related one. The names now say which question each answers.
+
+## Trap 65: the reveal's blur re-rastered one word at a time
+
+The reveal animated `filter: blur(1.6px) -> blur(0)`. A filter makes WebKit lift
+the word onto its own layer, rasterize it there, and drop it back into the text
+layer when the animation ends - so each word **pops** at the end of its own
+animation. At the 30-45 tokens per second this endpoint produces, that is a pop
+every 25ms, continuously, for the whole turn. Every earlier attempt to shorten or
+stagger the animation was treating the schedule of a mechanism that should not
+have been running at all.
+
+A transform would have been cheap and composited, but transforms do not apply to
+non-replaced inline boxes, and making the spans `inline-block` would change where
+the line breaks. So the reveal is **opacity only**. It still reads as words
+arriving - 110-170ms, staggered up to 90ms - and nothing re-rasters.
+
+The same trap has a second, less visible half: the duration used to be written as
+a custom property on the *paragraph* (`host.style.setProperty('--tin-dur', …)`) on
+every paint. An attribute write on a node re-resolves the style of everything
+inside it, so the animation's cost was paid by the settled text next door. The
+duration now goes on each new span. A `MutationObserver` on the streaming
+paragraph fails the self-test if it records a single `style` write - and had to
+filter `attributeName` in JavaScript, because WebKitGTK delivers `class` records
+even when `attributeFilter` is `['style']`.
+
+## Trap 66: the label was aligned with a padding hack
+
+`.blk > .blk-body.streaming { padding-top: 3px }` existed to make the label in the
+gutter sit level with the first line of a streaming answer. What it actually did
+was push the first line down *only while the turn was running*, so the name was
+misaligned for the whole turn and snapped into place the moment `streaming` came
+off - exactly the report: "the assistant label is misaligned while a token is
+being generated, then fixes itself at the end".
+
+Deleted. With the first block now being a real `<p>` (Trap 63), the streaming body
+and the finished body have the same first-line geometry, which is what the padding
+was faking. Alignment is measured in the real webview as the offset between the
+*text* boxes of the label and the first line: **-1.7px while generating, -1.7px
+once settled**. Measuring element boxes instead of text boxes compares chrome
+rather than what the eye aligns - the label carries its own padding and the
+paragraph sits inside block margins.
+
+## Trap 67: the measurement watched the wrong element, and pixels lie about scrolls
+
+Two harness traps from trying to prove "settled text does not move":
+
+- `document.querySelector('.blk-answer .blk-body')` selects the **first answer
+  block in a long transcript**, which is history. The probe reported markdown
+  "already formatted at frame 1" and zero mutations, because it was watching a
+  finished turn from an earlier session. Streaming measurements must select
+  `.blk-body.streaming`, and be re-attached when the element changes.
+- Diffing consecutive screencast frames by a crop taken from page-side geometry
+  produces huge false positives: a frame arrives slightly before or after its
+  paired geometry sample, and if the view scrolled by one line in between, nearly
+  every glyph differs. The honest version searches vertical offsets and takes the
+  best alignment - a shift that explains the diff is a scroll, not a redraw. With
+  that in place, the only surviving whole-block changes were the two structural
+  commits in the turn (a list and a table replacing their raw text), which is one
+  reflow per such block, by design.

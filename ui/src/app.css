@@ -1759,11 +1759,10 @@ body {
    more than 6px.
 
    A note on the streaming reveal (.tin): each word is one span, appended once,
-   animated once, never rewritten. A paragraph is re-rendered as markdown exactly
-   once when its blank line arrives (commitBlocks), so `**bold**` stops being
-   asterisks mid-answer instead of at the end - but the words that are already
-   at rest are never touched again, which is what every "fold the tail into the
-   settled text" design gets wrong. */
+   animated once, never rewritten. Each markdown block is closed in place when its
+   blank line arrives - a plain paragraph keeps its spans and its box, so nothing
+   that is already at rest is touched again - which is what every "fold the stream
+   into the settled text" design gets wrong. */
 :root {
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --ease-out: cubic-bezier(0.16, 0.84, 0.24, 1);
@@ -1780,43 +1779,45 @@ body {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
-/* No transform here: the wrapper is an inline span, and transforms do not apply
-   to non-replaced inline boxes. blur+opacity is also the part that reads as
-   "arriving" rather than "moving". */
+/* Opacity only, and that is a decision, not an omission.
+
+   This animation used to carry `filter: blur(1.6px) -> blur(0)`. A filter makes
+   WebKit take the word out of the text layer, rasterize it on its own, and put
+   it back when the animation ends - so each word *pops* at the end of its own
+   animation. At the 30-45 words per second this endpoint produces, that is a
+   pop every 25ms, forever, which is precisely what "it still blinks a bit while
+   generating" describes. A transform would be cheaper but does not apply to a
+   non-replaced inline box, and making the spans inline-block would change where
+   the line breaks. So: fade only. A staggered fade still reads as words
+   arriving, and nothing re-rasters. */
 @keyframes cwoffee-tin {
-  from { opacity: 0; filter: blur(1.6px); }
-  to   { opacity: 1; filter: blur(0); }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
-/* While a block streams, its first line sits where a <p>'s first line will sit
-   afterwards. Without the lift, the label out in the gutter is level with the
-   text instead of level with the line, and the gap between them changes at the
-   moment the markdown pass replaces the plain-text stream - which is what made
-   the CWOFFEE label look cramped next to the answer until the turn ended. */
-.blk > .blk-body.streaming { padding-top: 3px; }
+/* No padding compensation for a streaming body. There used to be a 3px nudge
+   here, which pushed the first line of the answer away from the CWOFFEE label
+   in the gutter for the length of the turn and then snapped back into place when
+   `streaming` came off - the "assistant name is not aligned while generating"
+   report, in one line of CSS. The first child of a streaming body is now a `<p>`
+   with the same metrics as a committed paragraph, so nothing needs nudging. */
 
 .pop { animation: cwoffee-pop var(--d2) var(--ease-out) both; }
 .pop.measuring { animation: none; }
 
 /*
- * Streaming text blurs and fades in. The duration mirrors REVEAL_HOLD_MS in
- * markdown.ts: the same decision written twice, because a chunk node pulled out
- * before its animation finishes simply appears - which is the exact failure the
- * chunk-node design exists to remove (170ms of animation inside a 120ms paint
- * looked like nothing at all).
+ * Streaming text fades in, one word at a time.
  *
- * The curve is deliberately not ease-out. The old one had already reached 0.70
- * opacity by 33ms, so the visible part was three frames and the rest was the
- * text sitting there finished. This one spends its change across the window.
+ * `backwards` owns only the pre-animation state: with `both` the finished word
+ * keeps an animation-owned end state, which is another way for settled text to
+ * be re-rasterized at the moment it should stop being interesting.
+ *
+ * The duration is written on each span by the transcript from the measured word
+ * rate (see revealDuration). A constant let a fast model outrun its own
+ * animation, and setting it on the *paragraph* instead - a custom property on
+ * the parent - invalidates the style of every settled span in it on every
+ * paint, which is a cost paid for nothing and a repaint of text that has
+ * already landed.
  */
-/* `backwards`, not `both`: with `both` a finished word keeps `filter: blur(0)`
-   forever, and a filter forces its own raster layer, so the word exists twice -
-   once in the layer the animation owns and once in the text layer - and the swap
-   between them is a visible snap at the end of an animation you thought had
-   finished. `backwards` owns only the pre-animation state.
-
-   The duration is set per paint by the transcript from the measured word rate
-   (see revealDuration); a constant is what let a fast model outrun its own
-   animation, which is what "the blur is playing catch up" looked like. */
 .tin {
   animation: cwoffee-tin var(--tin-dur, 170ms) cubic-bezier(0.32, 0.02, 0.28, 1) backwards;
 }
@@ -2139,10 +2140,12 @@ body {
    newlines collapse and an answer arrives as one grey wall until the final pass
    breaks it into paragraphs - the one moment in a turn where the layout jumps,
    so it is paid for here instead. */
-/* Only the unfinished tail keeps raw newlines. Committed blocks are real
-   markdown elements and would show the parser's own line breaks as blank lines
-   if the body kept pre-wrap. Reasoning stays raw text start to finish. */
-.live-tail { white-space: pre-wrap; }
+/* Each block being written is its own `<p>`, with the parser's own margins, so
+   committing a paragraph changes nothing about its box. Newlines are joined by
+   the paint for ordinary paragraphs (the parser joins them anyway) and kept
+   where the line structure is the content: lists, tables, quotes, code. */
+.live-para { white-space: normal; }
+.live-para.fenced { white-space: pre-wrap; }
 .blk-reasoning .blk-body.streaming { white-space: pre-wrap; }
 
 /* Only blocks created during a live turn ease in. Stored transcripts are

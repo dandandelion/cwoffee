@@ -41,6 +41,13 @@ PHRASES = [
     # A verification run that filmed the streaming reveal through the gateway UI.
     "with the markdown shown: a level-2 heading",
     "Name six colours, each on its own line, and nothing else",
+    # Runs that filmed the streaming transcript: a fixed shape prompt typed into
+    # the composer by a Playwright harness, then measured frame by frame.
+    "Write about coffee roasting. Exactly this shape, no preamble",
+    "Write about coffee roasting in exactly four paragraphs",
+    "Answer in the chat only, do not create or open any files",
+    "Answer in the chat only, use no tools and create no files",
+    'Say the word "pigeon" and nothing else',
 ]
 
 conn = sqlite3.connect(DB)

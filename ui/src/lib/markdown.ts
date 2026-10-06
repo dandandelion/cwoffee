@@ -249,7 +249,7 @@ function codeBlock(langRaw: string, escapedCode: string): string {
  * fence on is unfinished - a half-written table or list would otherwise render
  * as a mangled one and then get rewritten when the rest arrives.
  */
-export function splitCommitted(src: string): { blocks: string[]; cut: number } {
+export function splitCommitted(src: string): { blocks: string[]; cut: number; inFence: boolean } {
   const lines = src.split('\n')
   const blocks: string[] = []
   let blockStart = 0
@@ -274,7 +274,67 @@ export function splitCommitted(src: string): { blocks: string[]; cut: number } {
     }
     pos = lineEnd + 1
   }
-  return { blocks, cut: Math.min(cut, src.length) }
+  return { blocks, cut: Math.min(cut, src.length), inFence }
+}
+
+/**
+ * Where the first block at the start of `src` finishes.
+ *
+ * `splitCommitted` answers "everything that is finished"; this answers "where
+ * does the block I am writing end", which is the question the live paint asks:
+ * it needs one block boundary at a time so each block gets its own element.
+ * Returns null when the block is still open - including when an unclosed code
+ * fence owns everything so far, which must never be committed early: closing a
+ * fence mid-stream would render half a code block and then start a second one
+ * for the rest of it. `fenceOpen` answers the "am I inside a fence" question.
+ */
+export function firstBlockEnd(src: string): { end: number; fenced: boolean } | null {
+  let i = 0
+  let fence = false
+  while (i < src.length) {
+    const nl = src.indexOf('\n', i)
+    const lineEnd = nl === -1 ? src.length : nl + 1
+    const line = src.slice(i, lineEnd)
+    if (/^\s*(?:```|~~~)/.test(line)) fence = !fence
+    // A blank line at the very end of the source is not a terminator: the next
+    // delta may continue the same block, and guessing wrong would close a
+    // paragraph the model is still writing.
+    if (!fence && line.trim() === '' && lineEnd < src.length)
+      return { end: lineEnd, fenced: fence }
+    i = lineEnd
+  }
+  return null
+}
+
+/**
+ * Does an unclosed code fence own the end of `src`?
+ *
+ * The live paint needs this to decide whether raw newlines are content: inside
+ * a fence they are, in a paragraph they are not.
+ */
+export function fenceOpen(src: string): boolean {
+  let open = false
+  for (const line of src.split('\n')) if (/^\s*(?:```|~~~)/.test(line)) open = !open
+  return open
+}
+
+/**
+ * Does this block need the markdown parser at all?
+ *
+ * A paragraph with no markup characters is already rendered: its words are on
+ * screen as spans, in a `<p>` with the same margins the parser would produce.
+ * Re-rendering it would produce the same pixels and move the layout for
+ * nothing, which is exactly the flicker the streaming design is arranged
+ * around avoiding.
+ */
+export function needsMarkdown(block: string): boolean {
+  const t = block.trim()
+  if (!t) return false
+  // A block-level opener: heading, list, quote, rule, table row, fence.
+  if (/^\s*(?:#{1,6}\s|[-*+]\s|\d+\.\s|>|\||```|~~~)/.test(t)) return true
+  if (/\|/.test(t) && /^\s*\|/.test(t)) return true
+  // Inline markup: emphasis, code, links, images, stray HTML.
+  return /[*_`~\[\]<>]/.test(t)
 }
 
 export function renderMarkdown(src: string): string {

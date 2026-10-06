@@ -4,7 +4,7 @@
  * The security cases are the point. Model output quotes fetched web pages, so
  * anything that reaches this function is untrusted input from the internet.
  */
-import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS } from '../src/lib/markdown.ts'
+import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, needsMarkdown, firstBlockEnd, fenceOpen, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS } from '../src/lib/markdown.ts'
 
 let failed = 0
 function eq(name: string, got: string, want: string) {
@@ -202,6 +202,31 @@ for (const w of doc.split(/(?<=\s)/)) {
   lm2.render()
   renders++
 }
+// Which blocks are worth re-rendering at all: a plain paragraph is already
+// rendered, and rewriting it is the flicker, not a fix.
+ok('plain paragraph needs no parser', !needsMarkdown('Roast levels are a spectrum.\n\n'))
+ok('bold needs the parser', needsMarkdown('A **bold** phrase.'))
+ok('emphasis needs the parser', needsMarkdown('The *Aldous* coasted on.'))
+ok('heading needs the parser', needsMarkdown('## Section title'))
+ok('list needs the parser', needsMarkdown('- light\n- medium\n'))
+ok('table needs the parser', needsMarkdown('| a | b |'))
+ok('fence needs the parser', needsMarkdown('```\ncode\n```'))
+ok('a paragraph with a stray less-than is treated as markup', needsMarkdown('if a < b then'))
+ok('blank blocks need nothing', !needsMarkdown('\n\n'))
+
+// One block boundary at a time: the live paint needs the end of the block it is
+// writing, not of everything finished so far.
+ok('open block has no end', firstBlockEnd('one two three') === null)
+ok('trailing newline is not a boundary', firstBlockEnd('one two\n') === null)
+ok('blank line ends the block', firstBlockEnd('one two\n\nnext block').end === 9)
+ok('first boundary wins', firstBlockEnd('a\n\n\nb').end === 3)
+ok('fence interior blank lines do not end a block', firstBlockEnd('```\nbody\n\nmore\n```\n') === null)
+ok('an unclosed fence is never a boundary', firstBlockEnd('```\nbody\n\nmore') === null)
+ok('fence parity: open', fenceOpen('```\nbody'))
+ok('fence parity: closed', !fenceOpen('```\nbody\n```'))
+ok('fence parity: none', !fenceOpen('plain text'))
+ok('blank first line still ends a block', firstBlockEnd('\nreal text').end === 1)
+
 // The streaming formatter commits at byte offsets, so the offset has to be the
 // truth even when nothing was rendered.
 {
