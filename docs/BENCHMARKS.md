@@ -80,6 +80,32 @@ turn end chars=1443 frames=209 dropped=0 worst=18ms
 at DPR 2.0. The 3-dropped case is a tool card being inserted mid-turn, which
 changes layout; that is expected and bounded.
 
+### The reveal is append-only, and that is what the harness measures
+
+The animation gives each arriving word its own inline span (blur 1.6px → 0, opacity
+0 → 1) with duration derived from the observed word rate, `600 / words_per_second`
+clamped to 110–300ms, and a per-group stagger capped at 168ms. Nothing rewrites a
+span once created.
+
+What the in-app harness asserts, in the app's own webview:
+
+```
+append-only reveal ok (28 word spans, none rewritten)
+label gap holds through the turn (8px, drift 0px)
+```
+
+Every span created during a streamed reasoning block is still connected to the
+document after later paints, the spans' text concatenates back to exactly what the
+model sent, none of them is block-level, and the horizontal gap between the
+`CWOFFEE` label and the first glyph is the same 8px mid-stream as after the
+Markdown pass. Those are the two complaints this design answers: text that blinked
+again half a second after arriving (a fold step rewriting settled text), and a label
+that sat too close to the answer until the turn ended.
+
+Filmstrip diffing of the answer block through the gateway (fixed clip, real model
+at ~50 tok/s) shows settled frames inert: mean per-frame pixel difference 0.00,
+maximum 0.12, with the only visible change coinciding with new characters.
+
 ## Prefix caching (why the prompt builder is append-only)
 
 Two turns against `qwen3.8-flash-next-iq3_s`, second turn reuses the first's
@@ -98,6 +124,12 @@ a 0.8 s and a 9 s first token on a long transcript, which is why:
 - history is append-only and byte-stable,
 - tool definitions are registered in a fixed order,
 - compaction is explicit, rare, counted, and surfaced in the UI.
+
+The compaction budget derives from what the endpoint advertises rather than a
+constant: for the loaded model at a stated 262,144 token window the engine uses
+186,695 tokens (`window * 0.72 - 2048`, floor 4096) and re-derives it on every model
+switch. The previous constant of 8000 compacted a 43k transcript on that model and
+reported "context full", which was a claim about the model that had never been asked.
 
 ## GPU
 

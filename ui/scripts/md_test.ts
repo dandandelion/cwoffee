@@ -4,7 +4,7 @@
  * The security cases are the point. Model output quotes fetched web pages, so
  * anything that reaches this function is untrusted input from the internet.
  */
-import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, paraOnly, REVEAL_HOLD_MS, type Reveal } from '../src/lib/markdown.ts'
+import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS } from '../src/lib/markdown.ts'
 
 let failed = 0
 function eq(name: string, got: string, want: string) {
@@ -291,139 +291,67 @@ ok('negative input is clamped', fmtThink(-5_000) === 'Thought for 0s', fmtThink(
 
 // ---- streaming reveal (.tin) -------------------------------------------
 // The reveal is the difference between text appearing and text arriving. The
-// The streaming reveal. Its unit is a DOM node, not a substring: a substring is
-// replaced by the next paint 120ms later, which is shorter than the animation,
-// so the animation is invisible. Measured before the redesign: opacity reaches
-// 0.70 at 33ms on an ease-out curve and the node dies at ~120ms - three soft
-// frames in a 60fps stream. So the tests are about nodes surviving, about text
-// never being lost when a node is folded back, and about block structures being
-// painted whole rather than re-rendered per chunk and mis-parsed.
+// The streaming reveal. Its unit used to be a node inside re-rendered markup;
+// it is now an appended node that nothing ever rewrites, because every version
+// that re-rendered the growing paragraph made finished words blink again about
+// half a second after arriving. What is worth pinning: the split is lossless,
+// the duration follows the stream rate, and markdown is applied exactly once.
 {
-  const words = (t: string) => t.split(/(?<=\s)/)
-  // What the DOM would show for a reveal: finished blocks, then one paragraph
-  // holding the static head followed by one span per pending chunk.
-  const domOf = (r: Reveal) =>
-    r.mode === 'block'
-      ? r.html
-      : (r.frozen ? r.frozen + '\n' : '') +
-        '<p>' +
-        r.head +
-        r.chunks.map((c) => `<span class="tin">${c.html}</span>`).join('') +
-        '</p>'
-  // HTML whitespace is not content; compare the words the user would read.
-  const visible = (h: string) => h.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+  eq('revealWords keeps whitespace with the word before it', JSON.stringify(revealWords('one two  three ')), JSON.stringify(['one ', 'two  ', 'three ']))
+  eq('revealWords on a mid-word arrival', JSON.stringify(revealWords('shal')), JSON.stringify(['shal']))
+  eq('revealWords on whitespace only', JSON.stringify(revealWords('  ')), JSON.stringify(['  ']))
+  eq('revealWords on nothing', JSON.stringify(revealWords('')), JSON.stringify([]))
+  eq('revealWords carries blank lines with the word before them', JSON.stringify(revealWords('a\n\nb ')), JSON.stringify(['a\n\n', 'b ']))
 
-  // The gate itself, so the structure results above cannot pass by accident.
-  eq('gate: prose is revealable', paraOnly('one two three\n'), 'one two three')
-  eq('gate: a list is not prose', paraOnly('- one\n'), null)
-  eq('gate: a fence is not prose', paraOnly('```js\nlet x\n```\n'), null)
-  eq('gate: two paragraphs are not one', paraOnly('one\n\n   two\n'), null)
+  {
+    // The split must be lossless however the stream is cut, or words vanish
+    // between two paints.
+    const src = 'Lisbon in January: the trams still rattle up the hills.\n\nSecond para.'
+    let joined = ''
+    for (let i = 0; i < src.length; i += 3) joined += revealWords(src.slice(i, i + 3)).join('')
+    eq('cutting the stream anywhere loses nothing', joined, src)
+  }
 
-  const prose =
-    'Lisbon in January is mild and bright, damp after sunset, and the trams still rattle up the hills.'
-  const live = new LiveMarkdown()
-  const htmlOf = new Map<number, string>()
-  let inline = 0
-  let blocks = 0
-  let last = ''
-  for (const w of words(prose)) {
-    live.push(w)
-    const r = live.renderReveal()!
-    if (r.mode === 'block') blocks++
-    else {
-      inline++
-      for (const c of r.chunks) {
-        // A chunk that changed its html would restart its animation, which is
-        // the flicker this whole design exists to avoid.
-        if (htmlOf.has(c.id))
-          ok('chunk html is immutable', htmlOf.get(c.id) === c.html, `id=${c.id}`)
-        htmlOf.set(c.id, c.html)
-      }
+  ok('a fast stream gets a shorter reveal', revealDuration(12) < revealDuration(2))
+  eq('a stalled stream does not run a marathon reveal', revealDuration(0.01), REVEAL_MAX_MS)
+  eq('a firehose does not lose the effect entirely', revealDuration(10_000), REVEAL_MIN_MS)
+  eq('an unknown rate falls back to the css default', revealDuration(NaN), 320)
+
+  {
+    // Append-only paint: the transcript's cursor must put every character on
+    // screen once and in order, however the deltas are chunked.
+    const live = new LiveMarkdown()
+    const src = 'Answers stream word by word, then format **once** at the end.\n\n- and lists too\n'
+    let painted = 0
+    let domText = ''
+    for (const w of src.split(/(?<=\s)/)) {
+      live.push(w)
+      const delta = live.text.slice(painted)
+      painted += delta.length
+      domText += revealWords(delta).join('')
     }
-    last = domOf(r)
+    eq('the paint cursor lands on the end of the stream', painted, live.text.length)
+    eq('the appended words reassemble the source', domText, src)
   }
-  // Exactly one block paint: the first, which establishes the window. Every
-  // paint after it carries chunks.
-  ok('prose streams as inline chunks', inline > 3 && blocks === 1, ` inline=${inline} block=${blocks}`)
-  ok('chunk nodes were created', htmlOf.size > 3, ` chunks=${htmlOf.size}`)
-  eq('reveal text is exactly one pass', visible(last), visible(renderMarkdown(prose)))
-  eq(
-    'the reveal stays inside one paragraph',
-    (last.match(/<p>/g) || []).length,
-    1,
-  )
 
-  // Folding a finished chunk back into the head must neither drop nor duplicate
-  // text: hold still, and the head silently takes over the chunks' characters.
-  const hold = new LiveMarkdown()
-  hold.push('settling text that waits')
-  hold.renderReveal() // first paint establishes the window; it is painted whole
-  hold.push(' for the fold')
-  const early = hold.renderReveal()!
-  ok(
-    'newest text is a chunk, older text is the head',
-    early.mode === 'inline' && early.chunks.length === 1 && early.head.length > 0,
-    ` mode=${early.mode} chunks=${early.mode === 'inline' ? early.chunks.length : 'n/a'}`,
-  )
-  const beforeFold = visible(domOf(early))
-  // A real wait, because the hold is a wall-clock window and the behaviour under
-  // test is what happens when it expires with nothing new arriving.
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, REVEAL_HOLD_MS + 120)
-  const late = hold.renderReveal()!
-  ok('expired chunks fold into the head', late.mode === 'inline' && late.chunks.length === 0,
-    ` chunks=${late.mode === 'inline' ? late.chunks.length : 'n/a'}`)
-  eq('folding neither adds nor drops a character', visible(domOf(late)), beforeFold)
-  eq('and the head holds the whole paragraph', visible(domOf(late)), visible(hold.text))
-
-  // Lists, fences, tables, headings and raw HTML are painted whole. Chunk-level
-  // inline rendering cannot reproduce a list marker or a code fence, and a
-  // wrong structure is worse than no animation.
-  for (const [name, src] of [
-    ['bullet', '- **first** item that keeps going on\n'],
-    ['two bullets', '- one item\n- a second item that runs on\n'],
-    ['fence', '```python\ndef f():\n    return 1\n```\n'],
-    ['table', '| a | b |\n| - | - |\n| 1 | 2 |\n'],
-    ['heading', '# A title\n'],
-    ['raw html', '<div class="x">block</div>\n'],
-  ] as [string, string][]) {
-    const lv = new LiveMarkdown()
-    let allBlock = true
-    for (const w of words(src)) {
-      lv.push(w)
-      if (lv.renderReveal()!.mode !== 'block') allBlock = false
+  {
+    // markdown once, at stream end: whatever happened while streaming, the
+    // finished block equals a single pass over the stored text, so a reload
+    // cannot show something different from what was just watched.
+    const f = new LiveMarkdown()
+    const src = 'a simple answer with **bold** and a list\n- one\n- two\n'
+    for (const w of src.split(/(?<=\s)/)) {
+      f.push(w)
+      f.render() // the mid-stream approximation, which no longer drives the DOM
     }
-    ok(`structure paints whole: ${name}`, allBlock)
+    eq('finish() is one pass over the source', f.finish(), renderMarkdown(src))
   }
 
-  // A completed block must not leave a chunk pointing at text that has moved:
-  // the paragraph freezes, the window resets, and the paint stays correct.
-  const two = new LiveMarkdown()
-  const modes: string[] = []
-  let twoDom = ''
-  for (const w of words('first paragraph here.\n\nsecond paragraph starts.\n')) {
-    two.push(w)
-    const r = two.renderReveal()!
-    modes.push(r.mode)
-    twoDom = domOf(r)
+  {
+    const f = new LiveMarkdown()
+    f.push('<script>alert(1)</script> done')
+    ok('streamed html is escaped in the final block', !f.finish().includes('<script>'), f.finish())
   }
-  eq('completed block text is intact', visible(twoDom), visible(renderMarkdown(two.text)))
-  ok(
-    'the freeze repaints whole rather than half-parsing',
-    modes.filter((m) => m === 'block').length >= 2,
-    ` modes=${modes.join(',')}`,
-  )
-  ok(
-    'the frozen paragraph is in the static part',
-    two.render().includes('<p>first paragraph here.</p>'),
-  )
-
-  // finish() is what the stored transcript renders, animated or not.
-  const f = new LiveMarkdown()
-  for (const w of words('a simple answer with **bold** and a list\n- one\n- two\n')) {
-    f.push(w)
-    f.renderReveal()
-  }
-  eq('animation does not leak into the final DOM', f.finish(), renderMarkdown(f.text))
 }
 
 if (failed) {

@@ -37,7 +37,11 @@ pub struct HostConfig {
     pub max_tokens: Option<u32>,
     /// Prompt token budget. Compaction is expensive (it throws away the prefix
     /// cache), so this should sit near the server's context window, not below it.
-    pub context_budget: usize,
+    ///
+    /// `None` derives it from the model's advertised window. A hard 8 000 sat in
+    /// front of a 262 144-token model and compacted 43k-token conversations while
+    /// reporting "context full" at 16% occupancy.
+    pub context_budget: Option<usize>,
     /// Extra volatile context appended to the newest user message.
     pub env_block: String,
     /// How long an unanswered approval prompt waits before refusing.
@@ -56,14 +60,77 @@ impl HostConfig {
             workspace: workspace.into(),
             mode: ApprovalMode::Ask,
             reasoning: Reasoning::XHigh,
-            max_tool_iters: 8,
+            // A runaway guard, not a work budget. 8 ended research-then-write
+            // tasks before they could report anything; see the wrap-up in agent.rs.
+            max_tool_iters: 14,
             max_tokens: None,
-            context_budget: 8_000,
+            context_budget: None,
             env_block: String::new(),
             approval_timeout: std::time::Duration::from_secs(300),
             max_attachments: 4,
             max_attachment_bytes: 2 * 1024 * 1024,
         }
+    }
+}
+
+/// Budget when the caller did not pin one: most of the window, minus headroom
+/// for the reply and for the token estimate's own optimism.
+const FALLBACK_BUDGET: usize = 8_000;
+
+fn auto_budget(window: usize) -> usize {
+    // 72% of the window: the estimate is chars/3.5 plus framing, which is
+    // conservative for CJK and short on code, and the model still needs room to
+    // answer after the history is loaded.
+    ((window as f64 * 0.72) as usize)
+        .saturating_sub(2_048)
+        .max(4_096)
+}
+
+/// Read the loaded model's advertised window and set the compaction budget.
+async fn apply_context_budget(
+    agent: &mut Agent,
+    provider: &Arc<dyn crate::provider::Provider>,
+    pinned: Option<usize>,
+    state: &Arc<std::sync::Mutex<HostState>>,
+) {
+    let model = agent.model();
+    let window = provider
+        .list_models_info()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|m| m.id == model)
+        .and_then(|m| m.context_tokens)
+        .map(|t| t as usize);
+
+    let budget = pinned.unwrap_or_else(|| window.map(auto_budget).unwrap_or(FALLBACK_BUDGET));
+    {
+        let p = agent.prompt_mut();
+        p.token_budget = budget;
+        p.context_window = window;
+    }
+    let mut s = state.lock().unwrap();
+    s.context_budget = budget;
+    s.model_window = window;
+    drop(s);
+    eprintln!(
+        "[cwoffee] context budget {budget} tokens (model window {}, budget {})",
+        window.map(|w| w.to_string()).unwrap_or_else(|| "unknown".into()),
+        if pinned.is_some() { "pinned in config" } else { "derived" }
+    );
+}
+
+fn context_budget_note(state: &Arc<std::sync::Mutex<HostState>>, model: &str) -> String {
+    let s = state.lock().unwrap();
+    match s.model_window {
+        Some(w) => format!(
+            "{model}: {w} token window, compaction budget {} tokens",
+            s.context_budget
+        ),
+        None => format!(
+            "{model} did not state a context window; compaction budget {} tokens",
+            s.context_budget
+        ),
     }
 }
 
@@ -186,6 +253,12 @@ pub struct HostState {
     pub turns: u64,
     pub context_tokens: usize,
     pub compactions: u32,
+    /// The compaction budget in force, and the window it came from. Without these
+    /// a compaction message is a claim with nothing to check it against.
+    #[serde(default)]
+    pub context_budget: usize,
+    #[serde(default)]
+    pub model_window: Option<usize>,
     /// Seconds before an unanswered approval fails closed. The UI shows this as a
     /// countdown: a turn blocked on a human looks identical to a turn still
     /// working, and that difference is the entire message.
@@ -254,6 +327,8 @@ impl SessionHost {
             approval_timeout_secs: cfg.approval_timeout.as_secs(),
             workspace_refusal: None,
             refusal_seq: 0,
+            context_budget: cfg.context_budget.unwrap_or(FALLBACK_BUDGET),
+            model_window: None,
         }));
         let limits = AttachmentLimits {
             max_count: cfg.max_attachments,
@@ -264,6 +339,9 @@ impl SessionHost {
         // The task takes the provider; the host keeps a second handle for
         // non-turn questions like the model list.
         let host_provider = Arc::clone(&provider);
+        // The loop task needs a handle too: the compaction budget comes from the
+        // window the *loaded* model advertises, which is a provider question.
+        let budget_provider = Arc::clone(&provider);
 
         // Built here, not inside the task, so the host can hold the agent's own
         // cancel flag. `SessionHost::cancel()` used to set a separate AtomicBool
@@ -291,7 +369,7 @@ impl SessionHost {
             },
             ctx,
         );
-        agent.prompt_mut().token_budget = cfg.context_budget;
+        agent.prompt_mut().token_budget = cfg.context_budget.unwrap_or(FALLBACK_BUDGET);
         agent.prompt_mut().set_env(cfg.env_block.clone());
         let cancel = agent.cancel_handle();
         let agent_cancel = cancel.clone();
@@ -308,11 +386,147 @@ impl SessionHost {
             // into a sidebar full of identical blanks. A session row now appears
             // when the first message is sent.
             let mut session_id: i64 = 0;
+            // Sessions already told about a cold prompt cache. Saying it once per
+            // session per process is enough; the user re-clicking a row in the
+            // sidebar does not make the cache warmer.
+            let mut cold_announced: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
             {
                 let mut s = state_bg.lock().unwrap();
                 s.session_id = session_id;
             }
+
+            // Everything that changes when the host starts working on a different
+            // conversation: load its history, follow the folder its row names,
+            // rebind the persistence target, and tell every client. Two callers
+            // need it - an explicit switch, and a turn addressed to a conversation
+            // the host is not on - and a copy of this in each is how the two would
+            // drift apart, which is exactly how "my conversation got mutated"
+            // happened once already.
+            macro_rules! adopt_view {
+                ($target:expr) => {{
+                    let id = $target;
+                    // A row that does not exist is not an empty conversation:
+                    // `history()` answers an empty list for either, and switching
+                    // to a phantom id leaves the host reporting a session nothing
+                    // can load, with the next turn appended into nowhere.
+                    let real = matches!(store.session(id), Ok(Some(_)));
+                    if !real {
+                        let _ = ev_tx.send(EngineEvent::Error {
+                            message: format!(
+                                "session {id} does not exist: nothing was sent, and the host stays on session {session_id}"
+                            ),
+                            fatal: false,
+                        });
+                        false
+                    } else {
+                        match store.history(id) {
+                        Ok(hist) => {
+                            // Replayed messages keep sequence 0..n-1, which
+                            // lines up 1:1 with the rows already in the DB,
+                            // so resuming cannot re-persist them.
+                            let n = hist.len() as u64;
+                            agent.prompt_mut().with_history(hist);
+                            agent.prompt_mut().set_first_seq(0);
+                            agent.reset_turn_id();
+                            persisted_next = n;
+                            // Must rebind the persistence target too, not just
+                            // the reported state, or the resumed session's new
+                            // messages land in whichever session was active.
+                            session_id = id;
+                            // A session lives where its row says it lives. The
+                            // sidebar groups sessions by folder, so the tools
+                            // have to follow when one is clicked - and a folder
+                            // that has gone missing has to say so rather than
+                            // quietly run tools in the last good place, which
+                            // is how a file ends up written in the wrong tree.
+                            //
+                            // Done before taking the state lock: this branch
+                            // already holds it further down, and a nested lock
+                            // on the same mutex deadlocks the host loop. (It
+                            // did, in this very arm.)
+                            let row = store.session(id).ok().flatten();
+                            let mut follow_ws: Option<std::path::PathBuf> = None;
+                            if let Some(row) = row.as_ref() {
+                                if row.workspace != agent.workspace().display().to_string() {
+                                    match check_workspace(&row.workspace) {
+                                        Ok(p) => {
+                                            agent.set_workspace(p.clone());
+                                            agent
+                                                .prompt_mut()
+                                                .set_env(default_env_block(&p, "linux"));
+                                            let _ = ev_tx.send(EngineEvent::Note {
+                                                message: format!(
+                                                    "workspace is now {} (from this session)",
+                                                    p.display()
+                                                ),
+                                            });
+                                            follow_ws = Some(p);
+                                        }
+                                        Err(reason) => {
+                                            let msg = format!(
+                                                "session {id} lives in {:?}, which the engine refused: {reason}. Tools stay in {}",
+                                                row.workspace,
+                                                agent.workspace().display()
+                                            );
+                                            let _ = ev_tx.send(EngineEvent::Error {
+                                                message: msg,
+                                                fatal: false,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            let mut s = state_bg.lock().unwrap();
+                            s.session_id = id;
+                            s.context_tokens = agent.prompt_mut().estimate_tokens("");
+                            s.compactions = 0;
+                            if let Some(p) = follow_ws {
+                                s.workspace = p.display().to_string();
+                            }
+                            let title = row.map(|x| x.title).unwrap_or_default();
+                            let _ = ev_tx.send(EngineEvent::SessionChanged {
+                                session_id: id,
+                                title,
+                            });
+                            // Prefix-cache state is only interesting when it
+                            // costs something, so an empty or freshly created
+                            // session says nothing at all: the unconditional
+                            // warning used to mark every New Session as if
+                            // something had gone wrong. It is a note rather
+                            // than a warning for the same reason - a cold cache
+                            // is the expected state after a restart, not a
+                            // fault.
+                            if n > 0 && cold_announced.insert(id) {
+                                // `s` already holds the state lock; re-entering
+                                // it here deadlocks the host task (Trap 30).
+                                let est = s.context_tokens;
+                                let budget = s.context_budget;
+                                let _ = ev_tx.send(EngineEvent::Note {
+                                    message: format!(
+                                        "resumed session {id}: {n} message(s), ~{est} tokens of a \
+                                         {budget} token budget; the prompt cache is cold after a \
+                                         restart, so the first reply re-prefills the history"
+                                    ),
+                                });
+                            }
+                            true
+                        }
+                        Err(e) => {
+                            let _ = ev_tx.send(EngineEvent::Error {
+                                message: format!("cannot load session {id}: {e}"),
+                                fatal: false,
+                            });
+                            false
+                        }
+                        }
+                    }
+                }};
+            }
+
+            // Ask the endpoint what the model can actually hold, once, before the
+            // first turn. Everything else about the budget follows from that.
+            apply_context_budget(&mut agent, &budget_provider, cfg.context_budget, &state_bg).await;
 
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -326,6 +540,17 @@ impl SessionHost {
                         session_id = 0;
                         persisted_next = 0;
                         agent.replace_prompt(PromptBuilder::new());
+                        // Clearing the transcript must not reset the sizing: the
+                        // budget belongs to the model, not to the conversation.
+                        {
+                            let (b, w) = {
+                                let st = state_bg.lock().unwrap();
+                                (st.context_budget, st.model_window)
+                            };
+                            let p = agent.prompt_mut();
+                            p.token_budget = b;
+                            p.context_window = w;
+                        }
                         agent.prompt_mut().set_env(cfg.env_block.clone());
                         {
                             let mut s = state_bg.lock().unwrap();
@@ -404,7 +629,16 @@ impl SessionHost {
                             });
                         } else {
                             agent.set_model(model.clone());
+                            let model_now = agent.model();
                             state_bg.lock().unwrap().model = model;
+                            // Different model, different window. A budget carried
+                            // over from the previous model is how a compaction
+                            // warning shows up in a session that is nowhere near
+                            // full.
+                            apply_context_budget(&mut agent, &budget_provider, cfg.context_budget, &state_bg).await;
+                            let _ = ev_tx.send(EngineEvent::Note {
+                                message: context_budget_note(&state_bg, &model_now),
+                            });
                         }
                     }
 
@@ -431,7 +665,16 @@ impl SessionHost {
                                 persisted_next = 0;
                                 *agent.prompt_mut() = {
                                     let mut p = PromptBuilder::new();
-                                    p.token_budget = cfg.context_budget;
+                                    // The budget resolved for the loaded model, not
+                                    // the config default: a new session in the same
+                                    // process should not re-derive it, and a pinned
+                                    // value is already in there.
+                                    let (b, w) = {
+                                        let st = state_bg.lock().unwrap();
+                                        (st.context_budget, st.model_window)
+                                    };
+                                    p.token_budget = b;
+                                    p.context_window = w;
                                     p.set_env(cfg.env_block.clone());
                                     p
                                 };
@@ -455,88 +698,12 @@ impl SessionHost {
                     }
 
                     HostCmd::SwitchSession { id } => {
-                        match store.history(id) {
-                            Ok(hist) => {
-                                // Replayed messages keep sequence 0..n-1, which
-                                // lines up 1:1 with the rows already in the DB,
-                                // so resuming cannot re-persist them.
-                                let n = hist.len() as u64;
-                                agent.prompt_mut().with_history(hist);
-                                agent.prompt_mut().set_first_seq(0);
-                                agent.reset_turn_id();
-                                persisted_next = n;
-                                // Must rebind the persistence target too, not just
-                                // the reported state, or the resumed session's new
-                                // messages land in whichever session was active.
-                                session_id = id;
-                                // A session lives where its row says it lives. The
-                                // sidebar groups sessions by folder, so the tools
-                                // have to follow when one is clicked - and a folder
-                                // that has gone missing has to say so rather than
-                                // quietly run tools in the last good place, which
-                                // is how a file ends up written in the wrong tree.
-                                //
-                                // Done before taking the state lock: this branch
-                                // already holds it further down, and a nested lock
-                                // on the same mutex deadlocks the host loop. (It
-                                // did, in this very arm.)
-                                let row = store.session(id).ok().flatten();
-                                let mut follow_ws: Option<std::path::PathBuf> = None;
-                                if let Some(row) = row.as_ref() {
-                                    if row.workspace != agent.workspace().display().to_string() {
-                                        match check_workspace(&row.workspace) {
-                                            Ok(p) => {
-                                                agent.set_workspace(p.clone());
-                                                agent
-                                                    .prompt_mut()
-                                                    .set_env(default_env_block(&p, "linux"));
-                                                let _ = ev_tx.send(EngineEvent::Note {
-                                                    message: format!(
-                                                        "workspace is now {} (from this session)",
-                                                        p.display()
-                                                    ),
-                                                });
-                                                follow_ws = Some(p);
-                                            }
-                                            Err(reason) => {
-                                                let msg = format!(
-                                                    "session {id} lives in {:?}, which the engine refused: {reason}. Tools stay in {}",
-                                                    row.workspace,
-                                                    agent.workspace().display()
-                                                );
-                                                let _ = ev_tx.send(EngineEvent::Error {
-                                                    message: msg,
-                                                    fatal: false,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                                let mut s = state_bg.lock().unwrap();
-                                s.session_id = id;
-                                s.context_tokens = agent.prompt_mut().estimate_tokens("");
-                                s.compactions = 0;
-                                if let Some(p) = follow_ws {
-                                    s.workspace = p.display().to_string();
-                                }
-                                let title = row.map(|x| x.title).unwrap_or_default();
-                                let _ = ev_tx.send(EngineEvent::SessionChanged {
-                                    session_id: id,
-                                    title,
-                                });
-                                let _ = ev_tx.send(EngineEvent::Error {
-                                    message: format!("resumed session {id} with {n} messages; \
-                                                      the prefix cache is cold, first turn will be slow"),
-                                    fatal: false,
-                                });
-                            }
-                            Err(e) => {
-                                let _ = ev_tx.send(EngineEvent::Error {
-                                    message: format!("cannot load session {id}: {e}"),
-                                    fatal: false,
-                                });
-                            }
-                        }
+                        // An explicit request to work on this conversation. The UI
+                        // no longer sends it for looking: viewing a session and
+                        // making it the one the engine works on are different acts,
+                        // and conflating them meant every click printed a workspace
+                        // note and a cache warning into the transcript.
+                        adopt_view!(id);
                     }
 
                     HostCmd::Send { text, attachments, session } => {
@@ -574,13 +741,16 @@ impl SessionHost {
                         }
                         if let Some(want) = session {
                             if want > 0 && want != session_id {
-                                let _ = ev_tx.send(EngineEvent::Error {
-                                    message: format!(
-                                        "the turn asked for session {want}, but the host is on session {session_id}: nothing was sent. Open that conversation, or start a new one, and try again."
-                                    ),
-                                    fatal: false,
-                                });
-                                continue;
+                                // The turn is addressed to a conversation the host
+                                // is not on. Since browsing no longer moves the host,
+                                // sending is what moves it: adopt the addressed
+                                // conversation, then run the turn there. A turn is
+                                // only ever added to the conversation it names, and
+                                // if that conversation cannot be loaded, nothing is
+                                // sent at all.
+                                if !adopt_view!(want) {
+                                    continue;
+                                }
                             }
                         }
                         if session_id == 0 {
@@ -911,6 +1081,9 @@ mod tests {
     /// Scripted provider: fixed replies, no network.
     struct Scripted {
         replies: std::sync::Mutex<Vec<String>>,
+        /// What the endpoint advertises as the loaded model's context window.
+        /// `None` is the honest "the server never said".
+        window: Option<u64>,
         calls: AtomicUsize,
         /// What the provider actually received, so a test can prove an
         /// attachment survived the host, the prompt builder and the request.
@@ -962,12 +1135,21 @@ mod tests {
                 .map_err(|_| ProviderError::Cancelled)?;
             Ok(())
         }
+
+        async fn list_models_info(&self) -> Result<Vec<crate::provider::ModelInfo>, ProviderError> {
+            Ok(vec![crate::provider::ModelInfo {
+                id: "test-model".into(),
+                context_tokens: self.window,
+                ..Default::default()
+            }])
+        }
     }
 
     fn host(replies: Vec<String>) -> (SessionHost, Arc<Store>) {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(replies),
+            window: None,
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
         });
@@ -1113,6 +1295,125 @@ mod tests {
         wait_for("into b".into(), || h.state().workspace == b.display().to_string()).await;
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A budget is a property of the model, not of the app. The number used to be
+    /// a constant, which compacted 43k-token conversations on a model with a
+    /// 262 144-token window and then announced "context full".
+    #[test]
+    fn the_budget_sized_from_a_real_window() {
+        assert_eq!(auto_budget(262_144), 186_695);
+        assert_eq!(auto_budget(8_192), 4_096, "a small window cannot go below the floor");
+        assert_eq!(auto_budget(0), 4_096);
+    }
+
+    #[tokio::test]
+    async fn the_context_budget_follows_the_loaded_model() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p = Arc::new(Scripted {
+            replies: std::sync::Mutex::new(vec!["ok".into()]),
+            window: Some(262_144),
+            calls: AtomicUsize::new(0),
+            seen_attachments: Arc::new(AtomicUsize::new(0)),
+        });
+        let h = SessionHost::spawn(
+            p,
+            Registry::new(),
+            Arc::clone(&store),
+            HostConfig::new("test-model", std::env::temp_dir()),
+        );
+        ready(&h).await;
+        // One provider round-trip happens before the budget lands, so wait for it
+        // rather than the first turn.
+        wait_for(
+            "budget derived".into(),
+            || h.state().context_budget == auto_budget(262_144),
+        )
+        .await;
+        assert_eq!(h.state().model_window, Some(262_144));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_budget_is_not_overridden_by_the_window() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p = Arc::new(Scripted {
+            replies: std::sync::Mutex::new(vec!["ok".into()]),
+            window: Some(262_144),
+            calls: AtomicUsize::new(0),
+            seen_attachments: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut cfg = HostConfig::new("test-model", std::env::temp_dir());
+        cfg.context_budget = Some(12_000);
+        let h = SessionHost::spawn(p, Registry::new(), Arc::clone(&store), cfg);
+        ready(&h).await;
+        // Wait on the provider round-trip, not on the number: the state starts at
+        // the pinned value, so the budget alone proves nothing about the window.
+        wait_for("window reported".into(), || h.state().model_window == Some(262_144)).await;
+        assert_eq!(h.state().context_budget, 12_000, "the window overrode the pin");
+    }
+
+    /// Cold-cache information, not a fault: it belongs to a session with history
+    /// to re-prefill, and an empty one must not be marked as though something went
+    /// wrong. This was the "warning on every new session" complaint.
+    #[tokio::test]
+    async fn an_empty_session_is_not_announced_as_cold() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p = Arc::new(Scripted {
+            replies: std::sync::Mutex::new(vec!["one".into(), "two".into()]),
+            window: None,
+            calls: AtomicUsize::new(0),
+            seen_attachments: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut h = SessionHost::spawn(
+            p,
+            Registry::new(),
+            Arc::clone(&store),
+            HostConfig::new("test-model", std::env::temp_dir()),
+        );
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+
+        // A session with one message, so there is something to resume into.
+        h.submit("seed");
+        turns_done(&h, 1).await;
+        let sid = h.state().session_id;
+        assert_ne!(sid, 0);
+
+        h.send(HostCmd::ClearSession);
+        wait_for("draft".into(), || h.state().session_id == 0).await;
+        let fresh = store.create_session("fresh", "/tmp", "test-model").unwrap();
+        h.send(HostCmd::SwitchSession { id: fresh });
+        wait_for("switched".into(), || h.state().session_id == fresh).await;
+        let cold: Vec<String> = (|| {
+            let mut out = Vec::new();
+            while let Ok(e) = ev.try_recv() {
+                if let EngineEvent::Note { message } = e {
+                    if message.contains("prompt cache") {
+                        out.push(message);
+                    }
+                }
+            }
+            out
+        })();
+        assert!(
+            cold.is_empty(),
+            "an empty session was told about a cold cache: {cold:?}"
+        );
+
+        // Same session again: still nothing. And the seeded session says so once,
+        // as a note, with numbers.
+        h.send(HostCmd::SwitchSession { id: sid });
+        wait_for("back".into(), || h.state().session_id == sid).await;
+        let mut saw_cold = false;
+        while let Ok(e) = ev.try_recv() {
+            if let EngineEvent::Note { message } = e {
+                if message.contains("prompt cache") {
+                    saw_cold = true;
+                    assert!(message.contains("token"), "the note had no numbers: {message}");
+                }
+            }
+        }
+        assert!(saw_cold, "a resumed history did not mention the cold cache");
     }
 
     /// Same lock, session row created the way the desktop command does it: a row in
@@ -1413,6 +1714,7 @@ mod tests {
         let store = Arc::new(Store::in_memory().unwrap());
         let seen = Arc::new(AtomicUsize::new(0));
         let p = Arc::new(Scripted {
+            window: None,
             replies: std::sync::Mutex::new(vec!["noted".into()]),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::clone(&seen),
@@ -1484,26 +1786,32 @@ mod tests {
     /// appear in the chat the user is looking at. Naming the target, and refusing a
     /// mismatch, makes that impossible rather than merely unlikely.
     #[tokio::test]
-    async fn a_turn_named_for_another_session_is_refused() {
+    async fn a_turn_moves_the_host_to_the_conversation_it_names() {
         let ws = std::env::temp_dir().display().to_string();
-        let (mut h, store) = host(vec!["the turn ran".into()]);
+        let (mut h, store) = host(vec!["the turn ran".into(), "next one".into()]);
         let a = store.create_session("alpha", &ws, "test-model").unwrap();
         let b = store.create_session("beta", &ws, "test-model").unwrap();
         h.send(HostCmd::SwitchSession { id: a });
         wait_for("on alpha".into(), || h.state().session_id == a).await;
 
+        // Browsing does not move the host, so a turn addressed to another
+        // conversation is what moves it - and it lands exactly where it said.
         h.send_turn_to("this belongs to beta", vec![], Some(b));
-        // Give the loop every chance to run it. If it does, the assertion fires.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert_eq!(h.state().turns, 0, "a mis-addressed turn ran anyway");
-        assert!(store.history(a).unwrap().is_empty(), "it landed in the host's session");
-        assert!(store.history(b).unwrap().is_empty(), "it landed where it asked");
-
-        // Right target: it runs, and lands exactly where it said.
-        h.send_turn_to("this belongs to alpha", vec![], Some(a));
         wait_for("the addressed turn ran".into(), || h.state().turns == 1).await;
-        assert_eq!(store.history(a).unwrap().len(), 2, "user + assistant in alpha");
-        assert!(store.history(b).unwrap().is_empty(), "beta still untouched");
+        assert_eq!(h.state().session_id, b, "the host did not follow the addressee");
+        assert_eq!(store.history(b).unwrap().len(), 2, "user + assistant in beta");
+        assert!(
+            store.history(a).unwrap().is_empty(),
+            "the conversation that was open before got written into"
+        );
+
+        // An addressee that does not exist: nothing is sent, and the host stays
+        // put. Falling back to "whatever was open" is the bug this guards.
+        h.send_turn_to("nowhere to go", vec![], Some(b + 1000));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(h.state().turns, 1, "a turn with no addressee ran anyway");
+        assert_eq!(h.state().session_id, b, "the host moved to chase a missing row");
+        assert_eq!(store.history(b).unwrap().len(), 2, "the turn was appended anyway");
     }
 
     /// `session: Some(0)` means "my view is a draft". The send has to open its own
@@ -1743,6 +2051,7 @@ mod tests {
     async fn approval_channel_stays_open_and_unused_when_no_tools_are_called() {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {
+            window: None,
             replies: std::sync::Mutex::new(vec!["tool".into()]),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
@@ -1789,14 +2098,36 @@ mod tests {
         assert_eq!(got.len(), 1, "expected exactly one announcement, got {evs:?}");
         assert_eq!(got[0].1, "beta");
 
-        h.send(HostCmd::SwitchSession { id: first });
-        wait_for("switch back".into(), || h.state().session_id == first).await;
+        // A second conversation, then back to the first. The draft (session 0) is
+        // not a switch target: there is no row to load.
+        let beta = h.state().session_id;
+        h.send(HostCmd::NewSession { title: "gamma".into() });
+        wait_for("a second session".into(), || h.state().session_id != beta).await;
+        h.send(HostCmd::SwitchSession { id: beta });
+        wait_for("switch back".into(), || h.state().session_id == beta).await;
         let evs = drain_events(&mut ev).await;
         assert!(
             evs.iter()
-                .any(|e| matches!(e, EngineEvent::SessionChanged { session_id, .. } if *session_id == first)),
+                .any(|e| matches!(e, EngineEvent::SessionChanged { session_id, .. } if *session_id == beta)),
             "switching must also announce: {evs:?}"
         );
+    }
+
+    /// An id matching no row is refused. `history()` answers an empty list for a
+    /// missing session, so without this the host happily "switches" to a phantom
+    /// conversation and the next turn is appended to nothing.
+    #[tokio::test]
+    async fn switching_to_a_missing_session_says_so() {
+        let (mut h, _store) = host(vec![]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+        let before = h.state().session_id;
+        h.send(HostCmd::SwitchSession { id: 987_654 });
+        assert!(
+            await_error(&mut ev, "does not exist").await,
+            "the refusal never reached the client"
+        );
+        assert_eq!(h.state().session_id, before, "the host moved to a phantom session");
     }
 
     #[tokio::test]

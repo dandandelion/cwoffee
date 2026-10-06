@@ -16,6 +16,7 @@
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
   import { Transcript, linkProbe, subjectFor, riskHeadline } from './lib/transcript'
+  import { installContextMenu } from './lib/ctxmenu'
   import { pageLog } from './lib/pagelog'
 
   // ---- state --------------------------------------------------------------
@@ -286,9 +287,14 @@
 
   /** What the composer's folder chip says. In a draft it names the folder the
    * session will get, which need not be the folder the host is still holding. */
-  const wsChipLabel = $derived.by(() =>
-    viewId === null && draftWorkspace ? draftWsLabel : shortWorkspace,
-  )
+  // The folder shown next to the composer is the folder of the conversation on
+  // screen, not whatever the engine last moved to: since browsing no longer moves
+  // the engine, the two legitimately differ.
+  const wsChipLabel = $derived.by(() => {
+    if (viewId === null) return draftWorkspace ? draftWsLabel : shortWorkspace
+    const stored = sessions.find((s) => s.id === viewId)?.workspace ?? ''
+    return stored ? basenameOf(stored) : 'no folder'
+  })
 
   const draftWsLabel = $derived(
     draftWorkspace
@@ -1727,27 +1733,22 @@
   async function openSession(id: number) {
     closeDrawerOnMobile()
     if (id === viewId) return
+    // Looking is not working. This used to end in `switch_session`, so every click
+    // in the sidebar moved the engine: the workspace line changed, a cold-cache note
+    // appeared, and a glance at another conversation rewrote the state of the one
+    // you were reading. The host now follows the *composer*: a turn carries the
+    // conversation it was sent from, and that is the moment the engine moves.
     await resyncView(id)
-    // The view has already moved; the host's switch is a separate thing. While a
-    // turn runs, the host loop is *inside* that turn, so this command queues behind
-    // it - and awaiting it here meant clicking another session froze until the turn
-    // ended. That is what "you can't change sessions mid-conversation" looked like.
-    const sw = invoke('switch_session', { id })
-    if (hostState?.busy) {
-      sw.catch((e) => pageLog(`switch_session queued behind the running turn: ${e}`))
-    } else {
-      try {
-        await sw
-      } catch (e) {
-        pageLog(`switch_session failed: ${e}`)
-      }
-    }
   }
 
   async function resyncView(id: number) {
     const mySeq = ++resyncSeq
     resyncing++
     viewId = id
+    // The transcript owns buttons that name a conversation (export), so it needs
+    // the id of what is on screen - which is not the same as the session the
+    // engine happens to be working on.
+    if (transcript) transcript.sessionId = id
     transcript?.clear()
     try {
       await loadTranscript(id)
@@ -1771,6 +1772,7 @@
   // the first message is sent, already titled by that message.
   function newSession() {
     viewId = null
+    if (transcript) transcript.sessionId = 0
     viewMsgCount = 0
     hasOlder = false
     oldestId = null
@@ -2105,13 +2107,31 @@
         // a remote client moving the host by loading a page - is covered by the
         // gateway's own tests, where bootstrap and resync are read-only and a
         // watch token cannot drive at all.
+        // Browsing is not working. Opening a conversation moves the *view* and
+        // leaves the engine where it was: a click in the sidebar used to run a full
+        // session switch, which re-adopted that session's workspace and re-announced
+        // a cold prompt cache, so reading someone else's conversation printed a
+        // workspace-change note and a cache warning that looked spontaneous. The host
+        // follows a turn, not a mouse.
         const stAfter = await invoke<HostState>('session_state')
-        if (stAfter.session_id !== 0 && stAfter.session_id !== other.id) {
-          fail(`host moved to neither the old nor the opened session: ${stAfter.session_id}`)
-        }
+        if (stAfter.session_id !== stNow.session_id)
+          fail(`opening a session moved the host: ${stNow.session_id} -> ${stAfter.session_id}`)
+        const noise = [...document.querySelectorAll('.blk-note, .blk-warn')]
+          .map((n) => n.textContent ?? '')
+          .filter((t) => /prompt cache|workspace/i.test(t))
+        if (noise.length)
+          fail(`browsing announced host plumbing: ${noise[0].slice(0, 110)}`)
+        // The folder chip has to follow the conversation on screen, not the one the
+        // engine happens to be working in - otherwise the chip lies while you read.
+        const wanted = sessions.find((x) => x.id === other.id)?.workspace ?? ''
+        // Scoped to the composer: the sidebar has its own .wsrow rows, and the
+        // first match in the document is a folder group, not the chip.
+        const chip = document.querySelector('.cbox .wsrow span')?.textContent?.trim() ?? ''
+        if (wanted && chip && !chip.includes(wanted.split('/').filter(Boolean).pop() ?? ''))
+          fail(`composer folder chip shows ${chip} while viewing ${wanted}`)
         pageLog(
-          `openSession(${other.id}): view moved, host ${stNow.session_id}->${stAfter.session_id}, ` +
-            `transcript reloaded=${domChanged}`,
+          `openSession(${other.id}): view moved, host stayed on ${stAfter.session_id}, ` +
+            `transcript reloaded=${domChanged}, no host noise`,
         )
       }
 
@@ -3405,42 +3425,251 @@
         pageLog('collapsed cards, english headers and bubbles ok')
       }
 
-      // --- thinking fills the block instead of growing down it -----------------
-      // Each streamed delta used to become its own <div>, so a thinking block was a
-      // stack of one-clause lines, full width and half-empty, and the block got
-      // taller on every paint - which read as a flicker as well as a layout bug.
+      // --- the streaming reveal: append-only, word by word, never rewritten ----
+      // The earlier designs re-rendered the growing paragraph and folded finished
+      // chunks back into it. Every version of that made already-arrived text blink
+      // again about half a second after it landed, because folding is a rewrite and
+      // a rewrite re-rasters. What is provable from the DOM is the property the fix
+      // rests on: a node that has been painted is never replaced, and the spans
+      // concatenate back to exactly what the model sent.
       {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
-        for (const p of [
+        const deltas = [
           'thinking about the first clause, ',
           'then the second clause carries on ',
           'and a third arrives so the line has to wrap ',
           'across the block rather than down it.',
-        ]) {
-          transcript?.apply({ kind: 'reasoning', d: p })
-          // One chunk per repaint is the design: the reveal unit is whatever landed
-          // since the last paint. Applying four deltas in the same microtask makes one
-          // chunk, and a check that expects four is a check that misunderstands it.
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 30)))
+        ]
+        // Remember nodes by identity. If the paint machinery ever rewrites settled
+        // text again, these references stop being connected and this fails.
+        const seen: HTMLElement[] = []
+        const seenText: string[] = []
+        for (const d of deltas) {
+          transcript?.apply({ kind: 'reasoning', d })
+          // One paint per delta: the reveal unit is whatever landed since the last
+          // paint, and a check that applies them in one microtask tests one chunk.
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          transcript?.flushNow()
+          const body = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
+          const tins = [...(body?.querySelectorAll('.tin') ?? [])] as HTMLElement[]
+          if (!tins.length) fail('a reasoning delta produced no reveal spans')
+          for (const t of seen) {
+            if (!t.isConnected) fail('a revealed word was removed from the DOM after arriving')
+          }
+          for (const t of tins) {
+            if (!seen.includes(t)) {
+              seen.push(t)
+              seenText.push(t.textContent ?? '')
+            }
+          }
+          const disp = new Set(tins.map((t) => getComputedStyle(t).display))
+          if (disp.has('block')) fail(`reveal spans are block-level: ${[...disp].join(',')}`)
         }
+        const body = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
+        const br = body.getBoundingClientRect()
+        const text = [...body.querySelectorAll('.tin')]
+          .map((t) => t.textContent ?? '')
+          .join('')
+        if (text !== deltas.join(''))
+          fail(`the reveal lost characters: got ${JSON.stringify(text.slice(0, 40))}...`)
+        // The block must fill the column rather than stack one clause per line.
+        const first = seen[0].getBoundingClientRect()
+        const last = seen[seen.length - 1].getBoundingClientRect()
+        if (first.top === last.top && br.width > 400)
+          fail('the thinking block is one line wide, not filling the column')
+        if (seen.length < deltas.length)
+          fail(`${seen.length} spans for ${deltas.length} arrivals: words are being merged or dropped`)
+        // Newlines are kept while streaming, or an answer arrives as one grey wall
+        // until the markdown pass breaks it up - the one layout jump in a turn.
+        transcript?.apply({ kind: 'text', d: 'x\n\ny' })
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
         transcript?.flushNow()
-        const tins = [...document.querySelectorAll('.think-tin')] as HTMLElement[]
-        if (tins.length < 2) fail(`streaming thinking made ${tins.length} reveal chunks`)
-        const disp = tins.map((t) => getComputedStyle(t).display)
-        if (disp.some((d) => d !== 'inline'))
-          fail(`thinking chunks are block-level: ${disp.join(',')}`)
-        const run = document.querySelector('.think-run') as HTMLElement
-        const body = run?.closest('.blk-body') as HTMLElement
-        if (!run || !body) fail('no thinking run to measure')
+        const ans = document.querySelector('.blk-answer .blk-body') as HTMLElement
+        if (getComputedStyle(ans).whiteSpace !== 'pre-wrap')
+          fail('a streaming answer collapses newlines')
+        transcript?.clear()
+        pageLog(`append-only reveal ok (${seen.length} word spans, none rewritten)`)
+      }
+
+      // --- thinking sits under its own label; other blocks keep the gutter -----
+      // The thinking label is a heading for the text under it: label, rule and body
+      // edge share an x. Every other block hangs its label in the left gutter so the
+      // reading column stays one straight edge. The two layouts are deliberate and
+      // must not drift into each other.
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'reasoning', d: 'a thought worth reading, long enough to wrap a little.' })
+        transcript?.apply({ kind: 'text', d: 'an answer in the normal column' })
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 80))
+        const think = document.querySelector('.blk-reasoning') as HTMLElement
+        const ans = document.querySelector('.blk-answer') as HTMLElement
+        if (!think || !ans) fail('missing thinking or answer block to compare')
         else {
-          const rr = run.getBoundingClientRect()
+          // A settled thinking body is collapsed by design, and a collapsed element
+          // measures 0 - so open it before measuring it.
+          const head = think.querySelector('.blk-head') as HTMLElement
+          const body = think.querySelector('.blk-body') as HTMLElement
+          head.click()
+          await new Promise((r) => setTimeout(r, 300))
+          const hr = head.getBoundingClientRect()
           const br = body.getBoundingClientRect()
-          if (rr.width < br.width * 0.7)
-            fail(`thinking grows down instead of across: run ${Math.round(rr.width)}px inside ${Math.round(br.width)}px`)
+          const pad = parseFloat(getComputedStyle(body).paddingLeft || '0')
+          if (br.width < 100) fail(`expanded thinking block has no width: ${Math.round(br.width)}`)
+          if (Math.abs(hr.left - br.left) > 1.5)
+            fail(`thinking label is not above its text: head ${Math.round(hr.left)} vs body ${Math.round(br.left)}`)
+          // The rule is drawn at the body's left edge, so it lines up with the label.
+          if (Math.abs(br.left - hr.left) > 1.5)
+            fail(`thinking rule is not under the label: ${Math.round(br.left)} vs ${Math.round(hr.left)}`)
+          if (pad < 8) fail(`thinking text is not tucked under the rule: ${pad}px`)
+          const aHead = ans.querySelector('.blk-head')!.getBoundingClientRect()
+          const aBody = ans.querySelector('.blk-body')!.getBoundingClientRect()
+          if (aBody.left - aHead.left < 40)
+            fail(`answer label is no longer outdented: head ${Math.round(aHead.left)} body ${Math.round(aBody.left)}`)
+          const label = think.querySelector('.blk-head')?.textContent ?? ''
+          if (!/^Thought for /i.test(label.trim())) fail(`settled thinking reads "${label}"`)
         }
         transcript?.clear()
-        pageLog('thinking reveal is inline ok')
+        pageLog('thinking aligns under its label ok')
+      }
+
+      // --- the label does not crowd the answer while it streams -----------------
+      // Reported as "the CWOFFEE tag sits too close to the text while it writes, and
+      // it fixes itself at the end". The label lives in the gutter, so what the user
+      // is describing is horizontal: the breathing room between the tag and the first
+      // glyph. It has to be the same room while text arrives as after the markdown
+      // pass, or the turn visibly shifts as it finishes.
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        const gap = () => {
+          const blk = document.querySelector('.blk-answer') as HTMLElement
+          if (!blk) return null
+          const head = blk.querySelector('.blk-head')!.getBoundingClientRect()
+          const body = blk.querySelector('.blk-body') as HTMLElement
+          let first = body.querySelector('.tin') as HTMLElement | null
+          let left = first ? first.getBoundingClientRect().left : NaN
+          if (!isFinite(left)) {
+            const w = document.createTreeWalker(body, NodeFilter.SHOW_TEXT)
+            const n = w.nextNode()
+            if (n) {
+              const r = document.createRange()
+              r.setStart(n, 0)
+              r.setEnd(n, Math.min(1, (n.textContent ?? '').length))
+              left = r.getBoundingClientRect().left
+            }
+          }
+          if (!isFinite(left)) return null
+          return { h: left - head.right, v: head.bottom - body.getBoundingClientRect().top }
+        }
+        const live: number[] = []
+        for (const p of ['first streamed line, ', 'second streamed line arrives ', 'and a third ']) {
+          transcript?.apply({ kind: 'text', d: p })
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          transcript?.flushNow()
+          const g = gap()
+          if (g === null) fail('no streamed text to measure the label gap against')
+          else {
+            live.push(g.h)
+            if (g.h < 6) fail(`the label crowds the text mid-stream: ${Math.round(g.h)}px`)
+          }
+        }
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 150))
+        const fin = gap()
+        if (fin === null) fail('no rendered text to measure after the turn')
+        else {
+          const worst = Math.max(...live) - Math.min(...live)
+          if (worst > 3) fail(`the text edge moves during the turn: ${live.map((x) => Math.round(x)).join('px, ')}px`)
+          if (Math.abs(fin.h - live[0]) > 3)
+            fail(`the label gap changes at turn end: ${Math.round(live[0])}px -> ${Math.round(fin.h)}px`)
+          pageLog(`label gap holds through the turn (${Math.round(fin.h)}px, drift ${Math.round(worst)}px)`)
+        }
+        transcript?.clear()
+      }
+
+      // --- a finished turn offers copy, share, and an honest branch button -----
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'text', d: 'the answer to copy' })
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        const acts = [...document.querySelectorAll('.turn-acts .tact')] as HTMLButtonElement[]
+        if (acts.length !== 3) fail(`expected three turn actions, found ${acts.length}`)
+        const copy = acts.find((a) => a.classList.contains('copy'))
+        const share = acts.find((a) => a.classList.contains('share'))
+        const branch = acts.find((a) => a.classList.contains('branch'))
+        if (!copy || !share || !branch) fail('turn actions are mislabelled')
+        else {
+          if (!copy.querySelector('svg.tact-glyph')) fail('turn actions use a non-SVG icon')
+          if (!branch.disabled)
+            fail('branch is offered as if it worked; it does not exist yet')
+          if (!/not built yet/i.test(branch.title))
+            fail(`a disabled button should say why: ${branch.title}`)
+          if (copy.disabled || share.disabled) fail('working actions are disabled')
+        }
+        transcript?.clear()
+        pageLog('turn actions ok')
+      }
+
+      // --- right-click gives app actions, not Back/Forward/Reload --------------
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'text', d: 'right click me' })
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        const target = document.querySelector('.blk-answer .blk-body') as HTMLElement
+        if (!target) fail('no answer to right-click')
+        else {
+          const ev = new MouseEvent('contextmenu', {
+            bubbles: true,
+            cancelable: true,
+            clientX: 120,
+            clientY: 120,
+          })
+          target.dispatchEvent(ev)
+          await new Promise((r) => setTimeout(r, 60))
+          const menu = document.querySelector('.ctxmenu') as HTMLElement | null
+          if (ev.defaultPrevented !== true) fail('the native context menu was not suppressed')
+          if (!menu) fail('no app menu appeared')
+          else {
+            const labels = [...menu.querySelectorAll('.ctx-item')].map((b) =>
+              b.textContent?.trim(),
+            )
+            if (!labels.some((l) => /Copy/.test(l ?? '')))
+              fail(`the menu offers nothing useful: ${labels.join(' / ')}`)
+            if (labels.some((l) => /reload|back|forward/i.test(l ?? '')))
+              fail(`the menu kept the browser's items: ${labels.join(' / ')}`)
+            const r = menu.getBoundingClientRect()
+            if (r.right > window.innerWidth + 1 || r.bottom > window.innerHeight + 1)
+              fail(`the menu hangs off the viewport: ${Math.round(r.right)}x${Math.round(r.bottom)}`)
+            // Styling is part of the contract. A menu that forgot its CSS is a
+            // full-width transparent strip of text at the bottom of the window,
+            // which is what happened once when these rules never landed.
+            const cs = getComputedStyle(menu)
+            if (cs.position !== 'fixed') fail(`the menu is not fixed-positioned: ${cs.position}`)
+            if (cs.backgroundColor === 'rgba(0, 0, 0, 0)' || cs.backgroundColor === 'transparent')
+              fail('the menu has no background: it is unstyled')
+            if (r.width > 340 || r.width < 120) fail(`the menu width is wrong: ${Math.round(r.width)}px`)
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+            await new Promise((rr) => setTimeout(rr, 40))
+            if (document.querySelector('.ctxmenu')) fail('Escape does not close the menu')
+          }
+          // A field keeps the native menu: suppressing it would take away a Paste
+          // entry that script cannot provide.
+          const ta = document.querySelector('textarea') as HTMLElement
+          if (ta) {
+            const ev2 = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+            ta.dispatchEvent(ev2)
+            if (ev2.defaultPrevented) fail('the composer lost its native menu')
+          }
+        }
+        transcript?.clear()
+        pageLog('context menu ok')
       }
 
       // --- the temp folder is "no workspace", not a folder ---------------------
@@ -3733,6 +3962,36 @@
           for (const n of notes) transcript?.showNote(n)
         })
         .catch((e) => pageLog(`migration_notes failed: ${String(e)}`))
+      transcript.onToast = (msg, bad) => say(msg, !!bad)
+      // WebKit's own right-click menu offers Back, Forward and Reload: three ways
+      // to damage a frameless app window, and no way to do the things this app is
+      // for. The menu is ours now - ctxmenu.ts records the one place the native
+      // menu is deliberately left alone.
+      installContextMenu({
+        toast: (msg, bad) => say(msg, !!bad),
+        quote: (text) => {
+          draft = text.length > 4000 ? `${text.slice(0, 4000)}…` : text
+          setTimeout(() => composerEl?.focus(), 0)
+        },
+        openFile: async (path) => {
+          try {
+            await invoke<string>('open_file', { path })
+          } catch (e) {
+            say(`could not open ${path}: ${e}`, true)
+          }
+        },
+      })
+      // Export is a backend write: the file has to pass the engine's containment
+      // rules and land in the conversation's own workspace, which is also the only
+      // way the gateway gets the same feature without shipping a filesystem.
+      transcript.onExport = async (session: number) => {
+        if (!session) throw new Error('this conversation is not saved yet')
+        const f = await invoke<{ path: string; name: string; mime: string; bytes: number }>(
+          'export_markdown',
+          { session },
+        )
+        return f
+      }
       transcript.onOpenFile = async (path) => {
         try {
           const opened = await invoke<string>('open_file', { path })

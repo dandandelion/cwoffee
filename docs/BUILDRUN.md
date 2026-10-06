@@ -1046,3 +1046,92 @@ approval-waiting `.warn` variant has its own hover so it does not lose its meani
 under the cursor. Measured on the running app: normal 14:1, hover 9.7:1, glyph inside
 the button box in both states. `clip-path`/`mask` are `none` in both states, which is
 what distinguishes "faded" from "erased" when the complaint is a screenshot.
+
+## Trap 53: "context full" at 43k on a 262k model — a budget that never looked at the model
+
+The compaction budget was a constant: 8000 tokens, whatever the endpoint. The status bar said
+`43k / 262k`, the footer said the context was full, and the engine dropped the oldest messages
+of a conversation the model had room for six times over. A budget invented in a source file is
+a guess about someone else's hardware.
+
+It now comes from the server: `list_models_info()` for the loaded model, then
+`window * 0.72 - 2048` floored at 4096, re-derived on every model switch. `context.target_tokens`
+still wins when present — a pin is a decision — but the pin had leaked into the shipped example
+config and therefore into the user's config, which is how the fix stayed invisible after it was
+"implemented": the log said `budget pinned in config` while the config said `target_tokens = 8000`.
+
+Two rules follow. A default that a template config overrides is not a default; check the file the
+app actually reads. And the log line has to name the source of the number
+(`derived` / `pinned in config`), because otherwise the only difference between "the model says
+262k and we chose 186k" and "someone pinned 8000" is a file nobody opens.
+
+## Trap 54: a right-click menu with no CSS — a patch script that died halfway
+
+The menu rendered as a full-width transparent strip of text pinned to the bottom of the window:
+`box [0, 876, 1440, 24]`, `background: rgba(0,0,0,0)`. The behaviour was right, the styling did
+not exist. The CSS had been written by a script that asserted on a *later* edit in the same file
+and raised before its `open(..., 'w')` — so the first edit in that script never reached disk.
+
+A scripted edit that performs several replacements is a code review you skipped: every assert
+that fires after a mutation but before the write silently reverts the earlier mutations. Write
+per edit, or assert everything up front.
+
+And a component's CSS is part of its contract, so the self-test now asserts it: menu positioned
+`fixed`, non-transparent background, width between 120 and 340px. Those three lines would have
+caught this, and they cost nothing on a menu that is already being opened for the copy-items
+check.
+
+## Trap 55: the menu closed because the *model* scrolled the page
+
+The context menu had `window.addEventListener('scroll', close, true)`, copied from the habit of
+native menus. But the transcript scrolls itself to follow the stream, and a capture-phase listener
+on `document` cannot tell "the user scrolled" from "the engine moved the page". A menu opened
+mid-turn vanished on its own before it could be used.
+
+The menu is `position: fixed`, so it stays exactly where it was opened; scroll no longer closes
+it. Escape, a click elsewhere, and window blur still do. The general shape: any listener that
+closes a transient surface on a global event has to ask who caused that event, and in an app that
+animates its own layout, "everything" is a common cause.
+
+## Trap 56: measuring a collapsed block, and measuring the wrong `.wsrow`
+
+Two harness mistakes in one run, both of which reported a product bug that did not exist.
+
+A settled thinking block is `display: none` unless expanded — that is the feature. A geometry
+assertion that asked for its left edge got `0`, and compared against the label's real `350` it
+looked like the layout had broken. Expand the block before measuring it; a hidden element's rect
+is not a layout claim.
+
+The composer's folder chip was queried with `document.querySelector('.wsrow span')`. The sidebar
+also draws `.wsrow` rows, earlier in document order, so the check compared the *host's* folder to
+a session it had never opened and failed with "chip shows cwoffee-workspace while viewing
+/home/dandandelion/Projects". Scope the selector to the region under test (`.cbox .wsrow span`)
+and, when a failure message names two different things, suspect the measurement before the code.
+
+## Trap 57: the harness asserted the old contract after browsing stopped moving the host
+
+`openSession` used to run `switch_session`; the assertion tolerated the host landing on the opened
+session or on nothing. Making browsing view-only (Trap 44's sequel) turned that assertion red with
+"host moved to neither the old nor the opened session: 670" — which was the new behaviour working.
+
+A behaviour change has to update the assertions that encoded the old behaviour, and the updated
+check should assert the *new* invariant instead of merely tolerating it: opening a session leaves
+`session_id` untouched, produces no note matching `prompt cache|workspace`, and the composer chip
+follows the viewed session's folder. That is three product claims; the old check proved one weak
+one.
+
+## Trap 58: `export_markdown` and the workspace question it had to answer
+
+Sharing a conversation writes a file on the host, which raises a question the tool layer already
+answered elsewhere: *which* workspace? The host's current one is wrong — another client may be
+working in a different folder, and the sidebar row for the exported session names that session's
+own. So the export resolves the workspace **from the stored session row**, validates it through
+`check_workspace` (which refuses the temp root), and confines the write to `<workspace>/exports/`.
+
+The other details that are easy to get wrong and are now pinned by tests: drive-only (a watch
+token must not write files), a nonexistent session id is an error rather than an empty document,
+two exports of one session never clobber each other (`-2`, `-3` — the user may have edited the
+first), and the document must survive a title that tries to escape (`../../etc/passwd` slugs to
+`etc_passwd`). On the rendering side, a run of consecutive assistant rows is one speaker turn:
+stored one row per tool call, they used to produce five `## Cwoffee` headings and three
+"Tools used:" lists for a single paragraph of prose.

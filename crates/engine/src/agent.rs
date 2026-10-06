@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use crate::approval::{ApprovalGate, GateOutcome};
 use crate::event::{EngineEvent, ExecStream, FinishReason};
 use crate::prompt::PromptBuilder;
-use crate::provider::{ChatRequest, Delta, Provider, Reasoning, ToolCall};
+use crate::provider::{ChatRequest, Delta, Message, Provider, Reasoning, ToolCall};
 use crate::telemetry::{TurnStats, TurnTelemetry};
 use crate::tools::repair::{self, RepairError};
 use crate::tools::{ExecChunk, Registry, ToolCtx, ToolResult};
@@ -45,7 +45,10 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             model: "default".into(),
-            max_tool_iters: 8,
+            // 8 was too few for anything with a document in it: research, write,
+            // convert, verify is four rounds before the model has answered a
+            // question. The cap is a runaway guard, not a work budget.
+            max_tool_iters: 14,
             reasoning: Reasoning::Low,
             // None means "whatever the server defaults to", which for llama.cpp
             // is -1: generate until the model stops or the context fills.
@@ -217,22 +220,29 @@ impl Agent {
         let schemas = serde_json::to_string(&defs).unwrap_or_default();
         let dropped = self.prompt.compact_to_budget(&schemas);
         if dropped > 0 {
-            // Say so: compaction is a visible latency spike (the prefix cache is
-            // thrown away) and an unexplained one looks like a bug.
-            let _ = out.send(EngineEvent::Error {
+            // Say so, with the numbers: "context full" without them is a claim the
+            // user cannot check, and it used to fire at 43k tokens of a 262k
+            // window because the budget was a constant rather than the model's.
+            let est = self.prompt.estimate_tokens("");
+            let budget = self.prompt.token_budget;
+            let window = self
+                .prompt
+                .context_window
+                .map(|w| w.to_string())
+                .unwrap_or_else(|| "unstated".into());
+            let _ = out.send(EngineEvent::Note {
                 message: format!(
-                    "context full: dropped {dropped} oldest message(s) \
-                     (compaction #{}); the next prefill will be slow",
+                    "history over budget: ~{est} tokens now, budget {budget} (model window {window}); \
+                     dropped the oldest {dropped} message(s), compaction #{} - the next prefill will be slow",
                     self.prompt.compactions
                 ),
-                fatal: false,
             });
         }
 
         let mut agg = TurnTelemetry::default();
         self.turn_files.clear();
 
-        for iter in 0..self.cfg.max_tool_iters {
+        for _ in 0..self.cfg.max_tool_iters {
             if self.cancel.load(Ordering::Relaxed) {
                 self.emit_turn_files(turn, out);
                 let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Cancelled });
@@ -287,20 +297,65 @@ impl Agent {
                 self.run_tool(call, out).await;
             }
 
-            if iter + 1 == self.cfg.max_tool_iters {
+        }
+
+        // The tool budget is spent and the model still has not answered. Stopping
+        // here is what "stopped after 8 tool iterations without a final answer"
+        // used to look like: a warning, a file chip, and no summary of the work
+        // that was just done. So spend no more tools - one last round-trip with
+        // the tool list removed, whose only job is to say what it did and what is
+        // left.
+        self.wrap_up_without_tools(out, &mut agg).await;
+
+        self.emit_turn_files(turn, out);
+                let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Length });
+        agg
+    }
+
+    /// Final round-trip after the tool budget runs out: no tools offered, so the
+    /// only thing the model can do is talk.
+    ///
+    /// The instruction is added to the *request*, never to history. It is a
+    /// control message rather than something the user said, and pushing it through
+    /// `push_user` would store it and render a user bubble the user never typed.
+    async fn wrap_up_without_tools(&mut self, out: &EngineSink, agg: &mut TurnTelemetry) {
+        let _ = out.send(EngineEvent::Note {
+            message: format!(
+                "tool budget spent ({} iterations); summarising without running anything else",
+                self.cfg.max_tool_iters
+            ),
+        });
+
+        let mut req = self.prompt.build(&self.cfg.model);
+        req.tools = Vec::new();
+        req.reasoning = Reasoning::Low;
+        req.max_tokens = self.cfg.max_tokens;
+        req.messages.push(Message::user(
+            "You have used up your tool budget. Do not request any more tools.              In the user's own language, say in a few sentences what you actually              did, what you produced or changed (by name), and what is still              unfinished or unverified. Plain prose, no tool calls.",
+        ));
+
+        match self.stream_once(&req, out).await {
+            Ok(c) if !c.text.trim().is_empty() => {
+                agg.merge_server(&c.telemetry);
+                self.prompt
+                    .push_assistant_with(&c.text, reason(&c), c.reasoning_ms);
+            }
+            Ok(_) => {
                 let _ = out.send(EngineEvent::Error {
                     message: format!(
-                        "stopped after {} tool iterations without a final answer",
+                        "stopped after {} tool iterations and the model gave no summary",
                         self.cfg.max_tool_iters
                     ),
                     fatal: false,
                 });
             }
+            Err(msg) => {
+                let _ = out.send(EngineEvent::Error {
+                    message: format!("wrap-up after the tool budget failed: {msg}"),
+                    fatal: false,
+                });
+            }
         }
-
-        self.emit_turn_files(turn, out);
-                let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Length });
-        agg
     }
 
     /// One provider round-trip. Streams deltas out and collects the tool calls.
@@ -1439,6 +1494,80 @@ mod tests {
         let h = agent.prompt.history();
         let tr = h.iter().find(|m| m.tool_call_id.as_deref() == Some("u1")).expect("result exists");
         assert!(tr.content.contains("unknown tool"));
+    }
+
+    /// The tool budget is not an ending. When it runs out while the model still
+    /// wants tools, one last round-trip - with no tools offered - has to produce a
+    /// summary, because a transcript that ends on a warning and a file chip reads
+    /// as "it did the work and then said nothing".
+    #[tokio::test]
+    async fn an_exhausted_tool_budget_ends_with_a_summary() {
+        let tool_turn = vec![
+            Delta::ToolCallReady {
+                id: "t".into(),
+                name: "exec".into(),
+                arguments: "{\"cmd\":\"true\"}".into(),
+            },
+            Delta::Done(FinishReason::ToolCalls),
+        ];
+        let mut turns = vec![tool_turn; 3];
+        turns.push(vec![
+            Delta::Text("I read two files and wrote the report.".into()),
+            Delta::Done(FinishReason::Stop),
+        ]);
+        let (mut agent, _ev, mut arx) = harness(turns, ApprovalAnswer::Allow);
+        tokio::spawn(async move {
+            while let Some((_, reply)) = arx.recv().await {
+                reply.send(ApprovalAnswer::Allow).ok();
+            }
+        });
+        agent.cfg.max_tool_iters = 3;
+        let (tx, rx) = mpsc::unbounded_channel();
+        agent.run_turn("go", vec![], &tx).await;
+        drop(tx);
+
+        let mut rx = rx;
+        let mut saw_note = false;
+        let mut saw_complaint = false;
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                EngineEvent::Note { message } => {
+                    if message.contains("tool budget spent") {
+                        saw_note = true;
+                    }
+                }
+                EngineEvent::Error { message, .. } => {
+                    if message.contains("no summary") || message.contains("tool iterations") {
+                        saw_complaint = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_note, "the wrap-up did not say what it was doing");
+        assert!(!saw_complaint, "the turn ended with a warning anyway");
+
+        let last = agent.prompt.history()
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::provider::Role::Assistant)
+            .expect("an assistant turn");
+        assert!(
+            last.content.contains("wrote the report"),
+            "the summary never reached the transcript: {:?}",
+            last.content
+        );
+
+        // And the instruction that asked for it must not be sitting in history as
+        // something the user said.
+        assert!(
+            agent
+                .prompt_mut()
+                .history()
+                .iter()
+                .all(|m| m.role != crate::provider::Role::User || !m.content.contains("tool budget")),
+            "the wrap-up instruction was stored as a user message"
+        );
     }
 
     #[tokio::test]

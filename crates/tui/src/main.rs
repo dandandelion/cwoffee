@@ -336,7 +336,7 @@ async fn main() -> Result<()> {
         appcfg.provider.kind = v;
     }
     if let Some(v) = flags.context {
-        appcfg.context.target_tokens = v;
+        appcfg.context.target_tokens = Some(v);
     }
     if let Some(p) = &loaded {
         eprintln!("config: {}", p.display());

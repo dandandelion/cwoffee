@@ -82,7 +82,7 @@ pub struct MessagesPage {
     pub has_older: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub id: i64,
     pub session_id: i64,

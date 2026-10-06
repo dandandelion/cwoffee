@@ -809,6 +809,10 @@ const AUDITED: &[&str] = &[
     "remove_workspace",
     "respond_approval",
     "respond_question",
+    // Writes a file into the host's workspace without running a turn, so it is
+    // audited like the acts that do: on a shared token, "who put this here" has to
+    // be answerable.
+    "export_markdown",
 ];
 
 /// Empty a pending map and report how many waiters were released.
@@ -919,6 +923,23 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string()),
+        "export_markdown" => {
+            // Drive-only: it writes a file into the host's workspace.
+            if !role.can_drive() {
+                return need_drive(role);
+            }
+            let id = args.get("session").and_then(|v| v.as_i64()).ok_or("session id required")?;
+            let row = h
+                .store
+                .session(id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("session {id} does not exist"))?;
+            let ws = cwoffee_engine::host::check_workspace(&row.workspace)
+                .map_err(|reason| format!("{}: {reason}", row.workspace))?;
+            let rows = h.store.messages(id).map_err(|e| e.to_string())?;
+            let out = cwoffee_engine::share::write_export(&ws, &row.title, &rows)?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
         "session_messages" => {
             let id = arg_i64(&args, "id")?;
             let before = args.get("before").and_then(|v| v.as_i64());
@@ -2015,6 +2036,17 @@ mod tests {
     }
 
     fn test_handle_with_notes(notes: Vec<String>) -> Arc<EngineHandle> {
+        test_handle_in_notes(std::env::temp_dir().display().to_string(), notes)
+    }
+
+    /// A handle whose sessions live in `ws`. Export writes into the conversation's
+    /// own workspace, and the engine refuses the system temp root as a workspace,
+    /// so a test that wants a real file on disk has to say where.
+    fn test_handle_in(ws: &str) -> Arc<EngineHandle> {
+        test_handle_in_notes(ws.to_string(), Vec::new())
+    }
+
+    fn test_handle_in_notes(ws: String, notes: Vec<String>) -> Arc<EngineHandle> {
         let p: Arc<dyn cwoffee_engine::provider::Provider> = Arc::new(FakeProvider);
         // One store, shared. It used to be two, which quietly made every
         // store-backed RPC in these tests read a database the host had never
@@ -2025,7 +2057,7 @@ mod tests {
                 p,
                 cwoffee_engine::tools::Registry::new(),
                 Arc::clone(&store),
-                cwoffee_engine::host::HostConfig::new("m", std::env::temp_dir()),
+                cwoffee_engine::host::HostConfig::new("m", std::path::PathBuf::from(ws)),
             )),
             store,
             events: broadcast::channel(8).0,
@@ -2099,24 +2131,109 @@ mod tests {
     /// was well formed), so the client must render it; what this asserts is that
     /// nothing ran.
     #[tokio::test]
-    async fn a_turn_for_a_stale_view_is_refused_over_the_wire() {
-        let h = test_handle();
+    async fn a_phone_can_share_a_conversation_without_touching_the_host() {
+        // Export is the one write a remote client makes that is not a turn: it
+        // produces a document in the conversation's own workspace. It must be
+        // drive-only, must address a real session, and must not move the host or
+        // run a model call.
+        let dir = unique_dir("export");
+        let h = test_handle_in(&dir);
+        let id = match run_cmd("new_session", serde_json::json!({ "title": "share me" }), Role::Drive, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("new_session returned {other:?}"),
+        };
         let turns_before = h.host.state().turns;
-        let stale_view = h.host.state().session_id + 424_242;
+        let before = h.host.state().session_id;
+
+        let err = run_cmd("export_markdown", serde_json::json!({ "session": id }), Role::Watch, &h)
+            .await
+            .expect_err("a watch token may not write files");
+        assert!(err.contains("drive"), "expected a role error, got {err}");
+
+        let ghost = 900_000i64;
+        let err = run_cmd("export_markdown", serde_json::json!({ "session": ghost }), Role::Drive, &h)
+            .await
+            .expect_err("a conversation that does not exist cannot be exported");
+        assert!(err.contains("does not exist"), "got {err}");
+
+        // The session has no messages yet, which is a legitimate document: the
+        // export says what the conversation is rather than refusing.
+        let out = match run_cmd("export_markdown", serde_json::json!({ "session": id }), Role::Drive, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Object(o) => o,
+            other => panic!("export returned {other:?}"),
+        };
+        let rel = out.get("path").and_then(|v| v.as_str()).unwrap().to_string();
+        assert!(rel.starts_with("exports/") && rel.ends_with(".md"), "path {rel}");
+        assert_eq!(out.get("name").and_then(|v| v.as_str()).unwrap().ends_with(".md"), true);
+        let on_disk = std::fs::read_to_string(std::path::Path::new(&dir).join(&rel)).unwrap();
+        assert!(on_disk.contains("share me"), "the document does not name the session");
+
+        // Second export of the same conversation must not clobber the first: the
+        // user may have edited it by hand.
+        let again = run_cmd("export_markdown", serde_json::json!({ "session": id }), Role::Drive, &h)
+            .await
+            .unwrap();
+        let rel2 = again.get("path").and_then(|v| v.as_str()).unwrap().to_string();
+        assert_ne!(rel, rel2, "two exports wrote to the same file");
+
+        assert_eq!(h.host.state().turns, turns_before, "export ran a turn");
+        assert_eq!(h.host.state().session_id, before, "export moved the host");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_turn_from_a_phone_tab_lands_where_the_tab_is_looking() {
+        let h = test_handle();
+        // The phone is looking at its own conversation; the desktop may be on
+        // another. Browsing does not move the host, so the send carries the view
+        // and the host follows it.
+        let id = match run_cmd("new_session", serde_json::json!({ "title": "phone tab" }), Role::Drive, &h)
+            .await
+            .expect("new_session is drive-usable")
+        {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("new_session returned {other:?}"),
+        };
+        let turns_before = h.host.state().turns;
         run_cmd(
             "start_turn",
-            serde_json::json!({ "text": "hello from a stale phone tab", "session": stale_view }),
+            serde_json::json!({ "text": "hello from the phone", "session": id }),
             Role::Drive,
             &h,
         )
         .await
-        .expect("the command is well formed; the refusal is an event, not an rpc error");
+        .expect("the command is well formed; anything the engine refuses is an event");
+        for _ in 0..100 {
+            if h.host.state().turns > turns_before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(h.host.state().turns, turns_before + 1, "the turn never ran");
+        assert_eq!(h.host.state().session_id, id, "the host did not follow the addressee");
+        let rows = h.store.history(id).unwrap();
+        assert_eq!(rows.len(), 2, "the turn did not land in the addressed session");
+
+        // A number that matches no conversation: the send stops. It must not fall
+        // back to whatever the host happened to have open.
+        let ghost = 900_000;
+        run_cmd(
+            "start_turn",
+            serde_json::json!({ "text": "nowhere to go", "session": ghost }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("the rpc itself is fine; the refusal is an engine event");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(
-            h.host.state().turns,
-            turns_before,
-            "a turn addressed to a session the host is not on still ran"
-        );
+        assert_eq!(h.host.state().turns, turns_before + 1, "a turn with no addressee ran");
+        assert_eq!(h.host.state().session_id, id, "the host moved to chase a missing row");
     }
 
     #[tokio::test]

@@ -91,8 +91,12 @@ pub struct ContextCfg {
     /// Soft budget before compaction. Prefill on a local quantized model is
     /// 20-120 tok/s, so a long transcript is a latency problem, not a
     /// correctness one.
-    #[serde(default = "default_context")]
-    pub target_tokens: usize,
+    ///
+    /// Left unset, the budget comes from the model's own context window: 72% of
+    /// it, minus headroom. It used to be a fixed 8 000 tokens, which compacted a
+    /// 262 144-token model at 8k and then told the user the context was full.
+    #[serde(default)]
+    pub target_tokens: Option<usize>,
     #[serde(default = "default_max_output")]
     pub max_tool_output: usize,
 }
@@ -100,15 +104,12 @@ pub struct ContextCfg {
 impl Default for ContextCfg {
     fn default() -> Self {
         Self {
-            target_tokens: default_context(),
+            target_tokens: None,
             max_tool_output: default_max_output(),
         }
     }
 }
 
-fn default_context() -> usize {
-    8_000
-}
 fn default_max_output() -> usize {
     8_000
 }
@@ -254,8 +255,8 @@ impl Config {
             self.mode = Some(v);
         }
         if let Some(v) = env2("CWOFFEE_CONTEXT", "COWRY_CONTEXT") {
-            if let Ok(n) = v.parse() {
-                self.context.target_tokens = n;
+            if let Ok(n) = v.parse::<usize>() {
+                self.context.target_tokens = Some(n);
             }
         }
         if let Some(v) = env2("CWOFFEE_SEARXNG_URL", "COWRY_SEARXNG_URL") {
@@ -421,7 +422,7 @@ base_url = "http://127.0.0.1:9/v1"
         let c = Config::default();
         assert_eq!(c.provider.base_url, "http://127.0.0.1:8090/v1");
         assert_eq!(c.provider.kind, "llama.cpp");
-        assert_eq!(c.context.target_tokens, 8_000);
+        assert_eq!(c.context.target_tokens, None, "unset means derive it from the model");
         assert!(c.sandbox.enabled);
         assert_eq!(c.mode(), ApprovalMode::Ask);
     }
@@ -456,7 +457,7 @@ searxng_url = "http://127.0.0.1:8888/search"
         .expect("parses");
         assert_eq!(c.mode(), ApprovalMode::Auto);
         assert_eq!(c.approval_timeout_secs, Some(42));
-        assert_eq!(c.context.target_tokens, 12000);
+        assert_eq!(c.context.target_tokens, Some(12000));
         assert_eq!(c.provider.kind, "anthropic");
         match c.search_backend() {
             SearchBackend::SearXNG { base } => assert_eq!(base, "http://127.0.0.1:8888/search"),

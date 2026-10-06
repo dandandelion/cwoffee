@@ -16,6 +16,7 @@ pub mod prompt;
 pub mod sse;
 pub mod legacy;
 pub mod host;
+pub mod share;
 pub mod store;
 pub mod telemetry;
 pub mod stream;

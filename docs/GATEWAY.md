@@ -14,11 +14,17 @@ approvals when you are not at the machine.
 One host serves several clients - the desktop, a phone tab, a harness. A turn with no
 address runs in *whichever conversation the last switch left active*, which from the
 other person's chair is indistinguishable from the transcript editing itself. So the
-number is an assertion, and a mismatch is refused:
+number is an assertion: when it names a different conversation than the host has open,
+the host **follows it** - it adopts that session, moves its tools to that session's
+stored folder, and runs the turn there. That is not a reroute; the message was always
+meant for what the sender is looking at.
+
+An id that matches no conversation runs nothing. `Store::history()` returns an empty list
+for a missing row, which would otherwise let a typo invent an empty session and quietly
+make it current, so existence is checked first and the refusal is emitted:
 
 ```
-the turn asked for session 512, but the host is on session 508: nothing was sent.
-Open that conversation, or start a new one, and try again.
+session 900000 does not exist: nothing was sent, and the host stays on session 508
 ```
 
 That arrives as an `error` **event**, not an rpc error: the command was well formed and
@@ -28,11 +34,11 @@ shows it as a toast.
 `session: 0` means "my view is a draft", and the host opens a new conversation instead
 of appending to whatever it had open.
 
-A client whose view and the host disagree fixes itself before sending: the desktop moves
-the host to the conversation it is displaying and logs `send: host is on X, moving it to
-the viewed session Y`. That is not a reroute - the message was always meant for what the
-user is looking at - and the engine's refusal remains for a turn addressed to a session
-nobody is displaying.
+**Browsing is not a switch, and it never was meant to be one.** A client loading a
+transcript does not move the host: `switch_session` is not part of opening a session in
+the UI, and `bootstrap`/resync are read-only. Moving the host on a click is what made a
+phone tab print workspace-change and cold-prompt-cache notices at people who had only
+looked at a conversation. The host moves when a turn is addressed to a conversation.
 
 Related, and the other half of the same complaint: switching sessions during a running
 turn is handled by the *view*. The host's command loop is inside the turn, so a
@@ -74,7 +80,15 @@ Two roles, enforced server-side per command:
 * **drive** - everything that changes state: `start_turn`, `cancel_turn`,
   `respond_approval`, `respond_question`, `set_mode`, `set_reasoning`, `new_session`,
   `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
-  `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`.
+  `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`,
+  `export_markdown`.
+
+`export_markdown` takes `{ session }` and writes that conversation as a Markdown document
+into `exports/` **inside the workspace stored on that session** - not the host's current
+workspace, which may be somewhere else entirely if another client is working in a different
+folder. It returns the same `OutputFile` shape a tool output returns, so the phone shows the
+usual clickable chip. It runs no model call, moves no host, and refuses a session id that
+does not exist. It is drive-only because it writes a file on this machine.
 
 `new_session` takes an optional `workspace`, which the engine validates before the
 session is created; a browser can therefore start a session inside a named folder

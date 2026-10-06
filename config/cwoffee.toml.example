@@ -53,8 +53,13 @@ model    = ""                 # empty => adopt the first id from /v1/models
 # Prefill on a local quantized model is ~30-120 tok/s, so a long transcript is a
 # latency problem rather than a correctness one. Compaction is explicit, rare and
 # reported — it throws away the server-side prefix cache.
+# target_tokens is optional. Unset, the budget is derived from the window the
+# endpoint advertises for the loaded model (window * 0.72 - 2048, floor 4096), and
+# it is re-derived whenever you switch models. Pin it only to keep transcripts
+# short on purpose: a pinned 8000 on a 262k model compacts a 43k conversation and
+# then tells you the context is full, which is a lie about the model.
 [context]
-target_tokens   = 8000
+# target_tokens = 8000
 max_tool_output = 8000
 
 # ---------------------------------------------------------------------------

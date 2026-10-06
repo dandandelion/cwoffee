@@ -131,6 +131,35 @@ the server's own web UI produces, and the reason is in `docs/BENCHMARKS.md`: on 
 checkpoint, *any* system prompt collapses thinking from "runs to the token cap" to
 about 250 tokens. The web UI thinks more because it sends no system prompt at all.
 
+### How much context is allowed
+
+Compaction is what keeps prefill cheap on a local model, so the budget that triggers it
+matters: too low and the app throws away history it did not need to, and tells you the
+context is full when the model has room for six times the transcript.
+
+Unpinned, the budget is derived from the window the **endpoint advertises for the loaded
+model** - `window * 0.72 - 2048`, floored at 4096 - and it is re-derived whenever you switch
+models. On this machine that is 186,695 tokens against a stated 262,144, and a 43k transcript
+sits comfortably inside it. Pin `context.target_tokens` in the config only to keep
+conversations short on purpose; a pin is a decision, and the engine honours it and says
+"budget pinned in config" in the log rather than silently preferring its own arithmetic.
+
+The old default was a hardcoded 8000 regardless of model, which compacted a 43k conversation
+on a 262k model and reported "context full". That is why the number now comes from the server.
+
+### When the model runs out of tool budget
+
+A turn may keep calling tools; the loop is bounded so a confused model cannot spin forever.
+When the bound is reached, the engine does not stop mid-sentence and log a warning - it makes
+one final request with **no tools offered at all** and asks for an account of the work: what
+it did, what is unfinished, what it would do next. That summary streams and is stored like any
+other answer.
+
+The instruction that asks for it is transient: it goes into that one request and is never
+pushed into the transcript, so the user does not get a fake message from themselves and the
+append-only prefix stays intact. If the summary comes back empty the turn still ends with a
+visible note rather than silence.
+
 ### Motion
 
 Everything moves on one curve (`cubic-bezier(.2,.7,.2,1)`) with three durations, and
@@ -140,33 +169,43 @@ because a value changed, the send button's ring appears because you are about to
 press it. `prefers-reduced-motion` turns all of it off. The one looping animation in
 the app is the steam on the empty screen's cup.
 
-Streaming text **arrives** rather than appearing: each group of words that lands
-since the last repaint becomes its own node, blurs from 2.2px and fades from zero
-over 320ms, and is folded back into settled text only after it has finished. The
-cadence detail is the whole effect — the live block repaints every 120ms, so an
-effect wrapped in re-written text lives one paint and is invisible no matter what
-the computed styles say. Prose reveals; lists, code and tables paint whole,
-because a mis-parsed structure is worse than no animation.
+Streaming text **arrives** rather than appearing. Each word that lands since the last
+repaint becomes its own inline `<span>`, blurs from 1.6px and fades from zero, and is
+**never touched again**. Nothing about that word is re-laid-out, re-parsed or re-animated
+for the rest of the turn: the block is append-only, exactly like the prompt that produced
+it. Duration is not a constant either — it is derived from the observed word rate
+(`600/words_per_second`, clamped to 110-300ms), so a fast model reveals quickly and a slow
+one lingers, and the stagger across a group of words is capped at 168ms so a burst of
+tokens cannot queue up an animation backlog that plays for a second after the text stops.
 
-The effect is measured, not asserted. Filming the answer block through the gateway
-with a fixed clip while a turn streams gives chunk nodes sitting at opacity 0.2-0.94
-with `blur(1.76px)` mid-flight, and once the text stops arriving the filmstrip is
-inert: mean per-frame difference 0.00, maximum 0.12, with the only visible change
-coinciding with new characters. Settled prose is not re-parsed, re-rastered or
-re-animated by anything.
+The unit is the **word**, not the chunk. Earlier designs animated whatever arrived since
+the last paint, then folded finished chunks back into a re-written paragraph. Folding is a
+rewrite, and a rewrite re-rasters: every already-settled word blinked again roughly half a
+second after it landed, which reads as the animation "playing catch up" with the text. The
+append-only version has no fold step to blink in.
 
-Two details that paragraph depends on, both of which used to be bugs:
+While a turn streams the block is plain text in `white-space: pre-wrap`, and Markdown is
+applied **exactly once**, at stream end. That keeps newlines visible as they arrive (without
+it an answer lands as one grey wall and then breaks up, which is the one layout jump in a
+turn) without parsing Markdown per token.
 
-- A chunk is an **inline span**. Built as a block element instead, every arrival
-  starts a new line: the block grows straight down the page, gets taller on each
-  paint, and the transcript — which pins to the tail — nudges the whole view with it.
-  That is a flicker report waiting to happen, and it is why thinking once looked like
-  it "grew vertically instead of filling the width".
-- The animation fills **backwards**, not `both`. With `both`, a finished chunk keeps
-  its last keyframe, `filter: blur(0)`, forever, and a filter claims its own raster
-  layer. The text then exists twice — the layer the animation holds, and the layer the
-  folded paragraph is drawn into — and swapping between them pops at the end of every
-  transition.
+What the harness proves, in the app's own webview rather than in a screenshot: 28 word spans
+for four streamed reasoning deltas, every one of them still connected to the document after
+later paints, their `textContent` concatenating back to exactly what the model sent, and no
+span block-level. That is the whole contract — an animation that is invisible in the computed
+styles but rewrites settled text is still a bug, and a check on node identity catches it.
+
+Two details that paragraph depends on:
+
+- A word span is **inline**. Built as a block element instead, every arrival starts a new
+  line: the block grows straight down the page, gets taller on each paint, and the
+  transcript — which pins to the tail — nudges the whole view with it. That is a flicker
+  report waiting to happen, and it is why thinking once looked like it "grew vertically
+  instead of filling the width".
+- The animation fills **backwards**, not `both`. With `both`, a finished span keeps its last
+  keyframe, `filter: blur(0)`, forever, and a filter claims its own raster layer. The text
+  then exists twice — the layer the animation holds, and the layer the paragraph is drawn
+  into — and swapping between them pops at the end of every transition.
 
 ## Files, and asking instead of guessing
 
@@ -207,6 +246,34 @@ A question that closes with no answer - the timeout expired, or you cancelled th
 turn while it was parked - closes in every window as "no answer in time". Left
 alone it would sit there offering Send, and the answer would aim at a tool call that
 has already returned.
+
+## What you can do with a finished turn
+
+Under a finished answer sit three controls, quiet on purpose: **Copy** puts that answer on the
+clipboard as Markdown - the text the model wrote, not the rendering of it - and **Share as
+Markdown** writes the whole conversation into `exports/` in that conversation's own workspace,
+then shows the resulting file as the same clickable chip every other generated file gets. The
+chip is the receipt: it proves where the write landed and opens it.
+
+The document is for a person. It names the session and the working folder, keeps the prose,
+summarises each tool call in one English line ("wrote reports/q3.xlsx", "ran a command"), lists
+the files produced, and leaves the reasoning out while saying how long it took. No tool-call
+ids, no `<env>` plumbing, no chain of thought. Writing goes through the engine rather than the
+UI, so the containment rules, the collision-avoiding suffixes (`-2`, `-3`, never an overwrite -
+you may have edited the last one by hand) and the output metadata are identical whether you
+clicked in the desktop app or on a phone.
+
+**Branch** is there and disabled, with "not built yet" in its tooltip. A control that looks
+available and does nothing teaches the user to distrust the rest of the interface.
+
+Right-clicking anywhere replaces the browser's menu - Back, Forward, Reload, which in a
+frameless window are three ways to damage the app - with one built from what is under the
+pointer: open a file or copy its path on a chip, copy a code block or preview it, copy a
+message, quote it into the composer, copy the selection. It is clamped to the viewport, closes
+on Escape or a click away, and stays open when the transcript scrolls itself to follow the
+stream. Inside the composer the **native** menu is deliberately left alone: the webview's own
+Paste entry is wired to the clipboard in a way a page cannot reach, so suppressing it would
+remove a capability rather than improve a menu.
 
 ## What an approval actually gates
 
@@ -303,9 +370,18 @@ API calls. So:
 
 One engine, several screens. A desktop window, a phone tab and the app's own test harness
 can be attached at once, so a turn carries the conversation it was written in: the composer
-sends the session id you are looking at, and the host refuses a turn whose id does not
-match what it has open - and says so out loud instead of going quiet. A turn addressed to
-`0`, meaning a draft, opens a new conversation rather than appending to someone else's.
+sends the session id you are looking at, and the host follows it. A turn addressed to `0`,
+meaning a draft, opens a new conversation rather than appending to someone else's. An id
+that matches no conversation sends nothing and says so, rather than falling back to whichever
+session the engine happened to have open.
+
+**Looking is not working.** Clicking a session in the sidebar moves the *view* only: it loads
+that transcript and leaves the engine where it was. It used to run a full session switch,
+which re-adopted that session's folder and re-checked its prompt cache, so reading someone
+else's conversation printed a workspace-change line and a cold-cache warning as though you
+had done something. The host moves when a turn is addressed to a conversation, not when a
+mouse crosses a row - and the folder chip above the composer follows the conversation on
+screen, not the one the engine is inside.
 
 Switching sessions during a turn is allowed and instant: the view moves at once while the
 host finishes the turn it is inside. In the sidebar, a turning arc means that session is

@@ -34,6 +34,10 @@ PHRASES = [
     "Use write_file to save about 50 words about espresso",
     "Say the single word: 42",
     "Repeat the word latte three times",
+    # Turns a browser harness typed into whatever session was on screen. Not a
+    # model prompt at all: a scripted Playwright probe typing into the composer.
+    "Answer in two sentences about why espresso is short",
+    "Say the single word pong",
 ]
 
 conn = sqlite3.connect(DB)

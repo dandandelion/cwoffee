@@ -48,7 +48,7 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, revealOn, REVEAL_HOLD_MS, type InlineReveal } from './markdown'
+import { renderMarkdown, LiveMarkdown, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -114,6 +114,63 @@ function fileIcon(mime: string): SVGElement {
   return svg
 }
 
+function svgIcon(paths: string[], size = 14): SVGElement {
+  const NS = 'http://www.w3.org/2000/svg'
+  const svg = document.createElementNS(NS, 'svg')
+  svg.setAttribute('viewBox', '0 0 16 16')
+  svg.setAttribute('width', String(size))
+  svg.setAttribute('height', String(size))
+  svg.setAttribute('class', 'tact-glyph')
+  svg.setAttribute('aria-hidden', 'true')
+  for (const d of paths) {
+    const el = document.createElementNS(NS, 'path')
+    el.setAttribute('d', d)
+    svg.appendChild(el)
+  }
+  return svg
+}
+
+const iconCopy = () =>
+  svgIcon(['M5.6 5.6h7v7.4h-7z', 'M10.4 3.4H3.4v7.4'])
+const iconDoc = () =>
+  svgIcon(['M3.6 2.6h6l2.8 2.8v8H3.6z', 'M9.6 2.6v2.8h2.8', 'M8 8.2v4', 'M6.2 10.4 8 12.2l1.8-1.8'])
+const iconBranch = () =>
+  svgIcon(['M5 3.6v7.2', 'M5 12.4a1.4 1.4 0 1 0 0 .1', 'M5 3.5a1.4 1.4 0 1 0 0 .1', 'M11.4 5.6a1.4 1.4 0 1 0 0 .1', 'M11.4 6.9c0 2.4-2.6 2.6-4.4 3.6'])
+
+/**
+ * Clipboard, with a way out.
+ *
+ * `navigator.clipboard` is the right API and is refused by WebKitGTK depending on
+ * focus and permissions; a silent failure would leave the user pasting something
+ * from an hour ago. The execCommand path is deprecated everywhere but still works
+ * in the one webview this app ships, so try both and report which one failed.
+ */
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.top = '-1000px'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
 
 
@@ -162,27 +219,36 @@ export class Transcript {
   private questionCards = new Map<number, HTMLElement>()
   private fileStrip: HTMLElement | null = null
   private live = new LiveMarkdown()
-  // Nodes owned by the reveal: not rewritten while they are animating.
-  private revealFrozen: HTMLElement | null = null
-  private revealPara: HTMLElement | null = null
-  private revealHead: HTMLElement | null = null
-  private revealNodes = new Map<number, HTMLElement>()
   /**
-   * Streaming state for the thinking block, mirroring the answer reveal.
-   * Thinking was the one place text still popped in fully formed: it is
-   * rendered as plain text, so it never went through the reveal path at all.
+   * How much of `live` has been turned into nodes. The streaming paint is
+   * append-only: this only ever moves forward, and the only thing it decides is
+   * which characters have not been put on screen yet.
    */
-  private thinkEl: HTMLElement | null = null
-  private thinkRun: HTMLElement | null = null
-  private thinkSettled: Text | null = null
-  private thinkNodes = new Map<number, HTMLElement>()
-  private thinkSeq = 0
-  private thinkTimer = 0
+  private livePainted = 0
+  /**
+   * Words per second, smoothed. The reveal duration comes from this so the
+   * animation is the length of the gap it is filling rather than a constant that
+   * a fast model outruns.
+   */
+  private wordRate = 0
+  private lastPaintAt = 0
   private lastLiveRender = 0
   private liveTimer = 0
 
   /** Set by the shell: opening a file is a Tauri concern, not a renderer one. */
   onOpenFile: ((path: string) => void) | null = null
+  /**
+   * Set by the shell. Export is a backend operation - the file has to land in the
+   * workspace under the same containment rules as every other generated file - so
+   * the transcript asks rather than doing it, and gets an OutputFile back to show.
+   */
+  onExport: ((session: number) => Promise<OutputFile>) | null = null
+  /** Feedback for actions the user can otherwise not tell worked (copy, share). */
+  onToast: ((msg: string, bad?: boolean) => void) | null = null
+  /** Conversation the transcript is showing; export is addressed to it. */
+  sessionId = 0
+  /** Answer text of the live turn, kept so "copy" copies what the user read. */
+  private turnAnswer: string[] = []
 
   constructor(root: HTMLElement) {
     this.root = root
@@ -258,7 +324,10 @@ export class Transcript {
     this.live = new LiveMarkdown()
     this.turnFiles = []
     this.fileStrip = null
-    this.dropRevealNodes()
+    this.turnAnswer = []
+    this.livePainted = 0
+    this.wordRate = 0
+    this.lastPaintAt = 0
   }
 
   /**
@@ -310,6 +379,22 @@ export class Transcript {
     return body
   }
 
+  /**
+   * Settle the thinking block that just ended.
+   *
+   * This used to happen once, at turn end, so every reasoning block of a long turn
+   * read "thinking" - and stayed expanded - until the answer finished. A block
+   * ends when the model stops reasoning: the first content delta or tool call
+   * after it is the period at the end of that sentence, and that is when the
+   * header becomes the useful fact (how long it took) and the body collapses.
+   */
+  private closeReasoning() {
+    this.settleReasoning()
+    if (this.textKind === 'reasoning' && this.textBuf) {
+      this.textBuf.classList.remove('streaming')
+    }
+  }
+
   /** Collapse the thinking blocks of a finished turn back to their first lines. */
   private settleReasoning() {
     for (const el of this.reasoningEls) {
@@ -333,6 +418,7 @@ export class Transcript {
     this.pending = []
     if (!this.textBuf) return
     if (this.textKind === 'answer') {
+      this.turnAnswer.push(joined)
       // Answers format as they arrive. The naive version re-parses the whole
       // answer on every frame, which is what makes streaming UIs stutter on a
       // local model; instead only the still-growing tail block is re-parsed and
@@ -340,7 +426,9 @@ export class Transcript {
       this.live.push(joined)
       this.renderLive(false)
     } else if (this.textKind === 'reasoning') {
-      this.pushThink(joined)
+      // Reasoning is plain text - it arrives with half-written tags and asterisks
+      // that are not formatting - but it reveals the same way an answer does.
+      this.appendReveal(this.textBuf, joined, performance.now())
     } else {
       this.textBuf.appendChild(document.createTextNode(joined))
     }
@@ -355,12 +443,22 @@ export class Transcript {
    * Render the streaming answer.
    *
    * `force` is used at turn end, where correctness matters more than cost and a
-   * single full pass is cheap.
+   * single full markdown pass is cheap.
    */
   private renderLive(force: boolean) {
     if (!this.liveEl) return
+    if (force) {
+      if (this.liveTimer) {
+        clearTimeout(this.liveTimer)
+        this.liveTimer = 0
+      }
+      this.liveEl.classList.remove('streaming')
+      this.liveEl.innerHTML = this.live.finish()
+      this.livePainted = this.live.text.length
+      return
+    }
     const now = performance.now()
-    if (!force && now - this.lastLiveRender < LIVE_RENDER_MS) {
+    if (now - this.lastLiveRender < LIVE_RENDER_MS) {
       // Do not drop the update; re-render when the throttle window closes.
       if (!this.liveTimer) {
         this.liveTimer = window.setTimeout(() => {
@@ -371,189 +469,75 @@ export class Transcript {
       return
     }
     this.lastLiveRender = now
-    const r = this.live.renderReveal()
-    if (!r || r.mode === 'block') {
-      const html = r ? r.html : ''
-      this.dropRevealNodes()
-      if (this.liveEl.innerHTML !== html) this.liveEl.innerHTML = html
-      return
-    }
-    this.paintReveal(r)
+    const src = this.live.text
+    const delta = src.slice(this.livePainted)
+    if (!delta) return
+    this.livePainted = src.length
+    this.appendReveal(this.liveEl, delta, now)
   }
 
   /**
-   * Streaming paint with the newest arrivals kept as their own nodes.
+   * Put an arrival on screen as words, in nodes that are never touched again.
    *
-   * The reveal animation needs ~320ms per chunk and the paint cadence is 120ms,
-   * so anything rewritten on each paint is replaced before it can finish. Only
-   * the static head is rewritten; each chunk span is created once, animates
-   * once, and is removed when its text has been folded into the head.
-   */
-  private paintReveal(r: InlineReveal) {
-    const els = this.ensureRevealNodes()
-    if (els.frozenHost.dataset.src !== r.frozen) {
-      els.frozenHost.dataset.src = r.frozen
-      els.frozenHost.innerHTML = r.frozen
-    }
-
-    const live = new Set(r.chunks.map((c) => c.id))
-    for (const [id, el] of this.revealNodes) {
-      if (live.has(id)) continue
-      // Fold, do not rewrite. The chunk's finished nodes move into the settled
-      // run; the rest of the paragraph is left exactly as it is.
-      while (el.firstChild) els.head.append(el.firstChild)
-      el.remove()
-      this.revealNodes.delete(id)
-    }
-
-    // Re-parsing the settled run on every paint was the flash. Rewriting
-    // innerHTML tears down and re-rasters text that did not change, and the
-    // folded text simultaneously leaves the animation's compositing layer - so
-    // the newest words visibly blinked once more, ~520ms after arriving.
-    // Accumulating nodes instead means this only fires when the inline markup
-    // genuinely changes: a `**bold**` that straddled two chunks.
-    if (els.head.innerHTML !== r.head) els.head.innerHTML = r.head
-
-    for (const c of r.chunks) {
-      if (this.revealNodes.has(c.id)) continue
-      const el = document.createElement('span')
-      el.className = 'tin'
-      el.innerHTML = c.html
-      els.para.append(el)
-      this.revealNodes.set(c.id, el)
-    }
-  }
-
-  /** Finished blocks, then one paragraph holding `<head><chunk spans>`. */
-  private ensureRevealNodes() {
-    if (this.revealPara?.isConnected && this.revealHead?.isConnected) {
-      return {
-        frozenHost: this.revealFrozen as HTMLElement,
-        para: this.revealPara,
-        head: this.revealHead,
-      }
-    }
-    this.liveEl!.innerHTML = ''
-    const frozenHost = document.createElement('div')
-    frozenHost.className = 'tin-frozen'
-    const para = document.createElement('p')
-    para.className = 'tin-para'
-    const head = document.createElement('span')
-    head.className = 'tin-head'
-    para.append(head)
-    this.liveEl!.append(frozenHost, para)
-    this.revealFrozen = frozenHost
-    this.revealPara = para
-    this.revealHead = head
-    this.revealNodes = new Map()
-    return { frozenHost, para, head }
-  }
-
-  private dropRevealNodes() {
-    this.foldThink()
-    this.thinkEl = null
-    this.thinkRun = null
-    this.thinkSettled = null
-    this.revealFrozen = null
-    this.revealPara = null
-    this.revealHead = null
-    this.revealNodes = new Map()
-  }
-
-  /**
-   * Append the newest thinking text as a chunk of its own, then fold the chunks
-   * that have finished animating into the settled run.
+   * This replaces a design that re-rendered the growing paragraph and kept the
+   * newest spans separate until they could be "folded" into the settled text.
+   * Folding is a rewrite: the finished words left the animation's compositing
+   * layer and were re-rastered, so text blinked again roughly half a second
+   * after arriving - the "playing catch up" the blur was blamed for. Anything
+   * that rewrites settled text will do that, however carefully the rewrite is
+   * guarded, because the guard has to compare markup it has to regenerate.
    *
-   * Same rule as the answer reveal: an animation is only visible if the node it
-   * runs on outlives the paint cadence, so each arrival becomes a `<span>` that
-   * is created once and folded after `REVEAL_HOLD_MS` - never rewritten.
+   * So nothing here is ever rewritten. The stream is appended as spans, one per
+   * word, each animated once with a small stagger; markdown arrives exactly once,
+   * at stream end, as a single pass that replaces the whole block.
    */
-  private pushThink(s: string) {
-    const host = this.textBuf
-    if (!host) return
-    if (!revealOn()) {
-      host.appendChild(document.createTextNode(s))
+  private appendReveal(host: HTMLElement, delta: string, now: number) {
+    const words = revealWords(delta)
+    if (!revealOn() || !words.length) {
+      host.appendChild(document.createTextNode(delta))
       return
     }
-    if (this.thinkEl !== host || !this.thinkRun?.isConnected) {
-      host.innerHTML = ''
-      const run = document.createElement('span')
-      run.className = 'think-run'
-      const settled = document.createTextNode('')
-      run.append(settled)
-      host.append(run)
-      this.thinkEl = host
-      this.thinkRun = run
-      this.thinkSettled = settled
-      this.thinkNodes = new Map()
+    const gap = this.lastPaintAt ? now - this.lastPaintAt : LIVE_RENDER_MS
+    this.lastPaintAt = now
+    const inst = gap > 0 ? (words.length * 1000) / gap : 0
+    this.wordRate = this.wordRate ? this.wordRate * 0.7 + inst * 0.3 : inst
+    host.style.setProperty('--tin-dur', `${revealDuration(this.wordRate)}ms`)
+    const frag = document.createDocumentFragment()
+    for (let i = 0; i < words.length; i++) {
+      const span = document.createElement('span')
+      span.className = 'tin'
+      span.textContent = words[i]
+      // Stagger inside one arrival so a burst of six words reads as six words
+      // arriving, not one block fading in. Capped: a burst that arrives after a
+      // stall must not finish animating after the model has already moved on.
+      const delay = Math.min(i * 24, 168)
+      if (delay) span.style.animationDelay = `${delay}ms`
+      frag.append(span)
     }
-    const id = this.thinkSeq++
-    // An inline span, deliberately. `el()` builds a <div>, and a div per arrival
-    // puts every delta on its own line: the block grew straight down the full width
-    // instead of filling lines, which is what made thinking look like a rendering
-    // fault. Plain text, never markup: reasoning arrives with asterisks, angle
-    // brackets and half-written tags in it, and it is not markdown.
-    const span = document.createElement('span')
-    span.className = 'tin think-tin'
-    span.textContent = s
-    span.dataset.at = String(performance.now())
-    this.thinkRun.append(span)
-    this.thinkNodes.set(id, span)
-
-    const fold = () => {
-      this.thinkTimer = 0
-      const now = performance.now()
-      for (const [key, el] of this.thinkNodes) {
-        if (now - Number(el.dataset.at ?? 0) < REVEAL_HOLD_MS) continue
-        this.foldThinkNode(el)
-        this.thinkNodes.delete(key)
-      }
-      // The last chunks arrive at the end of the block, when no further paint
-      // will come to fold them. Without this they would stay blurred mid-flight
-      // in a block the user then collapses and reopens.
-      if (this.thinkNodes.size && !this.thinkTimer) {
-        this.thinkTimer = window.setTimeout(fold, REVEAL_HOLD_MS + 40)
-      }
-    }
-    fold()
+    host.append(frag)
   }
 
-  /** Fold one finished chunk into the settled text. Unwraps, does not rewrite. */
-  private foldThinkNode(el: HTMLElement) {
-    if (this.thinkSettled) this.thinkSettled.appendData(el.textContent ?? '')
-    el.remove()
-  }
-
-  /** Settle every in-flight chunk: block ended, collapsed, or view switched. */
-  private foldThink() {
-    if (this.thinkTimer) {
-      clearTimeout(this.thinkTimer)
-      this.thinkTimer = 0
-    }
-    for (const el of this.thinkNodes.values()) this.foldThinkNode(el)
-    this.thinkNodes.clear()
-  }
-
-  /** Start a fresh live-render target. */
+  /** Streaming blocks render as plain text with newlines kept; see appendReveal. */
   private beginLive(el: HTMLElement) {
     this.liveEl = el
     this.live = new LiveMarkdown()
+    this.livePainted = 0
     this.lastLiveRender = 0
-    this.dropRevealNodes()
+    this.lastPaintAt = 0
+    el.classList.add('streaming')
   }
-
   private push(s: string, kind: BlockKind) {
     if (this.textKind !== kind || !this.textBuf) {
       // Leaving an answer block: finish its markdown before anything else is
       // appended, so a tool call in the middle of an answer cannot truncate the
       // formatting of the part already on screen.
       if (this.textKind === 'answer') this.finalizeAnswer()
-      if (this.textKind === 'reasoning') this.foldThink()
+      if (this.textKind === 'reasoning') this.closeReasoning()
       const label = kind === 'reasoning' ? 'thinking' : kind === 'user' ? 'you' : 'cwoffee'
       this.textBuf = this.block(kind, label)
       this.textKind = kind
       if (kind === 'reasoning') {
-        this.textBuf.classList.add('clamp')
+        this.textBuf.classList.add('clamp', 'streaming')
         this.textBuf.dataset.thinkStart = String(performance.now())
         this.reasoningEls.push(this.textBuf)
       }
@@ -603,6 +587,9 @@ export class Transcript {
         this.push(ev.d, 'reasoning')
         break
       case 'toolCallBegin':
+        // A tool call ends the reasoning that preceded it: the model has decided,
+        // so that block should say how long it took now, not at turn end.
+        if (this.textKind === 'reasoning') this.closeReasoning()
         this.openTool(ev.d.id, ev.d.name)
         break
       case 'toolCallReady':
@@ -636,6 +623,10 @@ export class Transcript {
         this.setLive(null)
         this.textBuf = null
         this.textKind = null
+        // Actions after the answer, not before the files: the answer is what you
+        // read, the files are what it produced, and copying is a thing you do to
+        // a finished turn rather than one still arriving.
+        this.appendTurnActions()
         break
       case 'usage':
       case 'toolCallArgs':
@@ -668,10 +659,9 @@ export class Transcript {
       this.liveTimer = 0
     }
     if (this.liveEl) {
-      if (this.live.text) this.liveEl.innerHTML = this.live.finish()
+      if (this.live.text) this.renderLive(true)
       this.liveEl = null
     }
-    this.dropRevealNodes()
     this.live = new LiveMarkdown()
   }
 
@@ -982,6 +972,76 @@ export class Transcript {
     return row
   }
 
+  /**
+   * The line under a finished turn: copy what it said, export the conversation as
+   * a Markdown document, and a branch button that is honest about not existing
+   * yet. A disabled control that says why is better than an absent feature the
+   * user has to guess at, and better than a live button that does nothing.
+   */
+  private turnActionsRow(answerText: string, session: number): HTMLElement {
+    const row = this.el('turn-acts')
+
+    const btn = (cls: string, label: string, title: string, icon: SVGElement) => {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = `tact ${cls}`
+      b.title = title
+      b.setAttribute('aria-label', label)
+      const ico = this.el('tact-ico')
+      ico.append(icon)
+      b.append(ico, this.el('tact-label', label))
+      row.append(b)
+      return b
+    }
+
+    const copy = btn('copy', 'Copy', 'Copy this answer as Markdown', iconCopy())
+    copy.onclick = () => {
+      void copyToClipboard(answerText).then((ok) => {
+        if (this.onToast) this.onToast(ok ? 'copied the answer' : 'the webview refused the clipboard', !ok)
+        if (ok) {
+          copy.classList.add('done')
+          setTimeout(() => copy.classList.remove('done'), 1200)
+        }
+      })
+    }
+
+    const share = btn('share', 'Share as Markdown', 'Write this conversation to exports/ in its workspace', iconDoc())
+    share.onclick = () => {
+      if (!this.onExport) {
+        if (this.onToast) this.onToast('export is not available here', true)
+        return
+      }
+      share.disabled = true
+      void this.onExport(session)
+        .then((f) => {
+          // The chip is the receipt: it is the same affordance every other
+          // generated file gets, and it proves the write happened where it says.
+          this.addFiles([f])
+          this.appendTurnActions()
+          if (this.onToast) this.onToast(`saved to ${f.path}`)
+        })
+        .catch((e) => {
+          if (this.onToast) this.onToast(`export failed: ${e}`, true)
+        })
+        .finally(() => {
+          share.disabled = false
+        })
+    }
+
+    const branch = btn('branch', 'Branch', 'Branch this conversation - not built yet', iconBranch())
+    branch.disabled = true
+    return row
+  }
+
+  /** Live turns get their actions at turn end, from the text we streamed. */
+  private appendTurnActions() {
+    if (!this.turn) return
+    this.turn.querySelector('.turn-acts')?.remove()
+    const text = this.turnAnswer.join('')
+    if (!text.trim() && !this.turnFiles.length) return
+    this.turn.appendChild(this.turnActionsRow(text, this.sessionId))
+  }
+
   // ---- tool cards ---------------------------------------------------------
 
   /**
@@ -1259,6 +1319,15 @@ export class Transcript {
         }
         const body = blk('answer', 'cwoffee')
         body.innerHTML = renderMarkdown(m.content)
+        // The source, kept on the element: right-click "Copy" and any future
+        // export from the DOM should hand back what the model wrote, not the
+        // rendering of it.
+        body.dataset.md = m.content
+        // Same affordance as a live turn. In history the copy is that one message
+        // and the share is the whole conversation, which is what the buttons say.
+        const acts = this.turnActionsRow(m.content, this.sessionId)
+        acts.classList.add('from-history')
+        frag.appendChild(acts)
         if (m.files?.length) {
           // Into the fragment, directly under the answer that produced them. This
           // used to call ensureTurn() and append to the live turn, which landed the

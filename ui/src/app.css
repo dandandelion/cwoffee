@@ -330,16 +330,16 @@ body {
   font-style: italic;
   font-size: 13px;
   line-height: 1.55;
-  /* No border-left/padding-left: that indented thinking 12px away from the answer
-     text and the tool line above it. The rule still marks the block, it just
-     hangs in the gutter where it costs the text nothing. */
   position: relative;
-  padding-left: 0;
+  /* Thinking is the one block that slides under its own label rather than
+     hanging out to the left gutter: the label reads as a heading for the text
+     below it, and the rule below starts at the label's edge. */
+  padding-left: 15px;
 }
 .blk-reasoning .blk-body::before {
   content: '';
   position: absolute;
-  left: -12px;
+  left: 0;
   top: 1px;
   bottom: 1px;
   width: 2px;
@@ -1783,9 +1783,15 @@ body {
    to non-replaced inline boxes. blur+opacity is also the part that reads as
    "arriving" rather than "moving". */
 @keyframes cwoffee-tin {
-  from { opacity: 0; filter: blur(2.2px); }
+  from { opacity: 0; filter: blur(1.6px); }
   to   { opacity: 1; filter: blur(0); }
 }
+/* While a block streams, its first line sits where a <p>'s first line will sit
+   afterwards. Without the lift, the label out in the gutter is level with the
+   text instead of level with the line, and the gap between them changes at the
+   moment the markdown pass replaces the plain-text stream - which is what made
+   the CWOFFEE label look cramped next to the answer until the turn ended. */
+.blk > .blk-body.streaming { padding-top: 3px; }
 
 .pop { animation: cwoffee-pop var(--d2) var(--ease-out) both; }
 .pop.measuring { animation: none; }
@@ -1801,16 +1807,105 @@ body {
  * opacity by 33ms, so the visible part was three frames and the rest was the
  * text sitting there finished. This one spends its change across the window.
  */
-/* `backwards`, not `both`. With `both`, a finished chunk keeps the last keyframe -
-   `filter: blur(0)` - forever, and a filter forces its own raster layer. Text then
-   exists twice: the layer the animation holds and the layer the folded, static
-   paragraph is drawn into, and the swap between them is the flash reported at the
-   end of each transition. With `backwards` the animation only ever owns the
-   pre-animation state: at the end the span is ordinary text again, and folding it
-   moves glyphs that are already rasterised. */
-.tin { animation: cwoffee-tin 320ms cubic-bezier(0.32, 0.02, 0.28, 1) backwards; }
-/* The streaming paragraph is assembled from a static head plus chunk spans, so
-   it has to sit exactly where a markdown paragraph would sit. */
+/* `backwards`, not `both`: with `both` a finished word keeps `filter: blur(0)`
+   forever, and a filter forces its own raster layer, so the word exists twice -
+   once in the layer the animation owns and once in the text layer - and the swap
+   between them is a visible snap at the end of an animation you thought had
+   finished. `backwards` owns only the pre-animation state.
+
+   The duration is set per paint by the transcript from the measured word rate
+   (see revealDuration); a constant is what let a fast model outrun its own
+   animation, which is what "the blur is playing catch up" looked like. */
+.tin {
+  animation: cwoffee-tin var(--tin-dur, 200ms) cubic-bezier(0.32, 0.02, 0.28, 1) backwards;
+}
+/* ---- right-click, ours --------------------------------------------------
+   The native WebKit menu offers Back/Forward/Reload. This one is built from what
+   is under the pointer, so it can only offer things this app can actually do. */
+.ctxmenu {
+  position: fixed;
+  z-index: 90;
+  min-width: 176px;
+  max-width: min(320px, 88vw);
+  background: var(--color-paper-2);
+  border: 1px solid var(--color-hairline);
+  border-radius: 9px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  animation: cwoffee-pop 120ms var(--ease-out) both;
+}
+.ctx-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  border: 0;
+  background: none;
+  color: var(--color-ink);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.ctx-item:hover:not(:disabled), .ctx-item:focus-visible {
+  background: var(--color-tint);
+  outline: none;
+}
+.ctx-item:disabled { color: var(--color-ink-3); }
+.ctx-hint {
+  color: var(--color-ink-3);
+  font-size: 11px;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- what you can do with a finished turn ------------------------------
+   Quiet on purpose: these are not the point of the transcript, and a bright row
+   of buttons under every answer competes with the answer. They are reachable at
+   all times rather than on hover - this is a touch target on a phone too. */
+.turn-acts {
+  display: flex;
+  gap: 4px;
+  margin: 6px 0 18px;
+}
+.tact {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid transparent;
+  background: none;
+  border-radius: 7px;
+  padding: 3px 8px 3px 6px;
+  color: var(--color-ink-3);
+  font: inherit;
+  font-size: 11.5px;
+  transition: background var(--d1) var(--ease), color var(--d1) var(--ease),
+    border-color var(--d1) var(--ease);
+}
+.tact:hover:not(:disabled) {
+  background: var(--color-tint);
+  color: var(--color-ink);
+  border-color: var(--color-hairline-2);
+}
+.tact:disabled { color: var(--color-ink-4, var(--color-ink-3)); opacity: 0.55; }
+.tact-ico { display: flex; flex: none; }
+.tact-glyph {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* Copy worked, without taking space for a second label. */
+.tact.copy.done { color: var(--color-ok, var(--color-ink)); }
+.tact.copy.done .tact-label::after { content: ' ✓'; }
+
 /* ---- the model asking the user ----------------------------------------
    A question stops the turn, so this block is the most important thing on the
    screen while it is up. Question first, choices one click away, and a typed
@@ -2038,37 +2133,14 @@ body {
   color: var(--color-ink-2);
 }
 
-/* Thinking gets the same arrival animation as the answer. It previously had
-   none, because thinking is rendered as plain text and never went through the
-   markdown reveal path - so reasoning snapped in fully formed while the answer
-   below it faded in. */
-.think-run {
+/* A block being written right now holds plain text with the newlines the model
+   sent, because markdown arrives exactly once, at stream end. Without this the
+   newlines collapse and an answer arrives as one grey wall until the final pass
+   breaks it into paragraphs - the one moment in a turn where the layout jumps,
+   so it is paid for here instead. */
+.blk-body.streaming {
   white-space: pre-wrap;
 }
-/* The layer hint goes on the block, not the inline run: transforms do not apply to
-   a non-replaced inline box, so putting it on .think-run did nothing, and folded
-   text changed rasterisation mode as it left an animated span. The peek rules below
-   also need it: `display: none` on a settled body is a layout change, not a max-height
-   animation, and without a layer the re-raster of the header line reads as a blink. */
-.blk-reasoning .blk-body {
-  transform: translateZ(0);
-}
-.think-tin {
-  /* .tin carries the keyframes; this only marks it as thinking. */
-  white-space: pre-wrap;
-}
-
-/* The assembled paragraph is a real <p> inside .blk-body, so the app's own
-   paragraph rules give it its spacing - measured, not re-declared here. Only
-   the empty case needs saying. */
-/* Put the whole streaming paragraph on one compositing layer. Text inside a
-   filtered element is rasterised differently from text outside it, so without
-   this a chunk still changes glyph rendering at the moment its span is folded
-   away - a blink at the end of an animation that had already finished. */
-.tin-para {
-  transform: translateZ(0);
-}
-.tin-frozen:empty { display: none; }
 
 /* Only blocks created during a live turn ease in. Stored transcripts are
    rendered outside .turn, so opening an old session does not play 40 entrances
@@ -2403,7 +2475,7 @@ button, a, summary, label[for], [role='button'], [role='menuitem'],
 [role='menuitemradio'], [role='tab'],
 .sessrow, .wsrow, .ws-plus, .wsbtn, .filechip, .code-act, .cbtn, .fbtn, .tip,
 .att, .att-x, .keyhelp, .pop-item, .sidemenu, .swatch, .ask-opt,
-.ask-submit, .ask-decline, .ws-act, .msg-act {
+.ask-submit, .ask-decline, .ws-act, .msg-act, .tact, .ctx-item {
   cursor: pointer;
 }
 textarea, input, .blk-body, .tool-out, .tool-diff, .tool-args, .ask-input {

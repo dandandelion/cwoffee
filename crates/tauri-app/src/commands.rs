@@ -401,6 +401,31 @@ pub fn open_file(
 }
 
 #[tauri::command]
+/// Export a conversation as a Markdown document inside that conversation's own
+/// workspace, and hand back an OutputFile so the UI can show the usual chip.
+///
+/// It is a command rather than UI-side string building because the file has to
+/// pass the engine's containment rules and land where every other generated file
+/// lands - and because the same feature has to mean the same thing over the
+/// gateway, where there is no filesystem access from the client at all.
+pub fn export_markdown(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+) -> Result<cwoffee_engine::tools::OutputFile, String> {
+    let row = state
+        .store
+        .session(session)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("session {session} does not exist"))?;
+    let ws = cwoffee_engine::host::check_workspace(&row.workspace)
+        .map_err(|reason| format!("{}: {reason}", row.workspace))?;
+    let rows = state.store.messages(session).map_err(|e| e.to_string())?;
+    let out = cwoffee_engine::share::write_export(&ws, &row.title, &rows)?;
+    eprintln!("[cwoffee] export_markdown: wrote {}", out.path);
+    Ok(out)
+}
+
+#[tauri::command]
 pub fn session_messages(
     state: tauri::State<'_, AppState>,
     id: i64,

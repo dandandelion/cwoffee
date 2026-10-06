@@ -421,6 +421,7 @@ fn main() {
             commands::list_sessions,
             commands::search_messages,
             commands::session_messages,
+            commands::export_markdown,
             commands::open_file,
             commands::new_session,
             commands::list_workspaces,

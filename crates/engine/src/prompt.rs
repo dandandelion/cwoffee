@@ -37,6 +37,11 @@ pub struct PromptBuilder {
     env_block: String,
     /// Approximate token budget for the whole prompt.
     pub token_budget: usize,
+    /// The context window that budget was sized against, when the model stated
+    /// one. The compaction message quotes it: "context full" means nothing until
+    /// the user can see the number the model can actually hold.
+    #[allow(clippy::struct_field_names)]
+    pub context_window: Option<usize>,
     /// Incremented every time we drop history. Surfaced in the UI: a compaction
     /// is a visible latency spike, and users notice the spike.
     pub compactions: u32,
@@ -119,7 +124,10 @@ impl PromptBuilder {
             reasoning: crate::provider::Reasoning::default(),
             history: Vec::new(),
             env_block: String::new(),
+            // A fallback, not a policy: the host replaces this with a budget
+            // derived from the loaded model's window before the first turn.
             token_budget: 8_000,
+            context_window: None,
             compactions: 0,
             first_seq: 0,
         }
@@ -532,6 +540,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The complaint: 43k of 262k used and the app said the context was full.
+    /// The budget was a constant, so it was comparing the history against 8k.
+    #[test]
+    fn a_short_history_on_a_big_window_does_not_compact() {
+        let mut p = PromptBuilder::new();
+        let para = "x".repeat(5_000);
+        for _ in 0..15 {
+            p.push_user(&para);
+            p.push_assistant(&para);
+        }
+        let est = p.estimate_tokens("");
+        assert!(est > 40_000 && est < 46_000, "fixture is ~43k tokens, got {est}");
+
+        p.token_budget = 186_695; // 72% of 262 144, minus headroom
+        p.context_window = Some(262_144);
+        assert_eq!(
+            p.compact_to_budget(""),
+            0,
+            "{est} tokens was dropped against a 262 144 token window"
+        );
+
+        // The number this used to be compared against, kept so the fix cannot
+        // quietly regress back into a constant.
+        p.token_budget = 8_000;
+        assert!(
+            p.compact_to_budget("") > 0,
+            "an 8k budget no longer compacts this, so it no longer proves the bug"
+        );
     }
 
     #[test]
