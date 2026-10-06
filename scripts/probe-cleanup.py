@@ -38,6 +38,9 @@ PHRASES = [
     # model prompt at all: a scripted Playwright probe typing into the composer.
     "Answer in two sentences about why espresso is short",
     "Say the single word pong",
+    # A verification run that filmed the streaming reveal through the gateway UI.
+    "with the markdown shown: a level-2 heading",
+    "Name six colours, each on its own line, and nothing else",
 ]
 
 conn = sqlite3.connect(DB)

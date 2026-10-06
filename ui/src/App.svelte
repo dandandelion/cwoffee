@@ -3480,16 +3480,125 @@
           fail('the thinking block is one line wide, not filling the column')
         if (seen.length < deltas.length)
           fail(`${seen.length} spans for ${deltas.length} arrivals: words are being merged or dropped`)
-        // Newlines are kept while streaming, or an answer arrives as one grey wall
-        // until the markdown pass breaks it up - the one layout jump in a turn.
+        // Newlines are kept in the part of the answer that is still raw text, or
+        // an answer arrives as one grey wall until the block break appears. The
+        // body itself must not keep pre-wrap: it holds real markdown elements
+        // too, and the parser's own newlines would show up as blank lines.
         transcript?.apply({ kind: 'text', d: 'x\n\ny' })
         await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
         transcript?.flushNow()
         const ans = document.querySelector('.blk-answer .blk-body') as HTMLElement
-        if (getComputedStyle(ans).whiteSpace !== 'pre-wrap')
-          fail('a streaming answer collapses newlines')
+        const ansTail = ans.querySelector('.live-tail') as HTMLElement | null
+        if (!ansTail || getComputedStyle(ansTail).whiteSpace !== 'pre-wrap')
+          fail('a streaming answer collapses newlines in its unfinished block')
         transcript?.clear()
         pageLog(`append-only reveal ok (${seen.length} word spans, none rewritten)`)
+
+      // [1] Formatting arrives while the model is still talking.
+      //
+      // The video evidence was a horror story streamed for fifteen seconds with
+      // `**The Quiet Frequency**` on screen the whole time: the answer only
+      // became markdown when the turn ended. A paragraph is now committed the
+      // moment its blank line lands, and only the last, unfinished block stays
+      // as raw text.
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 2, model: 'selftest' } })
+        const parts = [
+          '# Roast levels\n\n',
+          'Light roasts keep **bright acidity** and hold ',
+          'on to whatever the origin gave them.\n\n',
+          '- light: cinnamon\n- medium: city\n',
+          '\n',
+          'Dark roasts are still arriving and *not* committed yet',
+        ]
+        for (const d of parts) {
+          transcript?.apply({ kind: 'text', d })
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          transcript?.flushNow()
+        }
+        const body = document.querySelector('.blk-answer .blk-body') as HTMLElement
+        if (!body) fail('no answer body for the streaming markdown check')
+        const h1 = body.querySelector('h1')
+        if (!h1 || !/Roast levels/.test(h1.textContent ?? ''))
+          fail('a heading stayed literal markdown while the answer streamed')
+        if (!body.querySelector('strong')) fail('bold did not format mid-stream')
+        if (!body.querySelector('ul li')) fail('a finished list did not become a list mid-stream')
+        const committed = [...body.querySelectorAll('h1, p, li')]
+          .map((n) => n.textContent ?? '')
+          .join(' ')
+        if (/\*\*|(^|\s)#\s/.test(committed))
+          fail(`committed markdown still shows its source: ${committed.slice(0, 60)}`)
+        // The unfinished block is still raw, still revealing, and still one run.
+        const tail = body.querySelector('.live-tail') as HTMLElement | null
+        if (tail) {
+          if (!/still arriving/.test(tail.textContent ?? ''))
+            fail('the unfinished block was committed before it ended')
+          if (!tail.querySelector('.tin')) fail('the tail is not revealing word by word')
+        } else {
+          fail('the unfinished block has no streaming tail')
+        }
+        // Ghost tail check: the animation must stay local to the newest words.
+        const animating = [...body.querySelectorAll('.tin')].filter(
+          (t) => Number(getComputedStyle(t).opacity) < 0.9,
+        ).length
+        if (animating > 16)
+          fail(`${animating} word spans are still half-drawn: the ghost tail is back`)
+        pageLog(`markdown mid-stream ok (h1+bold+list committed, ${animating} animating)`)
+        // Turn end leaves nothing half-rendered.
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 2, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        const done = document.querySelector('.blk-answer .blk-body') as HTMLElement
+        if (done.querySelector('.live-tail')) fail('a streaming tail survived the end of the turn')
+        if (/\*\*/.test(done.textContent ?? '')) fail('markdown markers survived the end of the turn')
+        if (!done.querySelector('em')) fail('the final block never got its markdown')
+        transcript?.clear()
+      }
+
+      // [3] The view follows the stream instead of lurching.
+      //
+      // Frame-by-frame measurements of the user's recording showed a line of
+      // text sitting at one height for five seconds and then moving 112px, then
+      // 92px, then 46px: the old rule was "jump to the bottom if it is within
+      // 160px", so the newest line lived below the fold until a jump rescued it.
+      // Following on every paint moves a few pixels at a time.
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest' } })
+        const sc = document.querySelector('.scroller') as HTMLElement
+        if (!sc) fail('no scroller for the follow check')
+        const filler = Array.from(
+          { length: 26 },
+          (_, i) => `line ${i} of a long answer that keeps the transcript taller than the viewport.`,
+        ).join('\n')
+        let prevTop = sc.scrollTop
+        let worst = 0
+        for (let i = 0; i < filler.length; i += 48) {
+          transcript?.apply({ kind: 'text', d: filler.slice(i, i + 48) })
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 25)))
+          transcript?.flushNow()
+          const step = sc.scrollTop - prevTop
+          if (step > worst) worst = step
+          prevTop = sc.scrollTop
+        }
+        const away = sc.scrollHeight - sc.scrollTop - sc.clientHeight
+        if (away > 40)
+          fail(`the newest line sits ${Math.round(away)}px below the fold: the view stopped following`)
+        if (worst > 60) fail(`the transcript lurched ${Math.round(worst)}px in a single paint`)
+        // Reading position is respected: scrolling up stops the follow, and the
+        // text does not move when a block is committed under the reader.
+        sc.scrollTop = Math.max(0, sc.scrollTop - 220)
+        await new Promise((r) => setTimeout(r, 80))
+        transcript?.apply({ kind: 'text', d: '\n\n## A committed heading ends the paragraph\n\n' })
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        transcript?.flushNow()
+        const stillUp = sc.scrollHeight - sc.scrollTop - sc.clientHeight
+        if (stillUp < away) fail('committing a block moved the text under a reader who scrolled up')
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 3, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 40))
+        transcript?.clear()
+        pageLog(`stream follow ok (worst step ${Math.round(worst)}px, off-bottom ${Math.round(away)}px)`)
+      }
       }
 
       // --- thinking sits under its own label; other blocks keep the gutter -----

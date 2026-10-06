@@ -24,7 +24,7 @@ use ratatui::{DefaultTerminal, Frame};
 use cwoffee_engine::approval::{ApprovalAnswer, ApprovalMode, ApprovalRequest};
 use cwoffee_engine::tools::ask::{Answer, Question};
 use cwoffee_engine::event::{EngineEvent, ExecStream, FinishReason};
-use cwoffee_engine::host::{default_env_block, HostCmd, HostConfig, SessionHost};
+use cwoffee_engine::host::{HostCmd, HostConfig, SessionHost};
 use cwoffee_engine::provider::Reasoning;
 use cwoffee_engine::store::Store;
 use cwoffee_engine::telemetry::{Rolling, TurnTelemetry};
@@ -368,7 +368,8 @@ async fn main() -> Result<()> {
     let mut cfg = HostConfig::new(model, workspace.clone());
     cfg.mode = appcfg.mode();
     cfg.context_budget = appcfg.context.target_tokens;
-    cfg.env_block = default_env_block(&workspace, "linux");
+    // Derived per turn from the live workspace; see SessionHost.
+    cfg.env_override = None;
     cfg.approval_timeout =
         std::time::Duration::from_secs(appcfg.approval_timeout_secs.unwrap_or(300));
 

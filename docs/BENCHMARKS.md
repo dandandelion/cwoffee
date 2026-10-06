@@ -106,6 +106,35 @@ Filmstrip diffing of the answer block through the gateway (fixed clip, real mode
 at ~50 tok/s) shows settled frames inert: mean per-frame pixel difference 0.00,
 maximum 0.12, with the only visible change coinciding with new characters.
 
+### Streaming markdown and follow, measured on the live gateway UI
+
+A scripted browser run typed a prompt that forces headings, bold and a list, then
+screenshotted the transcript every ~120ms while the answer streamed (153 frames):
+
+| what | measured |
+|---|---|
+| heading became an `h2` at frame | 88, while the tail still read `This` |
+| `**bold**` became `<strong>` at frame | 94, while the tail still read `- Bullet` |
+| list became `<li>` at frame | 100 |
+| committed blocks ever showing literal `**` | **0** |
+| frames whose unfinished block was still raw text | 15 of 65 |
+| spans mid-animation at any instant (max) | **5** |
+| frames with a span carrying non-zero blur | 14 |
+| distance from the bottom through the turn (max / median) | **0px / 0px** |
+
+Same run before the follow fix, tracking one line of text frame by frame: it held a
+position for 100 frames, then moved 112px, then 92px, then 46px. The desktop self-test now
+asserts the replacement contract directly — worst single-paint step 24px measured, fails
+above 60px, fails if the newest line ends more than 40px below the fold.
+
+Frame diffs of the user's own recording (`bug-submit-4.mp4`, 120fps source, sampled at
+20fps) are how the lurch was found: seven frames carried a mean difference of ~12/255 with
+170k pixels changed and **no** translation vector that explained them, i.e. the whole
+viewport was being rewritten rather than scrolled. A plain per-frame diff cannot tell those
+apart; the shift search can.
+
+Memory after all of it: PSS **259.5 MB** against the 400 MB ceiling.
+
 ## Prefix caching (why the prompt builder is append-only)
 
 Two turns against `qwen3.8-flash-next-iq3_s`, second turn reuses the first's

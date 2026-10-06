@@ -122,7 +122,8 @@ async fn main() -> anyhow::Result<()> {
         };
     }
     cfg.context_budget = appcfg.context.target_tokens;
-    cfg.env_block = cwoffee_engine::host::default_env_block(&workspace, "linux");
+    // Per-turn, from the live workspace: see SessionHost.
+    cfg.env_override = None;
     cfg.approval_timeout = std::time::Duration::from_secs(appcfg.approval_timeout_secs.unwrap_or(300));
 
     let mut host = SessionHost::spawn(

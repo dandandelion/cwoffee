@@ -42,8 +42,15 @@ pub struct HostConfig {
     /// front of a 262 144-token model and compacted 43k-token conversations while
     /// reporting "context full" at 16% occupancy.
     pub context_budget: Option<usize>,
-    /// Extra volatile context appended to the newest user message.
-    pub env_block: String,
+    /// Volatile context appended to the newest user message, **only** if the
+    /// caller wants something other than what the host would derive.
+    ///
+    /// `None` - the normal case - means "describe the folder the tools actually
+    /// run in", which the host recomputes before every turn. A startup snapshot
+    /// here used to be re-installed on new sessions and clears, so a session in
+    /// ~/Projects told the model it was working in ~/cwoffee-workspace while its
+    /// `pwd` said otherwise.
+    pub env_override: Option<String>,
     /// How long an unanswered approval prompt waits before refusing.
     pub approval_timeout: std::time::Duration,
     /// Attachment guardrails. Enforced at the host boundary rather than in the
@@ -65,7 +72,7 @@ impl HostConfig {
             max_tool_iters: 14,
             max_tokens: None,
             context_budget: None,
-            env_block: String::new(),
+            env_override: None,
             approval_timeout: std::time::Duration::from_secs(300),
             max_attachments: 4,
             max_attachment_bytes: 2 * 1024 * 1024,
@@ -370,7 +377,6 @@ impl SessionHost {
             ctx,
         );
         agent.prompt_mut().token_budget = cfg.context_budget.unwrap_or(FALLBACK_BUDGET);
-        agent.prompt_mut().set_env(cfg.env_block.clone());
         let cancel = agent.cancel_handle();
         let agent_cancel = cancel.clone();
 
@@ -452,9 +458,6 @@ impl SessionHost {
                                     match check_workspace(&row.workspace) {
                                         Ok(p) => {
                                             agent.set_workspace(p.clone());
-                                            agent
-                                                .prompt_mut()
-                                                .set_env(default_env_block(&p, "linux"));
                                             let _ = ev_tx.send(EngineEvent::Note {
                                                 message: format!(
                                                     "workspace is now {} (from this session)",
@@ -551,8 +554,7 @@ impl SessionHost {
                             p.token_budget = b;
                             p.context_window = w;
                         }
-                        agent.prompt_mut().set_env(cfg.env_block.clone());
-                        {
+                                        {
                             let mut s = state_bg.lock().unwrap();
                             s.session_id = 0;
                             s.context_tokens = 0;
@@ -610,9 +612,6 @@ impl SessionHost {
                         // add it by hand.
                         let _ = store.add_workspace(&p.display().to_string());
                         agent.set_workspace(p.clone());
-                        // The env block rides on the newest user message only, so
-                        // changing it does not disturb the cached prefix.
-                        agent.prompt_mut().set_env(default_env_block(&p, "linux"));
                         let _ = store.set_session_workspace(session_id, &p);
                         state_bg.lock().unwrap().workspace = p.display().to_string();
                         let _ = ev_tx.send(EngineEvent::Note {
@@ -675,8 +674,7 @@ impl SessionHost {
                                     };
                                     p.token_budget = b;
                                     p.context_window = w;
-                                    p.set_env(cfg.env_block.clone());
-                                    p
+                                        p
                                 };
                                 agent.reset_turn_id();
                                 let mut s = state_bg.lock().unwrap();
@@ -728,8 +726,7 @@ impl SessionHost {
                             session_id = 0;
                             persisted_next = 0;
                             agent.replace_prompt(PromptBuilder::new());
-                            agent.prompt_mut().set_env(cfg.env_block.clone());
-                            {
+                                                {
                                 let mut s = state_bg.lock().unwrap();
                                 s.session_id = 0;
                                 s.context_tokens = 0;
@@ -772,6 +769,16 @@ impl SessionHost {
                                 }
                             }
                         }
+                        // The env block says where the tools run. Derive it from
+                        // the workspace the host settled on a moment ago - after
+                        // any adoption, draft creation or workspace move - rather
+                        // than from anything captured at startup.
+                        let env = cfg.env_override.clone()
+                            .unwrap_or_else(|| {
+                                default_env_block(agent.workspace(), "linux")
+                            });
+                        agent.prompt_mut().set_env(env);
+
                         set_busy(&state_bg, true);
                         let tel: TurnTelemetry =
                             agent.run_turn(&text, attachments, &ev_tx).await;
@@ -1088,6 +1095,8 @@ mod tests {
         /// What the provider actually received, so a test can prove an
         /// attachment survived the host, the prompt builder and the request.
         seen_attachments: Arc<AtomicUsize>,
+        /// The user message the endpoint actually received, env block included.
+        seen_wire: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1112,6 +1121,14 @@ mod tests {
                 .map(|m| m.attachments.len())
                 .sum::<usize>();
             self.seen_attachments.fetch_add(seen, Ordering::Relaxed);
+            if let Some(last_user) = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == crate::provider::Role::User)
+            {
+                self.seen_wire.lock().unwrap().push(last_user.content.clone());
+            }
             let n = self.calls.fetch_add(1, Ordering::Relaxed);
             let reply = self
                 .replies
@@ -1152,6 +1169,7 @@ mod tests {
             window: None,
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
+            seen_wire: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -1160,6 +1178,78 @@ mod tests {
             HostConfig::new("test-model", std::env::temp_dir()),
         );
         (h, store)
+    }
+
+    #[tokio::test]
+    async fn the_env_block_names_the_folder_the_tools_run_in() {
+        // The bug this pins: the host re-installed the env block captured at
+        // startup, so a session in ~/Projects told the model it was working in
+        // the startup folder while `pwd` said otherwise. The model then typed
+        // absolute paths for a tree it was not sandboxed in.
+        let base = std::env::temp_dir().join(format!("cwoffee_env_{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p = Arc::new(Scripted {
+            window: None,
+            replies: std::sync::Mutex::new(vec!["ok".into(), "ok".into()]),
+            calls: AtomicUsize::new(0),
+            seen_attachments: Arc::new(AtomicUsize::new(0)),
+            seen_wire: Default::default(),
+        });
+        let h = SessionHost::spawn(
+            Arc::clone(&p) as Arc<dyn Provider>,
+            Registry::new(),
+            Arc::clone(&store),
+            HostConfig::new("test-model", &a),
+        );
+        ready(&h).await;
+
+        // A session that lives in a different folder, and a turn sent to it.
+        let in_b = store
+            .create_session("elsewhere", &b.display().to_string(), "test-model")
+            .unwrap();
+        h.send(HostCmd::Send {
+            text: "list the files".into(),
+            session: Some(in_b),
+            attachments: vec![],
+        });
+        turns_done(&h, 1).await;
+
+        let wire = p.seen_wire.lock().unwrap().last().cloned().unwrap_or_default();
+        assert!(
+            wire.contains(&b.display().to_string()),
+            "the model was told the wrong workspace; wire was:\n{wire}"
+        );
+        assert!(
+            !wire.contains(&a.display().to_string()),
+            "the startup folder leaked into a session that lives elsewhere:\n{wire}"
+        );
+        assert_eq!(h.state().workspace, b.display().to_string());
+
+        // Back to a draft, then to the other folder: the env block has to follow
+        // the folder the next turn actually runs in, not the last one it saw.
+        h.send(HostCmd::ClearSession);
+        wait_for("draft again".into(), || h.state().session_id == 0).await;
+        h.send(HostCmd::SetWorkspace { path: a.display().to_string() });
+        wait_for("back in a".into(), || {
+            h.state().workspace == a.display().to_string()
+        })
+        .await;
+        h.send(HostCmd::Send {
+            text: "again".into(),
+            session: None,
+            attachments: vec![],
+        });
+        turns_done(&h, 2).await;
+        let wire = p.seen_wire.lock().unwrap().last().cloned().unwrap_or_default();
+        assert!(
+            wire.contains(&a.display().to_string()),
+            "a new session kept the previous session's env block:\n{wire}"
+        );
     }
 
     #[tokio::test]
@@ -1315,6 +1405,7 @@ mod tests {
             window: Some(262_144),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
+            seen_wire: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -1341,6 +1432,7 @@ mod tests {
             window: Some(262_144),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
+            seen_wire: Default::default(),
         });
         let mut cfg = HostConfig::new("test-model", std::env::temp_dir());
         cfg.context_budget = Some(12_000);
@@ -1363,6 +1455,7 @@ mod tests {
             window: None,
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
+            seen_wire: Default::default(),
         });
         let mut h = SessionHost::spawn(
             p,
@@ -1718,6 +1811,7 @@ mod tests {
             replies: std::sync::Mutex::new(vec!["noted".into()]),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::clone(&seen),
+            seen_wire: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -2055,6 +2149,7 @@ mod tests {
             replies: std::sync::Mutex::new(vec!["tool".into()]),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
+            seen_wire: Default::default(),
         });
         let mut reg = Registry::new();
         reg.register(Box::new(ExecTool { timeout_secs: 5, allow_unsandboxed: false }));

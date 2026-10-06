@@ -233,6 +233,50 @@ function codeBlock(langRaw: string, escapedCode: string): string {
   )
 }
 
+/**
+ * Split a growing answer into finished blocks and a tail that is not.
+ *
+ * Unlike `splitBlocks`, which returns pieces, this returns the byte offset up to
+ * which the source is finished, because the caller has to retire exactly the
+ * word spans that the finished blocks replace.
+ *
+ * This is what lets an answer format *while it streams* instead of at the end:
+ * a paragraph becomes a paragraph the moment its blank line arrives, and only
+ * the last, still-growing block stays plain text.
+ *
+ * `cut` is the index into `src` up to which everything is finished. A block is
+ * closed by a blank line, and an unclosed code fence means everything from that
+ * fence on is unfinished - a half-written table or list would otherwise render
+ * as a mangled one and then get rewritten when the rest arrives.
+ */
+export function splitCommitted(src: string): { blocks: string[]; cut: number } {
+  const lines = src.split('\n')
+  const blocks: string[] = []
+  let blockStart = 0
+  let cut = 0
+  let inFence = false
+  let pos = 0
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const lineEnd = pos + line.length
+    if (/^\s*(?:```|~~~)/.test(line)) inFence = !inFence
+    // A trailing empty piece is just the newline the source ended with, not a
+    // blank line: a table row or list item may be the next thing to arrive.
+    const trailing = i === lines.length - 1 && line === ''
+    if (!inFence && !trailing && line.trim() === '') {
+      const body = src.slice(blockStart, lineEnd)
+      if (body.trim()) blocks.push(body)
+      // The blank line itself belongs to what it terminated, so the committed
+      // region is a clean prefix of the source and the word spans retired
+      // against it end on a word boundary.
+      cut = Math.min(lineEnd + 1, src.length)
+      blockStart = lineEnd + 1
+    }
+    pos = lineEnd + 1
+  }
+  return { blocks, cut: Math.min(cut, src.length) }
+}
+
 export function renderMarkdown(src: string): string {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const html: string[] = []
@@ -427,7 +471,7 @@ export const REVEAL_ANIM_MS = 320
  *  flicker; above the ceiling a fast model outruns its own animation, which is
  *  the "playing catch up" the user reported. */
 export const REVEAL_MIN_MS = 110
-export const REVEAL_MAX_MS = 300
+export const REVEAL_MAX_MS = 170
 
 /**
  * How long one word should take to land, given how fast words are arriving.

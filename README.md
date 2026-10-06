@@ -86,7 +86,9 @@ channels, which is also the seam for a future daemon/remote mode.
    Measured: 92% cache hit on turn two, 452 tok/s effective prefill against 38 tok/s raw.
 2. **Imperative transcript, never a reactive list** — deltas become text nodes
    batched once per animation frame. 0 dropped frames over 209 frames at 50 tok/s.
-3. **Plain text while streaming, markdown on stream end** — never re-parse per token.
+3. **Markdown is parsed once per block, not once per token** — a paragraph is
+   rendered the moment its blank line arrives, and the block that is still
+   arriving stays plain text.
 
 ## What the status bar actually measures
 
@@ -170,13 +172,17 @@ press it. `prefers-reduced-motion` turns all of it off. The one looping animatio
 the app is the steam on the empty screen's cup.
 
 Streaming text **arrives** rather than appearing. Each word that lands since the last
-repaint becomes its own inline `<span>`, blurs from 1.6px and fades from zero, and is
-**never touched again**. Nothing about that word is re-laid-out, re-parsed or re-animated
-for the rest of the turn: the block is append-only, exactly like the prompt that produced
-it. Duration is not a constant either — it is derived from the observed word rate
-(`600/words_per_second`, clamped to 110-300ms), so a fast model reveals quickly and a slow
-one lingers, and the stagger across a group of words is capped at 168ms so a burst of
-tokens cannot queue up an animation backlog that plays for a second after the text stops.
+repaint becomes its own inline `<span>`, blurs and fades from zero, and is **never touched
+again**. Nothing about that word is re-laid-out, re-parsed or re-animated for the rest of
+the turn: the block is append-only, exactly like the prompt that produced it. Duration is
+not a constant either — it is derived from the observed word rate (`600/words_per_second`,
+clamped to **110-170ms**) and the stagger across one arrival is capped at **90ms**.
+
+Those two caps are not taste. With a 300ms ceiling and a 168ms stagger, a fast model leaves
+a trailing row of words permanently at half opacity: the newest line is grey while the model
+is already two lines further down, and the eye reads a grey tail as flicker. Frames from a
+user recording showed exactly that, and a live run now measures at most five spans in flight
+with blur still on them.
 
 The unit is the **word**, not the chunk. Earlier designs animated whatever arrived since
 the last paint, then folded finished chunks back into a re-written paragraph. Folding is a
@@ -184,16 +190,42 @@ rewrite, and a rewrite re-rasters: every already-settled word blinked again roug
 second after it landed, which reads as the animation "playing catch up" with the text. The
 append-only version has no fold step to blink in.
 
-While a turn streams the block is plain text in `white-space: pre-wrap`, and Markdown is
-applied **exactly once**, at stream end. That keeps newlines visible as they arrive (without
-it an answer lands as one grey wall and then breaks up, which is the one layout jump in a
-turn) without parsing Markdown per token.
+**Markdown arrives with the answer, not after it.** A paragraph is committed to markdown
+the moment its blank line lands: headings become headings, `**bold**` stops being asterisks,
+lists become lists, all while the model is still talking. Only the last, unfinished block
+stays raw text in `white-space: pre-wrap`, and it is committed once at stream end. That is
+one markdown pass per block — never one per token — and blocks that are already rendered are
+never re-parsed, which is the same append-only rule the prompt builder follows.
+
+The frame-by-frame version of the bug this fixes: a 500-word story streamed for fifteen
+seconds with `**The Quiet Frequency**` on screen the entire time, and `#` markers and pipe
+tables visible until the turn ended.
 
 What the harness proves, in the app's own webview rather than in a screenshot: 28 word spans
 for four streamed reasoning deltas, every one of them still connected to the document after
 later paints, their `textContent` concatenating back to exactly what the model sent, and no
 span block-level. That is the whole contract — an animation that is invisible in the computed
 styles but rewrites settled text is still a bug, and a check on node identity catches it.
+
+Two more checks sit next to it: a streamed answer that must contain a real `h2`, a `strong`
+and an `li` **before** `turnEnd` while its tail is still raw text, and a follow check that
+fails if any single paint moves the transcript more than 60px or leaves the newest line more
+than 40px below the fold.
+
+### The view follows, it does not lurch
+
+Following the newest line used to be one rule — *if the bottom is within 160px, jump to it*.
+That is a rule that lets the newest line fall off the bottom of the screen and then rescues
+it. Measuring the user's recording line by line: one sentence sat at the same height for five
+seconds, then moved **112px**, then 92px, then 46px. Text that jumps a paragraph at a time
+reads as blinking, whatever the letter animation does.
+
+The answer is boring and continuous: after every paint, if the reader is still at the bottom,
+pin to the bottom, which moves a few pixels at a time. Scrolling up unpins, and the app stops
+moving the page; scrolling back to the bottom re-pins. Committing a finished block while a
+reader is scrolled up compensates `scrollTop` for the height change, so reformatting a
+paragraph cannot shove the text they are reading. Measured live: worst step **24px**, distance
+from the bottom through a whole turn **0px**.
 
 Two details that paragraph depends on:
 
@@ -335,6 +367,14 @@ lives in `~/Projects` quietly writes into `~/cwoffee-workspace`.
   beside a `No workspace` row, and registering the temp root as a workspace is refused
   and said out loud in a toast rather than only written to a log.
 - Renaming a group changes the label, never the path.
+- **The model is told the folder the tools actually run in.** Each request carries a
+  volatile `<env>` block with the workspace in it, and the host derives it per turn from
+  the folder it settled on after any session adoption or move — not from a snapshot taken
+  at startup. That snapshot used to be re-installed on new sessions and clears, so a
+  session in `~/Projects` quoted an `<env>` block naming `~/cwoffee-workspace` while its
+  own `pwd` said `~/Projects`, and the model then typed absolute paths for a tree it was
+  not sandboxed in. Ask the model "what does your env block say?" and ask it to run `pwd`:
+  if those two answers differ, this is the bug.
 
 Every file a turn produces appears once as an attachment however many times it was
 written, and file tools show the path they act on in the card header, so you can

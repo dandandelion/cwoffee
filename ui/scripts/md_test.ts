@@ -4,7 +4,7 @@
  * The security cases are the point. Model output quotes fetched web pages, so
  * anything that reaches this function is untrusted input from the internet.
  */
-import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS } from '../src/lib/markdown.ts'
+import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS } from '../src/lib/markdown.ts'
 
 let failed = 0
 function eq(name: string, got: string, want: string) {
@@ -202,6 +202,32 @@ for (const w of doc.split(/(?<=\s)/)) {
   lm2.render()
   renders++
 }
+// The streaming formatter commits at byte offsets, so the offset has to be the
+// truth even when nothing was rendered.
+{
+  const src = 'para one\n\npara two is still arriving'
+  const { blocks, cut } = splitCommitted(src)
+  ok('commit cut lands after the blank line', cut === 'para one\n\n'.length, `cut=${cut}`)
+  ok(
+    'committed blocks rebuild the prefix',
+    blocks.map((b) => b.trimEnd()).join('\n\n') === src.slice(0, cut).trimEnd(),
+    JSON.stringify(blocks),
+  )
+  ok('unfinished tail is left alone', src.slice(cut) === 'para two is still arriving', JSON.stringify(src.slice(cut)))
+  const open = splitCommitted('# Title\n\n```python\ncode = 1\n')
+  ok('an open fence is never committed', open.cut <= '# Title\n\n'.length, `cut=${open.cut}`)
+  const all = '# Title\n\n```python\ncode = 1\n```\n\n'
+  const closed = splitCommitted(all)
+  ok('a closed fence commits whole', closed.cut === all.length, `cut=${closed.cut}`)
+  const blank = splitCommitted('')
+  ok('empty source commits nothing', blank.cut === 0 && blank.blocks.length === 0)
+  // A blank line inside a table must not commit a half table.
+  const tbl = splitCommitted('| a | b |\n| - | - |\n| 1 | 2 |\n')
+  ok('a table with no blank line stays in the tail', tbl.cut === 0, `cut=${tbl.cut}`)
+  const rows = splitCommitted('| a | b |\n| - | - |\n| 1 | 2 |\n\nmore')
+  ok('a table commits once its blank line lands', rows.cut > 20 && rows.blocks.length === 1, `cut=${rows.cut}`)
+}
+
 ok('frozen blocks are never re-parsed', lm2.refrozen === 0, `refrozen=${lm2.refrozen}`)
 ok('tail-only rendering is cheaper than full re-render', renders > 10, `renders=${renders}`)
 

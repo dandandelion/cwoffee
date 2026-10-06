@@ -48,7 +48,7 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS } from './markdown'
+import { renderMarkdown, LiveMarkdown, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, splitCommitted } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -226,6 +226,26 @@ export class Transcript {
    */
   private livePainted = 0
   /**
+   * The answer streams into three places at once.
+   *
+   * `liveCommitted` characters of source have been rendered to markdown, once,
+   * and their nodes are never touched again. Everything after that lives in
+   * `liveTail` as word spans that animate and then sit still. When a paragraph
+   * finishes - the blank line arrives - its spans are removed and the same text
+   * is re-rendered as markdown exactly once, so `**bold**` stops being literal
+   * asterisks *while the model is still talking* rather than at the end.
+   */
+  private liveTail: HTMLElement | null = null
+  private liveCommitted = 0
+  /** How many finished blocks have already been rendered to markdown. */
+  private committedBlockCount = 0
+  /** Spans in the tail, in order, with the number of source characters each holds. */
+  private tailSpans: { node: HTMLElement; len: number }[] = []
+  /** Following the stream: pin to the bottom unless the reader scrolled away. */
+  private pinned = true
+  private programmatic = false
+  private scHooked: HTMLElement | null = null
+  /**
    * Words per second, smoothed. The reveal duration comes from this so the
    * animation is the length of the gap it is filling rather than a constant that
    * a fast model outruns.
@@ -326,6 +346,10 @@ export class Transcript {
     this.fileStrip = null
     this.turnAnswer = []
     this.livePainted = 0
+    this.liveTail = null
+    this.liveCommitted = 0
+    this.committedBlockCount = 0
+    this.tailSpans = []
     this.wordRate = 0
     this.lastPaintAt = 0
   }
@@ -453,8 +477,7 @@ export class Transcript {
         this.liveTimer = 0
       }
       this.liveEl.classList.remove('streaming')
-      this.liveEl.innerHTML = this.live.finish()
-      this.livePainted = this.live.text.length
+      this.commitAll()
       return
     }
     const now = performance.now()
@@ -471,9 +494,110 @@ export class Transcript {
     this.lastLiveRender = now
     const src = this.live.text
     const delta = src.slice(this.livePainted)
-    if (!delta) return
-    this.livePainted = src.length
-    this.appendReveal(this.liveEl, delta, now)
+    if (delta) {
+      this.livePainted = src.length
+      this.appendReveal(this.ensureTail(), delta, now, true)
+    }
+    this.commitBlocks()
+    // Follow even when nothing committed: a paragraph that has not ended yet
+    // still grows a line at a time, and a view that only moves at blank lines
+    // leaves the newest line below the fold until the next paragraph lands.
+    this.follow()
+  }
+
+  private ensureTail(): HTMLElement {
+    if (this.liveTail) return this.liveTail
+    const t = document.createElement('span')
+    t.className = 'live-tail'
+    this.liveEl!.append(t)
+    this.liveTail = t
+    return t
+  }
+
+  /**
+   * Turn the paragraphs the model has finished into markdown, once.
+   *
+   * A block is finished when its blank line arrives, so a heading, a list or a
+   * bold word appears formatted while the answer is still streaming, instead of
+   * the reader watching `**The Quiet Frequency**` for ten seconds and getting the
+   * real thing only when the turn ends.
+   *
+   * The rewrite is bounded: exactly the characters up to the last blank line,
+   * exactly once, and the nodes it produces are never parsed again.
+   */
+  private commitBlocks() {
+    if (!this.liveEl) return
+    const { blocks, cut } = splitCommitted(this.live.text)
+    if (cut <= this.liveCommitted) return
+    const sc = this.hookScroller()
+    const before = sc ? sc.scrollHeight - sc.scrollTop : 0
+    const host = this.liveEl
+    const anchor = this.liveTail
+    // The count is of *rendered* blocks, and splitCommitted already leaves
+    // blank-only blocks out, so the slice and the nodes stay in step. Getting
+    // this off by one would re-render a paragraph that is already on screen.
+    for (const b of blocks.slice(this.committedBlockCount)) {
+      const tpl = document.createElement('template')
+      tpl.innerHTML = renderMarkdown(b)
+      // Inserted as children of the body, not wrapped: the markdown styles are
+      // `.blk-body > p`, and a wrapper div would silently unstyle the answer.
+      while (tpl.content.firstChild) host.insertBefore(tpl.content.firstChild, anchor)
+    }
+    this.dropSpans(cut - this.liveCommitted)
+    this.liveCommitted = cut
+    this.committedBlockCount = blocks.length
+    if (sc) {
+      // Re-rendering a paragraph changes its height a little (a heading is
+      // taller than the line of text it replaced). Compensate the scroll for a
+      // reader who scrolled up, so committing never moves the text under them.
+      if (!this.pinned) {
+        const after = sc.scrollHeight - sc.scrollTop
+        sc.scrollTop += before - after
+      } else {
+        this.follow()
+      }
+    }
+  }
+
+  /** Replace the tail with its markdown at the end of the stream. */
+  private commitAll() {
+    if (!this.liveEl) return
+    const rest = this.live.text.slice(this.liveCommitted)
+    this.liveTail?.remove()
+    this.liveTail = null
+    this.tailSpans = []
+    if (rest.trim()) {
+      const tpl = document.createElement('template')
+      tpl.innerHTML = renderMarkdown(rest)
+      while (tpl.content.firstChild) this.liveEl.append(tpl.content.firstChild)
+    }
+    this.liveCommitted = this.live.text.length
+    this.livePainted = this.live.text.length
+    this.committedBlockCount = splitCommitted(this.live.text).blocks.length
+  }
+
+  /**
+   * Retire the spans a committed block replaces.
+   *
+   * Word spans carry their trailing whitespace, so a span never straddles the
+   * blank line that closes a block, and whole spans can be dropped. The trim
+   * branch is defensive: if a future splitter ever cuts mid-word, the frontier
+   * span is the newest one, still animating, so shortening it is cheap.
+   */
+  private dropSpans(chars: number) {
+    let left = chars
+    while (left > 0 && this.tailSpans.length) {
+      const first = this.tailSpans[0]
+      if (first.len <= left) {
+        first.node.remove()
+        left -= first.len
+        this.tailSpans.shift()
+      } else {
+        first.node.textContent = first.node.textContent!.slice(left)
+        first.len -= left
+        left = 0
+      }
+    }
   }
 
   /**
@@ -491,10 +615,12 @@ export class Transcript {
    * word, each animated once with a small stagger; markdown arrives exactly once,
    * at stream end, as a single pass that replaces the whole block.
    */
-  private appendReveal(host: HTMLElement, delta: string, now: number) {
+  private appendReveal(host: HTMLElement, delta: string, now: number, track = false) {
     const words = revealWords(delta)
     if (!revealOn() || !words.length) {
-      host.appendChild(document.createTextNode(delta))
+      const t = document.createTextNode(delta)
+      host.appendChild(t)
+      if (track) this.tailSpans.push({ node: t as unknown as HTMLElement, len: delta.length })
       return
     }
     const gap = this.lastPaintAt ? now - this.lastPaintAt : LIVE_RENDER_MS
@@ -508,13 +634,62 @@ export class Transcript {
       span.className = 'tin'
       span.textContent = words[i]
       // Stagger inside one arrival so a burst of six words reads as six words
-      // arriving, not one block fading in. Capped: a burst that arrives after a
-      // stall must not finish animating after the model has already moved on.
-      const delay = Math.min(i * 24, 168)
+      // arriving, not one block fading in. Capped hard: with a long cap the
+      // newest line sits at half-opacity while the model has moved on two lines
+      // down, which is the grey "ghost tail" the reveal got blamed for.
+      const delay = Math.min(i * 18, 90)
       if (delay) span.style.animationDelay = `${delay}ms`
       frag.append(span)
+      if (track) this.tailSpans.push({ node: span, len: words[i].length })
     }
     host.append(frag)
+  }
+
+  /**
+   * The scroller, hooked once, and only once it exists.
+   *
+   * The transcript is constructed before it is in the document, so `closest`
+   * answers null at that point; anything that needs the scroll container asks
+   * for it lazily.
+   */
+  private hookScroller(): HTMLElement | null {
+    const sc = this.root.closest('.scroller') as HTMLElement | null
+    if (!sc || sc === this.scHooked) return sc
+    this.scHooked = sc
+    sc.addEventListener(
+      'scroll',
+      () => {
+        if (this.programmatic) return
+        const away = sc.scrollHeight - sc.scrollTop - sc.clientHeight
+        // Reading backwards is a choice; being left behind by the stream is not.
+        // 48px is deliberately smaller than a line's worth of growth per paint,
+        // so a reader who has been outrun is re-pinned rather than stranded.
+        this.pinned = away < 48
+        pageLog(`follow ${this.pinned ? 'on' : 'off'}: ${Math.round(away)}px from the bottom`)
+      },
+      { passive: true },
+    )
+    return sc
+  }
+
+  /**
+   * Keep the newest line on screen without lurching.
+   *
+   * The old rule was "if the bottom is within 160px, jump to it", which meant
+   * the view sat still while text piled up below the fold and then moved a whole
+   * paragraph at once - the frames show 112px, 92px, 46px steps. Following on
+   * every paint moves a few pixels at a time, which is what a reading eye expects.
+   */
+  private follow() {
+    const sc = this.hookScroller()
+    if (!sc || !this.pinned) return
+    const away = sc.scrollHeight - sc.scrollTop - sc.clientHeight
+    if (away <= 0) return
+    this.programmatic = true
+    sc.scrollTop = sc.scrollHeight
+    requestAnimationFrame(() => {
+      this.programmatic = false
+    })
   }
 
   /** Streaming blocks render as plain text with newlines kept; see appendReveal. */
@@ -522,6 +697,10 @@ export class Transcript {
     this.liveEl = el
     this.live = new LiveMarkdown()
     this.livePainted = 0
+    this.liveTail = null
+    this.liveCommitted = 0
+    this.committedBlockCount = 0
+    this.tailSpans = []
     this.lastLiveRender = 0
     this.lastPaintAt = 0
     el.classList.add('streaming')
@@ -556,10 +735,12 @@ export class Transcript {
    * reader's scroll is the most annoying thing a streaming chat can do.
    */
   private scrollIfNeeded() {
-    const sc = this.root.closest('.scroller') as HTMLElement | null
-    if (!sc) return
-    const away = sc.scrollHeight - sc.scrollTop - sc.clientHeight
-    if (away < 160) sc.scrollTop = sc.scrollHeight
+    this.follow()
+  }
+
+  /** Where a reader deliberately is: false once they scroll up, true at the bottom. */
+  get following(): boolean {
+    return this.pinned
   }
 
   // ---- event application -------------------------------------------------
@@ -643,6 +824,9 @@ export class Transcript {
       clearTimeout(this.liveTimer)
       this.liveTimer = 0
     }
+    // "Now" means now: drop the throttle window so the next flush paints rather
+    // than scheduling itself again.
+    this.lastLiveRender = 0
     this.flush()
   }
 
@@ -1018,6 +1202,7 @@ export class Transcript {
           // generated file gets, and it proves the write happened where it says.
           this.addFiles([f])
           this.appendTurnActions()
+          this.follow()
           if (this.onToast) this.onToast(`saved to ${f.path}`)
         })
         .catch((e) => {
@@ -1040,6 +1225,9 @@ export class Transcript {
     const text = this.turnAnswer.join('')
     if (!text.trim() && !this.turnFiles.length) return
     this.turn.appendChild(this.turnActionsRow(text, this.sessionId))
+    // The row lands after the last paint, so a reader who was being followed
+    // ends up 30-odd pixels short of the bottom exactly when the turn closes.
+    this.follow()
   }
 
   // ---- tool cards ---------------------------------------------------------

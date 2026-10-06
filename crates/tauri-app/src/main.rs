@@ -168,7 +168,10 @@ fn main() {
     let mut cfg = HostConfig::new(model, workspace.clone());
     cfg.mode = mode;
     cfg.context_budget = appcfg.context.target_tokens;
-    cfg.env_block = cwoffee_engine::host::default_env_block(&workspace, "linux");
+    // No env block from here on purpose: the host derives it from the folder a
+    // turn actually runs in. A snapshot of the startup folder used to be shown to
+    // sessions living somewhere else.
+    cfg.env_override = None;
     // Fail-closed default: an unanswered prompt refuses rather than hanging the
     // turn forever.
     cfg.approval_timeout =

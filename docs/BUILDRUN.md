@@ -1135,3 +1135,88 @@ first), and the document must survive a title that tries to escape (`../../etc/p
 `etc_passwd`). On the rendering side, a run of consecutive assistant rows is one speaker turn:
 stored one row per tool call, they used to produce five `## Cwoffee` headings and three
 "Tools used:" lists for a single paragraph of prose.
+
+## Trap 59: "markdown only appears at the end" — the append-only rule read too strictly
+
+The rule *do not parse markdown per token* was written to stop a stutter, and the
+implementation obeyed it literally: the whole answer streamed as plain text and one
+markdown pass ran at stream end. A 500-word story spent fifteen seconds on screen as
+`**The Quiet Frequency**`, and a table was pipe characters until the model stopped.
+
+Blocks, not tokens, are the right unit. `splitCommitted(src)` returns the offset up to
+which the source cannot change again — a block ends at a blank line, and an unclosed
+fence keeps everything after it unfinished — and each finished block is rendered to
+markdown exactly once and inserted before the still-raw tail. Nothing already rendered
+is re-parsed, so the append-only property survives; the tail is committed once at stream
+end because a final paragraph never gets its blank line.
+
+Two traps inside the fix:
+
+- The rendered nodes go **as children of `.blk-body`**, not into a wrapper div. The
+  markdown styles are written `.blk-body > p`, so a wrapper silently unstyles the whole
+  answer: no list bullets, no heading sizes, and it looks like the commit never happened.
+- The count of *committed blocks* has to be tracked alongside the committed offset. Slice
+  from the wrong one and a paragraph is rendered twice on screen; recompute from the
+  offset with a stale value (the old code did exactly that, updating the count before
+  assigning the offset) and it happens one block later, which is worse because it looks
+  intermittent.
+
+`white-space: pre-wrap` moved from the body to the tail span for the same reason: the
+parser's own newlines between block elements would otherwise render as blank lines.
+
+## Trap 60: the transcript did not stream, it *lurched* — an autoscroll threshold
+
+"Blinking is worse" was not the letter animation. Filming the user's recording at 20fps
+and tracking one line of text frame by frame: it held one position for ~100 frames (five
+seconds), then moved **112px**, then 92px, then 46px. The whole answer block was being
+dragged up the screen in paragraph-sized steps.
+
+The rule was `if (scrollHeight - scrollTop - clientHeight < 160) scrollTop = scrollHeight`,
+called from block-creation sites — not from the paint path. So text accumulated *below the
+fold* while the view sat still, and the next event that happened to call the function
+teleported the view to wherever the model had got to. Note what the frame diff said: mean
+difference 12/255 with 170k changed pixels and *no* shift vector that explained it — a
+whole-viewport rewrite looks nothing like a scroll in a naive diff, and the shift search
+was the step that identified it.
+
+The fix is boring and continuous: follow on **every** paint (including the ones where
+nothing committed — a paragraph that has not ended still grows a line at a time), pin only
+while the reader is at the bottom, unpin on their own scroll, re-pin when they come back,
+and compensate `scrollTop` by the height delta when a committed block changes the height
+under a reader who scrolled up. Measured live: worst step 24px, 0px from the bottom for a
+whole turn. The turn-end action row is appended after the last paint, so it follows too —
+otherwise the last 30px of a finished turn sit below the fold, which is where the user
+looks first.
+
+## Trap 61: the reveal's own stagger built the grey tail it was blamed for
+
+Blur-in was measured working (spans caught mid-flight at opacity 0.2 with `blur(1.7px)`),
+and the user still said they could not see it. What they were seeing instead was the
+*tail*: with a 300ms duration ceiling and a 168ms per-word stagger cap, a fast model left
+the newest line permanently at half opacity while the model was already two lines further
+down. A row of grey words that re-darkens as the stream passes is flicker, whatever the
+keyframes say.
+
+Duration ceiling 170ms, stagger cap 90ms, and the harness fails if more than 16 spans are
+half-drawn at once (a live run measures five). An animation that is provably running is
+not the same as an animation that is not in the way.
+
+## Trap 62: the host showed the model a folder the tools were not using
+
+`<env>` — the volatile block naming the workspace, appended to the newest user message at
+wire time — was built once from the startup workspace and then *re-installed* from that
+snapshot on `NewSession`, `ClearSession` and the draft path. A session stored in
+`~/Projects` therefore told the model `workspace: ~/cwoffee-workspace` while `exec` ran with
+`pwd` in `~/Projects`. The model, being asked to list files, typed absolute paths into the
+folder it had been *told* about and got an empty sandbox in return.
+
+The symptom is unusually clean: the composer chip, the stored session row and the sandbox
+all agree, and only the model's own report of its environment disagrees. Ask it to quote
+its env block and to run `pwd` in the same turn — the pair is the test.
+
+`HostConfig::env_block` became `env_override: Option<String>`; `None` (every real caller)
+means derive from `agent.workspace()` immediately before the turn, after any session
+adoption or workspace move. One site, one order — the pinning test captures the wire
+message in `Scripted::seen_wire` and asserts it names the new folder *and not* the old one.
+The general shape: a volatile block that is refreshed by a snapshot of when the process
+started is a stale value with a fresh timestamp.

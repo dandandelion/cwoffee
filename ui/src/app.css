@@ -1758,11 +1758,12 @@ body {
    asked for. Nothing here loops except the cup's steam, and nothing here moves
    more than 6px.
 
-   A note on the streaming reveal (.tin): the answer is re-rendered from the
-   markdown state machine every 120ms, so the animation is applied only to the
-   slice that arrived since the last paint. 170ms against a 120ms repaint means
-   a word is essentially at rest by the time the boundary moves past it - which
-   is what stops it reading as flicker. */
+   A note on the streaming reveal (.tin): each word is one span, appended once,
+   animated once, never rewritten. A paragraph is re-rendered as markdown exactly
+   once when its blank line arrives (commitBlocks), so `**bold**` stops being
+   asterisks mid-answer instead of at the end - but the words that are already
+   at rest are never touched again, which is what every "fold the tail into the
+   settled text" design gets wrong. */
 :root {
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --ease-out: cubic-bezier(0.16, 0.84, 0.24, 1);
@@ -1817,7 +1818,7 @@ body {
    (see revealDuration); a constant is what let a fast model outrun its own
    animation, which is what "the blur is playing catch up" looked like. */
 .tin {
-  animation: cwoffee-tin var(--tin-dur, 200ms) cubic-bezier(0.32, 0.02, 0.28, 1) backwards;
+  animation: cwoffee-tin var(--tin-dur, 170ms) cubic-bezier(0.32, 0.02, 0.28, 1) backwards;
 }
 /* ---- right-click, ours --------------------------------------------------
    The native WebKit menu offers Back/Forward/Reload. This one is built from what
@@ -2138,9 +2139,11 @@ body {
    newlines collapse and an answer arrives as one grey wall until the final pass
    breaks it into paragraphs - the one moment in a turn where the layout jumps,
    so it is paid for here instead. */
-.blk-body.streaming {
-  white-space: pre-wrap;
-}
+/* Only the unfinished tail keeps raw newlines. Committed blocks are real
+   markdown elements and would show the parser's own line breaks as blank lines
+   if the body kept pre-wrap. Reasoning stays raw text start to finish. */
+.live-tail { white-space: pre-wrap; }
+.blk-reasoning .blk-body.streaming { white-space: pre-wrap; }
 
 /* Only blocks created during a live turn ease in. Stored transcripts are
    rendered outside .turn, so opening an old session does not play 40 entrances
