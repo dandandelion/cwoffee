@@ -663,17 +663,51 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
-/// Which backend to use. SearXNG has a real JSON API and is the default when a
-/// base URL is configured; DuckDuckGo's HTML endpoint is the keyless fallback.
+/// Which backend to use. SearXNG has a real JSON API and is the right answer for
+/// repeated searching; DuckDuckGo's HTML endpoint is the keyless fallback that
+/// starts returning bot challenges after a handful of queries. `Auto` means
+/// "Cwoffee runs its own SearXNG, and says so if it cannot".
 #[derive(Debug, Clone)]
 pub enum SearchBackend {
     SearXNG { base: String },
     DuckDuckGo,
+    Auto(crate::tools::searxng::AutoSearXNG),
+}
+
+impl SearchBackend {
+    /// One line for logs and the settings card. Never a struct dump: this is what
+    /// a person reads to know which search they are getting.
+    pub fn describe(&self) -> String {
+        match self {
+            SearchBackend::SearXNG { base } => {
+                if base.trim().is_empty() {
+                    "SearXNG (no URL configured)".into()
+                } else {
+                    format!("SearXNG at {}", base.trim_end_matches('/'))
+                }
+            }
+            SearchBackend::DuckDuckGo => "DuckDuckGo (keyless HTML endpoint)".into(),
+            SearchBackend::Auto(a) => format!("SearXNG managed by Cwoffee on port {}", a.port),
+        }
+    }
+
+    /// The spelling the settings UI sends and the config file uses, so there is
+    /// one vocabulary rather than three.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchBackend::SearXNG { .. } => "searxng",
+            SearchBackend::DuckDuckGo => "duckduckgo",
+            SearchBackend::Auto(_) => "auto",
+        }
+    }
 }
 
 pub struct WebSearchTool {
     pub client: reqwest::Client,
-    pub backend: SearchBackend,
+    /// Interior mutability, not a rebuild: the tool's name, description and schema
+    /// are prompt bytes, and switching providers must not change them. The order of
+    /// the tool list is pinned elsewhere for the same reason.
+    pub backend: std::sync::Mutex<SearchBackend>,
     pub max_results: usize,
 }
 
@@ -686,9 +720,10 @@ impl Default for WebSearchTool {
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .expect("reqwest client"),
-            backend: base
-                .map(|base| SearchBackend::SearXNG { base })
-                .unwrap_or(SearchBackend::DuckDuckGo),
+            backend: std::sync::Mutex::new(
+                base.map(|base| SearchBackend::SearXNG { base })
+                    .unwrap_or(SearchBackend::DuckDuckGo),
+            ),
             max_results: 8,
         }
     }
@@ -702,9 +737,18 @@ impl WebSearchTool {
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .expect("reqwest client"),
-            backend,
+            backend: std::sync::Mutex::new(backend),
             max_results: 8,
         }
+    }
+
+    pub fn backend(&self) -> SearchBackend {
+        self.backend.lock().map(|b| b.clone()).unwrap_or(SearchBackend::DuckDuckGo)
+    }
+
+    pub fn set_backend(&self, b: SearchBackend) -> SearchBackend {
+        let mut guard = self.backend.lock().expect("search backend mutex");
+        std::mem::replace(&mut *guard, b)
     }
 }
 
@@ -742,16 +786,18 @@ impl Tool for WebSearchTool {
             return ToolResult::err("web_search: query is empty");
         }
 
-        let results = match &self.backend {
-            SearchBackend::SearXNG { base } => self.searxng(base, &q).await,
-            SearchBackend::DuckDuckGo => self.duckduckgo(&q).await,
-        };
+        // The mutex is released before any await: a lock held across `.await` is
+        // how a search that hangs ends up blocking the settings card too.
+        let (note, results) = self.search_with(&q).await;
         let results = match results {
             Ok(r) => r,
-            Err(e) => return ToolResult::err(e.to_string()),
+            Err(e) => return ToolResult::err(e),
         };
         if results.is_empty() {
-            return ToolResult::ok("no results");
+            return ToolResult::ok(match note {
+                Some(n) => format!("{n}\n\nno results"),
+                None => "no results".into(),
+            });
         }
         let body = results
             .iter()
@@ -759,6 +805,12 @@ impl Tool for WebSearchTool {
             .map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.title, r.url, r.snippet))
             .collect::<Vec<_>>()
             .join("\n\n");
+        let body = match note {
+            // The note leads, so the model cannot report "searched the web" without
+            // knowing which search answered.
+            Some(n) => format!("{n}\n\n{body}"),
+            None => body,
+        };
         let mut res = ToolResult::ok(clamp_text(&body, ctx.max_output_bytes));
         res.truncated = body.len() > ctx.max_output_bytes;
         res
@@ -766,6 +818,65 @@ impl Tool for WebSearchTool {
 }
 
 impl WebSearchTool {
+    /// One query, one answer, plus a note when the answer did not come from the
+    /// backend that was configured. Shared by the tool and by the settings panel so
+    /// the two can never disagree about what a search would do.
+    pub async fn search_with(
+        &self,
+        q: &str,
+    ) -> (Option<String>, Result<Vec<SearchResult>, String>) {
+        let backend = self.backend();
+        match &backend {
+            SearchBackend::SearXNG { base } => {
+                if base.trim().is_empty() {
+                    // Configured "searxng" with no URL: name the missing key rather
+                    // than fetching an empty host and reporting a network error no
+                    // one can act on.
+                    return (
+                        None,
+                        Err(
+                            "web_search: backend is \"searxng\" but no URL is set; add \
+                             searxng_url under [search], or set backend = \"auto\" to \
+                             have Cwoffee run one"
+                                .into(),
+                        ),
+                    );
+                }
+                (None, self.searxng(base, q).await.map_err(|e| e.to_string()))
+            }
+            SearchBackend::DuckDuckGo => (None, self.duckduckgo(q).await.map_err(|e| e.to_string())),
+            SearchBackend::Auto(auto) => match auto.ensure_up().await {
+                Ok(()) => match self.searxng(&auto.base(), q).await {
+                    Ok(r) => {
+                        auto.touch();
+                        (None, Ok(r))
+                    }
+                    Err(e) => {
+                        // The instance answered the health check but not the search
+                        // (JSON off, engines all down). Fall back, and tell the model
+                        // which search it is actually reading.
+                        (
+                            Some(format!(
+                                "note: the SearXNG instance on {} answered but not for this \
+                                 search ({e}); these results came from DuckDuckGo instead",
+                                auto.base()
+                            )),
+                            self.duckduckgo(q).await.map_err(|e| e.to_string()),
+                        )
+                    }
+                },
+                Err(e) => (
+                    Some(format!(
+                        "note: Cwoffee could not start its own SearXNG ({e}); these results \
+                         came from DuckDuckGo, which starts answering with a bot challenge \
+                         after a handful of queries"
+                    )),
+                    self.duckduckgo(q).await.map_err(|e| e.to_string()),
+                ),
+            },
+        }
+    }
+
     async fn searxng(&self, base: &str, q: &str) -> Result<Vec<SearchResult>, WebError> {
         let url = format!(
             "{}/search?format=json&q={}",

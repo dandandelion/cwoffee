@@ -52,6 +52,10 @@ pub struct AppState {
     /// Owns the LAN gateway task, so the UI can show and change whether remote
     /// access is on. See gateway_ctl.
     pub gateway: std::sync::Arc<crate::gateway_ctl::GatewayCtl>,
+    /// The config file the app actually read (or where it would read one). The
+    /// search panel writes back to this, because a provider that resets on restart
+    /// is a provider that was never enabled.
+    pub config_path: std::path::PathBuf,
 }
 
 /// Is remote access on, on what address, and how many devices are attached.
@@ -401,29 +405,102 @@ pub fn open_file(
 }
 
 #[tauri::command]
-/// Export a conversation as a Markdown document inside that conversation's own
-/// workspace, and hand back an OutputFile so the UI can show the usual chip.
+/// The document behind "Share as Markdown": a suggested name and the text, with
+/// nothing written anywhere. It used to write into `<workspace>/exports/` and
+/// return an `OutputFile`, which made a share look like model output - a chip in
+/// the conversation, a file in the folder the tools work in, and a later turn
+/// tidying up a document nobody asked for.
 ///
-/// It is a command rather than UI-side string building because the file has to
-/// pass the engine's containment rules and land where every other generated file
-/// lands - and because the same feature has to mean the same thing over the
-/// gateway, where there is no filesystem access from the client at all.
-pub fn export_markdown(
+/// It is still a command rather than UI-side string building: the UI is not the
+/// only client, and the document has to be the same object over the gateway, where
+/// there is no engine-side view of the conversation at all.
+pub fn share_markdown(
     state: tauri::State<'_, AppState>,
     session: i64,
-) -> Result<cwoffee_engine::tools::OutputFile, String> {
+) -> Result<cwoffee_engine::share::ShareDoc, String> {
     let row = state
         .store
         .session(session)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("session {session} does not exist"))?;
-    let ws = cwoffee_engine::host::check_workspace(&row.workspace)
-        .map_err(|reason| format!("{}: {reason}", row.workspace))?;
     let rows = state.store.messages(session).map_err(|e| e.to_string())?;
-    let out = cwoffee_engine::share::write_export(&ws, &row.title, &rows)?;
-    eprintln!("[cwoffee] export_markdown: wrote {}", out.path);
-    Ok(out)
+    Ok(cwoffee_engine::share::share_document(&row.title, &row.workspace, &rows))
 }
+
+/// Ask the person where the shared document should go, then write it there.
+///
+/// Desktop-only by construction: a browser page cannot put a file wherever it
+/// likes, so over the gateway the same Share click downloads instead (see the UI).
+/// The dialog result is `None` when the person cancels, which is a real answer and
+/// not an error.
+#[tauri::command]
+pub async fn save_markdown_file(
+    app: tauri::AppHandle,
+    name: String,
+    contents: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&name)
+        .save_file(move |p| {
+            eprintln!(
+                "[cwoffee] save dialog: {}",
+                match &p {
+                    Some(tauri_plugin_dialog::FilePath::Path(_)) => "path",
+                    Some(tauri_plugin_dialog::FilePath::Url(_)) => "url",
+                    None => "cancelled",
+                }
+            );
+            let _ = tx.send(p.and_then(picked_to_path));
+        });
+    let chosen = tokio::time::timeout(std::time::Duration::from_secs(300), rx)
+        .await
+        .map_err(|_| "save dialog timed out".to_string())?
+        .map_err(|_| "save dialog closed without a result".to_string())?;
+    let Some(path) = chosen else {
+        return Ok(None);
+    };
+    std::fs::write(&path, contents.as_bytes()).map_err(|e| format!("cannot write {path}: {e}"))?;
+    eprintln!("[cwoffee] share: wrote {path}");
+    Ok(Some(path))
+}
+
+/// Web search settings. The logic lives in the engine (`settings`), because the
+/// phone's browser page has the same panel and must not get a second, drifting
+/// implementation of "which search is on". These are the desktop's thin calls:
+/// the config path comes from the shell, the answer comes from the engine.
+#[tauri::command]
+pub async fn search_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<cwoffee_engine::settings::SearchView, String> {
+    Ok(cwoffee_engine::settings::search_view(&state.host, &state.config_path).await)
+}
+
+#[tauri::command]
+pub async fn set_search_backend(
+    state: tauri::State<'_, AppState>,
+    backend: String,
+    searxng_url: Option<String>,
+) -> Result<cwoffee_engine::settings::SearchView, String> {
+    cwoffee_engine::settings::set_search_backend(
+        &state.host,
+        &state.config_path,
+        &backend,
+        &searxng_url.unwrap_or_default(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn search_probe(
+    state: tauri::State<'_, AppState>,
+    query: Option<String>,
+) -> Result<cwoffee_engine::settings::SearchProbe, String> {
+    cwoffee_engine::settings::search_probe(&state.host, query).await
+}
+
 
 #[tauri::command]
 pub fn session_messages(

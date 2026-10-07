@@ -117,13 +117,28 @@ fn default_max_output() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchCfg {
-    /// duckduckgo | searxng
+    /// duckduckgo | searxng | auto
+    ///
+    /// `auto` is the one that needs nothing from the person: Cwoffee runs its own
+    /// SearXNG in a container on first search and stops it when it goes idle. See
+    /// `tools::searxng`.
     #[serde(default = "default_backend")]
     pub backend: String,
     #[serde(default)]
     pub searxng_url: Option<String>,
     #[serde(default = "default_max_results")]
     pub max_results: usize,
+    /// `auto` only: the port Cwoffee publishes *its* instance on. Not 8888, which
+    /// is where an instance from elsewhere usually already lives.
+    #[serde(default = "default_auto_port")]
+    pub auto_port: u16,
+    /// `auto` only: how long an unused container is worth keeping.
+    #[serde(default = "default_auto_idle")]
+    pub auto_idle_secs: u64,
+    /// `auto` only: where the generated `settings.yml` / `limiter.toml` live.
+    /// Default: `<config dir>/searxng`.
+    #[serde(default)]
+    pub auto_dir: Option<String>,
 }
 
 impl Default for SearchCfg {
@@ -132,6 +147,9 @@ impl Default for SearchCfg {
             backend: default_backend(),
             searxng_url: None,
             max_results: default_max_results(),
+            auto_port: default_auto_port(),
+            auto_idle_secs: default_auto_idle(),
+            auto_dir: None,
         }
     }
 }
@@ -141,6 +159,12 @@ fn default_backend() -> String {
 }
 fn default_max_results() -> usize {
     8
+}
+fn default_auto_port() -> u16 {
+    crate::tools::searxng::DEFAULT_AUTO_PORT
+}
+fn default_auto_idle() -> u64 {
+    crate::tools::searxng::DEFAULT_IDLE_SECS
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -283,6 +307,108 @@ impl Config {
         p.to_string()
     }
 
+    /// Edit `[search]` keys in a config file's *text*, leaving every other line -
+    /// comments included - exactly as it was. A settings panel that re-serialised
+    /// the whole file would flatten a hand-annotated config into a generated one,
+    /// and the notes people leave themselves ("this endpoint is the slow box") are
+    /// the thing most worth keeping.
+    ///
+    /// Values are TOML literals, already quoted: `toml_str("auto")` or `"8899"`.
+    /// Returns a description of each change so the caller can say what it did.
+    pub fn set_search_keys_in(text: &str, kvs: &[(&str, &str)]) -> (String, Vec<String>) {
+        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+        let header = lines.iter().position(|l| l.trim() == "[search]");
+        let mut changed = Vec::new();
+        let Some(h) = header else {
+            if !text.is_empty() && !text.ends_with('\n') {
+                lines.push(String::new());
+            }
+            lines.push("[search]".into());
+            for (k, v) in kvs {
+                lines.push(format!("{k} = {v}"));
+                changed.push(format!("{k} = {v} (new)"));
+            }
+            let mut out = lines.join("\n");
+            out.push('\n');
+            return (out, changed)
+        };
+        // The section ends at the next header, so a `[sandbox] backend = ...` (no
+        // such key today, but any future collision) cannot be edited by accident.
+        let end = (h + 1..lines.len())
+            .find(|i| {
+                let t = lines[*i].trim();
+                t.starts_with('[') && t.ends_with(']')
+            })
+            .unwrap_or(lines.len());
+        for (k, v) in kvs {
+            // A commented-out key counts: `# searxng_url = "..."` is the example in
+            // the shipped config, and adding a second line would leave two, one of
+            // them a lie.
+            let at = (h + 1..end).find(|i| {
+                let t = lines[*i].trim();
+                let t = t.trim_start_matches('#').trim();
+                t.starts_with(&format!("{k} ")) || t.starts_with(&format!("{k}="))
+            });
+            match at {
+                Some(i) => {
+                    let old = lines[i].trim().to_string();
+                    lines[i] = format!("{k} = {v}");
+                    changed.push(format!("{k}: {old} -> {k} = {v}"));
+                }
+                None => {
+                    // Insert at the end of the section rather than at the top: the
+                    // first key in a section often carries the section's comment.
+                    let mut insert = end;
+                    while insert > h + 1 && lines[insert - 1].trim().is_empty() {
+                        insert -= 1;
+                    }
+                    lines.insert(insert, format!("{k} = {v}"));
+                    changed.push(format!("{k} = {v} (new)"));
+                }
+            }
+        }
+        let mut out = lines.join("\n");
+        if text.ends_with('\n') || !out.ends_with('\n') {
+            out.push('\n');
+        }
+        (out, changed)
+    }
+
+    /// A TOML string literal, with the quotes and escapes a hand-written config
+    /// would have.
+    pub fn toml_str(v: &str) -> String {
+        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    /// Write `[search]` keys to `path`, creating the file if the person has never
+    /// needed one. This is the persistence behind the settings panel: a provider
+    /// that resets on restart is a provider that was never really enabled.
+    pub fn set_search_keys(path: &std::path::Path, kvs: &[(&str, &str)]) -> Result<Vec<String>, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        let (out, changed) = Self::set_search_keys_in(&text, kvs);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        // Write-then-rename: a crash half-way through a config write leaves the
+        // old file intact rather than a truncated one the next boot refuses.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, out.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The file can come to hold an endpoint key, so it is not world-readable.
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+        Ok(changed)
+    }
+
     pub fn mode(&self) -> ApprovalMode {
         match self.mode.as_deref() {
             Some("session") => ApprovalMode::Session,
@@ -312,7 +438,22 @@ impl Config {
             "searxng" => SearchBackend::SearXNG {
                 base: self.search.searxng_url.clone().unwrap_or_default(),
             },
+            "auto" => SearchBackend::Auto(crate::tools::searxng::AutoSearXNG::new(
+                self.search.auto_port,
+                self.search.auto_idle_secs,
+                self.search_auto_dir(),
+            )),
             _ => SearchBackend::DuckDuckGo,
+        }
+    }
+
+    /// The directory `auto` owns. Under the config dir, next to config.toml, so a
+    /// person can find and read the settings we generated rather than having them
+    /// appear in a cache nobody looks in.
+    pub fn search_auto_dir(&self) -> std::path::PathBuf {
+        match self.search.auto_dir.as_deref().filter(|s| !s.is_empty()) {
+            Some(d) => std::path::PathBuf::from(Self::expand_tilde(d)),
+            None => Self::default_path().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from(".")).join("searxng"),
         }
     }
 
@@ -359,6 +500,86 @@ fn env(k: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_search_key_is_replaced_where_it_lives() {
+        let text = "# my notes: this is the slow box\nmode = \"ask\"\n\n[search]\nbackend = \"duckduckgo\"\nmax_results = 8\n\n[sandbox]\ntimeout_secs = 30\n";
+        let (out, changed) =
+            Config::set_search_keys_in(text, &[("backend", &Config::toml_str("auto"))]);
+        assert!(out.contains("backend = \"auto\""), "{out}");
+        assert!(!out.contains("duckduckgo"), "{out}");
+        // The person's comment and the neighbouring sections survive. This is the
+        // whole reason the edit is textual instead of re-serialising the file.
+        assert!(out.contains("# my notes: this is the slow box"));
+        assert!(out.contains("[sandbox]\ntimeout_secs = 30"));
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].contains("backend"), "{changed:?}");
+    }
+
+    #[test]
+    fn a_commented_key_is_uncommented_not_duplicated() {
+        // The shipped example carries `# searxng_url = "..."`. Leaving it commented
+        // and adding a live line would put two answers for one key in the file.
+        let text = "[search]\nbackend = \"searxng\"\n# searxng_url = \"http://127.0.0.1:8888/search\"\n";
+        let (out, _) = Config::set_search_keys_in(
+            text,
+            &[("searxng_url", &Config::toml_str("http://127.0.0.1:8080/search"))],
+        );
+        assert_eq!(out.matches("searxng_url").count(), 1, "{out}");
+        assert!(out.contains("searxng_url = \"http://127.0.0.1:8080/search\""), "{out}");
+        assert!(!out.contains("# searxng_url"), "{out}");
+    }
+
+    #[test]
+    fn a_missing_section_is_appended() {
+        let text = "[provider]\nbase_url = \"http://127.0.0.1:8090/v1\"\n";
+        let (out, changed) =
+            Config::set_search_keys_in(text, &[("backend", &Config::toml_str("auto"))]);
+        assert!(out.contains("[provider]\nbase_url"), "{out}");
+        assert!(out.contains("\n[search]\nbackend = \"auto\"\n"), "{out}");
+        assert!(changed[0].ends_with("(new)"), "{changed:?}");
+        // And the result parses, which is the only promise that matters.
+        let cfg: Config = toml::from_str(&out).expect("appended section must parse");
+        assert_eq!(cfg.search.backend, "auto");
+    }
+
+    #[test]
+    fn the_same_key_in_another_section_is_not_touched() {
+        // Key lookup is scoped to the [search] section. Without that, a future
+        // `[provider] backend = ...` (a real name: kind is called backend elsewhere)
+        // would be edited by the search panel.
+        let text = "[other]\nbackend = \"keep me\"\n\n[search]\nbackend = \"duckduckgo\"\n";
+        let (out, _) = Config::set_search_keys_in(text, &[("backend", &Config::toml_str("auto"))]);
+        assert!(out.contains("[other]\nbackend = \"keep me\""), "{out}");
+        assert!(out.contains("[search]\nbackend = \"auto\""), "{out}");
+    }
+
+    #[test]
+    fn written_search_keys_parse_back() {
+        // Round trip through the parser: the point of writing the file is that the
+        // next boot reads the same thing this panel believes it saved.
+        let text = "[search]\nbackend = \"duckduckgo\"\n";
+        let auto = Config::toml_str("auto");
+        let url = Config::toml_str("http://127.0.0.1:8080/search");
+        let kvs = [
+            ("backend", auto.as_str()),
+            ("auto_port", "8901"),
+            ("auto_idle_secs", "90"),
+            ("searxng_url", url.as_str()),
+        ];
+        let (out, _) = Config::set_search_keys_in(text, &kvs);
+        let cfg: Config = toml::from_str(&out).expect("round trip must parse");
+        assert_eq!(cfg.search.backend, "auto");
+        assert_eq!(cfg.search.auto_port, 8901);
+        assert_eq!(cfg.search.auto_idle_secs, 90);
+        match cfg.search_backend() {
+            SearchBackend::Auto(a) => {
+                assert_eq!(a.port, 8901);
+                assert_eq!(a.idle_secs, 90);
+            }
+            other => panic!("expected the managed backend, got {other:?}"),
+        }
+    }
 
     /// The trap the shipped example config fell into: a top-level key written
     /// after `[provider]` is parsed as `provider.workspace` and silently does
@@ -431,9 +652,17 @@ base_url = "http://127.0.0.1:9/v1"
     fn parses_the_example_file() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/cwoffee.toml.example");
         let text = std::fs::read_to_string(path).expect("example config present");
-        // The example documents keys the loader does not model yet; unknown
-        // fields must not be fatal or every doc update would break startup.
-        let _ = text;
+        // The example is the file people copy, so it has to parse with the same
+        // `deny_unknown_fields` the loader applies. Every key it documents must be
+        // one the parser models; otherwise a doc update silently teaches people a
+        // key that makes their config a startup error.
+        let example: Config = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("config/cwoffee.toml.example must parse: {e}"));
+        assert_eq!(example.search.backend, "auto", "the example ships the managed provider");
+        match example.search_backend() {
+            SearchBackend::Auto(a) => assert_eq!(a.port, crate::tools::searxng::DEFAULT_AUTO_PORT),
+            other => panic!("expected the managed backend in the example, got {other:?}"),
+        }
         let c: Config = toml::from_str(
             r#"
 workspace = "/tmp/ws"

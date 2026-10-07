@@ -4,7 +4,7 @@
  * The security cases are the point. Model output quotes fetched web pages, so
  * anything that reaches this function is untrusted input from the internet.
  */
-import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, needsMarkdown, firstBlockEnd, fenceOpen, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS } from '../src/lib/markdown.ts'
+import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, needsMarkdown, firstBlockEnd, fenceOpen, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS, InlineStream } from '../src/lib/markdown.ts'
 
 let failed = 0
 function eq(name: string, got: string, want: string) {
@@ -245,6 +245,30 @@ ok('blank first line still ends a block', firstBlockEnd('\nreal text').end === 1
   ok('splitCommitted commits a trailing table too', sc.cut === tbl.length && sc.blocks.length === 1, `cut=${sc.cut} blocks=${sc.blocks.length}`)
 }
 
+// Structure that markdown finishes with its own newline. A heading is one line
+// long, and so is a rule: holding them for a blank line leaves literal hash marks
+// on screen for as long as the model takes to type the sentence below them, which
+// is the "it only formats at certain points" complaint.
+{
+  ok('a heading ends at its own newline', firstBlockEnd('## The Copy\nThe photocopier').end === 12)
+  ok('a heading still being typed has no end', firstBlockEnd('## The Cop') === null)
+  ok('a heading with its newline is a complete block', firstBlockEnd('## Title\n')?.end === 9)
+  ok('an atx heading needs the space', firstBlockEnd('#Title not a heading\nmore') === null)
+  ok('a thematic break ends at its own newline', firstBlockEnd('---\nmore').end === 4)
+  ok(
+    'a hash in the middle of a paragraph is not a heading block',
+    firstBlockEnd('prose\n# not a heading\n\n') === null,
+  )
+  const t = '| a |\n|---|\n| 1 |\nnext paragraph'
+  const e = firstBlockEnd(t)
+  ok(
+    'a table ends before a line that is not a row',
+    e !== null && e.end === t.indexOf('next'),
+    `end=${e?.end} want=${t.indexOf('next')}`,
+  )
+  ok('a table does not end at a newline that may be followed by rows', firstBlockEnd('| a |\n|---|\n') === null)
+}
+
 // The streaming formatter commits at byte offsets, so the offset has to be the
 // truth even when nothing was rendered.
 {
@@ -428,3 +452,38 @@ if (failed) {
   process.exit(1)
 }
 console.log('markdown: all checks passed')
+
+// Inline emphasis decided as it streams. The markers must never flash, and
+// nothing already on screen may be rewritten: the words inside a construct are
+// born inside a <strong>/<em>/<code>, they are not re-parented later.
+{
+  const textOnly = (ts: any[]) => ts.filter((t) => t.kind === 'text').map((t) => t.text).join('')
+  const kinds = (ts: any[]) => ts.map((t) => t.kind).join(',')
+  const s1 = new InlineStream()
+  const t1 = s1.tokens('read **the copy** now')
+  ok('a construct brackets its words', kinds(t1) === 'text,open,text,close,text', kinds(t1))
+  ok('markers never reach the text', !textOnly(t1).includes('*'), JSON.stringify(t1))
+  const s2 = new InlineStream()
+  const c1 = s2.tokens('a **bo')
+  const c2 = s2.tokens('ld** x')
+  ok('a chunk-final marker is held, not guessed', s2.pendingText() === '' && kinds(c1) === 'text,open,text', kinds(c1))
+  ok('the construct closes across a chunk boundary', kinds(c2) === 'text,close,text', kinds(c2))
+  const s3 = new InlineStream()
+  ok('snake_case is not emphasis', s3.tokens('snake_case_names here').every((t) => t.kind === 'text'))
+  const s4 = new InlineStream()
+  ok('2**3 is not emphasis', s4.tokens('2**3 to the power').every((t) => t.kind === 'text'))
+  const s5 = new InlineStream()
+  ok('spaced asterisks are not emphasis', s5.tokens('a * b * c').every((t) => t.kind === 'text'))
+  const s6 = new InlineStream()
+  const t6 = s6.tokens('run `git status` now')
+  ok('code spans open and close', kinds(t6) === 'text,open,text,close,text', kinds(t6))
+  const s7 = new InlineStream()
+  const t7 = s7.tokens('`a *b* c` done')
+  ok('marks inside a code span stay literal', textOnly(t7).includes('a *b* c'), JSON.stringify(t7))
+  const s8 = new InlineStream()
+  const t8 = s8.tokens('dangling **')
+  ok('a trailing marker waits for the next delta', kinds(t8) === 'text' && s8.pendingText() === '**', `${kinds(t8)} pending=${s8.pendingText()}`)
+  const s9 = new InlineStream()
+  s9.tokens('**unclosed emphasis')
+  ok('an unclosed construct leaves the stack open for the parser to settle', s9.pendingText() === '')
+}

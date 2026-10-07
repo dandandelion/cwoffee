@@ -295,6 +295,12 @@ pub struct SessionHost {
     /// The host keeps a handle so the shell can ask the endpoint questions that
     /// are not turns - the composer's model picker being the obvious one.
     provider: Arc<dyn Provider>,
+    /// And the search tool, typed: the provider can change while the app runs, and
+    /// the only safe place to change it is inside the live tool. Rebuilding the
+    /// registry would move prompt bytes and drop every prefix cache, and the
+    /// settings card would then be a button that costs the next turn a cold prefill
+    /// in every session.
+    search: Option<Arc<crate::tools::web::WebSearchTool>>,
 }
 
 pub type EventRx = mpsc::UnboundedReceiver<EngineEvent>;
@@ -376,6 +382,9 @@ impl SessionHost {
             },
             ctx,
         );
+        // Taken before the agent is built? No - after: the registry was moved into
+        // the agent, and the agent hands out the handle it was built with.
+        let search_tool = agent.search_tool();
         agent.prompt_mut().token_budget = cfg.context_budget.unwrap_or(FALLBACK_BUDGET);
         let cancel = agent.cancel_handle();
         let agent_cancel = cancel.clone();
@@ -848,6 +857,7 @@ impl SessionHost {
             state,
             cancel,
             provider: host_provider,
+            search: search_tool,
         }
     }
 
@@ -868,6 +878,37 @@ impl SessionHost {
     /// Handle to the endpoint, for shell-level queries that are not turns.
     pub fn provider(&self) -> &Arc<dyn Provider> {
         &self.provider
+    }
+
+    /// What search is currently doing, in one line ("DuckDuckGo (keyless HTML
+    /// endpoint)", "SearXNG managed by Cwoffee on port 8899").
+    pub fn search_backend(&self) -> Option<crate::tools::web::SearchBackend> {
+        self.search.as_ref().map(|s| s.backend())
+    }
+
+    /// Switch the provider on the live tool and answer with what it became, so the
+    /// caller confirms a change rather than assuming one (`set_workspace` taught
+    /// that lesson: fire-and-forget left the UI showing something that had not
+    /// happened). Safe mid-turn: a search reads the backend when it starts.
+    pub fn set_search_backend(&self, b: crate::tools::web::SearchBackend) -> Option<String> {
+        self.search.as_ref().map(|s| {
+            s.set_backend(b);
+            s.backend().describe()
+        })
+    }
+
+    /// The live ephemeral-SearXNG handle, if that backend is selected. The clone
+    /// shares the idle clock, so the settings card reports the instance the tool
+    /// actually started rather than a copy that has never been used.
+    pub fn search_auto(&self) -> Option<crate::tools::searxng::AutoSearXNG> {
+        match self.search_backend()? {
+            crate::tools::web::SearchBackend::Auto(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    pub fn search_tool(&self) -> Option<Arc<crate::tools::web::WebSearchTool>> {
+        self.search.clone()
     }
 
     /// Move the event and approval receivers out of the host, exactly once.
@@ -1882,7 +1923,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_moves_the_host_to_the_conversation_it_names() {
         let ws = std::env::temp_dir().display().to_string();
-        let (mut h, store) = host(vec!["the turn ran".into(), "next one".into()]);
+        let (h, store) = host(vec!["the turn ran".into(), "next one".into()]);
         let a = store.create_session("alpha", &ws, "test-model").unwrap();
         let b = store.create_session("beta", &ws, "test-model").unwrap();
         h.send(HostCmd::SwitchSession { id: a });
@@ -1914,7 +1955,7 @@ mod tests {
     #[tokio::test]
     async fn a_draft_send_starts_its_own_conversation() {
         let ws = std::env::temp_dir().display().to_string();
-        let (mut h, store) = host(vec!["one".into(), "two".into()]);
+        let (h, store) = host(vec!["one".into(), "two".into()]);
         let a = store.create_session("alpha", &ws, "test-model").unwrap();
         h.send(HostCmd::SwitchSession { id: a });
         wait_for("on alpha".into(), || h.state().session_id == a).await;

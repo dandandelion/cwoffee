@@ -270,8 +270,23 @@ body {
   0%, 100% { transform: scale(0.82); opacity: 0.4; }
   50%      { transform: scale(1);    opacity: 0.9; }
 }
+/* The marker must not join the label's line box. `.blk > .blk-head` is 58px wide,
+   right-aligned and nowrap; an 11px dot pushed to 64px makes the line *wider than
+   its own box*, and `text-align` has no effect on a line that overflows - the text
+   falls back to the start edge and runs into the content column. So while a turn
+   ran, "CWOFFEE" sat against the answer's first word with no gutter at all, and
+   the margin reappeared the moment the dot did: the label was being re-laid-out by
+   its own decoration. Absolutely positioned, it hangs in the gutter and the label
+   text never moves. Reasoning leads with the marker instead (its head is a static
+   full-width line), so it is put back inline there. */
+.blk.live > .blk-head::before {
+  position: absolute;
+  left: -11px;
+  top: 4px;
+  margin-right: 0;
+}
 /* Reasoning sits outside the label grid, so its marker leads the line. */
-.blk-reasoning.live .blk-head::before { margin-right: 6px; }
+.blk-reasoning.live .blk-head::before { position: static; margin-right: 6px; }
 
 @media (prefers-reduced-motion: reduce) {
   .blk.live .blk-head::before {
@@ -891,6 +906,39 @@ body {
   padding: 12px 14px;
   border-color: var(--color-warn-hairline);
   background: var(--color-warn-bg);
+  /* A long command must not push the decision row out of the window. The card
+     lives in a fixed strip above the composer, so there is no page scroll to
+     escape into and no way to click Allow or Deny: the body scrolls on its own
+     and the buttons never move. Reported exactly like that - a here-document
+     write made the card taller than the screen and the app would not scroll. */
+  display: flex;
+  flex-direction: column;
+  max-height: 62vh;
+}
+.appr-body {
+  /* min-height:0 is what lets a flex child scroll instead of growing. */
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 6px 8px;
+  border: 1px solid var(--color-warn-hairline);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-warn) 5%, transparent);
+}
+.appr-body:focus-visible {
+  outline: 1px solid var(--color-warn);
+  outline-offset: 1px;
+}
+.appr-more {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--color-warn);
+}
+@media (max-height: 640px) {
+  /* A short window is where this matters most; the body has to keep some room. */
+  .approval-card { max-height: 74vh; }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1254,6 +1302,10 @@ body {
 /* Not a menu item: nothing to click, it is a two-column reference row. */
 .pop-item.static { cursor: default; }
 .pop-item.static:hover { background: transparent; }
+/* A labelled text field inside a popover. The composer's styles do not reach here,
+   and a stacked label + input needs its own box: a .pop-item is a row. */
+.pop-item.field { flex-direction: column; align-items: stretch; gap: 4px; }
+.pop-field-input { font-family: var(--font-mono); width: 100%; }
 .pop-key {
   grid-column: 2;
   grid-row: 1;
@@ -2142,6 +2194,129 @@ body {
 }
 .blk-ask.answered.by-other .ask-answered {
   color: var(--color-ink-2);
+}
+
+/* ---- a question set: several questions, one card, one submit ------------ */
+.ask-nav {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.ask-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--color-ink-2);
+  white-space: nowrap;
+}
+.ask-dots {
+  display: inline-flex;
+  gap: 6px;
+  margin-right: auto;
+}
+.ask-dot {
+  width: 9px;
+  height: 9px;
+  padding: 0;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+}
+.ask-dot.is-done {
+  background: var(--color-ok);
+  border-color: var(--color-ok);
+}
+.ask-dot.is-cur {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.ask-back,
+.ask-next {
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--color-line);
+  background: var(--color-shell);
+  color: var(--color-ink-2);
+  cursor: pointer;
+}
+.ask-back:hover:not(:disabled),
+.ask-next:hover:not(:disabled) {
+  background: var(--color-shell-2);
+  color: var(--color-ink);
+}
+.ask-back:disabled,
+.ask-next:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+/* One pane at a time. Keeping the others out of the document, rather than
+   rebuilding them, is what preserves a typed answer when someone navigates back
+   to check the first question. */
+.ask-stage > .ask-pane {
+  display: block;
+}
+.ask-hint {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--color-warn);
+  line-height: 1.4;
+}
+.ask-hint:empty {
+  display: none;
+}
+/* Settled: the card collapses to the receipt line, and the head expands a
+   read-only list of what was asked and what was answered. No option row survives
+   the collapse, so there is nothing left to answer twice. */
+.blk-ask.is-set.answered .ask-qa {
+  display: none;
+}
+.blk-ask.is-set.answered.is-open .ask-qa {
+  display: block;
+  margin-top: 8px;
+  border-top: 1px solid var(--color-line);
+  padding-top: 8px;
+}
+.ask-qa-item {
+  padding: 6px 0;
+}
+.ask-qa-item + .ask-qa-item {
+  border-top: 1px dashed var(--color-line);
+}
+.ask-qa-q {
+  font-size: 12.5px;
+  color: var(--color-ink);
+  line-height: 1.45;
+}
+.ask-qa-a {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--color-ink-2);
+}
+.ask-qa-a::before {
+  content: 'you said: ';
+  opacity: 0.7;
+}
+.ask-qa-a.is-none {
+  font-style: italic;
+  opacity: 0.7;
+}
+.blk-ask.is-set .blk-head.is-toggle {
+  cursor: pointer;
+  border-radius: 6px;
+}
+.blk-ask.is-set .blk-head.is-toggle:hover {
+  background: var(--color-shell-2);
+}
+.blk-ask.is-set .blk-head.is-toggle::after {
+  content: ' \25B8';
+  opacity: 0.55;
+  font-size: 10px;
+}
+.blk-ask.is-set .blk-head.is-open::after {
+  content: ' \25BE';
 }
 
 /* A block being written right now holds plain text with the newlines the model

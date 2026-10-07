@@ -83,12 +83,16 @@ Two roles, enforced server-side per command:
   `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`,
   `export_markdown`.
 
-`export_markdown` takes `{ session }` and writes that conversation as a Markdown document
-into `exports/` **inside the workspace stored on that session** - not the host's current
-workspace, which may be somewhere else entirely if another client is working in a different
-folder. It returns the same `OutputFile` shape a tool output returns, so the phone shows the
-usual clickable chip. It runs no model call, moves no host, and refuses a session id that
-does not exist. It is drive-only because it writes a file on this machine.
+`share_markdown` takes `{ session }` and returns `{ name, markdown }`: that conversation as a
+Markdown document, built from **the workspace stored on that session** rather than the host's
+current one, and **written nowhere**. The client decides where it goes - the desktop asks through
+a save dialog, a phone downloads. It runs no model call, moves no host, and refuses a session id
+that does not exist.
+
+It is not drive-only and not audited, because it is a read: a watch token can already page through
+the same conversation with `session_messages`. It used to be `export_markdown`, drive-only, and it
+wrote the file into `<workspace>/exports/`. A later turn then found a document it had not made -
+and offered to delete it - so the write left the feature entirely.
 
 `new_session` takes an optional `workspace`, which the engine validates before the
 session is created; a browser can therefore start a session inside a named folder
@@ -381,6 +385,14 @@ exposed on purpose — a leaked token should not also be a directory browser.
   receiver is gone says nothing until someone tries to use it. A browser that never
   hears it keeps showing a card whose Send button fails forever, and the answer it
   eventually sends aims at a tool call that already returned.
+- **A multi-question call is still one event per question.** `ask_user` with
+  `questions` sends N `questionRequested` events, each with its own `id` and each
+  answered by its own `respond_question`. What ties them together is the optional
+  `set: {id, index, total}` on the payload: group by `set.id` and render one card with
+  navigation. A client that ignores `set` still works — it just interrupts N times.
+  Absent `set` means a lone question, which is the shape that has always been sent.
+  Each question of a set keeps its own expiry event, so a card that stops being
+  answerable stops being answerable on every device at once.
 - **"Devices" means addresses, not sockets.** The footer pill counts devices keyed
   by peer address and names them: `2 devices: 100.86.160.103, 172.20.10.2
   (3 connections)`. Two tabs on one laptop are one device and three connections,

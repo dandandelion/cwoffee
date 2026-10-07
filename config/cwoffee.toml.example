@@ -66,12 +66,30 @@ max_tool_output = 8000
 # Search
 # ---------------------------------------------------------------------------
 [search]
-backend = "duckduckgo"        # duckduckgo | searxng
+# duckduckgo | searxng | auto
+#
+#   duckduckgo - no setup, no key. Works for the first few queries and then
+#                answers with a bot challenge (HTTP 202). Cwoffee reports that as
+#                an error you can act on rather than "no results".
+#   searxng    - an instance you already run. Needs `formats: [html, json]`
+#                enabled in its settings.yml; Cwoffee reads JSON.
+#   auto       - Cwoffee runs its own. On the first search it starts a podman (or
+#                docker) container bound to 127.0.0.1, with the JSON API on and the
+#                bot limiter off, and stops it after it has been idle. Enabling this
+#                configures it; setting it back to duckduckgo only disables it - no
+#                container is removed, and nothing is uninstalled.
+backend = "auto"
 max_results = 8
-# searxng_url = "http://127.0.0.1:8888/search"
-# Public DuckDuckGo serves a bot challenge (HTTP 202) from many IPs; Cwoffee
-# reports that as an actionable error rather than "no results". Self-hosting
-# SearXNG and enabling JSON is the reliable path.
+# searxng_url = "http://127.0.0.1:8080/search"
+# auto only: the port Cwoffee publishes on. Deliberately not 8888, which is where
+# an instance from elsewhere usually already lives; use `searxng` + searxng_url to
+# point at one instead.
+# auto_port = 8899
+# auto only: seconds an unused container is kept before it is stopped.
+# auto_idle_secs = 120
+# auto only: where settings.yml / limiter.toml are generated. Default is a
+# `searxng` directory next to this file, so you can read what was configured.
+# auto_dir = "~/.config/cwoffee/searxng"
 
 # ---------------------------------------------------------------------------
 # Exec sandbox

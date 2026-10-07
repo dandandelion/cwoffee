@@ -63,7 +63,9 @@ async fn main() -> anyhow::Result<()> {
     let watch_token = get("--watch-token", None);
 
     // Reuse the same config file and precedence as the desktop app and the TUI.
-    let mut appcfg = Config::load(None).map_err(anyhow::Error::msg)?.0;
+    let (mut appcfg, loaded) = Config::load(None).map_err(anyhow::Error::msg)?;
+    // Same file the desktop panel writes: one config, whichever shell changed it.
+    let config_path = loaded.unwrap_or_else(Config::default_path);
     appcfg.apply_env();
     if let Some(u) = get("--url", None) {
         appcfg.provider.base_url = u;
@@ -216,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         pending_questions: Arc::clone(&pending_q),
         clients: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         migration_notes,
+        config_path,
     });
 
     cwoffee_gateway::serve(gw, handle).await.map_err(|e| anyhow::anyhow!("{e}"))

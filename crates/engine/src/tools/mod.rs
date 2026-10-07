@@ -12,6 +12,7 @@ pub mod exec;
 pub mod files;
 pub mod path;
 pub mod repair;
+pub mod searxng;
 pub mod web;
 pub mod xlsx;
 
@@ -298,6 +299,7 @@ pub struct Registry {
     // Spawning needs shared ownership of the tool across the task boundary.
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
+    search: Option<Arc<web::WebSearchTool>>,
 }
 
 impl Registry {
@@ -343,7 +345,13 @@ impl Registry {
         r.register(Box::new(files::WriteFileTool));
         r.register(Box::new(xlsx::WriteXlsxTool));
         r.register(Box::new(web::WebFetchTool::default()));
-        r.register(Box::new(web::WebSearchTool::from_backend(search)));
+        // Kept as a typed handle as well as a tool: the search provider can change
+        // while the app runs (the settings card), and the only safe way to change
+        // it is inside the tool. Its name, description and schema are prompt bytes,
+        // so a rebuild of the tool list is not an option.
+        let search_tool = std::sync::Arc::new(web::WebSearchTool::from_backend(search));
+        r.search = Some(search_tool.clone());
+        r.register_arc(search_tool);
         // Appended, never inserted: this list is the tool order in the system
         // prompt, and reordering it invalidates the llama.cpp prefix cache for
         // every existing session.
@@ -361,6 +369,21 @@ impl Registry {
         let n = t.name().to_string();
         self.tools.insert(n.clone(), Arc::from(t));
         self.order.push(n);
+    }
+
+    /// Register an already-shared tool, for the cases where the caller needs the
+    /// same handle back (see `search_tool`).
+    pub fn register_arc(&mut self, t: Arc<dyn Tool>) {
+        let n = t.name().to_string();
+        self.tools.insert(n.clone(), t);
+        self.order.push(n);
+    }
+
+    /// The search tool, typed. Switching providers at runtime goes through this
+    /// rather than rebuilding the registry, because the registry order and the
+    /// tool's schema are prompt bytes.
+    pub fn search_tool(&self) -> Option<Arc<web::WebSearchTool>> {
+        self.search.clone()
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

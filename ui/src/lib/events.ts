@@ -23,6 +23,11 @@ export type QuestionRequested = {
   allow_custom: boolean
   /** The model allows more than one answer, so the card ticks boxes. */
   multi: boolean
+  /** Present when the model asked several questions in one call. They belong on
+     one card: three interruptions for one decision is three chances to get it
+     wrong. `index`/`total` let the card say "question 2 of 3" without waiting to
+     find out whether more are coming. */
+  set?: { id: number; index: number; total: number }
 }
 
 export type FileChange = {

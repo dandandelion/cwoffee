@@ -8,6 +8,7 @@
     GpuReport,
     HostState,
     ModelInfo,
+    QuestionRequested,
     ReasoningLevel,
     SearchHit,
     Session,
@@ -74,7 +75,22 @@
   let hits = $state<SearchHit[]>([])
   let searchErr = $state('')
 
-  let approval = $state<{ id: number; tool: string; risk: string; summary: string } | null>(null)
+  type ApprovalPrompt = { id: number; tool: string; risk: string; summary: string }
+  let approval = $state<ApprovalPrompt | null>(null)
+  // The quoted command scrolls inside the card; the buttons do not move. The
+  // hint only appears when the text really is clipped, measured after render.
+  let apprBodyEl = $state<HTMLElement | null>(null)
+  let apprClipped = $state(false)
+  $effect(() => {
+    if (!approval) {
+      if (apprClipped) apprClipped = false
+      return
+    }
+    const el = apprBodyEl
+    if (!el) return
+    const clipped = el.scrollHeight > el.clientHeight + 4
+    if (clipped !== apprClipped) apprClipped = clipped
+  })
   // A turn blocked on a human and a turn still computing look identical unless the
   // UI says otherwise: same disabled button, same spinner-ish label. That is how a
   // web_search that was simply waiting for approval read as "stuck".
@@ -106,7 +122,7 @@
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
-  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws'
+  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'search'
 
   /** Mirror of the desktop's GatewayStatus. Not reachable over the gateway
       itself: the payload carries the token inside ready-to-open URLs. */
@@ -457,6 +473,10 @@
     // Opening the model list is a natural retry point: if the endpoint was down
     // when the app started, this is the moment the user is asking about it.
     if (kind === 'model' && (modelErr || !models.length)) void loadModels()
+    // Search settings are read on first open rather than at boot: nothing here is
+    // needed to start a turn, and a container status probe (podman ps) has no
+    // business running before anyone asked about search.
+    if (kind === 'search' && !webSearch) void loadWebSearch()
     const r = anchor.getBoundingClientRect()
     menu = {
       kind,
@@ -704,6 +724,120 @@
   let gw = $state<GatewayStatus | null>(null)
   let gwErr = $state('')
   let gwBusy = $state(false)
+
+  // ---- web search provider ------------------------------------------------
+  // Three providers, one dropdown, and a test button. The status line comes from
+  // the engine rather than from the value in this component: "auto" with no
+  // container runtime is not the same situation as "auto" with one, and a card
+  // that prints the config value cannot tell them apart.
+  interface SearchAuto {
+    up: boolean
+    container_exists: boolean
+    runtime: string | null
+    base: string
+    note: string
+  }
+  interface SearchView {
+    backend: string
+    searxng_url: string
+    auto_port: number
+    auto_idle_secs: number
+    auto_dir: string
+    describing: string
+    runtime: string | null
+    auto: SearchAuto | null
+    env_override: string | null
+    saved_to: string | null
+  }
+  interface WebSearchProbe {
+    ms: number
+    note: string | null
+    backend: string
+    results: { title: string; url: string }[]
+    error: string | null
+  }
+  let webSearch = $state<SearchView | null>(null)
+  let webSearchErr = $state('')
+  let webSearchBusy = $state(false)
+  let webSearchProbe = $state<WebSearchProbe | null>(null)
+  let webSearchUrl = $state('')
+
+  const SEARCH_PROVIDERS: { id: string; label: string; sub: string }[] = [
+    {
+      id: 'duckduckgo',
+      label: 'DuckDuckGo',
+      sub: 'no setup, no key · starts blocking you after a few searches',
+    },
+    {
+      id: 'auto',
+      label: 'SearXNG, run by Cwoffee',
+      sub: 'its own container, started when you search, stopped when idle',
+    },
+    { id: 'searxng', label: 'SearXNG, already running', sub: 'point at an instance you run' },
+  ]
+
+  const webSearchText = $derived(
+    !webSearch
+      ? 'unknown'
+      : webSearch.backend === 'auto'
+        ? webSearch.auto?.up
+          ? `searxng :${webSearch.auto_port} up`
+          : webSearch.runtime
+            ? `searxng :${webSearch.auto_port} idle`
+            : 'no container runtime'
+        : webSearch.backend === 'searxng'
+          ? 'searxng (manual)'
+          : 'duckduckgo',
+  )
+  const webSearchDot = $derived(
+    webSearch?.backend === 'duckduckgo' ? 'warn' : webSearch?.backend ? 'ok' : '',
+  )
+
+  async function loadWebSearch() {
+    try {
+      const v = await invoke<SearchView>('search_settings')
+      webSearch = v
+      webSearchUrl = v.searxng_url ?? ''
+      webSearchErr = ''
+    } catch (e) {
+      webSearchErr = String(e)
+    }
+  }
+
+  async function chooseWebSearch(id: string) {
+    if (!webSearch || webSearchBusy) return
+    webSearchBusy = true
+    webSearchErr = ''
+    webSearchProbe = null
+    try {
+      webSearch = await invoke<SearchView>('set_search_backend', {
+        backend: id,
+        searxngUrl: webSearchUrl,
+      })
+      say(`search: ${webSearch.describing}`)
+    } catch (e) {
+      // The engine refused (no URL for a manual instance, a typo in the name).
+      // Say why in place rather than leaving the dropdown on the old value with no
+      // explanation.
+      webSearchErr = String(e)
+    } finally {
+      webSearchBusy = false
+    }
+  }
+
+  async function runWebSearchProbe() {
+    if (webSearchBusy) return
+    webSearchBusy = true
+    webSearchErr = ''
+    try {
+      webSearchProbe = await invoke<WebSearchProbe>('search_probe', { query: 'coffee roasting' })
+      if (webSearchProbe.error) webSearchErr = webSearchProbe.error
+    } catch (e) {
+      webSearchErr = String(e)
+    } finally {
+      webSearchBusy = false
+    }
+  }
   // What the *next* start should bind. Loopback is the safe default; the app
   // only reaches for 0.0.0.0 when the user picks "any device", and the gateway
   // still refuses that bind outright if no token exists.
@@ -874,6 +1008,8 @@
    * suite started reporting "turn never ended" for turns that had plainly ended.
    */
   let turnEnds = 0
+  // The endpoint's own prefill rate from the last completed turn.
+  let lastPrefill: number | null = null
   // Events of the in-flight turn, kept so returning to its session restores the
   // partial answer instead of showing a truncated one. Bounded: a runaway stream
   // must not grow this without limit.
@@ -894,6 +1030,39 @@
     return () => {
       eventTaps = eventTaps.filter((t) => t !== fn)
     }
+  }
+
+  // A question set is one `ask_user` call, delivered as one event per question.
+  // Buffered by set id so the card can be built once, with navigation, instead of
+  // one interruption per question.
+  const qSets = new Map<number, { qs: Map<number, QuestionRequested>; timer: number }>()
+
+  function respondQuestion(id: number, r: { text: string; options: number[] }) {
+    void invoke('respond_question', { id, text: r.text, options: r.options }).catch((e) => {
+      pageLog(`respond_question failed: ${cleanErr(String(e))}`)
+      // The engine stopped waiting before we answered. Close the card the same way
+      // the expiry event would, rather than leaving a button that fails every time
+      // it is pressed.
+      transcript?.expireQuestion(id)
+    })
+  }
+
+  function renderQuestionSet(setId: number) {
+    const b = qSets.get(setId)
+    if (!b) return
+    qSets.delete(setId)
+    if (b.timer) window.clearTimeout(b.timer)
+    const qs = [...b.qs.values()]
+    if (!qs.length) return
+    if (qs.length === 1) {
+      // One question is one question, whatever the model called it. Render it with
+      // the plain card so the simpler shape keeps its simpler layout.
+      const q = qs[0]
+      transcript?.showQuestion(q, (r) => respondQuestion(q.id, r))
+      return
+    }
+    pageLog(`question set rendered: ${qs.length} questions on one card`)
+    transcript?.showQuestionSet(qs, (id, r) => respondQuestion(id, r))
   }
 
   function handle(ev: EngineEvent) {
@@ -972,24 +1141,27 @@
         pageLog(`turn files: ${ev.d.files.map((f) => f.path).join(', ')}`)
         transcript?.addFiles(ev.d.files)
         break
-      case 'questionRequested':
+      case 'questionRequested': {
         // The turn is parked until this is answered, so the answer goes straight
         // back; nothing else in the UI needs to know.
-        pageLog(`question asked: ${ev.d.question}`)
-        transcript?.showQuestion(ev.d, (r) => {
-          void invoke('respond_question', {
-            id: ev.d.id,
-            text: r.text,
-            options: r.options,
-          }).catch((e) => {
-            pageLog(`respond_question failed: ${cleanErr(String(e))}`)
-            // The engine stopped waiting before we answered. Close the card the
-            // same way the expiry event would, rather than leaving a button that
-            // fails every time it is pressed.
-            transcript?.expireQuestion(ev.d.id)
-          })
-        })
+        const q = ev.d
+        pageLog(`question asked: ${q.question}`)
+        if (!q.set) {
+          transcript?.showQuestion(q, (r) => respondQuestion(q.id, r))
+          break
+        }
+        // A set arrives as separate events, back to back. Rendering each as it lands
+        // would give one card per question, which is the interruption the set form
+        // exists to remove, so buffer by set id until the whole set is here. If an
+        // event is lost - a reconnect mid-turn, say - a short timer renders what did
+        // arrive rather than parking the turn behind a card that never shows up.
+        const b = qSets.get(q.set.id) ?? { qs: new Map<number, QuestionRequested>(), timer: 0 }
+        b.qs.set(q.id, q)
+        if (!b.timer) b.timer = window.setTimeout(() => renderQuestionSet(q.set!.id), 400)
+        qSets.set(q.set.id, b)
+        if (b.qs.size >= q.set.total) renderQuestionSet(q.set.id)
         break
+      }
       case 'questionAnswered':
         transcript?.settleQuestion(ev.d.id)
         break
@@ -1044,6 +1216,9 @@
           draftOk: ev.d.draft_accepted,
         }
         if (turnStartTs) turnMs = Math.round(performance.now() - turnStartTs)
+        // Kept for the self-test: a turn that does not finish can be a hang or a
+        // model prefilling at 17 tok/s, and the difference decides who is buggy.
+        lastPrefill = s.effectivePrefillTps
         // Prove the bar is populated rather than assume it: these are the exact
         // values the footer binds.
         pageLog(
@@ -1496,8 +1671,34 @@
    * streams, which is the price of `CWOFFEE_WEBKIT_MODE` and has to be measured
    * rather than assumed free.
    */
+  /** Sample the frame clock while nothing is streaming: the machine's own ceiling. */
+  async function idleFrameSample(ms = 900) {
+    const stop = startFrameCadence()
+    await new Promise((r) => setTimeout(r, ms))
+    return stop()
+  }
+
   function startFrameCadence() {
     const gaps: number[] = []
+    // A long task is the page's own work blocking the frame clock - 50ms or more in
+    // one task. Counting them is what lets this check tell "our JS stalled the
+    // page" from "the process was not given a frame": the first is a bug in here,
+    // the second is the machine, and on a box serving a 50 GB model they look
+    // identical in the gap histogram alone.
+    let longN = 0
+    let longMs = 0
+    let obs: PerformanceObserver | null = null
+    try {
+      obs = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          longN++
+          longMs += e.duration
+        }
+      })
+      obs.observe({ entryTypes: ['longtask'] })
+    } catch {
+      /* no long-task support: the attribution then says so rather than claiming 0 */
+    }
     let last = performance.now()
     let id = 0
     const t0 = last
@@ -1524,6 +1725,7 @@
     id = requestAnimationFrame(tick)
     return () => {
       cancelAnimationFrame(id)
+      obs?.disconnect()
       const sorted = gaps.slice(1).sort((a, b) => a - b)
       const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] ?? 0
       return {
@@ -1534,6 +1736,9 @@
         worst: worst.ms,
         worstAt: worst.at,
         hiddenSpans,
+        longN,
+        longMs,
+        longTasksMeasured: obs !== null,
       }
     }
   }
@@ -1972,6 +2177,115 @@
       fails++
       pageLog(`SELFTEST FAIL: ${m}`)
     }
+    // Geometry checks need a window that is actually on screen. WebKitGTK hands an
+    // occluded or blanked page a zero-size viewport, so every rect measures 0 and
+    // one locked screen produced fourteen failures that read like CSS bugs.
+    // Measure nothing, say so once, and stop rather than inventing twelve.
+    const offScreen = () => {
+      if (window.innerWidth < 300 || window.innerHeight < 300)
+        return `the window measures ${window.innerWidth}x${window.innerHeight}`
+      if (document.visibilityState !== 'visible') return `the document is ${document.visibilityState}`
+      const t = document.querySelector('.transcript') as HTMLElement | null
+      if (!t) {
+        // Synthetic blocks are painted into the live transcript. If the view is a
+        // draft or the empty screen, that transcript is not in the document at all,
+        // every rect reads 0, and the failures read like CSS bugs.
+        return 'no transcript is mounted (the view is a draft or the empty screen)'
+      }
+      if (t.getBoundingClientRect().width < 50) {
+        // Which of the three causes it is changes the fix: an empty screen mounted
+        // over the transcript, a zero-size viewport from an occluded window, or a
+        // layout pass that never ran. Say what the DOM actually looks like.
+        const r = t.getBoundingClientRect()
+        const empty = !!document.querySelector('.empty')
+        return (
+          `.transcript measures ${Math.round(r.width)}x${Math.round(r.height)} ` +
+          `(empty screen shown=${empty}, turns=${document.querySelectorAll('.turn').length}, ` +
+          `viewport ${window.innerWidth}x${window.innerHeight})`
+        )
+      }
+      return null
+    }
+    // The layout checks need a mounted transcript, not a draft view. Opening the
+    // conversation the user was in is what a person would do; measuring a detached
+    // tree is what a broken harness does.
+    async function ensureTranscriptMounted() {
+      // Measured, not merely present: the empty screen can leave the transcript in the
+      // document with a zero box, which measures exactly as badly as being absent.
+      if ((document.querySelector('.transcript')?.getBoundingClientRect().width ?? 0) >= 50) return true
+      const sessions = await invoke<Session[]>('list_sessions')
+      // A session with messages, not merely the first row. An empty session keeps the
+      // empty screen up, the scroller stays `display: none`, and every rect still
+      // reads 0: opening "a session" is not the premise, opening one that renders is.
+      const back = sessions.find((s) => s.message_count > 0)?.id
+      if (back === undefined) return false
+      const err = await invoke('switch_session', { id: back }).then(
+        () => null,
+        (e) => String(e),
+      )
+      // The RPC moves the host; `openSession` moves the *view*, which is what these
+      // checks need. Doing only the first left the app showing a draft with the host
+      // pointed somewhere else, and the scroller stayed `display: none`.
+      await openSession(back).catch(() => {})
+      // History paints into the transcript asynchronously. A check that clears the
+      // transcript and writes its own blocks must not race that paint, or the element
+      // it measures is a history row that arrives afterwards - which is exactly how
+      // "expanded thinking block has no width: 0" came back even with the view open.
+      await waitFor('history to paint', () => document.querySelectorAll('.turn').length > 0, 4000)
+      await new Promise<void>((r) => requestAnimationFrame(() => r()))
+      // Width, not presence: the transcript element stays in the document while the
+      // empty screen is up, and a 0x0 box measures just as uselessly as none.
+      const ok = await waitFor(
+        'a laid-out transcript',
+        () => (document.querySelector('.transcript')?.getBoundingClientRect().width ?? 0) >= 50,
+        4000,
+      )
+      pageLog(
+        `selftest note: reopened session ${back} for the layout checks: laid out=${ok}, ` +
+          `viewId=${viewId}, msgs=${viewMsgCount}, busy=${busy}, turns=${document.querySelectorAll('.turn').length}` +
+          `${err ? `, switch failed: ${err}` : ''}`,
+      )
+      return ok
+    }
+    // Geometry checks are only meaningful while the page is being laid out. The
+    // window can leave that state halfway through a run - minimized, occluded,
+    // switched workspace - and then every rect reads 0. Counting those as CSS bugs
+    // produced fourteen failures about a locked screen, so the premise is checked
+    // where the measuring happens and the skip is reported by name.
+    let endpointSkips = 0
+    // A turn that never finished is a product bug only if the endpoint could have
+    // finished one. This box has been prefilling at 17 tok/s while a 50 GB model
+    // serves someone else: a ~2k-token prompt then needs three minutes of prefill
+    // alone, and every check that needs a completed turn fails in a chain. Attribute
+    // first, then skip by name, then refuse to call the run clean.
+    const endpointTooSlow = async (where: string) => {
+      if (lastPrefill === null || lastPrefill >= 50) return false
+      endpointSkips++
+      pageLog(
+        `selftest note: skipped ${where}; the endpoint prefills at ${lastPrefill.toFixed(1)} tok/s, so a turn cannot complete inside the harness budget`,
+      )
+      return true
+    }
+    let blindSkips = 0
+    const blind = async (where: string) => {
+      let b = offScreen()
+      if (!b) return false
+      // One recovery attempt first. A view that drifted onto a draft is a harness
+      // problem that can be fixed on the spot; a locked screen cannot be.
+      await ensureTranscriptMounted()
+      b = offScreen()
+      if (!b) {
+        pageLog(`selftest note: the view had drifted for ${where}; reopened a session`)
+        return false
+      }
+      blindSkips++
+      pageLog(`selftest note: skipped ${where}; ${b}`)
+      return true
+    }
+    if (await blind('at the start')) {
+      pageLog('SELFTEST ABORTED: nothing was measured')
+      return
+    }
       // Sessions created lazily by a check's `newSession(); send()` pair are not
       // the `selftest` session this harness deletes by id, and auto-titling renames
       // them anyway, so an exact-title delete never found them. Ten rows of debris
@@ -2309,6 +2623,53 @@
         }
       }
 
+      // A here-document write used to make the approval card taller than the
+      // window: Allow/Deny sat below the fold, nothing scrolled, and the only
+      // way out was to let the approval time out. The card caps its height and
+      // the quoted command scrolls inside it. Synthetic event on purpose - this
+      // must not wait for a model to decide to write a wall of text.
+      {
+        const wall =
+          'cat > notes.md <<\'EOF\'\n' +
+          Array.from({ length: 300 }, (_, i) => `line ${i} of prose about the harrow road branch library`).join('\n') +
+          '\nEOF  [+299 more lines, 20118 characters total]'
+        handle({
+          kind: 'approvalRequested',
+          d: { id: 990001, tool: 'exec', risk: 'sensitive', summary: wall },
+        } as unknown as EngineEvent)
+        await new Promise((r) => setTimeout(r, 90))
+        const body = document.querySelector('.appr-body') as HTMLElement | null
+        const card = document.querySelector('.approval-card') as HTMLElement | null
+        const deny = Array.from(document.querySelectorAll('.approval-card button')).find((b) =>
+          /deny/i.test(b.textContent ?? ''),
+        ) as HTMLElement | null
+        if (!body || !card || !deny) {
+          fail('the long-command approval card did not render all its parts')
+        } else {
+          const vp = window.innerHeight
+          if (card.getBoundingClientRect().bottom > vp + 1)
+            fail(`the approval card runs past a ${vp}px window (${Math.round(card.getBoundingClientRect().bottom)}px)`)
+          if (body.scrollHeight <= body.clientHeight + 4)
+            fail(`the quoted command does not scroll (${body.scrollHeight} <= ${body.clientHeight}): the card grew instead of capping`)
+          if (deny.getBoundingClientRect().bottom > vp + 1)
+            fail(`the Deny button sits ${Math.round(deny.getBoundingClientRect().bottom - vp)}px below the fold`)
+          // The scroll has to stay inside the card. `overscroll-behavior: contain`
+          // is the whole reason: without it, wheeling through a long command
+          // pushes the transcript behind the card instead.
+          const sc = document.querySelector('.scroller') as HTMLElement | null
+          const beforeTop = sc?.scrollTop ?? 0
+          body.scrollTop = 400
+          await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
+          if (body.scrollTop < 200) fail(`the command body refused to scroll (scrollTop ${body.scrollTop})`)
+          if (sc && Math.abs(sc.scrollTop - beforeTop) > 1) fail('scrolling the command moved the transcript behind it')
+          pageLog(
+            `approval scroll ok (body shows ${body.clientHeight}px of ${body.scrollHeight}px, deny ${Math.round(vp - deny.getBoundingClientRect().bottom)}px above the fold)`,
+          )
+        }
+        approval = null
+        await new Promise((r) => setTimeout(r, 40))
+      }
+
       // The approval round-trip, end to end. Every previous "approval verified"
       // check only proved the request arrived; none proved the answer landed. It
       // did not: the pump and the command used two different maps, so every gated
@@ -2357,7 +2718,13 @@
           // Do not leave the turn running: every check after this one would blame it.
           await settleTurn('approval turn', 5000)
         } else {
-          const asked = approval
+          // Read through the named type: the harness raises and clears a synthetic
+          // prompt earlier in this run, and the checker would otherwise narrow the
+          // live state to `never` here and refuse to describe what it sees. The
+          // sentinel keeps the assertions readable and still fails loudly.
+          const asked: ApprovalPrompt =
+            (approval as ApprovalPrompt | null) ?? { id: 0, tool: '<none>', risk: '<none>', summary: '<none>' }
+          if (!approval) fail('the approval prompt vanished between the wait and the read')
           if (asked.tool !== 'read_file') fail(`the gated call was ${asked.tool}, expected read_file`)
           if (asked.risk !== 'sensitive')
             fail(`a read outside the workspace was classified ${asked.risk}, expected sensitive`)
@@ -2625,19 +2992,74 @@
         // no-op and the assertions below race persistence.
         const turnsBeforeDraft = (await invoke<HostState>('session_state')).turns
         await send()
-        if (!(await waitTurnDone(turnsBeforeDraft))) {
+        const stalled =
+          (await waitTurnDone(turnsBeforeDraft)) === false &&
+          (await endpointTooSlow('the draft-session checks'))
+        if (!stalled && !(await waitTurnDone(turnsBeforeDraft, 1000)))
           fail('draft first turn never finished')
+        if (!stalled) {
+          const afterSend = await invoke<Session[]>('list_sessions')
+          if (afterSend.length !== beforeDraft.length + 1) {
+            fail(`first message did not create exactly one row: ${beforeDraft.length} -> ${afterSend.length}`)
+          }
+          const mine = afterSend.find((x) => x.title.includes('6 times 7'))
+          if (!mine)
+            fail(`the new row was not titled by its first message: ${afterSend.slice(0, 3).map((x) => x.title).join(' | ')}`)
+          if (!(await waitFor('view to leave the empty state', () => !showEmpty, 5000))) {
+            fail(`view stayed empty after sending (viewId=${viewId} msgCount=${viewMsgCount} busy=${busy})`)
+          }
+          if (mine) await invoke('delete_session', { id: mine.id })
         }
-        const afterSend = await invoke<Session[]>('list_sessions')
-        if (afterSend.length !== beforeDraft.length + 1) {
-          fail(`first message did not create exactly one row: ${beforeDraft.length} -> ${afterSend.length}`)
+      }
+
+      // --- the search panel reports the engine, and never changes the choice ----
+      {
+        const btn = [...document.querySelectorAll('footer button.fbtn')].find(
+          (b) => b.querySelector('.flbl')?.textContent?.trim() === 'search',
+        ) as HTMLButtonElement | undefined
+        if (!btn) {
+          fail('the footer has no search control, so a phone cannot see which search is on')
+        } else {
+          btn.click()
+          // The panel reads its state on first open, including a container probe
+          // (podman ps), so give the round trip room.
+          if (!(await waitFor('the search panel to fill in', () => document.querySelectorAll('.pop .pop-item').length > 3, 4000))) {
+            fail('the search panel opened but never listed its providers')
+          } else {
+            const items = [...document.querySelectorAll('.pop .pop-item')] as HTMLElement[]
+            const labels = items.map((i) => (i.querySelector('.pop-lbl')?.textContent ?? '').trim())
+            const want = ['DuckDuckGo', 'SearXNG, run by Cwoffee', 'SearXNG, already running']
+            const missing = want.filter((w) => !labels.includes(w))
+            if (missing.length)
+              fail(`the search panel is missing provider(s): ${missing.join(' | ')} (saw ${labels.join(' | ')})`)
+            const marked = items.filter((i) => i.getAttribute('aria-checked') === 'true')
+            if (marked.length !== 1)
+              fail(`exactly one provider must be marked as in use, saw ${marked.length}: ${labels.join(' | ')}`)
+            const inUse = items.find((i) => i.textContent?.includes('In use now'))
+            const said = (inUse?.querySelector('.pop-sub')?.textContent ?? '').trim()
+            if (!inUse || said.length < 6)
+              fail(
+                `the panel does not say what search is actually doing (got ${said || 'nothing'}): a card that prints the config value cannot tell "auto" with a container from "auto" with no runtime`,
+              )
+            // And the mark must agree with the engine, not with a stale local copy.
+            const view = await invoke<{ backend: string; describing: string }>('search_settings')
+            const expect =
+              view.backend === 'auto'
+                ? 'run by Cwoffee'
+                : view.backend === 'searxng'
+                  ? 'already running'
+                  : 'DuckDuckGo'
+            const text = marked[0]?.textContent ?? ''
+            if (!text.includes(expect))
+              fail(`the panel marks "${text.trim()}" while the engine says backend=${view.backend}`)
+            // Deliberately no click on a provider: choosing one writes the user's
+            // config file. A self-test that changes which search they use is the kind
+            // of side effect the harness promised to stop causing.
+            btn.click()
+            await new Promise((r) => setTimeout(r, 150))
+            pageLog(`search panel ok (${view.backend}: ${view.describing})`)
+          }
         }
-        const mine = afterSend.find((x) => x.title.includes('6 times 7'))
-        if (!mine) fail(`the new row was not titled by its first message: ${afterSend.slice(0,3).map((x)=>x.title).join(' | ')}`)
-        if (!(await waitFor('view to leave the empty state', () => !showEmpty, 5000))) {
-          fail(`view stayed empty after sending (viewId=${viewId} msgCount=${viewMsgCount} busy=${busy})`)
-        }
-        if (mine) await invoke('delete_session', { id: mine.id })
       }
 
       // --- delete through the actual DOM, the way a user does it ------------
@@ -2717,7 +3139,15 @@
         await send()
         // Wait for output to actually be streaming, then look.
         if (!(await waitFor('a live block to appear', () => liveCount() === 1, 6000))) {
-          fail(`expected exactly one live block during a turn, saw ${liveCount()}`)
+          // The premise of this check is tokens. An endpoint still in prefill after
+          // six seconds has not failed it - it has not answered it. Failing here
+          // blamed the UI for the model thinking. (Seen live: 131s to first token.)
+          const st = await invoke<HostState>('session_state')
+          if (st.busy)
+            pageLog(
+              `selftest note: no live block within 6s - turn ${st.turns} is running and the endpoint has emitted nothing yet, so this check skipped rather than blamed the UI`,
+            )
+          else fail(`expected exactly one live block during a turn, saw ${liveCount()}`)
         }
         if (!(await waitTurnDone(turnsBeforeLive))) {
           fail('live-marker turn never finished')
@@ -3072,6 +3502,128 @@
             fail('an expired card still offers Send')
           click(card.querySelector('.ask-submit'))
           card.remove()
+        }
+
+        // --- several questions in one call: one card, one submit --------------
+        {
+          const sent: { id: number; text: string; options: number[] }[] = []
+          transcript?.showQuestionSet(
+            [
+              {
+                id: 900_101,
+                question: 'Which format?',
+                options: [{ label: 'Markdown' }, { label: 'PDF', detail: 'prints well' }],
+                recommended: 1,
+                allow_custom: false,
+                multi: false,
+                set: { id: 7001, index: 0, total: 2 },
+              },
+              {
+                id: 900_102,
+                question: 'Anything else the document should say?',
+                options: [{ label: 'Keep it short' }],
+                allow_custom: true,
+                multi: false,
+                set: { id: 7001, index: 1, total: 2 },
+              },
+            ],
+            (id, r) => sent.push({ id, ...r }),
+          )
+          const setCard = document.querySelector('.blk-ask.is-set')
+          if (!setCard) {
+            fail('a set of questions did not render as one card')
+          } else {
+            const count = () => setCard.querySelector('.ask-count')?.textContent?.trim() ?? ''
+            if (count() !== 'Question 1 of 2') fail(`the set card does not say which question it is on: ${count()}`)
+            if (setCard.querySelectorAll('.ask-submit').length !== 1)
+              fail('a set must offer exactly one submit, not one per question')
+            const submitBtn = () => setCard.querySelector<HTMLButtonElement>('.ask-submit')!
+            if (!submitBtn().disabled) fail('a set with nothing answered must not offer Send')
+            if (setCard.querySelectorAll('.ask-opts').length !== 1)
+              fail('both questions are on screen at once; a set is answered one at a time')
+
+            // answer the first
+            click(setCard.querySelectorAll('.ask-opt')[1])
+            if (count() !== 'Question 1 of 2') fail('answering jumped to another question by itself')
+            if (submitBtn().disabled) fail('one answer is enough to send the set (the rest go as no answer)')
+            if (!/1 of 2/.test(submitBtn().textContent ?? ''))
+              fail(`the send button must say how much is answered: ${submitBtn()?.textContent}`)
+            const hint = setCard.querySelector('.ask-hint')?.textContent ?? ''
+            if (!/would be sent as no answer/.test(hint))
+              fail(`the card does not warn that a question is still unanswered: ${hint || 'nothing'}`)
+
+            // navigate, and check the first answer survives the trip
+            click(setCard.querySelector('.ask-next'))
+            if (count() !== 'Question 2 of 2') fail(`Next did not advance: ${count()}`)
+            const q2 = setCard.querySelector('.ask-q')?.textContent ?? ''
+            if (!q2.startsWith('Anything else')) fail(`the second question is not shown: ${q2}`)
+            const inp = setCard.querySelector('.ask-input') as HTMLInputElement | null
+            if (!inp) fail('the second question offers no typed answer')
+            else {
+              inp.value = 'add the cost per unit'
+              inp.dispatchEvent(new Event('input', { bubbles: true }))
+            }
+            click(setCard.querySelector('.ask-back'))
+            if (count() !== 'Question 1 of 2') fail(`Back did not return: ${count()}`)
+            if (!setCard.querySelector('.ask-opt.is-sel'))
+              fail('navigating back lost the answer given to the first question')
+            click(setCard.querySelector('.ask-next'))
+
+            if (submitBtn().disabled) fail('both answered but Send is still disabled')
+            if (submitBtn().textContent?.trim() !== 'Send answers')
+              fail(`a fully answered set should offer a plain Send: ${submitBtn()?.textContent}`)
+            click(submitBtn())
+
+            if (sent.length !== 2) fail(`a set must answer every question exactly once; got ${sent.length}`)
+            const a = sent.find((s) => s.id === 900_101)
+            const b = sent.find((s) => s.id === 900_102)
+            if (!a || a.options[0] !== 1 || a.text !== 'PDF') fail(`first answer came out wrong: ${JSON.stringify(a)}`)
+            if (!b || b.text !== 'add the cost per unit') fail(`second answer came out wrong: ${JSON.stringify(b)}`)
+            if (!setCard.classList.contains('answered')) fail('the set card did not collapse on submit')
+            // Settled: nothing left to answer. The complaint about the old card was
+            // that it stayed interactive forever after the call had returned.
+            if (setCard.querySelectorAll('.ask-opt, .ask-input, .ask-submit, .ask-back, .ask-next').length)
+              fail('a submitted set still holds interactive controls')
+            const label = setCard.querySelector('.blk-label')?.textContent?.trim() ?? ''
+            if (label !== 'answered 2 of 2') fail(`the settled head line reads "${label}"`)
+            const qa = setCard.querySelectorAll('.ask-qa-item')
+            if (qa.length !== 2) fail(`the expanded summary should hold both pairs, got ${qa.length}`)
+            else {
+              const txt = [...qa].map((n) => n.textContent ?? '').join(' | ')
+              if (!txt.includes('Which format?') || !txt.includes('Anything else'))
+                fail(`the summary lost the questions: ${txt}`)
+              if (!txt.includes('PDF') || !txt.includes('add the cost per unit'))
+                fail(`the summary lost the answers: ${txt}`)
+            }
+            const qaEl = setCard.querySelector('.ask-qa') as HTMLElement
+            if (getComputedStyle(qaEl).display !== 'none')
+              fail('a submitted set opens with its whole Q&A in the way')
+            click(setCard.querySelector('.blk-head'))
+            if (getComputedStyle(qaEl).display === 'none')
+              fail('the settled set does not expand to show what was asked and answered')
+            setCard.remove()
+          }
+
+          // Declining a set is an explicit no to all of it, and the card still closes.
+          const noes: { id: number; text: string }[] = []
+          transcript?.showQuestionSet(
+            [
+              { id: 900_111, question: 'a?', options: [{ label: 'x' }], allow_custom: false, multi: false, set: { id: 7002, index: 0, total: 2 } },
+              { id: 900_112, question: 'b?', options: [{ label: 'y' }], allow_custom: false, multi: false, set: { id: 7002, index: 1, total: 2 } },
+            ],
+            (id, r) => noes.push({ id, text: r.text }),
+          )
+          const decl = document.querySelector('.blk-ask.is-set')
+          if (!decl) fail('a declined set did not render')
+          else {
+            click(decl.querySelector('.ask-decline'))
+            if (noes.length !== 2 || noes.some((n) => n.text !== ''))
+              fail(`Decline must answer every question with nothing: ${JSON.stringify(noes)}`)
+            const lb = decl.querySelector('.blk-label')?.textContent?.trim() ?? ''
+            if (lb !== 'declined') fail(`a declined set reads "${lb}"`)
+            decl.remove()
+          }
+          pageLog('question set ok (one card, navigation kept answers, one submit, settled read-only)')
         }
 
         // An answer for a question nobody asked is an error, not a shrug.
@@ -3671,6 +4223,7 @@
       // became markdown when the turn ended. A paragraph is now committed the
       // moment its blank line lands, and only the last, unfinished block stays
       // as raw text.
+      if (await blind('before the streaming markdown checks')) return
       {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 2, model: 'selftest' } })
@@ -3719,6 +4272,26 @@
               fail(`streamed table has ${tbl.querySelectorAll('tbody tr').length} body rows`)
             if (tbl.textContent?.includes('|')) fail('stray pipes left in the streamed table')
           }
+        }
+        // A heading is one line long, so its own newline finishes it. Holding it
+        // for a blank line left literal hash marks on screen while the model typed
+        // the sentence underneath, which is the "only formats at certain points"
+        // report in its most visible form.
+        {
+          transcript?.apply({
+            kind: 'text',
+            d: '\n\n## The Copy\nThe photocopier in the basement started printing again at 3:14.',
+          })
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          transcript?.flushNow()
+          const b3 = document.querySelector('.blk-answer .blk-body') as HTMLElement
+          const h2 = b3?.querySelector('h2')
+          if (!h2 || (h2.textContent ?? '').trim() !== 'The Copy')
+            fail(`a heading waited for a blank line to format: ${(b3?.innerHTML ?? '').slice(0, 120)}`)
+          const tail3 = b3?.querySelector('.live-para')
+          if (tail3 && /(^|\s)#/.test(tail3.textContent ?? '')) fail('hash marks are visible while the answer streams')
+          if (!tail3 || !/photocopier/.test(tail3.textContent ?? ''))
+            fail('the sentence after a streamed heading is not its own live block')
         }
         const committed = [...body.querySelectorAll('h1, p, li')]
           .map((n) => n.textContent ?? '')
@@ -3830,7 +4403,7 @@
           const htn = who?.firstChild as Text | null
           if (!who || !tn || !htn) {
             fail(`nothing to measure for label alignment ${where}`)
-            return 0
+            return { v: 0, gap: 0 }
           }
           // Both measured as *text* boxes: the label carries its own padding and
           // the first paragraph sits inside block margins, so comparing element
@@ -3843,23 +4416,120 @@
           hr.setStart(htn, 0)
           hr.setEnd(htn, Math.min(4, htn.length))
           const head = hr.getBoundingClientRect()
-          const d = line.top + line.height / 2 - (head.top + head.height / 2)
-          pageLog(`label alignment (${where}): ${d.toFixed(1)}px`)
-          return d
+          const v = line.top + line.height / 2 - (head.top + head.height / 2)
+          // The other half of the complaint: the gutter. The live dot used to be an
+          // inline box inside a 58px right-aligned nowrap label, which made the line
+          // wider than its own box - and text-align does nothing to a line that
+          // overflows, so the label fell back to the start edge and abutted the
+          // answer's first word. Gap measured edge to edge, in the same frame.
+          const gap = line.left - head.right
+          pageLog(`label alignment (${where}): ${v.toFixed(1)}px off the line, ${gap.toFixed(1)}px gutter`)
+          return { v, gap }
         }
         const mid = alignPx('while generating')
         // 6px is the design allowance: the label hangs 2px below the block top and
         // carries 3px of its own padding. More than that reads as a name that does
         // not line up with the sentence beside it.
-        if (Math.abs(mid) > 6)
-          fail(`the CWOFFEE label is ${mid.toFixed(1)}px off the first line while generating`)
+        if (Math.abs(mid.v) > 6)
+          fail(`the CWOFFEE label is ${mid.v.toFixed(1)}px off the first line while generating`)
         transcript?.apply({ kind: 'text', d: 'right now, and the label must not shift when they finish.' })
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 3, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
         const after = alignPx('once settled')
-        if (Math.abs(after - mid) > 1.2)
-          fail(`the label moved ${(after - mid).toFixed(1)}px when the turn ended - it aligns only at the end`)
-        pageLog(`label alignment ok (${mid.toFixed(1)}px generating, ${after.toFixed(1)}px settled)`)
+        if (Math.abs(after.v - mid.v) > 1.2)
+          fail(`the label moved ${(after.v - mid.v).toFixed(1)}px when the turn ended - it aligns only at the end`)
+        // The gutter has to exist *while the dot is up*, not only after it. A label
+        // that touches the answer's first word for the whole turn and gains its
+        // margin at turn end is the bug, whatever the settled number looks like.
+        if (mid.gap < 6)
+          fail(`the label has ${mid.gap.toFixed(1)}px of gutter while generating - it is touching the answer`)
+        if (Math.abs(after.gap - mid.gap) > 1.0)
+          fail(
+            `the gutter changed ${(after.gap - mid.gap).toFixed(1)}px at turn end (${mid.gap.toFixed(1)}px -> ${after.gap.toFixed(1)}px): the label is being re-laid-out by its own marker`,
+          )
+
+        // The reported case was an answer that opens with a heading, so measure
+        // that too: heading line-height and margins differ from a paragraph's, and
+        // the label hangs off the block, not off the first paragraph.
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 4, model: 'selftest' } })
+        transcript?.apply({ kind: 'text', d: '## The Copy\n\nThe photocopier in the basement started printing again ' })
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        transcript?.flushNow()
+        const head1 = alignPx('heading answer, generating')
+        if (document.querySelector('.blk-answer h2, .blk-answer h3, .blk-answer h1') === null)
+          fail('an answer starting with `## ` did not become a heading while streaming')
+        if (document.querySelector('.blk-answer h2, .blk-answer h3, .blk-answer h1') === null)
+          fail('an answer starting with `## ` did not become a heading while streaming')
+        // No absolute vertical bound for the heading case, deliberately: the label
+        // hangs off the top of the block, and a heading carries top margin, so it
+        // sits ~12px below the label by design. What must not happen is the label
+        // *moving* - that was the bug - or losing its gutter next to a wide title.
+        if (head1.gap < 6)
+          fail(`the label has ${head1.gap.toFixed(1)}px of gutter next to a heading: it is touching the title`)
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 4, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        const head2 = alignPx('heading answer, settled')
+        if (Math.abs(head2.gap - head1.gap) > 1.0 || Math.abs(head2.v - head1.v) > 1.2)
+          fail('the label moves when a heading answer settles')
+        pageLog(
+          `label alignment ok (${mid.gap.toFixed(1)}px gutter generating / ${after.gap.toFixed(1)}px settled, heading ${head1.gap.toFixed(1)}px / ${head2.gap.toFixed(1)}px)`,
+        )
+        transcript?.clear()
+      }
+
+      // [2c] Emphasis arrives with the words, not at the blank line.
+      //
+      // The paragraph is still open when `**the copy**` closes, so the bold has
+      // to be *appended inside* a <strong> created at the opener. Re-parsing the
+      // paragraph to get the same pixels would rewrite spans the reader already
+      // read, which is the one thing every blink report traces back to. So the
+      // check measures the words on both sides of the construct: the ones before
+      // must not move by a pixel, and the marker characters must never be
+      // painted at all.
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 7, model: 'selftest' } })
+        transcript?.apply({ kind: 'text', d: 'The photocopier printed ' })
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        transcript?.flushNow()
+        const body = document.querySelector('.blk-answer .blk-body') as HTMLElement
+        const para = body?.querySelector('.live-para') as HTMLElement | null
+        const before = para?.lastElementChild as HTMLElement | null
+        const bx = before?.getBoundingClientRect().left ?? 0
+        if (!para || !before) fail('the streaming paragraph did not open')
+        else {
+          transcript?.apply({ kind: 'text', d: '**the copy** and `git status` quietly ' })
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          transcript?.flushNow()
+          if (!para.isConnected) fail('the streaming paragraph was replaced when emphasis arrived')
+          const strong = para.querySelector('strong') as HTMLElement | null
+          const code = para.querySelector('code') as HTMLElement | null
+          if (!strong) fail(`bold did not arrive while the paragraph was open: ${JSON.stringify(para.textContent)}`)
+          else if ((strong.textContent ?? '').trim() !== 'the copy')
+            fail(`bold wraps the wrong words: ${JSON.stringify(strong.textContent)}`)
+          if (!code) fail('a code span did not arrive while the paragraph was open')
+          const after = para.textContent ?? ''
+          if (after.includes('**')) fail(`the emphasis markers are visible on screen: ${JSON.stringify(after)}`)
+          if (after.includes('`')) fail(`the code markers are visible on screen: ${JSON.stringify(after)}`)
+          // The words that were already on screen must be exactly where they were.
+          const ax = before.getBoundingClientRect().left
+          if (Math.abs(ax - bx) > 0.5)
+            fail(`the word before the construct moved ${(ax - bx).toFixed(1)}px when the bold landed`)
+          if (!before.isConnected) fail('a settled word span was detached by the inline pass')
+          // Settling has to agree with the parser rather than fight it.
+          transcript?.apply({ kind: 'text', d: 'downstairs.' })
+          transcript?.apply({ kind: 'turnEnd', d: { turn_id: 7, finish: 'stop' } })
+          await new Promise((r) => setTimeout(r, 80))
+          const final = document.querySelector('.blk-answer .blk-body')
+          const fs = final?.querySelector('strong')
+          if (!fs || (fs.textContent ?? '').trim() !== 'the copy')
+            fail(`the settled paragraph lost the bold: ${JSON.stringify(final?.textContent)}`)
+          if (!final?.querySelector('code')) fail('the settled paragraph lost the code span')
+          pageLog(
+            `inline emphasis streams ok (bold and code appended in place, previous word moved ${(ax - bx).toFixed(1)}px, markers never painted)`,
+          )
+        }
         transcript?.clear()
       }
 
@@ -4072,18 +4742,58 @@
         const c = stop()
         await invoke('set_reasoning', { level: 'medium' })
         await sweepSelftest('after the frame-cadence turn', cadFloor)
+        // The baseline is measured on the same page a moment later with nothing
+        // streaming. Without it this check measures the machine: a box serving a
+        // 50 GB model on nine cores cannot hand any page a 60 Hz clock, and the
+        // failure text would blame the streaming path for the CPU situation.
+        const idle = await idleFrameSample(900)
         // The numbers are logged whatever the verdict: the cost of the rendering
         // path is the reason for measuring it, and a check that hides its own
         // measurements when it fails cannot be compared between modes or machines.
         pageLog(
           `frame cadence: ${c.frames} frames over ${c.ms}ms while a turn streamed; ` +
             `median ${c.median.toFixed(1)}ms, p95 ${c.p95.toFixed(1)}ms, worst ${c.worst.toFixed(1)}ms ` +
-            `(at +${Math.round(c.worstAt)}ms), off-screen spans ${c.hiddenSpans}`,
+            `(at +${Math.round(c.worstAt)}ms), off-screen spans ${c.hiddenSpans}, ` +
+            `page long tasks ${c.longN} totalling ${Math.round(c.longMs)}ms`,
         )
-        if (c.frames < 60)
+        pageLog(
+          `frame cadence baseline (nothing streaming): ${idle.frames} frames, ` +
+            `median ${idle.median.toFixed(1)}ms, p95 ${idle.p95.toFixed(1)}ms`,
+        )
+        const starved = idle.median > 21
+        if (offScreen()) {
+          blindSkips++
+          // A throttled frame clock is what an occluded page does, and this run
+          // already proved the page was not laid out (the geometry notes above). The
+          // numbers stay in the log; they are just not treated as a verdict.
+          pageLog(`selftest note: skipped the frame-cadence verdict; ${offScreen()}`)
+        } else if (c.frames < 60)
           fail(`frame cadence: only ${c.frames} animation frames in ${c.ms}ms: the sample is empty`)
-        else if (c.median > 21)
-          fail(`frame cadence: median gap ${c.median.toFixed(1)}ms - the page is not getting a 60Hz clock`)
+        else if (starved) {
+          // Absolute thresholds mean nothing when the page never gets 60 Hz idle. What
+          // still has to hold is that streaming costs little more than idling: an
+          // app-side regression shows up as the ratio, on any machine.
+          pageLog(
+            `selftest note: the machine is starved (idle median ${idle.median.toFixed(1)}ms), so the cadence is judged against the baseline rather than 60Hz`,
+          )
+          if (c.median > idle.median * 1.6 + 3)
+            fail(
+              `frame cadence: streaming runs at ${c.median.toFixed(1)}ms vs ${idle.median.toFixed(1)}ms idle - streaming costs the frame clock far more than it should, whatever the machine is doing`,
+            )
+          else if (c.worst > Math.max(250, idle.worst * 2))
+            fail(
+              `frame cadence: one gap of ${c.worst.toFixed(0)}ms while streaming (idle worst ${idle.worst.toFixed(0)}ms) - something blocked the frame clock`,
+            )
+          else pageLog(`frame cadence ok relative to the idle baseline (${idle.median.toFixed(1)}ms)`)
+        } else if ((c.median > 21 || c.p95 > 45 || c.worst > 250) && c.longTasksMeasured && c.longMs < 60) {
+          // The clock slowed, but the page did no long task while it did. Blaming the
+          // app for frames the process was never given measures the machine, and the
+          // idle baseline above says whether the machine was able to deliver them.
+          pageLog(
+            `selftest note: the frame clock slowed (median ${c.median.toFixed(1)}ms, p95 ${c.p95.toFixed(1)}ms, worst ${c.worst.toFixed(0)}ms) while the page itself ran ${c.longN} long task(s) totalling ${Math.round(c.longMs)}ms - nothing in the page accounts for it, so this is recorded, not blamed; the idle baseline was ${idle.median.toFixed(1)}ms`,
+          )
+        } else if (c.median > 21)
+          fail(`frame cadence: median gap ${c.median.toFixed(1)}ms with ${Math.round(c.longMs)}ms of the page's own long tasks - the page is not getting a 60Hz clock, and its own work is part of the reason`)
         else if (c.p95 > 45)
           fail(`frame cadence: p95 gap ${c.p95.toFixed(1)}ms while an answer streams - that is a hitch, not a pause`)
         else if (c.worst > 250)
@@ -4091,6 +4801,12 @@
         else pageLog('frame cadence ok')
         if (!done) pageLog('selftest note: the cadence turn did not finish; the sample above is partial')
       }
+
+      // The rest of this stretch measures geometry on synthetic blocks, so the
+      // transcript has to be in the document. A turn that never finished can leave the
+      // view on a draft, and every rect would read 0.
+      if (!(await ensureTranscriptMounted()))
+        pageLog('selftest note: no session with messages could be opened, so layout checks will be skipped')
 
       // [5] An entrance may only ever run on a node that has never been painted.
       //
@@ -4300,6 +5016,14 @@
       // reading column stays one straight edge. The two layouts are deliberate and
       // must not drift into each other.
       {
+        // The premise is verified BEFORE the blocks exist. Verifying it after capturing
+        // the nodes is worse than not verifying it: the recovery reopens a session,
+        // that reopen repaints the transcript, and the captured nodes are then measured
+        // while detached - which is how "expanded thinking block has no width: 0" came
+        // back three runs in a row with the view demonstrably open.
+        if (await blind('thinking and answer alignment')) {
+          // counted skip; blind() logged why
+        } else {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
         transcript?.apply({ kind: 'reasoning', d: 'a thought worth reading, long enough to wrap a little.' })
@@ -4309,7 +5033,9 @@
         const think = document.querySelector('.blk-reasoning') as HTMLElement
         const ans = document.querySelector('.blk-answer') as HTMLElement
         if (!think || !ans) fail('missing thinking or answer block to compare')
-        else {
+        else if (offScreen()) {
+          fail(`the view moved under this check mid-measurement: ${offScreen()}`)
+        } else {
           // A settled thinking body is collapsed by design, and a collapsed element
           // measures 0 - so open it before measuring it.
           const head = think.querySelector('.blk-head') as HTMLElement
@@ -4319,7 +5045,25 @@
           const hr = head.getBoundingClientRect()
           const br = body.getBoundingClientRect()
           const pad = parseFloat(getComputedStyle(body).paddingLeft || '0')
-          if (br.width < 100) fail(`expanded thinking block has no width: ${Math.round(br.width)}`)
+          if (br.width < 100) {
+            // A zero box has a cause, and the cause is in the ancestor chain: the
+            // first entry marked [display:none] is the thing that hid it. Without this
+            // line the failure reads as "CSS is broken" and costs three more runs.
+            const chain = (el: Element | null) => {
+              const out: string[] = []
+              let n: Element | null = el
+              while (n && out.length < 8) {
+                const cs = getComputedStyle(n)
+                const cls = String(n.className ?? '').trim().split(/\s+/).join('.')
+                out.push(`${n.tagName.toLowerCase()}.${cls}${cs.display === 'none' ? '[display:none]' : ''}`)
+                n = n.parentElement
+              }
+              return out.join(' < ')
+            }
+            const mounted = (document.querySelector('.transcript')?.contains(think) ?? false) ? 'under .transcript' : 'NOT under .transcript'
+            pageLog(`selftest diag: thinking ${Math.round(br.width)}px, ${mounted}, chain=${chain(think)}`)
+            fail(`expanded thinking block has no width: ${Math.round(br.width)}`)
+          }
           if (Math.abs(hr.left - br.left) > 1.5)
             fail(`thinking label is not above its text: head ${Math.round(hr.left)} vs body ${Math.round(br.left)}`)
           // The rule is drawn at the body's left edge, so it lines up with the label.
@@ -4328,6 +5072,12 @@
           if (pad < 8) fail(`thinking text is not tucked under the rule: ${pad}px`)
           const aHead = ans.querySelector('.blk-head')!.getBoundingClientRect()
           const aBody = ans.querySelector('.blk-body')!.getBoundingClientRect()
+          if (aHead.width === 0 || aBody.width === 0)
+            pageLog(
+              `selftest diag: answer head ${Math.round(aHead.width)}px body ${Math.round(aBody.width)}px, ` +
+                `under .transcript=${document.querySelector('.transcript')?.contains(ans) ?? false}, ` +
+                `empty-mode=${document.documentElement.className.includes('empty-mode') || !!document.querySelector('.empty-mode')}`,
+            )
           if (aBody.left - aHead.left < 40)
             fail(`answer label is no longer outdented: head ${Math.round(aHead.left)} body ${Math.round(aBody.left)}`)
           const label = think.querySelector('.blk-head')?.textContent ?? ''
@@ -4335,6 +5085,7 @@
         }
         transcript?.clear()
         pageLog('thinking aligns under its label ok')
+        }
       }
 
       // --- the label does not crowd the answer while it streams -----------------
@@ -4367,6 +5118,9 @@
           return { h: left - head.right, v: head.bottom - body.getBoundingClientRect().top }
         }
         const live: number[] = []
+        if (await blind('the label gap mid-stream')) {
+          // counted skip; the premise is checked before anything is painted
+        } else
         for (const p of ['first streamed line, ', 'second streamed line arrives ', 'and a third ']) {
           transcript?.apply({ kind: 'text', d: p })
           await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
@@ -4381,7 +5135,12 @@
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 150))
         const fin = gap()
-        if (fin === null) fail('no rendered text to measure after the turn')
+        if (!live.length) {
+          // Every mid-stream sample was skipped. Saying "holds" here would be the
+          // harness congratulating itself on measuring nothing.
+          blindSkips++
+          pageLog('selftest note: skipped the label-gap drift claim; no mid-stream sample was measurable')
+        } else if (fin === null) fail('no rendered text to measure after the turn')
         else {
           const worst = Math.max(...live) - Math.min(...live)
           if (worst > 3) fail(`the text edge moves during the turn: ${live.map((x) => Math.round(x)).join('px, ')}px`)
@@ -4412,9 +5171,44 @@
           if (!/not built yet/i.test(branch.title))
             fail(`a disabled button should say why: ${branch.title}`)
           if (copy.disabled || share.disabled) fail('working actions are disabled')
+          // Sharing answers with a sentence, not a chip. A share is something the
+          // person did *with* the conversation; giving it a file chip put it in the
+          // same row as the model's own output, and the next turn then treated the
+          // export as a file it had made.
+          const realShare = transcript?.onShare ?? null
+          if (transcript) transcript.onShare = async () => 'saved to /tmp/selftest.md'
+          share.click()
+          await new Promise((r) => setTimeout(r, 150))
+          if (document.querySelectorAll('.filechip').length)
+            fail('a share left a file chip in the conversation')
+          if (transcript) transcript.onShare = realShare
+        }
+        // A turn's files are that turn's. The report: a "clean up those downloads"
+        // turn ended up wearing the files it had just deleted, because the strip
+        // carried over and the next `addFiles` re-parented it.
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'text', d: 'downloaded the sources' })
+        transcript?.addFiles([{ path: 'metr_report.html', name: 'metr_report.html', mime: 'text/html', bytes: 430006 }])
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 2, model: 'selftest' } })
+        transcript?.apply({ kind: 'text', d: 'Cleaned up. Deleted the files I created.' })
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 2, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        const turns = [...document.querySelectorAll('.turn')]
+        if (turns.length !== 2) fail(`expected two turns for the file-ownership check, saw ${turns.length}`)
+        else {
+          const late = turns[1].querySelectorAll('.filechip')
+          if (late.length)
+            fail(
+              `the cleanup turn is wearing ${late.length} file chip(s) from the turn before: ${Array.from(late).map((c) => c.textContent?.trim()).join(', ')}`,
+            )
+          const early = turns[0].querySelectorAll('.filechip')
+          if (early.length !== 1) fail(`the turn that downloaded the file lost its own chip (${early.length})`)
         }
         transcript?.clear()
-        pageLog('turn actions ok')
+        pageLog('turn files ok (each turn owns its own files, and a share leaves no chip)')
       }
 
       // --- right-click gives app actions, not Back/Forward/Reload --------------
@@ -4604,6 +5398,22 @@
       }
 
       await sweepSelftest('end', idFloor)
+      // A run that skipped most of its layout checks proved nothing about layout, and
+      // silence about that would let "SELFTEST ok" mean something it does not.
+      if (endpointSkips > 0) {
+        pageLog(`selftest note: ${endpointSkips} turn-dependent check(s) were skipped because the endpoint was too slow to finish a turn`)
+        if (endpointSkips >= 3)
+          fail(
+            `${endpointSkips} checks were skipped: the endpoint never completed a turn during this run (last measured prefill ${lastPrefill === null ? 'unknown' : lastPrefill.toFixed(1)} tok/s), so the turn-dependent behaviour above was not verified`,
+          )
+      }
+      if (blindSkips > 0) {
+        pageLog(`selftest note: ${blindSkips} geometry check(s) were skipped because the page was not being laid out`)
+        if (blindSkips >= 4)
+          fail(
+            `${blindSkips} geometry checks were skipped: the window was off-screen for most of this run, so nothing about layout was verified. Keep the window visible and re-run.`,
+          )
+      }
       // Hand the host back to the conversation the user was in. The sweep deleted the
       // scratch sessions; leaving the host pointed at one of them meant the desktop
       // came back showing a harness title.
@@ -4783,16 +5593,34 @@
           }
         },
       })
-      // Export is a backend write: the file has to pass the engine's containment
-      // rules and land in the conversation's own workspace, which is also the only
-      // way the gateway gets the same feature without shipping a filesystem.
-      transcript.onExport = async (session: number) => {
+      // "Share as Markdown" builds the document on the engine (the same code for
+      // both transports) and then asks a person where it should go. The desktop
+      // gets the native save dialog; a browser page cannot pick a folder, so the
+      // browser does what it is good at and downloads. Either way the host's
+      // workspace gains nothing, which is the point: an earlier version wrote into
+      // `<workspace>/exports/`, and the next turn treated that file as its own
+      // output - including "cleaning it up".
+      transcript.onShare = async (session: number) => {
         if (!session) throw new Error('this conversation is not saved yet')
-        const f = await invoke<{ path: string; name: string; mime: string; bytes: number }>(
-          'export_markdown',
-          { session },
-        )
-        return f
+        const doc = await invoke<{ name: string; markdown: string }>('share_markdown', { session })
+        if (!doc?.markdown) throw new Error('the host returned an empty document')
+        if (transportKind === 'gateway') {
+          const blob = new Blob([doc.markdown], { type: 'text/markdown;charset=utf-8' })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a')
+          a.href = url
+          a.download = doc.name
+          document.body.append(a)
+          a.click()
+          a.remove()
+          setTimeout(() => URL.revokeObjectURL(url), 5000)
+          return `downloaded ${doc.name}`
+        }
+        const path = await invoke<string | null>('save_markdown_file', {
+          name: doc.name,
+          contents: doc.markdown,
+        })
+        return path ? `saved to ${path}` : 'not saved — you closed the dialog'
       }
       transcript.onOpenFile = async (path) => {
         try {
@@ -5236,7 +6064,22 @@
             >
               Approve · {riskHeadline(approval.tool)} ({approval.risk})
             </div>
-            <div class="mt-1 font-mono text-[13px]">{approval.summary}</div>
+            <!-- A scrollable region has to be focusable to be scrollable by keyboard.
+                 The a11y rule assumes a non-interactive element cannot need focus,
+                 which is exactly the case here, so it is ignored deliberately. -->
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+            <div
+              class="appr-body mt-1 font-mono text-[13px]"
+              role="region"
+              aria-label="Command to approve"
+              tabindex="0"
+              bind:this={apprBodyEl}
+            >
+              {approval.summary}
+            </div>
+            {#if apprClipped}
+              <div class="appr-more">the command continues — scroll this box</div>
+            {/if}
             <div class="mt-3 flex items-center gap-2">
               <button class="btn-go" onclick={() => answer('allow')}>Allow (y)</button>
               <button class="btn-ghost" onclick={() => answer('allowSession')}>Allow for session (a)</button>
@@ -5719,6 +6562,95 @@
             who reads it can drive this agent.
           </div>
         {/if}
+      {:else if menu.kind === 'search'}
+        <div class="pop-title">Web search</div>
+        <div class="pop-item static">
+          <span class="pop-lbl">In use now</span>
+          <span class="pop-sub">{webSearch ? webSearch.describing : 'reading\u2026'}</span>
+        </div>
+        <div class="popseg">
+          {#each SEARCH_PROVIDERS as p}
+            <button
+              class="pop-item {webSearch?.backend === p.id ? 'on' : ''}"
+              role="menuitemradio"
+              aria-checked={webSearch?.backend === p.id}
+              disabled={webSearchBusy || !webSearch}
+              onclick={() => void chooseWebSearch(p.id)}
+            >
+              <span class="pop-lbl">{p.label}</span>
+              <span class="pop-sub">{p.sub}</span>
+            </button>
+          {/each}
+        </div>
+        {#if webSearch?.backend === 'searxng'}
+          <label class="pop-item static field">
+            <span class="pop-lbl">Instance URL</span>
+            <input
+              class="ws-input pop-field-input"
+              type="text"
+              placeholder="http://127.0.0.1:8080/search"
+              bind:value={webSearchUrl}
+              onchange={() => void chooseWebSearch('searxng')}
+            />
+            <span class="pop-sub">
+              needs <span class="mono">format=json</span> enabled in its settings.yml
+            </span>
+          </label>
+        {/if}
+        {#if webSearch?.backend === 'auto'}
+          <div class="pop-item static">
+            <span class="pop-lbl">Its own container</span>
+            <span class="pop-sub">
+              {webSearch?.auto?.note ?? 'checking\u2026'}
+            </span>
+            <span class="pop-sub mono">
+              port {webSearch?.auto_port} · idle {webSearch?.auto_idle_secs}s · config {webSearch?.auto_dir}
+            </span>
+          </div>
+          {#if !webSearch?.runtime}
+            <div class="pop-note">
+              No podman or docker on this machine, so Cwoffee cannot run an instance
+              of its own. Search keeps working through DuckDuckGo and says so in every
+              result until a runtime appears.
+            </div>
+          {/if}
+        {/if}
+        <button
+          class="pop-item"
+          role="menuitem"
+          disabled={webSearchBusy}
+          onclick={() => void runWebSearchProbe()}
+        >
+          <span class="pop-lbl">{webSearchBusy ? 'searching\u2026' : 'Try one search'}</span>
+          <span class="pop-sub">
+            {webSearchProbe ? `${webSearchProbe.results.length} result${webSearchProbe.results.length === 1 ? '' : 's'} in ${webSearchProbe.ms}ms` : 'asks the provider, not the model'}
+          </span>
+        </button>
+        {#if webSearchProbe && !webSearchProbe.error}
+          {#each webSearchProbe.results.slice(0, 3) as r}
+            <div class="pop-item static">
+              <span class="pop-lbl">{r.title}</span>
+              <span class="pop-sub mono">{r.url}</span>
+            </div>
+          {/each}
+          {#if webSearchProbe.note}
+            <div class="pop-note">{webSearchProbe.note}</div>
+          {/if}
+        {/if}
+        {#if webSearchErr}
+          <div class="ws-err">{webSearchErr}</div>
+        {/if}
+        {#if webSearch?.env_override}
+          <div class="pop-note">{webSearch.env_override}</div>
+        {/if}
+        {#if webSearch?.saved_to}
+          <div class="pop-note">saved to {webSearch.saved_to}</div>
+        {/if}
+        <div class="pop-note">
+          {transportKind !== 'tauri' ? 'the host\'s' : 'this machine\'s'}
+          <span class="pop-mono">~/.config/cwoffee/config.toml</span> holds the choice,
+          so it survives a restart. Turning this off never removes a container.
+        </div>
       {:else if menu.kind === 'keys'}
         <div class="pop-title">Keyboard</div>
         {#each SHORTCUTS as sc}
@@ -5794,6 +6726,19 @@
       <span class="fdot {gwDot}" aria-hidden="true"></span>
       <span class="flbl">gateway</span>
       <span class="fsum">{gwText}</span>
+    </button>
+
+    <button
+      class="fbtn"
+      data-menu
+      aria-haspopup="menu"
+      aria-expanded={menu?.kind === 'search'}
+      aria-label="Web search"
+      onclick={(e) => openMenu('search', e.currentTarget as HTMLElement)}
+    >
+      <span class="fdot {webSearchDot}" aria-hidden="true"></span>
+      <span class="flbl">search</span>
+      <span class="fsum">{webSearchText}</span>
     </button>
 
     <span class="ml-auto flex items-center gap-2">

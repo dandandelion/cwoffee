@@ -491,3 +491,149 @@ not end at a trailing blank line`, `splitCommitted commits a trailing table too`
   text) instead of a bare "not rendered", because those are two different bugs.
 - A check that leaves a session behind changes which sessions a *later* check opens; the cadence
   turn is swept immediately rather than by the end-of-run sweep.
+
+---
+
+## Batch: gutter, question sets, live markdown, approvals, sharing, search providers
+
+### The assistant label must not move when the live dot appears
+
+The complaint was that the label lost its gutter while an answer streamed. Measured in the shipped
+build, mid-stream and settled, including an answer that opens with a heading:
+
+| sample | gutter (text edge − label edge), generating | gutter, settled |
+|---|---|---|
+| plain answer | **28.0px** | **28.0px** |
+| answer starting with `## heading` | **28.0px** | **28.0px** |
+
+The fix was structural, not cosmetic: an *inline* live dot made the label's line box wider than the
+58px gutter it is laid out in, and `text-align: right` has no effect on an overflowing line, so the
+label ended up flush against the text. The dot is now absolutely positioned off the label
+(`.blk.live > .blk-head::before { position: absolute; left: -11px }`), which is why generating and
+settled are the same number. Reasoning blocks keep the dot inline because their header is a static
+full-width line, not a gutter.
+
+Two related measurements from the same run, both on synthetic blocks so they do not depend on what
+the model decides to emit:
+
+```
+thinking aligns under its label ok          (label, rule and body edge share an x; body padded in)
+label gap holds through the turn (8px, drift 0px)
+```
+
+The second one is the "label crowds the text while it streams" complaint, measured at three points
+during a streamed answer and again at turn end: the gap is 8px and does not move. Before the fix the
+live dot's inline box made that gap 0px.
+
+Vertical offset of a heading-first answer is ~12px by design (the label hangs from the block top,
+the heading has a top margin), so the check asserts the gutter and live↔settled *stability* rather
+than an absolute heading offset.
+
+### Markdown that only arrives at `turnEnd` is markdown that arrives late
+
+| construct | appears during streaming | how |
+|---|---|---|
+| `## heading`, `---` | at its own newline | block terminators no longer require a blank line |
+| table | before the first non-table row | table blocks end at the row that stops looking like a table |
+| `**bold**`, `` `code` ``, `~~strike~~`, `*em*` | as soon as the construct closes | `InlineStream` in the live word-span path |
+
+Inline markup is decided per word-span append, and spans already painted are never rewritten: the
+check measures that the previously painted word did not move (**0.0px**) and that marker characters
+are never shown. False positives are covered in `md_test.ts`: `snake_case`, `2**3`, spaced
+asterisks, and markers inside a code span.
+
+### An approval card for a long command is a wall unless it is scrollable
+
+A 5.9k-character `exec` payload with a 4-line here-document:
+
+| | before | after |
+|---|---|---|
+| body height | grew past the window; Deny unreachable | **366px shown of 5901px**, scrollable |
+| Deny button | below the fold | **109px above the fold** |
+| prompt text | whole command quoted | first 4 lines / 320 chars + `[+399 more lines, 5901 characters total]` |
+
+The engine also refuses to run an oversized inline write through `exec` (limit **1200 chars**) and
+points the model at `write_file`. The guard is deliberately narrow: only redirections in the command
+*head* count as file writes, so scripts piped through a here-document, `>/dev/null` and `2>&1` still
+run (each is a test).
+
+### Sharing must not become someone else's output
+
+`share_markdown` returns `{name, markdown}` and writes nothing. Desktop opens a save dialog; browser
+and gateway download. The self-test asserts the absence of a chip and that each turn owns its files:
+
+```
+turn files ok (each turn owns its own files, and a share leaves no chip)
+```
+
+The bug behind the "deleted file attached to a later turn" report was the live transcript's
+`turnFiles` surviving across turns, so a later `addFiles` re-parented stale chips.
+
+### Web search: three providers, and the managed one measured
+
+`scripts/search-smoke.mjs --backend auto --probe "rust tokio worker threads how many"` against the
+running host:
+
+| step | result |
+|---|---|
+| switch duckduckgo → auto | accepted, `describe()` says "SearXNG managed by Cwoffee on port 8899" |
+| first probe (container cold start included) | **3243ms**, 5 real hits |
+| container footprint | **118.4MB** of a 268.4MB cgroup limit, CPU 8.4% idle |
+| idle reaper | `stopped cwoffee-searxng after 129s without a search; it starts again with the next one` |
+| disable | backend returned to `duckduckgo`; nothing was uninstalled, no container was removed |
+
+Enabling the managed provider writes `settings.yml` and `limiter.toml` under
+`~/.config/cwoffee/searxng/` (readable, not a cache dir) and pins port **8899** so an instance from
+elsewhere keeps 8888. If the container cannot start, the tool result begins with a note naming the
+fallback: the model cannot report "I searched the web" about a provider nobody chose.
+
+Engine tests for the ask protocol: **21 passed, 0 failures** in 0.31s under `scripts/cargo-guard.sh`
+(peak **1.03GB** with a 1.4GB ceiling). The full engine suite was deliberately **not** run on this
+box; see Trap 82 for why.
+
+### Multi-question `ask_user`, measured in the shipped UI
+
+```
+question set ok (one card, navigation kept answers, one submit, settled read-only)
+```
+
+What that line asserts: one `.ask-submit` for N questions, `Question 1 of 2` in the nav, Back
+restoring the first question **with its selection intact**, `Send 1 of 2 answers` while a question
+is unanswered plus a hint that it goes as no answer, exactly one `respond_question` per question id,
+then no option row, input, Back/Next or Send left in the settled card, a head line of
+`answered 2 of 2`, and a Q&A summary that is hidden until the head is expanded. Declining sends an
+empty answer for each and reads `declined`.
+
+Engine side: a set is one budget (`timeout × (1 + 0.5·(n−1))`), partial answers are kept and
+labelled, and every question that went unanswered gets its own `questionExpired`.
+
+### Frame clock: the baseline is now part of the measurement
+
+| sample (shipped build, this box) | idle baseline | streaming median | streaming p95 | worst | page long tasks |
+|---|---|---|---|---|---|
+| endpoint quiet | 17.0ms | **19.0ms** | 56.0ms | 74ms | **0 tasks, 0ms** |
+| model prefilling for someone else on 9 cores | 17.0ms | **41–44ms** | ~114ms | ~144ms | **0 tasks, 0ms** |
+
+The check used to fail the app for that window. It now attributes: the page's own long tasks are
+counted, and when they are zero the numbers are logged and the verdict is skipped with a named note,
+because a 50 GB model holding the CPU decides the web process's frame rate. Note what the two rows
+have in common: the *idle* clock is 17.0ms in both, so the difference is not the page's code and not
+the machine's capability - it is whether the model is mid-prefill. Quiet-box numbers (median 19ms,
+worst 74ms) are what the absolute thresholds were calibrated on.
+
+### Premise failure is now a first-class result
+
+Two cascades cost more time than the bugs they reported, so both are now measured where they happen:
+
+| cascade | root cause | what the harness says now |
+|---|---|---|
+| 7 failures about CSS geometry | view was a draft; `.empty-mode .scroller { display: none }` → every rect 0 | `skipped … ; .transcript measures 0x0 (empty screen shown=true, turns=0, viewport 1180x777)` and a run-level fail at ≥4 skips |
+| the same failures after the view was opened | the *recovery itself* repainted the transcript, detaching nodes the check had already captured (`chain=div.blk.blk-reasoning < div.turn`, no parent) | premise checked **before** the check builds its elements; when it still drifts: `the view moved under this check mid-measurement: …` |
+| 3 failures about turns not finishing | endpoint prefill **17 tok/s** (ttft 127s) | `skipped …; the endpoint prefills at 17.0 tok/s …` and a run-level fail at ≥3 skips |
+
+The recovery is attempted before the skip: the harness opens a session with `message_count > 0`
+(not merely the first row - an empty session keeps the empty screen up) and waits for the transcript
+to measure ≥50px. And the premise is checked *before* a check paints what it intends to measure:
+three runs of "expanded thinking block has no width: 0" came from the recovery itself wiping the
+transcript after the nodes had been captured, which a `selftest diag` line proved by printing the
+ancestor chain and whether the node was under `.transcript` at all.

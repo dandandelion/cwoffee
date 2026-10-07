@@ -17,6 +17,7 @@ pub mod sse;
 pub mod legacy;
 pub mod host;
 pub mod share;
+pub mod settings;
 pub mod store;
 pub mod telemetry;
 pub mod stream;

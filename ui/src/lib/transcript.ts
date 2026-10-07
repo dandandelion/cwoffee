@@ -48,7 +48,7 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS } from './markdown'
+import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, InlineStream } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -237,6 +237,13 @@ export class Transcript {
    * a line's worth of blank space and nudged the whole transcript.
    */
   private liveTail: HTMLElement | null = null
+  /**
+   * Inline emphasis for the paragraph currently being written: the stream that
+   * decides where a `<strong>` starts, and the element words are currently being
+   * appended into (the paragraph itself when nothing is open).
+   */
+  private inline = new InlineStream()
+  private inlineHost: HTMLElement | null = null
   /** Source offset where the block currently being written begins. */
   private blockStart = 0
   /** Following the stream: pin to the bottom unless the reader scrolled away. */
@@ -262,7 +269,15 @@ export class Transcript {
    * workspace under the same containment rules as every other generated file - so
    * the transcript asks rather than doing it, and gets an OutputFile back to show.
    */
-  onExport: ((session: number) => Promise<OutputFile>) | null = null
+  /**
+   * "Share as Markdown": build the document and let the *person* say where it
+   * goes. Resolves to one sentence for the toast ("saved to …", "downloaded …").
+   *
+   * It used to return an `OutputFile` that the transcript turned into a chip.
+   * That put a share in the same row as the model's own files, and the next turn
+   * then treated the export as something it had produced.
+   */
+  onShare: ((session: number) => Promise<string>) | null = null
   /** Feedback for actions the user can otherwise not tell worked (copy, share). */
   onToast: ((msg: string, bad?: boolean) => void) | null = null
   /** Conversation the transcript is showing; export is addressed to it. */
@@ -348,6 +363,7 @@ export class Transcript {
     this.turnAnswer = []
     this.livePainted = 0
     this.liveTail = null
+    this.inlineHost = null
     this.blockStart = 0
     this.wordRate = 0
     this.lastPaintAt = 0
@@ -382,6 +398,15 @@ export class Transcript {
     d.className = cls
     if (text !== undefined) d.textContent = text
     return d
+  }
+
+  /** A real button, because a clickable div is a guess at what the user meant. */
+  private btn(cls: string, text: string): HTMLButtonElement {
+    const b = document.createElement('button')
+    b.type = 'button'
+    b.className = cls
+    b.textContent = text
+    return b
   }
 
   private ensureTurn() {
@@ -508,6 +533,9 @@ export class Transcript {
     t.className = 'live-para'
     this.liveEl!.append(t)
     this.liveTail = t
+    // A new paragraph is a new inline scope: no open construct carries over.
+    this.inline.reset()
+    this.inlineHost = t
     return t
   }
 
@@ -574,6 +602,8 @@ export class Transcript {
   private closeBlock(blockSrc: string, final = false) {
     const el = this.liveTail
     this.liveTail = null
+    this.inlineHost = null
+    this.inline.reset()
     if (!el) return
     if (!blockSrc.trim()) {
       el.remove()
@@ -622,7 +652,31 @@ export class Transcript {
     if (host.classList.contains('live-para')) {
       if (joinNewlines) host.classList.remove('fenced')
       else host.classList.add('fenced')
+      // Inline emphasis in the paragraph being written: open a <strong>/<em>/
+      // <code> when the opener is recognised and append the coming words inside
+      // it, so `**the copy**` becomes bold the moment it closes instead of at the
+      // blank line. Nothing already painted changes: the marked words are born
+      // inside the element, the marker characters are never painted, and the text
+      // after the construct is appended after it. Reasoning and user bodies are
+      // plain text and are left alone.
+      for (const tok of this.inline.tokens(delta)) {
+        if (tok.kind === 'text') this.appendWords(this.inlineHost ?? host, tok.text, now, joinNewlines)
+        else if (tok.kind === 'open') {
+          const el = document.createElement(
+            tok.mark === '`' ? 'code' : tok.mark === '~~' ? 's' : tok.mark.length === 2 ? 'strong' : 'em',
+          )
+          ;(this.inlineHost ?? host).append(el)
+          this.inlineHost = el
+        } else {
+          this.inlineHost = this.inlineHost?.parentElement ?? host
+        }
+      }
+      return
     }
+    this.appendWords(host, delta, now, joinNewlines)
+  }
+
+  private appendWords(host: HTMLElement, delta: string, now: number, joinNewlines = false) {
     const words = revealWords(delta).map((w) => (joinNewlines ? w.replace(/\n/g, ' ') : w))
     if (!revealOn() || !words.length) {
       host.appendChild(document.createTextNode(words.join('')))
@@ -787,6 +841,8 @@ export class Transcript {
     this.live = new LiveMarkdown()
     this.livePainted = 0
     this.liveTail = null
+    this.inlineHost = null
+    this.inline.reset()
     this.blockStart = 0
     this.lastLiveRender = 0
     this.lastPaintAt = 0
@@ -846,6 +902,11 @@ export class Transcript {
         this.turn = null
         this.textBuf = null
         this.textKind = null
+        // A turn's files are that turn's. Left over, the previous turn's chips get
+        // re-parented into the new one by the next `addFiles` - which is how a
+        // "clean up those downloads" turn ended up wearing the files it deleted.
+        this.turnFiles = []
+        this.fileStrip = null
         this.collected = { answer: '', reasoning: '' }
         this.answerEls = []
         const head = this.el('turn-head', `turn ${ev.d.turn_id} · ${ev.d.model}`)
@@ -941,6 +1002,9 @@ export class Transcript {
       if (this.live.text) this.renderLive(true)
       this.liveEl = null
     }
+    this.liveTail = null
+    this.inlineHost = null
+    this.inline.reset()
     this.live = new LiveMarkdown()
   }
 
@@ -1185,6 +1249,281 @@ export class Transcript {
     this.scrollIfNeeded()
   }
 
+  /**
+   * Several questions asked in one `ask_user` call, as one card.
+   *
+   * The engine sends them together and waits for the set as a unit, so the card
+   * collects an answer per question and sends them in one submit. Two properties the
+   * single-question card does not need:
+   *
+   *   * navigating between questions keeps each pane's selection and typed text -
+   *     re-rendering from scratch loses the words someone typed two questions ago;
+   *   * after submit the card collapses to one line and expands to a read-only list
+   *     of question/answer pairs. It never becomes interactive again: the tool call
+   *     that asked has already returned, and a live option row on a settled card is
+   *     a button that does nothing, or worse, answers a call that is gone.
+   */
+  showQuestionSet(
+    qs: QuestionRequested[],
+    onAnswer: (id: number, r: { text: string; options: number[] }) => void,
+  ) {
+    // The helpers below are plain functions, and `this` inside a plain function is
+    // whatever called it. Bind the Transcript once, explicitly.
+    const self = this
+    this.flushNow()
+    this.ensureTurn()
+    const ordered = qs
+      .slice()
+      .sort((a, b) => (a.set?.index ?? 0) - (b.set?.index ?? 0))
+    const n = ordered.length
+    const card = this.el('blk blk-ask is-set')
+    const head = this.el('blk-head')
+    const label = this.el('blk-label', n > 1 ? `asking ${n}` : 'asking')
+    head.append(label)
+    const body = this.el('ask-body')
+    card.append(head, body)
+
+    const nav = this.el('ask-nav')
+    const count = this.el('ask-count')
+    const dots = this.el('ask-dots')
+    const back = this.btn('ask-back', 'Back')
+    const next = this.btn('ask-next', 'Next')
+    nav.append(count, dots, back, next)
+    body.append(nav)
+
+    // One pane per question, built once and kept. Only one is in the document at a
+    // time; the others wait detached, with their state intact.
+    type Pane = {
+      q: QuestionRequested
+      root: HTMLElement
+      sel: Set<number>
+      input: HTMLInputElement | null
+      rows: HTMLElement[]
+      answered: () => boolean
+      summary: () => string
+    }
+    const panes: Pane[] = ordered.map((q) => {
+      const root = this.el('ask-pane')
+      root.append(this.el('ask-q', q.question))
+      const sel = new Set<number>()
+      const opts = this.el('ask-opts')
+      opts.setAttribute('role', q.multi ? 'group' : 'radiogroup')
+      const rows: HTMLElement[] = []
+      q.options.forEach((o, i) => {
+        const row = this.el('ask-opt')
+        row.setAttribute('role', q.multi ? 'checkbox' : 'radio')
+        row.setAttribute('aria-checked', 'false')
+        row.tabIndex = 0
+        if (q.multi) row.classList.add('is-multi')
+        row.append(this.el('ask-mark', q.multi ? '\u2610' : '\u25CB'))
+        const main = this.el('ask-opt-main')
+        const title = this.el('ask-opt-title')
+        title.append(this.el('ask-lbl', o.label))
+        if (q.recommended === i) {
+          title.append(document.createTextNode(' '))
+          title.append(this.el('ask-badge', 'recommended'))
+          row.classList.add('is-rec')
+        }
+        main.append(title)
+        if (o.detail) main.append(this.el('ask-detail', o.detail))
+        row.append(main)
+        rows.push(row)
+        opts.append(row)
+      })
+      root.append(opts)
+      let input: HTMLInputElement | null = null
+      if (q.allow_custom) {
+        const row = this.el('ask-custom')
+        input = document.createElement('input')
+        input.className = 'ask-input'
+        input.placeholder = q.multi
+          ? 'or type your own answer (it is sent with any boxes you tick)'
+          : 'or type your own answer instead'
+        row.append(input)
+        root.append(row)
+      }
+      const paint = () => {
+        rows.forEach((row, i) => {
+          const on = sel.has(i)
+          row.classList.toggle('is-sel', on)
+          row.setAttribute('aria-checked', on ? 'true' : 'false')
+          const mark = row.querySelector('.ask-mark')
+          if (mark) mark.textContent = q.multi ? (sel.has(i) ? '\u2611' : '\u2610') : sel.has(i) ? '\u25CF' : '\u25CB'
+        })
+        paintNav()
+      }
+      rows.forEach((row, i) => {
+        const toggle = () => {
+          if (card.classList.contains('answered')) return
+          if (q.multi) {
+            if (sel.has(i)) sel.delete(i)
+            else sel.add(i)
+          } else {
+            sel.clear()
+            sel.add(i)
+          }
+          paint()
+        }
+        row.addEventListener('click', toggle)
+        row.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            toggle()
+          }
+        })
+      })
+      if (input) {
+        input.addEventListener('input', paint)
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault()
+            advance()
+          }
+        })
+      }
+      const picked = () => [...sel].sort((a, b) => a - b)
+      const typed = () => (input?.value ?? '').trim()
+      return {
+        q,
+        root,
+        sel,
+        input,
+        rows,
+        answered: () => sel.size > 0 || typed().length > 0,
+        summary: () => {
+          const labels = picked().map((i) => q.options[i]?.label ?? `#${i + 1}`)
+          const t = typed()
+          if (!labels.length && !t) return 'no answer'
+          if (!labels.length) return `typed: ${t}`
+          return t && t !== labels.join(', ') ? `${labels.join(' + ')} \u00b7 ${t}` : labels.join(' + ')
+        },
+      }
+    })
+
+    const stage = this.el('ask-stage')
+    body.append(stage)
+    const actions = this.el('ask-actions')
+    const send = this.btn('ask-submit', 'Send answers')
+    send.disabled = true
+    const decline = this.btn('ask-decline', 'Decline')
+    actions.append(send, decline)
+    body.append(actions)
+    const hint = this.el('ask-hint')
+    body.append(hint)
+
+    let cur = 0
+    const answeredCount = () => panes.filter((p) => p.answered()).length
+
+    function paintNav() {
+      count.textContent = n > 1 ? `Question ${cur + 1} of ${n}` : 'The model is asking'
+      dots.replaceChildren(
+        ...panes.map((p, i) => {
+          const d = document.createElement('button')
+          d.type = 'button'
+          d.className = `ask-dot${i === cur ? ' is-cur' : ''}${p.answered() ? ' is-done' : ''}`
+          d.setAttribute('aria-label', `Question ${i + 1} of ${n}${p.answered() ? ' (answered)' : ''}`)
+          d.addEventListener('click', () => show(i))
+          return d
+        }),
+      )
+      const done = answeredCount()
+      send.disabled = done === 0
+      send.textContent = done === n ? 'Send answers' : `Send ${done} of ${n} answer${n === 1 ? '' : 's'}`
+      back.disabled = cur === 0
+      next.disabled = cur === n - 1
+      hint.textContent =
+        done > 0 && done < n
+          ? `${n - done} question${n - done === 1 ? '' : 's'} would be sent as no answer`
+          : ''
+    }
+
+    function show(i: number) {
+      if (card.classList.contains('answered')) return
+      cur = Math.max(0, Math.min(n - 1, i))
+      stage.replaceChildren(panes[cur].root)
+      paintNav()
+    }
+
+    function advance() {
+      const gap = panes.findIndex((p, i) => i !== cur && !p.answered())
+      if (gap >= 0) show(gap)
+      else if (answeredCount() === n) submit()
+      else show(Math.min(n - 1, cur + 1))
+    }
+
+    function submit() {
+      if (card.classList.contains('answered')) return
+      const answers = panes.map((p) => {
+        const picked = [...p.sel].sort((a, b) => a - b)
+        const typed = (p.input?.value ?? '').trim()
+        const labels = picked.map((i) => p.q.options[i].label)
+        // Picks go in `options`, the person's own words in `text`: the engine reports
+        // the second as "User also said", which is what a constraint added beside a
+        // choice is.
+        const text = picked.length
+          ? typed && typed !== labels.join(', ')
+            ? typed
+            : labels.join(', ')
+          : typed
+        return { id: p.q.id, text, options: picked }
+      })
+      card.classList.add('answered')
+      // The interactive part goes away entirely. Disabling it leaves a card that
+      // looks answerable forever, which is the complaint about the old one.
+      nav.remove()
+      stage.remove()
+      actions.remove()
+      hint.remove()
+      const got = answers.filter((a) => a.text).length
+      body.append(
+        self.el('ask-answered', got ? `answered ${got} of ${n}` : 'declined - the model was told you answered nothing'),
+      )
+      const qa = self.el('ask-qa')
+      panes.forEach((p, i) => {
+        const row = self.el('ask-qa-item')
+        row.append(self.el('ask-qa-q', n > 1 ? `${i + 1}. ${p.q.question}` : p.q.question))
+        row.append(self.el('ask-qa-a', p.summary()))
+        qa.append(row)
+      })
+      body.append(qa)
+      head.classList.add('is-toggle')
+      head.setAttribute('role', 'button')
+      head.setAttribute('aria-expanded', 'false')
+      head.tabIndex = 0
+      head.addEventListener('click', () => {
+        const open = card.classList.toggle('is-open')
+        head.setAttribute('aria-expanded', open ? 'true' : 'false')
+      })
+      head.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          head.click()
+        }
+      })
+      label.textContent = got ? `answered ${got} of ${n}` : 'declined'
+      answers.forEach((a) => onAnswer(a.id, { text: a.text, options: a.options }))
+      self.scrollIfNeeded()
+    }
+
+    back.addEventListener('click', () => show(cur - 1))
+    next.addEventListener('click', () => show(cur + 1))
+    send.addEventListener('click', submit)
+    // Declining answers every question with nothing, which is what the engine reports
+    // as "answered none" rather than as a choice it may invent.
+    decline.addEventListener('click', () => {
+      panes.forEach((p) => {
+        p.sel.clear()
+        if (p.input) p.input.value = ''
+      })
+      submit()
+    })
+
+    this.turn!.appendChild(card)
+    for (const p of panes) this.questionCards.set(p.q.id, card)
+    show(0)
+    this.scrollIfNeeded()
+  }
+
   /** Close a question card answered elsewhere - another tab, another device. */
   settleQuestion(id: number) {
     const card = this.questionCards.get(id)
@@ -1284,24 +1623,26 @@ export class Transcript {
       })
     }
 
-    const share = btn('share', 'Share as Markdown', 'Write this conversation to exports/ in its workspace', iconDoc())
+    const share = btn(
+      'share',
+      'Share as Markdown',
+      'Save this conversation as a Markdown file, where you choose',
+      iconDoc(),
+    )
     share.onclick = () => {
-      if (!this.onExport) {
-        if (this.onToast) this.onToast('export is not available here', true)
+      if (!this.onShare) {
+        if (this.onToast) this.onToast('sharing is not available here', true)
         return
       }
       share.disabled = true
-      void this.onExport(session)
-        .then((f) => {
-          // The chip is the receipt: it is the same affordance every other
-          // generated file gets, and it proves the write happened where it says.
-          this.addFiles([f])
-          this.appendTurnActions()
-          this.follow()
-          if (this.onToast) this.onToast(`saved to ${f.path}`)
+      void this.onShare(session)
+        // A toast is the receipt, not a chip: the conversation does not gain a
+        // file because someone exported it.
+        .then((msg) => {
+          if (this.onToast) this.onToast(msg)
         })
         .catch((e) => {
-          if (this.onToast) this.onToast(`export failed: ${e}`, true)
+          if (this.onToast) this.onToast(`share failed: ${e}`, true)
         })
         .finally(() => {
           share.disabled = false

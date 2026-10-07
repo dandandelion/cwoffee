@@ -22,6 +22,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use cwoffee_engine::approval::{ApprovalAnswer, ApprovalMode, ApprovalRequest};
+use std::collections::VecDeque;
+
 use cwoffee_engine::tools::ask::{Answer, Question};
 use cwoffee_engine::event::{EngineEvent, ExecStream, FinishReason};
 use cwoffee_engine::host::{HostCmd, HostConfig, SessionHost};
@@ -74,6 +76,12 @@ struct App {
     /// A question from `ask_user`. It owns the keyboard the same way an
     /// approval does: the turn is parked until someone answers.
     pending_q: Option<(Question, oneshot::Sender<Answer>)>,
+    /// A model that asks several questions in one call sends them together, and the
+    /// terminal can only put one on screen at a time. The rest wait here: overwriting
+    /// `pending_q` would drop the earlier reply sender, and the engine would read that
+    /// as the question being cancelled - the whole set would collapse because the
+    /// terminal had nowhere to put the second question.
+    q_tail: VecDeque<(Question, oneshot::Sender<Answer>)>,
     /// Indices picked in the question that is up. Kept apart from the question
     /// itself so a digit toggles a choice without touching the engine's copy.
     q_sel: Vec<usize>,
@@ -97,6 +105,7 @@ impl App {
             session_id: 0,
             pending: None,
             pending_q: None,
+            q_tail: VecDeque::new(),
             q_sel: Vec::new(),
             quit: false,
             model,
@@ -202,6 +211,16 @@ impl App {
                     self.pending_q = None;
                     self.items
                         .push(Item::Note("the question closed without an answer".into()));
+                    promote(self);
+                } else if let Some(at) = self
+                    .q_tail
+                    .iter()
+                    .position(|(q, _)| q.id == id)
+                {
+                    // The engine stopped waiting for a question that has not been
+                    // shown yet. Dropping it here is what keeps the terminal from
+                    // prompting about a call that has already returned.
+                    self.q_tail.remove(at);
                 }
             }
             EngineEvent::Usage(u) => {
@@ -454,15 +473,12 @@ async fn run(
                 app.busy = true;
             }
             Some((q, reply)) = q_rx.recv() => {
-                app.q_sel = match q.recommended {
-                    // Pre-selection is a courtesy, not a decision: Enter still has
-                    // to be pressed, and a multi-select question that arrives with
-                    // the recommendation already ticked is one keystroke from an
-                    // answer instead of three.
-                    Some(r) if q.multi => vec![r],
-                    _ => Vec::new(),
-                };
-                app.pending_q = Some((q, reply));
+                if app.pending_q.is_some() {
+                    app.q_tail.push_back((q, reply));
+                } else {
+                    preselect(&mut app.q_sel, &q);
+                    app.pending_q = Some((q, reply));
+                }
                 app.busy = true;
             }
             else => break,
@@ -504,6 +520,7 @@ fn handle_key(k: KeyEvent, app: &mut App, host: &SessionHost) {
                 text: labels.join(", "),
                 options: sel,
             });
+            promote(app);
         };
         match k.code {
             KeyCode::Char(c @ '1'..='9') => {
@@ -543,6 +560,9 @@ fn handle_key(k: KeyEvent, app: &mut App, host: &SessionHost) {
                 let (_, reply) = app.pending_q.take().expect("checked above");
                 app.q_sel.clear();
                 let _ = reply.send(Answer::default());
+                // Declining one question of a set does not decline the others: they
+                // were asked separately and each gets its own answer or its own pass.
+                promote(app);
             }
             _ => {}
         }
@@ -699,6 +719,30 @@ fn render(f: &mut Frame, app: &App) {
     draw_telemetry(f, app, chunks[5]);
 }
 
+/// Move the next queued question onto the screen, if one is waiting.
+fn promote(app: &mut App) {
+    match app.q_tail.pop_front() {
+        Some((q, reply)) => {
+            preselect(&mut app.q_sel, &q);
+            app.pending_q = Some((q, reply));
+        }
+        // Nothing queued. `busy` is left alone on purpose: the turn is still running
+        // and its own events own that flag. Clearing it here would report an idle app
+        // while the model is still working.
+        None => {}
+    }
+}
+
+/// Pre-selection is a courtesy, not a decision: Enter still has to be pressed, and
+/// a multi-select question that arrives with the recommendation already ticked is
+/// one keystroke from an answer instead of three.
+fn preselect(sel: &mut Vec<usize>, q: &Question) {
+    *sel = match q.recommended {
+        Some(r) if q.multi => vec![r],
+        _ => Vec::new(),
+    };
+}
+
 /// The `ask_user` prompt. Options are numbered so the choice is one keystroke,
 /// and the recommended one is marked - the model's opinion is shown, not
 /// imposed, and Enter takes it.
@@ -760,7 +804,22 @@ fn draw_question(f: &mut Frame, app: &App, area: Rect) {
     )));
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title(" the model is asking ")),
+                        .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    // The count is part of the prompt: a set of three questions that
+                    // looks like one question gets one answer, and the other two time
+                    // out in a turn the user is watching stall.
+                    // The count is part of the prompt: a set of three questions that
+                    // looks like one question gets one answer, and the other two time
+                    // out in a turn the user is watching stall. Only the number waiting
+                    // is shown, because the terminal is not the thing that numbered them.
+                    .title(if app.q_tail.is_empty() {
+                        " the model is asking ".to_string()
+                    } else {
+                        format!(" the model is asking ({} more waiting) ", app.q_tail.len())
+                    }),
+            ),
         area,
     );
 }

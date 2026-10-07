@@ -200,7 +200,18 @@ impl ApprovalGate {
             id,
             tool: tool.to_string(),
             risk: risk.level,
-            summary: summarize_with(tool, args, &risk.escapes),
+            summary: {
+                let s = summarize_with(tool, args, &risk.escapes);
+                // Belt and braces: any tool whose summary grows past a screen is
+                // summarised wrong, and the card must fit on a laptop window.
+                if s.chars().count() > 900 {
+                    let mut t: String = s.chars().take(880).collect();
+                    t.push_str(" … [truncated]");
+                    t
+                } else {
+                    s
+                }
+            },
             args: args.clone(),
             escapes: risk.escapes.clone(),
         };
@@ -301,10 +312,10 @@ pub fn summarize_with(tool: &str, args: &serde_json::Value, escapes: &[String]) 
 /// One line for the approval prompt.
 pub fn summarize(tool: &str, args: &serde_json::Value) -> String {
     match tool {
-        "exec" => format!(
-            "run: {}",
-            crate::tools::repair::field_as_string(args, "cmd").unwrap_or_else(|| "???".into())
-        ),
+        "exec" => {
+            let raw = crate::tools::repair::field_as_string(args, "cmd").unwrap_or_else(|| "???".into());
+            format!("run: {}", cmd_head(&raw))
+        }
         "write_file" => format!(
             "write: {}",
             crate::tools::repair::field_as_string(args, "path").unwrap_or_else(|| "???".into())
@@ -340,6 +351,39 @@ pub fn summarize(tool: &str, args: &serde_json::Value) -> String {
             format!("{other} {s}")
         }
     }
+}
+
+/// An approval prompt is a decision, not a document.
+///
+/// `exec` bounces calls that carry a whole file inline, but the summary is built
+/// before that decision exists, and a card that quotes four hundred lines of
+/// prose cannot be read, scrolled or refused on the merits. Show the head, say
+/// how much is hanging off it, and name the write the payload amounts to.
+fn cmd_head(cmd: &str) -> String {
+    const HEAD_LINES: usize = 4;
+    const HEAD_CHARS: usize = 320;
+    let lines: Vec<&str> = cmd.split('\n').collect();
+    let flat: String = cmd.split('\n').collect::<Vec<_>>().join(" ⏎ ");
+    let mut out = String::new();
+    if lines.len() > HEAD_LINES || flat.chars().count() > HEAD_CHARS {
+        for (i, l) in lines.iter().take(HEAD_LINES).enumerate() {
+            if i > 0 {
+                out.push_str(" ⏎ ");
+            }
+            out.push_str(l.trim());
+        }
+        out.push_str(&format!(
+            "  [+{} more lines, {} characters total]",
+            lines.len().saturating_sub(HEAD_LINES),
+            cmd.chars().count()
+        ));
+    } else {
+        out.push_str(flat.trim());
+    }
+    if let Some((target, bytes)) = crate::tools::exec::oversized_inline_write(cmd) {
+        out.push_str(&format!("  \u{2014} writes {bytes} characters into {target}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -539,6 +583,37 @@ mod tests {
         let out = g.check("exec", &CallRisk::at(Risk::Sensitive), &json!({"cmd": "ls"})).await;
         h.await.ok();
         assert!(matches!(out, GateOutcome::Deny { .. }), "got {out:?}");
+    }
+
+    #[test]
+    fn an_exec_approval_shows_the_head_of_a_here_document_not_the_whole_thing() {
+        // The report: a long text file written through the shell produced an
+        // approval card taller than the window, with the buttons below the fold
+        // and nothing to scroll. The engine side of the fix is to quote the head
+        // and say what the payload is.
+        let body = (0..400)
+            .map(|i| format!("line {i} of a great deal of prose about coffee"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cmd = format!("cat > notes.txt <<'EOF'\n{body}\nEOF\n");
+        let sum = summarize_with("exec", &json!({ "cmd": cmd }), &[]);
+        assert!(sum.contains("cat > notes.txt <<'EOF'"), "{sum}");
+        assert!(sum.contains("+399 more lines"), "{sum}");
+        assert!(sum.contains("characters into notes.txt"), "{sum}");
+        assert!(sum.chars().count() < 500, "summary was {} chars: {}", sum.chars().count(), sum);
+        assert!(!sum.contains("line 300 of a great deal"), "the body leaked into the prompt");
+    }
+
+    #[test]
+    fn a_short_exec_command_is_still_quoted_verbatim() {
+        let sum = summarize_with("exec", &json!({ "cmd": "git status --short" }), &[]);
+        assert_eq!(sum, "run: git status --short");
+    }
+
+    #[test]
+    fn a_multiline_but_short_command_keeps_its_shape_on_one_line() {
+        let sum = summarize_with("exec", &json!({ "cmd": "cd out\ngrep -c tea *.md" }), &[]);
+        assert!(sum.contains("cd out ⏎ grep -c tea *.md"), "{sum}");
     }
 
     #[test]

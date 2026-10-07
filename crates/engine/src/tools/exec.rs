@@ -45,7 +45,10 @@ impl Tool for ExecTool {
 
     fn description(&self) -> &str {
         "Run a shell command in a sandbox (no network, host filesystem read-only, \
-         only the workspace is writable). Returns stdout and stderr combined."
+         only the workspace is writable). Returns stdout and stderr combined. \
+         Do not author file contents here: no here-documents and no long echo/printf \
+         redirections. Write files with write_file, which takes the content as an \
+         argument and shows the approver a diff instead of a wall of text."
     }
 
     fn schema(&self) -> Value {
@@ -85,6 +88,20 @@ impl Tool for ExecTool {
         let Some(cmd) = super::repair::field_as_string(&args, "cmd") else {
             return ToolResult::err("exec: missing required string field \"cmd\"");
         };
+
+        // A here-document that writes a two-thousand-character text file is the
+        // one case where the sandbox is not the problem: the *approval prompt*
+        // has to show the whole command to mean anything, and a card of prose the
+        // approver cannot scroll is a card they cannot read. `write_file` takes
+        // the same bytes in a body that scrolls and diffs, so refuse by name.
+        if let Some((target, bytes)) = oversized_inline_write(&cmd) {
+            return ToolResult::err(format!(
+                "exec: this command carries {bytes} characters of content to write into {target:?}. \
+                 Use write_file with path {target} and that content as its argument instead: an \
+                 approval prompt has to show the entire command, and a wall of text nobody can \
+                 scroll is not an approval. (Under {MAX_INLINE_WRITE} characters, carry on.)"
+            ));
+        }
 
         // Resolve cwd inside the workspace and refuse escapes. The sandbox bind
         // already confines writes, but a clear error beats a confusing one.
@@ -347,6 +364,139 @@ where
     }))
 }
 
+/// How much file content a shell command may carry inline before the call is
+/// bounced back with the tool to use named instead.
+///
+/// Not a security limit: `write_file` accepts far more. It is a legibility limit
+/// on the approval card, which quotes the command verbatim.
+pub const MAX_INLINE_WRITE: usize = 1200;
+
+/// Find a here-document (or a long redirect) whose payload is being written to a
+/// file, and report `(path, payload_bytes)`.
+///
+/// Deliberately narrow, because a false positive stops a legitimate command:
+/// only a redirection that appears in the command *head* - before any
+/// here-document body - counts as the target. So `python3 - <<'PY'` with a
+/// script that happens to contain `>` is not mistaken for a file write, and a
+/// body full of `>` characters does not create a second phantom write.
+pub fn oversized_inline_write(cmd: &str) -> Option<(String, usize)> {
+    let (head, payload) = match heredoc_span(cmd) {
+        Some((head, body)) => (head, body.len()),
+        None => (cmd, cmd.len()),
+    };
+    if payload < MAX_INLINE_WRITE {
+        return None;
+    }
+    let target = redirect_target(head)?;
+    if target == "/dev/null" {
+        return None;
+    }
+    Some((target, payload))
+}
+
+/// Split at the first here-document: everything before its body, and the body.
+fn heredoc_span(cmd: &str) -> Option<(&str, &str)> {
+    let b = cmd.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] == b'<' && b[i + 1] == b'<' && !(i + 2 < b.len() && b[i + 2] == b'<') {
+            let mut j = i + 2;
+            if j < b.len() && b[j] == b'-' {
+                j += 1;
+            }
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            let quote = if j < b.len() && (b[j] == b'\'' || b[j] == b'"') {
+                Some(b[j])
+            } else {
+                None
+            };
+            if quote.is_some() {
+                j += 1;
+            }
+            let delim_start = j;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j == delim_start {
+                // `<<` inside something that is not a here-document (a bit shift
+                // in an arithmetic expansion, a stray token): keep looking.
+                i += 1;
+                continue;
+            }
+            if let Some(q) = quote {
+                // The delimiter has to be closed by the quote it opened with,
+                // otherwise this is not a here-document header.
+                if j >= b.len() || b[j] != q {
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+            }
+            let delim = &cmd[delim_start..j];
+            let body_start = match cmd[j..].find('\n') {
+                Some(k) => j + k + 1,
+                None => return None,
+            };
+            let mut body_end = cmd.len();
+            for (off, line) in cmd[body_start..].split('\n').enumerate() {
+                if line.trim() == delim {
+                    body_end = body_start + off;
+                    break;
+                }
+            }
+            // `body_end` is the start of the terminator line; the newline before
+            // it belongs to the payload, and counting it is fine either way.
+            return Some((&cmd[..i], &cmd[body_start..body_end]));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The file a redirection in `head` writes, ignoring `2>`-style fd redirects,
+/// herestrings and `>|`/`>>` details.
+fn redirect_target(head: &str) -> Option<String> {
+    let b = head.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'>' && (i + 1 >= b.len() || (b[i + 1] != b'>' && b[i + 1] != b'&')) {
+            let prev = if i > 0 { b[i - 1] } else { b' ' };
+            // `2>` or `1>&2`: a file descriptor, not a file.
+            if prev.is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t' || b[j] == b'\n') {
+                j += 1;
+            }
+            if j >= b.len() || b[j] == b'|' || b[j] == b'&' || b[j] == b'<' {
+                i += 1;
+                continue;
+            }
+            let quote = if b[j] == b'\'' || b[j] == b'"' { Some(b[j]) } else { None };
+            if let Some(q) = quote {
+                let start = j + 1;
+                let rest = &head[start..];
+                let end = rest.find(q as char)?;
+                return Some(rest[..end].to_string());
+            }
+            let start = j;
+            while j < b.len() && b[j] != b' ' && b[j] != b'\t' && b[j] != b'\n' && b[j] != b';' && b[j] != b'|' && b[j] != b'&' {
+                j += 1;
+            }
+            let tok = &head[start..j];
+            if !tok.is_empty() {
+                return Some(tok.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn which(name: &str) -> Option<String> {
     if let Ok(p) = std::env::var("PATH") {
         for dir in p.split(':') {
@@ -489,6 +639,78 @@ mod tests {
         let r = t.run(json!({"command": "echo hi"}), &ctx, &sink()).await;
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap_or("").contains("cmd"));
+    }
+
+    #[test]
+    fn a_long_here_document_write_is_bounced_toward_write_file() {
+        // The approval card quotes the command verbatim, so a here-document that
+        // carries a document makes a prompt nobody can read - and the tool that
+        // takes the same bytes as an argument already exists.
+        let body = "tea shares coffee's origin in the same highland fog\n".repeat(60);
+        let cmd = format!("cat > notes.md <<'EOF'\n{body}EOF\n");
+        let hit = oversized_inline_write(&cmd).expect("should be caught");
+        assert_eq!(hit.0, "notes.md");
+        assert!(hit.1 > MAX_INLINE_WRITE, "{}", hit.1);
+    }
+
+    #[test]
+    fn a_short_here_document_is_left_alone() {
+        let cmd = "cat > notes.md <<'EOF'\nthree lines\nonly three\nEOF\n";
+        assert_eq!(oversized_inline_write(cmd), None);
+    }
+
+    #[test]
+    fn a_script_here_document_is_not_mistaken_for_a_file_write() {
+        // A python body full of `>` must not create a phantom redirect: only the
+        // command head names a target, and `python3 -` has none.
+        let body = "if x > 0 and y > 1: print('greater')\n".repeat(80);
+        let cmd = format!("python3 - <<'PY'\n{body}PY\n");
+        assert_eq!(oversized_inline_write(&cmd), None);
+    }
+
+    #[test]
+    fn a_redirect_into_dev_null_is_not_a_file_write() {
+        let body = "noise\n".repeat(400);
+        let cmd = format!("some-noisy-thing > /dev/null\n{body}");
+        assert_eq!(oversized_inline_write(&cmd), None);
+    }
+
+    #[test]
+    fn a_long_echo_redirect_is_caught_too() {
+        let cmd = format!("echo '{}' > story.md", "a long wind-up about a photocopier ".repeat(60));
+        let hit = oversized_inline_write(&cmd).expect("should be caught");
+        assert_eq!(hit.0, "story.md");
+    }
+
+    #[test]
+    fn an_stderr_redirect_is_not_read_as_a_file_write() {
+        let cmd = format!("make all 2>&1 | tail -5; printf '%s' '{}' > /dev/null", "x".repeat(2000));
+        // /dev/null target -> not a write. The point is that a long *output*
+        // pipeline is not held to the file-authoring rule.
+        assert_eq!(oversized_inline_write(&cmd), None);
+    }
+
+    #[tokio::test]
+    async fn a_long_here_document_write_is_refused_at_run_time() {
+        let (ctx, _g) = ws();
+        let body = "line of prose about the harrowing branch library\n".repeat(60);
+        let args = json!({ "cmd": format!("cat > big.md <<'EOF'\n{body}EOF\n") });
+        let r = ExecTool::default().run(args, &ctx, &sink()).await;
+        assert!(!r.ok, "a wall-of-text write should not run");
+        let msg = format!("{} {}", r.output, r.error.unwrap_or_default());
+        assert!(msg.contains("write_file"), "{}", msg);
+        assert!(msg.contains("big.md"), "{}", msg);
+    }
+
+    #[tokio::test]
+    async fn a_small_here_document_still_runs() {
+        // The guard is about legibility of the prompt, not about sandbox policy:
+        // a two-line here-document must work exactly as before.
+        let (ctx, _g) = ws();
+        let args = json!({ "cmd": "cat > small.md <<'EOF'\nte\nEOF\ncat small.md" });
+        let r = ExecTool::default().run(args, &ctx, &sink()).await;
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("te"), "{}", r.output);
     }
 
     #[tokio::test]

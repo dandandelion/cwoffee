@@ -410,6 +410,18 @@ number keys. The turn parks while it waits; cancel does not make the question
 disappear but releases the parked tool with a "cancelled" result the model can act
 on. Over the gateway, a watch-only client sees the question and cannot answer it.
 
+When one step needs several decisions, the model asks them in **one call with
+`questions`** (2–4) instead of one call each. The card shows them one at a time —
+"question 2 of 3", Back/Next, dots you can tap to jump — and **one submit answers
+the set**. Navigating keeps what you typed: going back to check the first question
+does not lose the words you put in the second. Submit says how much is answered
+("Send 1 of 2 answers") and says what the rest will become ("1 question would be
+sent as no answer"), because a silent partial answer is how a question gets
+answered by absence. Once submitted, the card collapses to `answered 2 of 2` and
+expands to a read-only list of what was asked and what you said. It never becomes
+interactive again — the tool call that asked has already returned, and a live option
+row on a settled card is a button aimed at nothing.
+
 Three rules the question card follows, because a card that answers on contact is a
 card that answers by accident:
 
@@ -426,23 +438,28 @@ card that answers by accident:
 A question that closes with no answer - the timeout expired, or you cancelled the
 turn while it was parked - closes in every window as "no answer in time". Left
 alone it would sit there offering Send, and the answer would aim at a tool call that
-has already returned.
+has already returned. A set gets one budget rather than one per question, because a
+person answering three questions in one card takes longer than one answering one, and
+a per-question clock would punish the model for asking them together.
 
 ## What you can do with a finished turn
 
 Under a finished answer sit three controls, quiet on purpose: **Copy** puts that answer on the
 clipboard as Markdown - the text the model wrote, not the rendering of it - and **Share as
-Markdown** writes the whole conversation into `exports/` in that conversation's own workspace,
-then shows the resulting file as the same clickable chip every other generated file gets. The
-chip is the receipt: it proves where the write landed and opens it.
+Markdown** builds the whole conversation as a document and then asks **you** where it should go:
+the desktop opens the native save dialog, a browser downloads. It used to write into
+`exports/` in the conversation's workspace and show the result as a file chip. That was wrong
+twice over: a share is not model output, so it should not appear in the conversation as a chip,
+and a file dropped into the working folder turned up in later turns as something the model had
+apparently produced - including being offered for clean-up. Now nothing is written unless a
+person names the path, the receipt is a toast rather than a chip, and `share_markdown` is a read
+over the gateway (a watch token can already read that conversation message by message).
 
 The document is for a person. It names the session and the working folder, keeps the prose,
 summarises each tool call in one English line ("wrote reports/q3.xlsx", "ran a command"), lists
 the files produced, and leaves the reasoning out while saying how long it took. No tool-call
-ids, no `<env>` plumbing, no chain of thought. Writing goes through the engine rather than the
-UI, so the containment rules, the collision-avoiding suffixes (`-2`, `-3`, never an overwrite -
-you may have edited the last one by hand) and the output metadata are identical whether you
-clicked in the desktop app or on a phone.
+ids, no `<env>` plumbing, no chain of thought. The name it suggests is the session title slugged
+plus a timestamp, so two shares of one conversation are two files rather than one overwrite.
 
 **Branch** is there and disabled, with "not built yet" in its tooltip. A control that looks
 available and does nothing teaches the user to distrust the rest of the interface.
@@ -598,6 +615,35 @@ renders in full colour from a system font, so a two-tone app sprouts a blue pict
 and a yellow folder, and renders differently on every platform - which is exactly what the
 file chips were doing.
 
+
+## Web search, and the container that comes with it
+
+`web_search` has three providers, chosen in the footer's **search** popover (same panel on
+the phone, and the same file either way): **DuckDuckGo** needs nothing and answers the first
+few queries, then replies with a bot challenge; **SearXNG, already running** points at an
+instance you operate; **SearXNG, run by Cwoffee** (`backend = "auto"`) starts its own on the
+first search and stops it after it has been idle. Enabling the managed one configures it —
+the config it mounts, the podman or docker run, the health check; turning it off only
+disables it. No container is removed and nothing is uninstalled, because you may have
+started that container yourself.
+
+The managed instance is deliberately small and deliberately temporary: bound to
+`127.0.0.1:8899` rather than the usual 8888 so an instance from elsewhere keeps its port,
+`--memory 256m --cpus 1.0`, `--rm`, JSON API on and the bot limiter off (a limiter is exactly
+what blocks an agent that runs four searches in one turn), and stopped when it has not been
+used for two minutes. Its settings live in `~/.config/cwoffee/searxng/` where you can read
+them, not in a cache directory.
+
+Two promises the code keeps rather than implies:
+
+- **A search says which search answered.** If the managed instance cannot start (no runtime,
+  image pull failed), the tool result begins with `note: Cwoffee could not start its own
+  SearXNG (…)` and the results come from DuckDuckGo. Otherwise the model reports "I searched
+  the web" about a different provider than the one you configured.
+- **The panel reports the engine, not the config.** "In use now" is the tool's own sentence,
+  and a probe (`Try one search`) asks the provider rather than asking the model to demonstrate
+  that it used a tool. A card that prints the config value cannot tell "auto with a container"
+  from "auto on a machine with no container runtime", and those need different fixes.
 
 ## Two things that are security, not polish
 

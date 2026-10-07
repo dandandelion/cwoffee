@@ -106,6 +106,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // The file the search panel writes back to. None from `load` means no file
+    // existed yet, which is not "nowhere to write": the panel creates one at the
+    // default path, so a provider chosen on a phone survives a restart.
+    let config_path = loaded.clone().unwrap_or_else(Config::default_path);
     appcfg.apply_env();
     if let Some(p) = flag(&args, "--url", None) {
         appcfg.provider.base_url = p;
@@ -223,15 +227,17 @@ fn main() {
         ec.timeout_secs, ec.sandbox_enabled
     );
     // Same reason: a search backend you cannot see is a backend you cannot tell
-    // apart from one that is silently falling back.
-    eprintln!(
-        "[cwoffee] search: {}",
-        match appcfg.search_backend() {
-            cwoffee_engine::tools::web::SearchBackend::SearXNG { base } => format!("searxng {base}"),
+    // apart from one that is silently falling back. `describe()` is the same wording
+    // the settings card shows, so the log and the UI cannot disagree.
+    {
+        let b = appcfg.search_backend();
+        let hint = match &b {
             cwoffee_engine::tools::web::SearchBackend::DuckDuckGo =>
-                "duckduckgo html (set [search] searxng_url for a reliable backend)".into(),
-        }
-    );
+                " — starts answering with a bot challenge after a handful of queries; set [search] backend = \"auto\" to have Cwoffee run its own SearXNG",
+            _ => "",
+        };
+        eprintln!("[cwoffee] search: {}{}", b.describe(), hint);
+    }
 
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();
     // A second fan-out for non-webview listeners (the gateway). The webview gets
@@ -329,6 +335,7 @@ fn main() {
         pending_questions: Arc::clone(&pending_q),
         clients: gateway_ctl::client_gauge(),
         migration_notes: migration_notes.clone(),
+        config_path: config_path.clone(),
     });
     let gateway = Arc::new(gateway_ctl::GatewayCtl::new(gw_handle));
 
@@ -341,6 +348,7 @@ fn main() {
         rendered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         migration_notes,
         gateway: Arc::clone(&gateway),
+        config_path: config_path.clone(),
     };
 
     // Boot-time gateway: off unless CWOFFEE_GATEWAY_PORT is set. Started through
@@ -432,7 +440,11 @@ fn main() {
             commands::list_sessions,
             commands::search_messages,
             commands::session_messages,
-            commands::export_markdown,
+            commands::share_markdown,
+            commands::save_markdown_file,
+            commands::search_settings,
+            commands::set_search_backend,
+            commands::search_probe,
             commands::open_file,
             commands::new_session,
             commands::list_workspaces,

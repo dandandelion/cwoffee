@@ -33,6 +33,18 @@ pub struct QuestionOption {
     pub detail: Option<String>,
 }
 
+/// Which card a question belongs to. A model that asks three things at once
+/// sends three questions, and a front end that shows them as three unrelated
+/// cards turns one decision into three interruptions. The set id groups them;
+/// `index`/`total` let the shell say "question 2 of 3" without waiting to see
+/// whether more are coming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionSet {
+    pub id: u64,
+    pub index: usize,
+    pub total: usize,
+}
+
 /// What the model asked and how the front end should render it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
@@ -49,6 +61,11 @@ pub struct Question {
     /// only it knows whether the question is "which one" or "which of these".
     #[serde(default)]
     pub multi: bool,
+    /// Absent for a one-question call, which is the shape every existing client
+    /// already renders. Making it optional rather than always-present keeps that
+    /// wire shape byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<QuestionSet>,
 }
 
 /// The answer, as the front end sent it.
@@ -102,11 +119,14 @@ impl Tool for AskUserTool {
         "Ask the user a question and wait for their answer. Use it when a decision \
          is theirs to make - which option, which format, which risk to accept - not \
          to confirm things you can determine yourself. Give 2-4 short options, mark \
-         the one you recommend, and keep the question to one sentence."
+         the one you recommend, and keep the question to one sentence. When one step \
+         needs several decisions, ask them in a single call with `questions` (2-4 of \
+         them, same fields each) instead of one call per question: the user answers \
+         them as one card and every answer comes back together."
     }
 
     fn schema(&self) -> Value {
-        json!({
+        let one = json!({
             "type": "object",
             "properties": {
                 "question": { "type": "string", "description": "One sentence" },
@@ -128,6 +148,26 @@ impl Tool for AskUserTool {
                 "multi": { "type": "boolean", "description": "Let the user pick more than one option. Only set this when the answers genuinely combine." }
             },
             "required": ["question", "options"]
+        });
+        // The set form reuses the single-question object instead of inventing a
+        // narrower variant: two shapes to learn is two ways to get it wrong, and a
+        // quantized local model will get it wrong.
+        json!({
+            "type": "object",
+            "properties": {
+                "question": one["properties"]["question"].clone(),
+                "options": one["properties"]["options"].clone(),
+                "recommended": one["properties"]["recommended"].clone(),
+                "allow_custom": one["properties"]["allow_custom"].clone(),
+                "multi": one["properties"]["multi"].clone(),
+                "questions": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "description": "Ask 2-4 questions as one card instead of one call each. Each entry has the same fields as a single call.",
+                    "items": one
+                }
+            }
         })
     }
 
@@ -138,57 +178,10 @@ impl Tool for AskUserTool {
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {
-        let question = match args.get("question").and_then(|v| v.as_str()) {
-            Some(q) if !q.trim().is_empty() => q.trim().to_string(),
-            _ => return ToolResult::err("ask_user: \"question\" is required and must not be empty"),
+        let specs = match parse_specs(&args) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::err(e),
         };
-
-        let raw_opts = match args.get("options") {
-            Some(Value::Array(items)) if !items.is_empty() => items.clone(),
-            _ => {
-                return ToolResult::err(
-                    "ask_user: \"options\" must be a non-empty array of {label, detail?}",
-                )
-            }
-        };
-        if raw_opts.len() > 6 {
-            return ToolResult::err(format!(
-                "ask_user: {} options is too many to choose from. Offer at most 6.",
-                raw_opts.len()
-            ));
-        }
-        let mut options: Vec<QuestionOption> = Vec::with_capacity(raw_opts.len());
-        for item in raw_opts {
-            let label = item.get("label").and_then(|v| v.as_str()).unwrap_or("").trim();
-            if label.is_empty() {
-                return ToolResult::err("ask_user: every option needs a non-empty \"label\"");
-            }
-            if options.iter().any(|o| o.label.eq_ignore_ascii_case(label)) {
-                return ToolResult::err(format!(
-                    "ask_user: two options have the same label {label:?}. They must be \
-                     distinguishable at a glance."
-                ));
-            }
-            options.push(QuestionOption {
-                label: label.to_string(),
-                detail: item
-                    .get("detail")
-                    .and_then(|v| v.as_str())
-                    .map(|d| d.trim().to_string())
-                    .filter(|d| !d.is_empty()),
-            });
-        }
-
-        let recommended = args
-            .get("recommended")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .filter(|i| *i < options.len());
-        let allow_custom = args
-            .get("allow_custom")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let multi = args.get("multi").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let Some(tx) = ctx.ask.as_ref() else {
             // Not a stub: this client genuinely has no way to ask, and the
@@ -199,77 +192,302 @@ impl Tool for AskUserTool {
             );
         };
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = oneshot::channel::<Answer>();
-        if tx
-            .send((
-                Question {
-                    id,
-                    question: question.clone(),
-                    options: options.clone(),
-                    recommended,
-                    allow_custom,
-                    multi,
-                },
-                reply_tx,
-            ))
-            .is_err()
-        {
-            return ToolResult::err(
-                "ask_user: nobody is connected to answer. Decide yourself, state the \
-                 assumption you made, and continue.",
-            );
+        // One set id for the whole call, so a shell can group the cards and say
+        // "question 2 of 3". A single question keeps `set: None`, which is exactly
+        // the wire shape every existing client already renders.
+        let total = specs.len();
+        let set_id = if total > 1 {
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+        let mut waiting: Vec<(u64, Spec, oneshot::Receiver<Answer>)> = Vec::with_capacity(total);
+        for (i, spec) in specs.into_iter().enumerate() {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let (reply_tx, reply_rx) = oneshot::channel::<Answer>();
+            let q = Question {
+                id,
+                question: spec.question.clone(),
+                options: spec.options.clone(),
+                recommended: spec.recommended,
+                allow_custom: spec.allow_custom,
+                multi: spec.multi,
+                set: (total > 1).then(|| QuestionSet { id: set_id, index: i, total }),
+            };
+            if tx.send((q, reply_tx)).is_err() {
+                return ToolResult::err(
+                    "ask_user: nobody is connected to answer. Decide yourself, state the \
+                     assumption you made, and continue.",
+                );
+            }
+            waiting.push((id, spec, reply_rx));
         }
 
-        // Tell every window when the question closes on its own. The reply
-        // channel is dead by then, so the shells cannot report it: they are the
-        // ones holding the sender, and a sender whose receiver is gone says
-        // nothing until someone tries to use it.
-        let expire = |ev: &super::ToolCtx, id: u64| {
+        // A set is answered as one card, so the wait is one budget rather than N
+        // sequential ones. Reading and answering three questions takes longer than
+        // answering one, and a per-question timeout would punish the model for
+        // asking them together - which is what the description just told it to do.
+        let budget = self.timeout.mul_f64(1.0 + 0.5 * (total - 1) as f64);
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut got: Vec<Option<Answer>> = Vec::with_capacity(total);
+        let mut timed_out = false;
+        for (_, _, rx) in waiting.iter_mut() {
+            if timed_out {
+                // The person walked away from the card, not from one field of it, so
+                // the rest of the set stops waiting too.
+                got.push(None);
+                continue;
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, rx).await {
+                Ok(Ok(a)) => got.push(Some(a)),
+                // The reply sender is gone: the turn was stopped, or the pending
+                // question was cleared.
+                Ok(Err(_)) => got.push(None),
+                Err(_) => {
+                    timed_out = true;
+                    got.push(None);
+                }
+            }
+        }
+
+        // Tell every window when a question closes on its own. The reply channel is
+        // dead by then, so the shells cannot report it: they are the ones holding the
+        // sender, and a sender whose receiver is gone says nothing until someone
+        // tries to use it.
+        let expire = |ev: &ToolCtx, id: u64| {
             if let Some(tx) = &ev.events {
                 let _ = tx.send(crate::event::EngineEvent::QuestionExpired { id });
             }
         };
+        let unanswered: Vec<u64> = waiting
+            .iter()
+            .zip(got.iter())
+            .filter(|(_, a)| a.is_none())
+            .map(|((id, _, _), _)| *id)
+            .collect();
+        for id in &unanswered {
+            expire(ctx, *id);
+        }
 
-        match tokio::time::timeout(self.timeout, reply_rx).await {
-            Err(_) => {
-                expire(ctx, id);
-                ToolResult::err(format!(
+        if total == 1 {
+            // One question keeps the three outcomes the shells and the tests describe:
+            // answered, timed out, cancelled.
+            let (_id, spec, _rx) = waiting.into_iter().next().expect("one question per slot");
+            match got.first().and_then(|a| a.as_ref()) {
+                Some(answer) => {
+                    let text = answer.text.trim();
+                    if text.is_empty() {
+                        return ToolResult::err(
+                            "ask_user: the user dismissed the question without answering. \
+                             Do not invent an answer; ask differently or state that you \
+                             need it.",
+                        );
+                    }
+                    // A single-select answer that arrived with several picks is a
+                    // client bug; keep the first rather than failing a turn over it.
+                    let picks: Vec<usize> = answer
+                        .options
+                        .iter()
+                        .copied()
+                        .filter(|i| *i < spec.options.len())
+                        .take(if spec.multi { usize::MAX } else { 1 })
+                        .collect();
+                    ToolResult::ok(restate(
+                        &spec.question,
+                        &spec.options,
+                        spec.recommended,
+                        &picks,
+                        text,
+                    ))
+                }
+                None if timed_out => ToolResult::err(format!(
                     "ask_user: the user did not answer within {}s. Pick the option you \
                      recommended (or the most sensible one), say in your reply that you \
                      asked and got no answer, and continue.",
                     self.timeout.as_secs()
-                ))
-            }
-            // The turn was cancelled, or the pending question was cleared.
-            Ok(Err(_)) => {
-                expire(ctx, id);
-                ToolResult::err(
+                )),
+                None => ToolResult::err(
                     "ask_user: the question was cancelled before it was answered. Stop and \
                      let the user know you were waiting on it.",
-                )
+                ),
             }
-            Ok(Ok(answer)) => {
-                let text = answer.text.trim();
-                if text.is_empty() {
-                    return ToolResult::err(
-                        "ask_user: the user dismissed the question without answering. \
-                         Do not invent an answer; ask differently or state that you \
-                         need it.",
-                    );
-                }
-                // A single-select answer that arrived with several picks is a
-                // client bug; keep the first rather than failing a turn over it.
-                let picks: Vec<usize> = answer
-                    .options
-                    .into_iter()
-                    .filter(|i| *i < options.len())
-                    .take(if multi { usize::MAX } else { 1 })
-                    .collect();
-                ToolResult::ok(restate(&question, &options, recommended, &picks, text))
+        } else {
+            let answered = got.iter().flatten().filter(|a| !a.text.trim().is_empty()).count();
+            if answered == 0 {
+                return ToolResult::err(if timed_out {
+                    format!(
+                        "ask_user: the user answered none of the {total} questions within {}s. \
+                         Decide them yourself, say in your reply that you asked and got no \
+                         answer, and continue.",
+                        budget.as_secs()
+                    )
+                } else {
+                    format!(
+                        "ask_user: the {total} questions were cancelled before any was \
+                         answered. Stop and let the user know you were waiting on them."
+                    )
+                });
             }
+            // Partial answers are not an error. Three of four answers are real
+            // information, and losing them because the fourth went unanswered would
+            // throw away the person's actual decisions.
+            let mut out = String::new();
+            for (i, ((_id, spec, _rx), answer)) in waiting.iter().zip(got.iter()).enumerate() {
+                let block = match answer {
+                    Some(a) if !a.text.trim().is_empty() => {
+                        let text = a.text.trim();
+                        let picks: Vec<usize> = a
+                            .options
+                            .iter()
+                            .copied()
+                            .filter(|i| *i < spec.options.len())
+                            .take(if spec.multi { usize::MAX } else { 1 })
+                            .collect();
+                        restate_nth(
+                            i + 1,
+                            total,
+                            &spec.question,
+                            &spec.options,
+                            spec.recommended,
+                            &picks,
+                            text,
+                        )
+                    }
+                    Some(_) => format!(
+                        "Question {} of {total} you asked: \"{}\"\nThe user skipped this one \
+                         without answering.",
+                        i + 1,
+                        spec.question
+                    ),
+                    None => format!(
+                        "Question {} of {total} you asked: \"{}\"\nThe user did not answer this \
+                         one in time.",
+                        i + 1,
+                        spec.question
+                    ),
+                };
+                out.push_str(&block);
+                out.push('\n');
+            }
+            let skipped = total - answered;
+            if skipped > 0 {
+                out.push_str(&format!(
+                    "\n{skipped} of {total} went unanswered (marked above). Decide those \
+                     yourself, state the assumption you made for each, and say in your reply \
+                     that you asked."
+                ));
+            }
+            ToolResult::ok(out)
         }
     }
+}
+
+/// One question as the model wrote it, before it becomes a `Question` on the wire.
+#[derive(Debug, Clone)]
+struct Spec {
+    question: String,
+    options: Vec<QuestionOption>,
+    recommended: Option<usize>,
+    allow_custom: bool,
+    multi: bool,
+}
+
+/// Read either shape: one question, or `questions` holding 2-4 of them.
+///
+/// The flat form stays the primary one, and the set form is an option on top of it
+/// rather than a second tool. Two tools would make the model choose which to call,
+/// and a quantized local model chooses by which one it saw more often in training,
+/// not by which one fits.
+fn parse_specs(args: &Value) -> Result<Vec<Spec>, String> {
+    if let Some(list) = args.get("questions") {
+        let items = match list {
+            Value::Array(items) if items.len() >= 2 => items.clone(),
+            Value::Array(items) => {
+                return Err(format!(
+                    "ask_user: `questions` needs 2-4 entries; got {}. Ask a single question \
+                     with `question` and `options` instead.",
+                    items.len()
+                ))
+            }
+            _ => {
+                return Err(
+                    "ask_user: `questions` must be an array of question objects".to_string(),
+                )
+            }
+        };
+        if items.len() > 4 {
+            return Err(format!(
+                "ask_user: {} questions at once is an interrogation, not a question card. \
+                 Ask at most 4, or ask the rest in a later turn.",
+                items.len()
+            ));
+        }
+        // A mixed call is refused rather than guessed at: a top-level `question` beside
+        // `questions` reads as a fifth question to anyone skimming the call, including
+        // the model that wrote it.
+        if args.get("question").is_some() || args.get("options").is_some() {
+            return Err(
+                "ask_user: use either `question`/`options` alone or `questions`, not both in \
+                 one call."
+                    .to_string(),
+            );
+        }
+        return items.iter().map(parse_spec).collect();
+    }
+    Ok(vec![parse_spec(args)?])
+}
+
+fn parse_spec(v: &Value) -> Result<Spec, String> {
+    let question = match v.get("question").and_then(|q| q.as_str()) {
+        Some(q) if !q.trim().is_empty() => q.trim().to_string(),
+        _ => return Err("ask_user: \"question\" is required and must not be empty".to_string()),
+    };
+
+    let raw_opts = match v.get("options") {
+        Some(Value::Array(items)) if !items.is_empty() => items.clone(),
+        _ => {
+            return Err(
+                "ask_user: \"options\" must be a non-empty array of {label, detail?}".to_string(),
+            )
+        }
+    };
+    if raw_opts.len() > 6 {
+        return Err(format!(
+            "ask_user: {} options is too many to choose from. Offer at most 6.",
+            raw_opts.len()
+        ));
+    }
+    let mut options: Vec<QuestionOption> = Vec::with_capacity(raw_opts.len());
+    for item in raw_opts {
+        let label = item.get("label").and_then(|l| l.as_str()).unwrap_or("").trim();
+        if label.is_empty() {
+            return Err("ask_user: every option needs a non-empty \"label\"".to_string());
+        }
+        if options.iter().any(|o| o.label.eq_ignore_ascii_case(label)) {
+            return Err(format!(
+                "ask_user: two options have the same label {label:?}. They must be \
+                 distinguishable at a glance."
+            ));
+        }
+        options.push(QuestionOption {
+            label: label.to_string(),
+            detail: item
+                .get("detail")
+                .and_then(|d| d.as_str())
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty()),
+        });
+    }
+
+    let recommended = v
+        .get("recommended")
+        .and_then(|n| n.as_u64())
+        .map(|n| n as usize)
+        .filter(|i| *i < options.len());
+    let allow_custom = v.get("allow_custom").and_then(|b| b.as_bool()).unwrap_or(true);
+    let multi = v.get("multi").and_then(|b| b.as_bool()).unwrap_or(false);
+    Ok(Spec { question, options, recommended, allow_custom, multi })
 }
 
 /// Put the question back in the answer.
@@ -288,8 +506,28 @@ fn restate(
     picks: &[usize],
     text: &str,
 ) -> String {
+    restate_nth(0, 0, question, options, recommended, picks, text)
+}
+
+/// `n`/`total` number the restatement when a call asked several questions. Without
+/// the number, two restated answers in one tool result read as one answer to both,
+/// which is the exact ambiguity the restatement exists to remove.
+fn restate_nth(
+    n: usize,
+    total: usize,
+    question: &str,
+    options: &[QuestionOption],
+    recommended: Option<usize>,
+    picks: &[usize],
+    text: &str,
+) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Question you asked: \"{question}\"\n"));
+    let lead = if n > 1 || total > 1 {
+        format!("Question {n} of {total} you asked")
+    } else {
+        "Question you asked".to_string()
+    };
+    out.push_str(&format!("{lead}: \"{question}\"\n"));
     let offered: Vec<String> = options
         .iter()
         .enumerate()
@@ -714,6 +952,218 @@ mod tests {
 
     /// A recommended index outside the option list is dropped, not wrapped:
     /// pointing at "option 9 of 3" would render a badge on nothing.
+    /// A set has to arrive as one card, not as three unrelated interruptions. The
+    /// `set` marker is what lets a shell render "question 2 of 3" and keep the
+    /// answers together.
+    #[tokio::test]
+    async fn a_set_of_questions_arrives_marked_as_one_card() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
+        };
+        let h = tokio::spawn(async move {
+            let (q1, r1) = rx.recv().await.unwrap();
+            let (q2, r2) = rx.recv().await.unwrap();
+            let s1 = q1.set.clone().expect("a set question must say which set");
+            let s2 = q2.set.clone().expect("the second too");
+            assert_eq!((s1.id, s1.index, s1.total), (s2.id, 0, 2), "set markers disagree");
+            assert_eq!((s2.index, s2.total), (1, 2), "the second question must know it is second");
+            assert_ne!(q1.id, q2.id, "each question still has its own id to answer");
+            r1.send(Answer { text: "PDF".into(), options: vec![1] }).unwrap();
+            r2.send(Answer { text: "landscape".into(), options: vec![] }).unwrap();
+            (q1.question, q2.question)
+        });
+        let r = tool()
+            .run(
+                json!({"questions": [
+                    {"question": "Which format?", "options": [{"label": "MD"}, {"label": "PDF"}]},
+                    {"question": "Which orientation?", "options": [{"label": "portrait"}, {"label": "landscape"}]}
+                ]}),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        let (q1, q2) = h.await.unwrap();
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.text();
+        assert!(out.contains(&format!("Question 1 of 2 you asked: \"{q1}\"")), "{out}");
+        assert!(out.contains(&format!("Question 2 of 2 you asked: \"{q2}\"")), "{out}");
+        assert!(out.contains("User chose: 2: PDF"), "{out}");
+        assert!(out.contains("User typed their own answer"), "{out}");
+    }
+
+    /// Answering one question of a set and skipping another is a normal answer. The
+    /// choices the person did make are information; dropping the whole result because
+    /// one field was skipped throws them away.
+    #[tokio::test]
+    async fn a_partial_set_keeps_the_answers_that_arrived() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
+        };
+        let h = tokio::spawn(async move {
+            let (_, r1) = rx.recv().await.unwrap();
+            let (_, r2) = rx.recv().await.unwrap();
+            r1.send(Answer { text: "MD".into(), options: vec![0] }).unwrap();
+            // Skipped: an empty answer, which is what a "no answer" submit sends.
+            r2.send(Answer::default()).unwrap();
+        });
+        let r = tool()
+            .run(
+                json!({"questions": [
+                    {"question": "Format?", "options": [{"label": "MD"}, {"label": "PDF"}]},
+                    {"question": "Orientation?", "options": [{"label": "portrait"}]}
+                ]}),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        h.await.unwrap();
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.text();
+        assert!(out.contains("User chose: 1: MD"), "{out}");
+        assert!(out.contains("The user skipped this one"), "{out}");
+        assert!(out.contains("1 of 2 went unanswered"), "{out}");
+        assert!(out.contains("Decide those yourself"), "{out}");
+    }
+
+    /// A set nobody answered is an error, and the wording has to match what actually
+    /// happened: two questions, not "the question".
+    #[tokio::test]
+    async fn an_unanswered_set_says_so_about_all_of_them() {
+        let (tx, _rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
+        };
+        let r = tool()
+            .run(
+                json!({"questions": [
+                    {"question": "a?", "options": [{"label": "x"}]},
+                    {"question": "b?", "options": [{"label": "y"}]}
+                ]}),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        assert!(!r.ok);
+        let said = r.text();
+        assert!(said.contains("answered none of the 2 questions"), "{said}");
+    }
+
+    /// One budget for a set, but every question that went unanswered still has to
+    /// close in every window. A card that still offers an answer to a tool call that
+    /// has already returned is a dead button with a live affordance.
+    #[tokio::test]
+    async fn a_set_that_ran_out_of_time_closes_the_ones_left_open() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: Some(etx),
+            permits: Vec::new(),
+        };
+        let (idx, iqx) = oneshot::channel::<u64>();
+        let h = tokio::spawn(async move {
+            let (q1, r1) = rx.recv().await.unwrap();
+            let (q2, r2) = rx.recv().await.unwrap();
+            r1.send(Answer { text: "MD".into(), options: vec![0] }).unwrap();
+            // The second stays unanswered: the watcher holds its sender past the
+            // budget, which is the situation the timeout has to survive.
+            let _ = idx.send(q2.id);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(r2);
+        });
+        let r = tool()
+            .run(
+                json!({"questions": [
+                    {"question": "Format?", "options": [{"label": "MD"}]},
+                    {"question": "Orientation?", "options": [{"label": "portrait"}]}
+                ]}),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        let lost = iqx.await.unwrap();
+        h.abort();
+        assert!(r.ok, "{:?}", r.error);
+        assert!(r.text().contains("did not answer this one in time"), "{}", r.text());
+        let ev = erx.recv().await.expect("the unanswered question must be closed");
+        match ev {
+            crate::event::EngineEvent::QuestionExpired { id } => assert_eq!(id, lost),
+            other => panic!("expected QuestionExpired, got {other:?}"),
+        }
+        assert!(erx.try_recv().is_err(), "only the unanswered question gets an expiry");
+    }
+
+    /// A single question keeps the wire shape existing clients render: no `set`, no
+    /// ordinal in the restatement. Changing that would be a protocol break dressed up
+    /// as a feature.
+    #[tokio::test]
+    async fn a_single_question_keeps_the_shape_clients_already_handle() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
+        };
+        let h = tokio::spawn(async move {
+            let (q, reply) = rx.recv().await.unwrap();
+            assert!(q.set.is_none(), "a lone question must not claim to be part of a set");
+            reply.send(Answer { text: "PDF".into(), options: vec![0] }).unwrap();
+        });
+        let r = tool()
+            .run(json!({"question": "Format?", "options": [{"label": "PDF"}]}), &ctx, &sink())
+            .await;
+        h.await.unwrap();
+        assert!(r.ok, "{:?}", r.error);
+        assert!(r.text().starts_with("Question you asked:"), "{}", r.text());
+    }
+
+    /// Malformed sets are refused with the reason, not quietly truncated: five
+    /// questions in one card is a wall, and a call that mixes both shapes is a call
+    /// whose meaning depends on which field the reader noticed.
+    #[tokio::test]
+    async fn malformed_sets_are_refused_with_a_reason() {
+        let ctx = ToolCtx::default();
+        let t = tool();
+        let one = json!({"question": "a?", "options": [{"label": "x"}]});
+        let r = t
+            .run(json!({"questions": [one.clone()]}), &ctx, &sink())
+            .await;
+        assert!(!r.ok && r.text().contains("2-4"), "{}", r.text());
+
+        let many: Vec<Value> = (0..5).map(|i| json!({"question": format!("q{i}?"), "options": [{"label": "x"}]})).collect();
+        let r = t.run(json!({"questions": many}), &ctx, &sink()).await;
+        assert!(!r.ok && r.text().contains("at most 4"), "{}", r.text());
+
+        let r = t
+            .run(json!({"question": "outer?", "options": [{"label": "x"}], "questions": [one.clone(), one.clone()]}), &ctx, &sink())
+            .await;
+        assert!(!r.ok && r.text().contains("not both"), "{}", r.text());
+
+        // A question inside the set is validated like a lone one: no options, no good.
+        let r = t
+            .run(json!({"questions": [{"question": "a?"}, {"question": "b?", "options": [{"label": "y"}]}]}), &ctx, &sink())
+            .await;
+        assert!(!r.ok && r.text().contains("options"), "{}", r.text());
+    }
+
     #[tokio::test]
     async fn an_out_of_range_recommendation_is_ignored() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();

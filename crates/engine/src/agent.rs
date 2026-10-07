@@ -118,6 +118,13 @@ impl Agent {
         &self.ctx.workspace
     }
 
+    /// The live search tool, typed, so the settings card can switch providers or
+    /// ask what an ephemeral SearXNG is doing without rebuilding the tool list.
+    /// Rebuilding it would change the prompt bytes and drop every prefix cache.
+    pub fn search_tool(&self) -> Option<std::sync::Arc<crate::tools::web::WebSearchTool>> {
+        self.registry.search_tool()
+    }
+
     /// Swap the whole prompt out, e.g. when moving to a different session.
     pub fn replace_prompt(&mut self, p: crate::prompt::PromptBuilder) {
         self.prompt = p;

@@ -74,6 +74,10 @@ pub struct EngineHandle {
     /// stub that looks like "nothing needed migrating", which is a claim, not a
     /// fact: the desktop knows and this side did not.
     pub migration_notes: Vec<String>,
+    /// The config file this host read (or would read). The search panel writes
+    /// through it, so a provider chosen on a phone is still chosen after a restart,
+    /// and so both shells write the same file rather than two.
+    pub config_path: std::path::PathBuf,
 }
 
 impl EngineHandle {
@@ -809,10 +813,7 @@ const AUDITED: &[&str] = &[
     "remove_workspace",
     "respond_approval",
     "respond_question",
-    // Writes a file into the host's workspace without running a turn, so it is
-    // audited like the acts that do: on a shared token, "who put this here" has to
-    // be answerable.
-    "export_markdown",
+    "set_search_backend",
 ];
 
 /// Empty a pending map and report how many waiters were released.
@@ -923,22 +924,32 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string()),
-        "export_markdown" => {
-            // Drive-only: it writes a file into the host's workspace.
-            if !role.can_drive() {
-                return need_drive(role);
-            }
+        "share_markdown" => {
+            // A read, not a write: the document is handed back and the client
+            // decides where it goes (a save dialog on the desktop, a download on
+            // a phone). It used to be `export_markdown`, drive-only, and it wrote
+            // into the host's workspace - which then looked like model output to
+            // the next turn. A watch token can already read this conversation, so
+            // there is nothing here that needs a drive token.
             let id = args.get("session").and_then(|v| v.as_i64()).ok_or("session id required")?;
             let row = h
                 .store
                 .session(id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("session {id} does not exist"))?;
-            let ws = cwoffee_engine::host::check_workspace(&row.workspace)
-                .map_err(|reason| format!("{}: {reason}", row.workspace))?;
             let rows = h.store.messages(id).map_err(|e| e.to_string())?;
-            let out = cwoffee_engine::share::write_export(&ws, &row.title, &rows)?;
-            serde_json::to_value(out).map_err(|e| e.to_string())
+            serde_json::to_value(cwoffee_engine::share::share_document(&row.title, &row.workspace, &rows))
+                .map_err(|e| e.to_string())
+        }
+        // ---- web search: the panel on a phone drives the same file the desktop
+        // panel writes. Reading is open to a watch token (it names a provider, not
+        // a payload); choosing one and running a probe are drive-only: the first
+        // edits the host's config, the second spends the host's network and CPU.
+        "search_settings" => {
+            serde_json::to_value(
+                cwoffee_engine::settings::search_view(&h.host, &h.config_path).await,
+            )
+            .map_err(|e| e.to_string())
         }
         "session_messages" => {
             let id = arg_i64(&args, "id")?;
@@ -1065,6 +1076,27 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             };
             h.host.send(HostCmd::SetReasoning { reasoning: r });
             Ok(json!(true))
+        }
+        "set_search_backend" => {
+            need_drive(role)?;
+            // Audited and drive-only: this edits the host's config file. A watch
+            // token may see which provider is on, not change it.
+            let v = cwoffee_engine::settings::set_search_backend(
+                &h.host,
+                &h.config_path,
+                &arg_str(&args, "backend")?,
+                &args.get("searxng_url").and_then(|v| v.as_str()).unwrap_or_default(),
+            )
+            .await?;
+            serde_json::to_value(v).map_err(|e| e.to_string())
+        }
+        "search_probe" => {
+            need_drive(role)?;
+            // One real search, so "is search working" can be answered on a machine
+            // where the model is not being asked to demonstrate it.
+            let q = args.get("query").and_then(|v| v.as_str()).map(String::from);
+            serde_json::to_value(cwoffee_engine::settings::search_probe(&h.host, q).await?)
+                .map_err(|e| e.to_string())
         }
         "respond_approval" => {
             need_drive(role)?;
@@ -1371,6 +1403,10 @@ mod tests {
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
         clients: Arc::new(Mutex::new(BTreeMap::new())),
             migration_notes: Vec::new(),
+            // Never read: serve() must fail before it touches the engine. Present
+            // because the struct says a gateway always knows which file it would
+            // write, and a test that cannot answer that is not a gateway.
+            config_path: std::env::temp_dir().join("cwoffee-gw-refused-config.toml"),
         });
         let err = serve(cfg, handle).await.unwrap_err();
         assert!(matches!(err, GatewayError::Refused(_)), "got {err:?}");
@@ -2031,6 +2067,13 @@ mod tests {
         assert!(err.contains("999"), "unhelpful: {err}");
     }
 
+    /// Sequence for unique temp config paths (see `test_handle_in_notes`).
+    static CONFIG_SEQ: std::sync::OnceLock<std::sync::atomic::AtomicUsize> =
+        std::sync::OnceLock::new();
+    fn config_seq() -> &'static std::sync::atomic::AtomicUsize {
+        CONFIG_SEQ.get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
+    }
+
     fn test_handle() -> Arc<EngineHandle> {
         test_handle_with_notes(Vec::new())
     }
@@ -2055,7 +2098,10 @@ mod tests {
         Arc::new(EngineHandle {
             host: Arc::new(SessionHost::spawn(
                 p,
-                cwoffee_engine::tools::Registry::new(),
+                // The real tool set, not an empty one: several RPCs here are about
+                // tools (web_search's provider being the obvious one), and an empty
+                // registry makes those assertions pass about nothing.
+                cwoffee_engine::tools::Registry::with_v1_tools(),
                 Arc::clone(&store),
                 cwoffee_engine::host::HostConfig::new("m", std::path::PathBuf::from(ws)),
             )),
@@ -2065,6 +2111,17 @@ mod tests {
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
         clients: Arc::new(Mutex::new(BTreeMap::new())),
             migration_notes: notes,
+            // A path under /tmp, never the real ~/.config: these tests write the
+            // file they claim to write, and must not touch anyone's settings.
+            // A path under /tmp, never the real ~/.config: these tests write the
+            // file they claim to write. Unique per handle, because two tests that
+            // both "set the search backend" through one shared file race, and the
+            // loser's assertion then depends on test order.
+            config_path: std::env::temp_dir().join(format!(
+                "cwoffee-gw-test-config-{}-{}.toml",
+                std::process::id(),
+                config_seq().fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            )),
         })
     }
 
@@ -2130,13 +2187,102 @@ mod tests {
     /// itself". Over the wire the refusal arrives as an error *event* (the rpc itself
     /// was well formed), so the client must render it; what this asserts is that
     /// nothing ran.
+    /// The search panel on a phone drives the same file the desktop panel writes.
+    /// What must hold: a watch token can read it, cannot change it, and a change
+    /// that is accepted lands in the config file this process was given (a temp
+    /// path in these tests, never anyone's ~/.config).
+    #[tokio::test]
+    async fn the_search_panel_is_readable_to_a_watcher_and_writable_only_by_a_driver() {
+        let h = test_handle();
+        let view = run_cmd("search_settings", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("a watcher can read which search is on");
+        assert_eq!(view["backend"], "duckduckgo", "{view}");
+        assert!(view["describing"].as_str().unwrap().contains("DuckDuckGo"), "{view}");
+        // Nothing was chosen by these tests, so nothing should have been written.
+        let cfg_path = h.config_path.clone();
+        let _ = std::fs::remove_file(&cfg_path);
+
+        let err = run_cmd(
+            "set_search_backend",
+            serde_json::json!({ "backend": "auto" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watcher must not be able to reconfigure the host");
+        assert!(err.contains("watch"), "unhelpful: {err}");
+        assert!(!cfg_path.exists(), "the refusal must not have written the file either");
+
+        let out = run_cmd("set_search_backend", serde_json::json!({ "backend": "auto" }), Role::Drive, &h)
+            .await
+            .expect("a driver can choose the managed provider");
+        assert_eq!(out["backend"], "auto", "{out}");
+        assert!(
+            out["describing"].as_str().unwrap().contains("managed by Cwoffee"),
+            "the answer must say what it became: {out}"
+        );
+        // Persisted, or "enabled" meant until the next restart.
+        let text = std::fs::read_to_string(&cfg_path).expect("the choice was written");
+        assert!(text.contains("backend = \"auto\""), "{text}");
+        // And the live tool agrees, not just the file.
+        let live = run_cmd("search_settings", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("read back");
+        assert_eq!(live["backend"], "auto", "{live}");
+
+        // A nonsense provider is an error, not a quiet fall back.
+        let bad = run_cmd(
+            "set_search_backend",
+            serde_json::json!({ "backend": "google" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("unknown provider must fail");
+        assert!(bad.contains("unknown search provider"), "unhelpful: {bad}");
+        let after = run_cmd("search_settings", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("read back again");
+        assert_eq!(after["backend"], "auto", "the refused choice must not stick: {after}");
+        let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    /// A probe is a real search, so it costs the host a request: drive-only. And
+    /// when the provider cannot answer, the answer is an error sentence rather than
+    /// an empty list that reads as "the internet has nothing about that".
+    #[tokio::test]
+    async fn a_probe_is_drive_only_and_says_which_side_failed() {
+        let h = test_handle();
+        let err = run_cmd("search_probe", serde_json::json!({ "query": "coffee" }), Role::Watch, &h)
+            .await
+            .expect_err("a watcher must not spend the host's network");
+        assert!(err.contains("watch"), "unhelpful: {err}");
+
+        // Point the tool at a loopback port nothing listens on, then probe. No
+        // internet needed, and the failure is the one a user actually hits.
+        let _ = run_cmd(
+            "set_search_backend",
+            serde_json::json!({ "backend": "searxng", "searxng_url": "http://127.0.0.1:9/search" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("a manual URL is a legitimate choice");
+        let out = run_cmd("search_probe", serde_json::json!({ "query": "coffee roasting" }), Role::Drive, &h)
+            .await
+            .expect("the probe itself is well formed even when the search fails");
+        assert!(out["error"].is_string(), "expected an error sentence, got {out}");
+        assert!(out["results"].as_array().map(|a| a.is_empty()).unwrap_or(false), "{out}");
+        let _ = std::fs::remove_file(&h.config_path);
+    }
+
     #[tokio::test]
     async fn a_phone_can_share_a_conversation_without_touching_the_host() {
-        // Export is the one write a remote client makes that is not a turn: it
-        // produces a document in the conversation's own workspace. It must be
-        // drive-only, must address a real session, and must not move the host or
-        // run a model call.
-        let dir = unique_dir("export");
+        // Sharing is a read: the document comes back over the wire and nothing is
+        // written on the host. The old shape put a file in the conversation's own
+        // workspace, and the next model turn treated that as its own output.
+        let dir = unique_dir("share");
         let h = test_handle_in(&dir);
         let id = match run_cmd("new_session", serde_json::json!({ "title": "share me" }), Role::Drive, &h)
             .await
@@ -2145,45 +2291,48 @@ mod tests {
             serde_json::Value::Number(n) => n.as_i64().unwrap(),
             other => panic!("new_session returned {other:?}"),
         };
+        h.store
+            .append_message(
+                id,
+                &cwoffee_engine::provider::Message::user("the story so far"),
+            )
+            .unwrap();
         let turns_before = h.host.state().turns;
         let before = h.host.state().session_id;
 
-        let err = run_cmd("export_markdown", serde_json::json!({ "session": id }), Role::Watch, &h)
-            .await
-            .expect_err("a watch token may not write files");
-        assert!(err.contains("drive"), "expected a role error, got {err}");
-
-        let ghost = 900_000i64;
-        let err = run_cmd("export_markdown", serde_json::json!({ "session": ghost }), Role::Drive, &h)
-            .await
-            .expect_err("a conversation that does not exist cannot be exported");
-        assert!(err.contains("does not exist"), "got {err}");
-
-        // The session has no messages yet, which is a legitimate document: the
-        // export says what the conversation is rather than refusing.
-        let out = match run_cmd("export_markdown", serde_json::json!({ "session": id }), Role::Drive, &h)
+        // A watch token may share. It is the same conversation it can already read
+        // message by message; there is no write left to gate.
+        let out = match run_cmd("share_markdown", serde_json::json!({ "session": id }), Role::Watch, &h)
             .await
             .unwrap()
         {
             serde_json::Value::Object(o) => o,
-            other => panic!("export returned {other:?}"),
+            other => panic!("share returned {other:?}"),
         };
-        let rel = out.get("path").and_then(|v| v.as_str()).unwrap().to_string();
-        assert!(rel.starts_with("exports/") && rel.ends_with(".md"), "path {rel}");
-        assert_eq!(out.get("name").and_then(|v| v.as_str()).unwrap().ends_with(".md"), true);
-        let on_disk = std::fs::read_to_string(std::path::Path::new(&dir).join(&rel)).unwrap();
-        assert!(on_disk.contains("share me"), "the document does not name the session");
+        let name = out.get("name").and_then(|v| v.as_str()).unwrap().to_string();
+        let body = out.get("markdown").and_then(|v| v.as_str()).unwrap().to_string();
+        assert!(name.ends_with(".md") && !name.contains('/'), "suggested name {name:?}");
+        assert!(body.contains("the story so far"), "document did not contain the conversation");
+        assert!(body.contains("share me"), "document did not name the session");
 
-        // Second export of the same conversation must not clobber the first: the
-        // user may have edited it by hand.
-        let again = run_cmd("export_markdown", serde_json::json!({ "session": id }), Role::Drive, &h)
+        // Nothing on the host changed. This is the whole point of the rewrite.
+        let left = std::fs::read_dir(&dir).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(left, 0, "sharing wrote {left} entr(y/ies) into the workspace");
+
+        let ghost = 900_000i64;
+        let err = run_cmd("share_markdown", serde_json::json!({ "session": ghost }), Role::Watch, &h)
             .await
-            .unwrap();
-        let rel2 = again.get("path").and_then(|v| v.as_str()).unwrap().to_string();
-        assert_ne!(rel, rel2, "two exports wrote to the same file");
+            .expect_err("a conversation that does not exist cannot be shared");
+        assert!(err.contains("does not exist"), "got {err}");
 
-        assert_eq!(h.host.state().turns, turns_before, "export ran a turn");
-        assert_eq!(h.host.state().session_id, before, "export moved the host");
+        // And the old command is gone rather than quietly still writing files.
+        let err = run_cmd("export_markdown", serde_json::json!({ "session": id }), Role::Drive, &h)
+            .await
+            .expect_err("export_markdown must not survive the change");
+        assert!(err.contains("unknown command"), "got {err}");
+
+        assert_eq!(h.host.state().turns, turns_before, "sharing ran a turn");
+        assert_eq!(h.host.state().session_id, before, "sharing moved the host");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

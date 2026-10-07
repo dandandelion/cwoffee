@@ -300,15 +300,32 @@ export function firstBlockEnd(src: string): { end: number; fenced: boolean } | n
   // quotes keep the conservative rule: a blank line at the very end may be the
   // model pausing mid-block, and closing early re-parses settled text.
   const tableBlock = /^\s*\|/.test(src.split('\n', 1)[0] ?? '')
+  // An ATX heading is exactly one line long, and so is a thematic break. Both are
+  // finished the moment their newline lands, so holding them for a blank line is
+  // a guess that costs the reader: `## Title` sits there as literal hash marks
+  // for as long as the model takes to type the sentence underneath it.
+  const headingBlock = /^ {0,3}#{1,6}\s/.test(src.split('\n', 1)[0] ?? '')
+  const ruleBlock = /^ {0,3}(?:[-*_]\s*){3,}$/.test(src.split('\n', 1)[0] ?? '')
   while (i < src.length) {
     const nl = src.indexOf('\n', i)
     const lineEnd = nl === -1 ? src.length : nl + 1
     const line = src.slice(i, lineEnd)
     if (/^\s*(?:```|~~~)/.test(line)) fence = !fence
+    if (fence) {
+      i = lineEnd
+      continue
+    }
+    if (i === 0 && (headingBlock || ruleBlock) && nl !== -1) return { end: lineEnd, fenced: false }
+    if (i > 0 && tableBlock && line.trim() !== '' && !/^\s*\|/.test(line)) {
+      // A table ends *before* the line that is not a row. Not at the newline that
+      // may be followed by more rows: closing there would split one table into two
+      // stacked tables the moment the next row arrives.
+      return { end: i, fenced: false }
+    }
     // A blank line at the very end of the source is not a terminator: the next
     // delta may continue the same block, and guessing wrong would close a
     // paragraph the model is still writing.
-    if (!fence && line.trim() === '' && (lineEnd < src.length || tableBlock))
+    if (line.trim() === '' && (lineEnd < src.length || tableBlock))
       return { end: lineEnd, fenced: fence }
     i = lineEnd
   }
@@ -613,5 +630,126 @@ export class LiveMarkdown {
 
   finish(): string {
     return renderMarkdown(this.src)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Inline emphasis, decided as it streams
+// ---------------------------------------------------------------------------
+
+/**
+ * Marks recognised while a paragraph is still being written, longest first so
+ * `**` is never read as two `*`.
+ */
+const INLINE_MARKS = ['~~', '**', '__', '`', '*', '_']
+
+function markAt(s: string, i: number): string | null {
+  for (const m of INLINE_MARKS) if (s.startsWith(m, i)) return m
+  return null
+}
+
+export type InlineToken =
+  | { kind: 'text'; text: string }
+  | { kind: 'open'; mark: string }
+  | { kind: 'close'; mark: string }
+
+/**
+ * Turn a stream of characters into text plus open/close decisions, so emphasis
+ * can be *appended* rather than re-rendered.
+ *
+ * The reason this exists at all: a paragraph that is still arriving is a chain
+ * of word spans that must never be rewritten, and `**bold**` inside it is
+ * normally invisible to the reader until the block commits at the next blank
+ * line. The only way to show bold early without touching settled spans is to
+ * open a `<strong>` element when the opener is recognised and append the coming
+ * words inside it. Nothing that is already on screen changes: the marked words
+ * are born bold, the asterisks are never painted, and the text after the
+ * construct is appended after the element.
+ *
+ * Deliberately narrower than CommonMark:
+ *   * an opener needs a non-space character after it;
+ *   * `*`, `**` and both `_` forms may not open in the middle of a word, which
+ *     keeps `snake_case_names` and `2**3` as the text they are;
+ *   * inside a code span nothing is interpreted but the closing backtick;
+ *   * a marker run at the very end of a chunk is held rather than guessed, so
+ *     the asterisks never flash before the next delta says which they are.
+ * A block that ends with an unclosed construct commits through the parser, which
+ * renders it exactly as markdown does; this stream is an approximation that is
+ * allowed to be wrong only until that commit, and never in a way that rewrites
+ * pixels already on screen.
+ */
+export class InlineStream {
+  private stack: string[] = []
+  private pending = ''
+  private lastChar = ''
+
+  reset(): void {
+    this.stack = []
+    this.pending = ''
+    this.lastChar = ''
+  }
+
+  /** Characters held back because the next delta has not decided them yet. */
+  pendingText(): string {
+    return this.pending
+  }
+
+  tokens(chunk: string): InlineToken[] {
+    const out: InlineToken[] = []
+    let buf = ''
+    const flush = () => {
+      if (!buf) return
+      out.push({ kind: 'text', text: buf })
+      this.lastChar = buf[buf.length - 1]
+      buf = ''
+    }
+    const s = this.pending + chunk
+    this.pending = ''
+    let i = 0
+    while (i < s.length) {
+      const m = markAt(s, i)
+      if (!m) {
+        buf += s[i]
+        i += 1
+        continue
+      }
+      const after = i + m.length < s.length ? s[i + m.length] : null
+      if (after === null) {
+        // Undecidable until the next character lands. Hold the run back rather
+        // than painting asterisks that are about to disappear.
+        this.pending = s.slice(i)
+        break
+      }
+      const before = buf ? buf[buf.length - 1] : this.lastChar
+      const top = this.stack[this.stack.length - 1]
+      const inCode = top === '`'
+      // A code span closes on its matching backtick whatever surrounds it; the
+      // emphasis marks close only when the character before them is not a space,
+      // which is what stops `* a * b` from becoming emphasis.
+      if (top === m && (m === '`' || /\S/.test(before))) {
+        flush()
+        this.stack.pop()
+        out.push({ kind: 'close', mark: m })
+        i += m.length
+        continue
+      }
+      if (inCode) {
+        buf += m
+        i += m.length
+        continue
+      }
+      const intraword = /[A-Za-z0-9]/.test(before)
+      if (/\S/.test(after) && !(intraword && (m.startsWith('_') || m === '*' || m === '**'))) {
+        flush()
+        this.stack.push(m)
+        out.push({ kind: 'open', mark: m })
+        i += m.length
+        continue
+      }
+      buf += m
+      i += m.length
+    }
+    flush()
+    return out
   }
 }

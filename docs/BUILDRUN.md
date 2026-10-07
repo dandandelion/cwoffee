@@ -1600,3 +1600,173 @@ is looking for.
 The probe now records `document.hidden` at the start of each gap, drops gaps that began while
 hidden, and prints `off-screen spans N` in the log line so a sample taken off screen is visible
 as one rather than as a rendering regression.
+
+## Trap 78: a share that writes into the workspace becomes someone else's output
+
+"Share as Markdown" wrote the conversation into `<workspace>/exports/` and returned an
+`OutputFile`, so the UI could show the usual clickable chip. Every part of that was reasonable
+until a turn actually followed it: the model, asked to clean up the files from a research turn,
+found the export sitting in the folder and reported *it* as one of the things it had made. A file
+the human created by pressing a button had become model output.
+
+Two rules came out of it:
+
+- **A share writes nothing.** `share::share_document` returns `{ name, markdown }`; the desktop
+  asks a person through the native save dialog (`tauri-plugin-dialog`, `save_file`, whose result
+  may legitimately be "cancelled"), and a browser downloads a Blob. Nothing lands in the
+  workspace, so nothing can be mistaken for output. `export_markdown` is gone rather than
+  deprecated, and a gateway test asks for it by name and asserts `unknown command`.
+- **A turn owns its files.** `Transcript.turnFiles` was never reset at `turnStart`, so the next
+  `addFiles` in a later turn removed the old strip and re-appended the *previous* turn's list to
+  the new one. That is the "the cleanup turn got attached to the files it deleted" report: the
+  store was clean (`files = []` on those rows), the live transcript was not. Resetting at
+  `turnStart` is the invariant, and the self-test asserts both halves: the downloading turn keeps
+  its one chip, the cleanup turn has none.
+
+Note which side the evidence was on. The DB said "no files on the cleanup message" and the user
+said "the cleanup message has files" - both were true, of different objects. Checking only the
+store would have closed the bug report as a misremembering.
+
+## Trap 79: the live dot re-laid-out the label it was decorating
+
+The answer's name hangs in the scroller's left gutter: `.blk > .blk-head` is absolutely
+positioned, **58px wide, `text-align: right`, `white-space: nowrap`**. The "still working" marker
+was an inline 6px dot with a 5px margin, *inside that box*. 53px of "CWOFFEE" plus 11px of dot is
+64px of line in a 58px box, and **`text-align` has no effect on a line wider than its own box** -
+the line falls back to its start edge and runs into the content column. So while the model was
+thinking and writing, the label sat flush against the answer's first word, and its gutter
+reappeared the instant the dot did at turn end. "Not properly aligned, no margin, fixes itself at
+turn end" is that one mechanism.
+
+Fix: the marker is `position: absolute` in the gutter (reasoning keeps it inline, because its head
+is a static full-width line). Then the label's box never changes, live or settled. Pinned by
+measuring the *text* ranges both while generating and after settling, for a paragraph answer and a
+heading answer: gutter must be ≥6px while the dot is up, and must move <1px at turn end.
+
+The general shape: a decoration that participates in the layout of the thing it decorates will
+change that thing's layout. This is the same class as the streaming `padding-top` that moved the
+label at turn end, and the reveal duration written on the paragraph instead of the span.
+
+## Trap 80: markdown that waits for a blank line is markdown that arrives late
+
+Block-granular streaming commits a block when `firstBlockEnd` says it is finished, and it was
+conservative in one direction only: no boundary at a blank line that ends the source. Correct for
+a paragraph, which may still be arriving; wrong for the blocks markdown itself finishes with a
+newline.
+
+- An ATX heading is one line. `## The Copy\n` is a *complete* block at that newline, and holding it
+  for a blank line left literal `##` on screen while the model typed the sentence below it. A
+  thematic break is the same.
+- A table ends at the first line that is not a row, so that is the boundary - *not* the newline
+  that may be followed by more rows, which would split one table into two stacked tables.
+- A table's trailing blank line at the end of the stream is a terminator (markdown has no other
+  reading), which is why `splitCommitted` and `firstBlockEnd` differ here on purpose.
+
+For emphasis inside a paragraph that is still open, re-parsing is off the table: it rewrites spans
+the reader already read, which is the flicker everything else here is arranged to avoid. So
+`InlineStream` decides as characters arrive: at `**` it *opens* a `<strong>` into which the
+following words are appended, at the matching `**` it closes it, and the marker characters are
+never painted. Nothing existing changes - the bold words are born bold, the text after the
+construct is appended after it - so the self-test can assert the boring version of the promise:
+the word before the construct has not moved, the paragraph element is the same node, and no
+asterisk or backtick is visible. It is deliberately narrower than CommonMark: no opener inside a
+word (which keeps `snake_case` and `2**3` literal), nothing interpreted inside a code span, and a
+marker run at the end of a chunk is *held* rather than guessed, so the asterisks never flash.
+
+## Trap 81: an approval card that quotes a here-document is a wall you cannot read
+
+`summarize_with("exec")` quoted the command verbatim. A model writing a text file through
+`cat > notes.md <<'EOF' … 400 lines … EOF` produced an approval card taller than the window, with
+Allow/Deny below the fold, inside a fixed strip above the composer - so there was no page scroll
+to escape into, and the only way out was to let the approval fail closed on timeout.
+
+Both sides got fixed, because either alone leaves the other half:
+
+- **UI**: the card caps at `62vh` (`74vh` on a short window), the command body scrolls inside it
+  with `overscroll-behavior: contain` so wheeling through it does not move the transcript behind
+  it, and the button row never moves. The self-test raises a synthetic 300-line prompt and checks
+  the pixels: body scrollable, Deny inside the viewport, transcript not moved by the scroll. A
+  synthetic event is the point - waiting for a model to write a wall of text makes the check
+  depend on a model's mood.
+- **Engine**: `cmd_head` shows the first four lines plus `[+399 more lines, 18718 characters
+  total] — writes 18694 characters into notes.txt`, and `exec` refuses oversized inline writes
+  outright (`oversized_inline_write`: here-doc payload or long redirect over 1200 chars) with an
+  error naming `write_file` and the path. It is a legibility limit, not a sandbox rule -
+  `write_file` takes far more - and it is narrow on purpose: only a redirection in the command
+  *head* counts as a target, so a `python3 - <<'PY'` body full of `>` is not mistaken for a file
+  write, and `/dev/null` is not a file.
+
+## Trap 82: `fs::read("/dev/urandom")` is not reading a file
+
+A helper needed sixteen random bytes and used `std::fs::read("/dev/urandom")`. That call
+reads **to EOF**, and a character device has no EOF: the Vec grew until the kernel looked
+around for the largest other process and killed it. That process was `llama-server`, the
+inference the person was actually using. The test suite was not slow; it ate roughly the
+whole machine, and the app code path was reached from a unit test, not from the app.
+
+- Read an exact count: `File::open("/dev/urandom")?.read_exact(&mut buf)`. Same for pipes and
+  `/proc/*` files whose reported size is a lie in the other direction.
+- The rule this broke was already written down: *anything spawned for testing on this machine
+  gets a watchdog, because a model already owns most of RAM.* The build/test command itself
+  was run without one. `scripts/cargo-guard.sh` now does it: runs the command in its own
+  process group, samples the group's RSS every two seconds, and `kill -TERM` then `-KILL` the
+  whole group (killing only the cargo parent leaves `rustc` holding the gigabytes) at a
+  ceiling. Negative control: a loop that allocates 32 MB every 0.4 s is killed at 329 MB with a
+  300 MB ceiling, exit 124. A guard that has never been observed firing is decoration.
+- Prefer `cargo check -p <crate> --tests` when the goal is "does this compile". It cost
+  532 MB peak and validated the whole test module including new tests; running them is a
+  separate decision on a box this full.
+
+## Trap 83: a setting that lives only in the running app is not a setting
+
+The search provider panel had the failure mode every settings UI has: switch the live object,
+show the new value, and let the next start read the old one from disk. Two rules came out of
+building it:
+
+- **Write the file first, then move the live tool.** The other order means a refused or failed
+  write leaves the running app and `config.toml` disagreeing about which provider is on, which
+  is indistinguishable from "it saved and then forgot".
+- **Edit the file as text.** `Config::set_search_keys_in` replaces the key inside `[search]`
+  (and a *commented* one, rather than adding a live twin next to it), appends the section when
+  it is missing, and never touches a same-named key in another section. Re-serialising would
+  have thrown away the comments people leave in their own config. Pinned by round-trip tests:
+  what the panel wrote must parse back to the same backend.
+- **The panel must report the engine, not the config it last wrote.** `describe()` and
+  `AutoStatus` come from the live tool, so "auto with no container runtime" and "auto with a
+  running instance" are different sentences. And when the managed provider fails, the tool
+  result itself starts with a note naming the fallback, so the model cannot report "I searched
+  the web" about a provider nobody chose.
+- **`auto` does not uninstall anything when turned off.** Disabling a feature is not licence
+  to delete a container the person may have started themselves; the idle reaper stops it, and
+  that is all.
+
+## Trap 84: a second question overwrote the first, and a detached transcript measured zero
+
+Two failures that both came from assuming a thing that had already stopped being true.
+
+**The terminal had one slot for a question.** `ask_user` can now ask 2-4 questions in one
+call, and the engine sends them together. The TUI held `pending_q: Option<...>` and
+assigned into it, so question two replaced question one and the dropped `oneshot::Sender`
+read to the engine as "the user cancelled" - the whole set collapsed because the terminal
+had nowhere to put the second question. Any client that keeps exactly one of something must
+say what happens to the second one. Now: a `VecDeque` tail, one on screen at a time, a title
+that admits more are waiting, and expiry that removes a *queued* question too, so the
+terminal never prompts about a call that has already returned.
+
+**The harness measured a transcript that was not in the document.** Synthetic blocks are
+painted into the live transcript. When the view was a draft or the empty screen, that
+transcript was detached, every `getBoundingClientRect()` read 0, and one slow turn turned
+into seven failures about CSS: "expanded thinking block has no width: 0", "answer label is
+no longer outdented: head 0 body 0". The premise of a geometry check is not just that the
+window is on screen; it is that the element is in the document. Three changes:
+
+- `offScreen()` now treats a *missing* `.transcript` as unmeasurable, and says which of the
+  three causes it looks like (empty screen mounted over it, zero-size viewport, no layout pass).
+- The run opens a session with history before the layout stretch (`ensureTranscriptMounted`).
+- Each geometry check verifies the premise *where it measures* and logs a named skip; the
+  summary refuses to call a run clean when 4+ checks were skipped.
+
+The same reasoning applies to the frame clock: a page with nothing streaming is the machine's
+own ceiling, so the cadence check now samples that baseline too and, when the box is starved
+(a model on nine cores), judges streaming against idling instead of against 60 Hz. Absolute
+thresholds on a contended machine measure the contention.

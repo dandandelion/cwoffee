@@ -2,24 +2,22 @@
 //!
 //! This lives in the engine rather than the UI for the same reason the workspace
 //! rules do: the UI is not the only client, and a "share" button that only behaves
-//! in one of them is three behaviours to keep correct. It also means the file lands
-//! where the engine says files land - inside the workspace, with the same
-//! containment check every other writer pays - and comes back as an ordinary
-//! `OutputFile`, so the chip, the opener and the "click to look at it" path are all
-//! already built.
+//! in one of them is three behaviours to keep correct. The engine builds the
+//! document and hands it back; it does not write it anywhere.
+//!
+//! An earlier version wrote the file into `<workspace>/exports/` and returned an
+//! `OutputFile`, which made a share indistinguishable from model output: a chip in
+//! the conversation, a file in the folder the tools work in, and a later turn
+//! reading or "cleaning up" a document nobody had asked to create. Where the bytes
+//! go is the human's decision — the desktop opens a save dialog, a browser
+//! downloads — and the conversation stays free of anything the model can trip over.
 //!
 //! Reasoning text is deliberately left out. The header says how long the model
 //! thought; the text itself is draft prose, often the bulk of the file, and a
 //! document you send to someone is not where you want it.
 
-use std::path::{Path, PathBuf};
-
+use serde::{Deserialize, Serialize};
 use crate::store::StoredMessage;
-use crate::tools::path;
-use crate::tools::OutputFile;
-
-/// Folder inside the workspace that holds exports. Created on demand.
-pub const EXPORT_DIR: &str = "exports";
 
 /// Slug for a filename, from a session title that may be any language, emoji, or
 /// 300 characters of a first message. Filenames are not allowed to be the reason
@@ -214,39 +212,22 @@ pub fn markdown_document(
     }
     out
 }
+/// The document behind "Share as Markdown": a suggested file name and the text,
+/// written nowhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareDoc {
+    /// Suggested file name, safe to pre-fill a save dialog with: the session
+    /// title slugged, plus a timestamp so two shares of one conversation are
+    /// two files rather than one overwrite.
+    pub name: String,
+    pub markdown: String,
+}
 
-/// Write the document into `<workspace>/exports/`, never overwriting anything.
-///
-/// The name is derived from the session title, which is model- and user-authored
-/// text: it has to be confined like any other tool argument, and it must not be
-/// able to walk out of the workspace with `../` or an absolute path. Collisions get
-/// a counter rather than a clobber, because the file people are sharing is the one
-/// they may have edited by hand since.
-pub fn write_export(
-    workspace: &Path,
-    title: &str,
-    msgs: &[StoredMessage],
-) -> Result<OutputFile, String> {
-    let dir = path::confine(workspace, EXPORT_DIR)?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {EXPORT_DIR}: {e}"))?;
-
-    let base = format!("{}-{}", slug(title), stamp());
-    let mut candidate: PathBuf = dir.join(format!("{base}.md"));
-    let mut n = 2;
-    while candidate.exists() {
-        if n > 999 {
-            return Err(format!("too many exports named {base}; rename one first"));
-        }
-        candidate = dir.join(format!("{base}-{n}.md"));
-        n += 1;
+pub fn share_document(title: &str, workspace: &str, msgs: &[StoredMessage]) -> ShareDoc {
+    ShareDoc {
+        name: format!("{}-{}.md", slug(title), stamp()),
+        markdown: markdown_document(title, workspace, msgs),
     }
-    // Belt and braces: the name is built from user text, and a filename containing
-    // a separator has to be caught before it reaches the filesystem.
-    let rel = path::confine(workspace, &candidate.to_string_lossy())?;
-
-    let body = markdown_document(title, &workspace.display().to_string(), msgs);
-    std::fs::write(&rel, body.as_bytes()).map_err(|e| format!("cannot write export: {e}"))?;
-    Ok(OutputFile::from_path(workspace, &rel))
 }
 
 #[cfg(test)]
@@ -288,7 +269,7 @@ mod tests {
             { "name": "write_file", "arguments": "{\"path\":\"notes/x.md\"}" }
         ])
         .to_string();
-        a.files = vec![OutputFile {
+        a.files = vec![crate::tools::OutputFile {
             path: "notes/x.md".into(),
             name: "x.md".into(),
             mime: "text/markdown".into(),
@@ -342,32 +323,38 @@ mod tests {
     }
 
     #[test]
-    fn a_title_that_tries_to_escape_stays_in_the_workspace() {
-        let base = ws("escape");
+    fn a_share_name_is_a_plain_file_name_whatever_the_title_is() {
+        // The name goes into a save dialog, so a title full of separators must
+        // not become a path. There is no workspace to escape into any more.
         let rows = [msg("user", "hi"), msg("assistant", "yo")];
-        let out = write_export(&base, "anything", &rows).unwrap();
-        let abs = base.join(&out.path);
-        assert!(abs.starts_with(&base), "{}", abs.display());
-        assert!(out.path.starts_with("exports/"), "{}", out.path);
-        let _ = std::fs::remove_dir_all(&base);
+        for title in ["../../etc/passwd", "a/b\\c", "", "  ", "Coffee, tea & the ★ thing"] {
+            let d = share_document(title, "/tmp/ws", &rows);
+            assert!(!d.name.contains('/'), "name was {:?}", d.name);
+            assert!(!d.name.contains('\\'), "name was {:?}", d.name);
+            assert!(d.name.ends_with(".md"), "name was {:?}", d.name);
+            assert!(d.markdown.starts_with('#'), "document looked like {:?}", &d.markdown[..40.min(d.markdown.len())]);
+        }
     }
 
     #[test]
-    fn two_exports_of_the_same_session_do_not_clobber_each_other() {
-        let base = ws("clobber");
+    fn sharing_writes_nothing_anywhere() {
+        // The complaint this answers: a share produced a file in the workspace,
+        // which a later turn then treated like its own output. Building a share
+        // document must leave the filesystem alone.
+        let base = ws("share-leaves-nothing");
         let rows = [msg("user", "hi"), msg("assistant", "yo")];
-        let first = write_export(&base, "same title", &rows).unwrap();
-        let second = write_export(&base, "same title", &rows).unwrap();
-        assert_ne!(first.path, second.path, "{} == {}", first.path, second.path);
-        assert!(std::fs::metadata(base.join(&first.path)).is_ok());
-        assert!(std::fs::metadata(base.join(&second.path)).is_ok());
+        let before = std::fs::read_dir(&base).map(|d| d.count()).unwrap_or(0);
+        let d = share_document("a conversation", &base.display().to_string(), &rows);
+        assert!(d.markdown.contains("yo"));
+        let after = std::fs::read_dir(&base).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(before, after, "sharing created files in {}", base.display());
         let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The store is the only source: an export has to contain what a reopened
     /// session shows, or "share" quietly exports less than the user can see.
     #[test]
-    fn an_export_covers_what_the_store_holds() {
+    fn a_share_covers_what_the_store_holds() {
         use crate::provider::Message;
         let store = Store::in_memory().unwrap();
         let sid = store.create_session("Notes", "/tmp", "m").unwrap();
@@ -376,11 +363,9 @@ mod tests {
             .append_message(sid, &Message::assistant("here it is"))
             .unwrap();
         let rows = store.messages(sid).unwrap();
-        let base = ws("store");
-        let out = write_export(&base, "Notes", &rows).unwrap();
-        let body = std::fs::read_to_string(base.join(&out.path)).unwrap();
-        assert!(body.contains("make a list"));
-        assert!(body.contains("here it is"));
-        let _ = std::fs::remove_dir_all(&base);
+        let doc = share_document("Notes", "/tmp", &rows);
+        assert!(doc.name.starts_with("notes-"), "name was {:?}", doc.name);
+        assert!(doc.markdown.contains("make a list"));
+        assert!(doc.markdown.contains("here it is"));
     }
 }
