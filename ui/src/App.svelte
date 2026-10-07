@@ -2213,39 +2213,58 @@
       // Measured, not merely present: the empty screen can leave the transcript in the
       // document with a zero box, which measures exactly as badly as being absent.
       if ((document.querySelector('.transcript')?.getBoundingClientRect().width ?? 0) >= 50) return true
-      const sessions = await invoke<Session[]>('list_sessions')
+      const reopen = async (id: number, how: string) => {
+        const err = await invoke('switch_session', { id }).then(() => null, (e) => String(e))
+        // The RPC moves the host; `openSession` moves the *view*, which is what these
+        // checks need. Doing only the first left the app showing a draft with the host
+        // pointed somewhere else, and the scroller stayed `display: none`.
+        await openSession(id).catch(() => {})
+        // History paints into the transcript asynchronously. A check that clears the
+        // transcript and writes its own blocks must not race that paint, or the element
+        // it measures is a history row that arrives afterwards - which is exactly how
+        // "expanded thinking block has no width: 0" came back even with the view open.
+        await waitFor('history to paint', () => document.querySelectorAll('.turn').length > 0, 4000)
+        await new Promise<void>((r) => requestAnimationFrame(() => r()))
+        // Width, not presence: the transcript element stays in the document while the
+        // empty screen is up, and a 0x0 box measures just as uselessly as none.
+        const ok = await waitFor(
+          'a laid-out transcript',
+          () => (document.querySelector('.transcript')?.getBoundingClientRect().width ?? 0) >= 50,
+          4000,
+        )
+        pageLog(
+          `selftest note: ${how} session ${id} for the layout checks: laid out=${ok}, ` +
+            `viewId=${viewId}, msgs=${viewMsgCount}, busy=${busy}, turns=${document.querySelectorAll('.turn').length}` +
+            `${err ? `, switch failed: ${err}` : ''}`,
+        )
+        return ok
+      }
       // A session with messages, not merely the first row. An empty session keeps the
       // empty screen up, the scroller stays `display: none`, and every rect still
       // reads 0: opening "a session" is not the premise, opening one that renders is.
+      const sessions = await invoke<Session[]>('list_sessions')
       const back = sessions.find((s) => s.message_count > 0)?.id
-      if (back === undefined) return false
-      const err = await invoke('switch_session', { id: back }).then(
-        () => null,
-        (e) => String(e),
-      )
-      // The RPC moves the host; `openSession` moves the *view*, which is what these
-      // checks need. Doing only the first left the app showing a draft with the host
-      // pointed somewhere else, and the scroller stayed `display: none`.
-      await openSession(back).catch(() => {})
-      // History paints into the transcript asynchronously. A check that clears the
-      // transcript and writes its own blocks must not race that paint, or the element
-      // it measures is a history row that arrives afterwards - which is exactly how
-      // "expanded thinking block has no width: 0" came back even with the view open.
-      await waitFor('history to paint', () => document.querySelectorAll('.turn').length > 0, 4000)
-      await new Promise<void>((r) => requestAnimationFrame(() => r()))
-      // Width, not presence: the transcript element stays in the document while the
-      // empty screen is up, and a 0x0 box measures just as uselessly as none.
-      const ok = await waitFor(
-        'a laid-out transcript',
-        () => (document.querySelector('.transcript')?.getBoundingClientRect().width ?? 0) >= 50,
-        4000,
-      )
-      pageLog(
-        `selftest note: reopened session ${back} for the layout checks: laid out=${ok}, ` +
-          `viewId=${viewId}, msgs=${viewMsgCount}, busy=${busy}, turns=${document.querySelectorAll('.turn').length}` +
-          `${err ? `, switch failed: ${err}` : ''}`,
-      )
-      return ok
+      if (back !== undefined) return reopen(back, 'reopened')
+      // A scratch store (scripts/selftest.sh runs against a throwaway data dir) starts
+      // empty, so there is nothing to reopen and the run used to abort having measured
+      // nothing. Make the content instead: one scripted turn, and the checks get the
+      // same premise they get everywhere else.
+      const st0 = await invoke<HostState>('session_state')
+      await invoke('start_turn', {
+        text: 'Selftest wipe check: reply with the single word ok.',
+        session: 0,
+      }).catch((e) => pageLog(`selftest note: could not start the bootstrap turn: ${e}`))
+      for (let i = 0; i < 120; i++) {
+        const st = await invoke<HostState>('session_state')
+        if (st.turns > st0.turns) break
+        await new Promise((r) => setTimeout(r, 250))
+      }
+      const made = (await invoke<Session[]>('list_sessions')).find((s) => s.message_count > 0)?.id
+      if (made === undefined) {
+        pageLog('selftest note: no session with content, and the bootstrap turn produced none')
+        return false
+      }
+      return reopen(made, 'created')
     }
     // Geometry checks are only meaningful while the page is being laid out. The
     // window can leave that state halfway through a run - minimized, occluded,
@@ -2258,7 +2277,15 @@
     // serves someone else: a ~2k-token prompt then needs three minutes of prefill
     // alone, and every check that needs a completed turn fails in a chain. Attribute
     // first, then skip by name, then refuse to call the run clean.
+    // scripts/mock-llm.mjs advertises itself: model id `cwoffee-mock`, build_info
+    // `cwoffee-mock ...`. Under a scripted endpoint there is no prefill to blame -
+    // it answers in milliseconds and plays the same scenario every run - so a turn
+    // that cannot finish is ours, and behaviour that used to be a coin flip
+    // ("did the model call the tool?") can be asserted instead of excused.
+    const scriptedEndpoint = () =>
+      models.some((m) => m.id === 'cwoffee-mock' || (m.server ?? '').startsWith('cwoffee-mock'))
     const endpointTooSlow = async (where: string) => {
+      if (scriptedEndpoint()) return false
       if (lastPrefill === null || lastPrefill >= 50) return false
       endpointSkips++
       pageLog(
@@ -2455,13 +2482,36 @@
       // purpose: a phone tab browsing history must not be able to redirect
       // where the next turn goes. invoke() resolving only proves the command
       // was accepted, so the observable effects are what gets asserted.
-      const stNow = await invoke<HostState>('session_state')
+      let stNow = await invoke<HostState>('session_state')
       // Exclude the view as well as the host session: comparing a session against
       // itself is how this step reported "DOM unchanged" while doing nothing.
-      const other = after.find(
-        (s) => s.id !== stNow.session_id && s.id !== viewId && (s.message_count ?? 0) > 0,
-      )
-      if (!other) fail('no stored session with messages available to open')
+      const eligible = (list: Session[], hostId: number) =>
+        list.find((s) => s.id !== hostId && s.id !== viewId && (s.message_count ?? 0) > 0)
+      let other = eligible(after, stNow.session_id)
+      if (!other) {
+        // The premise, not the assertion: a scratch store (scripts/selftest.sh runs
+        // against a throwaway data dir) starts with whatever one turn the harness had
+        // to create for layout, so "some other session with messages" has to be made
+        // rather than hoped for.
+        const madeBefore = (await invoke<HostState>('session_state')).turns
+        newSession()
+        await invoke('start_turn', {
+          text: 'Selftest wipe check: reply with the single word ok.',
+          session: 0,
+        }).catch(() => {})
+        for (let i = 0; i < 120; i++) {
+          const stt = await invoke<HostState>('session_state')
+          if (stt.turns > madeBefore) break
+          await new Promise((r) => setTimeout(r, 250))
+        }
+        const again = await invoke<Session[]>('list_sessions')
+        // Re-take the baseline: making the extra session moved the host, and the
+        // invariant below is "opening a conversation does not move the host from
+        // where it is now", not from where it was before the harness went fishing.
+        stNow = await invoke<HostState>('session_state')
+        other = eligible(again, stNow.session_id) ?? again.find((s) => (s.message_count ?? 0) > 0 && s.id !== viewId)
+      }
+      if (!other) fail('no stored session with messages available to open, even after making one')
       else {
         const domBefore = (rootEl?.textContent ?? '').trim()
         await openSession(other.id)
@@ -3899,6 +3949,184 @@
         })
         if (!(await waitTurnDone(cleanBefore))) pageLog('selftest: the cleanup turn did not finish')
         await invoke('set_reasoning', { level: 'medium' })
+      }
+
+      // --- what a scripted endpoint makes testable -----------------------------
+      // Everything above that needs a specific model behaviour feeds the transcript
+      // by hand, because against a live model the behaviour is a coin flip: the
+      // model may not call the tool, may call another one, may answer in prose.
+      // Under scripts/mock-llm.mjs the scenario decides what the model does, so the
+      // seams themselves get driven end to end - engine event -> App buffering ->
+      // transcript card, streamed markdown -> committed blocks, broken arguments ->
+      // repair -> run, dead stream -> a visible error - in seconds, with no prefill
+      // and nobody's prompt cache on the line.
+      if (scriptedEndpoint()) {
+        await invoke('set_mode', { mode: 'auto' })
+        await useSession(target.id)
+
+        // (a) structure while the tokens arrive, not when they stop
+        {
+          const before = await turnCount()
+          let stopped = false
+          let headingAt: number | null = null
+          let tableAt: number | null = null
+          let listAt: number | null = null
+          const sampler = (async () => {
+            while (!stopped) {
+              const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+              const body = all[all.length - 1]
+              if (body) {
+                const now = performance.now()
+                if (headingAt === null && body.querySelector('h1, h2, h3')) headingAt = now
+                if (tableAt === null && body.querySelector('table')) tableAt = now
+                if (listAt === null && body.querySelector('li')) listAt = now
+              }
+              await new Promise((r) => setTimeout(r, 40))
+            }
+          })()
+          await invoke('start_turn', {
+            text:
+              'Show me a markdown table of three brewing methods with columns Method, Grind and Time, then a bullet list.',
+            session: target.id,
+          })
+          const done = await waitTurnDone(before, 60000)
+          const endedAt = performance.now()
+          stopped = true
+          await sampler
+          const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+          const body = all[all.length - 1]
+          const rows = body ? body.querySelectorAll('table tr').length : 0
+          const items = body ? body.querySelectorAll('li').length : 0
+          // How long before the end of the turn the structure was already on screen.
+          const ago = (t: number | null) => (t === null ? -1 : Math.round(endedAt - t))
+          if (!done) fail('the scripted table turn never finished')
+          else if (!body) fail('the scripted table turn left no answer block')
+          else if (headingAt === null) fail('the heading never became a heading')
+          else if (tableAt === null) fail('the table never became a table; the answer stayed text')
+          else if (ago(tableAt) < 60)
+            fail(`the table only appeared ${ago(tableAt)}ms before turnEnd - that is at turnEnd, not during`)
+          else if (rows !== 4) fail(`the table has ${rows} rows (header counted), expected 4`)
+          else if (items !== 3) fail(`the bullet list has ${items} items, expected 3`)
+          else
+            pageLog(
+              `scripted structure ok (heading ${ago(headingAt)}ms and table ${ago(tableAt)}ms before turnEnd, ` +
+                `${rows - 1} data rows, ${items} list items)`,
+            )
+        }
+
+        // (b) one ask_user call, two questions, one card
+        {
+          const before = await turnCount()
+          await invoke('start_turn', {
+            text: 'Ask me two questions before writing the report, then write it.',
+            session: target.id,
+          })
+          let askCard: HTMLElement | null = null
+          const cardSeen = await waitFor(
+            'the scripted two-question card',
+            () => {
+              const cards = [...document.querySelectorAll('.blk-ask.is-set')] as HTMLElement[]
+              const c = cards[cards.length - 1]
+              askCard = c && c.querySelectorAll('.ask-opt').length ? c : null
+              return askCard !== null
+            },
+            60000,
+          )
+          const card = askCard as HTMLElement | null
+          if (!cardSeen || !card) {
+            fail('the scripted ask_user set produced no card: the App-side buffering never saw both questions')
+          } else {
+            const count = card.querySelector('.ask-count')?.textContent?.trim() ?? ''
+            if (!/1\s*of\s*2/.test(count)) fail(`a two-question card does not say which one it is on: "${count}"`)
+            if (card.querySelectorAll('.ask-submit').length !== 1)
+              fail(`a two-question set renders ${card.querySelectorAll('.ask-submit').length} submit buttons, expected one`)
+            const pick = (i: number) => {
+              const opts = [...card.querySelectorAll('.ask-opt')] as HTMLElement[]
+              if (!opts.length) fail('the question pane has no options to pick')
+              else opts[Math.min(i, opts.length - 1)].click()
+            }
+            const next = () => (card.querySelector('.ask-next') as HTMLElement | null)?.click()
+            pick(0)
+            await new Promise((r) => setTimeout(r, 90))
+            if (!card.querySelector('.ask-next')) fail('a two-question card has no Next control')
+            next()
+            await new Promise((r) => setTimeout(r, 120))
+            pick(1)
+            await new Promise((r) => setTimeout(r, 90))
+            const back = card.querySelector('.ask-back') as HTMLElement | null
+            if (!back) fail('a two-question card has no Back control')
+            else {
+              back.click()
+              await new Promise((r) => setTimeout(r, 120))
+              const kept = card.querySelectorAll('.ask-opt.is-sel, .ask-opt[aria-checked="true"]').length
+              if (kept !== 1) fail(`navigating back lost the first answer (${kept} still selected)`)
+              next()
+              await new Promise((r) => setTimeout(r, 120))
+            }
+            ;(card.querySelector('.ask-submit') as HTMLElement)?.click()
+            await new Promise((r) => setTimeout(r, 250))
+            const done = await waitTurnDone(before, 60000)
+            if (!card.classList.contains('answered')) fail('submitting a set left the card interactive')
+            else if (card.querySelector('.ask-opt') || card.querySelector('.ask-submit'))
+              fail('a settled set still carries controls the user could press again')
+            const pairs = [...card.querySelectorAll('.ask-qa-item')]
+            const receipt = card.querySelector('.ask-answered')?.textContent?.trim() ?? ''
+            const answers = pairs.map((r) => r.querySelector('.ask-qa-a')?.textContent?.trim() ?? '')
+            const questions = pairs.map((r) => r.querySelector('.ask-qa-q')?.textContent?.trim() ?? '')
+            if (!done) fail('the turn after the scripted questions never finished')
+            else if (pairs.length !== 2) fail(`the settled set shows ${pairs.length} question/answer pairs, expected 2`)
+            else if (!answers.every((a) => a.length > 0)) fail(`a settled answer is blank: ${JSON.stringify(answers)}`)
+            else if (!/answered 2 of 2/.test(receipt)) fail(`the settled card reads "${receipt}"`)
+            else
+              pageLog(
+                `scripted ask set ok (one tool call, two questions, one card; settled "${receipt}": ` +
+                  `${questions.map((q, i) => `${q} -> ${answers[i]}`).join(' | ').slice(0, 160)})`,
+              )
+          }
+        }
+
+        // (c) arguments a quantised model mangled: repaired, run, and admitted
+        {
+          const errs: string[] = []
+          const restore = beginEventTap((e) => {
+            if (e.kind === 'error') errs.push(e.d.message)
+          })
+          const before = await turnCount()
+          await invoke('start_turn', {
+            text: 'Call a tool with arguments that are missing a brace.',
+            session: target.id,
+          })
+          const done = await waitTurnDone(before, 60000)
+          restore()
+          const said = errs.filter((m) => /repaired malformed arguments/i.test(m))
+          const tools = [...document.querySelectorAll('.blk-tool')]
+          if (!done) fail('the broken-arguments turn never finished')
+          else if (!said.length)
+            fail(`a braceless tool call ran without the engine saying so; events: ${JSON.stringify(errs).slice(0, 200)}`)
+          else if (!tools.length) fail('the repaired call left no tool card in the transcript')
+          else pageLog(`scripted repair ok (${said[0].slice(0, 96)})`)
+        }
+
+        // (d) a stream that dies mid-answer must be reported, not truncated quietly
+        {
+          const errs: string[] = []
+          const restore = beginEventTap((e) => {
+            if (e.kind === 'error') errs.push(e.d.message)
+          })
+          const before = await turnCount()
+          await invoke('start_turn', {
+            text: 'Answer and then stop halfway through the tokens.',
+            session: target.id,
+          })
+          const done = await waitTurnDone(before, 40000)
+          restore()
+          const died = errs.filter((m) => /transport|connection|stream|closed|interrupt|eof/i.test(m))
+          if (!died.length)
+            fail(`an endpoint that dropped mid-stream surfaced nothing to the user; events: ${JSON.stringify(errs).slice(0, 200)}`)
+          else pageLog(`scripted dead stream ok (${died[0].slice(0, 96)}; turn ended=${done})`)
+        }
+
+        await sweepSelftest('after the scripted turns')
       }
 
       // --- a finished card is one line of English, and nothing else ------------

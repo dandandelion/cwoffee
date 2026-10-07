@@ -9,7 +9,12 @@ Measured on this box (Fedora, Intel iGPU + NVIDIA, llama.cpp on :8090).
 VITE_AUTOTURN=1 ./scripts/dev.sh       # streams a turn on launch, no clicking
 VITE_AUTOTURN_PROMPT='...' ./scripts/dev.sh
 VITE_SELFTEST=1 ./scripts/dev.sh       # exercises session create/rename/delete/search end-to-end
+./scripts/dev.sh --mock                # same, against scripts/mock-llm.mjs: no model, no prefill
+./scripts/selftest.sh                  # the full harness: builds, runs, prints the verdict
 ```
+
+The self-test defaults to the scripted endpoint (`docs/TESTING.md`). Point it at a real model with
+`--real-endpoint URL`, and it will tell you what that costs before doing it.
 
 `dev.sh` is the only supported way to run the dev build. It exports the Mesa pin
 before anything touches EGL; running `tauri dev` by hand gets an NVIDIA context.
@@ -1770,3 +1775,76 @@ The same reasoning applies to the frame clock: a page with nothing streaming is 
 own ceiling, so the cadence check now samples that baseline too and, when the box is starved
 (a model on nine cores), judges streaming against idling instead of against 60 Hz. Absolute
 thresholds on a contended machine measure the contention.
+
+---
+
+### Trap 85: a test suite that spends the user's prompt cache is not a free test
+
+The in-app harness drove the real llama.cpp endpoint. On this box that means one slot and a
+~200k-token conversation, so every self-test run evicted a warm prefix cache and then paid to
+re-ingest it: minutes of prefill, a cold next conversation, and measured prefill rates in the
+telemetry check falling to ~17 tok/s because the harness was competing with whatever the user was
+doing. Predictably, the suite started being skipped, and a skipped suite stops protecting anything.
+
+`scripts/selftest.sh` now defaults to `scripts/mock-llm.mjs`: the same SSE wire shape, no model.
+Two things it does at the same time, both of which the old setup got wrong:
+
+- **scratch homes.** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `CWOFFEE_WORKSPACE` and the gateway port
+  go into a `mktemp -d`. Probe turns used to land in the real `sessions.db` and be swept afterwards
+  by an id floor — a sweep bug was therefore invisible by construction, and one bad run left 40
+  sessions in the sidebar.
+- **it never `pkill`s your app.** It kills the PID it started; the two instances coexist because
+  neither shares a data dir.
+
+The real endpoint is still reachable and still has to be chosen with eyes open:
+
+```bash
+./scripts/selftest.sh --real-endpoint http://127.0.0.1:8090/v1   # prints the cost first
+```
+
+### Trap 86: a mock that answers anything turns a broken test into a passing one
+
+The first version of a scripted endpoint that "just returns something sensible" is worse than no
+mock: the harness would keep passing while the prompt it sent matched nothing it was written for.
+Three rules in `scripts/mock-llm.mjs` exist for that:
+
+- **no scenario → HTTP 400 naming the prompt**, and the engine surfaces it as a turn error. The
+  engine integration test for this is `an_unscripted_prompt_is_an_error_rather_than_a_plausible_stub`.
+- **scenario exhausted → 400.** If the loop asks for step 3 of a two-step scenario, something is
+  spinning; answering with prose hides it.
+- **`enable_thinking: false` actually suppresses reasoning deltas.** A mock that ignored the flag
+  would silently stop testing the flag.
+
+`GET /mock/state` prints per-scenario hits and misses at the end of every run, and *no unmatched
+prompts* is the line that catches a harness prompt that drifted.
+
+The mock also caught a real mistake in my own scenario file: `ask_user` options are
+`{"label": "...", "note": "..."}` objects, not bare strings. Against the real model I would never
+have seen it — the model formats its own options — but the scripted call reported
+`ask_user: every option needs a non-empty "label"` as a tool result, and the turn carried on as if
+nothing had happened. Which is its own lesson: **a canned scenario's tool arguments are a wire
+contract test**, and they have to satisfy the same schema a model's do.
+
+### Trap 87: the harness's own premise-fixing can break the invariant it is checking
+
+`SELFTEST FAIL: opening a session moved the host: 3 -> 4` looked like a regression in view/host
+ownership, which is a real invariant (a click must not relocate where the next turn goes). It wasn't.
+The check first needs *another session with messages* to open; on a scratch store there isn't one, so
+the check now makes one — and making one moves the host. The baseline (`session_id` before opening)
+had been captured before that step, so the check compared the host against where it used to be and
+reported its own setup as a bug.
+
+Rule: **re-read the baseline after you create the thing the check needs.** Same shape as the geometry
+checks measuring nodes their own recovery had detached — a premise fix is a state change, and state
+changes move baselines.
+
+Two smaller ones from the same batch:
+
+- **A mock left listening is a mock with stale data.** `selftest.sh` reuses port 8190; an earlier
+  manual instance answered health checks while serving the `scenarios.json` it had read an hour
+  before, so a scenario added in between did not exist as far as the run was concerned. The script
+  now refuses to start if something already answers on its port, and the mock refuses to bind at all
+  rather than fail with a stack trace.
+- **A scratch store breaks "there is obviously some session around" assumptions.** Several checks
+  quietly depended on the user's history being present. With an empty store they have to create the
+  state they need, which is slower to write and much harder to get wrong later.

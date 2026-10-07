@@ -637,3 +637,87 @@ to measure ≥50px. And the premise is checked *before* a check paints what it i
 three runs of "expanded thinking block has no width: 0" came from the recovery itself wiping the
 transcript after the nodes had been captured, which a `selftest diag` line proved by printing the
 ancestor chain and whether the node was under `.transcript` at all.
+
+---
+
+## Batch: the harness stopped paying for prefill
+
+### Why this one is measured at all
+
+The in-app harness drove the user's llama.cpp endpoint. That endpoint has **one slot** and carries a
+~200k-token conversation, so every self-test run evicted a warm prefix cache and made the *next real
+conversation* pay to re-ingest it. Under contention on this box, measured prefill dropped to
+**17 tok/s** (`selftest note: the endpoint prefills at 17.0 tok/s`), which turned a ~2k-token harness
+prompt into ~2 minutes per turn and produced cascades of turn-dependent failures that were really
+one cache miss.
+
+### What replaced it, and what it costs
+
+`scripts/mock-llm.mjs` answers in llama.cpp's wire shape from `tests/scenarios/scenarios.json`;
+`scripts/selftest.sh` starts it, points the app at it with a scratch config/data/workspace and its own
+gateway port, and reports the mock's own activity table afterwards.
+
+| suite | model | result |
+|---|---|---|
+| `cargo test -p cwoffee-engine --test mock_endpoint` | scripted HTTP | **7 passed, 0 failed in 0.57s** (mock at `--speed 0.2`) |
+| `cargo test -p cwoffee-engine --lib tools::ask::` | in-process | 21 passed, 0.30s |
+| gateway / app / markdown / svelte-check | none | 30 / 9 passed, `markdown: all checks passed`, 0 errors 0 warnings |
+| full in-app harness (`./scripts/selftest.sh`) | scripted HTTP | **SELFTEST ok: 24 requests, 24 turns served, 16 distinct scenarios, no unmatched prompts** |
+
+Turn latency under the mock, from the harness's own turn lines: a streamed 1.4k-character answer with
+a heading and four paragraphs takes **~2.2s wall** at the script's pacing (7 chars/11ms), and the
+provider's first delta arrives in **single-digit milliseconds** — the shape the streaming checks need,
+with no prefill at any point.
+
+What that does to the frame clock, measured in the same run against the idle baseline:
+
+| sample | median | p95 | worst | verdict |
+|---|---|---|---|---|
+| idle, nothing streaming | 17.0ms | 17.0ms | — | baseline |
+| while a scripted turn streams | **17.0ms** | **24.0ms** | 28.0ms | `frame cadence ok` against the absolute 60 Hz thresholds |
+| while a *real* turn streams (previous batch, same box) | 41–44ms | ~114ms | ~144ms | judged against the baseline, because the model held nine cores |
+
+So the streaming renderer was never the problem: with the same page and the same machine, replacing
+the model with a script returned the frame clock to 60 Hz. That is also why the cadence check can now
+run at its absolute thresholds instead of leaning on attribution.
+
+Structure arriving mid-stream, from the scripted table turn (`heading 500ms and table 200ms before
+turnEnd, 3 data rows, 3 list items`) — against a live model this check could only ever be a guess.
+
+### The mock's own footprint
+
+| measure | value |
+|---|---|
+| process | one node process, stdlib only |
+| RSS after three streamed turns (incl. the 1.4k-character four-paragraph answer) | **3.9 MB** |
+| listening | 127.0.0.1 only; refuses any other bind (a mock has no auth) |
+| scenario file | 18 scenarios, read once at start-up |
+
+That last row is why `selftest.sh` refuses to start when something already answers on its port: a
+mock left running from an earlier run serves the scenario file it read an hour ago, and a run against
+it silently ignores every scenario added since. One such run reported `no scenario for this prompt`
+for a scenario that existed in the repo.
+
+### The bug the scripted endpoint found, in the app rather than in the tests
+
+`ask_user` multi-question sets never reached the UI. The engine's `Question` struct carried
+`set: {id, index, total}`, `EngineEvent::QuestionRequested` did not have the field, and
+`host::question_event()` — the single function the desktop and the gateway both use to build that
+event — silently dropped it. So a two-question call rendered as two unrelated popups, while every
+engine test passed and the synthetic UI test passed too, because it called
+`transcript.showQuestionSet()` directly instead of going through the wire.
+
+Pinned at the seam where it broke, in `host.rs`:
+
+```
+host::question_wire_tests::a_question_event_carries_the_set_it_was_asked_in ... ok
+host::question_wire_tests::a_single_question_event_omits_the_set_key_entirely ... ok
+```
+
+The second one matters as much as the first: a single question's JSON must not grow a `set` key,
+because that shape is what every existing client renders.
+
+And the mock caught a second, dumber mistake of mine: `ask_user` options are
+`{label, detail}`, and my first scenarios sent `{label, note}` — serde ignored the unknown key, the
+tool refused the call with `every option needs a non-empty "label"`, and the model carried on as if
+nothing had happened. Canned tool arguments are a wire-contract test, not decoration.

@@ -1042,6 +1042,58 @@ pub fn question_event(q: &crate::tools::ask::Question) -> EngineEvent {
         options: q.options.clone(),
         recommended: q.recommended,
         allow_custom: q.allow_custom,
+        // The set marker has to travel. Dropping it here is what made a two-question
+        // `ask_user` render as two separate popups on the desktop while the engine
+        // believed it had sent one card.
+        set: q.set.clone(),
+    }
+}
+
+#[cfg(test)]
+mod question_wire_tests {
+    use super::*;
+    use crate::tools::ask::{Question, QuestionOption, QuestionSet};
+
+    /// The set marker is the difference between one card with Back/Next and N
+    /// unrelated popups, and the only place it can be lost is here: the desktop and
+    /// the gateway both build their question event through this function, so a
+    /// forgotten field is invisible inside the engine and unfixable in the UI.
+    #[test]
+    fn a_question_event_carries_the_set_it_was_asked_in() {
+        let q = Question {
+            id: 7,
+            question: "How long should it be?".into(),
+            options: vec![QuestionOption { label: "Half a page".into(), detail: None }],
+            recommended: Some(0),
+            allow_custom: true,
+            multi: false,
+            set: Some(QuestionSet { id: 42, index: 1, total: 2 }),
+        };
+        match question_event(&q) {
+            EngineEvent::QuestionRequested { id, set, .. } => {
+                assert_eq!(id, 7);
+                let s = set.expect("a set question must say which set it belongs to");
+                assert_eq!((s.id, s.index, s.total), (42, 1, 2));
+            }
+            other => panic!("expected a question event, got {other:?}"),
+        }
+    }
+
+    /// A single question keeps the shape it always had: no `set` key on the wire.
+    #[test]
+    fn a_single_question_event_omits_the_set_key_entirely() {
+        let q = Question {
+            id: 8,
+            question: "Which format?".into(),
+            options: vec![QuestionOption { label: "PDF".into(), detail: None }],
+            recommended: None,
+            allow_custom: false,
+            multi: false,
+            set: None,
+        };
+        let json = serde_json::to_string(&question_event(&q)).unwrap();
+        assert!(json.contains(r#""id":8"#), "{json}");
+        assert!(!json.contains("set"), "a single question grew a wire field: {json}");
     }
 }
 

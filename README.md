@@ -53,6 +53,7 @@ allow-list, count and byte caps, enforced by the engine rather than the UI).
 Gates:
 
 ```bash
+./scripts/selftest.sh                    # the in-app harness, against a scripted endpoint
 ./scripts/memory.sh cwoffee-app 400      # PSS, includes WebKit children
 ./scripts/gpu-check.sh cwoffee-app       # must hold renderD128 only
 ./scripts/sandbox-probe.sh             # re-run after any bwrap/kernel upgrade
@@ -64,12 +65,21 @@ the `[cwoffee/page]` lines. It asserts the streaming contract in the real webvie
 reveal, layout-neutral commit, markdown before `turnEnd`, follow without lurches, and that no
 entry animation ever restarts on content already on screen.
 
+It runs against **a scripted endpoint by default**, not your model: `scripts/mock-llm.mjs` answers
+from `tests/scenarios/scenarios.json` in llama.cpp's wire shape, so the SSE parser, tool loop,
+repair, approvals and telemetry are all exercised while your 200k-token prefix cache sits untouched.
+It also gets its own config dir, data dir, workspace and gateway port, so a test run leaves nothing
+in your sessions list. The real endpoint is opt-in and says what it costs:
+`./scripts/selftest.sh --real-endpoint http://127.0.0.1:8090/v1`. See
+[`docs/TESTING.md`](docs/TESTING.md).
+
 ## Docs
 
 | File | What |
 |---|---|
 | [`PLAN.md`](PLAN.md) | thesis, architecture, v1 scope, milestones, memory budget, perf rules, risks |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | every measured number and the command that reproduces it |
+| [`docs/TESTING.md`](docs/TESTING.md) | what each suite covers, the scripted endpoint, and when to spend a real prefill |
 | [`SETUP.md`](SETUP.md) | what's installed, what still needs `sudo`, endpoint details |
 | [`config/cwoffee.toml.example`](config/cwoffee.toml.example) | providers, models, context budget, sandbox policy |
 

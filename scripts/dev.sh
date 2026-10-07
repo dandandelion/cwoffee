@@ -20,6 +20,35 @@ export __GLX_VENDOR_LIBRARY_NAME=mesa
 
 cd "$(dirname "$0")/.."
 
+# --- --mock: a scripted endpoint, so dev runs cost no prefill ------------------
+# The dev build otherwise uses the endpoint in ~/.config/cwoffee/config.toml,
+# which on this box is a single-slot 200k-token llama.cpp. Pointing it at
+# scripts/mock-llm.mjs makes `VITE_SELFTEST=1 ./scripts/dev.sh --mock` a harness
+# run that touches neither the model nor the prompt cache.
+MOCK_PID=""
+cleanup() { [ -n "$MOCK_PID" ] && kill "$MOCK_PID" >/dev/null 2>&1 || true; }
+trap cleanup EXIT INT TERM
+
+ARGS=()
+for a in "$@"; do
+  if [ "$a" = "--mock" ]; then
+    MOCK_PORT=${CWOFFEE_MOCK_PORT:-8190}
+    node "$(dirname "$0")/mock-llm.mjs" --port "$MOCK_PORT" >/dev/null 2>&1 &
+    MOCK_PID=$!
+    for _ in $(seq 1 40); do
+      curl -fsS "http://127.0.0.1:${MOCK_PORT}/health" >/dev/null 2>&1 && break
+      sleep 0.2
+    done
+    curl -fsS "http://127.0.0.1:${MOCK_PORT}/health" >/dev/null 2>&1 \
+      || { echo "dev.sh: the scripted endpoint did not come up on ${MOCK_PORT}"; exit 1; }
+    export CWOFFEE_URL="http://127.0.0.1:${MOCK_PORT}/v1"
+    export CWOFFEE_MODEL=cwoffee-mock
+    echo "cwoffee dev — scripted endpoint on 127.0.0.1:${MOCK_PORT} (no prefill; scenarios in tests/scenarios/scenarios.json)"
+  else
+    ARGS+=("$a")
+  fi
+done
+
 echo "cwoffee dev — EGL pinned to: ${__EGL_VENDOR_LIBRARY_FILENAMES}"
 
 # `tauri dev` runs from crates/tauri-app so tauri.conf.json is the config root.
@@ -27,8 +56,13 @@ echo "cwoffee dev — EGL pinned to: ${__EGL_VENDOR_LIBRARY_FILENAMES}"
 # cargo-tauri rebuild on every version bump.
 TAURI_BIN="$(cd "$(dirname "$0")/.." && pwd)/ui/node_modules/.bin/tauri"
 
+if [ -n "${CWOFFEE_DEV_DRYRUN:-}" ]; then
+  echo "dev.sh (dry run): would exec: (cd crates/tauri-app && $TAURI_BIN dev ${ARGS[*]-})"
+  exit 0
+fi
+
 if [ -x "$TAURI_BIN" ]; then
-  ( cd crates/tauri-app && "$TAURI_BIN" dev "$@" )
+  ( cd crates/tauri-app && "$TAURI_BIN" dev "${ARGS[@]+"${ARGS[@]}"}" )
 else
   echo "dev.sh: tauri CLI not found at $TAURI_BIN"
   echo "        run: (cd ui && npm install)"

@@ -1793,34 +1793,6 @@ mod tests {
         assert_eq!(ghost.as_bool(), Some(false));
     }
 
-    /// Drive one RPC over an already-attached socket, skipping pushed events.
-    async fn rpc_over(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-        cmd: &str,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        use futures_util::StreamExt;
-        ws.send(txt(serde_json::json!({ "id": 4242, "cmd": cmd, "args": args }).to_string()))
-            .await
-            .map_err(|e| format!("send: {e}"))?;
-        for _ in 0..500 {
-            let frame = match ws.next().await {
-                None => return Err("socket closed".into()),
-                Some(Err(e)) => return Err(format!("frame error: {e}")),
-                Some(Ok(f)) => f,
-            };
-            let text = frame.to_text().map_err(|e| format!("to_text: {e}"))?;
-            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-            if v.get("id").and_then(|x| x.as_i64()) == Some(4242) {
-                if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
-                    return Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null));
-                }
-                return Err(v.get("error").and_then(|x| x.as_str()).unwrap_or("error").to_string());
-            }
-        }
-        Err("no reply to id 4242".into())
-    }
-
     /// A client that cannot keep up used to be hung up on, exactly as if the
     /// engine had shut down. That is the worst possible thing to do to a phone:
     /// it has usually already received the `turnStart`, so it comes back with a
@@ -2388,8 +2360,8 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_releases_what_the_turn_is_parked_on() {
         let h = test_handle();
-        let (atx, mut arx) = oneshot::channel::<ApprovalAnswer>();
-        let (qtx, mut qrx) = oneshot::channel::<cwoffee_engine::tools::ask::Answer>();
+        let (atx, arx) = oneshot::channel::<ApprovalAnswer>();
+        let (qtx, qrx) = oneshot::channel::<cwoffee_engine::tools::ask::Answer>();
         h.pending.lock().unwrap().insert(11, atx);
         h.pending_questions.lock().unwrap().insert(12, qtx);
 

@@ -1078,7 +1078,7 @@ mod tests {
         };
         let (idx, iqx) = oneshot::channel::<u64>();
         let h = tokio::spawn(async move {
-            let (q1, r1) = rx.recv().await.unwrap();
+            let (_q1, r1) = rx.recv().await.unwrap();
             let (q2, r2) = rx.recv().await.unwrap();
             r1.send(Answer { text: "MD".into(), options: vec![0] }).unwrap();
             // The second stays unanswered: the watcher holds its sender past the

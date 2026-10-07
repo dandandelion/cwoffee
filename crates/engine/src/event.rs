@@ -150,6 +150,17 @@ pub enum EngineEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recommended: Option<usize>,
         allow_custom: bool,
+        /// Present when one `ask_user` call asked several questions: the shared set
+        /// id plus this question's place in it. A front end that can show one card
+        /// with Back/Next needs it, and without it a set arrives as N unrelated
+        /// popups - which is exactly what the desktop did, because the host's
+        /// `question_event` forgot the field and nothing between the engine and the
+        /// webview could invent it afterwards.
+        ///
+        /// Optional and skipped when absent: a single question keeps the byte
+        /// shape it always had.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set: Option<crate::tools::ask::QuestionSet>,
     },
 
     /// A question was answered or cleared, from any client. Every view gets

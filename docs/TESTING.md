@@ -1,0 +1,128 @@
+# Testing
+
+The rule this file exists to enforce:
+
+> **No automated test may spend the user's prompt cache.**
+
+The reference setup on this machine is a single-slot llama.cpp server holding a ~200k-token
+conversation. Every request the harness sends there evicts that context and then has to re-ingest
+it, so a test run used to cost minutes of prefill and left the next real conversation cold. Tests
+that cost the user's working session get skipped, and skipped tests rot.
+
+So: the suites run against a **scripted endpoint**, and the real endpoint is a separate, deliberate,
+loudly-labelled choice.
+
+```bash
+./scripts/selftest.sh                                  # scripted (default)
+./scripts/selftest.sh --real-endpoint http://127.0.0.1:8090/v1   # pays prefill, on purpose
+./scripts/dev.sh --mock                                # dev build against the scripted endpoint
+```
+
+The dev path is worth having: poking at the real UI by hand against the mock costs nothing, and the
+mock logs every prompt it serves, so you can watch what the engine actually sent.
+
+## What is covered where
+
+| Suite | Command | Model involved | What it can prove |
+|---|---|---|---|
+| Engine unit tests | `cargo test -p cwoffee-engine --lib` | none (in-process scripted providers) | prompt building, repair, store, sandbox policy, approvals, tool semantics |
+| Engine end-to-end | `cargo test -p cwoffee-engine --test mock_endpoint` | **scripted HTTP** | the whole loop over a real socket: SSE parsing, tool-call fragmentation, repair, ask_user sets, file stamping, telemetry, error paths |
+| Markdown | `cd ui && npx tsx scripts/md_test.ts` | none | block/inline decisions, including while streaming |
+| Types | `cd ui && npx svelte-check --workspace . --threshold error` | none | the UI compiles against the event wire types |
+| In-app harness | `./scripts/selftest.sh` | **scripted HTTP** | the real webview: reveal, commit, follow, markdown mid-stream, cards, popovers, sessions, gateway |
+| Gateway | `node scripts/gateway-smoke.mjs` | none | auth, roles, workspace rules, boot shape from a phone |
+| Search | `node scripts/search-smoke.mjs` | none (HTTP to the search provider) | provider switching and the managed SearXNG container |
+| Sandbox | `./scripts/sandbox-probe.sh` | none | bwrap still isolates after a kernel update |
+| Budgets | `./scripts/memory.sh cwoffee-app 400`, `./scripts/gpu-check.sh cwoffee-app` | — | PSS ceiling, GPU pinned to the panel's iGPU |
+
+## The scripted endpoint
+
+`scripts/mock-llm.mjs` (Node, stdlib only) answers with llama.cpp's exact wire shape:
+
+- `GET /v1/models` with `meta.n_ctx` and `architecture.input_modalities`
+- `GET /props` with `model_alias`, `build_info`, and a `chat_template` carrying the
+  `reasoning_effort not in (...)` branch the UI reads to build the thinking menu
+- `POST /v1/chat/completions` as SSE: role delta → `reasoning_content` deltas → content deltas →
+  `tool_calls` with **fragmented** `function.arguments` → finish chunk → a chunk with `usage` and
+  `timings` → `[DONE]`
+
+That is the point of doing it over HTTP rather than with an in-process fake: the engine's provider,
+`SseParser`, tool-argument accumulator, repair path and telemetry all run unmodified. A Rust fake
+would test the loop and leave the socket untested, and the socket is where the interesting failures
+live.
+
+### Scenarios
+
+Behaviour lives in `tests/scenarios/scenarios.json`. Selection is stateless:
+
+- **scenario** = the first entry whose `match` substring appears in the last user message;
+- **step** = the number of `role: tool` messages after that user message, so a tool loop advances
+  by itself, which incidentally proves the prompt builder stays append-only (each request is a
+  superset of the previous one);
+- `$path` in a tool argument expands to the last path-shaped token of the prompt, so a harness can
+  interpolate its own temp paths and the canned call still names the right file.
+
+Each step may set `reasoning`, `content`, `tool_calls`, `finish` (`stop` | `tool_calls` | `abort`),
+`chunk_chars`, `delay_ms`, and `arg_fragments`.
+
+Three deliberate behaviours:
+
+- **An unmatched prompt is an HTTP 400 naming the prompt**, not a plausible filler. A stub that is
+  almost right turns a broken test into a passing one. `--allow-unknown` exists for experiments.
+- **An exhausted scenario is an error.** If the model is asked to continue a tool loop with no
+  scripted next step, that is either a spinning loop or a scenario that needs another step; either
+  way it should not be answered with shrugs.
+- **`enable_thinking: false` suppresses reasoning deltas.** A mock that ignored that flag would
+  stop testing it.
+
+`GET /mock/state` reports requests, turns, per-scenario hits, misses, and how often thinking was off.
+`selftest.sh` prints that table at the end: *no unmatched prompts* is a load-bearing line, because a
+harness prompt that drifted out of its scenario would otherwise fail somewhere far away.
+
+### What the mock cannot prove
+
+Do not let anyone, including future-you, read these suites as evidence about model quality:
+
+- that a real model calls the right tool for a task;
+- how often a quantisation mangles tool JSON (the repair path is tested by *feeding* it garbage);
+- prefill and decode rates, TTFT, or cache-hit rates — the `timings` the mock sends are invented, and
+  the telemetry bar is showing you a shape, not a measurement;
+- that prompt bytes are byte-stable across turns against a real cache (the mock's `cached_tokens` is
+  arithmetic).
+
+Those need the real endpoint. Run `--real-endpoint` when you mean it: it prints the cost first, and
+it is the only path in the repo that touches a configured model.
+
+## Scratch homes
+
+`selftest.sh` exports `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `CWOFFEE_WORKSPACE` into a `mktemp -d`
+and uses its own gateway port. Consequences worth knowing:
+
+- probe conversations never enter your sessions list (they used to, and were swept by id afterwards —
+  which is why a sweep bug was invisible);
+- the run cannot see or damage your `config.toml`, so it is free to change mode, reasoning and model
+  mid-harness;
+- two instances coexist, so the script never `pkill`s your app — it kills only the PID it started.
+
+`--keep` leaves the scratch dirs behind when you want to inspect the DB or the workspace a test wrote.
+
+## Adding a behaviour the harness needs
+
+1. Add the prompt to the harness, and a scenario for it in `tests/scenarios/scenarios.json` with the
+   `match` substring stable under the harness's interpolation.
+2. If a test would otherwise pass on filler, the mock will 400 and the harness will fail with the
+   prompt named. Add the scenario rather than relaxing the check.
+3. Keep the pacing honest: chunk sizes and delays decide whether mid-stream checks see structure
+   arrive *during* the turn. `--speed` scales all delays; the engine integration test uses `0.2`.
+
+## Machine contention
+
+This box usually runs a 50 GB model on nine cores, so `selftest.sh` keeps two honesty rules:
+
+- the frame-cadence check compares streaming against an **idle baseline** taken in the same run, and
+  attributes long tasks to the page or to the machine (`docs/BENCHMARKS.md` has both rows);
+- geometry checks verify that the page is actually being laid out before measuring rects, and count
+  the skips. Four skipped geometry checks fail the run: a run that measured nothing is not a pass.
+
+Neither rule exists to make failures disappear. Both exist because a failure that is really about the
+machine gets ignored, and an ignored suite is a suite that stops protecting anything.
