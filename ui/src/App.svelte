@@ -1484,6 +1484,60 @@
     return (await invoke<HostState>('session_state')).turns
   }
 
+  /**
+   * Sample the page's own frame clock and return its statistics.
+   *
+   * This is the heartbeat of every animation in the window: if the engine stops
+   * handing out frames, nothing here can look smooth no matter how the CSS is
+   * written. It is deliberately *not* a blink detector - a frame dropped after
+   * the engine painted it (which is what the DMABUF artifact was) is invisible
+   * to rAF. What it does catch is cost: a rendering path that spends the frame
+   * budget on copies or repaints shows up as widening gaps while an answer
+   * streams, which is the price of `CWOFFEE_WEBKIT_MODE` and has to be measured
+   * rather than assumed free.
+   */
+  function startFrameCadence() {
+    const gaps: number[] = []
+    let last = performance.now()
+    let id = 0
+    const t0 = last
+    let hiddenSpans = 0
+    let hiddenPrev = document.hidden
+    let worst = { ms: 0, at: 0 }
+    const tick = (t: number) => {
+      const gap = t - last
+      // A page that is not on screen is not animated, and WebKitGTK stops the
+      // frame loop when its surface is occluded. Counting that as a hitch would
+      // make this check measure window management instead of rendering, so the
+      // resume gap after a hidden span is dropped - and the count of hidden spans
+      // is reported, so a sample taken off screen is visible as one.
+      if (!hiddenPrev) {
+        gaps.push(gap)
+        if (gap > worst.ms) worst = { ms: gap, at: t - t0 }
+      }
+      const hiddenNow = document.hidden
+      if (hiddenNow && !hiddenPrev) hiddenSpans++
+      hiddenPrev = hiddenNow
+      last = t
+      id = requestAnimationFrame(tick)
+    }
+    id = requestAnimationFrame(tick)
+    return () => {
+      cancelAnimationFrame(id)
+      const sorted = gaps.slice(1).sort((a, b) => a - b)
+      const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] ?? 0
+      return {
+        frames: gaps.length,
+        ms: Math.round(last - t0),
+        median: at(0.5),
+        p95: at(0.95),
+        worst: worst.ms,
+        worstAt: worst.at,
+        hiddenSpans,
+      }
+    }
+  }
+
   // ---- actions ------------------------------------------------------------
   async function send() {
     const text = draft.trim()
@@ -2687,7 +2741,29 @@
 
           const table = document.querySelector('.transcript table')
           if (!table) {
-            fail('markdown table was not rendered as a table')
+            // Say which side failed. This check has fired with the table sitting
+            // correctly in the store and absent from the DOM, and those are two
+            // different bugs: a render path that never parsed the block, versus a
+            // turn whose answer was never a table. Without the store text and the
+            // block list in the log, every later reading of this line is a guess.
+            const blocks = [...document.querySelectorAll('.transcript .blk')].map(
+              (b) => (b.className.match(/blk-(\w+)/) ?? ['?', '?'])[1],
+            )
+            const bodies = [...document.querySelectorAll('.blk-answer .blk-body')] as HTMLElement[]
+            const lastBody = bodies[bodies.length - 1]
+            let stored = '(no session)'
+            if (viewId !== null) {
+              const page = await invoke<{ messages: { role: string; content: string }[] }>(
+                'session_messages',
+                { id: viewId },
+              )
+              const lastAssistant = [...page.messages].reverse().find((m) => m.role === 'assistant')
+              stored = lastAssistant ? lastAssistant.content.slice(0, 120) : '(none)'
+            }
+            fail(
+              `markdown table was not rendered as a table :: blocks=[${blocks.join(',')}] :: ` +
+                `last answer body='${(lastBody?.innerHTML ?? '').slice(0, 120)}' :: stored='${stored.replace(/\n/g, ' ')}'`,
+            )
           } else {
             if (!table.querySelector('thead th')) fail('table has no header cells')
             if (table.querySelectorAll('tbody tr').length < 2)
@@ -3618,6 +3694,32 @@
           fail('a heading stayed literal markdown while the answer streamed')
         if (!body.querySelector('strong')) fail('bold did not format mid-stream')
         if (!body.querySelector('ul li')) fail('a finished list did not become a list mid-stream')
+        // A table has to become a table *while the answer streams*. The real-turn
+        // version of this check depends on a quantised model following an
+        // instruction, so it can fail for reasons that are not the render path;
+        // this one feeds the exact block through the live pipeline and has no
+        // such excuse. It also pins the shape the CSS needs: the table must be a
+        // direct child of the body, because the styles are written `.blk-body table`.
+        {
+          transcript?.apply({
+            kind: 'text',
+            d: '\n\n| name | value |\n|---|---|\n| alpha | 1 |\n| beta | 2 |\n\n',
+          })
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          transcript?.flushNow()
+          const tb = document.querySelector('.blk-answer .blk-body') as HTMLElement
+          const tbl = tb?.querySelector('table')
+          if (!tbl) {
+            fail(`a completed markdown table stayed literal while streaming :: '${(tb?.innerHTML ?? '').slice(0, 160)}'`)
+          } else {
+            if (tbl.parentElement !== tb)
+              fail(`the table is nested in a ${(tbl.parentElement as HTMLElement).className} instead of sitting in the block body`)
+            if (!tbl.querySelector('thead th')) fail('streamed table has no header cells')
+            if (tbl.querySelectorAll('tbody tr').length < 2)
+              fail(`streamed table has ${tbl.querySelectorAll('tbody tr').length} body rows`)
+            if (tbl.textContent?.includes('|')) fail('stray pipes left in the streamed table')
+          }
+        }
         const committed = [...body.querySelectorAll('h1, p, li')]
           .map((n) => n.textContent ?? '')
           .join(' ')
@@ -3758,6 +3860,44 @@
         if (Math.abs(after - mid) > 1.2)
           fail(`the label moved ${(after - mid).toFixed(1)}px when the turn ended - it aligns only at the end`)
         pageLog(`label alignment ok (${mid.toFixed(1)}px generating, ${after.toFixed(1)}px settled)`)
+        transcript?.clear()
+      }
+
+      // [2] Switching from thinking to answering drains the queue first.
+      //
+      // The streaming queue is joined and painted by whatever block kind is
+      // *current at paint time*. So when the last thinking delta and the first
+      // answer delta land in the same frame - which is exactly what a local model
+      // does when it stops thinking - the thinking prose gets painted into the
+      // answer, and the answer's own text is glued onto the end of it where no
+      // blank line can ever separate it. A real turn produced precisely that: the
+      // table sat correctly in the store, the thinking block was empty, the answer
+      // began "The user wants just a table...", and no <table> was ever rendered.
+      // Both directions are proven in this engine: with the drain removed this
+      // case reports an empty thinking block, prose in the answer, and tables=0.
+      {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 11, model: 'selftest' } })
+        transcript?.addUser('Reply with ONLY a markdown table, no prose.')
+        transcript?.apply({ kind: 'reasoning', d: 'The user wants just a table in markdown format.' })
+        transcript?.apply({
+          kind: 'text',
+          d: '| name | value |\n|---|---|\n| alpha | 1 |\n| beta | 2 |',
+        })
+        await new Promise((r) => setTimeout(r, 120))
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 11, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        const prose = 'The user wants just a table'
+        const think = document.querySelector('.blk-reasoning .blk-body')
+        const ansBody = document.querySelector('.blk-answer .blk-body')
+        if (!think || !(think.textContent ?? '').includes(prose))
+          fail('the thinking prose left its thinking block when the answer started')
+        else if (!ansBody || !ansBody.querySelector('table'))
+          fail('a table that started in the same frame as the thinking did not become a table')
+        else if ((ansBody.textContent ?? '').includes(prose))
+          fail('the thinking prose was painted into the answer block')
+        else
+          pageLog('switch drain ok (thinking kept its words, the answer kept its table)')
         transcript?.clear()
       }
 
@@ -3905,7 +4045,54 @@
       }
       }
 
-      // [4] An entrance may only ever run on a node that has never been painted.
+      // [4] Frame cadence while a real answer streams.
+      //
+      // Everything else in this harness measures what the page *draws*. This
+      // measures whether the engine delivers the frames to draw on, which is the
+      // axis a rendering-path change moves: WebKitGTK's zero-copy DMABUF renderer
+      // is off by default in the app (gpu.rs) because it drops frames on this
+      // box, and the copy path that replaced it has to be shown not to cost the
+      // frame clock. Numbers for both modes live in docs/BENCHMARKS.md.
+      {
+        const cadBefore = await turnCount()
+        // Through send(), not invoke(): a draft creates its row first, so the turn
+        // lands in a session that exists. It is swept here rather than left to the
+        // final sweep: an extra row in the sidebar changes which sessions a later
+        // check opens, and one check's debris moved another check's counts.
+        const cadFloor = (await invoke<Session[]>('list_sessions')).reduce(
+          (m, s) => Math.max(m, s.id),
+          0,
+        )
+        newSession()
+        await invoke('set_reasoning', { level: 'off' })
+        draft = 'Write about coffee roasting in exactly four paragraphs. Answer in the chat only, use no tools and create no files.'
+        await send()
+        const stop = startFrameCadence()
+        const done = await waitTurnDone(cadBefore)
+        const c = stop()
+        await invoke('set_reasoning', { level: 'medium' })
+        await sweepSelftest('after the frame-cadence turn', cadFloor)
+        // The numbers are logged whatever the verdict: the cost of the rendering
+        // path is the reason for measuring it, and a check that hides its own
+        // measurements when it fails cannot be compared between modes or machines.
+        pageLog(
+          `frame cadence: ${c.frames} frames over ${c.ms}ms while a turn streamed; ` +
+            `median ${c.median.toFixed(1)}ms, p95 ${c.p95.toFixed(1)}ms, worst ${c.worst.toFixed(1)}ms ` +
+            `(at +${Math.round(c.worstAt)}ms), off-screen spans ${c.hiddenSpans}`,
+        )
+        if (c.frames < 60)
+          fail(`frame cadence: only ${c.frames} animation frames in ${c.ms}ms: the sample is empty`)
+        else if (c.median > 21)
+          fail(`frame cadence: median gap ${c.median.toFixed(1)}ms - the page is not getting a 60Hz clock`)
+        else if (c.p95 > 45)
+          fail(`frame cadence: p95 gap ${c.p95.toFixed(1)}ms while an answer streams - that is a hitch, not a pause`)
+        else if (c.worst > 250)
+          fail(`frame cadence: one gap of ${c.worst.toFixed(0)}ms - something blocked the frame clock`)
+        else pageLog('frame cadence ok')
+        if (!done) pageLog('selftest note: the cadence turn did not finish; the sample above is partial')
+      }
+
+      // [5] An entrance may only ever run on a node that has never been painted.
       //
       // This is the property every reported "it blinks" lands on, so it is now
       // measured rather than trusted. Isolated in plain HTML inside this same

@@ -48,7 +48,7 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, splitCommitted } from './markdown'
+import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -794,6 +794,13 @@ export class Transcript {
   }
   private push(s: string, kind: BlockKind) {
     if (this.textKind !== kind || !this.textBuf) {
+      // Drain first. `flush` joins the whole queue and routes it by whatever
+      // `textKind` is *at paint time*, so a queue that survives the switch paints
+      // the tail of a thinking block inside the answer - and glues that prose to
+      // the table that follows it into one paragraph that can never parse. That
+      // is the bug behind "the table is in the store but never became a table":
+      // the reasoning deltas and the first answer delta landed in the same frame.
+      this.flushNow()
       // Leaving an answer block: finish its markdown before anything else is
       // appended, so a tool call in the middle of an answer cannot truncate the
       // formatting of the part already on screen.

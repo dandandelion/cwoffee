@@ -261,7 +261,9 @@ export function splitCommitted(src: string): { blocks: string[]; cut: number; in
     const lineEnd = pos + line.length
     if (/^\s*(?:```|~~~)/.test(line)) inFence = !inFence
     // A trailing empty piece is just the newline the source ended with, not a
-    // blank line: a table row or list item may be the next thing to arrive.
+    // blank line: a table row or list item may be the next thing to arrive. A
+    // real blank line before the end does terminate a table, and this loop sees
+    // it: the trailing piece is only the final empty slice after a newline.
     const trailing = i === lines.length - 1 && line === ''
     if (!inFence && !trailing && line.trim() === '') {
       const body = src.slice(blockStart, lineEnd)
@@ -291,6 +293,13 @@ export function splitCommitted(src: string): { blocks: string[]; cut: number; in
 export function firstBlockEnd(src: string): { end: number; fenced: boolean } | null {
   let i = 0
   let fence = false
+  // A block whose first line opens a table cannot survive a blank line: markdown
+  // ends a table there, full stop. So for those the trailing blank line at the
+  // end of the source *is* the terminator, and the table becomes a table while
+  // the answer is still streaming instead of at turn end. Paragraphs, lists and
+  // quotes keep the conservative rule: a blank line at the very end may be the
+  // model pausing mid-block, and closing early re-parses settled text.
+  const tableBlock = /^\s*\|/.test(src.split('\n', 1)[0] ?? '')
   while (i < src.length) {
     const nl = src.indexOf('\n', i)
     const lineEnd = nl === -1 ? src.length : nl + 1
@@ -299,7 +308,7 @@ export function firstBlockEnd(src: string): { end: number; fenced: boolean } | n
     // A blank line at the very end of the source is not a terminator: the next
     // delta may continue the same block, and guessing wrong would close a
     // paragraph the model is still writing.
-    if (!fence && line.trim() === '' && lineEnd < src.length)
+    if (!fence && line.trim() === '' && (lineEnd < src.length || tableBlock))
       return { end: lineEnd, fenced: fence }
     i = lineEnd
   }

@@ -76,6 +76,14 @@ fn main() {
     // GPU that is already ~97% full from inference. See PLAN.md §12.
     gpu::pin_intel_gpu();
 
+    // WebKitGTK's own rendering path, also env-driven and also needed before the
+    // webview exists (the web process inherits this environment at fork time).
+    let webkit_mode = gpu::apply_webkit_mode();
+    eprintln!("[cwoffee] webkit render path: {}", webkit_mode.name);
+    if let Some(w) = webkit_mode.warning {
+        eprintln!("[cwoffee] WARNING: {w}");
+    }
+
     let report = gpu::report();
     eprintln!(
         "[cwoffee] EGL vendor pinned to: {}\n[cwoffee] GLX vendor: {}",

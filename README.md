@@ -326,6 +326,68 @@ worst 48ms. Opening another session and back starts **no animation at all** — 
 payoff of rendering stored transcripts outside `.turn`, so an old session does not play forty
 entrances.
 
+### It blinked in the window, and not in the browser
+
+The report that ended the hunt: the same bundle, served by the same process over the gateway and
+opened in a real browser, **does not blink**. Same bytes, same session, same server — so whatever
+was flickering was not in the page.
+
+That is what every in-page instrument had been saying for a while and it took a comparison to
+hear it: the entrance guard counts **0** replays, the reveal check sees no settled span rewritten,
+commits are append-only, the follow glides at 6px/frame. None of those can see a frame the engine
+painted and the compositor never showed.
+
+Engine facts here: WebKitGTK 2.54.0 on Wayland, accelerated compositing, and WebKit's zero-copy
+**DMABUF frame renderer on by default**. The app is pinned to Mesa/i915 (the panel is driven by
+i915, the NVIDIA card is ~97% full of inference), so the code path being exercised is same-vendor
+buffer exchange rather than a hybrid-GPU handoff.
+
+A/B, same build, same prompt, the user as the instrument:
+
+| webkit path | what you see |
+|---|---|
+| WebKit's default (zero-copy DMABUF) | blink on every streaming turn |
+| `WEBKIT_DISABLE_DMABUF_RENDERER=1` | gone, completely |
+
+So the copy path is the shipped default, and it is chosen in code rather than in a shell wrapper:
+`CWOFFEE_WEBKIT_MODE = default | no-dmabuf | no-compositing`, applied in `gpu.rs` **before the
+webview exists** — the web process inherits the environment at fork — logged at boot
+(`[cwoffee] webkit render path: no-dmabuf`) and pinned by a unit test, so a typo in the mode
+cannot quietly fall back to the path that blinks and look like a fix.
+
+What it costs, measured by a probe that samples the page's own animation clock while a real turn
+streams (one sample per mode; the third would have been a screen lock, see below):
+
+| webkit path | median frame gap | p95 | worst |
+|---|---|---|---|
+| zero-copy DMABUF | 17.0ms | 18.0ms | 24.0ms |
+| copy path (shipped) | 17.0ms | 32.0ms | 54.0ms |
+
+The steady 60Hz clock is untouched; the tail is roughly twice as long. For a chat window that is
+the right way round: a dropped frame is visible, a 32ms paint tail is not. If your machine does
+not drop frames, `CWOFFEE_WEBKIT_MODE=default` puts the zero-copy renderer back.
+
+The probe brought its own trap: an occluded webview stops animating, and the first sample
+reported a **7.9s stall** that was a locked screen. Off-screen spans are now excluded from the
+statistics and counted in the log line (`off-screen spans 2`), because a check that measures
+window management eventually fails on a screensaver.
+
+### The stream is a queue, and blocks are its boundaries
+
+- Deltas arrive faster than frames and are joined from a queue at paint time. The queue is routed
+  by the block kind that is current *then*, so the last thinking delta and the first answer delta
+  landing in one frame put the thinking prose **inside the answer block** and glued the answer's
+  own text onto the end of it, where no blank line could ever separate them. A real turn did
+  exactly this: the table sat correctly in the store, the thinking block was empty, the answer
+  began "The user wants just a table…", and no `<table>` was ever rendered. Switching block kinds
+  now drains the queue first, and a self-test case states the collision directly with no model
+  involved — remove the drain and that case reports an empty thinking block and `tables=0`, which
+  is how the drain was shown to be the fix rather than a plausible one.
+- A block commits when a blank line ends it, and a blank line at the very end of the stream is
+  *not* a terminator — a paragraph may still be being written. A table is the exception, because a
+  table cannot survive a blank line in markdown: committing there is exact, and it is what lets a
+  table become a table while the answer is still arriving instead of when it finishes.
+
 ## Files, and asking instead of guessing
 
 The agent's file tools are `read_file`, `write_file`, `edit_file`, `write_xlsx`,

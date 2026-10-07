@@ -1510,3 +1510,93 @@ What the film *can* prove is whether a fade is happening where it should. Normal
 line fills in, and every apparent "dip" lands on a frame that the shift search explains as a
 scroll. In the user-bubble band, alpha sits at .057-.060 across the three frames where the band
 moved 15px each: a scroll moves pixels, a blink changes alpha.
+
+## Trap 74: it blinks in the native window and not in the browser, so it was never in the page
+
+Three weeks of in-page instrumentation — animation-start guards, settled-span rewrite counts,
+append-only reveal checks, layout-drift probes, rAF deltas — all reported clean while the user
+kept seeing a flash. The line that ended it was a comparison rather than a measurement: the same
+bundle, served by the same process over the gateway, opened in a real browser, **does not blink**.
+
+Same bytes, same session, same server, different engine ⇒ the artifact is below the DOM. It also
+explains why the instruments were right *and* useless: they observe what the page draws. A frame
+that the engine produced and the compositor never presented is invisible to every one of them,
+and a page-side guard can never fail on it — a guard that cannot fail is decoration.
+
+The engine here is WebKitGTK 2.54.0 on Wayland with accelerated compositing and WebKit's zero-copy
+DMABUF frame renderer enabled by default. A/B on identical builds, with the user as the instrument:
+
+| `WEBKIT_DISABLE_DMABUF_RENDERER` | verdict |
+|---|---|
+| unset (WebKit's default path) | blink on every streaming turn |
+| `1` (copy path) | "OMG it's complete gone" |
+
+Product response, in this order:
+
+- `gpu.rs::apply_webkit_mode()` reads `CWOFFEE_WEBKIT_MODE = default | no-dmabuf | no-compositing`
+  and sets the WebKit variables **before the webview is created**, because the web process inherits
+  the environment at fork; setting them after `WebviewWindowBuilder` does nothing.
+- The shipped default is `no-dmabuf`, and `DEFAULT_WEBKIT_MODE` is asserted in a unit test so a
+  future cleanup that "restores WebKit's default" has to be a decision.
+- An unknown mode is an error, not a silent fallback: `CWOFFEE_WEBKIT_MODE=no-comp` must not run
+  the blinking path and look like it was fixed.
+- The boot log names the mode (`[cwoffee] webkit render path: no-dmabuf`), because "it blinks on
+  my machine" is unanswerable in eight months without it, and `apply_webkit_mode` respects an
+  explicitly-set variable (including treating an empty value as unset).
+
+Cost is measured, not assumed free — see `docs/BENCHMARKS.md`: the 60Hz median is identical in both
+modes (17.0ms), the p95 goes 18ms → 32ms. A dropped frame is visible; a 32ms paint tail is not.
+
+## Trap 75: the streaming queue is routed by the block kind at *paint* time
+
+Symptom, from a self-test failure that reproduced two runs in four: the markdown table was in the
+store, `document.querySelector('.transcript table')` found nothing, the thinking block was empty,
+and the answer block began with the model's thinking sentence.
+
+Cause: deltas accumulate in `pending` and one `flush()` per frame joins them and routes the joined
+string by `this.textKind` **at paint time**. If the last thinking delta and the first answer delta
+arrive in the same frame, the switch to the answer block happens *before* the drain, so the
+thinking prose is painted into the answer and the table is glued to the end of it — one paragraph,
+no blank line, nothing for the parser to work with, forever literal.
+
+Fix: `push()` calls `flushNow()` at the top of the kind-switch branch, so everything queued belongs
+to the block being left. Proven both ways in this engine (a WebKitGTK window loading a scratch
+page that replays the collision):
+
+| | thinking block | answer block | tables |
+|---|---|---|---|
+| with the drain | keeps its sentence | `name value alpha 1 beta 2` | 1 |
+| drain commented out | **empty** | begins "The user wants just a table…" | **0** |
+
+The self-test now states the collision directly (`switch drain ok`), with no model in the loop;
+the earlier version of this investigation replayed a recorded real turn instead, and that stream
+happened to have a benign final thinking delta, so it passed *with the bug present*. A repro that
+cannot fail is not a repro.
+
+## Trap 76: "never close a block at a trailing blank line" keeps a table literal forever
+
+`firstBlockEnd` deliberately refuses to treat a blank line at the very end of the stream as a
+terminator: the model may still be writing that paragraph, and closing early rewrites settled text.
+The consequence nobody noticed: a table that ends at the end of the stream — the common case, since
+tables usually close an answer — never commits while streaming and only becomes a table at `turnEnd`,
+which is the "markdown appears at the end" complaint in a new costume.
+
+A table is the one block for which the conservative rule is wrong: markdown ends a table at a blank
+line, so committing there is exact, not a guess. `firstBlockEnd` now makes the trailing-blank
+exception only when the block's first line opens a table.
+
+Do **not** generalise the exception, and do not "fix" `splitCommitted` to match: its trailing empty
+slice is the newline the source ended with, not a blank line, and making it a terminator breaks
+"a table with no blank line stays in the tail" (which is exactly what happens when rows are still
+arriving). Two rules, two functions, one md_test case each.
+
+## Trap 77: a frame-cadence probe measures window management too
+
+The first run of the cadence probe reported `worst 7932ms` — eight seconds with no animation
+frame. The page was not frozen; it was **occluded**. WebKitGTK stops the frame loop when its
+surface is not on screen, and a locked or covered window produces exactly the gap a jank detector
+is looking for.
+
+The probe now records `document.hidden` at the start of each gap, drops gaps that began while
+hidden, and prints `off-screen spans N` in the log line so a sample taken off screen is visible
+as one rather than as a rendering regression.

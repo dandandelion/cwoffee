@@ -436,3 +436,58 @@ Duration 130-200ms from the measured word rate, stagger inside an arrival capped
 | settled spans with a filter still applied | **0** | a filter outliving the fade means the layer is being torn down under settled text |
 
 Memory at the point of writing: PSS **267 MB**, RSS 482.8 MB, against the 400 MB gate.
+
+## The blink that was never in the page
+
+The discriminator, supplied by the user: the gateway-served bundle in a real browser does not
+blink; the native window does. Same bundle (`grep -c SELFTEST dist/assets/*.js` = 0 in both), same
+process, same session. Everything below the DOM was suspect, and everything above it had been
+measured clean: 0 entrance replays, 0 settled spans rewritten, commit drift 0.0px, follow steps
+≤7px/frame.
+
+### Engine A/B, same build, same prompt
+
+| `WEBKIT_DISABLE_DMABUF_RENDERER` | what the user sees |
+|---|---|
+| unset — WebKitGTK 2.54.0's zero-copy path | blink on every streaming turn |
+| `1` — copy path | gone, completely |
+
+`CWOFFEE_WEBKIT_MODE` selects the path in code (`gpu.rs`), the default is `no-dmabuf`, and the
+boot log records it. Both flags reach the web process: verified by reading
+`/proc/<WebKitWebProcess>/environ` of the running app, not by trusting the setter.
+
+### What the copy path costs — the page's own frame clock during a real streaming turn
+
+| webkit path | frames sampled | median | p95 | worst | off-screen spans |
+|---|---|---|---|---|---|
+| zero-copy DMABUF | 1074 / 17.9s | 17.0ms | 18.0ms | 24.0ms | 0 |
+| copy path (shipped default) | 954 / 18.4s | 17.0ms | **32.0ms** | 54.0ms | 0 |
+
+The 60Hz steady clock is identical; the tail roughly doubles. Self-test bound is p95 ≤45ms with
+median ≤21ms, which is a statement about the shipped rendering path rather than a number tuned to
+pass. One caveat, learned the hard way: an occluded or locked screen stops the frame loop, and the
+first sample blamed that on the app as an 7932ms stall.
+
+### A queue routed by the wrong block kind
+
+The failure that produced "the table is in the store but never became a table", reproduced in this
+engine with the drain removed and restored:
+
+| | thinking block body | answer block body | `<table>` count |
+|---|---|---|---|
+| drain on switch (shipped) | "The user wants just a table in markdown format." | `name value alpha 1 beta 2` | **1** |
+| drain commented out | *(empty)* | "The user wants just a table…" + table text, one paragraph | **0** |
+
+Coverage without a model: self-test `[2] switch drain ok`, and for the block splitter, md_test:
+`a table ends at its trailing blank line`, `a table still mid-row has no end`, `a paragraph does
+not end at a trailing blank line`, `splitCommitted commits a trailing table too`.
+
+### Harness hygiene this round added
+
+- `waitTurnDone` budget 150s → 240s: a cold prefill of ~2k tokens measured **12.8 tok/s** here, a
+  153s first token, with the turn completing correctly just outside the old window. The failure
+  message now says which side to look at.
+- The real-turn table check reports store-vs-DOM on failure (`blocks=[…]`, last answer body, stored
+  text) instead of a bare "not rendered", because those are two different bugs.
+- A check that leaves a session behind changes which sessions a *later* check opens; the cadence
+  turn is swept immediately rather than by the end-of-run sweep.

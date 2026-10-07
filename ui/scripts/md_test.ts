@@ -227,6 +227,24 @@ ok('fence parity: closed', !fenceOpen('```\nbody\n```'))
 ok('fence parity: none', !fenceOpen('plain text'))
 ok('blank first line still ends a block', firstBlockEnd('\nreal text').end === 1)
 
+// A table is the one block that *does* end at a blank line sitting at the very
+// end of the stream. Markdown has no other reading of it - a blank line closes a
+// table - so committing there is exact, and it is what makes a table arrive as a
+// table while the answer is still being written instead of when it finishes.
+{
+  const tbl = '| name | value |\n|---|---|\n| alpha | 1 |\n| beta | 2 |\n\n'
+  const e = firstBlockEnd(tbl)
+  ok('a table ends at its trailing blank line', e !== null && e.end === tbl.length, `end=${e?.end} len=${tbl.length}`)
+  ok(
+    'a table still mid-row has no end',
+    firstBlockEnd('| name | value |\n|---|---|\n| alpha | 1 |\n') === null,
+  )
+  ok('a paragraph does not end at a trailing blank line', firstBlockEnd('prose keeps going\n\n') === null)
+  ok('a list does not end at a trailing blank line', firstBlockEnd('- one\n\n') === null)
+  const sc = splitCommitted(tbl)
+  ok('splitCommitted commits a trailing table too', sc.cut === tbl.length && sc.blocks.length === 1, `cut=${sc.cut} blocks=${sc.blocks.length}`)
+}
+
 // The streaming formatter commits at byte offsets, so the offset has to be the
 // truth even when nothing was rendered.
 {

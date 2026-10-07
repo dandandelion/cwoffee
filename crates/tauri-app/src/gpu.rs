@@ -77,6 +77,92 @@ fn render_nodes_of(pid: &str) -> Vec<String> {
     out
 }
 
+/// Which WebKitGTK rendering path the webview is allowed to use.
+///
+/// The page is byte-for-byte the same code in a browser tab as in this window,
+/// and the blink the user reported appeared **only** in this window. That put the
+/// artifact under the DOM, in WebKitGTK's compositing / buffer-exchange path, and
+/// it is why every in-page instrument (computed styles, animation events, rAF
+/// deltas, committed-block counts) stayed clean while the eye saw a flash:
+/// nothing in the page stopped being drawn; a frame of it never arrived.
+///
+/// A/B on this box, same build, same prompt, user as the instrument:
+///
+///   WEBKIT_DISABLE_DMABUF_RENDERER unset  -> blink, every streaming turn
+///   WEBKIT_DISABLE_DMABUF_RENDERER=1      -> gone, completely, same build
+///
+/// So the zero-copy DMABUF frame exchange is what drops frames here (WebKitGTK
+/// 2.54.0, Wayland, Mesa/i915, panel driven by the same i915 mutter composites
+/// on). The copy path it replaces costs a frame copy and nothing measurable: PSS
+/// and animation frame cadence are in `docs/BENCHMARKS.md` for both modes.
+///
+/// The other documented hatch, kept because it is the one to reach for if a
+/// future artifact is layer-related rather than exchange-related:
+///
+///   WEBKIT_DISABLE_COMPOSITING_MODE=1  no accelerated compositing at all
+///
+/// `CWOFFEE_WEBKIT_MODE` selects one so the user does not need a shell wrapper,
+/// and the boot log records the choice - "it blinks on my machine" is
+/// unanswerable in eight months without it. Setting it back to `default` puts the
+/// zero-copy path back for anyone whose machine does not drop frames.
+pub fn apply_webkit_mode() -> WebkitMode {
+    let requested = std::env::var("CWOFFEE_WEBKIT_MODE").unwrap_or_else(|_| DEFAULT_WEBKIT_MODE.into());
+    match webkit_env_plan(&requested) {
+        Ok(plan) => {
+            for (k, v) in plan {
+                // An explicit empty value counts as unset: `FOO= app` is a user
+                // turning the flag off, not a user setting it to "".
+                let set = std::env::var_os(k).filter(|v| !v.is_empty()).is_some();
+                if !set {
+                    std::env::set_var(k, v);
+                }
+            }
+            WebkitMode {
+                name: normalise_webkit_mode(&requested),
+                warning: None,
+            }
+        }
+        Err(msg) => WebkitMode {
+            name: DEFAULT_WEBKIT_MODE.into(),
+            warning: Some(msg),
+        },
+    }
+}
+
+/// The default, and why it is not `default`: see the doc comment on
+/// `apply_webkit_mode`. WebKitGTK's zero-copy renderer drops frames on this
+/// class of Mesa/Wayland setup, and a dropped frame in a chat app is a bug the
+/// user can see, while the copy it costs us is invisible.
+const DEFAULT_WEBKIT_MODE: &str = "no-dmabuf";
+
+fn normalise_webkit_mode(mode: &str) -> String {
+    match mode {
+        "no-dmabuf" | "no_dmabuf" => "no-dmabuf",
+        "no-compositing" | "no_compositing" => "no-compositing",
+        _ => "default",
+    }
+    .to_string()
+}
+
+/// Which WebKit env vars a mode asks for. Pure, so the spelling table can be
+/// tested without racing the process-wide environment.
+fn webkit_env_plan(mode: &str) -> Result<Vec<(&'static str, &'static str)>, String> {
+    match mode {
+        "default" | "" => Ok(vec![]),
+        "no-dmabuf" | "no_dmabuf" => Ok(vec![("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]),
+        "no-compositing" | "no_compositing" => Ok(vec![("WEBKIT_DISABLE_COMPOSITING_MODE", "1")]),
+        other => Err(format!(
+            "unknown CWOFFEE_WEBKIT_MODE {other:?}; expected default | no-dmabuf | no-compositing"
+        )),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WebkitMode {
+    pub name: String,
+    pub warning: Option<String>,
+}
+
 /// Report for the UI / CLI.
 #[derive(serde::Serialize)]
 pub struct GpuReport {
@@ -117,5 +203,28 @@ mod tests {
     fn self_scan_does_not_panic() {
         // we may or may not hold render nodes depending on when this runs
         let _ = render_nodes_of("self");
+    }
+
+    #[test]
+    fn webkit_mode_table_is_exact_and_refuses_invention() {
+        // The shipped default is the copy path, not WebKit's own default: the
+        // zero-copy renderer drops frames here. Pinning the string means a
+        // future "cleanup" back to WebKit's default has to be a decision.
+        assert_eq!(DEFAULT_WEBKIT_MODE, "no-dmabuf");
+        assert!(webkit_env_plan("default").unwrap().is_empty());
+        assert_eq!(
+            webkit_env_plan("no-dmabuf").unwrap(),
+            vec![("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+        assert_eq!(
+            webkit_env_plan("no-compositing").unwrap(),
+            vec![("WEBKIT_DISABLE_COMPOSITING_MODE", "1")]
+        );
+        // underscore spellings are accepted, because every other knob is CWOFFEE_*
+        assert_eq!(webkit_env_plan("no_dmabuf").unwrap().len(), 1);
+        // a typo must not quietly run the broken default path and look like a fix
+        assert!(webkit_env_plan("no-comp").is_err());
+        assert_eq!(normalise_webkit_mode("no_compositing"), "no-compositing");
+        assert_eq!(normalise_webkit_mode("default"), "default");
     }
 }
