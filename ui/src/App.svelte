@@ -1452,7 +1452,7 @@
     return false
   }
 
-  async function waitTurnDone(prevTurns: number, budgetMs = 150000): Promise<boolean> {
+  async function waitTurnDone(prevTurns: number, budgetMs = 240000): Promise<boolean> {
     const endsBefore = turnEnds
     const dl = performance.now() + budgetMs
     let lastTurns = prevTurns
@@ -1469,7 +1469,14 @@
     // endpoint serves one slot and a 60s first token has been measured under
     // contention, so the budget has to sit above that and the timeout has to name
     // itself when it still trips.
-    pageLog(`waitTurnDone: no turnEnd after ${budgetMs}ms (turns=${prevTurns}->${lastTurns})`)
+    // 240s is not taste either: a cold prefill of ~2k tokens on this box has been
+    // measured at 12.8 tok/s, i.e. a 153s first token, and the turn completed
+    // correctly right after the old 150s window closed. A harness that times out
+    // under the model invents bugs.
+    pageLog(
+      `waitTurnDone: no turnEnd after ${budgetMs}ms (turns=${prevTurns}->${lastTurns}). ` +
+        'If telemetry shows prefill under ~50 tok/s this is the endpoint being slow, not the app stuck.',
+    )
     return false
   }
 
@@ -2215,7 +2222,7 @@
           attachments: [{ mime: 'image/png', data_b64: PNG1x1, name: 'probe.png' }],
           session: target.id,
         })
-        const done = await waitTurnDone(turnsBefore, 150000)
+        const done = await waitTurnDone(turnsBefore)
         await invoke('set_reasoning', { level: 'medium' })
         restore()
         if (!done) {
@@ -2524,7 +2531,7 @@
         // session while a turn is running" and the report blames the delete check.
         // So: wait a bounded time, then stop the turn the way a user would and prove
         // the host is idle before anything else touches it.
-        if (!(await waitTurnDone(turnsBeforeLive, 60000))) {
+        if (!(await waitTurnDone(turnsBeforeLive, 120000))) {
           await invoke('cancel_turn')
           const idleBy = performance.now() + 30000
           while (performance.now() < idleBy) {
@@ -3462,12 +3469,18 @@
         // text again, these references stop being connected and this fails.
         const seen: HTMLElement[] = []
         const seenText: string[] = []
+        let maxInFlight = 0
+        let judged = 0
         // The host element must not be restyled paint by paint. Writing the reveal
         // duration as a custom property on the paragraph used to re-resolve the
         // style of every settled word inside it, every frame.
         let restyled = 0
         const styleHits: string[] = []
         const bornAt = new Map<HTMLElement, number>()
+        // One word's worst-case animation window: duration cap plus the stagger
+        // cap plus slack for frame jitter. Anything older than this must be fully
+        // drawn, and anything younger may legitimately still be fading.
+        const REVEAL_BUDGET = 200 + 100 + 40
         const nowMs = () => performance.now()
         const moRef: { o: MutationObserver | null } = { o: null }
         let watched: Element | null = null
@@ -3521,13 +3534,21 @@
           // Words that landed at least one full animation window ago. New spans
           // are appended at the end, so "at rest" is a question about age, not
           // about position in the list.
-          const atRest = seen.filter((t) => (bornAt.get(t) ?? nowMs()) + 300 < nowMs())
+          const atRest = seen.filter((t) => (bornAt.get(t) ?? nowMs()) + REVEAL_BUDGET < nowMs())
+          judged += atRest.length
           for (const t of atRest.slice(-8)) {
             const cs = getComputedStyle(t)
             if (cs.filter !== 'none') fail(`a settled word is still under a filter: ${cs.filter}`)
             if (Number(cs.opacity) < 0.98)
               fail(`a word from an earlier arrival sits at opacity ${cs.opacity} while new words land`)
           }
+          // The other direction: a reveal nobody can see is not a feature. Counting
+          // words mid-fade right after a paint is how "subtle but noticeable" gets
+          // settled with a number instead of an opinion.
+          const inFlight = tins.filter((t) => Number(getComputedStyle(t).opacity) < 0.9).length
+          if (inFlight > maxInFlight) maxInFlight = inFlight
+          if (inFlight > 24)
+            fail(`${inFlight} words fading at once: the newest line is grey for lines of reading`)
         }
         const body = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
         const br = body.getBoundingClientRect()
@@ -3543,6 +3564,10 @@
           fail('the thinking block is one line wide, not filling the column')
         if (seen.length < deltas.length)
           fail(`${seen.length} spans for ${deltas.length} arrivals: words are being merged or dropped`)
+        if (maxInFlight < 4)
+          fail(`only ${maxInFlight} words were ever mid-fade at once: the reveal is invisible`)
+        if (judged < 4)
+          fail(`only ${judged} spans were ever old enough to judge: the reveal check sampled too early`)
         moRef.o?.disconnect()
         if (!watched) fail('no streaming paragraph to watch for style churn')
         if (restyled)
@@ -3558,7 +3583,10 @@
         const ansTail = ans.querySelector('.live-para') as HTMLElement | null
         if (!ansTail) fail('a streamed answer block is not its own paragraph element')
         transcript?.clear()
-        pageLog(`append-only reveal ok (${seen.length} word spans, none rewritten)`)
+        pageLog(
+          `append-only reveal ok (${seen.length} word spans, none rewritten, ` +
+            `${maxInFlight} mid-fade at the busiest moment)`,
+        )
 
       // [1] Formatting arrives while the model is still talking.
       //
@@ -3661,14 +3689,14 @@
           fail('the unfinished block has no streaming paragraph')
         }
         // Ghost tail check: the reveal belongs to the newest words only. A span
-        // that is still half-drawn after the animation window (170ms duration +
-        // 90ms stagger cap) is text the reader has already moved past, sitting
+        // that is still half-drawn after the animation window (200ms duration +
+        // 100ms stagger cap) is text the reader has already moved past, sitting
         // grey two lines up - the flicker that got the reveal blamed.
-        await new Promise((r) => setTimeout(r, 320))
+        await new Promise((r) => setTimeout(r, 400))
         const faint = [...document.querySelectorAll('.blk-answer .tin')].filter(
           (t) => Number(getComputedStyle(t).opacity) < 0.9,
         ).length
-        if (faint) fail(`${faint} word spans are still half-drawn after 320ms: the ghost tail is back`)
+        if (faint) fail(`${faint} word spans are still half-drawn after 400ms: the ghost tail is back`)
         pageLog('markdown mid-stream ok (h1+bold+list committed, no tail left half-drawn)')
         // Turn end leaves nothing half-rendered.
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 2, finish: 'stop' } })
@@ -3733,49 +3761,147 @@
         transcript?.clear()
       }
 
-      // [3] The view follows the stream instead of lurching.
+      // [3] The view follows the stream at a walk, never in jumps.
       //
-      // Frame-by-frame measurements of the user's recording showed a line of
-      // text sitting at one height for five seconds and then moving 112px, then
-      // 92px, then 46px: the old rule was "jump to the bottom if it is within
-      // 160px", so the newest line lived below the fold until a jump rescued it.
-      // Following on every paint moves a few pixels at a time.
+      // Two failures, both measured off real frames. The old rule ("jump to the
+      // bottom if it is within 160px") left a line sitting at one height for five
+      // seconds and then moved it 112px, 92px, 46px. Pinning on every paint fixed
+      // that only partly: a paint happens every 120ms, so the whole transcript
+      // still moved 23-33px in a single frame - the user's own screen recording
+      // shows 46px and 66px steps at 4.9s and 5.7s - and every word already read
+      // teleports, which is the "blink" being reported here. So the follow runs on
+      // the frame clock, and this check samples scrollTop on the frame clock too:
+      // sampling at paint granularity is how the last version of this check passed
+      // while the recording kept showing jumps.
       {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest' } })
         const sc = document.querySelector('.scroller') as HTMLElement
         if (!sc) fail('no scroller for the follow check')
         const filler = Array.from(
-          { length: 26 },
-          (_, i) => `line ${i} of a long answer that keeps the transcript taller than the viewport.`,
-        ).join('\n')
+          { length: 6 },
+          (_, p) =>
+            Array.from(
+              { length: 5 },
+              (_, i) =>
+                `paragraph ${p} line ${i} of a long answer that keeps the transcript taller than the viewport.`,
+            ).join('\n'),
+        ).join('\n\n')
         let prevTop = sc.scrollTop
-        let worst = 0
-        for (let i = 0; i < filler.length; i += 48) {
-          transcript?.apply({ kind: 'text', d: filler.slice(i, i + 48) })
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 25)))
+        let worstStep = 0
+        let worstGap = 0
+        let worstAccel = 0
+        let prevStep = 0
+        let frames = 0
+        const jumps: string[] = []
+        // Sample inside the same rAF chain that drives the feeding, one sample per
+        // frame. A free-running sampler chain looks the same on the page and is not:
+        // a pending frame can fire during a later await and score a scroll that the
+        // check itself caused.
+        const pump = () =>
+          new Promise<void>((res) =>
+            requestAnimationFrame(() => {
+              frames++
+              const step = Math.abs(sc.scrollTop - prevTop)
+              const gap = sc.scrollHeight - sc.clientHeight - sc.scrollTop
+              if (step > worstStep) worstStep = step
+              if (Math.abs(step - prevStep) > worstAccel) worstAccel = Math.abs(step - prevStep)
+              prevStep = step
+              if (step > 12 && jumps.length < 5)
+                jumps.push(`f${frames}: ${Math.round(prevTop)}->${Math.round(sc.scrollTop)} (gap ${Math.round(gap)})`)
+              if (gap > worstGap) worstGap = gap
+              prevTop = sc.scrollTop
+              res()
+            }),
+          )
+        for (let i = 0; i < filler.length; i += 96) {
+          transcript?.apply({ kind: 'text', d: filler.slice(i, i + 96) })
+          // ~250ms between arrivals: 96 characters is roughly what this endpoint
+          // produces in that time (30-45 words/s). Feeding at eight times real
+          // speed measures the harness's own queue, not the reader's experience.
+          for (let f = 0; f < 15; f++) await pump()
           transcript?.flushNow()
-          const step = sc.scrollTop - prevTop
-          if (step > worst) worst = step
-          prevTop = sc.scrollTop
+          for (let f = 0; f < 3; f++) await pump()
+        }
+        // Let the glide finish, then judge where it ended up.
+        for (let t = 0; t < 60; t++) {
+          await pump()
+          if (sc.scrollHeight - sc.clientHeight - sc.scrollTop <= 1) break
         }
         const away = sc.scrollHeight - sc.scrollTop - sc.clientHeight
-        if (away > 40)
-          fail(`the newest line sits ${Math.round(away)}px below the fold: the view stopped following`)
-        if (worst > 60) fail(`the transcript lurched ${Math.round(worst)}px in a single paint`)
+        if (frames < 40) fail(`the follow check sampled ${frames} frames: it measured nothing`)
+        // Half a line. A step is at most max(8px, 18% of the gap) and the gap is
+        // bounded below, so anything past 12px means more than one step landed in
+        // one frame - and every settled word on screen changed place at once, which
+        // is what the user calls a blink.
+        // Half a line steady, more only when the view has fallen behind a block
+        // that landed all at once, and even then gathering speed frame by frame
+        // (FOLLOW_ACCEL). A large step reached by a ramp is motion; a large step
+        // that appears out of nowhere is the blink.
+        if (worstStep > 24)
+          fail(
+            `the transcript moved ${Math.round(worstStep)}px in one frame: the follow lurches (${jumps.join(' | ')})`,
+          )
+        if (worstAccel > 8)
+          fail(
+            `the follow changed speed by ${Math.round(worstAccel)}px/frame in one frame: that is a jolt, not a glide`,
+          )
+        if (worstGap > 220)
+          fail(`the newest line sat ${Math.round(worstGap)}px below the fold while streaming`)
+        if (away > 4) fail(`the view finished ${Math.round(away)}px short of the bottom`)
         // Reading position is respected: scrolling up stops the follow, and the
-        // text does not move when a block is committed under the reader.
+        // text a reader stopped on does not move when a block commits under them.
+        const maxScroll = sc.scrollHeight - sc.clientHeight
+        if (maxScroll < 120)
+          fail(`the transcript only scrolls ${maxScroll}px: the reader-up half of this check needs more filler`)
         sc.scrollTop = Math.max(0, sc.scrollTop - 220)
         await new Promise((r) => setTimeout(r, 80))
+        if (sc.scrollTop > sc.scrollHeight - sc.clientHeight - 40)
+          fail('the scroll-up that starts the reader-up half did not take effect')
+        // Measure *text*, not an element box. The element version of this check
+        // reported a 25px move that no eye could see: a body's box moves with
+        // margin collapsing and with the box of whatever child lands first, while
+        // the line a reader is actually looking at did not budge.
+        const anchor = (() => {
+          const mid = sc.getBoundingClientRect().top + sc.clientHeight / 2
+          const walk = document.createTreeWalker(sc, NodeFilter.SHOW_TEXT)
+          let best: Range | null = null
+          let bestD = Infinity
+          for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+            const t = n as Text
+            if (!t.textContent?.trim()) continue
+            const r = document.createRange()
+            r.setStart(t, 0)
+            r.setEnd(t, Math.min(8, t.length))
+            const b = r.getBoundingClientRect()
+            if (!b.height) continue
+            const d = Math.abs(b.top - mid)
+            if (d < bestD) {
+              bestD = d
+              best = r
+            }
+          }
+          return best
+        })()
+        if (!anchor) fail('no settled text to anchor the scrolled-up reader to')
+        const rng = anchor as Range
+        const anchorTop = rng.getBoundingClientRect().top
         transcript?.apply({ kind: 'text', d: '\n\n## A committed heading ends the paragraph\n\n' })
         await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
         transcript?.flushNow()
-        const stillUp = sc.scrollHeight - sc.scrollTop - sc.clientHeight
-        if (stillUp < away) fail('committing a block moved the text under a reader who scrolled up')
+        if (!rng.startContainer.isConnected)
+          fail("the line a reader had stopped on was replaced when a block committed below it")
+        const moved = rng.getBoundingClientRect().top - anchorTop
+        if (Math.abs(moved) > 1.5)
+          fail(`committing a block moved the reader's line ${moved.toFixed(1)}px`)
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 3, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 40))
         transcript?.clear()
-        pageLog(`stream follow ok (worst step ${Math.round(worst)}px, off-bottom ${Math.round(away)}px)`)
+        pageLog(
+          `stream follow ok (worst frame step ${Math.round(worstStep)}px, worst speed change ` +
+            `${Math.round(worstAccel)}px/frame over ${frames} frames; worst ${Math.round(worstGap)}px below ` +
+            `the fold, settled ${Math.round(away)}px off bottom, reader's line moved ${moved.toFixed(1)}px on commit)`,
+        )
       }
       }
 

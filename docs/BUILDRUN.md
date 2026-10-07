@@ -1441,3 +1441,72 @@ Corollary for new guards: run a **negative control** before trusting one. The re
 validated by putting a word on screen, letting it settle 520ms, re-applying its entrance class,
 and reading `SELFTEST FAIL: 1 entrance(s) restarted on the same node: span.tin restarted
 cwoffee-tin (start #2)` — then removing the control. A guard nobody has seen fail is decoration.
+
+## Trap 71: following on every paint is still a lurch, and the user's own recording proved it
+
+After the reveal, the commit and the entrance replay were all fixed, the report came back as
+"the blinking is still there but minimal". The culprit was scroll, and the previous fix to it.
+
+The rule was *pin to the bottom on every paint*, which replaced a 112px jump with what looked
+like smooth motion. But a paint happens every `LIVE_RENDER_MS` = 120ms, so the view moved by
+however much text arrived in 120ms — two or three lines — **in one frame**. The user's screencast
+(`~/Videos/Screencasts/blinking.mp4`, 201 frames at ~26fps, cropped to the window) shows it
+exactly: aligning each recorded frame to the one before it by searching for the best vertical
+offset, most frames align at offset 0, and then 4.94s, 5.72s, 6.17s and 7.50s align at 66px,
+46px, 44px and 40px device pixels — 23-33 CSS px — with nothing moving either side. Stop,
+teleport, stop. The residual after alignment at those frames was 12-24 (text arriving), and where
+the residual was 0.4 the whole band had moved rigidly: a pure scroll, and a visible one.
+
+The fix is motion instead of a rule: a frame-clocked follow that steps at most 6px/frame, closes
+a seventh of any remaining gap, ramps its speed at 6px/frame², and puts the view (rather than
+walking it) when the gap is more than a screen and a half — which is a session opening, not text
+arriving.
+
+Two things that came out of the first attempt at that fix, both worth remembering:
+
+- **A catch-up snap is its own lurch.** `if (gap > 150) scrollTop = bottom` was written to handle
+  a committed table, and the self-test immediately caught it moving the page 204px in one frame,
+  because a harness can *also* fall 204px behind. Fractional catch-up with no threshold has no
+  discontinuity to hide.
+- **One step per frame, whichever caller asked for it.** Paints, tool events and turn-end all
+  call `follow()`. If each moves the page immediately, three callers inside one frame is three
+  steps, and an 8px step becomes a 24px jump. Events now only *arm* the loop; the loop is the
+  only thing that scrolls.
+
+## Trap 72: a free-running sampler measures the check's own scrolls
+
+The follow check sampled `scrollTop` from a `requestAnimationFrame` chain started next to the
+feeding loop. It reported `worst frame step 204px` while the actual worst step was 16px, because
+a frame queued before `sampling = false` fired during a later `await` and scored the `scrollTop
+-= 220` that the check itself performs two statements further down.
+
+Sample inside the chain that drives the input: `await pump()` once per frame, where `pump` reads
+`scrollTop` and resolves. Deterministic, one sample per frame, and the numbers matched the
+diagnostics in `follow()` immediately.
+
+Related: the check was also feeding text at ~1200 chars/s, eight times what this endpoint
+produces, which measured the harness's own queue. 96 characters per ~250ms is the real rate, and
+the bound that follows from the design (≤24px in a frame, ≤8px/frame change of speed, newest line
+within 220px) is a property of the app rather than of a stress test.
+
+## Trap 73: GNOME 50 renamed the screencast D-Bus API, and 19fps cannot see 50ms of motion
+
+Two things about the recording path on this box:
+
+- `org.gnome.Shell.Screencast` no longer has `RecStart(dir, name, opts)`. It is
+  `Screencast(s stem, a{sv} options) -> (b, s)` and `StopScreencast() -> b`; the caller passes the
+  output path without an extension, and mutter appends `.mp4`. The client still has to hold the
+  D-Bus connection for the whole recording, and the enum is `Gio.BusType.SESSION`.
+- The result is variable frame rate: 17.9fps for a mostly-static 62s take, 28fps while the
+  composer caret blinked, 26-29fps during a turn. A follow that glides 22px over three painted
+  frames (50ms at 60fps) is therefore recorded as *one* frame displaced by 22px — the film cannot
+  resolve it. Frame diffs on a VFR recording measure **velocity**, not smoothness: shift ÷ Δt
+  between recorded frames, and compare that against the design's velocity cap (6px/frame ≈
+  360px/s steady, more during a ramped catch-up). Measured after the change: median 277 CSS px/s,
+  p95 575, max 873 while the header row of a new turn was landing.
+
+What the film *can* prove is whether a fade is happening where it should. Normalised alpha
+(`1 - mean(luma)/paper`) per frame in the frontier band climbs smoothly from .040 to .063 as a
+line fills in, and every apparent "dip" lands on a frame that the shift search explains as a
+scroll. In the user-bubble band, alpha sits at .057-.060 across the three frames where the band
+moved 15px each: a scroll moves pixels, a blink changes alpha.

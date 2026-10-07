@@ -530,8 +530,8 @@ export const REVEAL_ANIM_MS = 320
 /** Floor and ceiling for the adaptive duration. Below the floor the effect is a
  *  flicker; above the ceiling a fast model outruns its own animation, which is
  *  the "playing catch up" the user reported. */
-export const REVEAL_MIN_MS = 110
-export const REVEAL_MAX_MS = 170
+export const REVEAL_MIN_MS = 130
+export const REVEAL_MAX_MS = 200
 
 /**
  * How long one word should take to land, given how fast words are arriving.

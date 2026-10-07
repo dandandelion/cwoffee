@@ -384,3 +384,55 @@ variable-rate and dedupes identical frames. The in-page rAF counter says the pag
 
 Memory after this change: PSS **244.8-267.0 MB** across three samples (main process plus the
 WebKit web/network children) against the 400 MB ceiling; RSS 462.7-482.8 MB.
+
+### The leftover blink was scroll, and these are the numbers on it
+
+The user's own recording (`~/Videos/Screencasts/blinking.mp4`, 201 frames, ~26fps, window crop)
+aligned frame to frame by searching for the best vertical offset:
+
+| measured on the user's recording (before) | value |
+|---|---|
+| frames whose best alignment is offset 0 | most of them — the page sat still |
+| then displacements at 4.94s / 5.72s / 6.17s / 7.50s | **66 / 46 / 44 / 40 device px** = 33 / 23 / 22 / 20 CSS px |
+| residual after alignment on those frames | 12-24 (text arriving); 0.4-1.6 where the move was a pure scroll |
+| motion in the frames either side | none — stop, teleport, stop |
+| implied velocity of one such jump | 600-870 CSS px/s in a single frame |
+
+After moving the follow onto a frame clock with a velocity cap and a ramped catch-up, recorded on
+the same kind of take (62s, 1191 frames, ~19fps) with the same alignment method:
+
+| measured after | value |
+|---|---|
+| page velocity per recorded frame — median / p95 / max | **277 / 575 / 873 CSS px/s** |
+| frames aligned by a rigid move with residual < 1 | continuous, and the residual says *moved*, not *rewritten* |
+| normalised alpha in the user-bubble band across moving frames | .057 → .057 → .060 (a scroll moves pixels; a blink changes alpha) |
+| normalised alpha in the frontier band while a line fills in | .040 → .045 → .050 → .055 → .060 → .063, no dips except on frames the shift search explains |
+
+And in-page, where the frame clock is actually visible (self-test, real engine, 505 sampled frames):
+
+| check | before | after |
+|---|---|---|
+| worst single-frame `scrollTop` step | 23-33px (paint granularity) | **8px** steady, 9-16px on a ramped catch-up |
+| worst change of speed in one frame | everything, instantly | **8px/frame** |
+| newest line, furthest below the fold | unbounded (204px seen) | **56px** |
+| where the follow ends up | — | **0px** off the bottom |
+| the line a scrolled-up reader stopped on, when a block committed below it | — | **0.0px** |
+
+The rules that hold it, in `transcript.ts`: 6px/frame steady, a seventh of any remaining gap,
+6px/frame² of acceleration, place-rather-than-walk past one screen and a half of gap, and exactly
+one step per frame no matter how many callers asked for a follow.
+
+### The reveal is a fade with a little focus, bounded at both ends
+
+`cwoffee-tin` is now `opacity 0→1` with `blur(1.2px)→0`, the blur gone by 55% of the animation and
+the end value `blur(0)` (identity) so the layer goes away while the word is still darkening.
+Duration 130-200ms from the measured word rate, stagger inside an arrival capped at 100ms.
+
+| bound | value | why it is a rule and not a taste call |
+|---|---|---|
+| spans mid-fade at the busiest moment (self-test) | **6** | fewer than 4 fails as "the reveal is invisible" — an opacity-only fade at 110-170ms is what triggered that |
+| same, upper bound | ≤24 | more is a grey ghost tail sitting two lines above the reading position |
+| spans still under 90% opacity 400ms after the last arrival | **0** | the ghost tail coming back |
+| settled spans with a filter still applied | **0** | a filter outliving the fade means the layer is being torn down under settled text |
+
+Memory at the point of writing: PSS **267 MB**, RSS 482.8 MB, against the 400 MB gate.

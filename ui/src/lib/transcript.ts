@@ -242,6 +242,8 @@ export class Transcript {
   /** Following the stream: pin to the bottom unless the reader scrolled away. */
   private pinned = true
   private programmatic = false
+  private followRaf = 0
+  private followVel = 0
   private scHooked: HTMLElement | null = null
   /**
    * Words per second, smoothed. The reveal duration comes from this so the
@@ -332,6 +334,7 @@ export class Transcript {
   }
 
   clear() {
+    this.stopFollow()
     this.root.textContent = ''
     this.turn = null
     this.textBuf = null
@@ -474,6 +477,10 @@ export class Transcript {
       }
       this.liveEl.classList.remove('streaming')
       this.paintAnswer(performance.now(), true)
+      // A forced paint is still a paint: if it did not follow, the newest line
+      // can sit below the fold until some later event rescues it - which is the
+      // lurch coming back through the side door.
+      this.follow()
       return
     }
     const now = performance.now()
@@ -640,7 +647,7 @@ export class Transcript {
       // arriving, not one block fading in. Capped hard: with a long cap the
       // newest line sits at half-opacity while the model has moved on two lines
       // down, which is the grey "ghost tail" the reveal got blamed for.
-      const delay = Math.min(i * 18, 90)
+      const delay = Math.min(i * 20, 100)
       if (delay) span.style.animationDelay = `${delay}ms`
       frag.append(span)
     }
@@ -677,16 +684,96 @@ export class Transcript {
   /**
    * Keep the newest line on screen without lurching.
    *
-   * The old rule was "if the bottom is within 160px, jump to it", which meant
-   * the view sat still while text piled up below the fold and then moved a whole
-   * paragraph at once - the frames show 112px, 92px, 46px steps. Following on
-   * every paint moves a few pixels at a time, which is what a reading eye expects.
+   * Two rules, both learned from frames rather than from taste. Follow on the
+   * frame clock, not the paint clock: the old "jump to the bottom if it is
+   * within 160px" rule left the newest line below the fold until a whole
+   * paragraph rescued it (112px, 92px, 46px steps), and pinning on every paint
+   * only shrank the step to a couple of lines, which still reads as a blink.
+   * So the follow runs as its own animation, at most FOLLOW_MAX_STEP px per
+   * frame, and only a structural gap larger than FOLLOW_SNAP_PX moves at once.
    */
   private follow() {
     const sc = this.hookScroller()
+    if (!sc) return
+    if (!this.pinned) {
+      this.stopFollow()
+      return
+    }
+    this.armFollow()
+  }
+
+  /**
+   * One step per animation frame, however many events asked for a follow.
+   *
+   * The first version of the glide moved immediately in `follow()`, so a paint
+   * and a tool event and the loop's own frame could each take a step inside the
+   * same frame: three 8px steps is a 24px jump, which is the thing being fixed.
+   * Events now only arm the loop; the loop is the only thing that scrolls.
+   */
+  private armFollow() {
+    if (this.followRaf) return
+    this.followRaf = requestAnimationFrame(() => {
+      this.followRaf = 0
+      this.stepFollow()
+      const sc = this.hookScroller()
+      if (sc && this.pinned && sc.scrollHeight - sc.clientHeight - sc.scrollTop > 0.5)
+        this.armFollow()
+    })
+  }
+
+  private stepFollow() {
+    const sc = this.hookScroller()
     if (!sc || !this.pinned) return
-    const away = sc.scrollHeight - sc.scrollTop - sc.clientHeight
-    if (away <= 0) return
+    const target = sc.scrollHeight - sc.clientHeight
+    const gap = target - sc.scrollTop
+    if (gap <= 0.5) {
+      this.followVel = 0
+      return
+    }
+    if (gap > sc.clientHeight * FOLLOW_JUMP) {
+      pageLog(`follow: ${Math.round(gap)}px behind is a view change, not a stream; placing the view`)
+      this.followVel = 0
+      this.programmatic = true
+      sc.scrollTop = target
+      requestAnimationFrame(() => {
+        this.programmatic = false
+      })
+      return
+    }
+    const want = Math.min(gap, Math.max(FOLLOW_MAX_STEP, gap * FOLLOW_CATCHUP))
+    const step = Math.min(want, this.followVel + FOLLOW_ACCEL)
+    this.followVel = step
+    if (step > FOLLOW_MAX_STEP + 1)
+      pageLog(`follow catch-up: ${Math.round(gap)}px behind, moving ${Math.round(step)}px this frame`)
+    const before = sc.scrollTop
+    this.programmatic = true
+    sc.scrollTop = before + step
+    requestAnimationFrame(() => {
+      this.programmatic = false
+    })
+    // The engine rounds scrollTop. If a step bought nothing, finish the trip
+    // rather than spin on sub-pixel residue.
+    if (sc.scrollTop - before < 0.5) {
+      pageLog(`follow: a ${Math.round(step)}px step bought nothing at ${Math.round(gap)}px behind; finishing the trip`)
+      sc.scrollTop = target
+      this.followVel = 0
+    }
+  }
+
+  private stopFollow() {
+    this.followVel = 0
+    if (this.followRaf) {
+      cancelAnimationFrame(this.followRaf)
+      this.followRaf = 0
+    }
+  }
+
+  /** Put the reader at the bottom this frame. For switching, never mid-stream. */
+  followNow() {
+    this.stopFollow()
+    this.followVel = 0
+    const sc = this.hookScroller()
+    if (!sc) return
     this.programmatic = true
     sc.scrollTop = sc.scrollHeight
     requestAnimationFrame(() => {
@@ -1599,6 +1686,47 @@ export class Transcript {
 
 /** Minimum interval between live markdown passes. */
 const LIVE_RENDER_MS = 120
+
+/**
+ * How fast the view may chase the bottom while following, in CSS px per frame.
+ *
+ * A paint happens every 120ms and can add two or three lines, so pinning to the
+ * bottom *at paint granularity* still moves the whole transcript by 23-33px in a
+ * single frame - measured in the user's own screen recording as 46px and 66px
+ * steps at 4.9s and 5.7s. Everything already on screen teleports, and the eye
+ * reads that as a blink. 6px/frame glides at ~360px/s, which is three times the
+ * fastest this endpoint streams text and slow enough to read as motion rather
+ * than a jump.
+ */
+const FOLLOW_MAX_STEP = 6
+
+/**
+ * When the view has fallen further behind, catch up by a fraction of the gap
+ * each frame rather than in one jump. A hard "snap if more than 150px" rule was
+ * the first attempt and it is its own lurch: 151px of accumulated text - or one
+ * big tool card, or one slow frame on a busy machine - moved the whole page in a
+ * single frame. Closing a seventh of the gap per frame covers 200px in about 16
+ * frames and never has a discontinuity to hide.
+ */
+const FOLLOW_CATCHUP = 0.14
+
+/**
+ * How fast the follow may speed up, in px/frame per frame.
+ *
+ * A fixed fraction of the gap makes the first frame of a catch-up jump straight
+ * to full speed: when a table or a tool card lands below the fold the view moves
+ * 29px instantly, which is the same single-frame displacement the lurch had. The
+ * velocity now ramps, so the same catch-up reads as a glide that gathers speed.
+ */
+const FOLLOW_ACCEL = 6
+
+/**
+ * A gap more than a screen and a half wide is not text arriving; it is a view
+ * changing under the reader - a session opened, an older page loaded. Gliding
+ * through 3000px of transcript is not smooth motion, it is a mistake, so the
+ * view is placed rather than walked.
+ */
+const FOLLOW_JUMP = 1.5
 
 function parseCalls(jsonStr: string): Array<{ id: string; name: string; arguments: string }> {
   if (!jsonStr) return []

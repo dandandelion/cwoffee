@@ -1779,20 +1779,29 @@ body {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
-/* Opacity only, and that is a decision, not an omission.
+/* Fade plus a little focus, and the ratio is measured rather than tasted.
 
-   This animation used to carry `filter: blur(1.6px) -> blur(0)`. A filter makes
-   WebKit take the word out of the text layer, rasterize it on its own, and put
-   it back when the animation ends - so each word *pops* at the end of its own
-   animation. At the 30-45 words per second this endpoint produces, that is a
-   pop every 25ms, forever, which is precisely what "it still blinks a bit while
-   generating" describes. A transform would be cheaper but does not apply to a
-   non-replaced inline box, and making the spans inline-block would change where
-   the line breaks. So: fade only. A staggered fade still reads as words
-   arriving, and nothing re-rasters. */
+   This animation went blur(1.6px) -> opacity-only -> back to a smaller blur, and
+   each change had an excuse. What is actually true, in order of evidence:
+
+   - An animated `filter` puts the word on its own layer and takes it back off at
+     the end. That costs something, and if the last animated value differs from
+     the unfiltered raster the word visibly *pops* when the layer goes away.
+   - The app-side "word pop" that got the blur deleted was mostly not the blur: it
+     was the transcript jumping 23-33px a frame at a time (see the follow rules in
+     transcript.ts), which moves every word on screen whether it is fading or not.
+   - Isolated in this engine at 120fps, an opacity-only fade, a blur-only fade and
+     the two together all draw cleanly. Blur is not the flicker.
+
+   So: blur arrives *faster* than opacity (the 55% stop), which is what reads as
+   coming into focus, and the last 45% of the animation is a plain fade with
+   `blur(0)` - identity - so the layer goes away while the word is still darkening
+   and there is nothing to pop. 1.2px is deliberate: past about 1.5px a five-letter
+   word stops being a word while it arrives, and the line reads as soup. */
 @keyframes cwoffee-tin {
-  from { opacity: 0; }
-  to   { opacity: 1; }
+  from { opacity: 0; filter: blur(1.2px); }
+  55%  { opacity: .86; filter: blur(0.2px); }
+  to   { opacity: 1; filter: blur(0); }
 }
 /* No padding compensation for a streaming body. There used to be a 3px nudge
    here, which pushed the first line of the answer away from the CWOFFEE label
@@ -1819,7 +1828,7 @@ body {
  * already landed.
  */
 .tin {
-  animation: cwoffee-tin var(--tin-dur, 170ms) cubic-bezier(0.32, 0.02, 0.28, 1) backwards;
+  animation: cwoffee-tin var(--tin-dur, 200ms) cubic-bezier(0.32, 0.02, 0.28, 1) backwards;
 }
 /* ---- right-click, ours --------------------------------------------------
    The native WebKit menu offers Back/Forward/Reload. This one is built from what

@@ -227,23 +227,50 @@ Three more checks sit next to it. A streamed answer must contain a real `h2`, a 
 an `li` **before** `turnEnd` while its tail is still raw text. A committed plain paragraph must
 keep **all** of its word spans connected and must not move the paragraph above it by more than
 0.6px — measured at **0.0px**, with 15 of 15 spans kept. And a follow check fails if any single
-paint moves the transcript more than 60px or leaves the newest line more than 40px below the
-fold.
+animation frame moves the transcript more than 24px, if the follow changes speed by more than
+8px/frame in one frame, or if the newest line is left more than 220px below the fold.
 
 ### The view follows, it does not lurch
 
-Following the newest line used to be one rule — *if the bottom is within 160px, jump to it*.
-That is a rule that lets the newest line fall off the bottom of the screen and then rescues
-it. Measuring the user's recording line by line: one sentence sat at the same height for five
-seconds, then moved **112px**, then 92px, then 46px. Text that jumps a paragraph at a time
-reads as blinking, whatever the letter animation does.
+Following the newest line has been wrong twice, in two different directions.
 
-The answer is boring and continuous: after every paint, if the reader is still at the bottom,
-pin to the bottom, which moves a few pixels at a time. Scrolling up unpins, and the app stops
-moving the page; scrolling back to the bottom re-pins. Committing a finished block while a
-reader is scrolled up compensates `scrollTop` for the height change, so reformatting a
-paragraph cannot shove the text they are reading. Measured live: worst step **24px**, distance
-from the bottom through a whole turn **0px**.
+The first rule was *if the bottom is within 160px, jump to it*. Measuring the user's recording
+line by line: one sentence sat at the same height for five seconds, then moved **112px**, then
+92px, then 46px. Text that jumps a paragraph at a time reads as blinking, whatever the letter
+animation does.
+
+The first fix — *pin to the bottom after every paint* — was still wrong, and the user's own
+screen recording is what proved it. A paint happens every 120ms, so a paint-granularity follow
+moves the whole transcript by **23-33px in a single frame** (46px and 66px device pixels at
+4.9s and 5.7s of their clip), with no movement in the frames either side: stop, teleport, stop.
+Every word the reader had already read changed place at once. That is the "minimal blink" left
+over after the reveal and the commit were fixed.
+
+So the follow now runs on its own animation-frame clock, as a piece of motion rather than a
+rule:
+
+- **6px per frame** steady (≈360px/s), which is about three times the fastest this endpoint
+  streams text, so text never outruns it.
+- If the view has fallen behind — a table committing, a tool card landing, one slow frame on a
+  busy machine — it closes a seventh of the gap per frame, and it **gathers speed** at 6px/frame²
+  instead of starting at full speed. A 160px catch-up takes about a sixth of a second and has no
+  discontinuity in it.
+- A gap wider than a screen and a half is not text arriving, it is a view changing (a session
+  opened, an older page loaded), and the view is placed rather than walked.
+- One step per frame, no matter how many events asked for a follow. Three callers each taking an
+  8px step inside one frame is a 24px jump, which is the bug being fixed; events now only arm the
+  loop.
+- Scrolling up unpins and the app stops moving the page; scrolling back to the bottom re-pins.
+  Committing a finished block while a reader is scrolled up compensates `scrollTop` for the
+  height change, so reformatting a paragraph cannot shove the text they are reading.
+
+Measured: worst single-frame step **8px** and worst speed change **8px/frame** across 505 sampled
+frames of a synthetic turn, newest line never more than **56px** below the fold, and the line a
+scrolled-up reader stopped on moved **0.0px** when a block committed under them. On real turns the
+catch-up logs 9-16px steps. The compositor film agrees: page velocity median **277px/s**, p95
+**575px/s**, with frames aligned to their neighbours at residual ≈0.4 (a rigid glide, not a
+rewrite), where the same measurement on the user's recording showed 23-33px displacements
+concentrated in single frames.
 
 Two details that paragraph depends on:
 
@@ -252,15 +279,23 @@ Two details that paragraph depends on:
   transcript — which pins to the tail — nudges the whole view with it. That is a flicker
   report waiting to happen, and it is why thinking once looked like it "grew vertically
   instead of filling the width".
-- The animation is **opacity only**, and fills `backwards`, not `both`. A `filter` — the blur
-  this reveal used to animate — makes WebKit lift the word onto its own layer and drop it back
-  when the animation ends, so every word pops at the end of its own animation. At 30-45 tokens
-  a second that is a pop every 25ms for the whole turn, which is what "it still blinks a little"
-  turned out to be. `both` has the same fault in slower form: it keeps an animation-owned end
-  state on text that has already landed.
+- The reveal is a **fade with a little focus**: `opacity 0 → 1` and `blur(1.2px) → 0`, with the
+  blur gone by 55% of the animation so the word is already sharp while it is still darkening.
+  Duration 130-200ms by measured word rate, stagger inside an arrival capped at 100ms. An
+  opacity-only fade of that length is, it turns out, barely visible: the entry reads as smooth
+  and registers as nothing. Blur arriving first is what makes a word look like it *comes into
+  focus* rather than appearing. What blur must not do is outlast the fade — `filter` lifts a
+  word onto its own layer and drops it at the end of the animation, and if the last animated
+  value differs from the unfiltered raster, the word pops when the layer goes away.
+  `blur(0)` is identity, so the layer goes away mid-darkening and there is nothing to pop; past
+  about 1.5px a five-letter word stops being a word while it arrives.
 - The duration is written on **each span**, never as a custom property on the paragraph. An
   attribute write on the parent re-resolves the style of every settled span inside it, on every
   paint; a `MutationObserver` on the streaming paragraph fails the self-test if it sees one.
+- The reveal is bounded in **both** directions, because either failure is visible: fewer than 4
+  spans mid-fade at the busiest moment fails as "the reveal is invisible", more than 24 fails as
+  "the newest line is grey for lines of reading", and any span still under 90% opacity 400ms after
+  the last arrival fails as the ghost tail coming back.
 
 ### An entrance belongs to newness, not to the element
 
