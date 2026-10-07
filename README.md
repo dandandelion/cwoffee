@@ -56,7 +56,13 @@ Gates:
 ./scripts/memory.sh cwoffee-app 400      # PSS, includes WebKit children
 ./scripts/gpu-check.sh cwoffee-app       # must hold renderD128 only
 ./scripts/sandbox-probe.sh             # re-run after any bwrap/kernel upgrade
+node scripts/gateway-smoke.mjs         # what a phone can actually rely on; mutates nothing
 ```
+
+The self-test is the other gate: build the UI with `VITE_SELFTEST=1`, run the binary, and read
+the `[cwoffee/page]` lines. It asserts the streaming contract in the real webview — append-only
+reveal, layout-neutral commit, markdown before `turnEnd`, follow without lurches, and that no
+entry animation ever restarts on content already on screen.
 
 ## Docs
 
@@ -74,7 +80,8 @@ crates/engine      the product — agent loop, providers, tools, storage (no UI 
 crates/tauri-app   thin desktop host (links the engine in-process)
 crates/tui         ratatui client — the permanent dev/debug harness
 ui/                Svelte 5 + Tailwind v4
-scripts/           memory.sh (the PSS gate), gpu-check.sh, sandbox-probe.sh, check-docx.py
+scripts/           memory.sh (the PSS gate), gpu-check.sh, sandbox-probe.sh,
+                   gateway-smoke.mjs, check-docx.py
 ```
 
 The engine has no idea a UI exists. Both clients drive one `SessionHost` over
@@ -173,9 +180,9 @@ press it. `prefers-reduced-motion` turns all of it off. The one looping animatio
 the app is the steam on the empty screen's cup.
 
 Streaming text **arrives** rather than appearing. Each word that lands since the last
-repaint becomes its own inline `<span>`, blurs and fades from zero, and is **never touched
-again**. Nothing about that word is re-laid-out, re-parsed or re-animated for the rest of
-the turn: the block is append-only, exactly like the prompt that produced it. Duration is
+repaint becomes its own inline `<span>`, fades in from zero on opacity alone, and is **never
+touched again**. Nothing about that word is re-laid-out, re-parsed or re-animated for the rest
+of the turn: the block is append-only, exactly like the prompt that produced it. Duration is
 not a constant either — it is derived from the observed word rate (`600/words_per_second`,
 clamped to **110-170ms**) and the stagger across one arrival is capped at **90ms**.
 
@@ -254,6 +261,35 @@ Two details that paragraph depends on:
 - The duration is written on **each span**, never as a custom property on the paragraph. An
   attribute write on the parent re-resolves the style of every settled span inside it, on every
   paint; a `MutationObserver` on the streaming paragraph fails the self-test if it sees one.
+
+### An entrance belongs to newness, not to the element
+
+Every "it blinks" report came back to one mechanism, and it is not animation being
+decorative: an entry animation whose first keyframe is `opacity: 0` is a **hiding mechanism**
+for as long as it runs. Measured in plain HTML inside this same engine — no Svelte, no app
+code, real compositor output — a fresh node given an entrance stays *fully unpainted* for 14
+frames at 120fps (≈117ms), and re-applying the animation class to an element that already
+finished it gives the same 13-14 blank frames. An opacity-only fade holds it invisible for
+17-23 frames. A fresh node with **no** animation: zero blank frames. Fill mode (`both`,
+`backwards`, `none`), `will-change`, `blur`, `transform` — none of them change it either way.
+
+So the rule is not "animate less", it is: **an entrance may only run on a node that has never
+been painted.** The CSS deliberately binds entrances to structure — `.turn > *`, `.tin`,
+`.pop`, `.filechip`, `.toast`, `.empty` — which is safe only while nothing re-creates those
+nodes. Re-create the `.turn` container and `.turn > *` replays the entrance of every row in it
+at once, which is a whole-transcript flash; `transcript.ts` is the only code that builds
+transcript DOM, and that convention is now pinned rather than trusted. The self-test watches
+every `animationstart` in the page against the insertion time of every element, and fails if
+an entrance runs a second time on the same node, lands on a node that predates the check, or
+starts more than 400ms after the node arrived; it also fails if the live turn's container is
+replaced or loses a child mid-turn.
+
+Measured in the production UI running in this same WebKitGTK 2.54.0: **593 reveals across a
+real turn, 0 of them a restart**, insertion-to-start age 100-135ms, and the reveal ramping through
+`0 → .04 → .17 → .39 → .59 → .74 → .85 → .92 → .97 → 1` at ~60fps, median paint gap 17ms,
+worst 48ms. Opening another session and back starts **no animation at all** — that is the
+payoff of rendering stored transcripts outside `.turn`, so an old session does not play forty
+entrances.
 
 ## Files, and asking instead of guessing
 

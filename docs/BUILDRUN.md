@@ -138,6 +138,7 @@ VmSize at small PSS, and the limit produces allocation failures that are not rea
 ./scripts/memory.sh cwoffee-app 400
 ./scripts/gpu-check.sh cwoffee-app
 ./scripts/sandbox-probe.sh
+node scripts/gateway-smoke.mjs
 ```
 
 ## Trap 8 — the TUI needs a real terminal
@@ -1338,3 +1339,105 @@ Two harness traps from trying to prove "settled text does not move":
   that in place, the only surviving whole-block changes were the two structural
   commits in the turn (a list and a table replacing their raw text), which is one
   reflow per such block, by design.
+
+## Trap 68: an entry animation is a hiding mechanism, and it was running on painted content
+
+"Almost every animated element blinks at some point" went through four suspect lists —
+blur, `will-change`, fill mode, easing, WebKit itself — and every one of them was wrong.
+The mechanism was found by animating a *solid square* in plain HTML inside a bare
+WebKitGTK window and reading real compositor output:
+
+| what the page did | frames with the element fully unpainted |
+| --- | --- |
+| fresh node, no animation | **0** |
+| fresh node + `rise`, fill `both` / `none` / `backwards` | 14, 14, 14 (≈117ms at 120fps) |
+| same node, animation class removed and re-added | 13-14 |
+| fresh node + opacity-only fade | 17-23 (≈142-192ms) |
+
+Fill mode changes nothing. `will-change` changes nothing. A row of 16 variants —
+opacity-only, transform-only, `blur`-only, all combinations, opacity on a raw text node,
+plain controls — animated cleanly across 1450 frames: **the engine does not blink.** The
+artifact appears when an animation whose first keyframe is invisible is *started on
+content that is already on screen*, either by re-creating the node or by re-applying the
+class to the same one. While the animation runs the element is composited at the keyframe
+value, i.e. transparent. Which means every entry animation in the app is a hide for its
+full duration, and the CSS binds entry animations to *structure* — `.turn > *`, `.tin`,
+`.pop`, `.filechip`, `.toast`, `.empty` — not to newness.
+
+The consequence is specific and worth internalizing: `.turn > * { animation: cwoffee-rise … both }`
+is only safe because `transcript.ts` never rebuilds a `.turn`. Rebuild it once — a `{#key}`,
+a keyed-each reshuffle, remounting the transcript — and every row in the turn goes invisible
+for 150-260ms at the same moment. That is a whole-transcript flash, and it is invisible in a
+screenshot.
+
+So the invariant is now measured rather than assumed. The self-test mirrors every
+`animationstart` in the page against the insertion time of every element and fails if an
+entrance runs twice on the same node, lands on a node that predates the check, or starts more
+than 400ms after its node arrived; it also fails if the live turn's `.turn` element is
+replaced or loses a child mid-turn, and fails vacuously if it saw fewer than 10 reveals. It
+passes today: 56 entrances across a turn, a popover and a session round trip, oldest node at
+start 99ms, 0 replays. In a real turn in the production UI: 593 `cwoffee-tin` starts, 411
+ends, **0 nodes animated twice**.
+
+What this also settles: the reveal *is* visible. Per-paint `getComputedStyle` sampling of a
+production `.tin` span gives `0 → .04 → .17 → .39 → .59 → .74 → .85 → .92 → .97 → 1` across
+10-12 paints at ~60fps (median paint gap 17ms, worst 48ms). If a fade reads as a pop, the
+suspicion is frame pacing, not the keyframes.
+
+## Trap 69: the screencast lies — variable frame rate, deduped frames, and an ink threshold
+
+Three measurement traps, all of which produced confident wrong conclusions before they were
+caught:
+
+- **GNOME Shell's screencast is variable-frame-rate and dedupes identical frames.** The same
+  recorder produced 2.9 fps on a mostly idle app page, 120 fps on a page full of looping
+  animations and 26 fps during a model turn. A "frame 61 was blank" reading from that stream
+  means nothing until the cadence is known; the container must be asked
+  (`ffprobe -show_entries frame=pts_time`), never assumed constant.
+- **An ink threshold is not an alpha meter.** Counting pixels below luma 150 in a box makes a
+  correct 200ms linear fade read as "invisible for 115ms, then snap", because at 50% opacity
+  the text is above the threshold. Measuring mean luma and normalizing it to alpha showed the
+  same frames as a clean ramp. Any fade measurement must be a *ratio*, not a count.
+- **Frames captured off the compositor are not the app's paint rate.** The page's own
+  `requestAnimationFrame` clock (a bar whose width advances one step per paint, decoded out of
+  the recording) showed 59.7fps while the recording carried 26fps of samples. Trust the
+  in-page counter for pacing and use the film for what actually reached the screen.
+
+When presentation-level truth matters, skip the recorder: `WebKit2.WebView.get_snapshot`
+returns the engine's own committed output (a `cairo.ImageSurface`, and note the callback takes
+three arguments — `view, result, user_data` — and `SnapshotOptions` is not nullable). Sampling
+the production UI at 11.6 snapshots/s for 40s across boot, a full streaming turn and two
+session switches found **zero** frames where already-drawn text stopped being drawn. Two
+tools that made this cheap and are worth keeping: a `Gtk`+`WebKit2` window that loads any URL
+and dumps an in-page probe over the message handler, and an in-page canvas film that draws one
+column per paint — a self-recording strip, immune to whatever the recorder does with frames.
+
+## Trap 70: a self-test that asks a local model to cooperate will fail on a good day
+
+`SELFTEST FAIL: no file attachment rendered for a turn that wrote a file` appeared once and
+nothing in the app had changed. The check sends "use write_file to create selftest-note.md",
+waits for the turn, then looks for the chip. `qwen3.8-flash-next-iq3_s` sometimes answers
+"the path is …" **without calling the tool**, and then there is no file, no chip, and a
+failure that blames the app for the model's choice.
+
+It now asks the store what actually happened
+(`session_messages` → any row with `files`, or `tool_calls_json` naming `write_file`) and
+branches:
+
+- file was written, no chip → **fail**, that is the product bug the check exists for.
+- no file was written → log `selftest note: the model answered without calling write_file,
+  so there was no file to attach; the chip check needs that premise and skipped`.
+
+Two rules fell out of it, and they are harness rules rather than taste:
+
+- **State the premise or drop the check.** Any check whose input depends on a model decision
+  must verify that decision from the store before asserting anything about its consequences.
+- **Never print "ok" after a FAIL.** The replay watch used to log
+  `no entrance replays ok (…)` on the line below its own `SELFTEST FAIL`, which is how a
+  harness trains you not to read its last line. Checks now capture `fails` first and log the
+  success line only if their own assertions were clean.
+
+Corollary for new guards: run a **negative control** before trusting one. The replay watch was
+validated by putting a word on screen, letting it settle 520ms, re-applying its entrance class,
+and reading `SELFTEST FAIL: 1 entrance(s) restarted on the same node: span.tin restarted
+cwoffee-tin (start #2)` — then removing the control. A guard nobody has seen fail is decoration.

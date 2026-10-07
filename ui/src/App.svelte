@@ -2729,8 +2729,25 @@
         } else {
           await new Promise((r) => setTimeout(r, 400))
           const chips = [...document.querySelectorAll('.filechip')] as HTMLElement[]
-          if (!chips.length) {
-            fail('no file attachment rendered for a turn that wrote a file')
+          // Whether the file exists at all is the model's decision, not the app's,
+          // and a quantized local model sometimes answers "the path is ..." without
+          // calling the tool. Ask the store what the turn actually did, so a run
+          // where nothing was written says that instead of reporting a product bug
+          // - a gate that cries wolf is a gate people stop reading.
+          const st = await invoke<HostState>('session_state')
+          const page = await invoke<{ messages: any[] }>('session_messages', {
+            id: st.session_id,
+          }).catch(() => ({ messages: [] as any[] }))
+          const wrote = page.messages.some(
+            (m) => (m.files?.length ?? 0) > 0 || /write_file/.test(m.tool_calls_json ?? ''),
+          )
+          if (!wrote) {
+            pageLog(
+              'selftest note: the model answered without calling write_file, so there was no ' +
+                'file to attach; the chip check needs that premise and skipped',
+            )
+          } else if (!chips.length) {
+            fail('the turn wrote a file and no attachment was rendered')
           } else {
             const paths = chips.map((c) => c.dataset.path ?? '')
             if (!paths.some((p) => p.includes('selftest-note.md')))
@@ -3760,6 +3777,208 @@
         transcript?.clear()
         pageLog(`stream follow ok (worst step ${Math.round(worst)}px, off-bottom ${Math.round(away)}px)`)
       }
+      }
+
+      // [4] An entrance may only ever run on a node that has never been painted.
+      //
+      // This is the property every reported "it blinks" lands on, so it is now
+      // measured rather than trusted. Isolated in plain HTML inside this same
+      // engine - no Svelte, no app code, real compositor frames at 120 fps - an
+      // entry animation whose first keyframe is `opacity: 0` leaves its element
+      // *fully unpainted* for the whole animation: 14 frames, about 120 ms, and
+      // 17-23 frames for a longer opacity fade. A fresh node with no animation:
+      // zero blank frames. Fill mode (`both`, `backwards`, `none`), blur,
+      // transform and `will-change` change nothing. So the lesson is not "make
+      // animations shorter" - it is that an entrance belongs to *newness*. Run
+      // it on content the reader has already read and that content disappears
+      // for the length of the animation, which is exactly the flash that was
+      // reported over and over.
+      //
+      // The CSS deliberately binds entrances to structure rather than newness -
+      // `.turn > *`, `.tin`, `.pop`, `.filechip`, `.toast`, `.empty` - which is
+      // only safe while nothing re-creates those nodes. This check is what keeps
+      // that safe: it watches every animation start in the page and fails if one
+      // lands on a node that was already on screen, or runs a second time on the
+      // same node.
+      {
+        transcript?.clear()
+        const before = fails
+        const born = new WeakMap<Element, number>()
+        const started = new WeakMap<Element, Map<string, number>>()
+        const seedAt = performance.now()
+        for (const el of document.querySelectorAll('*')) born.set(el, seedAt)
+        const mo = new MutationObserver((recs) => {
+          const at = performance.now()
+          for (const r of recs)
+            for (const n of Array.from(r.addedNodes)) {
+              if (n.nodeType !== 1) continue
+              const el = n as Element
+              if (!born.has(el)) born.set(el, at)
+              for (const d of el.querySelectorAll('*')) if (!born.has(d)) born.set(d, at)
+            }
+        })
+        mo.observe(document.body, { childList: true, subtree: true })
+
+        const sig = (el: Element) => {
+          const c = (el as HTMLElement).className
+          const s = typeof c === 'string' ? c.trim().split(/\s+/)[0] : ''
+          return el.tagName.toLowerCase() + (s ? `.${s}` : '')
+        }
+        const again: string[] = []      // same node, entrance run twice
+        const late: string[] = []       // entrance on something already on screen
+        const cut: string[] = []        // entrance cancelled: the node was thrown away
+        const byName: Record<string, number> = {}
+        let fresh = 0
+        let oldest = 0
+        const onStart = (e: AnimationEvent) => {
+          const el = e.target as Element
+          byName[e.animationName] = (byName[e.animationName] ?? 0) + 1
+          const seen = started.get(el) ?? new Map<string, number>()
+          const nth = (seen.get(e.animationName) ?? 0) + 1
+          seen.set(e.animationName, nth)
+          started.set(el, seen)
+          if (nth > 1) {
+            again.push(`${sig(el)} restarted ${e.animationName} (start #${nth})`)
+            return
+          }
+          const at = born.get(el)
+          if (at === undefined) {
+            late.push(`${sig(el)} started ${e.animationName} although it predates this check`)
+            return
+          }
+          const age = performance.now() - at
+          if (age > oldest) oldest = age
+          fresh++
+          // A node created by the paint machinery starts its entrance on the
+          // following frame; measured in the running app at 100-135 ms. An
+          // entrance starting seconds after arrival is an entrance on content
+          // that is sitting there already.
+          if (age > 400)
+            late.push(`${sig(el)} started ${e.animationName} ${Math.round(age)}ms after it arrived`)
+        }
+        const onCancel = (e: AnimationEvent) => {
+          if (e.animationName === 'cwoffee-tin') cut.push(sig(e.target as Element))
+        }
+        document.addEventListener('animationstart', onStart, true)
+        document.addEventListener('animationcancel', onCancel, true)
+
+        // (a) a live turn: reveals, three kinds of structural commit, a tool card.
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 91, model: 'selftest' } })
+        const parts = [
+          'Six parts of one streamed answer, so that a heading, a list and a table ',
+          'all commit while the model is still talking.\n\n',
+          '## Roast levels\n\n',
+          '- light: cinnamon\n- medium: city\n\n',
+          '| level | oil |\n|---|---|\n| light | none |\n\n',
+          'A plain closing paragraph with no markup at all keeps its spans.\n\n',
+        ]
+        let turnEl: HTMLElement | null = null
+        let kids = 0
+        for (const d of parts) {
+          transcript?.apply({ kind: 'text', d })
+          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 60)))
+          transcript?.flushNow()
+          const t = document.querySelector('.turn') as HTMLElement | null
+          if (!t) {
+            fail('the live turn container vanished during the turn')
+            break
+          }
+          if (turnEl && t !== turnEl) {
+            fail(
+              'the live turn container was replaced mid-turn: `.turn > *` would replay the ' +
+                'entrance of every row in it at once, which is a whole-transcript flash',
+            )
+          } else if (turnEl && t.children.length < kids) {
+            fail(`the turn lost a child (${kids} -> ${t.children.length}): blocks are being rebuilt, not appended`)
+          }
+          turnEl = t
+          kids = t.children.length
+        }
+        transcript?.apply({ kind: 'toolCallBegin', d: { id: 'e1', name: 'exec' } })
+        transcript?.apply({ kind: 'toolCallReady', d: { id: 'e1', args: { cmd: 'true' } } })
+        transcript?.apply({ kind: 'toolExecEnd', d: { id: 'e1', ok: true, exit_code: 0, changes: [] } })
+        transcript?.apply({ kind: 'note', d: { message: 'a note lands in the same turn' } })
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 60)))
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 91, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 150))
+
+        // (b) a popover: `.pop` carries `cwoffee-pop ... both`, so a re-render of
+        // an open menu would fade the open menu out from under the pointer.
+        const chip = document.querySelector('button.cbtn.chip[data-menu]') as HTMLElement | null
+        if (!chip) fail('no composer chip to open a popover with')
+        else {
+          chip.click()
+          await new Promise((r) => setTimeout(r, 260))
+          const pop = document.querySelector('.pop') as HTMLElement | null
+          if (!pop) fail('the popover did not open')
+          else {
+            // Same node, twice, with the menu contents swapped underneath it.
+            pop.classList.toggle('pop-wide')
+            pop.classList.toggle('pop-wide')
+            await new Promise((r) => setTimeout(r, 200))
+          }
+        }
+
+        // (c) a session round trip through the click path. Stored transcripts are
+        // rendered outside `.turn` on purpose, so opening an old session must be
+        // silent rather than play forty entrances at once.
+        const rowMine = document.querySelector('.sessrow.active') as HTMLElement | null
+        const rows = [...document.querySelectorAll('.sessrow')] as HTMLElement[]
+        const rowOther = rows.find((r) => r !== rowMine)
+        let roundTrip = false
+        if (rowMine && rowOther) {
+          roundTrip = true
+          const openRow = (r: HTMLElement) =>
+            (r.querySelector('.sessbtn') as HTMLElement | null)?.click()
+          openRow(rowOther)
+          await new Promise((r) => setTimeout(r, 500))
+          openRow(rowMine)
+          await new Promise((r) => setTimeout(r, 500))
+        }
+        if (chip) (document.querySelector('.reader') as HTMLElement | null)?.click()
+        await new Promise((r) => setTimeout(r, 120))
+
+        document.removeEventListener('animationstart', onStart, true)
+        document.removeEventListener('animationcancel', onCancel, true)
+        mo.disconnect()
+        transcript?.clear()
+
+        if (again.length)
+          fail(`${again.length} entrance(s) restarted on the same node: ${again.slice(0, 3).join(' | ')}`)
+        if (late.length)
+          fail(
+            `${late.length} entrance(s) ran on content already on screen, which hides it for the length ` +
+              `of the animation: ${late.slice(0, 3).join(' | ')}`,
+          )
+        // A check that watches nothing passes vacuously, so require the traffic -
+        // unless the platform asked for reduced motion, where these animations are
+        // switched off by design and there is nothing to watch.
+        const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
+        const tins = byName['cwoffee-tin'] ?? 0
+        const rises = byName['cwoffee-rise'] ?? 0
+        if (!reduced && tins < 10) fail(`only ${tins} word reveals were seen: the replay watch proved nothing`)
+        if (!reduced && rises < 3) fail(`only ${rises} block entrances were seen: the replay watch proved nothing`)
+        if (!reduced && roundTrip && rises > 6)
+          fail(`${rises} block entrances in one turn: rows are entering more than once per turn`)
+        // Cancelling an entrance means the node was thrown away mid-animation. One
+        // per committed list or table is the honest cost of committing markdown; a
+        // cancel per paint means the transcript is being rebuilt under the reader.
+        if (cut.length > 6)
+          fail(`${cut.length} reveals were cancelled mid-flight: nodes are being rebuilt under the reader (${cut.slice(0, 4).join(', ')})`)
+        // Only claim success on this check's own line if this check had no say in
+        // the failure count: a line that says "ok" after a FAIL is the reason
+        // people stop reading logs.
+        if (fails === before)
+          pageLog(
+            `no entrance replays ok (${fresh} entrances on ${Object.keys(byName).length} animation kinds, ` +
+              `${tins} reveals, oldest node at start ${Math.round(oldest)}ms, ${cut.length} cut short` +
+              `${roundTrip ? ', session round trip silent' : ', no session switch available'})`,
+          )
+        // Verified by negative control, then removed: putting a word on screen, let
+        // it settle for 520ms, and re-apply its entrance makes this fail with
+        //   SELFTEST FAIL: 1 entrance(s) restarted on the same node:
+        //     span.tin restarted cwoffee-tin (start #2)
+        // A guard that has never been seen to fail is decoration.
       }
 
       // --- thinking sits under its own label; other blocks keep the gutter -----

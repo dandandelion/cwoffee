@@ -179,6 +179,26 @@ Verified behaviour, from the LAN address rather than from a unit test:
 * correct token -> `drive`, and `list_sessions` / `session_state` answer.
 * a turn driven from the browser streams into the browser *and* the desktop window.
 
+### Re-checking it without a phone
+
+`scripts/gateway-smoke.mjs` drives the same path a phone takes, with nothing but
+Node's own WebSocket, and asserts the answers the browser depends on: the two
+auth refusals say different things, a rejected socket is never told the session is
+ready, one `bootstrap` brings sessions + models + folders + host folder + session
++ transcript rows, and a `set_workspace` the host cannot honour comes back as a
+reason instead of a struct shaped almost right. It only ever calls the workspace
+requests the gateway is supposed to refuse, so it changes nothing on the host.
+
+```bash
+node scripts/gateway-smoke.mjs                     # ws://127.0.0.1:8099/ws
+node scripts/gateway-smoke.mjs --url ws://192.168.100.3:8099/ws
+```
+
+Two wire facts the script encodes, because both produce a silent hang when you get
+them wrong: an RPC `id` is a **u64** — `{id: "b1"}` is rejected as a malformed
+frame, not answered — and `auth_fail` carries its explanation in **`reason`**,
+not `message`.
+
 ### Why the first load took a while
 
 Reported from a phone: the page paints quickly, but the session list and model

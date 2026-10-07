@@ -209,6 +209,7 @@ only. Verified for both debug and release builds.
 # gates, against a running app
 ./scripts/gpu-check.sh cwoffee-app
 ./scripts/memory.sh cwoffee-app 400      # walks the whole descendant tree
+node scripts/gateway-smoke.mjs           # browser-side promises, mutates nothing
 
 # streaming + engine path, driven from a script
 VITE_AUTOTURN=1 VITE_AUTOTURN_PROMPT='Say hello in five words.' ./scripts/dev.sh
@@ -341,3 +342,45 @@ Honesty rules that came out of this: the endpoint's capabilities are read from
 attached only to the model its `model_alias` names, unknown is rendered as "not
 reported" rather than "no", and tool support is marked as inferred (it is
 detected from the served chat template because no endpoint states it).
+
+## Blink: what an entry animation actually costs, and whether the app replays one
+
+Investigating "almost every animated element blinks at some point". Isolated in plain HTML in
+a bare WebKitGTK 2.54.0 window, a solid square whose entrance is measured on real compositor
+output at 120fps:
+
+| page behaviour | frames fully unpainted | ≈ ms invisible |
+| --- | --- | --- |
+| fresh node, **no** animation | 0 | 0 |
+| fresh node + `rise`, fill `both` | 14 | 117 |
+| fresh node + `rise`, fill `none` | 14 | 117 |
+| fresh node + `rise`, fill `backwards` | 14 | 117 |
+| same node, class removed and re-added | 13-14 | 108-117 |
+| fresh node + opacity-only fade (200ms) | 17-23 | 142-192 |
+| 16 variants: opacity / transform / `blur` / combinations / `will-change` / opacity on a text node | clean, 1450 frames | — |
+
+In the production UI, same engine, during a real turn:
+
+| measurement | value |
+| --- | --- |
+| `cwoffee-tin` starts / ends / cancelled in one turn | 593 / 411 / 2 |
+| nodes animated **twice** (the blink signature) | **0** |
+| node age at animation start | 100-135 ms (insertion → first frame) |
+| reveal opacity per paint | `0 → .04 → .17 → .39 → .59 → .74 → .85 → .92 → .97 → 1` |
+| page paint pacing during a turn | median 17ms, p90 18ms, worst 48ms (59.7fps) |
+| animation starts when opening another session and back | **0** |
+| engine snapshots (`get_snapshot`) sampled over 40s of boot + turn + 2 session switches | 460, frames where settled text stopped being drawn: **0** |
+| self-test: entrances watched / replays / cut short | 56 / **0** / 0 |
+
+So the app's append-only, animate-once transcript holds. The danger is not the animation, it
+is a re-render that re-creates a node carrying one: `.turn > *` alone would hide an entire
+turn for 150-260ms. That is why the self-test now fails on any entrance that is a repeat, or
+that lands on a node older than the check, or on a `.turn` replaced mid-turn.
+
+Measurement rates, recorded so nobody reads a film wrong: the GNOME screencast produced 2.9fps
+on a near-idle page, 26fps during a turn and 120fps on a page of looping animations — it is
+variable-rate and dedupes identical frames. The in-page rAF counter says the page painted at
+59.7fps throughout.
+
+Memory after this change: PSS **244.8-267.0 MB** across three samples (main process plus the
+WebKit web/network children) against the 400 MB ceiling; RSS 462.7-482.8 MB.
