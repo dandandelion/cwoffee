@@ -124,6 +124,8 @@ async fn main() -> anyhow::Result<()> {
         };
     }
     cfg.context_budget = appcfg.context.target_tokens;
+    // None means the server's own output cap applies; see Config.
+    cfg.max_tokens = appcfg.max_output_tokens;
     // Per-turn, from the live workspace: see SessionHost.
     cfg.env_override = None;
     cfg.approval_timeout = std::time::Duration::from_secs(appcfg.approval_timeout_secs.unwrap_or(300));

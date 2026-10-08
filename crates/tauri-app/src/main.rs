@@ -180,6 +180,8 @@ fn main() {
     let mut cfg = HostConfig::new(model, workspace.clone());
     cfg.mode = mode;
     cfg.context_budget = appcfg.context.target_tokens;
+    // None means the server's own output cap applies; see Config.
+    cfg.max_tokens = appcfg.max_output_tokens;
     // No env block from here on purpose: the host derives it from the folder a
     // turn actually runs in. A snapshot of the startup folder used to be shown to
     // sessions living somewhere else.

@@ -48,7 +48,7 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, InlineStream } from './markdown'
+import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, firstItemEnd, listMarker, maybeListMarker, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, InlineStream } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -213,6 +213,19 @@ export class Transcript {
   private answerEls: HTMLElement[] = []
   // Live markdown state for the answer block currently streaming.
   private liveEl: HTMLElement | null = null
+  /**
+   * The `<ul>`/`<ol>` for a list that is being written, and whether the element
+   * now being filled was built as final structure rather than a placeholder.
+   *
+   * Building a list live is the only way four bullets can appear one at a time:
+   * the parser's own rule is that a list ends at a blank line, so waiting for the
+   * block means painting four `-` lines as text and then replacing them with four
+   * `<li>` boxes in one go. `tailStructured` is how `closeBlock` knows to leave
+   * those nodes alone: re-rendering a list that is already a list is a rewrite of
+   * settled text, and every rewrite of settled text has been a flicker report.
+   */
+  private liveList: HTMLElement | null = null
+  private tailStructured = false
   /** Files produced so far this turn, deduped by path, and the one row that
    *  shows them. */
   private turnFiles: OutputFile[] = []
@@ -526,9 +539,33 @@ export class Transcript {
     this.follow()
   }
 
-  /** The element the block currently being written lives in. */
-  private ensureTail(): HTMLElement {
+  /**
+   * The element the block currently being written lives in.
+   *
+   * A list item is born as an `<li>` inside a `<ul>`; a paragraph is born as a
+   * `<p>`. Deciding that at creation time is the whole trick - the alternative,
+   * painting text and re-making the node afterwards, is a rewrite.
+   */
+  private ensureTail(head = ''): HTMLElement {
     if (this.liveTail) return this.liveTail
+    const mark = listMarker(head)
+    if (mark && mark.flat && !mark.checkbox) {
+      if (!this.liveList) {
+        const ul = document.createElement(mark.ordered ? 'ol' : 'ul')
+        ul.className = 'live-list'
+        this.liveEl!.append(ul)
+        this.liveList = ul
+      }
+      const li = document.createElement('li')
+      this.liveList.append(li)
+      this.liveTail = li
+      this.tailStructured = true
+      this.inline.reset()
+      this.inlineHost = li
+      return li
+    }
+    this.liveList = null
+    this.tailStructured = false
     const t = document.createElement('p')
     t.className = 'live-para'
     this.liveEl!.append(t)
@@ -537,6 +574,50 @@ export class Transcript {
     this.inline.reset()
     this.inlineHost = t
     return t
+  }
+
+  /**
+   * One exception to "built live, leave alone": a link.
+   *
+   * Inline emphasis and code are opened as they complete, but a link needs both
+   * brackets before either half means anything, and research answers put a source
+   * in nearly every bullet. So an item with link syntax is parsed once, at its
+   * boundary, into the `<li>` that is already on screen: the box stays, only its
+   * inline children change, and it happens once per item rather than once per
+   * paint.
+   */
+  private settleItem(el: HTMLElement | null, itemSrc: string) {
+    if (!el || !/!?\[[^\]]*\]\([^)]+\)/.test(itemSrc)) return
+    const body = itemSrc.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, '').replace(/\n+$/, '')
+    const tpl = document.createElement('template')
+    tpl.innerHTML = renderMarkdown(body)
+    const parsed = Array.from(tpl.content.querySelectorAll('li'))
+      .flatMap((li) => Array.from(li.childNodes))
+      .concat(
+        Array.from(tpl.content.childNodes).filter(
+          (n) => (n as HTMLElement).tagName !== 'UL' && (n as HTMLElement).tagName !== 'OL',
+        ) as ChildNode[],
+      )
+    if (parsed.length) el.replaceChildren(...parsed)
+  }
+
+  /**
+   * Close one list item without closing the list.
+   *
+   * `listOver` is decided by the source, not by a guess: a blank line after the
+   * item ends the list, and the next list in the answer must be its own element
+   * rather than more `<li>`s on the end of the old one.
+   */
+  private endItem(src: string, at: number) {
+    this.liveTail = null
+    this.inlineHost = null
+    this.inline.reset()
+    const nextLine = src.slice(at).split('\n', 1)[0] ?? ''
+    // The list continues only if what follows is an item, or a marker still
+    // arriving. Anything else - prose, a heading, a blank line - ends it, and a
+    // later list must be a new element rather than extra `<li>`s on this one.
+    if (src.length > at && nextLine.trim() === '') this.liveList = null
+    else if (src.length > at && !listMarker(nextLine) && !maybeListMarker(nextLine)) this.liveList = null
   }
 
   /**
@@ -564,15 +645,51 @@ export class Transcript {
       const rest = src.slice(this.blockStart)
       const rel = firstBlockEnd(rest)
       const head = rest.split('\n', 1)[0]
+      const mark = listMarker(head)
       // A paragraph's soft line breaks are joined by the parser anyway, so they
       // are joined here too: painting them as breaks would add a line box that
       // vanishes when the block closes and shifts the page. Lists, tables,
       // quotes and code are meaningful per line, so those keep their newlines.
       const structural =
         fenceOpen(rest) || /^\s*(?:\||```|~~~|[-*+]\s|\d+\.\s|>)/.test(head)
+      // A live `<li>` starts after the marker. Painting `- ` into the item and
+      // taking it away later is a rewrite of settled text, and the harness caught
+      // exactly that: the first chunk landed as "- Sourc" inside the bullet.
+      const builtMark = mark && mark.flat && !mark.checkbox ? mark : null
+      const contentFrom = this.blockStart + (builtMark ? builtMark.prefix : 0)
+      const paintFrom = () => Math.max(this.livePainted, contentFrom)
+      // A list item is a finished piece of markdown as soon as the line starting
+      // the next one lands. Committing at that boundary, into an `<li>` that was
+      // created when the marker arrived, is what makes bullets appear one by one
+      // instead of four at a time at the end of the list.
+      const itemEnd = structural && !fenceOpen(rest) ? firstItemEnd(rest) : null
+      if (itemEnd !== null) {
+        const iend = this.blockStart + itemEnd
+        const upto = Math.min(iend, src.length)
+        if (upto > paintFrom()) {
+          const body = src.slice(paintFrom(), upto).replace(/\n+$/, '')
+          if (body) this.appendReveal(this.ensureTail(head), body, now, true, !fenceOpen(rest))
+        }
+        this.livePainted = Math.max(this.livePainted, upto)
+        this.settleItem(this.liveTail, src.slice(this.blockStart, iend))
+        this.endItem(src, iend)
+        this.blockStart = iend
+        continue
+      }
+      if (!rel && maybeListMarker(head) && !structural) {
+        // Half a marker ("-") is not enough to choose a box for this block. Wait a
+        // delta rather than painting syntax and rebuilding the box afterwards.
+        break
+      }
       if (!rel) {
         // Unfinished block: paint what arrived and leave the element open.
-        this.appendReveal(this.ensureTail(), src.slice(this.livePainted, src.length), now, !structural)
+        this.appendReveal(
+          this.ensureTail(head),
+          src.slice(paintFrom(), src.length),
+          now,
+          !structural,
+          !fenceOpen(rest),
+        )
         this.livePainted = src.length
         break
       }
@@ -582,7 +699,13 @@ export class Transcript {
       const end = this.blockStart + rel.end
       const upto = Math.min(end, src.length)
       if (upto > this.livePainted)
-        this.appendReveal(this.ensureTail(), src.slice(this.livePainted, upto), now, !structural)
+        this.appendReveal(
+          this.ensureTail(head),
+          src.slice(this.livePainted, upto),
+          now,
+          !structural,
+          !fenceOpen(rest),
+        )
       this.livePainted = Math.max(this.livePainted, upto)
       this.closeBlock(src.slice(this.blockStart, end))
       this.blockStart = end
@@ -601,10 +724,19 @@ export class Transcript {
    */
   private closeBlock(blockSrc: string, final = false) {
     const el = this.liveTail
+    const builtLive = this.tailStructured
     this.liveTail = null
     this.inlineHost = null
+    this.tailStructured = false
     this.inline.reset()
     if (!el) return
+    if (builtLive) {
+      // An `<li>` built as an `<li>` needs no parser. Running it anyway would
+      // replace spans that are already on screen with spans saying the same thing,
+      // and the compositor cannot tell that "the same thing" is free.
+      this.liveList = null
+      return
+    }
     if (!blockSrc.trim()) {
       el.remove()
       return
@@ -645,13 +777,31 @@ export class Transcript {
    * what the parser will do with them anyway; doing it here means the paragraph
    * occupies the same number of lines before and after it is committed.
    */
-  private appendReveal(host: HTMLElement, delta: string, now: number, joinNewlines = false) {
+  private appendReveal(
+    host: HTMLElement,
+    delta: string,
+    now: number,
+    joinNewlines = false,
+    allowInline = true,
+  ) {
     // `fenced` belongs to the streaming paragraph only. Toggling a class on a
     // body that is not streaming is an attribute write on a node full of settled
     // text, and every attribute write invalidates that text's style.
+    // The live text host is a `<p class="live-para">` or, for a list, the `<li>`
+    // being written. Both get inline constructs opened as they complete; a code
+    // fence does not, because `**` inside a code block is the text `**`.
+    // `fenced` means "this block's newlines are content right now", not "this is a
+    // code block" - it goes on any unfinished block whose line breaks must
+    // survive. Testing it to decide whether inline markup applies cost a literal
+    // `**` on screen, because one paragraph can gain and lose it between paints.
     if (host.classList.contains('live-para')) {
       if (joinNewlines) host.classList.remove('fenced')
       else host.classList.add('fenced')
+    }
+    // The live text host is a `<p class="live-para">` or, for a list, the `<li>`
+    // being written. Both get inline constructs opened as they complete; an open
+    // code fence does not, because `**` inside a code block is the text `**`.
+    if (host === this.inlineHost && allowInline) {
       // Inline emphasis in the paragraph being written: open a <strong>/<em>/
       // <code> when the opener is recognised and append the coming words inside
       // it, so `**the copy**` becomes bold the moment it closes instead of at the

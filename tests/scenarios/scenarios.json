@@ -397,6 +397,50 @@
           "delay_ms": 35
         }
       ]
+    },
+    {
+      "name": "truncation-check",
+      "match": "truncation-check",
+      "steps": [
+        {
+          "reasoning": "I will answer in one go, but the output cap will stop me.",
+          "content": "The quarterly report should go to the engineering team, and it needs to cover",
+          "finish": "length",
+          "delay_ms": 4,
+          "chunk_chars": 9
+        },
+        {
+          "content": " three risks: the migration window, the vendor lock-in, and the hiring gap. Each one is quantified below.",
+          "finish": "stop",
+          "delay_ms": 4,
+          "chunk_chars": 9
+        }
+      ]
+    },
+    {
+      "name": "thinking-ate-the-budget",
+      "match": "thinking-ate-the-budget",
+      "steps": [
+        {
+          "reasoning": "Let me weigh the options. First, the migration window: it is long, and it is risky, and it needs a rollback plan, and the rollback plan needs a dry run, and the dry run needs a freeze, and the freeze needs sign-off, and the sign-off needs...",
+          "finish": "length",
+          "delay_ms": 4,
+          "chunk_chars": 24
+        }
+      ]
+    },
+    {
+      "name": "bullets-live",
+      "match": "bullets-live",
+      "steps": [
+        {
+          "reasoning": "Four bullets, each one a separate line, then one sentence to close.",
+          "content": "- **Sourcing** matters more than the roast\n- Grind size is the biggest single lever in the whole ritual\n- Water is 98% of the cup, and almost nobody tunes it\n- Freshness beats any machine: see [the harvest date](https://example.com/harvest)\n\nThe last one is also the cheapest to fix, and it is the one people ignore.",
+          "finish": "stop",
+          "chunk_chars": 9,
+          "delay_ms": 34
+        }
+      ]
     }
   ]
 }

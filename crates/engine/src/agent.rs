@@ -248,6 +248,11 @@ impl Agent {
 
         let mut agg = TurnTelemetry::default();
         self.turn_files.clear();
+        // A round-trip that stopped at an output limit, and how many times this
+        // turn has picked such an answer back up. Bounded because each
+        // continuation is another prefill on a single-slot local server.
+        let mut cut_short = 0usize;
+        let mut carry_on = false;
 
         for _ in 0..self.cfg.max_tool_iters {
             if self.cancel.load(Ordering::Relaxed) {
@@ -260,6 +265,15 @@ impl Agent {
             req.tools = defs.clone();
             req.reasoning = self.cfg.reasoning;
             req.max_tokens = self.cfg.max_tokens;
+            if carry_on {
+                carry_on = false;
+                // Request-only. History already ends with the partial answer, and a
+                // instruction pushed through history would render a user bubble the
+                // user never typed.
+                req.messages.push(Message::user(
+                    "Your previous message was cut off at the output limit. Continue it from              exactly where it stopped, in the same language, without repeating anything              you already wrote.",
+                ));
+            }
 
             let collected = match self.stream_once(&req, out).await {
                 Ok(c) => c,
@@ -274,10 +288,28 @@ impl Agent {
             agg.merge_server(&collected.telemetry);
 
             if collected.text.is_empty() && collected.calls.is_empty() {
-                let _ = out.send(EngineEvent::Error {
-                    message: "model returned an empty turn".into(),
-                    fatal: false,
-                });
+                if collected.finish == FinishReason::Length {
+                    // The shape this box produced for a while: nine tool calls, a
+                    // "Done" chip, and no answer. Thinking and the answer share one
+                    // output budget, so a thinking-heavy turn can consume all of it
+                    // and the answer never starts. Say which knob to turn.
+                    let cap = match self.cfg.max_tokens {
+                        Some(m) => format!("cwoffee's max_output_tokens = {m}"),
+                        None => "the server's -np / n_predict (Cwoffee sets no cap of its own)".into(),
+                    };
+                    let _ = out.send(EngineEvent::Error {
+                        message: format!(
+                            "no answer: the model used all {} completion tokens on thinking and stopped at the output limit.                              Lower the thinking level, or raise {cap}.",
+                            collected.telemetry.completion_tokens
+                        ),
+                        fatal: false,
+                    });
+                } else {
+                    let _ = out.send(EngineEvent::Error {
+                        message: "model returned an empty turn".into(),
+                        fatal: false,
+                    });
+                }
             }
 
             if collected.calls.is_empty() {
@@ -286,8 +318,33 @@ impl Agent {
                     reason(&collected),
                     collected.reasoning_ms,
                 );
+
+                // The answer stopped at an output limit rather than at a sentence.
+                // Until a moment ago this was reported as a clean stop, which is how
+                // "the real LLM gets cut off mid-generation" looked like nothing at
+                // all in the log. Pick it back up while there is room, then say so.
+                if collected.finish == FinishReason::Length {
+                    if !collected.text.trim().is_empty() && cut_short < MAX_CONTINUATIONS {
+                        cut_short += 1;
+                        carry_on = true;
+                        let _ = out.send(EngineEvent::Note {
+                            message: format!(
+                                "the answer hit the output limit after {} tokens - continuing where it stopped ({cut_short} of {MAX_CONTINUATIONS})",
+                                collected.telemetry.completion_tokens
+                            ),
+                        });
+                        continue;
+                    }
+                    let _ = out.send(EngineEvent::Note {
+                        message: format!(
+                            "the answer is still cut short at the output limit ({} tokens).                              Raise max_output_tokens in config.toml, or the server's -np.",
+                            collected.telemetry.completion_tokens
+                        ),
+                    });
+                }
+
                 self.emit_turn_files(turn, out);
-                let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Stop });
+                let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: collected.finish });
                 return agg;
             }
 
@@ -713,6 +770,9 @@ impl Agent {
 
 /// Empty reasoning must not become `Some("")`: an empty thinking block replayed
 /// to a provider that wants reasoning is a different prompt from no block at all.
+/// How many times one turn may resume an answer that hit an output cap.
+const MAX_CONTINUATIONS: usize = 2;
+
 fn reason(c: &Collected) -> Option<String> {
     if c.reasoning.is_empty() {
         None
@@ -725,7 +785,8 @@ struct Collected {
     text: String,
     calls: Vec<ToolCall>,
     telemetry: TurnTelemetry,
-    #[allow(dead_code)]
+    /// Why the provider stopped. `Length` means an output cap, not the model's
+    /// own choice, and changes what the turn does next.
     finish: FinishReason,
     /// Raw thinking text from this round-trip, kept for the transcript.
     reasoning: String,

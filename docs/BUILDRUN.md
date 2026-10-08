@@ -1848,3 +1848,34 @@ Two smaller ones from the same batch:
 - **A scratch store breaks "there is obviously some session around" assumptions.** Several checks
   quietly depended on the user's history being present. With an empty store they have to create the
   state they need, which is slower to write and much harder to get wrong later.
+### Trap 88: a markdown marker can arrive as half a marker
+
+Deltas do not respect syntax. A chunk ended with `-` and the space came in the next one,
+and the live painter resolved that two-character state as "not a list": it painted the
+bullet as text, started a **second** `<ul>` (because the list-continuation test also read
+the half line), and the final close re-parsed the remainder into a third structure. The
+visible symptom was `the bullet list has 2 items, expected 3` with `ul.live-list ul.live-list`
+in the diagnostic.
+
+Rule: when a construct's opener has not finished arriving, the answer is *wait one delta*,
+never guess. `maybeListMarker("-")` is true, `listMarker("-")` is false, and the painter
+breaks out of its loop until one of them is decidable. Cost: one delta of latency. Benefit:
+no syntax on screen, no rebuilt box, no rewrite of settled text.
+
+The same rule in the mock: `firstItemEnd` will not close an item on a half-arrived next
+marker.
+
+### Trap 89: a CSS class is not a type, and a viewport rect is not an element's position
+
+Two near-misses in one change:
+
+- `.fenced` means "this unfinished block keeps its newlines". It is **not** "this is a code
+  block", and using `host.classList.contains('fenced')` to decide whether inline markup
+  applies put a literal `**` on screen: a paragraph gains and loses that class between
+  paints, so the guard turned off mid-construct. The honest input is `fenceOpen(rest)`, which
+  is computed from the source, not from a class an earlier paint happened to set.
+- A self-test that checks "did this element move" with `getBoundingClientRect().top` inside a
+  transcript that is **being scrolled by the stream** measures the scroll. It reported
+  `the first bullet moved 165.4px - settled text was rewritten` for an element that had not
+  moved at all. Compare against a stable ancestor (`li.top - ul.top`), or add the scroll
+  offset; never compare viewport coordinates across time in a scrolling view.

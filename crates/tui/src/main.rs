@@ -387,6 +387,8 @@ async fn main() -> Result<()> {
     let mut cfg = HostConfig::new(model, workspace.clone());
     cfg.mode = appcfg.mode();
     cfg.context_budget = appcfg.context.target_tokens;
+    // None means the server's own output cap applies; see Config.
+    cfg.max_tokens = appcfg.max_output_tokens;
     // Derived per turn from the live workspace; see SessionHost.
     cfg.env_override = None;
     cfg.approval_timeout =

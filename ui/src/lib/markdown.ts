@@ -333,6 +333,92 @@ export function firstBlockEnd(src: string): { end: number; fenced: boolean } | n
 }
 
 /**
+ * Does this line start a list item, and is it one the live painter can build?
+ *
+ * `flat` is the guard: a nested item belongs inside its parent `li`, and building
+ * a flat list live would silently flatten it. `checkbox` likewise - `- [ ] task`
+ * is a construct the live word spans do not render, so those blocks stay with the
+ * parser.
+ */
+export function listMarker(
+  line: string,
+): { ordered: boolean; indent: number; flat: boolean; checkbox: boolean; prefix: number } | null {
+  // Callers pass a line *with* its newline; without stripping it the `$` anchor
+  // fails on every line of the block and no item is ever recognised as finished.
+  const m = /^(\s*)([-*+]|\d+[.)])(\s+)(.*)$/.exec(line.replace(/\r?\n$/, ''))
+  if (!m) return null
+  const body = m[4]
+  return {
+    ordered: /\d/.test(m[2]),
+    indent: m[1].length,
+    flat: m[1].length === 0,
+    checkbox: /^\[[ xX]]\s/.test(body),
+    // The syntax characters themselves. A live `<li>` must not paint them: the
+    // bullet is the box's business, not the sentence's.
+    prefix: m[1].length + m[2].length + m[3].length,
+  }
+}
+
+/**
+ * Where the list item that starts at offset 0 ends, or null if it may still grow.
+ *
+ * The whole-list rule is what makes four bullets appear all at once: a list block
+ * only ends at a blank line or at prose, so the reader sees four literal `-` lines
+ * and then four bullets. An item, on the other hand, is finished the moment the
+ * line that starts the *next* item arrives, and that is a fact the source already
+ * states. Lazy continuation is the trap: a wrapped line belongs to the item above
+ * it, so the scan keeps going until it sees a marker, a blank line, or a line that
+ * cannot continue an item.
+ *
+ * A nested marker ends the scan at the line before it rather than being swallowed:
+ * the caller stops building the list live and hands the rest to the parser.
+ */
+/**
+ * Could this line still turn into a list marker?
+ *
+ * Deltas do not respect token boundaries, so the line can arrive as `-` with the
+ * space in the next chunk. Deciding "not a list" from those two characters is what
+ * made a bullet get painted as text, put into its own second `<ul>`, and then be
+ * re-parsed into a third structure. The answer for a half-arrived marker is to
+ * wait one delta, not to guess.
+ */
+export function maybeListMarker(line: string): boolean {
+  const l = line.replace(/\r?\n$/, '')
+  return l.length > 0 && /^\s*(?:[-*+]|\d*[.)]?)$/.test(l)
+}
+
+export function firstItemEnd(src: string): number | null {
+  const head = src.split('\n', 1)[0] ?? ''
+  // `- - -` looks like an item and is not one; the block rule turns it into a
+  // thematic break, so leave it to the parser.
+  if (/^ {0,3}(?:[-*_]\s*){3,}$/.test(head)) return null
+  const first = listMarker(head)
+  if (!first || first.checkbox) return null
+  let i = 0
+  let prevEnd = 0
+  while (i < src.length) {
+    const nl = src.indexOf('\n', i)
+    const isLast = nl === -1
+    const lineEnd = isLast ? src.length : nl + 1
+    const line = src.slice(i, lineEnd)
+    if (i > 0) {
+      const next = listMarker(line)
+      if (next) return prevEnd // the next item (or a nested one) starts here
+      // A marker that has only half arrived ("-") is not a continuation of the
+      // item above it, and it is not a new item yet either: wait for the delta
+      // that settles it.
+      if (maybeListMarker(line)) return null
+      if (line.trim() === '') return prevEnd
+      if (/^ {0,3}(#{1,6}\s|>|```|~~~|\|)/.test(line)) return prevEnd
+    }
+    if (isLast) break // the last line has no newline yet: the item may still grow
+    prevEnd = lineEnd
+    i = lineEnd
+  }
+  return null
+}
+
+/**
  * Does an unclosed code fence own the end of `src`?
  *
  * The live paint needs this to decide whether raw newlines are content: inside

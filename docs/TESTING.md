@@ -115,6 +115,25 @@ and uses its own gateway port. Consequences worth knowing:
 3. Keep the pacing honest: chunk sizes and delays decide whether mid-stream checks see structure
    arrive *during* the turn. `--speed` scales all delays; the engine integration test uses `0.2`.
 
+## Scripted scenarios worth knowing about
+
+| scenario | what it forces, and the fault it pins |
+|---|---|
+| `truncation-check` | step 0 stops with `finish_reason: "length"` mid-sentence, step 1 finishes the sentence. Pins that the engine notices the cap, says so, resumes, and keeps both halves in history. |
+| `thinking-ate-the-budget` | reasoning deltas and then `length`, with no answer text at all. Pins the error that names thinking and the knob to turn, instead of a "Done" chip above an empty answer. |
+| `bullets-live` | four bullets streamed 9 characters at a time, one containing a link. Pins that items become `<li>` one at a time (`counts 0->1->2->3->4`), that one list stays one `<ul>`, that `-` is never painted, and that the first bullet does not move while the rest arrive. |
+
+Scenario selection is the `match` substring of the newest user message that has a
+scenario, then **assistant messages since that message** as the step index.
+Counting tool results instead breaks the continuation case: a resumed answer
+appends an assistant message and no tool result, so the mock would serve step 0
+again and the model would repeat the same truncated half-answer forever.
+
+Control lines the engine appends to a request only ("continue where you stopped",
+"you have used up your tool budget") are deliberately not scenario anchors: the
+matcher walks back to the older user message that does match. A matcher that only
+looked at the newest message would report a perfectly scripted turn as unscripted.
+
 ## Machine contention
 
 This box usually runs a 50 GB model on nine cores, so `selftest.sh` keeps two honesty rules:

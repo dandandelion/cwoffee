@@ -30,6 +30,13 @@ mode = "ask"
 # an unreachable UI must not leave the agent waiting forever.
 approval_timeout_secs = 300
 
+# Tokens the model may produce in one round-trip. Thinking and the answer share
+# this budget, which is why a small number looks like "it thought and never
+# answered". Unset leaves the server's own -np / n_predict in charge. Either way a
+# turn that hits the limit is now reported, and the answer is picked back up
+# instead of ending mid-sentence.
+# max_output_tokens = 8192
+
 theme = "light"               # light | dark | system (not wired up yet)
 
 # ---------------------------------------------------------------------------

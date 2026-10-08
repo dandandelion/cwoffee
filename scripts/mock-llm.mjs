@@ -100,16 +100,44 @@ function lastUserText(messages) {
   return ''
 }
 
-/** How many tool results came after that user message: the step in the loop. */
-function toolStepsSinceLastUser(messages) {
-  let lastUser = -1
-  for (let i = messages.length - 1; i >= 0; i--)
-    if (messages[i].role === 'user') {
-      lastUser = i
-      break
-    }
-  if (lastUser < 0) return 0
-  return messages.slice(lastUser + 1).filter((m) => m.role === 'tool').length
+function textOf(m) {
+  if (typeof m.content === 'string') return m.content
+  if (Array.isArray(m.content))
+    return m.content.map((p) => (typeof p === 'string' ? p : (p?.text ?? ''))).join('\n')
+  return ''
+}
+
+/**
+ * Which scenario to serve, and which user message it was asked in.
+ *
+ * The newest user message is tried first, then older ones. That is not a
+ * convenience: the engine appends request-only control lines ("continue where you
+ * stopped", "you have used up your tool budget") that the user never typed, and a
+ * matcher that only looks at the newest message would report those as unscripted
+ * and fail a turn that was scripted perfectly.
+ */
+function scenarioFor(messages) {
+  const indexed = []
+  for (let i = 0; i < messages.length; i++)
+    if (messages[i].role === 'user') indexed.push({ i, text: textOf(messages[i]) })
+  for (let k = indexed.length - 1; k >= 0; k--) {
+    const sc = pickScenario(indexed[k].text)
+    if (sc) return { scenario: sc, at: indexed[k].i, text: indexed[k].text }
+  }
+  const last = indexed.length ? indexed[indexed.length - 1] : { i: -1, text: '' }
+  return { scenario: null, at: last.i, text: last.text }
+}
+
+/**
+ * How far into the scenario this request is. The unit is an **assistant message
+ * after the matched user message**, not a tool result: a tool round appends one
+ * assistant message, and so does an answer that was cut off at an output limit and
+ * picked back up. Counting tool results made the continuation re-serve step 0,
+ * which would repeat the same truncated half-answer forever.
+ */
+function stepsSince(messages, atIndex) {
+  if (atIndex < 0) return 0
+  return messages.slice(atIndex + 1).filter((m) => m.role === 'assistant').length
 }
 
 /**
@@ -222,7 +250,10 @@ async function streamCompletion(res, step, opts) {
     }
   }
 
-  const finish = step.finish === 'tool_calls' ? 'tool_calls' : 'stop'
+  // 'length' has to survive: it is the difference between "the model finished" and
+  // "an output cap bit it", and the engine behaves differently for each.
+  const finish =
+    step.finish === 'tool_calls' ? 'tool_calls' : step.finish === 'length' ? 'length' : 'stop'
   res.write(chunk(id, created, { choices: [{ index: 0, delta: {}, finish_reason: finish }] }))
 
   // llama.cpp puts timings on the stream; the telemetry bar reads them. The
@@ -316,8 +347,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   const messages = body.messages ?? []
-  const prompt = lastUserText(messages)
-  const scenario = pickScenario(prompt)
+  const found = scenarioFor(messages)
+  const scenario = found.scenario
+  // `$path` comes from what the user actually just asked for, not from the older
+  // message that happened to match a scenario.
+  const prompt = lastUserText(messages) || found.text
   const kwargs = body.chat_template_kwargs ?? {}
   const thinkingOff = kwargs.enable_thinking === false
   if (thinkingOff) stats.thinking_off += 1
@@ -337,7 +371,7 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ error: { message: why } }))
   }
 
-  const stepNo = toolStepsSinceLastUser(messages)
+  const stepNo = stepsSince(messages, found.at)
   const step = (scenario.steps ?? [])[stepNo]
   if (!step) {
     const why =

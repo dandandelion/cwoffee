@@ -797,6 +797,13 @@ body {
   color: var(--color-ink-3);
   margin-top: 1px;
 }
+/* The managed-SearXNG block has three lines, not label+sub. `.pop-sub` is pinned to
+   grid row 2 for every item, so a second sub was painted *on top of* the first:
+   "podman · 8899 · idle in 120s" over "port 8899 · config …", one unreadable line.
+   Anything with a third line declares it, rather than hoping the grid guesses. */
+.pop-item.status .pop-sub.s2 { grid-row: 3; }
+.pop-item.status { grid-template-rows: auto auto auto; }
+
 .pop-mono { font-family: var(--font-mono); font-size: 12px; word-break: break-all; }
 /* Rendered but not shown until the placement effect has measured it, so the menu
    never flashes at a guessed coordinate. */

@@ -3105,6 +3105,86 @@
             // Deliberately no click on a provider: choosing one writes the user's
             // config file. A self-test that changes which search they use is the kind
             // of side effect the harness promised to stop causing.
+
+            // Geometry of the panel. The user found by eye what a rect check finds
+            // for free: the managed-container block prints three lines, and every
+            // `.pop-sub` is pinned to grid row 2, so line 3 was painted on top of
+            // line 2 into one garbled sentence. Measure it, and measure it on a
+            // synthetic status block so the check runs whatever provider is set.
+            const panel = document.querySelector('.pop') as HTMLElement | null
+            if (!panel) fail('the search panel popover element vanished mid-check')
+            else {
+              const pr = panel.getBoundingClientRect()
+              const footer = document.querySelector('footer')?.getBoundingClientRect()
+              if (pr.width < 200 || pr.height < 60)
+                fail(`the search panel has no size: ${pr.width.toFixed(0)}x${pr.height.toFixed(0)}`)
+              if (pr.top < -1 || pr.bottom > innerHeight + 1)
+                fail(`the search panel is off-screen vertically: ${pr.top.toFixed(0)}..${pr.bottom.toFixed(0)} of ${innerHeight}`)
+              if (pr.left < -1 || pr.right > innerWidth + 1)
+                fail(`the search panel is cut off sideways: ${pr.left.toFixed(0)}..${pr.right.toFixed(0)} of ${innerWidth}`)
+              // A panel that opens upward from the footer should end at the footer's
+              // top; a pixel of overlap is rounding, not a layout fault. What must not
+              // happen is the panel sitting *inside* or behind the footer.
+              if (footer && pr.bottom > footer.top + 4 && pr.top < footer.bottom - 4)
+                fail(
+                  `the search panel sits on top of the footer it opens from: panel ${pr.top.toFixed(0)}..${pr.bottom.toFixed(0)}, footer ${footer.top.toFixed(0)}..${footer.bottom.toFixed(0)}`,
+                )
+
+            const overlaps = (a: Element, b: Element) => {
+              const x = a.getBoundingClientRect(),
+                y = b.getBoundingClientRect()
+              return (
+                Math.min(x.right, y.right) - Math.max(x.left, y.left) > 4 &&
+                Math.min(x.bottom, y.bottom) - Math.max(x.top, y.top) > 4
+              )
+            }
+            const rows = [...panel.querySelectorAll('.pop-item')] as HTMLElement[]
+            for (let i = 0; i + 1 < rows.length; i++)
+              if (overlaps(rows[i], rows[i + 1]))
+                fail(`provider rows overlap: "${rows[i].textContent?.trim().slice(0, 20)}" / "${rows[i + 1].textContent?.trim().slice(0, 20)}"`)
+
+            const synth = document.createElement('div')
+            synth.className = 'pop-item static status'
+            const l1 = document.createElement('span')
+            l1.className = 'pop-lbl'
+            l1.textContent = 'Its own container'
+            const l2 = document.createElement('span')
+            l2.className = 'pop-sub'
+            l2.textContent = 'podman · 8899 · idle in 120s · standing up'
+            const l3 = document.createElement('span')
+            l3.className = 'pop-sub mono s2'
+            l3.textContent = 'port 8899 · idle 120s · config /home/user/.config/cwoffee/searxng'
+            synth.append(l1, l2, l3)
+            panel.appendChild(synth)
+            await new Promise<void>((r) => requestAnimationFrame(() => setTimeout(r, 60)))
+            const lineBad: string[] = []
+            for (const [a, b, na, nb] of [
+              [l1, l2, 'label', 'runtime line'],
+              [l2, l3, 'runtime line', 'port/config line'],
+              [l1, l3, 'label', 'port/config line'],
+            ] as [HTMLElement, HTMLElement, string, string][]) {
+              if (overlaps(a, b)) {
+                const ra = a.getBoundingClientRect(),
+                  rb = b.getBoundingClientRect()
+                lineBad.push(
+                  `${na} at y ${ra.top.toFixed(0)}..${ra.bottom.toFixed(0)} and ${nb} at ${rb.top.toFixed(0)}..${rb.bottom.toFixed(0)}`,
+                )
+              }
+              if (a.getBoundingClientRect().width < 20 || b.getBoundingClientRect().width < 20)
+                lineBad.push(`${na} or ${nb} has no width`)
+            }
+            synth.remove()
+            if (lineBad.length)
+              fail(
+                `the managed-container status block stacks wrong: ${lineBad.join('; ')} ` +
+                  `(every .pop-sub sits on grid row 2 unless the item says otherwise)`,
+              )
+            const real = panel.querySelector('.pop-item.status')
+            pageLog(
+              `search panel geometry ok (${rows.length} rows, ${pr.width.toFixed(0)}x${pr.height.toFixed(0)} inside ` +
+                `${innerWidth}x${innerHeight}, status block stacks, live status ${real ? 'shown' : 'not applicable on this backend'})`,
+            )
+            }
             btn.click()
             await new Promise((r) => setTimeout(r, 150))
             pageLog(`search panel ok (${view.backend}: ${view.describing})`)
@@ -3964,6 +4044,87 @@
         await invoke('set_mode', { mode: 'auto' })
         await useSession(target.id)
 
+        // (a2) bullets one at a time, not four at once
+        {
+          const before = await turnCount()
+          let stopped = false
+          const liCounts: number[] = []
+          const ulCounts: number[] = []
+          let markerPainted = ''
+          let firstItemTop: number | null = null
+          let firstItemText = ''
+          const sampler = (async () => {
+            while (!stopped) {
+              const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+              const body = all[all.length - 1]
+              if (body) {
+                const lis = [...body.querySelectorAll('li')]
+                liCounts.push(lis.length)
+                ulCounts.push(body.querySelectorAll('ul').length)
+                const text = body.textContent ?? ''
+                // The marker characters belong to the syntax, not to the sentence.
+                if (!markerPainted && /(^|\n)\s*[-*+]\s/.test(text)) markerPainted = text.slice(0, 60)
+                if (firstItemTop === null && lis.length >= 2) {
+                  // Relative to the list, not to the viewport: the view is being
+                  // scrolled by the stream itself, so a viewport coordinate moves
+                  // 165px for reasons that have nothing to do with the bullet.
+                  const ul = lis[0].parentElement?.getBoundingClientRect()
+                  firstItemTop = lis[0].getBoundingClientRect().top - (ul?.top ?? 0)
+                  firstItemText = lis[0].textContent ?? ''
+                }
+              }
+              await new Promise((r) => setTimeout(r, 40))
+            }
+          })()
+          await invoke('start_turn', {
+            text: 'Selftest bullets-live: four short bullets about coffee, then one sentence.',
+            session: target.id,
+          })
+          const done = await waitTurnDone(before, 60000)
+          stopped = true
+          await sampler
+          const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+          const body = all[all.length - 1]
+          const lis = body ? [...body.querySelectorAll('li')] : []
+          // The last sample taken while the turn was still running is what proves
+          // the structure arrived during the stream rather than at turnEnd.
+          const running = liCounts.slice(0, Math.max(0, liCounts.length - 1))
+          const maxRunning = running.length ? Math.max(...running) : 0
+          const steps = new Set(running).size
+          if (!done) fail('the scripted bullet turn never finished')
+          else if (!body) fail('the scripted bullet turn left no answer block')
+          else if (lis.length !== 4) fail(`the bullet list ended with ${lis.length} items, expected 4`)
+          else if (maxRunning < 3)
+            fail(
+              `only ${maxRunning} of 4 bullets were real <li> elements while the stream was still running ` +
+                `(counts ${running.slice(0, 12).join(',')}): the list waited for its blank line and then appeared all at once`,
+            )
+          else if (steps < 2)
+            fail(`the item count never grew during the stream (saw ${[...new Set(running)].join(', ')})`)
+          else if (markerPainted)
+            fail(`a list marker was painted as text: "${markerPainted}"`)
+          else if (Math.max(...ulCounts) > 1)
+            fail(
+              `the stream built ${Math.max(...ulCounts)} separate lists out of one: ` +
+                'items must join the list that already exists',
+            )
+          else if (body.querySelectorAll('a').length !== 1)
+            fail(`the link inside a bullet did not become a link (${body.querySelectorAll('a').length} anchors)`)
+          else {
+            const ulNow = lis[0].parentElement?.getBoundingClientRect()
+            const nowTop = lis[0].getBoundingClientRect().top - (ulNow?.top ?? 0)
+            if (firstItemTop !== null && Math.abs(nowTop - firstItemTop) > 1)
+              fail(`the first bullet moved ${Math.abs(nowTop - firstItemTop).toFixed(1)}px while the list finished - settled text was rewritten`)
+            if (firstItemText && (lis[0].textContent ?? '') !== firstItemText)
+              fail(`the first bullet's text changed while the list finished: "${firstItemText}" -> "${lis[0].textContent}"`)
+            pageLog(
+              `scripted bullets ok (${maxRunning} of 4 were structure while streaming, ` +
+                `counts ${[...new Set(running)].join('->')}, one <ul>, markers never painted, ` +
+                `first bullet moved ${(Math.abs(nowTop - (firstItemTop ?? nowTop))).toFixed(1)}px)`,
+            )
+          }
+        }
+
         // (a) structure while the tokens arrive, not when they stop
         {
           const before = await turnCount()
@@ -4006,7 +4167,12 @@
           else if (ago(tableAt) < 60)
             fail(`the table only appeared ${ago(tableAt)}ms before turnEnd - that is at turnEnd, not during`)
           else if (rows !== 4) fail(`the table has ${rows} rows (header counted), expected 4`)
-          else if (items !== 3) fail(`the bullet list has ${items} items, expected 3`)
+          else if (items !== 3)
+            fail(
+              `the bullet list has ${items} items, expected 3; ` +
+                `answer bodies=${all.length}, last body children=[${body ? [...body.children].map((c) => c.tagName.toLowerCase() + (c.className ? '.' + c.className : '')).join(' ') : 'none'}], ` +
+                `raw tail=${JSON.stringify((body?.textContent ?? '').slice(-70))}`,
+            )
           else
             pageLog(
               `scripted structure ok (heading ${ago(headingAt)}ms and table ${ago(tableAt)}ms before turnEnd, ` +
@@ -6826,12 +6992,12 @@
           </label>
         {/if}
         {#if webSearch?.backend === 'auto'}
-          <div class="pop-item static">
+          <div class="pop-item static status">
             <span class="pop-lbl">Its own container</span>
             <span class="pop-sub">
               {webSearch?.auto?.note ?? 'checking\u2026'}
             </span>
-            <span class="pop-sub mono">
+            <span class="pop-sub mono s2">
               port {webSearch?.auto_port} · idle {webSearch?.auto_idle_secs}s · config {webSearch?.auto_dir}
             </span>
           </div>

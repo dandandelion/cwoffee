@@ -721,3 +721,71 @@ And the mock caught a second, dumber mistake of mine: `ask_user` options are
 `{label, detail}`, and my first scenarios sent `{label, note}` — serde ignored the unknown key, the
 tool refused the call with `every option needs a non-empty "label"`, and the model carried on as if
 nothing had happened. Canned tool arguments are a wire-contract test, not decoration.
+
+---
+
+## Batch: a bullet is a bullet the moment the next one starts
+
+### Item 1: the search panel's three-line status block
+
+`.pop-item` is a grid, and `.pop-sub` is pinned to grid row 2 for every item. The
+managed-SearXNG block has **two** subs, so "podman · 8899 · idle in 120s · standing up"
+was painted on top of "port 8899 · idle 120s · config …" — one garbled line, found by the
+user's eyes and not by the harness, which had no geometry check for that panel.
+
+| measure | value |
+|---|---|
+| panel | 732×272 inside a 1180×777 webview, 5 rows, none overlapping |
+| panel vs footer | ends 1px above the footer's top (tolerance 4px; 1px is rounding) |
+| status block | three rows at distinct y; asserted on a **synthetic** `.pop-item.status` so the check runs on any backend, including DuckDuckGo where the real block is absent |
+
+The check is now `search panel geometry ok (5 rows, 732x272 inside 1180x777, status block stacks, live status not applicable on this backend)`.
+
+### Item 2: `finish_reason` was parsed and thrown away
+
+`Collected.finish` carried `#[allow(dead_code)]`, and the final-answer branch reported
+`TurnEnd { finish: Stop }` whatever the provider had said. So a turn that an output cap
+bit looked, in the log and in the UI, exactly like a turn the model finished.
+
+| fault | what the user saw | what happens now |
+|---|---|---|
+| answer cut mid-sentence | prose stops mid-word, no note | note `the answer hit the output limit after N tokens - continuing where it stopped (1 of 2)`, then a second round-trip that resumes the sentence; up to 2 continuations, then an explicit note naming `max_output_tokens` and `-np` |
+| thinking consumed the whole budget | tool card + `Done · 9 tool call(s)` and **no answer** | error naming it: `no answer: the model used all N completion tokens on thinking and stopped at the output limit. Lower the thinking level, or raise …` |
+| turn ends at a cap after continuations | looked clean | `TurnEnd { finish: length }`, not `stop` |
+
+New user-facing knob, because none existed: `max_output_tokens` in `config.toml`, wired
+through `Config` → `HostConfig.max_tokens` in all three shells. Unset means the server's
+`-np` decides, which is what Cwoffee has always done — but now a cap that bites is visible
+and actionable instead of silent.
+
+Proved by `mock_endpoint` (2 round trips, both halves in history, the note present,
+`finish = length` for the thinking case) and by the new scenarios. The mock itself had the
+same fault as the engine — it turned every `finish` that was not `tool_calls` into `stop` —
+so the first version of these tests could not fail. Fixing the mock is what made the tests
+mean anything.
+
+### Item 3: markdown structure that waits for a block that has not ended
+
+A list block, per CommonMark, ends at a blank line. The live painter waited for that, so a
+four-bullet answer showed four lines of `-` text and then became four bullets in one
+replacement. The unit was wrong: **an item is finished as soon as the line starting the
+next item has arrived**, which the bytes already on the wire state.
+
+| measure | value |
+|---|---|
+| item count during the stream | `0→1→2→3→4` — 4 of 4 were real `<li>` before `turnEnd` |
+| list elements built | **1** `<ul>`; more would mean the list was chopped into stacked lists |
+| marker characters painted | none (`-` is syntax, not sentence) |
+| first bullet's position while the rest arrived | **0.0px** relative to its list, text unchanged |
+| link inside a bullet | became an `<a>` (the one construct parsed once at the item boundary) |
+| nested / checkbox / thematic-break lists | left to the parser: `- [ ] task` and `  - nested` are not built live |
+
+`firstItemEnd` is the new rule, unit-tested in `md_test.ts` (wrapped lines belong to the
+item above, lazy continuation too, a heading closes the item, a nested marker stops the
+scan rather than being flattened, a half-arrived marker returns "wait").
+
+### Gates
+
+`SELFTEST ok` (0 failures) against the scripted endpoint; `markdown: all checks passed`;
+`svelte-check` 0 errors 0 warnings; engine `mock_endpoint` **9 passed**, `config::` 13 passed;
+production app PSS **245.2 MB** (≤ 400), `render OK`, gateway smoke OK, search-smoke OK.

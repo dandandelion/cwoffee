@@ -51,6 +51,16 @@ pub struct Config {
     #[serde(default)]
     pub approval_timeout_secs: Option<u64>,
 
+    /// Hard cap on tokens the model may produce in one round-trip. It covers
+    /// thinking and answer **together**, which is why a low number looks like the
+    /// model "didn't get to the answer": the thinking ate the budget.
+    ///
+    /// Unset means Cwoffee asks for no cap and the server's own `-np` /
+    /// `n_predict` applies. Either way a turn that stops at the limit is now
+    /// reported and continued instead of ending mid-sentence.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+
     #[serde(default)]
     pub theme: Option<String>,
 }

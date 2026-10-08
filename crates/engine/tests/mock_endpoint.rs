@@ -183,6 +183,7 @@ impl Harness {
                                 EngineEvent::Text(s) => t.answer.push_str(s),
                                 EngineEvent::Reasoning(s) => t.reasoning.push_str(s),
                                 EngineEvent::Error { message, .. } => t.errors.push(message.clone()),
+                                EngineEvent::Note { message } => t.notes.push(message.clone()),
                                 EngineEvent::ToolExecEnd { ok, .. } => t.tool_results.push(*ok),
                                 EngineEvent::ToolExecOutput { chunk, .. } => t.tool_out.push_str(&chunk),
                                 EngineEvent::TurnFiles { files, .. } => t.files.extend(files.clone()),
@@ -214,6 +215,7 @@ struct Turn {
     answer: String,
     reasoning: String,
     errors: Vec<String>,
+    notes: Vec<String>,
     events: Vec<EngineEvent>,
     tool_results: Vec<bool>,
     tool_out: String,
@@ -223,6 +225,100 @@ struct Turn {
     finish: Option<cwoffee_engine::event::FinishReason>,
     timed_out: bool,
     turns_after: u64,
+}
+
+/// The bug this test exists for: a turn that stopped because an output cap bit it
+/// used to be reported as a clean stop, so "the answer got cut off mid-sentence"
+/// left no trace anywhere. The turn must notice, say so, and pick the answer back
+/// up rather than ending on a truncated sentence.
+#[tokio::test]
+async fn an_answer_cut_off_at_the_output_limit_is_picked_back_up() {
+    let Some(mock) = Mock::start().await else {
+        eprintln!("SKIP: scripted endpoint unavailable");
+        return;
+    };
+    let mut h = Harness::new(&mock).await;
+    let mut h2 = Harness::new(&mock).await;
+    let _ = &mut h2;
+    let t = h
+        .turn("Selftest truncation-check: give me the one-sentence recommendation.", &mut |_| {
+            Answer::default()
+        })
+        .await;
+
+    assert!(
+        t.answer.contains("engineering team"),
+        "the first half never arrived: {:?}",
+        t.answer
+    );
+    assert!(
+        t.answer.contains("hiring gap"),
+        "the cut-off answer was never continued: {:?}",
+        t.answer
+    );
+    assert!(
+        t.notes.iter().any(|n| n.contains("output limit")),
+        "nothing told the user the answer had been cut short: {:?}",
+        t.notes
+    );
+    assert_eq!(
+        t.finish,
+        Some(cwoffee_engine::event::FinishReason::Stop),
+        "the resumed turn should end on the model's own stop, not on the cap"
+    );
+
+    // Both halves are history, in order: a continuation is not a rewrite of the
+    // partial answer, and the model has to be able to see what it already said.
+    let rows = h.store.messages(h.state().session_id).unwrap_or_default();
+    let assistant: Vec<String> = rows
+        .iter()
+        .filter(|r| r.role == "assistant")
+        .map(|r| r.content.clone())
+        .collect();
+    assert!(
+        assistant.len() >= 2,
+        "the partial answer and its continuation should both be stored, got {assistant:?}"
+    );
+    assert!(
+        assistant.last().unwrap().contains("three risks"),
+        "the stored continuation is not what the model said: {assistant:?}"
+    );
+    assert_eq!(
+        mock.turns().await,
+        Some(2),
+        "the mock should have served exactly two round trips: the cut-off and the continuation"
+    );
+}
+
+/// The other half of the same fault: with thinking on, the *thinking* can consume
+/// the whole output budget, and the turn produces a "Done" chip and no prose. That
+/// has to name the mechanism and the knob, not report an empty answer as success.
+#[tokio::test]
+async fn thinking_that_eats_the_output_budget_says_which_knob_to_turn() {
+    let Some(mock) = Mock::start().await else {
+        eprintln!("SKIP: scripted endpoint unavailable");
+        return;
+    };
+    let mut h = Harness::new(&mock).await;
+    let t = h
+        .turn("Selftest thinking-ate-the-budget: what is the plan?", &mut |_| Answer::default())
+        .await;
+
+    assert!(t.answer.trim().is_empty(), "there should be no answer: {:?}", t.answer);
+    let named = t
+        .errors
+        .iter()
+        .find(|e| e.contains("thinking") && e.contains("output limit"));
+    assert!(
+        named.is_some(),
+        "no error explained that thinking consumed the budget: {:?}",
+        t.errors
+    );
+    assert_eq!(
+        t.finish,
+        Some(cwoffee_engine::event::FinishReason::Length),
+        "the turn must report the cap as the reason it stopped, not a clean stop"
+    );
 }
 
 fn first_line(prompt: &str) -> String {

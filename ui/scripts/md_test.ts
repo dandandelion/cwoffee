@@ -4,7 +4,7 @@
  * The security cases are the point. Model output quotes fetched web pages, so
  * anything that reaches this function is untrusted input from the internet.
  */
-import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, needsMarkdown, firstBlockEnd, fenceOpen, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS, InlineStream } from '../src/lib/markdown.ts'
+import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, needsMarkdown, firstBlockEnd, firstItemEnd, listMarker, maybeListMarker, fenceOpen, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS, InlineStream } from '../src/lib/markdown.ts'
 
 let failed = 0
 function eq(name: string, got: string, want: string) {
@@ -486,4 +486,69 @@ console.log('markdown: all checks passed')
   const s9 = new InlineStream()
   s9.tokens('**unclosed emphasis')
   ok('an unclosed construct leaves the stack open for the parser to settle', s9.pendingText() === '')
+}
+
+// --- an item ends where the next item starts ---------------------------------
+// The rule the streaming painter needed: a list block ends at a blank line, so
+// waiting for the block is what makes four bullets arrive as four lines of `-`
+// text and then all at once. An item is finished the moment the source says the
+// next one began, and that is knowable from the bytes already on the wire.
+{
+  const line = (src: string, end: number | null) =>
+    end === null ? '<open>' : src.slice(0, end).split('\n').pop() ?? ''
+  ok('a plain line is not an item', firstItemEnd('plain prose\nmore prose\n') === null)
+  ok(
+    'an item with no newline after it is still open',
+    firstItemEnd('- sourcing the beans\n') === null,
+    line('- sourcing the beans\n', firstItemEnd('- sourcing the beans\n')),
+  )
+  ok(
+    'the next marker closes the item',
+    firstItemEnd('- one\n- two\n') === 6,
+    `end=${firstItemEnd('- one\n- two\n')}`,
+  )
+  ok(
+    'a wrapped line belongs to the item above it',
+    firstItemEnd('- one\n  still the first\n- two\n') === 24,
+    `end=${firstItemEnd('- one\n  still the first\n- two\n')}`,
+  )
+  ok(
+    'lazy continuation without indentation still belongs to the item',
+    firstItemEnd('- one\nstill the first\n- two\n') === 22,
+    `end=${firstItemEnd('- one\nstill the first\n- two\n')}`,
+  )
+  ok('a blank line closes the item', firstItemEnd('- one\n\nprose') === 6)
+  ok(
+    'a heading after an item closes it and is not swallowed',
+    firstItemEnd('- one\n## Next\n') === 6,
+    `end=${firstItemEnd('- one\n## Next\n')}`,
+  )
+  ok(
+    'a nested item ends the scan rather than being flattened',
+    firstItemEnd('- one\n  - nested\n') === 6,
+    `end=${firstItemEnd('- one\n  - nested\n')}`,
+  )
+  ok('ordered items count as items', !!listMarker('3) third thing')?.ordered)
+  ok('an indent is not flat, so the parser keeps that list', listMarker('  - nested')?.flat === false)
+  ok(
+    'a checkbox item is left to the parser, which draws the box',
+    firstItemEnd('- [ ] write the report\n- [ ] send it\n') === null,
+  )
+  ok('a table row is not a list item', listMarker('| a | b |') === null)
+  ok('a thematic break is not a list item', firstItemEnd('- - -\n- a\n') === null)
+  // The half-arrived marker: a delta can stop between "-" and " ", and that is not
+  // permission to paint a bullet as text or to start a second list.
+  ok('a lone dash is a marker that has not finished arriving', maybeListMarker('-'))
+  ok('a lone digit may become an ordered marker', maybeListMarker('1') && maybeListMarker('12.'))
+  ok('"-ish" is a word, not a marker', !maybeListMarker('-ish'))
+  ok(
+    'an item does not close on a half-arrived next marker',
+    firstItemEnd('- one\n-') === null,
+    `end=${firstItemEnd('- one\n-')}`,
+  )
+  ok(
+    'a "- " that has arrived does close it',
+    firstItemEnd('- one\n- ') === 6,
+    `end=${firstItemEnd('- one\n- ')}`,
+  )
 }
