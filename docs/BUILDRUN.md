@@ -1930,3 +1930,61 @@ was deliberately not painted still has to reach the screen when the stream ends,
 final path used to return early when there was no live element. A rule that says "wait"
 has to be paired with the sentence "and if we never learn more, render it anyway" —
 otherwise the fix for a duplication becomes a missing-sentence bug.
+
+### Trap 94: an XML reader that drops entity references rewrites the user's cells
+
+`sheet_read` printed `Header` for a cell whose stored text was `Hea&amp;der`, and
+`inline  free` for `inline & free`. quick-xml 0.42 does not fold `&amp;` into the
+surrounding text: it ends the text run at the reference and emits
+`Event::GeneralRef` separately. A SAX loop that handles `Text` and ignores that
+event is not lossy in a visible way - it *edits the data*. Handle the ref, resolve
+the five XML built-ins and numeric refs, and leave anything unresolvable written
+out as `&name;` so it looks wrong rather than reading wrong. Attribute values are
+the other half: they arrive still escaped, so a sheet named `Q&A` needs
+`unescape` or the model is told the wrong tab name.
+
+### Trap 95: an assertion that prints `output` prints nothing when the tool failed
+
+Every engine test in `sheets.rs` failed with a blank message. `ToolResult::err`
+puts the text in `error` and leaves `output` empty, and the assertions printed
+`"{}", r.output`. So a tool that was returning a real, useful error looked
+identical to a test framework swallowing the reason. Print *what the tool said*,
+ok or not (`fn why(r)` in that module), and the same 20 minutes spent chasing a
+parser returns to chasing the actual bug.
+
+### Trap 96: Excel's date epoch has a day that never existed
+
+Serial `1` is 1900-01-01, and serial `60` is 1900-02-29, which is not a date:
+Excel inherited the bug and keeps it. Anything at or above `61` therefore sits one
+above a naive day count, and the offset is `-25567` epoch days, not the round
+number a comment suggests. The failure mode is quiet - every date six days off
+looks like a plausible date - so the unit test pins `59`, `60` and `61` explicitly
+rather than one modern date. And the fixture written from memory (`45678` is
+2025-01-15) was the thing that was wrong: the code was right. Compute fixture
+expectations, do not recall them.
+
+### Trap 97: `<mergeCells count="2">` and its two children are the same two merges
+
+OOXML states a count *and* contains the elements. Reading the parent's `count`
+attribute and then incrementing per child reports twice as many merged ranges,
+which is exactly the number a later edit pass would use to decide a file is too
+dangerous to touch. Take the max of declared and counted, never the sum. Same
+shape as any format that carries a length prefix next to the payload.
+
+### Trap 98: a paging hint computed from the request loses rows the model never saw
+
+`sheet_read` stops at a cell cap and then tells the model which range to ask for
+next. Deriving that range from the *requested* rectangle ("rows 1-4, stopped at
+row 2, so ask for row 5") makes the model skip rows 3 and 4 forever, and it will
+do it silently. Derive it from the last row actually painted, print that row in
+the message (`last row shown 2`), and assert in the test that the hint continues
+from the maximum row prefix present in the output. The UI check makes the same
+cross-check from the other side, on the tool card.
+
+### Trap 99: `nope` is a column name unless you bound the grid
+
+Range parsing that accepts any run of letters accepts `nope` as column NOPE, and
+a model that typed a sheet name into `range` gets an enormous, empty,
+confidently-formatted answer. Excel's own limits (`XFD`, 1048576 rows) turn that
+into an error naming the format. Boundaries in a parser are where "silently
+nonsense" and "an error you can act on" part.

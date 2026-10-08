@@ -12,6 +12,7 @@ pub mod exec;
 pub mod files;
 pub mod path;
 pub mod repair;
+pub mod sheets;
 pub mod searxng;
 pub mod web;
 pub mod xlsx;
@@ -362,6 +363,10 @@ impl Registry {
         // is to re-emit the entire file.
         r.register(Box::new(files::EditFileTool));
         r.register(Box::new(ask::AskUserTool::default()));
+        // Appended, like everything else. `sheet_read` is read-only and gives the
+        // model eyes on a workbook the user already has - until now the engine could
+        // write .xlsx files and could not open one.
+        r.register(Box::new(sheets::SheetReadTool));
         r
     }
 
@@ -503,6 +508,10 @@ mod cfg_tests {
 
     /// Order is load-bearing for the prefix cache; assert it rather than trust it.
     ///
+    /// `sheet_read` is appended last for the same reason as `edit_file`, and the
+    /// test failing on a new tool is the mechanism working: it says the addition is
+    /// a pure suffix, not a reshuffle of bytes every existing session has cached.
+    ///
     /// `edit_file` is appended at the end rather than slotted next to
     /// `write_file`: inserting would re-render the tool list in the system prompt
     /// and invalidate every existing session's prefix. A new tool changes those
@@ -523,6 +532,7 @@ mod cfg_tests {
                 "download_file",
                 "edit_file",
                 "ask_user",
+                "sheet_read",
             ]
         );
     }

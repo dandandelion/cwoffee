@@ -332,6 +332,10 @@ pub fn summarize(tool: &str, args: &serde_json::Value) -> String {
             "read: {}",
             crate::tools::repair::field_as_string(args, "path").unwrap_or_else(|| "???".into())
         ),
+        "sheet_read" => format!(
+            "read cells from: {}",
+            crate::tools::repair::field_as_string(args, "path").unwrap_or_else(|| "???".into())
+        ),
         "write_xlsx" => format!(
             "write spreadsheet: {}",
             crate::tools::repair::field_as_string(args, "path").unwrap_or_else(|| "???".into())

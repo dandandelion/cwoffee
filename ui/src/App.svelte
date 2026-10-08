@@ -4261,6 +4261,66 @@
           else pageLog(`fake table head ok (held back while ambiguous, then painted: "${said.slice(0, 44)}...")`)
         }
 
+        // (a5) the model opens a spreadsheet the user already has
+        //
+        // Until `sheet_read` the engine could make an .xlsx and could not look at
+        // one: read_file calls it binary. The interesting failure of a new tool is
+        // not a crash, it is the model calling it and getting nothing useful back,
+        // so this check reads the *card*, which holds what the engine really
+        // returned, and cross-checks the paging hint against the rows shown. The
+        // scenario carries `require` strings too: a tool result that never reached
+        // the prompt fails the turn instead of being papered over by a scripted
+        // answer that sounds right.
+        {
+          const before = await turnCount()
+          const ws = (hostState?.workspace ?? '').replace(/\/+$/, '')
+          const file = `${ws}/selftest-regions.csv`
+          if (!ws) fail('the self-test host has no workspace, so the sheet-read fixture path is unknown')
+          await invoke('start_turn', {
+            text:
+              `Selftest sheet-read: put a four-row region table into ${file} (Region, Units, Price) ` +
+              'and then read it back with the spreadsheet tool and tell me the first two rows.',
+            session: target.id,
+          }).catch((e) => pageLog(`selftest note: sheet-read turn failed: ${e}`))
+          const done = await waitTurnDone(before, 60000)
+          const cards = [...document.querySelectorAll('.blk-tool[data-tool="sheet_read"]')]
+          const card = cards[cards.length - 1]
+          const out = card?.querySelector('.tool-out')?.textContent ?? ''
+          const rows = [...out.matchAll(/^(\d+):/gm)].map((m) => Number(m[1]))
+          const hint = out.match(/ask again with range [A-Z]+(\d+):/)
+          if (!done) fail('the scripted sheet-read turn never finished')
+          else if (!card)
+            fail('no tool card for sheet_read: the model never reached the spreadsheet tool')
+          else if (!out.includes('Region') || !out.includes('North'))
+            fail(`the sheet_read card shows no cells - output was "${out.slice(0, 180)}"`)
+          else if (!out.includes('ask again with range'))
+            fail(`a 6-cell cap returned the whole table without a continuation: "${out.slice(0, 220)}"`)
+          else if (!rows.length) fail(`the grid has no row prefixes: "${out.slice(0, 180)}"`)
+          else if (hint && Number(hint[1]) !== Math.max(...rows) + 1)
+            fail(
+              `the continuation names row ${hint[1]} but the last row shown was ${Math.max(...rows)}: ` +
+                'a range the model copies verbatim would silently skip rows',
+            )
+          else {
+            // The answer is the last thing to arrive, so its presence is what says
+            // the tool loop ran to the end rather than stopping after one call.
+            const answers = [...document.querySelectorAll('.blk-answer .blk-body')].map(
+              (b) => b.textContent ?? '',
+            )
+            const said = answers.some((t) => t.includes('North 12'))
+            if (!said)
+              fail(
+                `the grid arrived but the answer did not: ${answers.length} answer block(s), ` +
+                    'the scripted loop stopped before its last step - check the tool results in the prompt',
+              )
+            else
+              pageLog(
+                `sheet_read ok (grid rows ${rows[0]}-${rows[rows.length - 1]}, cap held at 6 cells, ` +
+                  `continuation starts at row ${hint![1]}, the grid the card shows is what the prompt got)`,
+              )
+          }
+        }
+
         // (a) structure while the tokens arrive, not when they stop
         {
           const before = await turnCount()

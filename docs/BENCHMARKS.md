@@ -846,3 +846,61 @@ shape is not knowable from the bytes that have arrived.
 passed`; `svelte-check` 0 errors 0 warnings; `cwoffee-app` gateway_ctl **4 passed**
 (including the failed-bind note); production app PSS **246.3 MB** (≤ 400),
 `render OK`, `webkit render path: no-dmabuf`, gateway smoke OK, search-smoke OK.
+
+## Batch: the model can open a spreadsheet, and the read is bounded
+
+Stage 1 of the spreadsheet plan is one tool, `sheet_read`, read-only, over `.xlsx`,
+`.csv` and `.tsv`. Before it the engine could *make* a workbook (`write_xlsx`) and
+could not look at one: `read_file` refused `.xlsx` as binary, so "what is in my
+budget sheet" was answered with a refusal to read a file the user was pointing at.
+
+| gate | number |
+|---|---|
+| engine unit tests, `tools::sheets` | **19 passed**, 0 failed |
+| suites this could have broken | `tools:: approval:: prompt::` **195 passed**; `mock_endpoint` **9 passed** |
+| self-test (scripted endpoint) | `SELFTEST ok`, 0 failures |
+| the new check's line | `sheet_read ok (grid rows 1-2, cap held at 6 cells, continuation starts at row 3, the grid the card shows is what the prompt got)` |
+| production app | binary 16.4 MB, PSS **243.1 MB** (≤ 400), `render OK`, `webkit render path: no-dmabuf`, gateway smoke OK, search-smoke OK, holds `renderD128` only |
+
+### The new check can fail, which is the only reason it is worth having
+
+The scripted scenario makes the model write a CSV and then read it back. The step
+that plays the answer carries `require: ["Region", "North", "ask again with
+range"]`, checked against the **tool results in the request** — the canned answer
+proves the script, the tool result in the prompt proves the tool. Armed with an
+impossible required string:
+
+```
+[mock-llm] REQUIRE FAILED: sheet-read-csv step 2: zzz-not-in-any-tool-output
+SELFTEST FAIL: the grid arrived but the answer did not: 8 answer block(s),
+               the scripted loop stopped before its last step
+```
+
+The UI assertion reads the *tool card*, which holds what the engine really
+returned, and cross-checks the paging hint against the rows actually painted:
+`continuation starts at row 3` is derived from the last row on screen, not from
+the range the model happened to ask for.
+
+### The bound is a bill, not a style rule
+
+| measure | value |
+|---|---|
+| fixture | 1,200-row CSV, **39,873 bytes** |
+| returned under the default 2000-cell cap | **18,526 bytes, 500 of 1200 rows** |
+| next range offered | `A502:D` — one past the last row actually shown |
+| caps | default 2000 cells, hard 8000, scan stop 400k, file 25 MB, one zip part 64 MB |
+| wire flag | `truncated` is the union of the cell cap and the byte clamp |
+
+The cap is on cells rather than bytes on purpose: on a 262k-context, single-slot
+endpoint, a full dump is not a large message, it is a cost every later turn pays
+again because it is in history.
+
+### Why nothing was written
+
+`sheet_read` writes nothing, and Stage 2 will not be a re-save. OOXML is a zip of
+twenty-odd parts; a writer that models sheets and styles and nothing else silently
+deletes the charts, pivots, external links and query tables it never read — which
+is why `structure` mode counts them and names them before any edit is attempted.
+The plan is a surgical package edit that leaves every untouched part byte-identical,
+with a preservation test as its gate. Until that test exists, the answer to "edit
+my spreadsheet" is a read and an explanation, not a rewrite.

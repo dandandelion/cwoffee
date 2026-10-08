@@ -785,6 +785,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "pulldown-cmark",
+ "quick-xml",
  "reqwest 0.12.28",
  "rusqlite",
  "rust_xlsxwriter",

@@ -111,7 +111,10 @@ and uses its own gateway port. Consequences worth knowing:
 1. Add the prompt to the harness, and a scenario for it in `tests/scenarios/scenarios.json` with the
    `match` substring stable under the harness's interpolation.
 2. If a test would otherwise pass on filler, the mock will 400 and the harness will fail with the
-   prompt named. Add the scenario rather than relaxing the check.
+   prompt named. Add the scenario rather than relaxing the check. When a step should not run until
+   a tool has really said something, put those strings in that step's `require`: the mock checks
+   them against the tool results in the request and 400s with what the engine actually returned.
+   A scripted answer about a file proves the script, not the tool.
 3. Keep the pacing honest: chunk sizes and delays decide whether mid-stream checks see structure
    arrive *during* the turn. `--speed` scales all delays; the engine integration test uses `0.2`.
 
@@ -124,6 +127,7 @@ and uses its own gateway port. Consequences worth knowing:
 | `bullets-live` | four bullets streamed 9 characters at a time, one containing a link. Pins that items become `<li>` one at a time (`counts 0->1->2->3->4`), that one list stays one `<ul>`, that `-` is never painted, and that the first bullet does not move while the rest arrive. |
 | `bold-split-live` | the same answer in 3-character chunks with a 130 ms gap, i.e. one bold construct split across two paints. Pins that no literal `*` reaches the screen and that no words are dropped from a construct whose opener landed in an earlier paint than its closer. |
 | `fake-table-head` | a line that opens with a pipe and is *not* a table, then prose. Pins that waiting on an ambiguous first line may delay, but may never drop: the words have to be on screen at the end. |
+| `sheet-read-csv` | the model writes a delimited file, then reads it back with `sheet_read` under a 6-cell cap. Pins that the tool card shows the engine's own grid, that the cap is honoured, and that the continuation range continues from the last row actually shown. The step also carries `require`, so a tool result that never reached the prompt fails the turn. |
 
 Scenario selection is the `match` substring of the newest user message that has a
 scenario, then **assistant messages since that message** as the step index.

@@ -401,7 +401,7 @@ window management eventually fails on a screensaver.
 ## Files, and asking instead of guessing
 
 The agent's file tools are `read_file`, `write_file`, `edit_file`, `write_xlsx`,
-`download_file`. Two decisions there are worth knowing about:
+`sheet_read`, `download_file`. Three decisions there are worth knowing about:
 
 **`edit_file` is search-and-replace, not a diff.** A 4-bit local model copying a
 line it can see does far better than one generating hunks with correct line
@@ -413,6 +413,20 @@ to a sibling temp file and renamed over the original, so a failure partway canno
 truncate your file. Anything that can be edited - text, markdown, code - should
 go through `edit_file`, which changes a few lines instead of re-emitting the whole
 document and rewriting your whole chat window for it.
+
+**`sheet_read` is read-only, on purpose.** Until now the engine could make an
+`.xlsx` and could not open one - `read_file` calls it binary, so the model was
+blind to a workbook you already had. It now reads `.xlsx`, `.csv` and `.tsv`
+through one tool: `mode: "structure"` lists sheets, extents and the things an
+edit would have to preserve (charts, pivot tables, merges, filters, shared
+formulas), `mode: "values"` returns a tab-separated grid for a range. Dates come
+back as dates rather than as `45672`, formulas come back with the value Excel last
+cached and a marker saying that value is a cache, and every read is bounded - the
+default 2000 cells, hard cap 8000 - because an unbounded dump costs tens of
+thousands of prefill tokens on a single-slot endpoint. Editing an `.xlsx` is a
+separate tool and deliberately not here yet: re-serializing a workbook quietly
+throws away the parts you did not ask about, so it will be a surgical zip edit
+with a preservation test, or nothing.
 
 **`ask_user` stops the agent guessing.** One question, one to six options, one
 marked recommended, and a typed answer always available. The TUI answers with

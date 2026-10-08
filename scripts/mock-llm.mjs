@@ -25,6 +25,12 @@
  * prompt, not a plausible-sounding filler - a stub that is almost right is worse
  * than an error, because the harness would then "pass" while testing nothing.
  *
+ * A step may also carry `require`: strings that must appear in the tool results of
+ * the request that plays it. The canned answer is not evidence that a tool ran; the
+ * bytes the engine put back into the prompt are. So a scenario can insist, for
+ * example, that `sheet_read` really returned a cell grid before it is allowed to
+ * answer from one.
+ *
  * Routes:
  *   GET  /health              -> ok
  *   GET  /v1/models           -> the mock model list (meta.n_ctx, input_modalities)
@@ -380,6 +386,28 @@ const server = http.createServer(async (req, res) => {
     log(`EXHAUSTED: ${scenario.name} step ${stepNo}`)
     res.writeHead(400, { 'content-type': 'application/json' })
     return res.end(JSON.stringify({ error: { message: why } }))
+  }
+
+  // `require`: strings the engine's own tool output must contain, checked against
+  // this request. Without it, a scripted answer about a file proves only that the
+  // scenario said so; with it, the tool result in the prompt is the evidence.
+  const needs = Array.isArray(step.require) ? step.require : []
+  if (needs.length) {
+    const toolText = messages
+      .slice(found.at + 1)
+      .filter((m) => m.role === 'tool')
+      .map((m) => String(m.content ?? ''))
+      .join('\n---\n')
+    const missing = needs.filter((needle) => !toolText.includes(needle))
+    if (missing.length) {
+      const why =
+        `mock-llm scenario "${scenario.name}" step ${stepNo} required ${JSON.stringify(missing)} in the tool ` +
+        `results and did not find them. The tools ran; what the engine actually said was: ` +
+        `${JSON.stringify(toolText.slice(0, 700))}`
+      log(`REQUIRE FAILED: ${scenario.name} step ${stepNo}: ${missing.join(', ')}`)
+      res.writeHead(400, { 'content-type': 'application/json' })
+      return res.end(JSON.stringify({ error: { message: why } }))
+    }
   }
 
   stats.turns += 1

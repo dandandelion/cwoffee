@@ -136,11 +136,24 @@ impl Tool for ReadFileTool {
         };
 
         if looks_binary(&bytes) {
+            // The pointer has to name the tool that can actually do it. A .xlsx is a
+            // zip of xml parts, and "use a converter" would send the model off to
+            // build a pipeline for something the engine can read directly.
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            let pointer = match ext.as_str() {
+                "xlsx" | "xlsm" | "xlsb" => "sheet_read opens a .xlsx: it lists the sheets \
+                 and returns cells by range.",
+                _ => "use exec with an appropriate converter.",
+            };
             return ToolResult::err(format!(
-                "{} looks like a binary file ({} bytes). read_file handles text; \
-                 use exec with an appropriate converter.",
+                "{} looks like a binary file ({} bytes). read_file handles text; {}",
                 display_rel(&ctx.workspace, &path),
-                bytes.len()
+                bytes.len(),
+                pointer
             ));
         }
 
@@ -350,7 +363,8 @@ impl Tool for WriteFileTool {
         match ext.as_str() {
             "xlsx" => {
                 return ToolResult::err(
-                    "write_file cannot produce .xlsx (cells would be text). Use write_xlsx.",
+                    "write_file cannot produce .xlsx (cells would be text). Use write_xlsx \
+                     to make one, sheet_read to read one.",
                 )
             }
             "docx" | "pdf" => {

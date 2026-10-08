@@ -14,7 +14,12 @@
   "",
   "$path in a tool argument expands to the last path-shaped token of the matching",
   "user message, so the harness can interpolate its own temp paths into a prompt and",
-  "the canned tool call still names the right file."
+  "the canned tool call still names the right file.",
+  "",
+  "`require` in a step lists strings that must appear in the tool results of",
+  "the request playing that step; a missing one fails the request. A scripted",
+  "answer about a file proves only that the scenario said so - the engine's own",
+  "tool output in the prompt is the evidence."
  ],
  "model": "cwoffee-mock",
  "defaults": {
@@ -465,6 +470,52 @@
      "finish": "stop",
      "chunk_chars": 7,
      "delay_ms": 55
+    }
+   ]
+  },
+  {
+   "name": "sheet-read-csv",
+   "_why": "sheet_read end to end: the model writes a delimited file, opens it with the spreadsheet tool, and the scenario refuses to continue unless the engine's own cell grid is in the prompt",
+   "match": "Selftest sheet-read",
+   "steps": [
+    {
+     "reasoning": "A file to read. Make it first so the read has something real behind it.",
+     "tool_calls": [
+      {
+       "id": "mock-sheet-1",
+       "name": "write_file",
+       "arguments": "{\"path\": \"$path\", \"content\": \"Region,Units,Price\\nNorth,12,3\\nSouth,7,4\\nWest,26,2\\nEast,9,5\\n\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "require": [
+      "created",
+      "selftest-regions.csv"
+     ],
+     "reasoning": "The file exists. Read it as a table, a few cells at a time.",
+     "tool_calls": [
+      {
+       "id": "mock-sheet-2",
+       "name": "sheet_read",
+       "arguments": "{\"path\": \"$path\", \"range\": \"A1:C9\", \"max_cells\": 6}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "require": [
+      "Region",
+      "North",
+      "ask again with range"
+     ],
+     "content": "Units: North 12, South 7. The cap stopped at row 2; the rest is one more read away.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 10
     }
    ]
   }

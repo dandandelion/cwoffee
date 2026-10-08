@@ -33,7 +33,7 @@ These are architectural, not aspirational. Every one of them has a CI check or a
 | Storage | SQLite via `rusqlite` (bundled) + FTS5 |
 | Markdown | `pulldown-cmark` in Rust → HTML → `DOMPurify` → DOM |
 | Highlighting | `highlight.js`, ≤6 languages, on idle (not Shiki — grammar loading is a memory hog) |
-| Excel | `rust_xlsxwriter` (write) + `calamine` (read) |
+| Excel | `rust_xlsxwriter` (write) + our own SAX over the OOXML parts via `quick-xml` (read). `calamine` was not taken: Stage 2 has to edit the same parts without re-serializing the package, so the reader is the same package model the editor will touch. |
 | PDF out | `typst` crate + bundled `.typ` templates |
 | PDF in | `pdf-extract`, fallback to system `pdftotext` (present) |
 | Exec sandbox | `tokio::process` + `portable-pty` inside `bwrap` (present) |
