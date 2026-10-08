@@ -369,12 +369,16 @@ fn main() {
         let watch = std::env::var("CWOFFEE_GATEWAY_WATCH_TOKEN")
             .ok()
             .filter(|s| !s.is_empty());
+        // Started before the window exists rather than alongside it. The first
+        // `gateway_status` read happens as the UI boots, and a status taken while
+        // the accept loop is still being spawned says "off" about a gateway that is
+        // about to be reachable - the one reading of this pill that could mislead.
         let ctl = Arc::clone(&gateway);
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = ctl.start(bind, port, drive, watch, source).await {
-                eprintln!("[cwoffee] gateway not running: {e}");
-            }
-        });
+        if let Err(e) =
+            tauri::async_runtime::block_on(ctl.start(bind, port, drive, watch, source))
+        {
+            eprintln!("[cwoffee] gateway not running: {e}");
+        }
     }
 
     let rendered_flag = state.rendered.clone();

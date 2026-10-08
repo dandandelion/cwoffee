@@ -122,6 +122,8 @@ and uses its own gateway port. Consequences worth knowing:
 | `truncation-check` | step 0 stops with `finish_reason: "length"` mid-sentence, step 1 finishes the sentence. Pins that the engine notices the cap, says so, resumes, and keeps both halves in history. |
 | `thinking-ate-the-budget` | reasoning deltas and then `length`, with no answer text at all. Pins the error that names thinking and the knob to turn, instead of a "Done" chip above an empty answer. |
 | `bullets-live` | four bullets streamed 9 characters at a time, one containing a link. Pins that items become `<li>` one at a time (`counts 0->1->2->3->4`), that one list stays one `<ul>`, that `-` is never painted, and that the first bullet does not move while the rest arrive. |
+| `bold-split-live` | the same answer in 3-character chunks with a 130 ms gap, i.e. one bold construct split across two paints. Pins that no literal `*` reaches the screen and that no words are dropped from a construct whose opener landed in an earlier paint than its closer. |
+| `fake-table-head` | a line that opens with a pipe and is *not* a table, then prose. Pins that waiting on an ambiguous first line may delay, but may never drop: the words have to be on screen at the end. |
 
 Scenario selection is the `match` substring of the newest user message that has a
 scenario, then **assistant messages since that message** as the step index.

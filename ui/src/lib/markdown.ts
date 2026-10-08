@@ -171,6 +171,80 @@ function aligns(delim: string): string[] {
 }
 
 /**
+ * Is `src` the start of a pipe table whose header and delimiter rows have both
+ * arrived? Returns the offset just past the delimiter line, or null.
+ *
+ * A table cannot be built before the delimiter row exists - the column count and
+ * the alignment come from it, and "a | b" in prose must stay prose. But once those
+ * two lines are down, the table is a known shape, and waiting for the *block* to
+ * end (a blank line, or the first non-row) is why a table appears all at once:
+ * every row the reader watched the model type arrives as one replacement.
+ */
+export function tableHeadEnd(src: string): number | null {
+  const first = src.indexOf('\n')
+  if (first === -1) return null
+  const second = src.indexOf('\n', first + 1)
+  if (second === -1) return null
+  const header = src.slice(0, first)
+  const delim = src.slice(first + 1, second)
+  if (!header.includes('|') || !TABLE_DELIM.test(delim.trim())) return null
+  return second + 1
+}
+
+/**
+ * Is this the beginning of a table that we are not allowed to build yet?
+ *
+ * The header line of a table arrives before the delimiter row that proves it is a
+ * table, and painting that line as paragraph prose and then building the table
+ * below it leaves the header on screen twice - which is what the table-only
+ * scenario did. So: when a line starts with a pipe and the line after it could
+ * still turn into a delimiter row, wait for that line rather than choose a box on
+ * a guess. The wait is bounded by one newline; if the second line turns out not to
+ * be a delimiter, the prose path takes it.
+ */
+export function tableHeadPending(src: string): boolean {
+  const first = src.indexOf('\n')
+  const header = first === -1 ? src : src.slice(0, first)
+  if (!header.startsWith('|')) return false
+  if (first === -1) return true
+  const second = src.indexOf('\n', first + 1)
+  const delim = second === -1 ? src.slice(first + 1) : src.slice(first + 1, second)
+  if (second !== -1) return false
+  return /^[\s|:-]*$/.test(delim)
+}
+
+/**
+ * Is the first line of `src` a complete table row? Its offset past the newline, or
+ * null while it is still arriving. A row that has finished is a finished piece of
+ * markdown: nothing about a later row can change it.
+ */
+export function tableRowEnd(src: string): number | null {
+  const nl = src.indexOf('\n')
+  if (nl === -1) return null
+  const line = src.slice(0, nl)
+  if (line.trim() === '' || !line.includes('|')) return null
+  return nl + 1
+}
+
+/** The `<table>` skeleton: header row filled, body empty. */
+export function tableSkeletonHtml(header: string, delim: string): string {
+  return renderTable(header, delim, [])
+}
+
+/** One `<tr>` of the body, with the parser\'s own cell rules. */
+export function tableRowHtml(delim: string, line: string): string {
+  const al = aligns(delim)
+  const n = splitRow(delim).length
+  const cells = Array.from({ length: n }, (_, i) => splitRow(line)[i] ?? '')
+  return `<tr>${cells
+    .map((c, i) => {
+      const a = al[i] ? ` class="ta-${al[i]}"` : ''
+      return `<td${a}>${renderInline(escapeHtml(c))}</td>`
+    })
+    .join('')}</tr>`
+}
+
+/**
  * Render a pipe table. `header` is the line before the delimiter row.
  *
  * Ragged rows are normal from a model, so the column count comes from the

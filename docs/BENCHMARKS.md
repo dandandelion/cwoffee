@@ -789,3 +789,60 @@ scan rather than being flattened, a half-arrived marker returns "wait").
 `SELFTEST ok` (0 failures) against the scripted endpoint; `markdown: all checks passed`;
 `svelte-check` 0 errors 0 warnings; engine `mock_endpoint` **9 passed**, `config::` 13 passed;
 production app PSS **245.2 MB** (≤ 400), `render OK`, gateway smoke OK, search-smoke OK.
+
+---
+
+## The toolbar stopped guessing, and markup arrives as structure while it is typed
+
+Three reports, one shape: the app stated a fact it had not read yet, and markdown
+became structure only when the model stopped typing.
+
+### What the footer says before it is asked
+
+The search pill read `unknown` until the search popover was opened; the gateway pill
+could read `off` while a phone was connected. Both values existed at boot and were
+fetched on demand.
+
+| measure | value |
+|---|---|
+| footer at boot, before any popover | search `duckduckgo` (backend=duckduckgo), gateway `:8199 · 0 devices` running=true |
+| gateway boot | started with `block_on` before the window, so the first `gateway_status` cannot land mid-bind |
+| a gateway that could not bind | note is `off - Address already in use (os error 98)`, not `off` — the case where a phone reaches a gateway this instance does not own |
+
+### A bold span split across two paints
+
+The user's screenshot showed `**What it is**:` with the words bold and the closing
+`**` printed as text. The inline stream had opened `<strong>`; the next paint passed
+the **block** host into a guard that compared it with the **insertion point**, which
+was now the `<strong>`, so the rest of the item was painted as literal source.
+
+| measure | value |
+|---|---|
+| strong spans in the answer | 2, and 0 literal `*` on screen while streaming |
+| samples with bold already on screen | 151 mid-stream samples |
+| words lost from a split construct | none (`Sourcing sets the ceiling` present in full) |
+| negative control | reverting one condition reproduces the report verbatim: `Sourcing** matters more than the roast...` |
+
+### Tables while the rows arrive, not after
+
+A table used to become a `<table>` in one replacement at the end of its block. Once the
+header row and the delimiter row have landed, the shape is known, so the skeleton is
+built then and each completed line becomes a `<tr>` — using the parser's own cell rules,
+so a live row and a parsed row are the same element.
+
+| measure | before | after |
+|---|---|---|
+| body rows present mid-stream | 0 | `0→2→3` (2 of 3 minimum asserted) |
+| table on screen | at `turnEnd` | 452 ms before `turnEnd` |
+| rows dropped when the stream ends mid-table | — | 0 (a row without its newline is decided at stream end) |
+| a pipe-led line with no delimiter row | prose | prose, and still on screen |
+
+Fences, nested lists, checkbox lists and thematic breaks stay with the parser: their
+shape is not knowable from the bytes that have arrived.
+
+### Gates
+
+`SELFTEST ok` (0 failures) against the scripted endpoint; `markdown: all checks
+passed`; `svelte-check` 0 errors 0 warnings; `cwoffee-app` gateway_ctl **4 passed**
+(including the failed-bind note); production app PSS **246.3 MB** (≤ 400),
+`render OK`, `webkit render path: no-dmabuf`, gateway smoke OK, search-smoke OK.

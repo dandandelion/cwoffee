@@ -48,7 +48,7 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, firstItemEnd, listMarker, maybeListMarker, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, InlineStream } from './markdown'
+import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, firstItemEnd, listMarker, maybeListMarker, tableHeadEnd, tableHeadPending, tableRowEnd, tableSkeletonHtml, tableRowHtml, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, InlineStream } from './markdown'
 import { fmtThink } from './think'
 import { openPreview, inlineSvg } from './preview'
 
@@ -226,6 +226,25 @@ export class Transcript {
    */
   private liveList: HTMLElement | null = null
   private tailStructured = false
+  /**
+   * The block element whose text is currently being written - the `<p>` or the
+   * `<li>`. Distinct from `inlineHost`, which is where the next word goes and may
+   * be a `<strong>` or `<code>` opened inside it.
+   *
+   * Testing the wrong one is how bold broke in real use: a construct opened in one
+   * paint left `inlineHost` pointing at the `<strong>`, the next paint compared the
+   * `<li>` against it, decided the host was "not live", and appended the rest of
+   * the item - closing marker and all - as raw text. Word-for-word what the
+   * screenshots showed.
+   */
+  private liveTextHost: HTMLElement | null = null
+  /**
+   * The `<tbody>` of a table that is still being written, and the delimiter row
+   * that fixed its columns. Built as soon as the header and delimiter lines are
+   * down - the point at which the shape is known - so each row the model types
+   * lands as a `<tr>` instead of the whole table replacing a paragraph at the end.
+   */
+  private liveTable: { delim: string; tbody: HTMLElement } | null = null
   /** Files produced so far this turn, deduped by path, and the one row that
    *  shows them. */
   private turnFiles: OutputFile[] = []
@@ -377,6 +396,10 @@ export class Transcript {
     this.livePainted = 0
     this.liveTail = null
     this.inlineHost = null
+    this.liveTextHost = null
+    this.liveList = null
+    this.liveTable = null
+    this.tailStructured = false
     this.blockStart = 0
     this.wordRate = 0
     this.lastPaintAt = 0
@@ -560,6 +583,7 @@ export class Transcript {
       this.liveList.append(li)
       this.liveTail = li
       this.tailStructured = true
+      this.liveTextHost = li
       this.inline.reset()
       this.inlineHost = li
       return li
@@ -570,6 +594,7 @@ export class Transcript {
     t.className = 'live-para'
     this.liveEl!.append(t)
     this.liveTail = t
+    this.liveTextHost = t
     // A new paragraph is a new inline scope: no open construct carries over.
     this.inline.reset()
     this.inlineHost = t
@@ -611,6 +636,7 @@ export class Transcript {
   private endItem(src: string, at: number) {
     this.liveTail = null
     this.inlineHost = null
+    this.liveTextHost = null
     this.inline.reset()
     const nextLine = src.slice(at).split('\n', 1)[0] ?? ''
     // The list continues only if what follows is an item, or a marker still
@@ -662,6 +688,46 @@ export class Transcript {
       // the next one lands. Committing at that boundary, into an `<li>` that was
       // created when the marker arrived, is what makes bullets appear one by one
       // instead of four at a time at the end of the list.
+      // Tables: build the skeleton once the delimiter row makes the shape known,
+      // then append each completed row. The parser's own rules (splitRow, alignment,
+      // padding) do the cells, so a live row and a parsed row are the same thing.
+      if (!this.liveTable && !fenceOpen(rest)) {
+        const headEnd = tableHeadEnd(rest)
+        if (headEnd !== null) {
+          const lines = rest.slice(0, headEnd).split('\n')
+          const tpl = document.createElement('template')
+          tpl.innerHTML = tableSkeletonHtml(lines[0], lines[1].trim())
+          const table = tpl.content.firstElementChild as HTMLElement | null
+          const tbody = table?.querySelector('tbody') ?? null
+          if (table && tbody) {
+            this.liveEl!.append(table)
+            this.liveTable = { delim: lines[1].trim(), tbody }
+            this.tailStructured = true
+            this.blockStart += headEnd
+            this.livePainted = Math.max(this.livePainted, this.blockStart)
+            continue
+          }
+        }
+        // A table we cannot prove yet is not a paragraph either. Paint nothing.
+        if (tableHeadPending(rest)) break
+      }
+      if (this.liveTable) {
+        const rowEnd = tableRowEnd(rest)
+        if (rowEnd !== null) {
+          const line = rest.slice(0, rowEnd).replace(/\n+$/, '')
+          const tpl = document.createElement('template')
+          tpl.innerHTML = tableRowHtml(this.liveTable.delim, line)
+          const tr = tpl.content.firstElementChild
+          if (tr) this.liveTable.tbody.append(tr)
+          this.blockStart += rowEnd
+          this.livePainted = Math.max(this.livePainted, this.blockStart)
+          continue
+        }
+        // No complete row yet. Painting the half-row as paragraph text and then
+        // replacing it with a `<tr>` is a rewrite of settled text, so wait.
+        if (!firstBlockEnd(rest)) break
+      }
+
       const itemEnd = structural && !fenceOpen(rest) ? firstItemEnd(rest) : null
       if (itemEnd !== null) {
         const iend = this.blockStart + itemEnd
@@ -723,14 +789,45 @@ export class Transcript {
    * text is what every "blink while streaming" report has traced back to.
    */
   private closeBlock(blockSrc: string, final = false) {
+    if (this.liveTable) {
+      // A stream that stops mid-table never gives the last row a newline, and a
+      // row without its newline is not provably finished - so it is still in the
+      // unclaimed part of the source. At the end of the stream there is nothing
+      // left it could have been, so the rows left in `blockSrc` are rows. Dropping
+      // them is how a live table ended up one row short of what the model typed.
+      if (final) {
+        for (const line of blockSrc.split('\n')) {
+          const t = line.trim()
+          if (t === '' || !t.includes('|')) continue
+          const tpl = document.createElement('template')
+          tpl.innerHTML = tableRowHtml(this.liveTable.delim, t)
+          const tr = tpl.content.firstElementChild
+          if (tr) this.liveTable.tbody.append(tr)
+        }
+      }
+      this.liveTable = null
+    }
     const el = this.liveTail
     const builtLive = this.tailStructured
     this.liveTail = null
     this.inlineHost = null
+    this.liveTextHost = null
     this.tailStructured = false
     this.inline.reset()
-    if (!el) return
-    if (builtLive) {
+    if (!el) {
+      // Nothing was ever painted for this block. That used to mean "empty"; now it
+      // can also mean "held back because its first line looked like a table header
+      // and the delimiter row had not landed" (see tableHeadPending). At the end of
+      // a stream there is nothing left it could have become, so hand the text to the
+      // parser rather than silently dropping words the model typed.
+      if (final && blockSrc.trim() && this.liveEl) {
+        const tpl = document.createElement('template')
+        tpl.innerHTML = renderMarkdown(blockSrc)
+        this.liveEl.append(...Array.from(tpl.content.childNodes))
+      }
+      return
+    }
+    if (builtLive || !el) {
       // An `<li>` built as an `<li>` needs no parser. Running it anyway would
       // replace spans that are already on screen with spans saying the same thing,
       // and the compositor cannot tell that "the same thing" is free.
@@ -801,7 +898,7 @@ export class Transcript {
     // The live text host is a `<p class="live-para">` or, for a list, the `<li>`
     // being written. Both get inline constructs opened as they complete; an open
     // code fence does not, because `**` inside a code block is the text `**`.
-    if (host === this.inlineHost && allowInline) {
+    if (host === this.liveTextHost && allowInline) {
       // Inline emphasis in the paragraph being written: open a <strong>/<em>/
       // <code> when the opener is recognised and append the coming words inside
       // it, so `**the copy**` becomes bold the moment it closes instead of at the
@@ -992,6 +1089,14 @@ export class Transcript {
     this.livePainted = 0
     this.liveTail = null
     this.inlineHost = null
+    // Every piece of per-block live state belongs here. A field left out survives
+    // into the next block, and the next block paints into a box its owner has
+    // already forgotten - which is how a table built for one answer can swallow
+    // the rows of the next one.
+    this.liveTextHost = null
+    this.liveList = null
+    this.liveTable = null
+    this.tailStructured = false
     this.inline.reset()
     this.blockStart = 0
     this.lastLiveRender = 0

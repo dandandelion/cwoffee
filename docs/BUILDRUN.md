@@ -1879,3 +1879,54 @@ Two near-misses in one change:
   `the first bullet moved 165.4px - settled text was rewritten` for an element that had not
   moved at all. Compare against a stable ancestor (`li.top - ul.top`), or add the scroll
   offset; never compare viewport coordinates across time in a scrolling view.
+
+### Trap 90: the insertion point is not the text host
+
+`appendReveal` decided whether to run the inline stream with `host === this.inlineHost`.
+That comparison was always going to fail the moment a construct opened: `**bold` makes
+the insertion point the `<strong>`, while the next paint still hands in the `<li>` or
+`<p>` it is writing. The fallback was "paint it as plain text", so the closing marker and
+everything after it landed on screen as source — the user's `**What it is**:`.
+
+Two different questions were being asked with one variable:
+
+- **which block am I writing?** — `liveTextHost`, a `<p>` or `<li>`, set when the block's
+  tail is created and cleared when the block or item ends;
+- **where does the next character go?** — `inlineHost`, which may be nested inside a
+  `<strong>`, `<em>` or `<code>` the inline stream opened.
+
+Guard on the first; insert at the second. The negative control is the whole point of this
+trap: put the old comparison back and the self-test prints the user's screenshot as text.
+
+### Trap 91: a new field on a stateful renderer needs a reset audit, not a compile
+
+`liveTable` was added to the streaming transcript and worked — until the next answer in
+the same session behaved oddly. Per-block live state (`liveTail`, `livePainted`,
+`blockStart`, `inlineHost`, and now `liveTable`, `liveTextHost`, `liveList`,
+`tailStructured`) is cleared in **two** places: the turn reset and `beginLive`. A field
+left out of either survives into the next block, and the next block then paints into a
+box the code that owns it has already forgotten. The compiler cannot see this; the only
+defense when adding live state is to grep for both reset sites and add the field.
+
+### Trap 92: a check that waits on the store is not a check on the page
+
+A new self-test turn polled `session_state.turns` to decide the turn was over. The store
+records a turn before the page has finished painting it, so the next check started
+streaming into a transcript whose previous answer block had not closed — and an unrelated
+check failed two steps later with `the heading never became a heading`, on a body that
+began mid-word (`ods`). Nothing was wrong with the renderer; the harness had interleaved
+two turns.
+
+- UI checks wait on the UI's own `turnEnd` (`waitTurnDone`), not the engine's counter.
+- When a structural check fails, print the shape of the body over time. The ring of
+  `179ms [P TABLE] ods Method Grind Time...` made this diagnosable from one log line;
+  "the heading never became a heading" alone sent two full runs past the real cause.
+
+### Trap 93: waiting may delay, it may never drop
+
+Holding back a pipe-led first line until its delimiter row arrives is right (painting it
+as prose and then building the table below it shows the header twice). But a block that
+was deliberately not painted still has to reach the screen when the stream ends, and the
+final path used to return early when there was no live element. A rule that says "wait"
+has to be paired with the sentence "and if we never learn more, render it anyway" —
+otherwise the fix for a duplication becomes a missing-sentence bug.

@@ -1,446 +1,472 @@
 {
-  "_about": [
-    "Canned model behaviour for Cwoffee's automated tests. Nothing here is a claim",
-    "about what a real model would say: it is the shape of a response, chosen so the",
-    "wire path (SSE parsing, tool-call fragmentation, JSON repair, telemetry from",
-    "`timings`, streaming block commit) is exercised without a GPU and without",
-    "touching anyone's prefix cache.",
-    "",
-    "Selection is stateless on purpose: a scenario is the first entry whose `match`",
-    "substring appears in the last user message, and the step played is the number of",
-    "role=tool messages after that user message. A tool loop therefore advances by",
-    "itself, which also proves the prompt builder really is append-only: every request",
-    "is a superset of the previous one.",
-    "",
-    "$path in a tool argument expands to the last path-shaped token of the matching",
-    "user message, so the harness can interpolate its own temp paths into a prompt and",
-    "the canned tool call still names the right file."
-  ],
-  "model": "cwoffee-mock",
-  "defaults": {
-    "chunk_chars": 8,
-    "delay_ms": 12,
-    "arg_chunk_chars": 24,
-    "tokens_per_chunk": 2
+ "_about": [
+  "Canned model behaviour for Cwoffee's automated tests. Nothing here is a claim",
+  "about what a real model would say: it is the shape of a response, chosen so the",
+  "wire path (SSE parsing, tool-call fragmentation, JSON repair, telemetry from",
+  "`timings`, streaming block commit) is exercised without a GPU and without",
+  "touching anyone's prefix cache.",
+  "",
+  "Selection is stateless on purpose: a scenario is the first entry whose `match`",
+  "substring appears in the last user message, and the step played is the number of",
+  "role=tool messages after that user message. A tool loop therefore advances by",
+  "itself, which also proves the prompt builder really is append-only: every request",
+  "is a superset of the previous one.",
+  "",
+  "$path in a tool argument expands to the last path-shaped token of the matching",
+  "user message, so the harness can interpolate its own temp paths into a prompt and",
+  "the canned tool call still names the right file."
+ ],
+ "model": "cwoffee-mock",
+ "defaults": {
+  "chunk_chars": 8,
+  "delay_ms": 12,
+  "arg_chunk_chars": 24,
+  "tokens_per_chunk": 2
+ },
+ "props": {
+  "build_info": "cwoffee-mock 1.0",
+  "model_alias": "cwoffee-mock",
+  "model_path": "/mock/cwoffee-mock.gguf",
+  "hardware_params": {
+   "n_ctx": 262144,
+   "n_gpu_layers": 0
   },
-  "props": {
-    "build_info": "cwoffee-mock 1.0",
-    "model_alias": "cwoffee-mock",
-    "model_path": "/mock/cwoffee-mock.gguf",
-    "hardware_params": {
-      "n_ctx": 262144,
-      "n_gpu_layers": 0
-    },
+  "n_ctx": 262144,
+  "n_slot": 1,
+  "add_bos_token": true,
+  "trim_eos": true,
+  "parallel": 1,
+  "chat_template": "{% if tools %}{{ tool_call }}{{ tool_name }}{{ tool_response }}{% endif %}{% set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}{% if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}{{- raise_exception('Unexpected reasoning effort: ' ~ resolved_reasoning_effort) -}}{% endif %}",
+  "modalities": [
+   "text",
+   "image"
+  ],
+  "vipool": false,
+  "default_generation_settings": {
+   "n_ctx": 262144,
+   "temperature": 0.8,
+   "reasoning_effort": "xhigh"
+  }
+ },
+ "models": [
+  {
+   "id": "cwoffee-mock",
+   "object": "model",
+   "owned_by": "cwoffee",
+   "meta": {
     "n_ctx": 262144,
-    "n_slot": 1,
-    "add_bos_token": true,
-    "trim_eos": true,
-    "parallel": 1,
-    "chat_template": "{% if tools %}{{ tool_call }}{{ tool_name }}{{ tool_response }}{% endif %}{% set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}{% if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}{{- raise_exception('Unexpected reasoning effort: ' ~ resolved_reasoning_effort) -}}{% endif %}",
-    "modalities": [
-      "text",
-      "image"
+    "vocab_size": 151645,
+    "n_vocab": 151645,
+    "size": 0,
+    "ftype": "mock"
+   },
+   "architecture": {
+    "modals": 1,
+    "input_modalities": [
+     "text",
+     "image"
     ],
-    "vipool": false,
-    "default_generation_settings": {
-      "n_ctx": 262144,
-      "temperature": 0.8,
-      "reasoning_effort": "xhigh"
+    "output_modalities": [
+     "text"
+    ]
+   }
+  }
+ ],
+ "scenarios": [
+  {
+   "name": "one-word-image",
+   "_why": "vision over the wire: the attachment has to reach the request, and thinking is off for this one so no reasoning deltas may appear",
+   "match": "What colour is this image?",
+   "steps": [
+    {
+     "content": "white",
+     "finish": "stop",
+     "chunk_chars": 4,
+     "delay_ms": 10
     }
+   ]
   },
-  "models": [
+  {
+   "name": "read-file-approval",
+   "_why": "the approval round trip: engine asks, UI answers, tool runs, model reports",
+   "match": "Use read_file to read the file /etc/hostname",
+   "steps": [
     {
-      "id": "cwoffee-mock",
-      "object": "model",
-      "owned_by": "cwoffee",
-      "meta": {
-        "n_ctx": 262144,
-        "vocab_size": 151645,
-        "n_vocab": 151645,
-        "size": 0,
-        "ftype": "mock"
-      },
-      "architecture": {
-        "modals": 1,
-        "input_modalities": [
-          "text",
-          "image"
-        ],
-        "output_modalities": [
-          "text"
-        ]
+     "reasoning": "Reading a file the user named. It is outside the workspace, so it needs approval.",
+     "tool_calls": [
+      {
+       "id": "mock-read-1",
+       "name": "read_file",
+       "arguments": "{\"path\":\"/etc/hostname\"}"
       }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "content": "That is the machine's host name.",
+     "finish": "stop",
+     "chunk_chars": 6,
+     "delay_ms": 12
     }
-  ],
-  "scenarios": [
+   ]
+  },
+  {
+   "name": "write-file-output",
+   "_why": "a turn that produces a file: the chip, the store stamp, and the header must all follow",
+   "match": "Use write_file to save about 50 words about espresso to",
+   "steps": [
     {
-      "name": "one-word-image",
-      "_why": "vision over the wire: the attachment has to reach the request, and thinking is off for this one so no reasoning deltas may appear",
-      "match": "What colour is this image?",
-      "steps": [
-        {
-          "content": "white",
-          "finish": "stop",
-          "chunk_chars": 4,
-          "delay_ms": 10
-        }
-      ]
+     "reasoning": "One write_file call, no shell.",
+     "tool_calls": [
+      {
+       "id": "mock-write-1",
+       "name": "write_file",
+       "arguments": "{\"path\":\"$path\",\"content\":\"Espresso is coffee forced through finely ground beans under pressure. The shot carries a crema of emulsified oils, and everything about it is a trade: finer grind means more resistance, more resistance means more body, and more body means less room for the origin's brighter notes to speak. Pull it short and it turns sour; pull it long and it turns ashen.\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
     },
     {
-      "name": "read-file-approval",
-      "_why": "the approval round trip: engine asks, UI answers, tool runs, model reports",
-      "match": "Use read_file to read the file /etc/hostname",
-      "steps": [
-        {
-          "reasoning": "Reading a file the user named. It is outside the workspace, so it needs approval.",
-          "tool_calls": [
-            {
-              "id": "mock-read-1",
-              "name": "read_file",
-              "arguments": "{\"path\":\"/etc/hostname\"}"
-            }
-          ],
-          "finish": "tool_calls",
-          "delay_ms": 20
-        },
-        {
-          "content": "That is the machine's host name.",
-          "finish": "stop",
-          "chunk_chars": 6,
-          "delay_ms": 12
-        }
-      ]
-    },
-    {
-      "name": "write-file-output",
-      "_why": "a turn that produces a file: the chip, the store stamp, and the header must all follow",
-      "match": "Use write_file to save about 50 words about espresso to",
-      "steps": [
-        {
-          "reasoning": "One write_file call, no shell.",
-          "tool_calls": [
-            {
-              "id": "mock-write-1",
-              "name": "write_file",
-              "arguments": "{\"path\":\"$path\",\"content\":\"Espresso is coffee forced through finely ground beans under pressure. The shot carries a crema of emulsified oils, and everything about it is a trade: finer grind means more resistance, more resistance means more body, and more body means less room for the origin's brighter notes to speak. Pull it short and it turns sour; pull it long and it turns ashen.\"}"
-            }
-          ],
-          "finish": "tool_calls",
-          "delay_ms": 20
-        },
-        {
-          "content": "Saved.",
-          "finish": "stop",
-          "chunk_chars": 4,
-          "delay_ms": 10
-        }
-      ]
-    },
-    {
-      "name": "write-file-note",
-      "_why": "the output-file chip: a stored row has to carry the file, and the live strip has to show it",
-      "match": "Use write_file to create selftest-note.md",
-      "steps": [
-        {
-          "tool_calls": [
-            {
-              "id": "mock-note-1",
-              "name": "write_file",
-              "arguments": "{\"path\":\"selftest-note.md\",\"content\":\"cwoffee output file\\n\"}"
-            }
-          ],
-          "finish": "tool_calls",
-          "delay_ms": 20
-        },
-        {
-          "content": "I wrote selftest-note.md in the workspace.",
-          "finish": "stop",
-          "chunk_chars": 6,
-          "delay_ms": 12
-        }
-      ]
-    },
-    {
-      "name": "exec-delete-cleanup",
-      "_why": "the cleanup turn from the deleted-files bug: exec runs, and its output must not attach the file it just removed",
-      "match": "using exec with: rm -f",
-      "steps": [
-        {
-          "tool_calls": [
-            {
-              "id": "mock-rm-1",
-              "name": "exec",
-              "arguments": "{\"command\":\"rm -f $path\"}"
-            }
-          ],
-          "finish": "tool_calls",
-          "delay_ms": 15
-        },
-        {
-          "content": "done",
-          "finish": "stop",
-          "chunk_chars": 4,
-          "delay_ms": 10
-        }
-      ]
-    },
-    {
-      "name": "count-fifteen",
-      "_why": "line-by-line streaming: one newline per number, so commit boundaries are visible",
-      "match": "Count out loud from one to fifteen",
-      "steps": [
-        {
-          "content": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n",
-          "finish": "stop",
-          "chunk_chars": 3,
-          "delay_ms": 90
-        }
-      ]
-    },
-    {
-      "name": "six-times-seven",
-      "match": "What is 6 times 7?",
-      "steps": [
-        {
-          "content": "42",
-          "finish": "stop",
-          "chunk_chars": 2,
-          "delay_ms": 15
-        }
-      ]
-    },
-    {
-      "name": "wipe-check",
-      "match": "Selftest wipe check",
-      "steps": [
-        {
-          "content": "ok",
-          "finish": "stop",
-          "chunk_chars": 2,
-          "delay_ms": 15
-        }
-      ]
-    },
-    {
-      "name": "live-marker",
-      "_why": "thinking then answer, with a switch in the same flush window - the shape that once leaked reasoning prose into answer blocks",
-      "match": "Selftest live marker: count from one to five",
-      "steps": [
-        {
-          "reasoning": "Count, then answer.",
-          "content": "1, 2, 3, 4, 5",
-          "finish": "stop",
-          "chunk_chars": 2,
-          "delay_ms": 40
-        }
-      ]
-    },
-    {
-      "name": "coffee-roasting",
-      "_why": "a long four-paragraph answer with real structure: this is the turn the frame-cadence and follow checks ride on",
-      "match": "Write about coffee roasting in exactly four paragraphs",
-      "steps": [
-        {
-          "content": "## Roasting coffee at home\n\nRoasting is the point where green coffee stops being a shelf-stable seed and becomes a flavour. A cheap pan, a colander and a stove hood will do it; what matters is that the beans move constantly and that you can hear the two cracks.\n\nThe first crack is steam. The beans have given up their moisture, the cell walls let go with a sound like popcorn, and the coffee is drinkable from here on - light, acidic, and tasting of wherever it grew.\n\nThen comes Maillard browning, which is where sweetness is made. Heat drives sugars and amino acids together; body thickens, acidity softens, and the origin's sharper notes start to blur behind roast taste.\n\nSecond crack is structure failing. Oils surface, the beans swell and go brittle, and every minute past it trades origin for char. Stop when the cup says stop, not when the timer does.",
-          "finish": "stop",
-          "chunk_chars": 7,
-          "delay_ms": 11
-        }
-      ]
-    },
-    {
-      "name": "ask-two-questions",
-      "_why": "multi-question ask_user through the engine event path, not through a synthetic card",
-      "match": "Ask me two questions before writing the report",
-      "steps": [
-        {
-          "reasoning": "Two decisions belong to the user: audience and length. Ask both in one call.",
-          "tool_calls": [
-            {
-              "id": "mock-ask-1",
-              "name": "ask_user",
-              "arguments": "{\"questions\": [{\"question\": \"Who is the report for?\", \"options\": [{\"label\": \"Engineers\", \"detail\": \"numbers, and name the tools\"}, {\"label\": \"Executives\", \"detail\": \"one page, no jargon\"}, {\"label\": \"Nobody in particular\"}], \"recommended\": 0, \"allow_custom\": false, \"multi\": false}, {\"question\": \"How long should it be?\", \"options\": [{\"label\": \"Half a page\", \"detail\": \"the short version\"}, {\"label\": \"Two pages\"}, {\"label\": \"As long as it takes\"}], \"recommended\": 1, \"allow_custom\": false, \"multi\": false}]}"
-            }
-          ],
-          "finish": "tool_calls",
-          "delay_ms": 25
-        },
-        {
-          "content": "Written, with those two settled.",
-          "finish": "stop",
-          "chunk_chars": 6,
-          "delay_ms": 12
-        }
-      ]
-    },
-    {
-      "name": "table-mid-stream",
-      "_why": "structure must appear while streaming, not at turnEnd: heading, table, then a list",
-      "match": "Show me a markdown table of three brewing methods",
-      "steps": [
-        {
-          "content": "## Three methods\n\n| Method | Grind | Time |\n| --- | --- | --- |\n| V60 | medium | 3:00 |\n| Chemex | medium-coarse | 4:00 |\n| AeroPress | fine | 1:30 |\n\n- **V60** is forgiving of a bad pour\n- *Chemex* is the cleanest cup\n- `AeroPress` travels",
-          "finish": "stop",
-          "chunk_chars": 13,
-          "delay_ms": 26
-        }
-      ]
-    },
-    {
-      "name": "oversized-inline-write",
-      "_why": "the engine refuses a 1.6k-character here-document write and points at write_file; the refusal must come back as a tool result, not a hung approval",
-      "match": "Write that note into a file using a shell here-document",
-      "steps": [
-        {
-          "tool_calls": [
-            {
-              "id": "mock-heredoc-1",
-              "name": "exec",
-              "arguments": "{\"command\":\"cat > $path <<'EOF'\\nEspresso is a suspension of coffee solids and CO2 in water, stabilised by emulsified oils and fine bubbles. What makes it different from filter coffee is pressure: nine bar forces water through a compacted puck in under thirty seconds, extracting compounds that gravity brewing cannot reach, and it produces crema, which is the only part of the cup that is genuinely unique to the method. Crema is not a mark of quality by itself - it is largely a product of fresh CO2 and bean roast date, and it dissipates within minutes - but a thin, quickly-vanishing crema usually correlates with a stale coffee or under-extraction. The rest of the shot is dissolved solids, in roughly an eight to twelve percent concentration band; anything lower reads thin, anything higher reads hollow, and the whole craft is choosing where inside that band you want your bitterness and your acidity to sit. There is also a thermodynamic argument for espresso, which is that a small volume of liquid near boiling will lose heat quickly, so the cup must be small, and the smallness in turn constrains the dose, which constrains the grind, and so the machine sets the recipe more than any roaster or barista does, which is why people who brew at home tend to arrive at espresso last and complain about it loudest.\\nEOF\"}"
-            }
-          ],
-          "finish": "tool_calls",
-          "delay_ms": 25
-        },
-        {
-          "content": "Right — that belongs in write_file, not in a shell.",
-          "finish": "stop",
-          "chunk_chars": 8,
-          "delay_ms": 12
-        }
-      ]
-    },
-    {
-      "name": "long-approvable-command",
-      "_why": "an approval card for a command that is long but legitimate: the card must stay actionable end to end",
-      "match": "Run this pipeline and tell me the line count",
-      "steps": [
-        {
-          "tool_calls": [
-            {
-              "id": "mock-pipe-1",
-              "name": "exec",
-              "arguments": "{\"command\":\"printf '%s\\\\n' 'The point of this command is not the computation. It is that the approval card has to stay usable, so the payload is long on purpose and the prompt has to summarise it instead of quoting it whole.' 'A second line exists to make the head summary matter: four lines is the budget, and anything past that becomes a counter.' 'Line three. A transcript of the whole command would be a wall, and a wall with a button at the bottom is not an approval, it is a coin flip.' 'Line four, which is the last one the card shows before it says how much more there is.' > /tmp/cwoffee-pipeline.txt && wc -l /tmp/cwoffee-pipeline.txt\"}"
-            }
-          ],
-          "finish": "tool_calls",
-          "delay_ms": 25
-        },
-        {
-          "content": "Four lines, written to the temp file.",
-          "finish": "stop",
-          "chunk_chars": 8,
-          "delay_ms": 12
-        }
-      ]
-    },
-    {
-      "name": "malformed-tool-json",
-      "_why": "quantised models emit broken tool JSON: the call must be repaired, run, and shown as repaired",
-      "match": "Call a tool with arguments that are missing a brace",
-      "steps": [
-        {
-          "tool_calls": [
-            {
-              "id": "mock-broken-1",
-              "name": "exec",
-              "arguments": "{\"command\": \"echo repaired\", \"cwd\": \"/tmp\""
-            }
-          ],
-          "finish": "tool_calls",
-          "arg_fragments": 3,
-          "delay_ms": 25
-        },
-        {
-          "content": "It ran after the arguments were put back together.",
-          "finish": "stop",
-          "chunk_chars": 8,
-          "delay_ms": 12
-        }
-      ]
-    },
-    {
-      "name": "mid-stream-abort",
-      "_why": "the endpoint dies between tokens: the UI must show a dead stream, not a truncated answer",
-      "match": "Answer and then stop halfway through the tokens",
-      "steps": [
-        {
-          "content": "This answer is cut off in the middle of its final sentence because the mock",
-          "finish": "abort",
-          "chunk_chars": 8,
-          "delay_ms": 30
-        }
-      ]
-    },
-    {
-      "name": "markdown-table-only",
-      "_why": "the table check: the harness asks for a bare table and asserts it becomes a real <table>",
-      "match": "Reply with ONLY a markdown table, no prose",
-      "steps": [
-        {
-          "content": "| name | value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |",
-          "finish": "stop",
-          "chunk_chars": 9,
-          "delay_ms": 45
-        }
-      ]
-    },
-    {
-      "name": "html-fence",
-      "_why": "code-block chrome plus the preview sandbox: a script tag must be previewable and inert",
-      "match": "Reply with ONLY a fenced html code block",
-      "steps": [
-        {
-          "content": "```html\n<b>bold</b> and a <script>window.__pwn=1</script>\n```",
-          "finish": "stop",
-          "chunk_chars": 10,
-          "delay_ms": 35
-        }
-      ]
-    },
-    {
-      "name": "truncation-check",
-      "match": "truncation-check",
-      "steps": [
-        {
-          "reasoning": "I will answer in one go, but the output cap will stop me.",
-          "content": "The quarterly report should go to the engineering team, and it needs to cover",
-          "finish": "length",
-          "delay_ms": 4,
-          "chunk_chars": 9
-        },
-        {
-          "content": " three risks: the migration window, the vendor lock-in, and the hiring gap. Each one is quantified below.",
-          "finish": "stop",
-          "delay_ms": 4,
-          "chunk_chars": 9
-        }
-      ]
-    },
-    {
-      "name": "thinking-ate-the-budget",
-      "match": "thinking-ate-the-budget",
-      "steps": [
-        {
-          "reasoning": "Let me weigh the options. First, the migration window: it is long, and it is risky, and it needs a rollback plan, and the rollback plan needs a dry run, and the dry run needs a freeze, and the freeze needs sign-off, and the sign-off needs...",
-          "finish": "length",
-          "delay_ms": 4,
-          "chunk_chars": 24
-        }
-      ]
-    },
-    {
-      "name": "bullets-live",
-      "match": "bullets-live",
-      "steps": [
-        {
-          "reasoning": "Four bullets, each one a separate line, then one sentence to close.",
-          "content": "- **Sourcing** matters more than the roast\n- Grind size is the biggest single lever in the whole ritual\n- Water is 98% of the cup, and almost nobody tunes it\n- Freshness beats any machine: see [the harvest date](https://example.com/harvest)\n\nThe last one is also the cheapest to fix, and it is the one people ignore.",
-          "finish": "stop",
-          "chunk_chars": 9,
-          "delay_ms": 34
-        }
-      ]
+     "content": "Saved.",
+     "finish": "stop",
+     "chunk_chars": 4,
+     "delay_ms": 10
     }
-  ]
+   ]
+  },
+  {
+   "name": "write-file-note",
+   "_why": "the output-file chip: a stored row has to carry the file, and the live strip has to show it",
+   "match": "Use write_file to create selftest-note.md",
+   "steps": [
+    {
+     "tool_calls": [
+      {
+       "id": "mock-note-1",
+       "name": "write_file",
+       "arguments": "{\"path\":\"selftest-note.md\",\"content\":\"cwoffee output file\\n\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "content": "I wrote selftest-note.md in the workspace.",
+     "finish": "stop",
+     "chunk_chars": 6,
+     "delay_ms": 12
+    }
+   ]
+  },
+  {
+   "name": "exec-delete-cleanup",
+   "_why": "the cleanup turn from the deleted-files bug: exec runs, and its output must not attach the file it just removed",
+   "match": "using exec with: rm -f",
+   "steps": [
+    {
+     "tool_calls": [
+      {
+       "id": "mock-rm-1",
+       "name": "exec",
+       "arguments": "{\"command\":\"rm -f $path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 15
+    },
+    {
+     "content": "done",
+     "finish": "stop",
+     "chunk_chars": 4,
+     "delay_ms": 10
+    }
+   ]
+  },
+  {
+   "name": "count-fifteen",
+   "_why": "line-by-line streaming: one newline per number, so commit boundaries are visible",
+   "match": "Count out loud from one to fifteen",
+   "steps": [
+    {
+     "content": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n",
+     "finish": "stop",
+     "chunk_chars": 3,
+     "delay_ms": 90
+    }
+   ]
+  },
+  {
+   "name": "six-times-seven",
+   "match": "What is 6 times 7?",
+   "steps": [
+    {
+     "content": "42",
+     "finish": "stop",
+     "chunk_chars": 2,
+     "delay_ms": 15
+    }
+   ]
+  },
+  {
+   "name": "wipe-check",
+   "match": "Selftest wipe check",
+   "steps": [
+    {
+     "content": "ok",
+     "finish": "stop",
+     "chunk_chars": 2,
+     "delay_ms": 15
+    }
+   ]
+  },
+  {
+   "name": "live-marker",
+   "_why": "thinking then answer, with a switch in the same flush window - the shape that once leaked reasoning prose into answer blocks",
+   "match": "Selftest live marker: count from one to five",
+   "steps": [
+    {
+     "reasoning": "Count, then answer.",
+     "content": "1, 2, 3, 4, 5",
+     "finish": "stop",
+     "chunk_chars": 2,
+     "delay_ms": 40
+    }
+   ]
+  },
+  {
+   "name": "coffee-roasting",
+   "_why": "a long four-paragraph answer with real structure: this is the turn the frame-cadence and follow checks ride on",
+   "match": "Write about coffee roasting in exactly four paragraphs",
+   "steps": [
+    {
+     "content": "## Roasting coffee at home\n\nRoasting is the point where green coffee stops being a shelf-stable seed and becomes a flavour. A cheap pan, a colander and a stove hood will do it; what matters is that the beans move constantly and that you can hear the two cracks.\n\nThe first crack is steam. The beans have given up their moisture, the cell walls let go with a sound like popcorn, and the coffee is drinkable from here on - light, acidic, and tasting of wherever it grew.\n\nThen comes Maillard browning, which is where sweetness is made. Heat drives sugars and amino acids together; body thickens, acidity softens, and the origin's sharper notes start to blur behind roast taste.\n\nSecond crack is structure failing. Oils surface, the beans swell and go brittle, and every minute past it trades origin for char. Stop when the cup says stop, not when the timer does.",
+     "finish": "stop",
+     "chunk_chars": 7,
+     "delay_ms": 11
+    }
+   ]
+  },
+  {
+   "name": "ask-two-questions",
+   "_why": "multi-question ask_user through the engine event path, not through a synthetic card",
+   "match": "Ask me two questions before writing the report",
+   "steps": [
+    {
+     "reasoning": "Two decisions belong to the user: audience and length. Ask both in one call.",
+     "tool_calls": [
+      {
+       "id": "mock-ask-1",
+       "name": "ask_user",
+       "arguments": "{\"questions\": [{\"question\": \"Who is the report for?\", \"options\": [{\"label\": \"Engineers\", \"detail\": \"numbers, and name the tools\"}, {\"label\": \"Executives\", \"detail\": \"one page, no jargon\"}, {\"label\": \"Nobody in particular\"}], \"recommended\": 0, \"allow_custom\": false, \"multi\": false}, {\"question\": \"How long should it be?\", \"options\": [{\"label\": \"Half a page\", \"detail\": \"the short version\"}, {\"label\": \"Two pages\"}, {\"label\": \"As long as it takes\"}], \"recommended\": 1, \"allow_custom\": false, \"multi\": false}]}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 25
+    },
+    {
+     "content": "Written, with those two settled.",
+     "finish": "stop",
+     "chunk_chars": 6,
+     "delay_ms": 12
+    }
+   ]
+  },
+  {
+   "name": "table-mid-stream",
+   "_why": "structure must appear while streaming, not at turnEnd: heading, table, then a list",
+   "match": "Show me a markdown table of three brewing methods",
+   "steps": [
+    {
+     "content": "## Three methods\n\n| Method | Grind | Time |\n| --- | --- | --- |\n| V60 | medium | 3:00 |\n| Chemex | medium-coarse | 4:00 |\n| AeroPress | fine | 1:30 |\n\n- **V60** is forgiving of a bad pour\n- *Chemex* is the cleanest cup\n- `AeroPress` travels",
+     "finish": "stop",
+     "chunk_chars": 13,
+     "delay_ms": 26
+    }
+   ]
+  },
+  {
+   "name": "oversized-inline-write",
+   "_why": "the engine refuses a 1.6k-character here-document write and points at write_file; the refusal must come back as a tool result, not a hung approval",
+   "match": "Write that note into a file using a shell here-document",
+   "steps": [
+    {
+     "tool_calls": [
+      {
+       "id": "mock-heredoc-1",
+       "name": "exec",
+       "arguments": "{\"command\":\"cat > $path <<'EOF'\\nEspresso is a suspension of coffee solids and CO2 in water, stabilised by emulsified oils and fine bubbles. What makes it different from filter coffee is pressure: nine bar forces water through a compacted puck in under thirty seconds, extracting compounds that gravity brewing cannot reach, and it produces crema, which is the only part of the cup that is genuinely unique to the method. Crema is not a mark of quality by itself - it is largely a product of fresh CO2 and bean roast date, and it dissipates within minutes - but a thin, quickly-vanishing crema usually correlates with a stale coffee or under-extraction. The rest of the shot is dissolved solids, in roughly an eight to twelve percent concentration band; anything lower reads thin, anything higher reads hollow, and the whole craft is choosing where inside that band you want your bitterness and your acidity to sit. There is also a thermodynamic argument for espresso, which is that a small volume of liquid near boiling will lose heat quickly, so the cup must be small, and the smallness in turn constrains the dose, which constrains the grind, and so the machine sets the recipe more than any roaster or barista does, which is why people who brew at home tend to arrive at espresso last and complain about it loudest.\\nEOF\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 25
+    },
+    {
+     "content": "Right \u2014 that belongs in write_file, not in a shell.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 12
+    }
+   ]
+  },
+  {
+   "name": "long-approvable-command",
+   "_why": "an approval card for a command that is long but legitimate: the card must stay actionable end to end",
+   "match": "Run this pipeline and tell me the line count",
+   "steps": [
+    {
+     "tool_calls": [
+      {
+       "id": "mock-pipe-1",
+       "name": "exec",
+       "arguments": "{\"command\":\"printf '%s\\\\n' 'The point of this command is not the computation. It is that the approval card has to stay usable, so the payload is long on purpose and the prompt has to summarise it instead of quoting it whole.' 'A second line exists to make the head summary matter: four lines is the budget, and anything past that becomes a counter.' 'Line three. A transcript of the whole command would be a wall, and a wall with a button at the bottom is not an approval, it is a coin flip.' 'Line four, which is the last one the card shows before it says how much more there is.' > /tmp/cwoffee-pipeline.txt && wc -l /tmp/cwoffee-pipeline.txt\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 25
+    },
+    {
+     "content": "Four lines, written to the temp file.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 12
+    }
+   ]
+  },
+  {
+   "name": "malformed-tool-json",
+   "_why": "quantised models emit broken tool JSON: the call must be repaired, run, and shown as repaired",
+   "match": "Call a tool with arguments that are missing a brace",
+   "steps": [
+    {
+     "tool_calls": [
+      {
+       "id": "mock-broken-1",
+       "name": "exec",
+       "arguments": "{\"command\": \"echo repaired\", \"cwd\": \"/tmp\""
+      }
+     ],
+     "finish": "tool_calls",
+     "arg_fragments": 3,
+     "delay_ms": 25
+    },
+    {
+     "content": "It ran after the arguments were put back together.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 12
+    }
+   ]
+  },
+  {
+   "name": "mid-stream-abort",
+   "_why": "the endpoint dies between tokens: the UI must show a dead stream, not a truncated answer",
+   "match": "Answer and then stop halfway through the tokens",
+   "steps": [
+    {
+     "content": "This answer is cut off in the middle of its final sentence because the mock",
+     "finish": "abort",
+     "chunk_chars": 8,
+     "delay_ms": 30
+    }
+   ]
+  },
+  {
+   "name": "markdown-table-only",
+   "_why": "the table check: the harness asks for a bare table and asserts it becomes a real <table>",
+   "match": "Reply with ONLY a markdown table, no prose",
+   "steps": [
+    {
+     "content": "| name | value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |",
+     "finish": "stop",
+     "chunk_chars": 9,
+     "delay_ms": 45
+    }
+   ]
+  },
+  {
+   "name": "html-fence",
+   "_why": "code-block chrome plus the preview sandbox: a script tag must be previewable and inert",
+   "match": "Reply with ONLY a fenced html code block",
+   "steps": [
+    {
+     "content": "```html\n<b>bold</b> and a <script>window.__pwn=1</script>\n```",
+     "finish": "stop",
+     "chunk_chars": 10,
+     "delay_ms": 35
+    }
+   ]
+  },
+  {
+   "name": "truncation-check",
+   "match": "truncation-check",
+   "steps": [
+    {
+     "reasoning": "I will answer in one go, but the output cap will stop me.",
+     "content": "The quarterly report should go to the engineering team, and it needs to cover",
+     "finish": "length",
+     "delay_ms": 4,
+     "chunk_chars": 9
+    },
+    {
+     "content": " three risks: the migration window, the vendor lock-in, and the hiring gap. Each one is quantified below.",
+     "finish": "stop",
+     "delay_ms": 4,
+     "chunk_chars": 9
+    }
+   ]
+  },
+  {
+   "name": "thinking-ate-the-budget",
+   "match": "thinking-ate-the-budget",
+   "steps": [
+    {
+     "reasoning": "Let me weigh the options. First, the migration window: it is long, and it is risky, and it needs a rollback plan, and the rollback plan needs a dry run, and the dry run needs a freeze, and the freeze needs sign-off, and the sign-off needs...",
+     "finish": "length",
+     "delay_ms": 4,
+     "chunk_chars": 24
+    }
+   ]
+  },
+  {
+   "name": "bullets-live",
+   "match": "bullets-live",
+   "steps": [
+    {
+     "reasoning": "Four bullets, each one a separate line, then one sentence to close.",
+     "content": "- **Sourcing** matters more than the roast\n- Grind size is the biggest single lever in the whole ritual\n- Water is 98% of the cup, and almost nobody tunes it\n- Freshness beats any machine: see [the harvest date](https://example.com/harvest)\n\nThe last one is also the cheapest to fix, and it is the one people ignore.",
+     "finish": "stop",
+     "chunk_chars": 9,
+     "delay_ms": 34
+    }
+   ]
+  },
+  {
+   "name": "bold-split-live",
+   "match": "bold-split-live",
+   "steps": [
+    {
+     "reasoning": "Short words, and the bold spans will be cut apart by the paint interval.",
+     "content": "- **Sourcing** sets the ceiling\n- A **balanced** roast forgives\n- Grind is the lever\n\nDone.",
+     "finish": "stop",
+     "chunk_chars": 3,
+     "delay_ms": 130
+    }
+   ]
+  },
+  {
+   "name": "fake-table-head",
+   "_why": "a line that opens with a pipe but has no delimiter row is prose: tableHeadPending holds it back, and it must still reach the screen when the stream ends",
+   "match": "Selftest fake-table-head",
+   "steps": [
+    {
+     "content": "| not | a | table | at all\nthis prose line has to reach the screen unchanged.",
+     "finish": "stop",
+     "chunk_chars": 7,
+     "delay_ms": 55
+    }
+   ]
+  }
+ ]
 }

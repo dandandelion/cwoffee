@@ -4,7 +4,7 @@
  * The security cases are the point. Model output quotes fetched web pages, so
  * anything that reaches this function is untrusted input from the internet.
  */
-import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, needsMarkdown, firstBlockEnd, firstItemEnd, listMarker, maybeListMarker, fenceOpen, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS, InlineStream } from '../src/lib/markdown.ts'
+import { renderMarkdown, escapeHtml, LiveMarkdown, splitBlocks, splitCommitted, needsMarkdown, firstBlockEnd, firstItemEnd, listMarker, maybeListMarker, tableHeadEnd, tableHeadPending, tableRowEnd, tableRowHtml, tableSkeletonHtml, fenceOpen, revealWords, revealDuration, REVEAL_MIN_MS, REVEAL_MAX_MS, InlineStream } from '../src/lib/markdown.ts'
 
 let failed = 0
 function eq(name: string, got: string, want: string) {
@@ -551,4 +551,31 @@ console.log('markdown: all checks passed')
     firstItemEnd('- one\n- ') === 6,
     `end=${firstItemEnd('- one\n- ')}`,
   )
+}
+
+// --- a table is a table once the delimiter row lands ------------------------
+{
+  const head = '| Method | Grind |\n| --- | --- |\n| V60 | medium |'
+  ok('the header plus delimiter is the moment the shape is known', tableHeadEnd(head) === 33, `end=${tableHeadEnd(head)}`)
+  ok('a delimiter row that has not finished arriving is not a table yet', tableHeadEnd('| A | B |\n| --- | --- |') === null)
+  ok('"a | b" in prose is not a table', tableHeadEnd('a | b\nno delimiter here\n') === null)
+  ok('a complete row ends at its newline', tableRowEnd('| 1 | 2 |\nmore') === 10, `end=${tableRowEnd('| 1 | 2 |\nmore')}`)
+  ok('a row still being typed is not a row', tableRowEnd('| 1 | 2 |') === null)
+  ok('a blank line is not a row', tableRowEnd('\nprose') === null)
+  const skel = tableSkeletonHtml('| A | B |', '| --- | ---: |')
+  ok('the skeleton has the header and an empty body', skel.includes('<th>A</th>') && skel.includes('<tbody></tbody>'), skel)
+  const row = tableRowHtml('| --- | ---: |', '| x |')
+  ok('a ragged row is padded, not dropped', row === '<tr><td>x</td><td class="ta-right"></td></tr>', row)
+  const cell = tableRowHtml('| --- | --- |', '| **b** & <i> |')
+  ok('cells escape html and parse inline markup', cell.includes('<strong>b</strong>') && cell.includes('&lt;i&gt;'), cell)
+  ok('an escaped pipe stays a pipe', tableRowHtml('| --- |', '| a \\| b |').includes('a | b'))
+}
+
+// --- a header line is not prose, and not yet a table ------------------------
+{
+  ok('a header with its delimiter still arriving waits', tableHeadPending('| a | b |\n| --') === true)
+  ok('a header on its own waits for the next line', tableHeadPending('| a | b |') === true)
+  ok('a complete delimiter row is a table, not a wait', tableHeadPending('| a | b |\n| --- | --- |\n') === false)
+  ok('a second line of prose ends the debate', tableHeadPending('| a | b |\nprose here\n') === false)
+  ok('prose is never a pending table', tableHeadPending('plain prose\n') === false)
 }

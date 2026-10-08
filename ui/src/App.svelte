@@ -850,7 +850,11 @@
         ? 'unknown'
         : gw.running
           ? `:${gw.port} · ${gw.clients} device${gw.clients === 1 ? '' : 's'}`
-          : 'off',
+          : // "off" is true but useless when the reason is a port someone else
+            // holds; the reason is the whole message.
+            gw.note && gw.note !== 'off'
+            ? gw.note
+            : 'off',
   )
   const gwDot = $derived(
     transportKind !== 'tauri' ? 'live' : gw?.running ? 'live' : 'off',
@@ -2239,6 +2243,53 @@
         )
         return ok
       }
+      // ---- what the footer claimed before anyone clicked it ------------------
+      // The toolbar states two facts the window does not need to start a turn:
+      // which search provider is live, and whether the gateway is up. Both used to
+      // be fetched only when their popover opened, so the pill printed "unknown"
+      // until it was interrogated - and for the gateway, an "off" that a phone
+      // contradicts is a claim about a network-exposed agent.
+      {
+        const footVal = (label: string) => {
+          const b = [...document.querySelectorAll('footer button.fbtn')].find(
+            (x) => x.querySelector('.flbl')?.textContent?.trim() === label,
+          )
+          return (b?.querySelector('.fsum')?.textContent ?? '<no control>').trim()
+        }
+        const searchVal = await waitFor(
+          'the footer to state the search provider',
+          () => footVal('search') !== 'unknown' && footVal('search') !== '',
+          4000,
+        )
+          ? footVal('search')
+          : footVal('search')
+        const view = await invoke<{ backend: string }>('search_settings')
+        const allowed =
+          view.backend === 'auto'
+            ? ['searxng', 'no container runtime']
+            : view.backend === 'searxng'
+              ? ['searxng']
+              : ['duckduckgo']
+        if (!allowed.some((a) => searchVal.startsWith(a)))
+          fail(
+            `the search control says "${searchVal}" before anyone opened it, while the engine says ` +
+              `backend=${view.backend} (no boot fetch, so the toolbar is a placeholder)`,
+          )
+        const g = await invoke<{ running: boolean; port: number; note: string }>('gateway_status')
+        const gwVal = footVal('gateway')
+        if (gwVal === 'unknown' || gwVal === '<no control>')
+          fail(`the gateway control says "${gwVal}" while the engine reports running=${g.running}`)
+        else if (g.running && !gwVal.includes(String(g.port)))
+          fail(`the gateway control says "${gwVal}" while it is serving on :${g.port}`)
+        else if (!g.running && !gwVal.startsWith('off'))
+          fail(`the gateway control says "${gwVal}" while it is not running`)
+        else
+          pageLog(
+            `footer truth ok (search "${searchVal}" for backend=${view.backend}, ` +
+              `gateway "${gwVal}" running=${g.running})`,
+          )
+      }
+
       // A session with messages, not merely the first row. An empty session keeps the
       // empty screen up, the scroller stays `display: none`, and every rect still
       // reads 0: opening "a session" is not the premise, opening one that renders is.
@@ -3299,7 +3350,11 @@
         } else {
           await new Promise((r) => setTimeout(r, 400))
 
-          const table = document.querySelector('.transcript table')
+          // Scope to the answer that just streamed. A document-wide query passes
+          // this check on a table left over from an earlier turn, which is how a
+          // render bug in the newest answer can be hidden by an older one.
+          const lastAns = [...document.querySelectorAll('.blk-answer .blk-body')].pop()
+          const table = lastAns?.querySelector('table') ?? null
           if (!table) {
             // Say which side failed. This check has fired with the table sitting
             // correctly in the store and absent from the DOM, and those are two
@@ -4125,6 +4180,87 @@
           }
         }
 
+        // (a3) an inline construct that straddles two paints
+        // The real model streams roughly a token at a time and the UI paints about
+        // every 120ms, so a `**bold**` span almost always arrives across two or three
+        // paints. The mock's chunking used to be coarser than the paint interval,
+        // which is why every inline check passed while the user saw literal asterisks.
+        {
+          const before = await turnCount()
+          let stopped = false
+          let starSeen = ''
+          let strongWhileStreaming = 0
+          const sampler = (async () => {
+            while (!stopped) {
+              const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+              const body = all[all.length - 1]
+              if (body) {
+                const t = body.textContent ?? ''
+                if (!starSeen && t.includes('*')) starSeen = t.slice(0, 70)
+                if (body.querySelectorAll('strong').length > 0) strongWhileStreaming += 1
+              }
+              await new Promise((r) => setTimeout(r, 40))
+            }
+          })()
+          await invoke('start_turn', {
+            text: 'Selftest bold-split-live: three bullets, two bold words, one word after.',
+            session: target.id,
+          })
+          const done = await waitTurnDone(before, 60000)
+          stopped = true
+          await sampler
+          const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+          const body = all[all.length - 1]
+          const text = body ? body.textContent ?? '' : ''
+          if (!done) fail('the scripted bold turn never finished')
+          else if (!body) fail('the scripted bold turn left no answer block')
+          else if (starSeen)
+            fail(
+              `a literal asterisk reached the screen while a bold span was being written: "${starSeen}" ` +
+                `- the inline stream and the DOM host disagreed about where the next word goes`,
+            )
+          else if (body.querySelectorAll('strong').length !== 2)
+            fail(`expected 2 bold spans, found ${body.querySelectorAll('strong').length}`)
+          else if (!text.includes('Sourcing sets the ceiling'))
+            fail(`characters were dropped from a split construct: "${text.slice(0, 120)}"`)
+          else if (strongWhileStreaming < 3)
+            fail(
+              `bold appeared in only ${strongWhileStreaming} samples during the stream, i.e. only at the end - ` +
+                'a construct should become bold as it closes, not when the block commits',
+            )
+          else
+            pageLog(
+              `scripted bold ok (2 spans, no literal asterisks, bold present in ${strongWhileStreaming} mid-stream samples, ` +
+                `nothing dropped from a construct split across paints)`,
+            )
+        }
+
+        // (z) a line that starts like a table and is not one still arrives
+        {
+          // Same session, same wait primitive as every other turn in this file.
+          // A store-counter poll returns before the page has finished the turn, and
+          // the next check then streams into a transcript whose previous block had
+          // not closed yet - which measures the harness, not the renderer.
+          const before = await turnCount()
+          await invoke('start_turn', {
+            text: 'Selftest fake-table-head: one line starting with a pipe, then one prose line.',
+            session: target.id,
+          }).catch((e) => pageLog(`selftest note: fake-table-head turn failed: ${e}`))
+          if (!(await waitTurnDone(before)))
+            fail('the fake-table-head turn never finished')
+          const bodies = [...document.querySelectorAll('.blk-answer .blk-body')]
+          const body = bodies[bodies.length - 1]
+          const said = (body?.textContent ?? '').replace(/\s+/g, ' ')
+          if (!said.includes('has to reach the screen unchanged'))
+            fail(
+              `a pipe-led line with no delimiter row lost its text: body='${said.slice(0, 120)}' - ` +
+                `tableHeadPending waits for the delimiter row, and waiting is only allowed to delay, never to drop`,
+            )
+          else if (body?.querySelector('table'))
+            fail('a line with no delimiter row was rendered as a table')
+          else pageLog(`fake table head ok (held back while ambiguous, then painted: "${said.slice(0, 44)}...")`)
+        }
+
         // (a) structure while the tokens arrive, not when they stop
         {
           const before = await turnCount()
@@ -4132,15 +4268,30 @@
           let headingAt: number | null = null
           let tableAt: number | null = null
           let listAt: number | null = null
+          const rowCounts: number[] = []
+          // When structure arrives late, the useful question is what the body held
+          // while the tokens arrived. Keep a short ring of that, so a failure names
+          // the shape on screen instead of only the symptom.
+          const trace: string[] & { lastTick?: number } = [] as string[] & { lastTick?: number }
+          const tTrace = performance.now()
           const sampler = (async () => {
             while (!stopped) {
               const all = [...document.querySelectorAll('.blk-answer .blk-body')]
               const body = all[all.length - 1]
               if (body) {
                 const now = performance.now()
+                if (now - (trace.lastTick ?? 0) > 150) {
+                  trace.lastTick = now
+                  trace.push(
+                    `${Math.round(now - tTrace)}ms [${[...body.children].map((c) => c.tagName).join(' ')}] ` +
+                      (body.innerHTML ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 44),
+                  )
+                  if (trace.length > 40) trace.shift()
+                }
                 if (headingAt === null && body.querySelector('h1, h2, h3')) headingAt = now
                 if (tableAt === null && body.querySelector('table')) tableAt = now
                 if (listAt === null && body.querySelector('li')) listAt = now
+                rowCounts.push(body.querySelectorAll('tbody tr').length)
               }
               await new Promise((r) => setTimeout(r, 40))
             }
@@ -4162,11 +4313,22 @@
           const ago = (t: number | null) => (t === null ? -1 : Math.round(endedAt - t))
           if (!done) fail('the scripted table turn never finished')
           else if (!body) fail('the scripted table turn left no answer block')
-          else if (headingAt === null) fail('the heading never became a heading')
+          else if (headingAt === null)
+            fail(`the heading never became a heading :: ${trace.slice(-8).join(' :: ')}`)
           else if (tableAt === null) fail('the table never became a table; the answer stayed text')
           else if (ago(tableAt) < 60)
             fail(`the table only appeared ${ago(tableAt)}ms before turnEnd - that is at turnEnd, not during`)
           else if (rows !== 4) fail(`the table has ${rows} rows (header counted), expected 4`)
+          else if (
+            (() => {
+              const running = rowCounts.slice(0, Math.max(0, rowCounts.length - 1))
+              return running.length ? Math.max(...running) : 0
+            })() < 2
+          )
+            fail(
+              `only ${Math.max(...rowCounts.slice(0, -1))} of 3 table rows existed while the stream was still ` +
+                `running (counts ${rowCounts.slice(0, 14).join(',')}) - the table waited for its block to end`,
+            )
           else if (items !== 3)
             fail(
               `the bullet list has ${items} items, expected 3; ` +
@@ -4176,6 +4338,7 @@
           else
             pageLog(
               `scripted structure ok (heading ${ago(headingAt)}ms and table ${ago(tableAt)}ms before turnEnd, ` +
+                `rows arrived ${[...new Set(rowCounts)].join('->')} during the stream, ` +
                 `${rows - 1} data rows, ${items} list items)`,
             )
         }
@@ -6046,7 +6209,16 @@
     if (!booted) {
       // The independent fetches run concurrently. They used to be awaited one
       // after another, and over a VPN each one pays a full round trip.
-      const fetches: Promise<unknown>[] = [refreshState(), loadSessions(), loadModels()]
+      // The footer reports which search provider is live and whether the gateway is
+    // up. Both were read only when their popover opened, so the toolbar showed
+    // "unknown" until the user clicked it - a control that lies about the current
+    // state until interrogated. Fetch them with everything else.
+    const fetches: Promise<unknown>[] = [
+      refreshState(),
+      loadSessions(),
+      loadModels(),
+      loadWebSearch(),
+    ]
       if (transportKind === 'tauri') {
         // gpu_report is desktop-only and always errors over the gateway, so asking
         // for one there is a guaranteed-failed round trip in the middle of boot.

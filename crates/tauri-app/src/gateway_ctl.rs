@@ -37,6 +37,10 @@ struct State {
     /// Set between "clicked" and "bound", so a double click cannot spawn two
     /// accept loops on the same port.
     starting: bool,
+    /// Why the last start attempt failed. The footer's "off" is true but useless
+    /// when the reason is that another Cwoffee already holds the port - which is
+    /// exactly when a phone can reach a gateway this window says nothing about.
+    last_error: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -73,6 +77,7 @@ impl GatewayCtl {
                 watch: None,
                 token_source: "none".into(),
                 starting: false,
+                last_error: None,
             }),
         }
     }
@@ -118,9 +123,11 @@ impl GatewayCtl {
                 st.drive = drive;
                 st.watch = watch;
                 st.token_source = token_source.into();
+                st.last_error = None;
             }
             Err(e) => {
                 st.task = None;
+                st.last_error = Some(e.clone());
                 drop(st);
                 return Err(e);
             }
@@ -220,15 +227,22 @@ impl GatewayCtl {
             token_source: st.token_source.clone(),
             urls,
             tls: false,
-            note: if running && lan {
-                "plain http: anyone who can read the link can drive this agent"
-                    .into()
-            } else if running {
-                "loopback only".into()
-            } else {
-                "off".into()
-            },
+            note: note_for(running, lan, st.last_error.as_deref()),
         }
+    }
+}
+
+/// One line that tells the user what the gateway state *means*, including why a
+/// start failed. Split out so the wording is testable without a live server.
+fn note_for(running: bool, lan: bool, last_error: Option<&str>) -> String {
+    if running && lan {
+        "plain http: anyone who can read the link can drive this agent".into()
+    } else if running {
+        "loopback only".into()
+    } else if let Some(e) = last_error {
+        format!("off - {e}")
+    } else {
+        "off".into()
     }
 }
 
@@ -350,6 +364,21 @@ mod tests {
         assert_eq!(a.len(), 24);
         assert_ne!(a, b, "two draws were identical");
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn a_failed_start_says_why_and_a_working_one_says_where() {
+        // "off" alone sent a user to me with a phone connected to a gateway this
+        // window insisted was off: another instance already held the port.
+        assert_eq!(note_for(false, false, None), "off");
+        assert_eq!(
+            note_for(false, false, Some("Address already in use (os error 98)")),
+            "off - Address already in use (os error 98)"
+        );
+        assert_eq!(note_for(true, false, None), "loopback only");
+        assert!(note_for(true, true, None).contains("plain http"));
+        // A running gateway outranks an older failure.
+        assert_eq!(note_for(true, false, Some("earlier")), "loopback only");
     }
 
     #[test]
