@@ -37,6 +37,17 @@ approval_timeout_secs = 300
 # instead of ending mid-sentence.
 # max_output_tokens = 8192
 
+# How many tool-call round-trips one turn may take. Unset or 0 means no cap.
+#
+# This used to be a hardcoded 14, and that number was not a runaway guard - it was
+# a work budget, and it bit real tasks: a session asked to read an 8-sheet workbook
+# used all 14 iterations on sheet_read calls, then had to summarise work it had not
+# finished. With no cap a runaway model is still bounded in practice (the context
+# budget compacts the history, repeated identical calls are visible in the
+# transcript, Cancel works at any time), and the transcript says so once at 20 tool
+# calls. Set a number when you want a hard stop instead:
+# max_tool_iters = 40
+
 # Sampling. Every key is optional, and a key you do not write is not sent at all:
 # the server's own default then decides, which is the right answer for an endpoint
 # somebody else tuned. Cwoffee deliberately ships no defaults here.

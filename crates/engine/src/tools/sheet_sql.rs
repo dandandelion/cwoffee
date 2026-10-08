@@ -105,7 +105,11 @@ impl Tool for SheetQueryTool {
                 },
                 "header": {
                     "type": "boolean",
-                    "description": "Row 1 holds the column names (default true). false names them c1..cN"
+                    "description": "Use a header row for the column names (default true). false names every column c1..cN"
+                },
+                "header_row": {
+                    "type": "integer",
+                    "description": "Sheet row holding the column names, 1-based. Default: detected - a real workbook opens with a title block, so row 1 is often not the header. Rows above it are titles, not records"
                 },
                 "max_rows": {
                     "type": "integer",
@@ -178,7 +182,18 @@ impl Tool for SheetQueryTool {
             },
             _ => None,
         };
-        let header = args.get("header").and_then(Value::as_bool).unwrap_or(true);
+        let header = match args.get("header_row").and_then(Value::as_u64) {
+            Some(n) if n >= 1 => Header::Explicit((n - 1) as usize),
+            Some(n) => {
+                return ToolResult::err(format!(
+                    "sheet_query: header_row {n} is not a sheet row; rows start at 1"
+                ))
+            }
+            None => match args.get("header").and_then(Value::as_bool) {
+                Some(false) => Header::None,
+                _ => Header::Auto,
+            },
+        };
         let max_rows = args
             .get("max_rows")
             .and_then(Value::as_u64)
@@ -293,6 +308,9 @@ impl Tool for SheetQueryTool {
             "# {rel} [{:?}] -> t: {} data rows x {} columns (rownum = the row's number in the sheet)\n",
             loaded.sheet, rows_loaded, shape.names.len()
         ));
+        if !shape.header_note.is_empty() {
+            out.push_str(&shape.header_note);
+        }
         out.push_str(&format!("# columns: rownum | {}\n", shape.names.join(" | ")));
         if !loaded.note.is_empty() {
             out.push_str(&format!("# {}\n", loaded.note));
@@ -495,6 +513,80 @@ enum Kind {
     Text,
 }
 
+/// How the column names were chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Header {
+    /// Pick the row that looks like a header (see `pick_header_row`).
+    Auto,
+    /// A sheet row the caller named, stored 0-based like `Loaded::rows`.
+    Explicit(usize),
+    /// No header row: columns are `c1..cN` and every row is data.
+    None,
+}
+
+/// Which row holds the column names.
+///
+/// Real spreadsheets open with a title block, not a header: row 1
+/// "BURGOS ELEMENTARY SCHOOL", row 2 the treasurer's name, row 3 the actual
+/// `DATE | DESCRIPTION | CATEGORY | INCOME | EXPENSES`. Taking the first non-empty
+/// row named the columns `burgos_elementary_school`, `c2`, `c3` - which made a tool
+/// meant to stop models writing their own parser unusable on precisely the
+/// workbooks that need it. So score the early rows: a header is wide, it is text
+/// rather than numbers, its names are distinct, and data follows it.
+fn pick_header_row(rows: &BTreeMap<usize, BTreeMap<usize, String>>, cols: &[usize]) -> Option<usize> {
+    let mut best: Option<(f64, usize)> = None;
+    for (idx, (row, cells)) in rows.iter().enumerate() {
+        // Only the early rows can be a header; scanning all of them costs nothing
+        // but invites a data row full of text to win.
+        if idx >= 20 {
+            break;
+        }
+        let filled: Vec<&String> = cols
+            .iter()
+            .filter_map(|c| cells.get(c))
+            .filter(|v| !v.trim().is_empty())
+            .collect();
+        if filled.len() < 2 {
+            continue;
+        }
+        let ratio = filled.len() as f64 / cols.len().max(1) as f64;
+        if ratio < 0.34 {
+            continue;
+        }
+        let numeric = filled
+            .iter()
+            .filter(|v| v.trim().parse::<f64>().is_ok())
+            .count() as f64;
+        let texty = 1.0 - numeric / filled.len() as f64;
+        let mut seen: Vec<String> = Vec::new();
+        for v in &filled {
+            let k = v.trim().to_ascii_lowercase();
+            if !seen.iter().any(|s| s == &k) {
+                seen.push(k);
+            }
+        }
+        let distinct = seen.len() as f64 / filled.len() as f64;
+        let follows = rows
+            .range((std::ops::Bound::Excluded(*row), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(_, next)| {
+                if cols.iter().any(|c| next.get(c).map(|v| !v.trim().is_empty()).unwrap_or(false)) {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        let score = 1.6 * ratio + 1.6 * texty + 0.4 * distinct + 0.5 * follows;
+        // Higher wins; on a tie the earlier row does, because a sheet rarely has
+        // two plausible headers and the first is the one the author meant.
+        if best.map(|(b, _)| score > b + 1e-9).unwrap_or(true) {
+            best = Some((score, *row));
+        }
+    }
+    best.map(|(_, r)| r)
+}
+
 /// The table shape: one column per sheet column, named from row 1 when there is
 /// one. Names are normalised (`Unit Cost` -> `unit_cost`) because a model quoting
 /// `"Retail Price"` correctly on every call is a worse bet than a name it can type.
@@ -506,11 +598,15 @@ struct Shape {
     /// it in adds a phantom record, and a `COUNT(*)` that includes the header is
     /// off by one in a way that looks like the file's fault.
     header_row: Option<usize>,
+    /// Rows above the header: a title block, not records. They are not loaded, and
+    /// the output says so, because silently dropping rows is worse than naming it.
+    skipped_above: Vec<usize>,
     blank_headers: bool,
+    header_note: String,
 }
 
 impl Shape {
-    fn build(loaded: &Loaded, header: bool) -> Result<Shape, String> {
+    fn build(loaded: &Loaded, header: Header) -> Result<Shape, String> {
         if loaded.max_col + 1 - loaded.min_col > MAX_COL {
             return Err(format!(
                 "this sheet spans more than {MAX_COL} columns; use range to pick some"
@@ -524,17 +620,23 @@ impl Shape {
                 cols.len()
             ));
         }
-        // Header row: the first row that actually says something.
-        let header_row = if header {
-            loaded.rows.iter().find_map(|(r, m)| {
-                if m.values().any(|v| !v.trim().is_empty()) {
-                    Some(*r)
+        // Which row names the columns. `Auto` scores the early rows rather than
+        // trusting row 1, because row 1 of a real workbook is usually a title.
+        let header_row = match header {
+            Header::None => None,
+            Header::Explicit(r) => {
+                if loaded.rows.contains_key(&r) {
+                    Some(r)
                 } else {
-                    None
+                    return Err(format!(
+                        "header_row {}: that sheet row has no cells. first row with content: row {}",
+                        r + 1,
+                        loaded.rows.keys().next().copied().map(|k| k + 1).unwrap_or(0)
+                    ));
                 }
-            })
-        } else {
-            None
+            }
+            Header::Auto => pick_header_row(&loaded.rows, &cols)
+                .or_else(|| loaded.rows.iter().find_map(|(r, m)| (!m.is_empty()).then_some(*r))),
         };
         let mut names = Vec::with_capacity(cols.len());
         let mut seen: Vec<String> = Vec::new();
@@ -557,22 +659,56 @@ impl Shape {
             seen.push(name.clone());
             names.push(name);
         }
+        // Anything above the header is a title or a label, not a record: leaving it
+        // in puts "BURGOS ELEMENTARY SCHOOL" in a GROUP BY and adds 2 to COUNT(*).
+        let skipped_above: Vec<usize> = header_row
+            .map(|h| loaded.rows.keys().copied().filter(|r| *r < h).collect())
+            .unwrap_or_default();
         let data: Vec<usize> = loaded
             .rows
             .keys()
             .copied()
-            .filter(|r| Some(*r) != header_row)
+            .filter(|r| Some(*r) != header_row && !skipped_above.contains(r))
             .collect();
         let kinds = cols
             .iter()
             .map(|c| sample_kind(&loaded.rows, &data, *c))
             .collect();
+        let header_note = match (header, header_row) {
+            (Header::Auto, Some(h)) => {
+                let label: Vec<String> = cols
+                    .iter()
+                    .map(|c| {
+                        loaded
+                            .rows
+                            .get(&h)
+                            .and_then(|m| m.get(c))
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| "·".into())
+                    })
+                    .collect();
+                let mut note = format!("# header: sheet row {} -> {}\n", h + 1, label.join(" | "));
+                let skipped = loaded.rows.keys().copied().filter(|r| *r < h).count();
+                if skipped > 0 {
+                    note.push_str(&format!(
+                        "# note: rows 1-{skipped} sit above the header (titles, names, dates) so they are not rows of t.                          If they are data, pass header_row=1; if you only want part of the sheet, pass range.\n"
+                    ));
+                }
+                note
+            }
+            (Header::Auto, None) => String::new(),
+            (Header::Explicit(h), _) => format!("# header: sheet row {} as you specified\n", h + 1),
+            (Header::None, _) => "# header: none, so columns are c1..cN and every row is data\n".to_string(),
+        };
         Ok(Shape {
             names,
             cols,
             kinds,
             header_row,
+            skipped_above,
             blank_headers,
+            header_note,
         })
     }
 
@@ -599,7 +735,7 @@ impl Shape {
         let mut stmt = conn.prepare(&sql)?;
         let mut n = 0usize;
         for (row, cells) in &loaded.rows {
-            if Some(*row) == self.header_row {
+            if Some(*row) == self.header_row || self.skipped_above.contains(row) {
                 continue;
             }
             let mut vals: Vec<SqlValue> = Vec::with_capacity(self.names.len() + 1);
@@ -1041,5 +1177,155 @@ mod tests {
         .await;
         assert!(!r.ok, "a cartesian product over 400 rows ran to completion:\n{}", why(&r));
         assert!(why(&r).contains("stopped"), "{}", why(&r));
+    }
+
+    /// Write a small package whose first rows are a **title block**, the way school
+    /// and office workbooks actually look: row 1 the institution, row 2 the person
+    /// in charge, row 3 the header, rows 4+ the ledger.
+    fn titled_workbook(path: &Path) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(CompressionMethod::Stored);
+        let add = |zw: &mut zip::ZipWriter<std::fs::File>, name: &str, body: &str| {
+            zw.start_file(name, opts).unwrap();
+            use std::io::Write;
+            zw.write_all(body.as_bytes()).unwrap();
+        };
+        add(
+            &mut zw,
+            "xl/workbook.xml",
+            r#"<?xml version="1.0"?><workbook><sheets><sheet name="Local Fund " sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        );
+        add(
+            &mut zw,
+            "xl/_rels/workbook.xml.rels",
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+        );
+        let s = |col: &str, r: usize, v: &str| {
+            format!(r#"<c r="{col}{r}" t="inlineStr"><is><t>{v}</t></is></c>"#)
+        };
+        let n = |col: &str, r: usize, v: f64| format!(r#"<c r="{col}{r}"><v>{v}</v></c>"#);
+        let sheet = format!(
+            r#"<?xml version="1.0"?><worksheet><sheetData>
+<row r="1">{a1}</row>
+<row r="2">{a2}{b2}</row>
+<row r="3">{a3}{b3}{c3}{d3}{e3}</row>
+<row r="4">{a4}{b4}{c4}{d4}</row>
+<row r="5">{a5}{b5}{c5}{d5}</row>
+<row r="6">{a6}{b6}{c6}{d6}</row>
+</sheetData></worksheet>"#,
+            a1 = s("A", 1, "BURGOS ELEMENTARY SCHOOL"),
+            a2 = s("A", 2, "Treasurer:"),
+            b2 = s("B", 2, "MERLY R. BAUTO"),
+            a3 = s("A", 3, "DATE"),
+            b3 = s("B", 3, "DESCRIPTION"),
+            c3 = s("C", 3, "CATEGORY"),
+            d3 = s("D", 3, "INCOME (In)"),
+            e3 = s("E", 3, "Expenses (Ex)"),
+            a4 = s("A", 4, "2024-09-06"),
+            b4 = s("B", 4, "Starting Balance"),
+            c4 = s("C", 4, "Opening"),
+            d4 = n("D", 4, 1000.0),
+            a5 = s("A", 5, "2024-09-09"),
+            b5 = s("B", 5, "Books"),
+            c5 = s("C", 5, "MOOE"),
+            d5 = n("D", 5, 250.0),
+            a6 = s("A", 6, "2024-09-11"),
+            b6 = s("B", 6, "Snacks"),
+            c6 = s("C", 6, "MOOE"),
+            d6 = n("D", 6, 120.0),
+        );
+        add(&mut zw, "xl/worksheets/sheet1.xml", &sheet);
+        zw.finish().unwrap();
+    }
+
+    /// The failure that made `sheet_query` useless on a real workbook: its header
+    /// was row 3, the detector used row 1, and the column names became
+    /// `burgos_elementary_school`, `c2`, `c3` - so the model gave up on the tool and
+    /// unzipped the package instead.
+    #[tokio::test]
+    async fn a_header_below_a_title_block_is_found_and_the_title_is_not_a_record() {
+        let d = tmp("titled");
+        let xlsx = d.join("cashflow.xlsx");
+        titled_workbook(&xlsx);
+        let ctx = ToolCtx {
+            workspace: d.clone(),
+            ..Default::default()
+        };
+        let r = call(
+            &ctx,
+            json!({"path": "cashflow.xlsx", "query": "SELECT category, SUM(income_in) AS income, COUNT(*) AS n FROM t GROUP BY category ORDER BY income DESC"}),
+        )
+        .await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        // The note quotes the sheet's own header text; the column list is the
+        // normalised form a query has to type.
+        assert!(
+            out.contains("# header: sheet row 3 -> DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex)"),
+            "the tool must say which row it used: {out}"
+        );
+        assert!(
+            out.contains("# columns: rownum | date | description | category | income_in | expenses_ex"),
+            "the queryable names must be shown: {out}"
+        );
+        assert!(
+            out.contains("rows 1-2 sit above the header"),
+            "skipping rows must be stated, not silent: {out}"
+        );
+        // MOOE 370 over two rows, Opening 1000 over one - and no phantom row for
+        // the school name, which is what a title row becomes if it is loaded.
+        assert!(out.contains("MOOE\t370\t2"), "{out}");
+        assert!(out.contains("Opening\t1000\t1"), "{out}");
+        assert!(!out.to_lowercase().contains("burgos"), "the title block leaked into the result: {out}");
+    }
+
+    #[tokio::test]
+    async fn header_row_and_header_false_are_honoured_exactly_as_said() {
+        let d = tmp("explicit");
+        let xlsx = d.join("cashflow.xlsx");
+        titled_workbook(&xlsx);
+        let ctx = ToolCtx {
+            workspace: d.clone(),
+            ..Default::default()
+        };
+
+        // Named by the caller: row 1, which is the title. The tool obeys, says it
+        // obeyed, and the title becomes the first column's name.
+        let r = call(
+            &ctx,
+            json!({"path": "cashflow.xlsx", "header_row": 1, "query": "SELECT COUNT(*) AS n FROM t"}),
+        )
+        .await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(out.contains("as you specified"), "{out}");
+        assert!(out.contains("burgos_elementary_school"), "{out}");
+        // Every row is data now, and the count says so: 5 rows, not 3.
+        assert!(out.contains("5"), "header_row=1 should keep every row: {out}");
+
+        // No header at all: c1..cN and nothing dropped.
+        let r = call(
+            &ctx,
+            json!({"path": "cashflow.xlsx", "header": false, "query": "SELECT COUNT(*) AS n FROM t"}),
+        )
+        .await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(out.contains("# header: none"), "{out}");
+        assert!(out.contains("c1 | c2 | c3 | c4 | c5"), "{out}");
+        assert!(out.contains("6"), "header:false must load all 6 rows: {out}");
+
+        // A row that does not exist is an error with the first real row in it, not a
+        // silent fallback to a guess.
+        let r = call(
+            &ctx,
+            json!({"path": "cashflow.xlsx", "header_row": 99, "query": "SELECT 1"}),
+        )
+        .await;
+        let out = why(&r);
+        assert!(!r.ok, "header_row 99 must not be accepted quietly");
+        assert!(out.contains("row 1"), "{out}");
     }
 }

@@ -4370,6 +4370,91 @@
             )
         }
 
+        // (a7) a header below a title block is still a header
+        //
+        // The cash-flow workbook the user actually handed the model opens with
+        // "BURGOS ELEMENTARY SCHOOL" in row 1 and the treasurer's name in row 2;
+        // the header is row 3. Naming columns from row 1 made `sheet_query` return
+        // `burgos_elementary_school | c2 | c3`, i.e. unusable, which is how a model
+        // ends up unzipping an .xlsx in a shell. So the detector scores rows, and
+        // this check makes the tool say which row it used.
+        {
+          const before = await turnCount()
+          const ws = (hostState?.workspace ?? '').replace(/\/+$/, '')
+          const file = `${ws}/selftest-titled.csv`
+          if (!ws) fail('the self-test host has no workspace, so the titled-sheet fixture path is unknown')
+          await invoke('start_turn', {
+            text:
+              `Selftest titled-sheet: write ${file} with a school name on the first line, a ` +
+              'treasurer on the second, then a DATE,DESCRIPTION,INCOME header and two data rows, ' +
+              'then total INCOME by description in one query.',
+            session: target.id,
+          }).catch((e) => pageLog(`selftest note: titled-sheet turn failed: ${e}`))
+          const done = await waitTurnDone(before, 60000)
+          const cards = [...document.querySelectorAll('.blk-tool[data-tool="sheet_query"]')]
+          const card = cards[cards.length - 1]
+          const out = card?.querySelector('.tool-out')?.textContent ?? ''
+          const answers = [...document.querySelectorAll('.blk-answer .blk-body')].map(
+            (b) => b.textContent ?? '',
+          )
+          if (!done) fail('the scripted titled-sheet turn never finished')
+          else if (!card) fail('no tool card for sheet_query on the titled sheet')
+          else if (!out.includes('# header: sheet row 3'))
+            fail(
+              'the tool did not say which row named the columns (a title block is not a header): ' +
+                JSON.stringify(out.slice(0, 260)),
+            )
+          else if (!out.includes('Books\t250'))
+            fail(`the titled sheet did not aggregate: ${JSON.stringify(out.slice(0, 260))}`)
+          else if (!answers.some((t) => t.includes('header was row 3')))
+            fail('the header note reached the card but not the answer')
+          else
+            pageLog(
+              'titled header ok (header found on sheet row 3, the two title rows above it are not ' +
+                'records, and the card says so)',
+            )
+        }
+
+        // (a8) a turn is not capped at fourteen tool calls
+        //
+        // Fourteen was a work budget wearing a guard's clothes: the cash-flow
+        // session spent all of them reading eight sheets, then the engine forced a
+        // summary of work it had not finished. The cap is now `max_tool_iters`
+        // (0 = none, the default), and this scripted turn makes seventeen calls -
+        // it cannot complete at all unless the cap is gone.
+        {
+          const before = await turnCount()
+          const ws = (hostState?.workspace ?? '').replace(/\/+$/, '')
+          const file = `${ws}/selftest-long.csv`
+          if (!ws) fail('the self-test host has no workspace, so the long-turn fixture path is unknown')
+          await invoke('start_turn', {
+            text:
+              `Selftest long-turn: put three lines into ${file}, then read it back seventeen ` +
+              'times and tell me the last line.',
+            session: target.id,
+          }).catch((e) => pageLog(`selftest note: long-turn turn failed: ${e}`))
+          const done = await waitTurnDone(before, 120000)
+          const reads = document.querySelectorAll('.blk-tool[data-tool="read_file"]').length
+          const notes = [...document.querySelectorAll('.blk-note, .note')].map((n) =>
+            n.textContent ?? '',
+          )
+          const answers = [...document.querySelectorAll('.blk-answer .blk-body')].map(
+            (b) => b.textContent ?? '',
+          )
+          if (!done) fail('a 17-call turn never finished: the tool loop is capped somewhere')
+          else if (reads < 16)
+            fail(`only ${reads} read_file calls reached the transcript: the loop stopped early`)
+          else if (!answers.some((t) => t.includes('never capped at fourteen')))
+            fail(`seventeen calls ran but the answer never arrived (${answers.length} answer block(s))`)
+          else if (!notes.some((t) => t.includes('no cap set')))
+            fail('an uncapped turn ran 20+ calls without ever saying it was uncapped')
+          else
+            pageLog(
+              `long turn ok (${reads} tool calls in one turn, the answer arrived, and the turn ` +
+                'said once that it was uncapped)',
+            )
+        }
+
         // (a) structure while the tokens arrive, not when they stop
         {
           const before = await turnCount()
@@ -5433,8 +5518,13 @@
           // already proved the page was not laid out (the geometry notes above). The
           // numbers stay in the log; they are just not treated as a verdict.
           pageLog(`selftest note: skipped the frame-cadence verdict; ${offScreen()}`)
-        } else if (c.frames < 60)
-          fail(`frame cadence: only ${c.frames} animation frames in ${c.ms}ms: the sample is empty`)
+        } else if (c.frames < 60 && !starved)
+          fail(
+            `frame cadence: only ${c.frames} animation frames in ${c.ms}ms while the page was `
+            + `getting a ${idle.median.toFixed(1)}ms clock idle (${idle.frames} frames in the `
+            + `baseline): a thin sample on a machine that can deliver frames is a stalled page, `
+            + 'and the streaming path is the only thing running',
+          )
         else if (starved) {
           // Absolute thresholds mean nothing when the page never gets 60 Hz idle. What
           // still has to hold is that streaming costs little more than idling: an

@@ -313,7 +313,7 @@
      "delay_ms": 25
     },
     {
-     "content": "Right \u2014 that belongs in write_file, not in a shell.",
+     "content": "Right — that belongs in write_file, not in a shell.",
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 12
@@ -563,6 +563,319 @@
       "# columns: rownum | region | units | price"
      ],
      "content": "Per region: West 26, North 12, East 9, South 7. West is the biggest.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 10
+    }
+   ]
+  },
+  {
+   "name": "sheet-titled-header",
+   "_why": "the real cash-flow workbook opens with a title block: row 1 the school, row 2 the treasurer, row 3 the header. When sheet_query named its columns from row 1 the tool was useless and the model went back to unzipping the package. require pins the engine's own header note",
+   "match": "Selftest titled-sheet",
+   "steps": [
+    {
+     "reasoning": "A sheet whose first rows are titles, like the real file.",
+     "tool_calls": [
+      {
+       "id": "mock-t1",
+       "name": "write_file",
+       "arguments": "{\"path\": \"$path\", \"content\": \"BURGOS ELEMENTARY SCHOOL\\nTreasurer: MERLY R. BAUTO\\nDATE,DESCRIPTION,INCOME\\n2024-09-06,Books,250\\n2024-09-09,Snacks,120\\n\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "require": [
+      "created",
+      "selftest-titled.csv"
+     ],
+     "reasoning": "Total the income column. The header is not row 1.",
+     "tool_calls": [
+      {
+       "id": "mock-t2",
+       "name": "sheet_query",
+       "arguments": "{\"path\": \"$path\", \"query\": \"SELECT description, SUM(income) AS total FROM t GROUP BY description ORDER BY total DESC\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "require": [
+      "# header: sheet row 3",
+      "Books\t250"
+     ],
+     "content": "Books 250, Snacks 120. The header was row 3, and the two title rows above it are not records.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 10
+    }
+   ]
+  },
+  {
+   "name": "long-turn-past-the-old-cap",
+   "_why": "14 tool round-trips was not a runaway guard, it was a work budget: a real session on an 8-sheet workbook used all 14 on reads and then had to summarise unfinished work. This turn makes 17 calls and must still reach its answer.",
+   "match": "Selftest long-turn",
+   "steps": [
+    {
+     "reasoning": "One file, read back over and over: the shape of a real deep read.",
+     "tool_calls": [
+      {
+       "id": "mock-l0",
+       "name": "write_file",
+       "arguments": "{\"path\": \"$path\", \"content\": \"line one\\nline two\\nline three\\n\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 1 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l1",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 2 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l2",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 3 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l3",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 4 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l4",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 5 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l5",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 6 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l6",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 7 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l7",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 8 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l8",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 9 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l9",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 10 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l10",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 11 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l11",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 12 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l12",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 13 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l13",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 14 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l14",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 15 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l15",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 16 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-l16",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 8
+    },
+    {
+     "require": [
+      "line three"
+     ],
+     "content": "Seventeen calls, one answer: the loop was never capped at fourteen.",
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 10

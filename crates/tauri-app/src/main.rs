@@ -182,6 +182,8 @@ fn main() {
     cfg.context_budget = appcfg.context.target_tokens;
     // None means the server's own output cap applies; see Config.
     cfg.max_tokens = appcfg.max_output_tokens;
+    // 0 = no cap. The hardcoded 14 was cutting real tasks short; see Config.
+    cfg.max_tool_iters = appcfg.max_tool_iters();
     // Empty unless `[sampling]` says otherwise, in which case the keys go on every
     // request. Validated here rather than at request time: a bad range should stop
     // the app at boot, not bend the model's behaviour invisibly.

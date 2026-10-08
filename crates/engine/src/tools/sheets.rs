@@ -644,7 +644,19 @@ struct SheetStat {
     shared_formulas: usize,
     array_formulas: usize,
     capped_scan: bool,
+    /// Sheet names this sheet's formulas read from, counted. This is the "flow" a
+    /// workbook has - which sheet feeds which - and without it a model that is
+    /// asked to explain the file unzips the package and greps the XML instead.
+    refs: BTreeMap<String, usize>,
+    /// External workbook references (`[2]Sheet!A1`): counted, never resolved.
+    ext_refs: usize,
+    /// Merged ranges as the file spells them, up to `MERGE_LIST_CAP`.
+    merge_list: Vec<String>,
 }
+
+/// Enough merge ranges to recognise a layout, without turning a formatted report
+/// into a list of a thousand ranges in the prompt.
+const MERGE_LIST_CAP: usize = 12;
 
 pub(crate) struct SheetContent {
     /// row index -> column index -> rendered text
@@ -872,7 +884,14 @@ fn open(
             }
         }
         "is" => *in_is = true,
-        "mergeCell" => stat.merged += 1,
+        "mergeCell" => {
+            stat.merged += 1;
+            if stat.merge_list.len() < MERGE_LIST_CAP {
+                if let Some(r) = attrs.get("ref") {
+                    stat.merge_list.push(r.clone());
+                }
+            }
+        }
         "mergeCells" => {
             // The count attribute and the children say the same thing; adding them
             // would report twice as many merges as exist.
@@ -922,6 +941,16 @@ fn close(
     let stat = &mut out.stat;
     if let Some(n) = stat.merge_declared {
         stat.merged = stat.merged.max(n);
+    }
+    // The formula text is the only place a workbook says where its numbers come
+    // from. Shared formulas spell the reference once on the master cell, so a
+    // counted link may apply to more cells than the count - the note says so.
+    if !fbuf.is_empty() {
+        let (names, external) = cross_refs(fbuf);
+        for name in names {
+            *stat.refs.entry(name).or_insert(0) += 1;
+        }
+        stat.ext_refs += external;
     }
     stat.cells += 1;
     stat.min_row = stat.min_row.min(r);
@@ -1112,11 +1141,12 @@ impl Tool for SheetReadTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Workspace-relative .xlsx, .csv or .tsv" },
-                "sheet": { "type": "string", "description": "Sheet name (xlsx). Omit, with mode=structure, to list every sheet" },
+                "sheet": { "type": "string", "description": "Sheet name (xlsx). \"*\" sweeps every visible sheet in one call, sharing max_cells between them. Omit, with mode=structure, to list every sheet with its size, merges and cross-sheet links" },
                 "range": { "type": "string", "description": "A1:D12, or B7, or A:D. Omit to start at the top-left" },
                 "mode": { "type": "string", "enum": ["structure", "values"], "description": "Defaults to values when sheet or range is given, otherwise structure" },
                 "max_cells": { "type": "integer", "description": "Cells to return; default 2000, max 8000" },
                 "include_formulas": { "type": "boolean", "description": "Show each formula with the last value Excel cached" },
+                "cell_addresses": { "type": "boolean", "description": "values mode: print each non-empty cell as CELL=value instead of a tab-separated grid. Use it on wide sheets, or sheets with several blocks side by side, where counting empty tabs is how columns get mis-read" },
                 "delimiter": { "type": "string", "description": "csv/tsv only: one of , ; | or a tab" }
             },
             "required": ["path"]
@@ -1194,6 +1224,10 @@ impl Tool for SheetReadTool {
             .get("include_formulas")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let cell_addrs = args
+            .get("cell_addresses")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let rect = match args.get("range").and_then(|v| v.as_str()) {
             Some(r) => match parse_rect(r) {
                 Ok(q) => Some(q),
@@ -1208,6 +1242,7 @@ impl Tool for SheetReadTool {
                 sheet_arg,
                 rect.as_ref(),
                 want_values,
+                cell_addrs,
                 max_cells,
                 formulas,
                 ctx,
@@ -1246,6 +1281,7 @@ fn read_xlsx(
     sheet_arg: Option<&str>,
     rect: Option<&Rect>,
     want_values: bool,
+    cell_addrs: bool,
     max_cells: usize,
     formulas: bool,
     ctx: &ToolCtx,
@@ -1256,8 +1292,16 @@ fn read_xlsx(
     let (sheets, defined) = workbook_meta(&mut zip)?;
     let rel = display_rel(&ctx.workspace, path);
 
+    // `sheet: "*"` is an explicit sweep. It is worth having because the alternative
+    // is one call per sheet, and a workbook with eight sheets spends a third of a
+    // turn's tool budget before the model has read anything.
+    let sweep = sheet_arg
+        .map(|w| matches!(w.trim(), "*" | "all" | "All" | "ALL"))
+        .unwrap_or(false);
     let pick: Vec<&SheetMeta> = match sheet_arg {
+        None if want_values => sheets.iter().filter(|s| !s.hidden).collect(),
         None => sheets.iter().collect(),
+        Some(_) if sweep => sheets.iter().filter(|s| !s.hidden).collect(),
         Some(want) => {
             let w = want.trim();
             let hit = sheets
@@ -1300,6 +1344,35 @@ fn read_xlsx(
     let ss = shared_strings(&mut zip);
     let styles = date_styles(&mut zip);
 
+    // A sweep shares one cell budget instead of spending `max_cells` on every
+    // sheet: eight sheets at 2 000 cells each is 16 000 cells in the prompt, which
+    // is the cost this tool exists to avoid.
+    let budget = if want_values && pick.len() > 1 {
+        // An equal share of what the caller asked for, and never more: inventing a
+        // floor would turn "60 cells" into 300 and break the one promise this tool
+        // makes about its own size. The note says what each sheet got.
+        max_cells / pick.len()
+    } else {
+        max_cells
+    };
+    if want_values && pick.len() > 1 {
+        let hidden = sheets.iter().filter(|s| s.hidden).count();
+        out.push_str(&format!(
+            "# {} sheets in one call, {} cells each - about {} in total (raise max_cells for more of one \
+             sheet, or pass one sheet name to read it in full)\n",
+            pick.len(),
+            budget,
+            budget * pick.len()
+        ));
+        if hidden > 0 {
+            out.push_str(&format!(
+                "# note: {} hidden sheet(s) skipped by the sweep; pass its name to read it\n",
+                hidden
+            ));
+        }
+    }
+
+    let mut flow: Vec<(String, BTreeMap<String, usize>)> = Vec::new();
     for sm in &pick {
         let content = read_sheet(
             &mut zip,
@@ -1307,7 +1380,7 @@ fn read_xlsx(
             &ss,
             &styles,
             if want_values { rect } else { None },
-            max_cells,
+            budget,
             formulas,
         )?;
         let stat = &content.stat;
@@ -1387,16 +1460,94 @@ fn read_xlsx(
             if stat.capped_scan {
                 out.push_str("  note: extents come from the file's own record; the cell scan was capped\n");
             }
-            // The first row is what lets a model talk about the columns at all.
-            if let Some(head) = content.rows.get(&r1) {
-                let cols: Vec<usize> = (c1..=(c1 + 40).min(c2)).collect();
-                let cells: Vec<String> = cols
+            if !stat.merge_list.is_empty() {
+                let more = stat.merged.saturating_sub(stat.merge_list.len());
+                let tail = if more > 0 { format!(", +{more} more") } else { String::new() };
+                out.push_str(&format!("  merges: {}{tail}\n", stat.merge_list.join(", ")));
+            }
+            let linked: Vec<(String, usize)> = stat
+                .refs
+                .iter()
+                .filter(|(n, _)| !n.eq_ignore_ascii_case(&sm.name))
+                .map(|(n, c)| (n.clone(), *c))
+                .collect();
+            if !linked.is_empty() {
+                let parts: Vec<String> = linked
                     .iter()
-                    .map(|c| head.get(c).map(|v| esc(v)).unwrap_or_default())
+                    .take(8)
+                    .map(|(n, c)| format!("{n:?} ({c})"))
                     .collect();
-                if cells.iter().any(|c| !c.is_empty()) {
-                    out.push_str(&format!("  row {}: {}\n", r1 + 1, cells.join(" | ")));
+                let more = linked.len().saturating_sub(8);
+                let tail = if more > 0 { format!(", +{more} more") } else { String::new() };
+                out.push_str(&format!("  reads from: {}{tail}\n", parts.join(", ")));
+                if stat.shared_formulas > 0 {
+                    out.push_str("  note: shared formulas state a link once, so the count is of formulas, not cells\n");
                 }
+            }
+            if stat.ext_refs > 0 {
+                out.push_str(&format!(
+                    "  external links: {} - they point at another workbook, which this tool does not read\n",
+                    stat.ext_refs
+                ));
+            }
+            flow.push((sm.name.clone(), stat.refs.clone()));
+            // The first rows are what let a model talk about the columns at all.
+            // More than one, because a real workbook opens with a title and a
+            // person's name: showing only row 1 showed "BURGOS ELEMENTARY SCHOOL"
+            // and left the actual header - row 3 - invisible, so the model could
+            // not name a single column without another call.
+            let cols: Vec<usize> = (c1..=(c1 + 40).min(c2)).collect();
+            let mut shown = 0usize;
+            for (row, cells) in content.rows.iter() {
+                if shown >= 3 {
+                    break;
+                }
+                let line: Vec<String> = cols
+                    .iter()
+                    .map(|c| cells.get(c).map(|v| esc(v)).unwrap_or_default())
+                    .collect();
+                if line.iter().all(|c| c.is_empty()) {
+                    continue;
+                }
+                out.push_str(&format!("  row {}: {}\n", row + 1, line.join(" | ")));
+                shown += 1;
+            }
+        } else if cell_addrs {
+            let cols: Vec<usize> = (c1..=c2).collect();
+            out.push_str(&format!(
+                "# sheet {:?} rows {}-{} cols {}-{} - one line per row, only the cells that have                  a value, as CELL=value\n",
+                sm.name,
+                r1 + 1,
+                r2 + 1,
+                col_name(c1),
+                col_name(c2)
+            ));
+            for (row, cells) in content.rows.iter() {
+                let parts: Vec<String> = cols
+                    .iter()
+                    .filter_map(|c| {
+                        cells.get(c).filter(|v| !v.is_empty()).map(|v| {
+                            format!("{}{}={}", col_name(*c), row + 1, esc(v))
+                        })
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                out.push_str(&format!("{}: {}\n", row + 1, parts.join(" ")));
+            }
+            if content.truncated {
+                let span = (r2 - r1 + 1).max(1);
+                let next = r2 + 2;
+                out.push_str(&format!(
+                    "{PAGING_MARK}{} cells - last row shown {}, ask again with range {}{}:{}{}\n",
+                    budget,
+                    r2 + 1,
+                    col_name(c1),
+                    next,
+                    col_name(c2),
+                    next + span - 1
+                ));
             }
         } else {
             let cols: Vec<usize> = (c1..=c2).collect();
@@ -1414,7 +1565,7 @@ fn read_xlsx(
                 let next = r2 + 2;
                 out.push_str(&format!(
                     "{PAGING_MARK}{} cells - last row shown {}, ask again with range {}{}:{}{}\n",
-                    max_cells,
+                    budget,
                     r2 + 1,
                     col_name(c1),
                     next,
@@ -1424,7 +1575,122 @@ fn read_xlsx(
             }
         }
     }
+    if !want_values && flow.len() > 1 {
+        let edges = flow_edges(&flow);
+        if edges.is_empty() {
+            out.push_str("\n# flow: no sheet reads from another - every sheet stands alone\n");
+        } else {
+            out.push_str("\n# flow (which sheet's formulas read which other sheet):\n");
+            for (from, to, n) in &edges {
+                out.push_str(&format!("  {from:?} -> {to:?} ({n} formula reference(s))\n"));
+            }
+        }
+    }
     Ok(out.trim_end().to_string())
+}
+
+/// The dependency edges of a workbook, from the per-sheet reference counts. A model
+/// asked to "learn the flow" of a cash book is asking this question, and until now
+/// the only way to answer it was to unzip the file and grep the XML.
+///
+/// Links to a sheet this workbook does not have are dropped: a formula naming a
+/// deleted sheet is a #REF artifact, not a flow.
+fn flow_edges(flow: &[(String, BTreeMap<String, usize>)]) -> Vec<(String, String, usize)> {
+    let mut edges: Vec<(String, String, usize)> = Vec::new();
+    for (from, refs) in flow {
+        for (to, n) in refs {
+            if to.eq_ignore_ascii_case(from) {
+                continue;
+            }
+            if !flow.iter().any(|(n, _)| n.eq_ignore_ascii_case(to)) {
+                continue;
+            }
+            edges.push((from.clone(), to.clone(), *n));
+        }
+    }
+    edges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)));
+    edges
+}
+
+/// Which other sheets this formula reads from.
+///
+/// Excel writes a cross-sheet reference two ways: `Canteen!F30` when the name is
+/// plain, and `'Mr. and Ms. Burgos 2026'!F30` when it needs quoting (with a literal
+/// apostrophe doubled inside). `[2]Sheet!A1` is a reference to a *different
+/// workbook* - counted as a hazard and not resolved, because reading another file
+/// is not this tool's job and silently following it would be a surprise.
+fn cross_refs(formula: &str) -> (Vec<String>, usize) {
+    let b = formula.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut external = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                // Quoted sheet name: run to the closing quote, where '' is an
+                // escaped apostrophe rather than the end.
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() {
+                    if b[j] == b'\'' {
+                        if j + 1 < b.len() && b[j + 1] == b'\'' {
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                if j < b.len() && j + 1 < b.len() && b[j + 1] == b'!' && j > start {
+                    let name = formula[start..j].replace("''", "'");
+                    out.push(name);
+                    i = j + 2;
+                    continue;
+                }
+                i = j.min(b.len());
+            }
+            b'[' => {
+                // A reference to another workbook: `[2]Budget!A1`. Counted, and the
+                // sheet name after the bracket must not be mistaken for a sheet of
+                // this workbook - following it would read a file the user never
+                // pointed at.
+                let end = formula[i..].find(']').map(|k| i + k + 1).unwrap_or(b.len());
+                let mut j = end;
+                while j < b.len()
+                    && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'.' || b[j] == b'$')
+                {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'!' {
+                    external += 1;
+                    j += 1;
+                }
+                i = j;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' || c == b'.' => {
+                let start = i;
+                let mut j = i;
+                while j < b.len()
+                    && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'.' || b[j] == b'$')
+                {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'!' {
+                    let name = &formula[start..j];
+                    // `_xlfn.IFS`, `_xlnm.HYPERLINK` and friends are function
+                    // namespaces, not sheets.
+                    if !name.starts_with("_xl") && !name.is_empty() {
+                        out.push(name.to_string());
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                i = j.max(i + 1);
+            }
+            _ => i += 1,
+        }
+    }
+    (out, external)
 }
 
 /// What an edit would have to keep. Styles and defined names belong here: a
@@ -1652,6 +1918,22 @@ mod tests {
             FileOptions::default().compression_method(CompressionMethod::Deflated);
         for (name, body) in parts {
             w.start_file(*name, opts).unwrap();
+            w.write_all(body.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+        p
+    }
+
+    /// `hand_xlsx` with a chosen file name, for tests that need more than one
+    /// workbook in the same directory.
+    fn hand_xlsx_with(dir: &Path, name: &str, parts: &[(&str, &str)]) -> PathBuf {
+        let p = dir.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (part, body) in parts {
+            w.start_file(*part, opts).unwrap();
             w.write_all(body.as_bytes()).unwrap();
         }
         w.finish().unwrap();
@@ -2137,5 +2419,201 @@ line</t></si></sst>"#
         assert_eq!(esc("a\tb"), "a\\tb");
         assert_eq!(esc("a\\b"), "a\\\\b");
         assert_eq!(esc("line\nbreak"), "line\\nbreak");
+    }
+
+    #[test]
+    fn cross_refs_separates_real_links_from_other_workbooks_and_namespaces() {
+        assert_eq!(cross_refs("Canteen!F30+D4"), (vec!["Canteen".into()], 0));
+        // A name needing quotes is the common case in real files, and an apostrophe
+        // inside it is escaped by doubling.
+        assert_eq!(
+            cross_refs("'Mr. and Ms. Burgos 2026'!B4+'Q''s'!A1"),
+            (vec!["Mr. and Ms. Burgos 2026".into(), "Q's".into()], 0)
+        );
+        // Another workbook is a hazard, not a link to follow.
+        assert_eq!(cross_refs("[2]Budget!A1+C4"), (Vec::<String>::new(), 1));
+        // `_xlfn.` prefixes are function namespaces; the sheet after them is real.
+        assert_eq!(cross_refs("_xlfn.IFS(Data!A1,1)"), (vec!["Data".into()], 0));
+        // Ranges, names and arithmetic contain no links at all.
+        assert_eq!(cross_refs("SUM(A1:A9)/Totals"), (Vec::<String>::new(), 0));
+    }
+
+    /// The question "learn the flow of this workbook" is a question about which
+    /// sheet reads which. Until the structure pass answered it, the answer cost the
+    /// model an `unzip` plus a hand-written XML dump.
+    #[tokio::test]
+    async fn structure_reports_the_flow_between_sheets_and_the_merge_ranges() {
+        let d = tmp("flow");
+        let wb = r#"<?xml version="1.0"?><workbook><sheets><sheet name="Local Fund " sheetId="1" r:id="rId1"/><sheet name="Canteen" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>"#;
+        let sheet1 = concat!(
+            r#"<?xml version="1.0"?><worksheet><sheetData>"#,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>DATE</t></is></c><c r="B1" t="inlineStr"><is><t>Cash Flow</t></is></c></row>"#,
+            r#"<row r="2"><c r="A2" t="inlineStr"><is><t>2024-09-06</t></is></c><c r="B2"><f>'Canteen'!F5+C2</f><v>30</v></c></row>"#,
+            r#"<row r="3"><c r="A3" t="inlineStr"><is><t>2024-09-09</t></is></c><c r="B3"><f>'Canteen'!F6</f><v>12</v></c></row>"#,
+            r#"</sheetData><mergeCells count="2"><mergeCell ref="A5:C5"/><mergeCell ref="E1:G1"/></mergeCells></worksheet>"#
+        );
+        let sheet2 = concat!(
+            r#"<?xml version="1.0"?><worksheet><sheetData>"#,
+            r#"<row r="1"><c r="F5" t="inlineStr"><is><t>30</t></is></c><c r="F6"><f>'Local Fund '!B2*2</f><v>60</v></c></row>"#,
+            r#"</sheetData></worksheet>"#
+        );
+        hand_xlsx_with(
+            &d,
+            "flow.xlsx",
+            &[
+                ("xl/workbook.xml", wb),
+                ("xl/_rels/workbook.xml.rels", rels),
+                ("xl/worksheets/sheet1.xml", sheet1),
+                ("xl/worksheets/sheet2.xml", sheet2),
+            ],
+        );
+        let ctx = ctx_in(&d);
+        let r = call(&ctx, json!({"path": "flow.xlsx", "mode": "structure"})).await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(
+            out.contains(r#"reads from: "Canteen" (2)"#),
+            "a sheet that reads another must say so: {out}"
+        );
+        assert!(
+            out.contains(r#""Local Fund " -> "Canteen" (2 formula reference(s))"#),
+            "the workbook flow must be stated: {out}"
+        );
+        assert!(
+            out.contains(r#""Canteen" -> "Local Fund " (1 formula reference(s))"#),
+            "the reverse link is part of the flow: {out}"
+        );
+        assert!(
+            out.contains("merges: A5:C5, E1:G1"),
+            "merge ranges must be listed, not only counted: {out}"
+        );
+    }
+
+    /// One call for a whole workbook. Per sheet was eight calls on the cash-flow
+    /// file, which is most of a turn's tool budget spent before any analysis.
+    #[tokio::test]
+    async fn a_sweep_reads_every_sheet_for_the_price_of_one_call() {
+        let d = tmp("sweep");
+        let wb = r#"<?xml version="1.0"?><workbook><sheets><sheet name="One" sheetId="1" r:id="rId1"/><sheet name="Two" sheetId="2" r:id="rId2"/><sheet name="Three" sheetId="3" r:id="rId3"/></sheets></workbook>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Target="worksheets/sheet3.xml"/></Relationships>"#;
+        let sheet = |n: usize| {
+            format!(
+                r#"<?xml version="1.0"?><worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>sheet {n}</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>row</t></is></c><c r="B2"><v>{n}</v></c></row></sheetData></worksheet>"#
+            )
+        };
+        let s1 = sheet(1);
+        let s2 = sheet(2);
+        let s3 = sheet(3);
+        hand_xlsx_with(
+            &d,
+            "three.xlsx",
+            &[
+                ("xl/workbook.xml", wb),
+                ("xl/_rels/workbook.xml.rels", rels),
+                ("xl/worksheets/sheet1.xml", &s1),
+                ("xl/worksheets/sheet2.xml", &s2),
+                ("xl/worksheets/sheet3.xml", &s3),
+            ],
+        );
+        let ctx = ctx_in(&d);
+        let r = call(
+            &ctx,
+            json!({"path": "three.xlsx", "mode": "values", "sheet": "*", "max_cells": 60}),
+        )
+        .await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(out.contains("\"One\"") && out.contains("\"Two\"") && out.contains("\"Three\""), "{out}");
+        assert!(
+            out.contains("# 3 sheets in one call, 20 cells each"),
+            "the shared budget must be stated, not discovered: {out}"
+        );
+        assert!(out.contains("sheet 1") && out.contains("sheet 3"), "{out}");
+    }
+
+    /// Row 1 of a real workbook is a title, row 2 a person, row 3 the header. A
+    /// structure preview that shows only row 1 names nothing useful, and the model
+    /// spends another call to find out what the columns are called.
+    #[tokio::test]
+    async fn structure_previews_the_rows_below_a_title_block() {
+        let d = tmp("preview");
+        let wb = r#"<?xml version="1.0"?><workbook><sheets><sheet name="Local Fund " sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let sheet = concat!(
+            r#"<?xml version="1.0"?><worksheet><sheetData>"#,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>BURGOS ELEMENTARY SCHOOL</t></is></c></row>"#,
+            r#"<row r="2"><c r="A2" t="inlineStr"><is><t>Treasurer:</t></is></c><c r="B2" t="inlineStr"><is><t>MERLY R. BAUTO</t></is></c></row>"#,
+            r#"<row r="3"><c r="A3" t="inlineStr"><is><t>DATE</t></is></c><c r="B3" t="inlineStr"><is><t>DESCRIPTION</t></is></c><c r="C3" t="inlineStr"><is><t>CATEGORY</t></is></c></row>"#,
+            r#"<row r="4"><c r="A4" t="inlineStr"><is><t>2024-09-06</t></is></c><c r="C4" t="inlineStr"><is><t>MOOE</t></is></c></row>"#,
+            r#"</sheetData></worksheet>"#
+        );
+        hand_xlsx_with(
+            &d,
+            "titled.xlsx",
+            &[
+                ("xl/workbook.xml", wb),
+                ("xl/_rels/workbook.xml.rels", rels),
+                ("xl/worksheets/sheet1.xml", sheet),
+            ],
+        );
+        let ctx = ctx_in(&d);
+        let r = call(&ctx, json!({"path": "titled.xlsx", "mode": "structure"})).await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(out.contains("row 1: BURGOS ELEMENTARY SCHOOL"), "{out}");
+        assert!(
+            out.contains("row 3: DATE | DESCRIPTION | CATEGORY"),
+            "the header row must be visible in the structure preview: {out}"
+        );
+    }
+
+    /// Tab-separated values assume the reader can count empty fields. On a sheet
+    /// with several blocks side by side that is the wrong assumption - the model in
+    /// the cash-flow session rebuilt its own `A1='First Canvassing' | B1=''` dump
+    /// with a script, which is the sound of a tool being worked around.
+    #[tokio::test]
+    async fn cell_addresses_name_the_cell_instead_of_counting_tabs() {
+        let d = tmp("celladdr");
+        let wb = r#"<?xml version="1.0"?><workbook><sheets><sheet name="Grid" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let sheet = concat!(
+            r#"<?xml version="1.0"?><worksheet><sheetData>"#,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>First Canvassing</t></is></c><c r="D1" t="inlineStr"><is><t>Second Canvassing</t></is></c></row>"#,
+            r#"<row r="2"><c r="B2"><v>12</v></c><c r="E2" t="inlineStr"><is><t>Total</t></is></c></row>"#,
+            r#"</sheetData></worksheet>"#
+        );
+        hand_xlsx_with(
+            &d,
+            "grid.xlsx",
+            &[
+                ("xl/workbook.xml", wb),
+                ("xl/_rels/workbook.xml.rels", rels),
+                ("xl/worksheets/sheet1.xml", sheet),
+            ],
+        );
+        let ctx = ctx_in(&d);
+        let r = call(
+            &ctx,
+            json!({"path": "grid.xlsx", "mode": "values", "sheet": "Grid", "cell_addresses": true}),
+        )
+        .await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(out.contains("A1=First Canvassing"), "{out}");
+        assert!(out.contains("D1=Second Canvassing"), "{out}");
+        assert!(out.contains("B2=12"), "{out}");
+        assert!(out.contains("E2=Total"), "{out}");
+        // Empty cells are absent, not implied by a run of tabs.
+        assert!(!out.contains("\t"), "cell mode must not print a tab grid: {out}");
+
+        // And the same file without the flag keeps the compact grid, so nothing
+        // that worked before changed shape.
+        let plain = call(
+            &ctx,
+            json!({"path": "grid.xlsx", "mode": "values", "sheet": "Grid"}),
+        )
+        .await;
+        assert!(why(&plain).contains("First Canvassing\t\t\tSecond Canvassing"), "{}", why(&plain));
     }
 }

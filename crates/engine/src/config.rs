@@ -74,6 +74,15 @@ pub struct Config {
 
     #[serde(default)]
     pub theme: Option<String>,
+
+    /// Provider round-trips allowed inside one user turn. **0 or absent = no cap.**
+    ///
+    /// This used to be a hardcoded 14, which was not a runaway guard but a work
+    /// budget: a session asked to deep-read an 8-sheet workbook used all 14
+    /// iterations on reads and was then forced to summarise work it had not
+    /// finished. Set a number when you want a hard stop on a runaway model.
+    #[serde(default)]
+    pub max_tool_iters: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -430,6 +439,11 @@ impl Config {
         Ok(changed)
     }
 
+    /// 0 means "no cap"; see the field comment for why that is the default.
+    pub fn max_tool_iters(&self) -> usize {
+        self.max_tool_iters.unwrap_or(0)
+    }
+
     pub fn mode(&self) -> ApprovalMode {
         match self.mode.as_deref() {
             Some("session") => ApprovalMode::Session,
@@ -687,6 +701,11 @@ base_url = "http://127.0.0.1:9/v1"
         let example: Config = toml::from_str(&text)
             .unwrap_or_else(|e| panic!("config/cwoffee.toml.example must parse: {e}"));
         assert_eq!(example.search.backend, "auto", "the example ships the managed provider");
+        assert_eq!(
+            example.max_tool_iters(),
+            0,
+            "copying the example must not reintroduce a work budget on turns"
+        );
         // The example is what people copy, so copying it must not change how the
         // model behaves. Sampling is documented but left unset.
         assert!(
@@ -785,6 +804,21 @@ api_key = "sk-plain""#,
     /// `[sampling]` exists so a person can tune an endpoint without Cwoffee
     /// deciding for them. The half that matters is the middle test: a key that is
     /// absent must stay absent from the request, not become our guess.
+    #[test]
+    fn the_tool_iteration_cap_is_a_choice_not_a_constant() {
+        // Absent means no cap, which is the default behaviour now.
+        let c: Config = toml::from_str("[provider]\nkind = 'llama.cpp'").expect("parses");
+        assert_eq!(c.max_tool_iters(), 0, "no cap unless the file says otherwise");
+
+        // A number means a hard stop, honoured exactly.
+        let c: Config = toml::from_str("max_tool_iters = 40").expect("parses");
+        assert_eq!(c.max_tool_iters(), 40);
+
+        // 0 spelled out is the same as absent: "no cap", not "zero iterations".
+        let c: Config = toml::from_str("max_tool_iters = 0").expect("parses");
+        assert_eq!(c.max_tool_iters(), 0);
+    }
+
     #[test]
     fn sampling_keys_are_optional_and_reach_the_host() {
         let c: Config = toml::from_str(

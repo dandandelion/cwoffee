@@ -260,3 +260,98 @@ that API rejects the combination without naming the cause.
 Preservation fixture first (charts, merges, pivots, formulas, styles, tables,
 validations, conditional formats), edit one cell, assert every untouched zip part
 is byte-identical. Only then does an editing tool exist.
+
+## Stage 1c: the cash-flow workbook, and the cap that cut it off
+
+Session 1305 (`~/Downloads/cashflow`, `BES Cash Flow.xlsx`, 8 sheets, 63 KB) is the
+most honest test of the two sheet tools, because nobody scripted it. The model was
+asked to work out what the workbook does. Its calls, in order:
+
+| # | call | why it made it |
+|---|---|---|
+| 1 | `exec ls` | see what is there |
+| 2 | `sheet_read` structure | what sheets, what sizes |
+| 3-9 | `sheet_read` values x7 | one sheet at a time |
+| 10 | `exec` `import openpyxl` | hoping it exists (it does not) |
+| 11 | `exec` unzip | give up on the tool |
+| 12 | `exec` python XML dump | find merges, formulas |
+| 13-14 | `exec` awk x2 | cross-sheet refs, layout |
+
+Fourteen calls. The engine's `max_tool_iters` was 14. The turn did not finish
+because the workbook was answered; it finished because the budget ran out and the
+engine asked for a summary of unfinished work. Turn telemetry: 293,539 prompt
+tokens, 231,728 cached, 3,194 completion.
+
+What the tools could not express, in the model's own order of frustration:
+
+1. **Flow.** "Learn the flow" means which sheet's formulas read which other sheet.
+   `sheet_read` said `119 formula(s)`, `1 merged ranges` — counts. The model
+   wanted names. It got them by `awk`-ing `mergeCells` and `<f>` out of raw XML.
+2. **Layout.** `FINAL CANVASSING` is 29 columns with four blocks side by side. A
+   tab grid asks the reader to count empty fields; the model printed
+   `A1='First Canvassing' | B1=''` by hand instead.
+3. **One call per workbook.** Eight sheets, eight calls, each paying prefill.
+4. **Aggregation on a titled sheet.** `sheet_query` was never called in 1305. The
+   reason is visible in one line of its old behaviour: the Canteen sheet's header
+   is row 3, so `t`'s columns were `burgos_elementary_school | c2 | c3`.
+
+### What shipped
+
+- **`max_tool_iters`** in `config.toml`; absent or `0` means **no cap**. At the
+  iteration where the old build stopped, an uncapped turn says once that it is
+  uncapped. A cap that is set is honoured exactly (its note names the number).
+- **Structure reports names, not just counts**: merge ranges listed
+  (`merges: A1:F1`), rows 1-3 previewed instead of row 1, and a workbook-level
+  flow graph (`"Local Fund " -> "Canteen" (2 formula reference(s))`).
+  External-workbook refs (`[2]Budget!A1`) are counted, not resolved.
+- **`sheet: "*"`** sweeps every visible sheet in one call, splitting the cell
+  budget evenly and saying so; hidden sheets are skipped with a note.
+- **`cell_addresses: true`** prints `1: A1=First Canvassing C1=01/16/2026` for
+  wide / multi-block sheets.
+- **Header detection in `sheet_query`**: rows are scored (width filled, text not
+  numbers, distinct labels, data beneath), the chosen row is printed, and rows
+  above it are not records. `header_row` forces one; `header: false` means none.
+
+### Evidence on the real file (`crates/engine/examples/sheet_probe.rs`)
+
+The example drives the tools with no model in the loop, which is how a tool
+failure gets distinguished from a model failure:
+
+```
+sheet "Local Fund ": A1:V80 (80 rows x 22 cols, 917 non-empty cells) - 1 merged ranges, 119 formula(s) (110 shared...)
+  merges: A1:F1
+  row 2: Treasurer: | MERLY R. BAUTO | ... | Treasurer: | MERLY R. BAUTO | ...
+  row 3: DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex) | Cash Flow | ...
+  row 4: 2024-08-09 | Special Education Fund | Starting Balance | 43000 | | 43000 | ...
+# flow: no sheet reads from another - every sheet stands alone
+```
+
+That last line is a finding, not a failure: raw XML confirms **1** formula in the
+whole package contains `!`, and it is a `#DIV/0!` error cell. The workbook's
+sheets really are independent; the linkage is that the same layout is repeated,
+three ledgers side by side on one sheet. The tool now says that in one call
+instead of the model discovering it with `awk`.
+
+The aggregation that 1305 could not do:
+
+```
+# header: sheet row 3 -> DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex) | Cash Flow
+# note: rows 1-2 sit above the header (titles, names, dates) so they are not rows of t.
+# columns: rownum | date | description | category | income_in | expenses_ex | cash_flow
+category  entries  income   expenses
+NULL      293      76392    76378.75
+```
+
+`category` is NULL for all 293 rows because that column really is empty on
+Canteen — an honest answer, and the kind the model had to assemble out of 60 rows
+of tab-separated text before.
+
+### Still open, deliberately
+
+- **Shared formulas.** Of ~800 `<f>` elements on Canteen, only 198 carry text;
+  the rest inherit from a shared master. Flow detection reads masters. The
+  structure line states the split rather than overstating coverage.
+- **No writes yet.** Stage 2's preservation fixture is still unbuilt.
+- **Header detection is a heuristic.** It is reported so it can be argued with,
+  and `header_row` is the escape hatch. A future `sheet_query` error could
+  suggest the fix when a query names a column like `c2`.

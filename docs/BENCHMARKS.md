@@ -1066,3 +1066,134 @@ render OK x2 · webkit render path: no-dmabuf · holds renderD128
 
 Prompt cost of this feature: zero bytes, since the system prompt and tool schemas are
 untouched and the change only adds JSON fields on the request when the user asks.
+
+## Batch: a workbook read in one call, and a turn that is not cut off at fourteen
+
+The evidence for this batch is a real session (1305) in `~/Downloads/cashflow`,
+working on `BES Cash Flow.xlsx`: 8 sheets, 63 KB. Nobody scripted it, and the way
+it went wrong is the specification.
+
+### What session 1305 actually did
+
+| | |
+|---|---|
+| tool calls | **14** - one `ls`, seven `sheet_read`, five `exec` |
+| the cap it hit | `max_tool_iters = 14`, the hardcoded default |
+| how it ended | the engine forced a wrap-up; the workbook was not finished |
+| prompt tokens | 293,539 (231,728 cached) |
+| completion tokens | 3,194 |
+| `sheet_query` calls | **0** |
+| raw-XML workarounds | `unzip`, a python dump, two `awk` passes over `mergeCells` and `<f>` |
+
+The four reasons the model left the tool and went into a shell, in the order it
+hit them: `structure` reported *counts* ("1 merged ranges, 119 formula(s)") where
+it needed *names*; a 29-column sheet with four blocks side by side is unreadable as
+a tab grid; eight sheets cost eight calls; and `sheet_query` named its columns
+`burgos_elementary_school | c2 | c3`, because the header of that sheet is row 3.
+
+### What the tools say now, on the same file
+
+`crates/engine/examples/sheet_probe.rs` drives the tools with no model in the loop
+- which is how a tool failure stops being mistaken for a model failure:
+
+```
+sheet "Local Fund ": A1:V80 (80 rows x 22 cols, 917 non-empty cells) - 1 merged ranges, 119 formula(s) (110 shared...)
+  merges: A1:F1
+  row 2: Treasurer: | MERLY R. BAUTO | ...
+  row 3: DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex) | Cash Flow | ...
+# flow: no sheet reads from another - every sheet stands alone
+```
+
+"no sheet reads from another" is a finding, not a shrug: the raw package contains
+exactly one `<f>` with a `!` in it, and it is a `#DIV/0!` error cell. The sheets
+are independent; the linkage is that three ledgers sit side by side on one sheet.
+The model used to discover that with `awk`.
+
+The aggregation 1305 could not attempt:
+
+```
+# header: sheet row 3 -> DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex) | Cash Flow
+# note: rows 1-2 sit above the header (titles, names, dates) so they are not rows of t.
+# columns: rownum | date | description | category | income_in | expenses_ex | cash_flow
+category  entries  income   expenses
+NULL      293      76392    76378.75
+```
+
+`category` is NULL for all 293 rows because that column really is empty - an
+honest answer rather than a silently wrong one.
+
+### Calls and bytes for a whole workbook
+
+| read the workbook | calls | bytes into the prompt |
+|---|---|---|
+| one `sheet_read` per sheet | **8** | 40,197 |
+| `sheet: "*"` sweep | **1** | 30,281 |
+
+The sweep splits the budget evenly and says so (`# 8 sheets in one call, 500 cells
+each`), and every sheet it could not finish says where to continue
+(`stopped after 500 cells - last row shown 151, ask again with range A152:F302`).
+Hidden sheets are skipped with a note naming how to read one.
+
+### The cap
+
+| | before | after |
+|---|---|---|
+| default tool iterations per turn | 14 | none |
+| how to bound it | edit Rust | `max_tool_iters = 40` in `config.toml` |
+| what happens at the old limit | the turn is cut and summarised | one line: "15 tool calls so far and no cap set; set max_tool_iters in config.toml to bound a turn" |
+| a cap that *is* set | honoured | honoured, and its note names it (`tool budget spent (3 iterations)`) |
+
+### What the schemas cost
+
+```
+tool block 10084 bytes: exec=1014 read_file=504 write_file=546 write_xlsx=727
+web_fetch=308 web_search=273 download_file=724 edit_file=773 ask_user=2076
+sheet_read=1540 sheet_query=1599
+```
+
+9,459 -> 10,084 bytes: **+625 bytes (~156 tokens)**, one-time, at the front of the
+prompt where llama.cpp caches it. Against that, session 1305 put ~9,000 bytes of
+model-written Python *inside* the transcript, where every retry re-prefills it.
+
+### Gates for this batch
+
+```
+engine lib: tools:: agent::                    206 passed
+engine lib: tools::sheets                       26 passed (2 new: preview rows, cell addresses)
+engine lib: tools::sheet_sql                    13 passed (2 new: titled header, header_row/header:false)
+mock_endpoint                                   10 passed
+markdown: all checks passed
+svelte-check found 0 errors and 0 warnings
+SELFTEST ok: sessions 0->0, fts-safe query -> 0 hits, models=1 picked=cwoffee-mock
+  titled header ok (header found on sheet row 3, the two title rows above it are not records)
+  long turn ok (16 tool calls in one turn, the answer arrived, and the turn said once that it was uncapped)
+  sheet_query ok / sheet_read ok (unchanged)
+```
+
+Negative controls, both run and both seen to fail:
+
+```
+score the header row out  -> SELFTEST FAIL: "the columns of t are: rownum, burgos_elementary_school, c2, c3"
+put the 14 cap back       -> SELFTEST FAIL: "only 14 read_file calls reached the transcript: the loop stopped early"
+```
+
+The second control is also what told us `HostConfig`'s default is not what the app
+runs with: the app sets `cfg.max_tool_iters = appcfg.max_tool_iters()`, so the
+control had to be armed in the shell, not in the engine's `Default`.
+
+### One harness correction that came out of a loaded machine
+
+The frame-cadence check failed with `only 36 animation frames in 1535ms: the
+sample is empty` while `strata` held 1009% CPU and 52 GB. The idle baseline in the
+same run read 31 frames / **median 31.0 ms**, i.e. the page was never getting a
+60 Hz clock to begin with, and the ratio branch below would have handled it. The
+thin-sample branch above had no baseline premise check and reported the machine as
+an empty sample - the exact pattern traps 90-93 warn about. A thin sample on a
+machine that *can* deliver frames still fails, now naming the baseline it failed
+against:
+
+```
+frame cadence: 36 frames over 1535ms while a turn streamed; median 43.0ms, p95 53.0ms, worst 59.0ms, page long tasks 0
+frame cadence baseline (nothing streaming): 31 frames, median 31.0ms, p95 35.0ms
+selftest note: the machine is starved (idle median 31.0ms), so the cadence is judged against the baseline rather than 60Hz
+```

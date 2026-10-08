@@ -10,9 +10,12 @@
 //!     Providers reject an assistant turn with tool_calls that has no matching
 //!     results, and a model that never learns a call was refused will keep
 //!     retrying it forever.
-//!   * **The loop is bounded.** A small model can call a tool, misread the
-//!     output, and call it again identically. `max_tool_iters` is a hard stop,
-//!     reported as such rather than silently continuing.
+//!   * **The loop ends in a known way.** It stops when the model answers, when the
+//!     user cancels, or when `max_tool_iters` says so. The cap is a *choice* now
+//!     (`0` = no cap, and that is the default): 14 was not a runaway guard, it was
+//!     a work budget, and a real session on an 8-sheet workbook spent all 14 just
+//!     reading sheets and then had to summarise work it had not finished. When a cap
+//!     is set it is honoured and reported, never silently extended.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -35,7 +38,15 @@ pub type EngineSink = mpsc::UnboundedSender<EngineEvent>;
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub model: String,
-    /// Hard cap on provider round-trips inside one user turn.
+    /// Cap on provider round-trips inside one user turn. **0 means no cap.**
+    ///
+    /// The default is no cap because the number kept doing harm as a work budget:
+    /// a session reading an 8-sheet workbook used all 14 iterations on `sheet_read`
+    /// calls and was then forced into a summary of unfinished work. Runaway
+    /// behaviour is still bounded in practice - the context budget triggers
+    /// compaction, a repeated identical call is the model's own doing and visible
+    /// in the transcript, and Cancel works at any point - and an operator who wants
+    /// a hard stop sets `max_tool_iters` in the config.
     pub max_tool_iters: usize,
     pub reasoning: Reasoning,
     pub max_tokens: Option<u32>,
@@ -48,10 +59,9 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             model: "default".into(),
-            // 8 was too few for anything with a document in it: research, write,
-            // convert, verify is four rounds before the model has answered a
-            // question. The cap is a runaway guard, not a work budget.
-            max_tool_iters: 14,
+            // 14 was not a runaway guard, it was a work budget, and it bit a real
+            // session mid-task. See the field comment.
+            max_tool_iters: 0,
             reasoning: Reasoning::Low,
             // None means "whatever the server defaults to", which for llama.cpp
             // is -1: generate until the model stops or the context fills.
@@ -65,6 +75,13 @@ impl Default for AgentConfig {
         }
     }
 }
+
+/// With no cap, say so once at this many tool calls: a turn this long is either
+/// real work or a model going in circles, and the user should be able to tell which
+/// without reading 40 tool cards. The number is the old hardcoded cap plus one -
+/// exactly where the previous build would have stopped, and why the turn keeps
+/// going is worth one line at that moment.
+const SOFT_ITERATION_NOTE: usize = 15;
 
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -276,7 +293,25 @@ impl Agent {
         let mut cut_short = 0usize;
         let mut carry_on = false;
 
-        for _ in 0..self.cfg.max_tool_iters {
+        let cap = self.cfg.max_tool_iters;
+        let mut iters = 0usize;
+        let mut soft_note_sent = false;
+        loop {
+            if cap > 0 && iters >= cap {
+                break;
+            }
+            if cap == 0 && iters == SOFT_ITERATION_NOTE && !soft_note_sent {
+                soft_note_sent = true;
+                // Uncapped is the default, so a long turn needs a signal that says
+                // what is happening and how to bound it - without pretending the
+                // turn is out of road.
+                let _ = out.send(EngineEvent::Note {
+                    message: format!(
+                        "{iters} tool calls so far and no cap set; set max_tool_iters in config.toml to bound a turn"
+                    ),
+                });
+            }
+            iters += 1;
             if self.cancel.load(Ordering::Relaxed) {
                 self.emit_turn_files(turn, out);
                 let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Cancelled });
@@ -1744,14 +1779,76 @@ mod tests {
         drop(tx);
         let mut rx = rx;
         let mut saw_cap = false;
+        let mut named_cap = false;
         while let Ok(e) = rx.try_recv() {
-            if let EngineEvent::Error { message, .. } = e {
-                if message.contains("tool iterations") {
-                    saw_cap = true;
+            match e {
+                EngineEvent::Error { message, .. } if message.contains("tool iterations") => saw_cap = true,
+                EngineEvent::Note { message } if message.contains("tool budget spent (3 iterations)") => {
+                    named_cap = true
                 }
+                _ => {}
             }
         }
         assert!(saw_cap, "runaway loop was not bounded");
+        assert!(named_cap, "the cap was hit silently, without saying which cap");
+    }
+
+    /// The default is no cap, and that is the point: the old hardcoded 14 was a
+    /// work budget in disguise, and it cut a real 8-sheet-workbook turn off after
+    /// 14 reads. Uncapped must mean "runs until the model answers", with exactly one
+    /// note saying the turn is uncapped and how to bound it.
+    #[tokio::test]
+    async fn an_uncapped_turn_runs_to_the_end_and_says_so_once() {
+        let loop_turn = vec![
+            Delta::ToolCallReady { id: "x".into(), name: "exec".into(), arguments: "{\"cmd\":\"true\"}".into() },
+            Delta::Done(FinishReason::ToolCalls),
+        ];
+        // Past the old cap of 14, and past the point where an uncapped turn says
+        // so out loud (15).
+        let mut turns = vec![loop_turn; 17];
+        turns.push(vec![
+            Delta::Text("done: I read all eight sheets".into()),
+            Delta::Done(FinishReason::Stop),
+        ]);
+        let (mut agent, _ev, mut arx) = harness(turns, ApprovalAnswer::Allow);
+        tokio::spawn(async move {
+            while let Some((_, reply)) = arx.recv().await {
+                reply.send(ApprovalAnswer::Allow).ok();
+            }
+        });
+        agent.cfg.max_tool_iters = 0;
+        let (tx, rx) = mpsc::unbounded_channel();
+        agent.run_turn("go", vec![], &tx).await;
+        drop(tx);
+        let mut rx = rx;
+        let mut uncapped_notes = 0usize;
+        let mut claimed_budget = false;
+        while let Ok(e) = rx.try_recv() {
+            if let EngineEvent::Note { message } = e {
+                if message.contains("no cap set") {
+                    uncapped_notes += 1;
+                }
+                if message.contains("tool budget spent") {
+                    claimed_budget = true;
+                }
+            }
+        }
+        assert_eq!(uncapped_notes, 1, "the uncapped note should appear exactly once");
+        assert!(!claimed_budget, "an uncapped turn must not claim a spent budget");
+
+        let hist = agent.prompt.history();
+        let results = hist.iter().filter(|m| m.role == crate::provider::Role::Tool).count();
+        assert!(results >= 17, "only {results} tool results: the loop stopped early");
+        let last = hist
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::provider::Role::Assistant)
+            .expect("an assistant turn");
+        assert!(
+            last.content.contains("all eight sheets"),
+            "the answer never arrived: {:?}",
+            last.content
+        );
     }
 
     #[test]

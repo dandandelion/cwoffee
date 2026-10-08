@@ -2089,3 +2089,105 @@ example must not change how the model behaves. `deny_unknown_fields` on `Samplin
 turns `topP = 0.9` into an error naming `topP` instead of a key that looks
 configured and does nothing, and range checks (`temperature 0..=2`,
 `top_p`/`min_p` `0..=1`, `top_k >= 1`) run at boot in every shell, not per request.
+
+### Trap 110: a tool-iteration cap of 14 was a work budget, not a guard
+
+The cash-flow session made **exactly fourteen** tool calls - one `ls`, eight
+`sheet_read`, five `exec` - and then the engine cut it off and asked the model to
+summarise work it had not finished. The user read a summary of a third of a
+workbook. A guard stops runaway loops; this one stopped real ones, and it did so
+silently, in the middle, with the worst possible artifact: a confident summary of
+an unfinished investigation.
+
+`max_tool_iters` is a config key now, and **absent or `0` means no cap**. What
+replaced the guard is a line at the iteration where the old build would have
+stopped ("15 tool calls so far and no cap set; set `max_tool_iters` in
+config.toml to bound a turn"), so a turn that goes on long is visible instead of
+truncated. A cap you do set is honoured exactly: the bounded path still forces a
+wrap-up, and its note names the number (`tool budget spent (3 iterations)`).
+
+Both halves are pinned in the harness. `long-turn-past-the-old-cap` makes
+seventeen calls and cannot complete if a cap exists; its negative control -
+putting `cfg.max_tool_iters = 14` back in the app - fails with
+`only 14 read_file calls reached the transcript: the loop stopped early`. A guard
+nobody has seen fail is decoration.
+
+### Trap 111: the first row with content in it is not the header row
+
+`sheet_query` named its columns from the first non-empty row. In a hand-made
+workbook that row is a title, so the cash-flow file arrived as
+`burgos_elementary_school | c2 | c3`, the real header became a data row, and
+`COUNT(*)` counted the school's name. The tool was not wrong; it was useless, and
+the model went back to `unzip`.
+
+Detection now scores the early rows - filled across the sheet's width, text
+rather than numbers, distinct labels, data underneath - and **prints the row it
+chose** so a wrong guess is arguable rather than invisible:
+
+```
+# header: sheet row 3 -> DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex)
+# note: rows 1-2 sit above the header (titles, names, dates) so they are not rows of t.
+```
+
+`header_row` overrides the detector and a row that does not exist says so with
+the row count and column count attached; `header: false` means "no header" and
+gives `c1..cN` with every row as data. The detector has a negative control too:
+score it out and the self-test fails naming `burgos_elementary_school, c2, c3`.
+
+### Trap 112: "learn the flow" means merges and cross-sheet references, not counts
+
+The same session was asked to learn how a workbook fits together. `sheet_read`
+answered `1 merged ranges, 119 formula(s)` - true, and useless: a *count* tells
+you nothing about which cell spans what or which sheet feeds which. So the model
+unzipped the package and ran `awk` over `mergeCells` and `<f>` text, which is how
+it found that the sheets are independent and the linkage is structural.
+
+Structure mode now prints the merge ranges themselves (`merges: A1:F1`), the rows
+under a title block (rows 1-3, not row 1), and a workbook-level flow graph
+(`"Local Fund " -> "Canteen" (2 formula reference(s))`). Cross-sheet parsing
+handles quoted names with spaces and apostrophes (`'Mr. and Ms. Burgos 2026'!B4`,
+`'Q''s'!A1`), and deliberately does **not** resolve `[2]Budget!A1`: a reference to
+another workbook is reported as one, because following it would mean inventing
+data the file does not contain.
+
+### Trap 113: shared formulas have no text to read, so say how many are shared
+
+Of the cash-flow workbook's ~800 formulas, only 198 carry an expression: the rest
+are `<f t="shared" si="3"/>`, inheriting text from a master cell elsewhere on the
+sheet. A flow graph built from `<f>` text therefore sees the master and misses the
+members, and would be wrong if it claimed otherwise. The structure line states the
+split - `119 formula(s) (110 shared; they spill past the cell they sit in)` - and
+the sweep test asserts that count of `<f>` elements is reported as-is rather than
+silently lowered to the number with text.
+
+### Trap 114: a tab-separated grid lies on a wide sheet
+
+`FINAL CANVASSING` is 29 columns wide with four blocks side by side. Reading it as
+`A\tB\tC` means counting empty fields, and the model in that session wrote a
+script to print `A1='First Canvassing' | B1='' | ...` instead. When the model
+builds a format by hand, that format is a feature request.
+
+`cell_addresses: true` prints one line per row with only the cells that have a
+value (`1: A1=First Canvassing C1=01/16/2026 E1=Second Canvassing`). The grid
+stays the default - nothing that worked before changed shape - and the test
+asserts both: cell mode contains no tabs at all, and the plain call still returns
+`First Canvassing\t\t\tSecond Canvassing`.
+
+### Trap 115: an eight-sheet workbook must not cost eight calls, but a sweep must say what it spent
+
+Eight `sheet_read` calls is eight round trips of prefill on a single-slot
+endpoint, and fourteen calls is what the old cap allowed. `sheet: "*"` sweeps the
+visible sheets in one call, splitting the requested budget evenly (`250 cells
+each`) and saying so, so nobody reads a truncated sweep as a complete one. Hidden
+sheets are skipped with a note naming how to read one - silently including them
+would put data the user hid into the prompt, and silently dropping them would lie
+about coverage.
+
+### Trap 116: an example binary built before the flag was threaded tests the old code
+
+`sheet_probe` with `cell_addresses: true` printed the tab-separated header and the
+first instinct was that the flag was being ignored. It was not: the example
+binary predated the change. A probe is only as fresh as its last build, and a
+diagnostic that lies about the code under test is worse than no diagnostic. Any
+example run that decides whether a change works must be preceded by a build of
+that example.

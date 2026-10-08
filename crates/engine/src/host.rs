@@ -33,6 +33,8 @@ pub struct HostConfig {
     pub workspace: PathBuf,
     pub mode: ApprovalMode,
     pub reasoning: Reasoning,
+    /// Cap on provider round-trips in one turn; 0 = no cap. See AgentConfig: the
+    /// old hardcoded 14 acted as a work budget and cut real tasks short.
     pub max_tool_iters: usize,
     pub max_tokens: Option<u32>,
     /// Prompt token budget. Compaction is expensive (it throws away the prefix
@@ -71,9 +73,8 @@ impl HostConfig {
             workspace: workspace.into(),
             mode: ApprovalMode::Ask,
             reasoning: Reasoning::XHigh,
-            // A runaway guard, not a work budget. 8 ended research-then-write
-            // tasks before they could report anything; see the wrap-up in agent.rs.
-            max_tool_iters: 14,
+            // Uncapped by default; set max_tool_iters in config.toml for a hard stop.
+            max_tool_iters: 0,
             max_tokens: None,
             context_budget: None,
             env_override: None,

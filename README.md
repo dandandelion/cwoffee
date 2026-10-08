@@ -215,6 +215,33 @@ exclusive - the API rejects `temperature`/`top_p`/`top_k` when thinking is on.
 Thinking wins and the omission is printed once per process, because a 400 whose text
 never mentions `[sampling]` is a worse diagnosis than one line in the log.
 
+### How long a turn may run (`max_tool_iters`)
+
+A turn keeps calling tools until the model stops asking for them. There is no
+count it stops at unless you write one:
+
+```toml
+max_tool_iters = 40   # hard stop; 0 or absent means no cap
+```
+
+The default used to be 14, and it was described as a runaway guard. It was not
+one - it was a work budget wearing a guard's clothes. A real session on an
+8-sheet workbook spent all fourteen calls reading sheets, at which point the
+engine cut the turn off and asked the model to summarise work it had not
+finished. The user read a summary of a third of a spreadsheet; the model had
+been two calls from the answer.
+
+So the cap is a knob, uncapped by default, and a turn that goes past where the
+old build would have stopped says so once:
+
+```
+15 tool calls so far and no cap set; set max_tool_iters in config.toml to bound a turn
+```
+
+That line is the guard now: you find out a turn is long by seeing it is long,
+not by having it taken away. Cancel still works at any iteration, and a cap you
+*do* set is honoured exactly - it forces a wrap-up instead of running out.
+
 ### Motion
 
 Everything moves on one curve (`cubic-bezier(.2,.7,.2,1)`) with three durations, and
@@ -463,6 +490,32 @@ separate tool and deliberately not here yet: re-serializing a workbook quietly
 throws away the parts you did not ask about, so it will be a surgical zip edit
 with a preservation test, or nothing.
 
+Three things a real workbook forced into the structure output, because counts
+alone left the model guessing:
+
+- **the merge ranges themselves**, not just "1 merged ranges": `merges: A1:F1`
+  says the sheet has a title block, which is the difference between a table and
+  a form;
+- **rows 1-3**, not just row 1: real sheets open with a school name and a
+  treasurer's name, and the header is row 3. Showing only row 1 named nothing;
+- **the flow between sheets**: `"Local Fund " -> "Canteen" (2 formula
+  reference(s))`. Ask a model to "learn the flow" of a workbook and this is the
+  question it is trying to answer; without it, it unzips the package and greps
+  the XML.
+
+A whole workbook is one call, not one call per sheet: `sheet: "*"` sweeps every
+visible sheet and splits the cell budget between them, saying so (`# 8 sheets in
+one call, 250 cells each`). Hidden sheets are skipped with a note naming how to
+read one. For wide sheets, or sheets holding several blocks side by side, `cell_addresses: true`
+prints `A1=First Canvassing C1=01/16/2026` instead of a tab grid - counting
+empty tabs across 29 columns is how columns get mis-read, and a model in a real
+session wrote a script to produce this exact format by hand.
+
+One honest limit: shared formulas are read from the cell that defines them. A
+formula that only inherits its text (`<f t="shared" si="3"/>`) carries no
+expression, so cross-sheet flow sees the master, not all 284 members. The
+structure output says how many formulas are shared for exactly that reason.
+
 **`sheet_query` is there because the model asked for it by writing one.** After
 `sheet_read` showed it a 1000-row workbook, the agent could see cells but could
 not total a column, so it wrote its own: 111 lines of Python that unzip an .xlsx
@@ -471,11 +524,26 @@ the sheet becomes a read-only SQLite table (`t`, one row per row, `rownum` for t
 sheet's own row number) and one `SELECT` answers the question - `GROUP BY`,
 `SUM`, `ORDER BY`, top-N - with the result capped at 200 rows and a note saying how
 to page. Read-only is engine-enforced: one statement, `SELECT`/`WITH`/`EXPLAIN`
-only, and `SQLITE_LIMIT_ATTACHED=0` so the query cannot reach for a file. Columns
-are named from row 1 (`Unit Cost` -> `unit_cost`), blanks are NULL, and a column is
-only numeric if every value round-trips through the number: `01234` stays text,
-because silently turning a code into an integer is corruption between the read and
-the write.
+only, and `SQLITE_LIMIT_ATTACHED=0` so the query cannot reach for a file. Blanks
+are NULL, and a column is only numeric if every value round-trips through the
+number: `01234` stays text, because silently turning a code into an integer is
+corruption between the read and the write.
+
+The header row is found, not assumed. `sheet_query` used to name its columns from
+the first row that had anything in it, and on a real workbook that row is a
+title: the cash-flow file's columns came out as `burgos_elementary_school | c2 |
+c3`, which made the tool useless and sent the model back to the shell. Rows are
+now scored - filled out, text rather than numbers, distinct labels, data beneath
+- and the winner is reported where you can argue with it:
+
+```
+# header: sheet row 3 -> DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex)
+# note: rows 1-2 sit above the header (titles, names, dates) so they are not rows of t.
+```
+
+Rows above the header are not records, so `COUNT(*)` counts entries rather than
+the school's name. `header_row` forces a row, `header: false` means "there is no
+header" and gives you `c1..cN` with every row kept as data.
 
 **`ask_user` stops the agent guessing.** One question, one to six options, one
 marked recommended, and a typed answer always available. The TUI answers with
