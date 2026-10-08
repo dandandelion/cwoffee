@@ -34,7 +34,11 @@ url = "2"
 # bundled: we ship a desktop app; depending on the distro's libsqlite3 means
 # FTS5 may or may not be compiled in, and a missing virtual table is a runtime
 # failure on the user's machine rather than a build failure on ours.
-rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "hooks", "limits"] }
+# `hooks` and `limits` are for sheet_query, not for the session store: the
+# progress handler puts a wall clock on a model-authored query, and
+# SQLITE_LIMIT_ATTACHED=0 makes "read-only" a fact of the engine rather than
+# a promise in a tool description. Both are rusqlite modules, no new crate.
 chrono = "0.4"
 toml = "0.8"
 

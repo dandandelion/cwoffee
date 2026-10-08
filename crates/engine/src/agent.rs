@@ -141,7 +141,24 @@ impl Agent {
     /// Files the last turn produced. The host persists these onto the assistant
     /// row so they survive a reload; the event is only the live path.
     pub fn take_turn_files(&mut self) -> Vec<crate::tools::OutputFile> {
+        self.drop_deleted_turn_files();
         std::mem::take(&mut self.turn_files)
+    }
+
+    /// Drop the files this turn produced and then deleted.
+    ///
+    /// A chip in the transcript is a button. The model that writes a scratch
+    /// script, runs it, and removes the folder afterwards - which is what a
+    /// careful agent does, and what one did in a real session - left two chips
+    /// pointing at paths that no longer existed. The test is existence when the
+    /// turn closes rather than a delete event: the tool surface has no "unproduce"
+    /// result, and a file the *user* removed mid-turn deserves the same treatment.
+    fn drop_deleted_turn_files(&mut self) {
+        if self.turn_files.is_empty() {
+            return;
+        }
+        let ws = self.ctx.workspace.clone();
+        self.turn_files.retain(|f| ws.join(&f.path).exists());
     }
 
     /// Record a file this turn produced.
@@ -162,6 +179,7 @@ impl Agent {
     }
 
     fn emit_turn_files(&mut self, turn: u64, out: &EngineSink) {
+        self.drop_deleted_turn_files();
         if self.turn_files.is_empty() {
             return;
         }
@@ -1210,6 +1228,15 @@ mod tests {
         let (atx, _arx) = mpsc::unbounded_channel();
         let mut reg = Registry::new();
         reg.register(Box::new(Producer::default()));
+        // A real workspace with a real file in it: turn files are checked against
+        // the disk before they become chips, so the fixture has to be on the disk.
+        let dir = std::env::temp_dir().join(format!(
+            "cwoffee_turnfiles_{}_dup",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("report.md"), "# hi\n").unwrap();
         let mut agent = Agent::new(
             Arc::new(Scripted {
                 turns: vec![
@@ -1236,7 +1263,10 @@ mod tests {
             reg,
             ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
             AgentConfig::default(),
-            ToolCtx::default(),
+            ToolCtx {
+                workspace: dir.clone(),
+                ..Default::default()
+            },
         );
         agent.run_turn("go", vec![], &etx).await;
 
@@ -1245,6 +1275,56 @@ mod tests {
         // Metadata is the latest write, so the size the chip shows is the size
         // of what is on disk now.
         assert_eq!(files[0].bytes, 200, "kept the wrong revision: {files:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A turn that cleans up after itself produces nothing to show. The model
+    /// that writes a scratch script, runs it, and `rm -rf`s the folder is doing
+    /// the right thing; the transcript used to answer that with chips pointing at
+    /// paths that no longer existed.
+    #[tokio::test]
+    async fn a_file_the_turn_deleted_is_not_an_attachment() {
+        let (etx, _erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Producer::default()));
+        let dir = std::env::temp_dir().join(format!(
+            "cwoffee_turnfiles_{}_deleted",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("report.md"), "# hi\n").unwrap();
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "p1".into(),
+                            name: "producer".into(),
+                            arguments: "{}".into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
+            AgentConfig::default(),
+            ToolCtx {
+                workspace: dir.clone(),
+                ..Default::default()
+            },
+        );
+        agent.run_turn("go", vec![], &etx).await;
+        // The cleanup call, arriving as a real deletion on disk.
+        std::fs::remove_file(dir.join("report.md")).unwrap();
+
+        let files = agent.take_turn_files();
+        assert!(files.is_empty(), "a deleted scratch file is still an artifact: {files:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

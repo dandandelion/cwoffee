@@ -12,6 +12,7 @@ pub mod exec;
 pub mod files;
 pub mod path;
 pub mod repair;
+pub mod sheet_sql;
 pub mod sheets;
 pub mod searxng;
 pub mod web;
@@ -367,6 +368,10 @@ impl Registry {
         // model eyes on a workbook the user already has - until now the engine could
         // write .xlsx files and could not open one.
         r.register(Box::new(sheets::SheetReadTool));
+        // Appended after sheet_read for the same reason edit_file was: a tool
+        // schema is prompt bytes, so a new tool has to arrive as a suffix. The
+        // tool_order test failing is the proof this is an addition, not a reshuffle.
+        r.register(Box::new(sheet_sql::SheetQueryTool));
         r
     }
 
@@ -533,7 +538,42 @@ mod cfg_tests {
                 "edit_file",
                 "ask_user",
                 "sheet_read",
+                "sheet_query",
             ]
+        );
+    }
+
+    /// Tool schemas are prompt bytes: the block is re-sent on every turn of every
+    /// session, and on a one-slot llama.cpp endpoint it is part of what gets
+    /// re-prefilled whenever the prefix moves. So the cost of the surface is a
+    /// number someone had to write down, and a description that sprawls fails a
+    /// check instead of quietly charging the user prefill for the rest of the
+    /// machine's life.
+    #[test]
+    fn the_tool_block_costs_what_it_says_it_costs() {
+        let r = Registry::with_v1_tools();
+        let defs = r.defs();
+        let each: Vec<(String, usize)> = defs
+            .iter()
+            .map(|d| (d.name.clone(), serde_json::to_string(d).unwrap().len()))
+            .collect();
+        let total: usize = each.iter().map(|(_, b)| b).sum();
+        let one = each
+            .iter()
+            .find(|(n, _)| n == "sheet_query")
+            .map(|(_, b)| *b)
+            .unwrap_or(0);
+        eprintln!(
+            "[cwoffee/test] tool block {total} bytes: {}",
+            each.iter()
+                .map(|(n, b)| format!("{n}={b}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(one > 0 && one < 1600, "sheet_query alone is {one} bytes");
+        assert!(
+            total < 11_000,
+            "the whole tool block is {total} bytes: two spreadsheet tools now, and              a description longer than this is a per-turn tax on every session"
         );
     }
 }

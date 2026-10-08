@@ -401,7 +401,7 @@ window management eventually fails on a screensaver.
 ## Files, and asking instead of guessing
 
 The agent's file tools are `read_file`, `write_file`, `edit_file`, `write_xlsx`,
-`sheet_read`, `download_file`. Three decisions there are worth knowing about:
+`sheet_read`, `sheet_query`, `download_file`. Four decisions there are worth knowing about:
 
 **`edit_file` is search-and-replace, not a diff.** A 4-bit local model copying a
 line it can see does far better than one generating hunks with correct line
@@ -427,6 +427,20 @@ thousands of prefill tokens on a single-slot endpoint. Editing an `.xlsx` is a
 separate tool and deliberately not here yet: re-serializing a workbook quietly
 throws away the parts you did not ask about, so it will be a surgical zip edit
 with a preservation test, or nothing.
+
+**`sheet_query` is there because the model asked for it by writing one.** After
+`sheet_read` showed it a 1000-row workbook, the agent could see cells but could
+not total a column, so it wrote its own: 111 lines of Python that unzip an .xlsx
+and parse `sharedStrings.xml` by hand, then another script for the aggregates. So
+the sheet becomes a read-only SQLite table (`t`, one row per row, `rownum` for the
+sheet's own row number) and one `SELECT` answers the question - `GROUP BY`,
+`SUM`, `ORDER BY`, top-N - with the result capped at 200 rows and a note saying how
+to page. Read-only is engine-enforced: one statement, `SELECT`/`WITH`/`EXPLAIN`
+only, and `SQLITE_LIMIT_ATTACHED=0` so the query cannot reach for a file. Columns
+are named from row 1 (`Unit Cost` -> `unit_cost`), blanks are NULL, and a column is
+only numeric if every value round-trips through the number: `01234` stays text,
+because silently turning a code into an integer is corruption between the read and
+the write.
 
 **`ask_user` stops the agent guessing.** One question, one to six options, one
 marked recommended, and a typed answer always available. The TUI answers with

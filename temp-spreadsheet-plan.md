@@ -185,3 +185,71 @@ an impossible string) fails the run as it must.
 Stage 2 starts at the preservation test, not at the editor: a fixture workbook
 with charts, merges, pivot tables, formulas and styles, an edit to one cell, and an
 assertion that every untouched part is byte-identical.
+
+---
+
+## Stage 1b: the question the reader could not answer (landed)
+
+Stage 1 made the sheet visible. A real session then showed what visibility is
+worth without queryability: the model read a 1000-row inventory workbook, could
+not total a column, and wrote its own parser — 111 lines of Python that unzip an
+.xlsx and parse `sharedStrings.xml`, plus 62 more for the aggregates, after two
+calls wasted on `import openpyxl` and on assuming `/tmp` survives between `exec`
+calls. It ended at the output cap with a degenerate tail.
+
+What landed:
+
+* **`sheet_query`** (appended after `sheet_read` in the fixed tool order, so the
+  prompt diff is a pure suffix): loads the sheet or delimited file into an
+  in-memory SQLite table `t` and runs one `SELECT`. `rownum` keeps the sheet's own
+  row number; row 1 supplies the column names (`Unit Cost` → `unit_cost`, deduped
+  as `unit_cost_2`); blanks are NULL; a column is numeric only if every value
+  round-trips through the number, so `01234` stays `TEXT`; results are capped at
+  200 rows (1000 max) with a note saying how to page.
+* **Read-only as an engine fact**: one statement, `SELECT`/`WITH`/`EXPLAIN` only,
+  `SQLITE_LIMIT_ATTACHED = 0`, progress handler with a 5 s wall clock. Each half
+  has a negative test, including a cartesian blow-up that must be interrupted.
+* **`sheet_read`'s "an edit here would have to preserve" line now counts styles and
+  defined names.** It used to say "only the cells" about a workbook with an
+  AutoFilter, blue bold headers and a custom `$#,##0.00` format — and the test that
+  asserted that phrase was wrong, because a real writer always emits `styles.xml`.
+  A hand-built package with no styles is now its own counter-test.
+* **Values mode says a format is not a value**: a workbook with custom number
+  formats gets `values are the stored numbers, not the formatted text (a money cell
+  arrives as 9.72, not $9.72)`.
+* **Artifact chips respect deletion**: a file the turn deleted produces no chip.
+  Existence is checked when the turn closes; there is no "unproduce" tool result.
+* **`exec` says what is ephemeral**: the description now states that each call gets
+  a fresh filesystem and `/tmp` does not survive to the next call, so scratch files
+  belong in the workspace. That assumption cost the model a call in the session
+  above.
+
+Live proof (real endpoint, one probe turn, cleaned up afterwards): three calls —
+`sheet_read`, `sheet_query` for the group totals, `sheet_query` for the grand total
+— `finish=stop` in 22.5 s, correct numbers (West 57 of 121), zero `exec`, zero
+model-authored parser. Numbers and gates: `docs/BENCHMARKS.md`, "the model stopped
+writing its own spreadsheet parser".
+
+Cost of the two tools, measured: `sheet_read` 1,159 bytes + `sheet_query` 1,355
+bytes, whole tool block 9,459 bytes (`the_tool_block_costs_what_it_says_it_costs`).
+
+## Open: sampling parameters
+
+Question from the user: does Cwoffee send any sampling config, or does the server
+decide? Answer today: **the server decides.** `ChatRequest` carries
+`temperature` / `top_p` / `top_k` / `min_p` / `seed` fields, but nothing sets them
+and the OpenAI adapter omits nulls, so llama.cpp's defaults apply. On this
+endpoint `/props` reports `temperature=1.0, top_p=0.95, top_k=20, min_p=0.0`.
+
+That matters because of the transcript above: at temperature 1.0, a long agentic
+turn can drift, and the failure mode we hit was a run of `!` at the output cap.
+The next change is a `[sampling]` section in `config.toml` where every key is
+optional — unset means "do not send it, let the server decide" — with the endpoint's
+reported defaults logged at boot so the user knows what they are leaving alone.
+No default value is invented for someone else's endpoint.
+
+## Stage 2 unchanged, still the gate for writes
+
+Preservation fixture first (charts, merges, pivots, formulas, styles, tables,
+validations, conditional formats), edit one cell, assert every untouched zip part
+is byte-identical. Only then does an editing tool exist.

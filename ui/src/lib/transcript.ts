@@ -2358,6 +2358,11 @@ const TOOL_HEAD: Record<string, { run: string; done: string; bad: string }> = {
     done: 'Read a spreadsheet',
     bad: 'Could not read that spreadsheet',
   },
+  sheet_query: {
+    run: 'Asking the spreadsheet a question',
+    done: 'Answered from the spreadsheet',
+    bad: 'Could not query that spreadsheet',
+  },
   write_xlsx: { run: 'Writing a spreadsheet', done: 'Wrote a spreadsheet', bad: 'Could not write the spreadsheet' },
   download_file: { run: 'Downloading a file', done: 'Downloaded a file', bad: 'Could not download that file' },
   web_fetch: { run: 'Opening a page', done: 'Opened a page', bad: 'Could not open that page' },

@@ -336,6 +336,23 @@ pub fn summarize(tool: &str, args: &serde_json::Value) -> String {
             "read cells from: {}",
             crate::tools::repair::field_as_string(args, "path").unwrap_or_else(|| "???".into())
         ),
+        // A query outside the workspace is still a read, but the approver should
+        // see *which* file and *what* was asked: "run a query" is not weighable,
+        // and the query is short enough to fit on the line.
+        "sheet_query" => {
+            let path =
+                crate::tools::repair::field_as_string(args, "path").unwrap_or_else(|| "???".into());
+            let q =
+                crate::tools::repair::field_as_string(args, "query").unwrap_or_else(|| "???".into());
+            let q: String = q.split_whitespace().collect::<Vec<_>>().join(" ");
+            let q = if q.chars().count() > 160 {
+                let cut: String = q.chars().take(157).collect();
+                format!("{cut}...")
+            } else {
+                q
+            };
+            format!("query cells of {path}: {q}")
+        }
         "write_xlsx" => format!(
             "write spreadsheet: {}",
             crate::tools::repair::field_as_string(args, "path").unwrap_or_else(|| "???".into())
@@ -398,6 +415,29 @@ mod tests {
     fn gate(mode: ApprovalMode) -> (ApprovalGate, mpsc::UnboundedReceiver<(ApprovalRequest, oneshot::Sender<ApprovalAnswer>)>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (ApprovalGate::new(mode, tx), rx)
+    }
+
+    /// A query is only weighable if the line shows the file and the ask. The
+    /// fallback summary prints the raw argument blob, which for a SELECT is a
+    /// wall the approver cannot read in the second they have.
+    #[test]
+    fn a_query_approval_names_the_file_and_the_query() {
+        let args = serde_json::json!({
+            "path": "Budget.xlsx",
+            "query": "SELECT   category,\n  SUM(amount) FROM t GROUP BY category"
+        });
+        let line = summarize("sheet_query", &args);
+        assert!(line.contains("Budget.xlsx"), "{line}");
+        assert!(line.contains("SUM(amount)"), "{line}");
+        assert!(!line.contains("\n"), "the summary has to stay one line: {line:?}");
+
+        let long = serde_json::json!({
+            "path": "Budget.xlsx",
+            "query": format!("SELECT {} FROM t", "a,".repeat(200))
+        });
+        let clipped = summarize("sheet_query", &long);
+        assert!(clipped.chars().count() < 240, "{} chars", clipped.chars().count());
+        assert!(clipped.ends_with("..."), "{clipped}");
     }
 
     #[tokio::test]

@@ -45,7 +45,9 @@ impl Tool for ExecTool {
 
     fn description(&self) -> &str {
         "Run a shell command in a sandbox (no network, host filesystem read-only, \
-         only the workspace is writable). Returns stdout and stderr combined. \
+         only the workspace is writable). Each call gets a fresh filesystem: /tmp and \
+         anything you create outside the workspace is gone before the next call, so \
+         scratch files belong in the workspace. Returns stdout and stderr combined. \
          Do not author file contents here: no here-documents and no long echo/printf \
          redirections. Write files with write_file, which takes the content as an \
          argument and shows the approver a diff instead of a wall of text."

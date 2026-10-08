@@ -518,6 +518,51 @@
      "delay_ms": 10
     }
    ]
+  },
+  {
+   "name": "sheet-query-csv",
+   "_why": "the gap this closes: after sheet_read the model could see cells but not total a column, so in a real session it wrote a 111-line Python xlsx parser. This step makes it ask the question, and require makes the engine's own result grid the proof",
+   "match": "Selftest sheet-query",
+   "steps": [
+    {
+     "reasoning": "A file to query. Make it first.",
+     "tool_calls": [
+      {
+       "id": "mock-q1",
+       "name": "write_file",
+       "arguments": "{\"path\": \"$path\", \"content\": \"Region,Units,Price\\nNorth,12,3\\nSouth,7,4\\nWest,26,2\\nEast,9,5\\n\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "require": [
+      "created",
+      "selftest-query.csv"
+     ],
+     "reasoning": "Totals per region: one query, not four reads.",
+     "tool_calls": [
+      {
+       "id": "mock-q2",
+       "name": "sheet_query",
+       "arguments": "{\"path\": \"$path\", \"query\": \"SELECT region, SUM(units) AS units FROM t GROUP BY region ORDER BY units DESC\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "require": [
+      "West\t26",
+      "# columns: rownum | region | units | price"
+     ],
+     "content": "Per region: West 26, North 12, East 9, South 7. West is the biggest.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 10
+    }
+   ]
   }
  ]
 }

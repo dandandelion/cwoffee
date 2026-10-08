@@ -36,7 +36,7 @@ use super::{clamp, CallRisk, Risk, Tool, ToolCtx, ToolResult};
 
 /// Above this, say so rather than try. A 200 MB workbook is a database, and the
 /// honest answer is a smaller export or an exec pipeline.
-const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Decompressed ceiling for one zip part. A bomb declares gigabytes; we refuse
 /// rather than find out from the OOM killer.
@@ -59,7 +59,7 @@ const MAX_SCAN_CELLS: usize = 400_000;
 /// Excel's own grid limits. `nope` looks like a column name and is not one, and a
 /// model that types a sheet name into `range` should be told rather than pointed at
 /// column four million.
-const MAX_COL: usize = 16_384; // XFD
+pub(crate) const MAX_COL: usize = 16_384; // XFD
 const MAX_ROW: usize = 1_048_576;
 
 /// 0-based column: "A" -> 0, "Z" -> 25, "AA" -> 26.
@@ -80,7 +80,7 @@ fn col_of(letters: &str) -> Option<usize> {
     }
 }
 
-fn col_name(idx: usize) -> String {
+pub(crate) fn col_name(idx: usize) -> String {
     let mut out = Vec::new();
     let mut n = idx + 1;
     while n > 0 {
@@ -108,16 +108,16 @@ fn split_ref(ref_text: &str) -> Option<(usize, usize)> {
     Some((row - 1, col))
 }
 
-struct Rect {
-    r1: usize,
-    c1: usize,
-    r2: usize,
-    c2: usize,
+pub(crate) struct Rect {
+    pub(crate) r1: usize,
+    pub(crate) c1: usize,
+    pub(crate) r2: usize,
+    pub(crate) c2: usize,
 }
 
 /// `A1:D12`, `B7`, `A:D`, `3:9`. Sheet-qualified input (`Sales!A1:D12`) is accepted
 /// and the sheet part ignored, because that is how it appears in spreadsheets.
-fn parse_rect(spec: &str) -> Result<Rect, String> {
+pub(crate) fn parse_rect(spec: &str) -> Result<Rect, String> {
     let spec = spec.trim();
     let body = match spec.find('!') {
         Some(i) => spec[i + 1..].trim(),
@@ -211,10 +211,10 @@ fn scan_hazards(names: impl Iterator<Item = String>) -> Hazards {
     h
 }
 
-struct SheetMeta {
-    name: String,
-    part: String,
-    hidden: bool,
+pub(crate) struct SheetMeta {
+    pub(crate) name: String,
+    pub(crate) part: String,
+    pub(crate) hidden: bool,
 }
 
 /// Read one zip part with a hard cap on the decompressed size.
@@ -362,7 +362,7 @@ fn resolve_target(target: &str) -> String {
 
 /// `xl/workbook.xml` and its rels, in the order the user sees the tabs. The sheet
 /// element carries a *relationship id*, not a path, so the rels are read first.
-fn workbook_meta(
+pub(crate) fn workbook_meta(
     zip: &mut ZipArchive<std::fs::File>,
 ) -> Result<(Vec<SheetMeta>, Vec<String>), String> {
     let mut rels: BTreeMap<String, String> = BTreeMap::new();
@@ -430,7 +430,7 @@ fn workbook_meta(
 
 /// `xl/sharedStrings.xml`: one entry per `<si>`, with rich-text runs concatenated -
 /// the styling lives in `styles.xml` and a reader wants the text.
-fn shared_strings(zip: &mut ZipArchive<std::fs::File>) -> Vec<String> {
+pub(crate) fn shared_strings(zip: &mut ZipArchive<std::fs::File>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if zip.by_name("xl/sharedStrings.xml").is_err() {
         return out;
@@ -503,7 +503,7 @@ fn custom_date_fmt(code: &str) -> bool {
 }
 
 /// Index -> is-date for `cellXfs`, which is what a cell's `s` attribute points at.
-fn date_styles(zip: &mut ZipArchive<std::fs::File>) -> Vec<bool> {
+pub(crate) fn date_styles(zip: &mut ZipArchive<std::fs::File>) -> Vec<bool> {
     let mut out = Vec::new();
     if zip.by_name("xl/styles.xml").is_err() {
         return out;
@@ -538,6 +538,42 @@ fn date_styles(zip: &mut ZipArchive<std::fs::File>) -> Vec<bool> {
         })?;
         out = xf;
         Ok(())
+    });
+    out
+}
+
+/// What styling a workbook carries. Two reasons to count it: an edit that
+/// re-serializes the package loses it, and a value grid that prints `9.72` for a
+/// cell the user sees as `$9.72` should say so rather than let the model explain
+/// the file by its storage.
+#[derive(Default)]
+pub(crate) struct StyleSummary {
+    pub(crate) custom_fmts: usize,
+    pub(crate) cell_fmts: usize,
+    pub(crate) fonts: usize,
+    pub(crate) fills: usize,
+}
+
+pub(crate) fn style_summary(zip: &mut ZipArchive<std::fs::File>) -> StyleSummary {
+    let mut out = StyleSummary::default();
+    if zip.by_name("xl/styles.xml").is_err() {
+        return out;
+    }
+    let _ = read_part(zip, "xl/styles.xml", |r| {
+        visit(r, |ev| {
+            if let Visit::Open { tag, attrs: _ } = ev {
+                match tag {
+                    // numFmt entries are the ones a viewer wrote down by hand;
+                    // the built-in ids are not declared in the part at all.
+                    "numFmt" => out.custom_fmts += 1,
+                    "xf" => out.cell_fmts += 1,
+                    "font" => out.fonts += 1,
+                    "fill" => out.fills += 1,
+                    _ => {}
+                }
+            }
+            Ok(())
+        })
     });
     out
 }
@@ -610,16 +646,16 @@ struct SheetStat {
     capped_scan: bool,
 }
 
-struct SheetContent {
+pub(crate) struct SheetContent {
     /// row index -> column index -> rendered text
-    rows: BTreeMap<usize, BTreeMap<usize, String>>,
+    pub(crate) rows: BTreeMap<usize, BTreeMap<usize, String>>,
     stat: SheetStat,
-    truncated: bool,
+    pub(crate) truncated: bool,
 }
 
 /// Read one worksheet part, keeping only cells inside `want` (all of them when
 /// None, capped at `max_cells`).
-fn read_sheet(
+pub(crate) fn read_sheet(
     zip: &mut ZipArchive<std::fs::File>,
     part: &str,
     ss: &[String],
@@ -938,7 +974,7 @@ fn render_cell(t: &str, v: &str, inline: &str, style: u32, styles: &[bool], ss: 
 
 /// RFC4180-shaped: quoted fields, doubled quotes inside them, newlines inside
 /// quotes, CRLF tolerated, BOM stripped.
-fn parse_delimited(text: &str, delim: char) -> Vec<Vec<String>> {
+pub(crate) fn parse_delimited(text: &str, delim: char) -> Vec<Vec<String>> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
@@ -986,7 +1022,7 @@ fn parse_delimited(text: &str, delim: char) -> Vec<Vec<String>> {
     rows
 }
 
-fn pick_delim(ext: &str, over: Option<&str>) -> char {
+pub(crate) fn pick_delim(ext: &str, over: Option<&str>) -> char {
     if let Some(o) = over.map(str::trim).filter(|s| !s.is_empty()) {
         if let Some(c) = o.chars().next() {
             return c;
@@ -1003,7 +1039,7 @@ fn pick_delim(ext: &str, over: Option<&str>) -> char {
 
 /// The grid separator is a tab, so a tab or newline inside a cell has to be an
 /// escape, and a literal backslash has to be doubled to be reversible.
-fn esc(v: &str) -> String {
+pub(crate) fn esc(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for c in v.chars() {
         match c {
@@ -1035,6 +1071,26 @@ fn grid_lines(rows: &BTreeMap<usize, BTreeMap<usize, String>>, cols: &[usize]) -
 // ---------------------------------------------------------------------------
 // the tool
 
+/// Both sheet tools share one risk shape: reading inside the workspace is never
+/// gated (a prompt on a benign read trains the user to click through the prompt
+/// that matters), and a path outside it is named in the approval.
+pub(crate) fn read_call_risk(args: &Value, ctx: &ToolCtx) -> CallRisk {
+    let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if raw.trim().is_empty() || raw.contains('\0') {
+        return CallRisk::at(Risk::Harmless);
+    }
+    let p = lexical_resolve(&ctx.workspace, raw);
+    let ws = lexical_resolve(&ctx.workspace, ".");
+    if p == ws || p.starts_with(&ws) {
+        CallRisk::at(Risk::Harmless)
+    } else {
+        CallRisk {
+            level: Risk::Sensitive,
+            escapes: vec![p.display().to_string()],
+        }
+    }
+}
+
 pub struct SheetReadTool;
 
 #[async_trait]
@@ -1046,7 +1102,9 @@ impl Tool for SheetReadTool {
     fn description(&self) -> &str {
         "Read a spreadsheet or delimited file without changing it. mode \"structure\" \
          lists sheets, sizes and what an edit would have to preserve; mode \"values\" \
-         returns cells, tab-separated and paged. Handles .xlsx, .csv and .tsv."
+         returns cells, tab-separated and paged. For a total, a count, a group or a \
+         top-N across the whole file, use sheet_query rather than reading cells and \
+         adding them up yourself. Handles .xlsx, .csv and .tsv."
     }
 
     fn schema(&self) -> Value {
@@ -1073,20 +1131,7 @@ impl Tool for SheetReadTool {
     /// read trains the user to click through the prompt that matters. Outside it,
     /// the path is named and the normal per-call permit machinery applies.
     fn risk_for(&self, args: &Value, ctx: &ToolCtx) -> CallRisk {
-        let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        if raw.trim().is_empty() || raw.contains('\0') {
-            return CallRisk::at(Risk::Harmless);
-        }
-        let p = lexical_resolve(&ctx.workspace, raw);
-        let ws = lexical_resolve(&ctx.workspace, ".");
-        if p == ws || p.starts_with(&ws) {
-            CallRisk::at(Risk::Harmless)
-        } else {
-            CallRisk {
-                level: Risk::Sensitive,
-                escapes: vec![p.display().to_string()],
-            }
-        }
+        read_call_risk(args, ctx)
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &super::ExecSink) -> ToolResult {
@@ -1235,12 +1280,21 @@ fn read_xlsx(
 
     let mut out = String::new();
     out.push_str(&format!("# {rel} - {} sheet(s)\n", sheets.len()));
+    let style_info = style_summary(&mut zip);
     if !want_values {
-        let hz = hazard_line(&hazards);
-        out.push_str(&format!("# an edit here would have to preserve: {hz}\n"));
+        out.push_str(&format!(
+            "# an edit here would have to preserve: {}\n",
+            preserve_line(&hazards, &style_info, defined.len())
+        ));
         if !defined.is_empty() {
             out.push_str(&format!("# defined names: {}\n", defined.join(" | ")));
         }
+    } else if style_info.custom_fmts > 0 {
+        out.push_str(&format!(
+            "# note: {} custom number format(s) in this workbook: values are the stored \
+             numbers, not the formatted text (a money cell arrives as 9.72, not $9.72)\n",
+            style_info.custom_fmts
+        ));
     }
 
     let ss = shared_strings(&mut zip);
@@ -1373,7 +1427,29 @@ fn read_xlsx(
     Ok(out.trim_end().to_string())
 }
 
-fn hazard_line(h: &Hazards) -> String {
+/// What an edit would have to keep. Styles and defined names belong here: a
+/// workbook whose header row is blue, bold and white-on-#4472C4 and whose money
+/// cells carry a custom `$#,##0.00` format is not "only the cells", and a tool
+/// that says "only the cells" invites the next stage to overwrite the file.
+fn preserve_line(h: &Hazards, st: &StyleSummary, defined: usize) -> String {
+    let mut bits = hazard_bits(h);
+    if st.custom_fmts > 0 || st.cell_fmts > 1 || st.fonts > 1 || st.fills > 1 {
+        bits.push(format!(
+            "styles ({} cell format(s), {} custom number format(s), {} font(s), {} fill(s))",
+            st.cell_fmts, st.custom_fmts, st.fonts, st.fills
+        ));
+    }
+    if defined > 0 {
+        bits.push(format!("{defined} defined name(s)"));
+    }
+    if bits.is_empty() {
+        "only the cells".into()
+    } else {
+        bits.join(", ")
+    }
+}
+
+fn hazard_bits(h: &Hazards) -> Vec<String> {
     let mut bits = Vec::new();
     if h.charts > 0 {
         bits.push(format!("{} chart(s)", h.charts));
@@ -1399,11 +1475,7 @@ fn hazard_line(h: &Hazards) -> String {
     if h.macros {
         bits.push("macros".into());
     }
-    if bits.is_empty() {
-        "only the cells".into()
-    } else {
-        bits.join(", ")
-    }
+    bits
 }
 
 fn delimited_text(
@@ -1607,7 +1679,78 @@ mod tests {
         assert!(r.output.contains("\"Notes\""), "{}", why(&r));
         // Without the header row a model cannot talk about the columns.
         assert!(r.output.contains("Region | Units | Total"), "{}", why(&r));
+        // A real writer always emits styles.xml, so a generated workbook is not
+        // "only the cells" and never was: it carries cell formats and fonts that a
+        // careless edit would drop.
+        assert!(
+            r.output.contains("styles (") && r.output.contains("custom number format"),
+            "{}",
+            why(&r)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_package_is_still_only_the_cells() {
+        // The counter-case, so the line above cannot be an always-true string.
+        let d = tmp("plain");
+        let sheet = concat!(
+            r#"<?xml version="1.0"?><worksheet><sheetData>"#,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>a</t></is></c></row>"#,
+            r#"</sheetData></worksheet>"#
+        );
+        let wb = r#"<?xml version="1.0"?><workbook><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        hand_xlsx(
+            &d,
+            &[
+                ("xl/workbook.xml", wb),
+                ("xl/_rels/workbook.xml.rels", rels),
+                ("xl/worksheets/sheet1.xml", sheet),
+            ],
+        );
+        let ctx = ctx_in(&d);
+        let r = call(&ctx, json!({"path": "hand.xlsx", "mode": "structure"})).await;
+        assert!(r.ok, "{}", why(&r));
         assert!(r.output.contains("only the cells"), "{}", why(&r));
+    }
+
+    #[tokio::test]
+    async fn styled_values_say_that_a_format_is_not_a_value() {
+        let d = tmp("moneyfmt");
+        let styles = concat!(
+            r#"<?xml version="1.0"?><styleSheet><numFmts count="1"><numFmt numFmtId="164" formatCode="$#,##0.00"/></numFmts>"#,
+            r#"<fonts count="2"><font/><font><b/></font></fonts><fills count="2"><fill/><fill/></fills>"#,
+            r#"<cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>"#
+        );
+        let sheet = concat!(
+            r#"<?xml version="1.0"?><worksheet><sheetData>"#,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>Price</t></is></c></row>"#,
+            r#"<row r="2"><c r="A2" s="1"><v>9.72</v></c></row>"#,
+            r#"</sheetData></worksheet>"#
+        );
+        hand_xlsx(
+            &d,
+            &[
+                ("xl/workbook.xml", WB),
+                ("xl/_rels/workbook.xml.rels", WBRELS),
+                ("xl/styles.xml", styles),
+                ("xl/worksheets/sheet1.xml", sheet),
+                ("xl/worksheets/sheet2.xml", EMPTY2),
+            ],
+        );
+        let ctx = ctx_in(&d);
+        let st = call(&ctx, json!({"path": "hand.xlsx", "mode": "structure"})).await;
+        assert!(st.ok, "{}", why(&st));
+        let line = why(&st);
+        assert!(line.contains("styles ("), "{line}");
+        assert!(line.contains("1 custom number format"), "{line}");
+        assert!(line.contains("2 font(s)"), "{line}");
+        assert!(line.contains("1 defined name(s)"), "{line}");
+        let v = call(&ctx, json!({"path": "hand.xlsx", "sheet": "Data"})).await;
+        assert!(v.ok, "{}", why(&v));
+        let out = why(&v);
+        assert!(out.contains("stored"), "the value grid should say a format is not a value:\n{out}");
+        assert!(out.contains("9.72"), "{out}");
     }
 
     #[tokio::test]

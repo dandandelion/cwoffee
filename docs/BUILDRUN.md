@@ -1988,3 +1988,66 @@ a model that typed a sheet name into `range` gets an enormous, empty,
 confidently-formatted answer. Excel's own limits (`XFD`, 1048576 rows) turn that
 into an error naming the format. Boundaries in a parser are where "silently
 nonsense" and "an error you can act on" part.
+
+### Trap 100: when the model starts writing its own tool, that is a gap report
+
+A real session asked the agent to describe `01 Retail Inventory.xlsx`. `sheet_read`
+worked: structure, then a bounded block of values. Then the model needed a column
+total, could not get one, and did something no prompt tweak fixes - it wrote its
+own spreadsheet reader: `write_file` 111 lines of Python that unzips the package
+and parses `sharedStrings.xml` by hand, then a second 62-line script for the
+aggregates. Seven tool calls, ~9k characters of model-authored parser in the
+prompt, and two calls wasted first on assumptions (`import openpyxl`, and that
+`/tmp` survives between `exec` calls).
+
+The tell is not an error message; it is generated code that reimplements a file
+format. A capability gap should be read as a feature request against the tool
+surface. The fix here was `sheet_query` - load the sheet into an in-memory SQLite
+table and let one `SELECT` answer the question - and the description of
+`sheet_read` now points at it, because a tool the model does not know about is a
+tool it will re-implement.
+
+### Trap 101: SQLite's progress handler interrupts when the callback returns *true*
+
+`progress_handler(nops, || elapsed >= budget)`. Writing the intuitive
+`elapsed < budget` compiles, runs, and never interrupts anything: a cartesian
+product over 400 rows (`FROM t a, t b, t c, t d`) sits there until it finishes or
+the process is killed. Every deadline guard needs a test that would fail if the
+predicate were inverted - the slow-query test exists for exactly that reason.
+
+### Trap 102: "every cell parses as an integer" is not the test for a numeric column
+
+`01234` parses as 1234. A column of codes, postcodes or account numbers coerced to
+`INTEGER` loses the thing that made it an identifier, and the loss happens between
+the read and any later write, where nobody is looking. Require the digits to
+round-trip (`i.to_string() == v`) before calling a column numeric; otherwise it is
+`TEXT` and the original bytes stay in the cell. The test asserts `01234` survives
+a `SELECT`, next to a test that `SUM(qty)` still works on a genuinely numeric
+column.
+
+### Trap 103: the header row is a name, not a record
+
+The first pass loaded row 1 as both the column names and a data row, so
+`COUNT(*)` over a 1000-row sheet returned 1001 and a `GROUP BY` grew a
+`"category"` group. Off-by-one aggregates read as "the file has junk in it", which
+is a complaint about the user's data rather than about the tool. Exclude the header
+from the rows, and count what was actually inserted.
+
+### Trap 104: a capability line that is always true is decoration
+
+`sheet_read` reported "an edit here would have to preserve: only the cells" for a
+workbook with an AutoFilter, bold white-on-blue headers and a custom `$#,##0.00`
+number format. The package scanner only looked at charts, pivots and macros. Now
+styles and defined names are counted too - and the test that used to assert
+"only the cells" was *wrong*, because a real writer always emits `styles.xml`; the
+counter-case (a hand-built package with no styles and no names) became its own
+test so the phrase still means something.
+
+### Trap 105: a chip for a file the turn deleted is a button that opens nothing
+
+The session in Trap 100 cleaned up after itself - `rm -rf _xlsx_extract` - and the
+transcript still showed two chips for `analyze.py` and `analyze2.py`. Existence is
+checked when the turn closes, not by watching for delete events: the tool surface
+has no "unproduce" result, and a file the *user* removed mid-turn deserves the same
+treatment. Both halves are tested: a file produced twice is one chip, and a file
+the turn deleted is none.

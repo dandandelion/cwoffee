@@ -128,6 +128,7 @@ and uses its own gateway port. Consequences worth knowing:
 | `bold-split-live` | the same answer in 3-character chunks with a 130 ms gap, i.e. one bold construct split across two paints. Pins that no literal `*` reaches the screen and that no words are dropped from a construct whose opener landed in an earlier paint than its closer. |
 | `fake-table-head` | a line that opens with a pipe and is *not* a table, then prose. Pins that waiting on an ambiguous first line may delay, but may never drop: the words have to be on screen at the end. |
 | `sheet-read-csv` | the model writes a delimited file, then reads it back with `sheet_read` under a 6-cell cap. Pins that the tool card shows the engine's own grid, that the cap is honoured, and that the continuation range continues from the last row actually shown. The step also carries `require`, so a tool result that never reached the prompt fails the turn. |
+| `sheet-query-csv` | the model writes a delimited file and then totals a column with `sheet_query`. `require` names the engine's own result grid (`West\t26`, the column list), so a query tool that ran but returned nothing useful fails the run. This is the gap that made a real session write a 111-line Python xlsx parser. |
 
 Scenario selection is the `match` substring of the newest user message that has a
 scenario, then **assistant messages since that message** as the step index.

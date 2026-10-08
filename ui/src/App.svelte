@@ -4321,6 +4321,55 @@
           }
         }
 
+        // (a6) the model totals a column instead of writing its own parser
+        //
+        // The transcript this pins is a real one: after `sheet_read` had shown it
+        // the header row and 15 rows of a 1000-row workbook, the model could not
+        // total a column, so it wrote a 111-line Python script that unzipped the
+        // package and parsed sharedStrings.xml by hand - after two failed calls
+        // assuming openpyxl existed and that /tmp survived between commands. The
+        // scenario's `require` strings are the engine's own result grid, so a tool
+        // that ran but returned nothing useful fails the run instead.
+        {
+          const before = await turnCount()
+          const ws = (hostState?.workspace ?? '').replace(/\/+$/, '')
+          const file = `${ws}/selftest-query.csv`
+          if (!ws) fail('the self-test host has no workspace, so the sheet-query fixture path is unknown')
+          await invoke('start_turn', {
+            text:
+              `Selftest sheet-query: put a four-row region table into ${file} (Region, Units, Price) ` +
+              'and then total Units by Region with one query and tell me the biggest region.',
+            session: target.id,
+          }).catch((e) => pageLog(`selftest note: sheet-query turn failed: ${e}`))
+          const done = await waitTurnDone(before, 60000)
+          const cards = [...document.querySelectorAll('.blk-tool[data-tool="sheet_query"]')]
+          const card = cards[cards.length - 1]
+          const out = card?.querySelector('.tool-out')?.textContent ?? ''
+          const head = card?.querySelector('.tool-name')?.textContent ?? ''
+          const answers = [...document.querySelectorAll('.blk-answer .blk-body')].map(
+            (b) => b.textContent ?? '',
+          )
+          if (!done) fail('the scripted sheet-query turn never finished')
+          else if (!card) fail('no tool card for sheet_query: the model never reached the query tool')
+          else if (!out.includes('West\t26'))
+            fail(
+              'the query result grid is not what a total looks like: ' +
+                JSON.stringify(out.slice(0, 220)),
+            )
+          else if (!out.includes('rownum | region | units | price'))
+            fail(`the result does not name the table's columns: ${JSON.stringify(out.slice(0, 220))}`)
+          else if (!answers.some((t) => t.includes('West is the biggest')))
+            fail(
+              `the grid reached the card but not the answer: ${answers.length} answer block(s) - ` +
+                'the loop stopped before its last step',
+            )
+          else
+            pageLog(
+              `sheet_query ok ("${head.trim()}", the card shows West/26 from the engine's own result grid: ` +
+                'a column totalled without the model writing a parser)',
+            )
+        }
+
         // (a) structure while the tokens arrive, not when they stop
         {
           const before = await turnCount()

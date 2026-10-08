@@ -146,7 +146,8 @@ impl Tool for ReadFileTool {
                 .unwrap_or_default();
             let pointer = match ext.as_str() {
                 "xlsx" | "xlsm" | "xlsb" => "sheet_read opens a .xlsx: it lists the sheets \
-                 and returns cells by range.",
+                 and returns cells by range; sheet_query totals, groups and filters the \
+                 whole file without loading it into the chat.",
                 _ => "use exec with an appropriate converter.",
             };
             return ToolResult::err(format!(

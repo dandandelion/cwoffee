@@ -904,3 +904,101 @@ is why `structure` mode counts them and names them before any edit is attempted.
 The plan is a surgical package edit that leaves every untouched part byte-identical,
 with a preservation test as its gate. Until that test exists, the answer to "edit
 my spreadsheet" is a read and an explanation, not a rewrite.
+
+---
+
+## Batch: the model stopped writing its own spreadsheet parser
+
+### What the gap looked like in a real session
+
+The user asked for an analysis of `01 Retail Inventory.xlsx` (session 1300, the
+file read fine — 1000 rows, one sheet). What the transcript then shows is not a
+failure to read, it is a failure to *ask*:
+
+| what happened | evidence from the store |
+|---|---|
+| `sheet_read` structure, then bounded values | worked, 2 calls |
+| the model needed per-category totals | no tool could answer that |
+| so it wrote its own reader | `write_file` with **111 lines of Python** that unzip the package and parse `sharedStrings.xml` |
+| then its own aggregator | a second script, **62 lines** |
+| two calls wasted first | `import openpyxl` (not installed), then a `/tmp` scratch file (does not survive between `exec` calls) |
+| the answer | hit the output cap and degenerated into repeated `!` |
+| total | 27 messages, ~9 KB of model-authored parser in the prompt |
+
+The tell is not an error message, it is generated code that reimplements a file
+format. That is a feature request against the tool surface, so the fix is a tool.
+
+### `sheet_query`: one question, one statement
+
+The sheet becomes an in-memory SQLite table `t` (one row per row, `rownum` kept as
+the sheet's own row number, row 1 used for column names with `Unit Cost` →
+`unit_cost`), and the model asks its question in SQL. Read-only is the engine's
+fact, not the description's: one statement per call, `SELECT` / `WITH` / `EXPLAIN`
+only, `SQLITE_LIMIT_ATTACHED = 0`, and a progress handler with a 5 s budget. A
+column is numeric only when every value round-trips through the number, so `01234`
+stays `TEXT` — a code coerced to an integer is corruption between the read and any
+later write.
+
+### Live, against the endpoint that is actually running
+
+One probe turn (a 9-row CSV in the real workspace, real `qwen3.8-flash-next-iq3_s`,
+one probe session, deleted afterwards; mode and reasoning restored):
+
+| measure | session 1300 (before) | live probe (after) |
+|---|---|---|
+| tool calls | 9, two of them failed | 3 (`sheet_read`, `sheet_query`, `sheet_query`) |
+| model-written parser | 173 lines of Python | none |
+| `exec` calls | 4 | 0 |
+| prompt bytes of model-authored code | ~9,000 | 0 |
+| turn end | `finish_reason: length`, degenerate tail | `finish=stop` in 22.5 s |
+| the numbers | unusable | West 57, North 26, South 25, East 13, grand total 121, and the model reconciled them itself |
+
+Two honest notes about the probe itself. It first reported `tools: []` and "no
+answer" for a turn that had in fact succeeded: the events are
+`{kind: "text", d: …}`, and the script assumed an externally tagged shape. The
+transcript was the authority, not the harness. And the gateway *refused* to delete
+the session while its turn was running — correct behaviour, which made the first
+version's "cleaned up" line a lie; the probe now asserts `ok: true` on every RPC
+instead of assuming it.
+
+### What the two spreadsheet tools cost, in prompt bytes
+
+`tools::cfg_tests::the_tool_block_costs_what_it_says_it_costs` prints and caps it:
+
+```
+tool block 9459 bytes: exec=1014 read_file=504 write_file=546 write_xlsx=727
+web_fetch=308 web_search=273 download_file=724 edit_file=773 ask_user=2076
+sheet_read=1159 sheet_query=1355
+```
+
+So the pair costs **2,514 bytes ≈ 630 tokens** per turn. That is the front of the
+prompt, which is byte-stable and therefore cached by llama.cpp. The workaround it
+replaced was 9 KB of Python sitting *mid*-transcript, rewritten on every retry —
+the opposite of cacheable. `ask_user` at 2,076 bytes is now the fattest schema and
+the first thing to trim.
+
+### Read-only is tested as a boundary, not a mood
+
+| negative control | result |
+|---|---|
+| `UPDATE t SET units = 0` | refused: one statement, and not a SELECT |
+| `SELECT 1; DROP TABLE t` | refused: two statements |
+| `ATTACH DATABASE '/home/me/x.db' AS x` | refused, and `ATTACHED = 0` means it cannot be honoured even if the parser were fooled |
+| `PRAGMA table_info(t)` | refused: not a query |
+| a cartesian blow-up (`FROM t a, t b, t c, t d`) | interrupted by the 5 s wall clock, with the timeout named in the error |
+
+### Gates for this batch
+
+```
+tools::sheets                      21 passed
+tools::sheet_sql                   11 passed
+tools:: approval:: agent:: prompt:: store::  258 passed
+mock_endpoint (scripted)             9 passed
+markdown: all checks passed
+svelte-check found 0 errors and 0 warnings
+SELFTEST ok — sheet_read ok (grid rows 1-2, cap held at 6 cells) and
+            sheet_query ok ("Answered from the spreadsheet", West/26 from the
+            engine's own result grid)
+PSS 229.8 MB <= 400 MB · gateway http 200 · GATEWAY SMOKE OK · search-smoke ok
+render OK · webkit render path: no-dmabuf · app holds renderD128
+```
