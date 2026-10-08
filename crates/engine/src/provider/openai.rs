@@ -131,6 +131,18 @@ impl OpenAiProvider {
         if let Some(p) = req.top_p {
             body["top_p"] = json!(p);
         }
+        // llama.cpp's OpenAI-compatible endpoint takes these directly. Sending a
+        // key we were not given would override the server's chosen default with
+        // ours, which is the thing `Sampling` exists to avoid.
+        if let Some(k) = req.top_k {
+            body["top_k"] = json!(k);
+        }
+        if let Some(m) = req.min_p {
+            body["min_p"] = json!(m);
+        }
+        if let Some(s) = req.seed {
+            body["seed"] = json!(s);
+        }
         if let Some(m) = req.max_tokens {
             body["max_tokens"] = json!(m);
         }
@@ -578,6 +590,37 @@ impl Provider for OpenAiProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sampling_defaults_are_read_where_each_build_puts_them() {
+        // A current llama.cpp: nested under default_generation_settings.params.
+        let p = serde_json::json!({
+            "default_generation_settings": {
+                "n_ctx": 262144,
+                "params": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 }
+            }
+        });
+        let d = sampling_defaults(&p);
+        assert_eq!(d.temperature, Some(1.0));
+        assert_eq!(d.top_p, Some(0.95));
+        assert_eq!(d.top_k, Some(20));
+        assert_eq!(d.min_p, Some(0.0), "a stated 0.0 is information, not absence");
+        assert_eq!(d.seed, None, "nothing stated a seed, so nothing is claimed");
+
+        // Per-key resolution: some keys at the root, the rest nested.
+        let p = serde_json::json!({
+            "top_p": 0.9,
+            "default_generation_settings": { "params": { "temperature": 0.6 } }
+        });
+        let d = sampling_defaults(&p);
+        assert_eq!(d.temperature, Some(0.6));
+        assert_eq!(d.top_p, Some(0.9));
+
+        // An endpoint that states nothing must yield nothing: the boot line then
+        // says "the endpoint decides" instead of inventing numbers to display.
+        let d = sampling_defaults(&serde_json::json!({ "model_alias": "x" }));
+        assert!(d.is_empty(), "invented defaults: {d:?}");
+    }
+
     use super::*;
     use crate::provider::{Message, Role, ToolCall, ToolDef};
 
@@ -820,6 +863,36 @@ fn parse_reasoning_default(t: &str) -> Option<String> {
 /// server responses: the shapes here are what llama-server actually answers, and
 /// a silent rename upstream would otherwise only show up as a picker that lost
 /// its chips.
+/// The endpoint's own sampling defaults, as stated - never invented.
+///
+/// llama.cpp states them in up to three places, and which one depends on the
+/// build: `default_generation_settings.params` (what a current server actually
+/// applies), `default_generation_settings` itself, and the root of `/props`.
+/// Resolution is per key rather than per object, so a server that lists `top_p`
+/// at the root and the rest under `params` is still read completely.
+fn sampling_defaults(props: &serde_json::Value) -> crate::provider::Sampling {
+    let dgs = props.get("default_generation_settings");
+    let layers = [
+        dgs.and_then(|d| d.get("params")),
+        dgs,
+        Some(props),
+    ];
+    let num = |k: &str| {
+        layers
+            .iter()
+            .flatten()
+            .filter_map(|o| o.get(k).and_then(|v| v.as_f64()))
+            .next()
+    };
+    crate::provider::Sampling {
+        temperature: num("temperature").map(|x| x as f32),
+        top_p: num("top_p").map(|x| x as f32),
+        min_p: num("min_p").map(|x| x as f32),
+        top_k: num("top_k").map(|x| x as u32),
+        seed: num("seed").map(|x| x as u64),
+    }
+}
+
 fn model_infos(
     v: &serde_json::Value,
     props: Option<&serde_json::Value>,
@@ -863,6 +936,11 @@ fn model_infos(
                         .and_then(|v| v.as_u64())
                 });
                 info.slots = p.get("total_slots").and_then(|v| v.as_u64());
+                // The endpoint's own sampling defaults. Not applied to anything -
+                // read out so the boot log can say what leaving the keys alone
+                // actually means, and so "temperature is too hot for tool calls"
+                // is a claim about this server rather than about llama.cpp in general.
+                info.sampling = sampling_defaults(p);
                 info.server = p.get("build_info").and_then(|v| v.as_str()).map(str::to_string);
                 info.source = p
                     .get("model_path")

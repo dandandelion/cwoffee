@@ -147,6 +147,12 @@ pub struct ModelInfo {
     pub reasoning_default: Option<String>,
     /// True if the endpoint published at least one capability for this model.
     pub advertised: bool,
+    /// The endpoint's own sampling defaults, as stated (llama.cpp: `/props`).
+    ///
+    /// Reported, never applied: the point is that a log line can say what
+    /// leaving `[sampling]` alone means for *this* server.
+    #[serde(default)]
+    pub sampling: Sampling,
 }
 
 impl ModelInfo {
@@ -285,6 +291,108 @@ impl Reasoning {
     }
 }
 
+/// Sampling knobs, sent only when the user wrote them down.
+///
+/// Every field is optional and there are **no defaults here on purpose**: an
+/// inference server's sampling defaults are a decision somebody made for that
+/// model, and a harness that quietly overrides them changes what the model does
+/// without anyone asking, on a codebase whose whole prompt strategy assumes the
+/// model behaves the way it did yesterday. Unset means the key is not in the
+/// request at all, so the server decides exactly as it would without Cwoffee.
+///
+/// `seed` is included because reproducibility is the reason to touch sampling at
+/// all when debugging a tool loop; llama.cpp accepts it, Anthropic does not.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Sampling {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub seed: Option<u64>,
+}
+
+impl Sampling {
+    /// Nothing set: requests go out exactly as they did before this existed.
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.min_p.is_none()
+            && self.seed.is_none()
+    }
+
+    /// Reject nonsense before a request leaves, naming the key that caused it. A
+    /// silently ignored `temperature = 12` is a model that behaves oddly with no
+    /// trace of why.
+    pub fn checked(&self) -> Result<(), String> {
+        if let Some(t) = self.temperature {
+            if !(0.0..=2.0).contains(&t) {
+                return Err(format!("sampling.temperature = {t} is outside 0.0..=2.0"));
+            }
+        }
+        for (key, v) in [
+            ("sampling.top_p", self.top_p),
+            ("sampling.min_p", self.min_p),
+        ] {
+            if let Some(v) = v {
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(format!("{key} = {v} is outside 0.0..=1.0"));
+                }
+            }
+        }
+        if let Some(k) = self.top_k {
+            if k == 0 {
+                return Err("sampling.top_k = 0 asks the server to keep no tokens; use 1 or remove the key".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply(&self, req: &mut ChatRequest) {
+        req.temperature = self.temperature;
+        req.top_p = self.top_p;
+        req.top_k = self.top_k;
+        req.min_p = self.min_p;
+        req.seed = self.seed;
+    }
+
+    /// What this says to a log line. `server` is what the endpoint reports as its
+    /// own defaults, so the line answers "what happens if I leave this alone?"
+    /// rather than only restating the config.
+    pub fn describe(&self, server: Option<&Sampling>) -> String {
+        let parts = |s: &Sampling| -> Vec<String> {
+            let mut v = Vec::new();
+            if let Some(x) = s.temperature {
+                v.push(format!("temperature={x}"));
+            }
+            if let Some(x) = s.top_p {
+                v.push(format!("top_p={x}"));
+            }
+            if let Some(x) = s.top_k {
+                v.push(format!("top_k={x}"));
+            }
+            if let Some(x) = s.min_p {
+                v.push(format!("min_p={x}"));
+            }
+            if let Some(x) = s.seed {
+                v.push(format!("seed={x}"));
+            }
+            v
+        };
+        let mine = parts(self);
+        let ours = if mine.is_empty() {
+            "nothing set, the endpoint decides".to_string()
+        } else {
+            mine.join(" ")
+        };
+        match server {
+            Some(sv) if !parts(sv).is_empty() => format!("{ours} | endpoint defaults: {}", parts(sv).join(" ")),
+            _ => ours,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub model: String,
@@ -293,6 +401,9 @@ pub struct ChatRequest {
     pub reasoning: Reasoning,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub seed: Option<u64>,
     pub max_tokens: Option<u32>,
 }
 
@@ -305,6 +416,9 @@ impl ChatRequest {
             reasoning: Reasoning::Off,
             temperature: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
+            seed: None,
             max_tokens: None,
         }
     }

@@ -2051,3 +2051,41 @@ checked when the turn closes, not by watching for delete events: the tool surfac
 has no "unproduce" result, and a file the *user* removed mid-turn deserves the same
 treatment. Both halves are tested: a file produced twice is one chip, and a file
 the turn deleted is none.
+
+### Trap 106: an unset key must stay unset, so "no defaults" has to be tested
+
+Adding sampling looked like a five-line change until the first draft filled in
+`temperature: 0.7` as a `Default`. That single number would have changed how every
+user's model behaves - on an endpoint somebody else tuned - with nothing in the UI
+or the log to say so. `Sampling` is therefore all-`Option`, `Default` is all-`None`,
+and the test that matters is the negative one: with no `[sampling]` section the
+endpoint must see **zero** sampling keys (`sampling_keys_reach_the_endpoint_only_when_they_were_written_down`,
+half 1). A feature whose absence is unobservable cannot be trusted to be absent.
+
+### Trap 107: the endpoint's defaults are not where you looked first
+
+The first `/props` reader took `default_generation_settings.temperature` and printed
+nothing, because a current llama.cpp keeps them one level deeper, under
+`default_generation_settings.params`. Resolution is now **per key** across
+`params` → `default_generation_settings` → root, because servers split the keys
+between those places: the mock states `top_p` at the root and `temperature`/`top_k`
+under `params`, and both are read. A stated `0.0` is information (`min_p: 0`) and
+must not be treated as absence, which is why the reader tests `min_p = 0.0`
+explicitly.
+
+### Trap 108: sampling and thinking cannot both be on, and the API does not say so
+
+Anthropic rejects `temperature`, `top_p` and `top_k` when `thinking` is enabled, with
+an error that never mentions `[sampling]`. Honouring the config would turn a working
+setup into a 400 with no traceable cause, so thinking wins, the sampling keys are
+dropped, and the omission is printed **once per process** (`Once`) rather than once
+per request: per-request logging buries the log, silence buries the cause.
+
+### Trap 109: a documented key that does not parse is a startup error for everyone
+
+The example config ships `[sampling]` fully commented out, and
+`parses_the_example_file` now asserts `example.sampling.is_empty()` - copying the
+example must not change how the model behaves. `deny_unknown_fields` on `Sampling`
+turns `topP = 0.9` into an error naming `topP` instead of a key that looks
+configured and does nothing, and range checks (`temperature 0..=2`,
+`top_p`/`min_p` `0..=1`, `top_k >= 1`) run at boot in every shell, not per request.

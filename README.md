@@ -180,6 +180,41 @@ pushed into the transcript, so the user does not get a fake message from themsel
 append-only prefix stays intact. If the summary comes back empty the turn still ends with a
 visible note rather than silence.
 
+### What sampling the app sends (and what it deliberately does not)
+
+Cwoffee sends **no sampling parameters unless you write them down**. `temperature`,
+`top_p`, `top_k`, `min_p` and `seed` are all absent from a default request, so the
+server behaves exactly as it does for any other client. That is not laziness about
+a tuning knob: sampling decides what the model does, and a harness that sets
+`temperature = 0.7` because it "seems sensible" changes the product invisibly, on a
+codebase whose whole prompt strategy assumes the model behaves as it did yesterday.
+
+The section exists so you *can* set them, and the boot log states both halves of
+the answer - what this app sends, and what your endpoint says it uses when nothing
+is sent:
+
+```
+[cwoffee] sampling: nothing set, the endpoint decides | endpoint defaults: temperature=1 top_p=0.95 top_k=20 min_p=0
+```
+
+Those defaults are read per key from wherever your llama.cpp build puts them
+(`default_generation_settings.params`, `default_generation_settings`, or the root of
+`/props`), and unstated keys stay unstated rather than becoming our numbers.
+
+Why bother with the section at all: llama.cpp's default temperature is 1.0, which is
+a fine creative setting and a poor one for tool-call JSON across a long agentic turn.
+The symptom is far from the cause - repaired tool arguments, or a run of repeated
+characters at the end of an answer. `[sampling]` with `temperature = 0.7`,
+`top_p = 0.9`, `min_p = 0.05` is the shape that behaves well on Qwen-class models,
+and `seed` is there so a tool loop can be reproduced while you debug it. Out-of-range
+values (`temperature = 11`, `top_k = 0`) and misspelt keys stop the app at boot with
+the key named, instead of being quietly ignored.
+
+One asymmetry worth knowing: on Anthropic, thinking and sampling are mutually
+exclusive - the API rejects `temperature`/`top_p`/`top_k` when thinking is on.
+Thinking wins and the omission is printed once per process, because a 400 whose text
+never mentions `[sampling]` is a worse diagnosis than one line in the log.
+
 ### Motion
 
 Everything moves on one curve (`cubic-bezier(.2,.7,.2,1)`) with three durations, and

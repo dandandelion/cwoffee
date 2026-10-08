@@ -100,6 +100,18 @@ impl Mock {
         None
     }
 
+    /// Which sampling keys reached the request, and with what values. The engine's
+    /// contract is that an unset key is *absent*, so absence has to be observable.
+    async fn sampling_seen(&self) -> Option<serde_json::Value> {
+        let v: serde_json::Value = reqwest::get(format!("{}/mock/state", self.base))
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        v.get("sampling_seen").cloned()
+    }
+
     /// How many turns the mock actually served. A test that thinks it ran a turn
     /// while the mock served nothing is testing a memory.
     async fn turns(&self) -> Option<u64> {
@@ -123,6 +135,12 @@ struct Harness {
 
 impl Harness {
     async fn new(mock: &Mock) -> Harness {
+        Self::with_sampling(mock, cwoffee_engine::provider::Sampling::default()).await
+    }
+
+    /// The `[sampling]` passthrough, end to end: the only proof that matters is
+    /// what the endpoint saw on the wire, and the scripted one reports it.
+    async fn with_sampling(mock: &Mock, sampling: cwoffee_engine::provider::Sampling) -> Harness {
         let ws = std::env::temp_dir().join(format!("cwoffee-mock-test-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
         let mut cfg = Config::default();
@@ -137,6 +155,7 @@ impl Harness {
         // plumbing, which has its own tests in host.rs and its own UI check.
         hcfg.mode = cwoffee_engine::approval::ApprovalMode::Auto;
         hcfg.reasoning = cwoffee_engine::provider::Reasoning::Off;
+        hcfg.sampling = sampling;
         let mut host = SessionHost::spawn(provider, registry, Arc::clone(&store), hcfg);
         let (events, _approvals) = host.take_receivers().expect("event receivers");
         let questions = host.take_questions().expect("question receiver");
@@ -501,4 +520,77 @@ async fn the_scripted_endpoint_advertises_itself_the_way_llama_cpp_does() {
     assert_eq!(m.reasoning_efforts.len(), 3, "efforts: {:?}", m.reasoning_efforts);
     assert!(m.advertised, "the endpoint published nothing");
     assert_eq!(m.server.as_deref(), Some("cwoffee-mock 1.0"), "build_info: {m:?}");
+    // The endpoint's own sampling defaults, read from `default_generation_settings`
+    // (the values it actually applies) and reported, never applied. The mock states
+    // only temperature, so the rest must stay None rather than becoming our guess.
+    // Real llama.cpp nests these under default_generation_settings.params; the
+    // mock mirrors that, and states top_p at the root instead, so the per-key
+    // fallback is exercised rather than assumed.
+    assert_eq!(m.sampling.temperature, Some(0.8), "defaults: {:?}", m.sampling);
+    assert_eq!(m.sampling.top_k, Some(40), "defaults: {:?}", m.sampling);
+    assert_eq!(m.sampling.top_p, Some(0.95), "root-level fallback: {:?}", m.sampling);
+    assert_eq!(m.sampling.min_p, None, "unstated defaults must stay unstated");
+    assert_eq!(m.sampling.seed, None, "unstated defaults must stay unstated");
+}
+
+/// The `[sampling]` section, proved at the only place it can be proved: the bytes
+/// the endpoint receives. Unset keys must be absent, because a default invented
+/// here would silently rewrite how someone else's server behaves — and this
+/// project's own endpoint runs at temperature 1.0, which is a decision about that
+/// model, not a bug for us to paper over.
+#[tokio::test]
+async fn sampling_keys_reach_the_endpoint_only_when_they_were_written_down() {
+    let Some(mock) = Mock::start().await else {
+        eprintln!("SKIP: scripted endpoint unavailable (node or scenarios missing)");
+        return;
+    };
+    let prompt = "What is 6 times 7? Answer with just the number.";
+
+    // 1. Nothing configured: the request carries no sampling keys at all.
+    let mut bare = Harness::new(&mock).await;
+    let t = bare.turn(prompt, &mut |_| Answer::default()).await;
+    assert!(!t.timed_out, "the turn never closed: {:?}", t.errors);
+    assert_eq!(t.answer.trim(), "42", "answer: {:?}", t.answer);
+    let seen = mock
+        .sampling_seen()
+        .await
+        .expect("the scripted endpoint reports what it received");
+    let last = &seen[0];
+    assert_eq!(
+        last["keys"].as_array().map(|a| a.len()),
+        Some(0),
+        "unset sampling keys must not be invented: {seen}"
+    );
+
+    // 2. Configured: those keys, with those values, in the shape llama.cpp takes.
+    let mut tuned = Harness::with_sampling(
+        &mock,
+        cwoffee_engine::provider::Sampling {
+            temperature: Some(0.6),
+            top_p: Some(0.9),
+            top_k: Some(20),
+            min_p: Some(0.05),
+            seed: Some(7),
+        },
+    )
+    .await;
+    let t = tuned.turn(prompt, &mut |_| Answer::default()).await;
+    assert!(!t.timed_out, "the turn never closed: {:?}", t.errors);
+    let seen = mock.sampling_seen().await.expect("state");
+    let last = &seen[0];
+    let keys: Vec<&str> = last["keys"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        keys,
+        vec!["temperature", "top_p", "top_k", "min_p", "seed"],
+        "every configured key must be on the wire: {seen}"
+    );
+    let v = &last["values"];
+    assert!((v["temperature"].as_f64().unwrap() - 0.6).abs() < 1e-3);
+    assert!((v["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-3);
+    assert_eq!(v["top_k"].as_u64(), Some(20), "top_k must stay an integer");
+    assert!((v["min_p"].as_f64().unwrap() - 0.05).abs() < 1e-3);
+    assert_eq!(v["seed"].as_u64(), Some(7), "seed must stay an integer");
 }

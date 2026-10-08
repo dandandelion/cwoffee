@@ -191,11 +191,31 @@ impl AnthropicProvider {
         if !system.is_empty() {
             body["system"] = json!(system.join("\n\n"));
         }
-        if let Some(t) = req.temperature {
-            body["temperature"] = json!(t);
-        }
-        if let Some(p) = req.top_p {
-            body["top_p"] = json!(p);
+        // Sampling and thinking do not coexist on this API: with `thinking`
+        // enabled it rejects temperature / top_p / top_k outright. Honouring the
+        // config would mean a 400 whose text says nothing about `[sampling]`, so
+        // thinking wins and the omission is said out loud - once per process,
+        // because a per-request warning would bury the log.
+        let sampling_on = req.temperature.is_some()
+            || req.top_p.is_some()
+            || req.top_k.is_some()
+            || req.min_p.is_some()
+            || req.seed.is_some();
+        if sampling_on && !req.reasoning.enabled() {
+            if let Some(t) = req.temperature {
+                body["temperature"] = json!(t);
+            }
+            if let Some(p) = req.top_p {
+                body["top_p"] = json!(p);
+            }
+            if let Some(k) = req.top_k {
+                body["top_k"] = json!(k);
+            }
+            if req.min_p.is_some() || req.seed.is_some() {
+                warn_unsupported_once("min_p, seed (this API has no equivalent)")
+            }
+        } else if sampling_on && req.reasoning.enabled() {
+            warn_unsupported_once("temperature, top_p, top_k (thinking is on for this turn)")
         }
 
         if req.reasoning.enabled() {
@@ -286,6 +306,15 @@ struct DeltaBlk {
     partial_json: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
+}
+
+/// One line per process, not one per request: a per-request warning would make
+/// the log unreadable, and silence would make `[sampling]` look ignored.
+fn warn_unsupported_once(what: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!("[cwoffee/anthropic] ignoring sampling parameters this API does not take: {what}")
+    });
 }
 
 /// Which block index is a tool call, and what its id/name were.

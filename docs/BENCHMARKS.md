@@ -1002,3 +1002,67 @@ SELFTEST ok — sheet_read ok (grid rows 1-2, cap held at 6 cells) and
 PSS 229.8 MB <= 400 MB · gateway http 200 · GATEWAY SMOKE OK · search-smoke ok
 render OK · webkit render path: no-dmabuf · app holds renderD128
 ```
+
+---
+
+## Batch: sampling is a knob now, and the app refuses to turn it for you
+
+Asked: does Cwoffee give the endpoint any sampling config, or does it leave the
+provider's chat-template defaults alone? Before this batch: **nothing was sent** —
+`ChatRequest` had two sampling fields and no code ever set them. Now `[sampling]`
+in `config.toml` passes `temperature`, `top_p`, `top_k`, `min_p` and `seed` through
+to the request, and every key that is not written is *absent* from it.
+
+### What the boot log now says about this machine
+
+```
+[cwoffee] sampling: nothing set, the endpoint decides | endpoint defaults: temperature=1 top_p=0.95 top_k=20 min_p=0
+```
+
+That is one line answering two different questions: what Cwoffee sends, and what
+your own server does when nothing is sent. The defaults half is read per key from
+`default_generation_settings.params` → `default_generation_settings` → root, because
+llama.cpp builds split those keys between the three places; the scripted endpoint
+deliberately states `top_p` at the root and `temperature`/`top_k` under `params` so
+the fallback is exercised rather than assumed.
+
+### Why the defaults stay `None`
+
+The gap this closes is visible in the transcript from the previous batch: at
+temperature 1.0 (llama.cpp's stated default), a long tool loop drifts, and the
+failure surfaces as repaired tool arguments and then a run of `!` at the output cap
+— three layers away from its cause. The fix is a documented knob, not an invented
+default: a harness that sets `temperature = 0.7` silently changes what the model
+does on an endpoint somebody else tuned, in a product whose whole prompt strategy
+depends on the model behaving as it did yesterday.
+
+### Tests, both directions
+
+| test | claim |
+|---|---|
+| `sampling_keys_reach_the_endpoint_only_when_they_were_written_down`, half 1 | with no `[sampling]`, the endpoint sees **zero** sampling keys |
+| same test, half 2 | configured keys arrive with the configured values, `top_k`/`seed` as integers |
+| `an_absent_sampling_key_is_not_replaced_by_our_opinion` | one key set does not fill in the other four |
+| `an_out_of_range_or_misspelt_sampling_key_names_itself` | `temperature = 11` and `top_k = 0` name themselves; `topP` is refused |
+| `sampling_defaults_are_read_where_each_build_puts_them` | per-key resolution; a stated `0.0` is not absence; nothing stated ⇒ nothing claimed |
+| `parses_the_example_file` | the example config sends no sampling keys, so copying it changes nothing |
+
+Anthropic asymmetry, tested by the same wire assertion path: with thinking on,
+`temperature`/`top_p`/`top_k` are dropped and the reason is printed once per process
+rather than arriving as a 400 that never mentions `[sampling]`.
+
+### Gates for this batch
+
+```
+engine lib: config:: provider::            40 passed
+engine lib: tools:: sheet_sql etc.         179 passed (previous batch, unchanged)
+mock_endpoint                              10 passed
+mock_endpoint activity: 5 sampling records read back from /mock/state
+SELFTEST ok: sessions 0->0, fts-safe query -> 0 hits, models=1 picked=cwoffee-mock
+[cwoffee] sampling: nothing set, the endpoint decides | endpoint defaults: temperature=0.8 top_p=0.95 top_k=40
+production PSS 241.5 MB <= 400 MB · gateway http 200 · GATEWAY SMOKE OK · search-smoke ok
+render OK x2 · webkit render path: no-dmabuf · holds renderD128
+```
+
+Prompt cost of this feature: zero bytes, since the system prompt and tool schemas are
+untouched and the change only adds JSON fields on the request when the user asks.

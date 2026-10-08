@@ -39,6 +39,9 @@ pub struct AgentConfig {
     pub max_tool_iters: usize,
     pub reasoning: Reasoning,
     pub max_tokens: Option<u32>,
+    /// Sampling overrides for the endpoint. Empty by default: the server's own
+    /// defaults are its decision, not ours.
+    pub sampling: crate::provider::Sampling,
 }
 
 impl Default for AgentConfig {
@@ -58,6 +61,7 @@ impl Default for AgentConfig {
             // truncates thinking before the model has finished, and finish_reason
             // comes back as `length` rather than the model ever stopping.
             max_tokens: None,
+            sampling: crate::provider::Sampling::default(),
         }
     }
 }
@@ -283,6 +287,7 @@ impl Agent {
             req.tools = defs.clone();
             req.reasoning = self.cfg.reasoning;
             req.max_tokens = self.cfg.max_tokens;
+            self.cfg.sampling.apply(&mut req);
             if carry_on {
                 carry_on = false;
                 // Request-only. History already ends with the partial answer, and a
@@ -412,6 +417,7 @@ impl Agent {
         req.tools = Vec::new();
         req.reasoning = Reasoning::Low;
         req.max_tokens = self.cfg.max_tokens;
+        self.cfg.sampling.apply(&mut req);
         req.messages.push(Message::user(
             "You have used up your tool budget. Do not request any more tools.              In the user's own language, say in a few sentences what you actually              did, what you produced or changed (by name), and what is still              unfinished or unverified. Plain prose, no tool calls.",
         ));

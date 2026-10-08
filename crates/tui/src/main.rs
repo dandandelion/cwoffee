@@ -389,6 +389,8 @@ async fn main() -> Result<()> {
     cfg.context_budget = appcfg.context.target_tokens;
     // None means the server's own output cap applies; see Config.
     cfg.max_tokens = appcfg.max_output_tokens;
+    // Validated at boot, not per request: see Config::sampling_checked.
+    cfg.sampling = appcfg.sampling_checked().map_err(anyhow::Error::msg)?;
     // Derived per turn from the live workspace; see SessionHost.
     cfg.env_override = None;
     cfg.approval_timeout =

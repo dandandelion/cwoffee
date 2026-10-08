@@ -47,6 +47,17 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: SandboxCfg,
 
+    /// Sampling overrides for the inference endpoint. Every key is optional, and
+    /// a key that is absent is not sent at all - the server's default then
+    /// decides, which is the right answer for an endpoint someone else tuned.
+    ///
+    /// The section exists because temperature 1.0 - llama.cpp's default, and what
+    /// this project's own endpoint reports - is a fine creative setting and a poor
+    /// one for tool-call JSON: a long agentic turn can drift, and the failure
+    /// shows up as garbage at the tail of an answer, far from its cause.
+    #[serde(default)]
+    pub sampling: crate::provider::Sampling,
+
     /// Seconds an unanswered approval prompt waits before refusing.
     #[serde(default)]
     pub approval_timeout_secs: Option<u64>,
@@ -443,6 +454,13 @@ impl Config {
         }
     }
 
+    /// Validate `[sampling]` before anything talks to the model. A typo'd range
+    /// that is quietly ignored turns into "the model behaves oddly" with no trace
+    /// of the cause, which is the most expensive kind of config bug there is.
+    pub fn sampling_checked(&self) -> Result<crate::provider::Sampling, String> {
+        self.sampling.clone().checked().map(|()| self.sampling.clone())
+    }
+
     pub fn search_backend(&self) -> SearchBackend {
         match self.search.backend.as_str() {
             "searxng" => SearchBackend::SearXNG {
@@ -669,6 +687,13 @@ base_url = "http://127.0.0.1:9/v1"
         let example: Config = toml::from_str(&text)
             .unwrap_or_else(|e| panic!("config/cwoffee.toml.example must parse: {e}"));
         assert_eq!(example.search.backend, "auto", "the example ships the managed provider");
+        // The example is what people copy, so copying it must not change how the
+        // model behaves. Sampling is documented but left unset.
+        assert!(
+            example.sampling.is_empty(),
+            "the example must not quietly configure sampling: {:?}",
+            example.sampling
+        );
         match example.search_backend() {
             SearchBackend::Auto(a) => assert_eq!(a.port, crate::tools::searxng::DEFAULT_AUTO_PORT),
             other => panic!("expected the managed backend in the example, got {other:?}"),
@@ -755,6 +780,88 @@ api_key = "sk-plain""#,
         )
         .expect("parses");
         assert_eq!(lit.api_key().as_deref(), Some("sk-plain"));
+    }
+
+    /// `[sampling]` exists so a person can tune an endpoint without Cwoffee
+    /// deciding for them. The half that matters is the middle test: a key that is
+    /// absent must stay absent from the request, not become our guess.
+    #[test]
+    fn sampling_keys_are_optional_and_reach_the_host() {
+        let c: Config = toml::from_str(
+            r#"[provider]
+kind = "llama.cpp"
+
+[sampling]
+temperature = 0.7
+top_p = 0.9
+top_k = 20
+min_p = 0.05
+seed = 1234"#,
+        )
+        .expect("parses");
+        let s = c.sampling_checked().expect("in range");
+        assert_eq!(s.temperature, Some(0.7));
+        assert_eq!(s.top_p, Some(0.9));
+        assert_eq!(s.top_k, Some(20));
+        assert_eq!(s.min_p, Some(0.05));
+        assert_eq!(s.seed, Some(1234));
+    }
+
+    #[test]
+    fn an_absent_sampling_key_is_not_replaced_by_our_opinion() {
+        let c: Config = toml::from_str(
+            r#"[provider]
+kind = "llama.cpp"
+
+[sampling]
+temperature = 0.6"#,
+        )
+        .expect("parses");
+        let s = c.sampling_checked().expect("in range");
+        assert_eq!(s.temperature, Some(0.6));
+        // The whole point: one key set does not imply the others get filled in.
+        assert_eq!(
+            (s.top_p, s.top_k, s.min_p, s.seed),
+            (None, None, None, None),
+            "an unset key must stay unset"
+        );
+        assert!(!s.is_empty());
+        assert!(
+            Config::default().sampling.is_empty(),
+            "a config with no [sampling] must send no sampling keys at all"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_or_misspelt_sampling_key_names_itself() {
+        let bad: Config = toml::from_str(
+            r#"[provider]
+kind = "llama.cpp"
+
+[sampling]
+temperature = 11.0"#,
+        )
+        .expect("parses");
+        let err = bad.sampling_checked().unwrap_err();
+        assert!(err.contains("temperature") && err.contains("11"), "got {err}");
+
+        let zero_k: Config = toml::from_str(
+            r#"[sampling]
+top_k = 0"#,
+        )
+        .expect("parses");
+        let err = zero_k.sampling_checked().unwrap_err();
+        assert!(err.contains("top_k"), "got {err}");
+
+        // deny_unknown_fields means `topP` is a startup error rather than a key
+        // that looks configured and does nothing.
+        let typo = toml::from_str::<Config>(
+            r#"[sampling]
+topP = 0.9"#,
+        );
+        assert!(typo.is_err(), "a camelCase sampling key must be refused");
+        let msg = typo.unwrap_err().to_string();
+        assert!(msg.contains("topP"), "the message should name the typo: {msg}");
     }
 
     #[test]

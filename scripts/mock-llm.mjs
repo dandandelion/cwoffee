@@ -83,6 +83,7 @@ const stats = {
   thinking_off: 0,
   thinking_on: 0,
   tools_requested: 0,
+  sampling_seen: [],
   last: [],
 }
 
@@ -317,6 +318,7 @@ const server = http.createServer(async (req, res) => {
     stats.thinking_off = 0
     stats.thinking_on = 0
     stats.tools_requested = 0
+    stats.sampling_seen = []
     stats.last = []
     res.writeHead(200, { 'content-type': 'application/json' })
     return res.end(JSON.stringify({ ok: true }))
@@ -363,6 +365,17 @@ const server = http.createServer(async (req, res) => {
   if (thinkingOff) stats.thinking_off += 1
   else stats.thinking_on += 1
   if (Array.isArray(body.tools) && body.tools.length) stats.tools_requested += 1
+  // Sampling: which keys the engine actually put on the wire. Cwoffee's contract
+  // is "absent means the server decides", so a test has to see absence, not
+  // infer it from an answer that happened to look calm.
+  const SAMPLE_KEYS = ['temperature', 'top_p', 'top_k', 'min_p', 'seed']
+  const seen = SAMPLE_KEYS.filter((k) => body[k] !== undefined && body[k] !== null)
+  stats.sampling_seen.unshift({
+    at: Date.now(),
+    keys: seen,
+    values: Object.fromEntries(seen.map((k) => [k, body[k]])),
+  })
+  stats.sampling_seen = stats.sampling_seen.slice(0, 5)
   stats.last.unshift({ prompt: prompt.slice(0, 120), at: Date.now() })
   stats.last = stats.last.slice(0, 12)
 

@@ -117,6 +117,11 @@ and uses its own gateway port. Consequences worth knowing:
    A scripted answer about a file proves the script, not the tool.
 3. Keep the pacing honest: chunk sizes and delays decide whether mid-stream checks see structure
    arrive *during* the turn. `--speed` scales all delays; the engine integration test uses `0.2`.
+4. When the claim is about **the request** rather than the answer, ask the mock what it received:
+   `GET /mock/state` reports `thinking_off`/`thinking_on`, `tools_requested` and `sampling_seen`
+   (which sampling keys arrived, with what values, for the last five requests). Absence is a
+   claim too — `[sampling]` being off by default is only verifiable if a test can see that no
+   key was sent.
 
 ## Scripted scenarios worth knowing about
 

@@ -233,20 +233,27 @@ writing its own spreadsheet parser".
 Cost of the two tools, measured: `sheet_read` 1,159 bytes + `sheet_query` 1,355
 bytes, whole tool block 9,459 bytes (`the_tool_block_costs_what_it_says_it_costs`).
 
-## Open: sampling parameters
+## Sampling: the answer, and what shipped
 
-Question from the user: does Cwoffee send any sampling config, or does the server
-decide? Answer today: **the server decides.** `ChatRequest` carries
-`temperature` / `top_p` / `top_k` / `min_p` / `seed` fields, but nothing sets them
-and the OpenAI adapter omits nulls, so llama.cpp's defaults apply. On this
-endpoint `/props` reports `temperature=1.0, top_p=0.95, top_k=20, min_p=0.0`.
+Question: does Cwoffee give the endpoint any sampling config, or leave the server's
+defaults alone? Before this batch: nothing was sent at all (`ChatRequest` had two
+fields, no code set them), so llama.cpp's own defaults decided — temperature 1.0,
+top_p 0.95, top_k 20, min_p 0 on this machine's endpoint.
 
-That matters because of the transcript above: at temperature 1.0, a long agentic
-turn can drift, and the failure mode we hit was a run of `!` at the output cap.
-The next change is a `[sampling]` section in `config.toml` where every key is
-optional — unset means "do not send it, let the server decide" — with the endpoint's
-reported defaults logged at boot so the user knows what they are leaving alone.
-No default value is invented for someone else's endpoint.
+Now `[sampling]` in `config.toml` passes `temperature`, `top_p`, `top_k`, `min_p` and
+`seed` through, and a key that is not written stays out of the request. No defaults
+are invented: the temperature-1.0 degeneration in session 1300 is an argument for a
+documented knob, not for quietly overriding somebody else's endpoint. The boot line
+states both halves — what we send, and what the endpoint says it uses:
+
+```
+[cwoffee] sampling: nothing set, the endpoint decides | endpoint defaults: temperature=1 top_p=0.95 top_k=20 min_p=0
+```
+
+Defaults are read per key across `default_generation_settings.params` →
+`default_generation_settings` → root (builds split them between all three).
+Anthropic drops sampling when thinking is on, once-per-process in the log, because
+that API rejects the combination without naming the cause.
 
 ## Stage 2 unchanged, still the gate for writes
 

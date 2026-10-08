@@ -58,6 +58,10 @@ pub struct HostConfig {
     pub max_attachments: usize,
     /// Decoded bytes per attachment.
     pub max_attachment_bytes: usize,
+    /// Sampling overrides for the endpoint. Empty means the server decides, which
+    /// is the default and the honest one: these numbers change what the model
+    /// does, and a harness that sets them silently changes the product.
+    pub sampling: crate::provider::Sampling,
 }
 
 impl HostConfig {
@@ -76,6 +80,7 @@ impl HostConfig {
             approval_timeout: std::time::Duration::from_secs(300),
             max_attachments: 4,
             max_attachment_bytes: 2 * 1024 * 1024,
+            sampling: crate::provider::Sampling::default(),
         }
     }
 }
@@ -99,16 +104,16 @@ async fn apply_context_budget(
     provider: &Arc<dyn crate::provider::Provider>,
     pinned: Option<usize>,
     state: &Arc<std::sync::Mutex<HostState>>,
+    sampling: &crate::provider::Sampling,
 ) {
     let model = agent.model();
-    let window = provider
+    let info = provider
         .list_models_info()
         .await
         .unwrap_or_default()
         .into_iter()
-        .find(|m| m.id == model)
-        .and_then(|m| m.context_tokens)
-        .map(|t| t as usize);
+        .find(|m| m.id == model);
+    let window = info.as_ref().and_then(|m| m.context_tokens).map(|t| t as usize);
 
     let budget = pinned.unwrap_or_else(|| window.map(auto_budget).unwrap_or(FALLBACK_BUDGET));
     {
@@ -124,6 +129,14 @@ async fn apply_context_budget(
         "[cwoffee] context budget {budget} tokens (model window {}, budget {})",
         window.map(|w| w.to_string()).unwrap_or_else(|| "unknown".into()),
         if pinned.is_some() { "pinned in config" } else { "derived" }
+    );
+    // Sampling is a claim about behaviour, so the boot line states both halves:
+    // what this app sends and what the endpoint says it uses when nothing is
+    // sent. A user who never opens `[sampling]` should still be able to see that
+    // their server is running at temperature 1.0.
+    eprintln!(
+        "[cwoffee] sampling: {}",
+        sampling.describe(info.as_ref().map(|m| &m.sampling))
     );
 }
 
@@ -379,6 +392,7 @@ impl SessionHost {
                 max_tool_iters: cfg.max_tool_iters,
                 reasoning: cfg.reasoning,
                 max_tokens: cfg.max_tokens,
+                sampling: cfg.sampling.clone(),
             },
             ctx,
         );
@@ -538,7 +552,13 @@ impl SessionHost {
 
             // Ask the endpoint what the model can actually hold, once, before the
             // first turn. Everything else about the budget follows from that.
-            apply_context_budget(&mut agent, &budget_provider, cfg.context_budget, &state_bg).await;
+            apply_context_budget(
+                &mut agent,
+                &budget_provider,
+                cfg.context_budget,
+                &state_bg,
+                &cfg.sampling,
+            ).await;
 
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -643,7 +663,13 @@ impl SessionHost {
                             // over from the previous model is how a compaction
                             // warning shows up in a session that is nowhere near
                             // full.
-                            apply_context_budget(&mut agent, &budget_provider, cfg.context_budget, &state_bg).await;
+                            apply_context_budget(
+                &mut agent,
+                &budget_provider,
+                cfg.context_budget,
+                &state_bg,
+                &cfg.sampling,
+            ).await;
                             let _ = ev_tx.send(EngineEvent::Note {
                                 message: context_budget_note(&state_bg, &model_now),
                             });

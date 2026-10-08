@@ -37,6 +37,30 @@ approval_timeout_secs = 300
 # instead of ending mid-sentence.
 # max_output_tokens = 8192
 
+# Sampling. Every key is optional, and a key you do not write is not sent at all:
+# the server's own default then decides, which is the right answer for an endpoint
+# somebody else tuned. Cwoffee deliberately ships no defaults here.
+#
+# Why the section exists at all: llama.cpp's default temperature is 1.0, which is
+# a reasonable creative setting and a poor one for tool-call JSON on a long agentic
+# turn. The failure shows up far from its cause - as malformed tool arguments, or a
+# run of repeated characters at the tail of an answer.
+#
+# The boot log prints both halves, so you can see what leaving this alone means for
+# your server:
+#   [cwoffee] sampling: nothing set, the endpoint decides | endpoint defaults: temperature=1 top_p=0.95 top_k=20 min_p=0
+#
+# Values that work well for tool-heavy use on Qwen-class models, if you want them:
+# temperature 0.6-0.8, top_p 0.9, top_k 20, min_p 0.05. Set `seed` when you want a
+# tool loop to be reproducible while you debug it.
+#
+# [sampling]
+# temperature = 0.7
+# top_p = 0.9
+# top_k = 20
+# min_p = 0.05
+# seed = 1234
+
 theme = "light"               # light | dark | system (not wired up yet)
 
 # ---------------------------------------------------------------------------

@@ -182,6 +182,16 @@ fn main() {
     cfg.context_budget = appcfg.context.target_tokens;
     // None means the server's own output cap applies; see Config.
     cfg.max_tokens = appcfg.max_output_tokens;
+    // Empty unless `[sampling]` says otherwise, in which case the keys go on every
+    // request. Validated here rather than at request time: a bad range should stop
+    // the app at boot, not bend the model's behaviour invisibly.
+    match appcfg.sampling_checked() {
+        Ok(s) => cfg.sampling = s,
+        Err(e) => {
+            eprintln!("[cwoffee] bad {e} - fix it in {}", config_path.display());
+            std::process::exit(1);
+        }
+    }
     // No env block from here on purpose: the host derives it from the folder a
     // turn actually runs in. A snapshot of the startup folder used to be shown to
     // sessions living somewhere else.
