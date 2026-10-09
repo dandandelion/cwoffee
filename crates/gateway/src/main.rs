@@ -130,6 +130,11 @@ async fn main() -> anyhow::Result<()> {
     cfg.max_tool_iters = appcfg.max_tool_iters();
     // Validated at boot, not per request: see Config::sampling_checked.
     cfg.sampling = appcfg.sampling_checked().map_err(anyhow::Error::msg)?;
+    // The exec sandbox's egress block, validated here so a mode word that does not
+    // parse stops the app rather than silently becoming the default.
+    appcfg.net_checked().map_err(anyhow::Error::msg)?;
+    cfg.question_timeout = appcfg.question_timeout();
+    appcfg.question_timeout_checked().map_err(anyhow::Error::msg)?;
     // Per-turn, from the live workspace: see SessionHost.
     cfg.env_override = None;
     cfg.approval_timeout = std::time::Duration::from_secs(appcfg.approval_timeout_secs.unwrap_or(300));

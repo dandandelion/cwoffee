@@ -194,6 +194,24 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // How long a question card stays open. Validated at boot for the same reason
+    // sampling is: a value that is nonsense should stop the app, not be ignored.
+    match appcfg.question_timeout_checked() {
+        Ok(d) => cfg.question_timeout = d,
+        Err(e) => {
+            eprintln!("[cwoffee] bad {e} - fix it in {}", config_path.display());
+            std::process::exit(1);
+        }
+    }
+    // Same rule for the sandbox's egress block: a mode word that does not parse is
+    // a startup error naming itself, not a silent fall back to the default.
+    if let Err(e) = appcfg.net_checked() {
+        eprintln!("[cwoffee] bad {e} - fix it in {}", config_path.display());
+        std::process::exit(1);
+    }
+    // Say what the sandbox will actually do. Without this line a user who set
+    // `network = "open"` has no way to know the app honoured it.
+    println!("[cwoffee] sandbox egress: {}", appcfg.exec_cfg().net.describe());
     // No env block from here on purpose: the host derives it from the folder a
     // turn actually runs in. A snapshot of the startup folder used to be shown to
     // sessions living somewhere else.

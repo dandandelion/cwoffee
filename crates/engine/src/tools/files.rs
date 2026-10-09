@@ -532,14 +532,22 @@ impl Tool for EditFileTool {
 
         let hits = text.matches(old).count();
         if hits == 0 {
+            let hint = near_miss(&text, old);
             let mut msg = format!(
-                "old_text was not found in {} ({} lines). Copy it from the file exactly - \
-                 indentation and spacing are part of the match. Use read_file first.",
+                "old_text was not found in {} ({} lines).",
                 display_rel(&ctx.workspace, &path),
                 text.lines().count()
             );
-            if let Some(hint) = near_miss(&text, old) {
-                msg.push_str(&format!("\nnear miss: {hint}"));
+            match hint {
+                // The file is already in hand, so the correction is to quote the bytes
+                // rather than to spend another call reading them. Session 1306 paid a
+                // read_file for every failed edit because the old message said
+                // "use read_file first" and gave nothing else.
+                Some(hint) => msg.push_str(&format!("\n{hint}")),
+                None => msg.push_str(
+                    " Copy it from the file exactly - indentation and spacing are part of \
+                     the match. Use read_file first.",
+                ),
             }
             return ToolResult::err(msg);
         }
@@ -592,25 +600,59 @@ fn near_miss(file: &str, old: &str) -> Option<String> {
     for (i, line) in file.lines().enumerate() {
         if line.trim() == want {
             return Some(format!(
-                "line {} holds the same text with different leading whitespace: {:?}",
+                "near miss: line {} holds the same text with different leading whitespace: {}",
                 i + 1,
-                line
+                clip_line(line, 200)
             ));
         }
     }
     let first = old.lines().next().unwrap_or("").trim();
     if !first.is_empty() {
+        // Where the snippet starts: quote the file's own lines from there, so the
+        // retry can be written from the text in front of the model. Line numbers and
+        // exact leading spaces are part of the quote, because those are the two
+        // things that were wrong.
         for (i, line) in file.lines().enumerate() {
             if line.trim() == first {
+                let want = old.lines().count().clamp(1, 12);
+                let excerpt: Vec<String> = file
+                    .lines()
+                    .skip(i)
+                    .take(want)
+                    .enumerate()
+                    .map(|(k, l)| format!("  {}: {}", i + k + 1, clip_line(l, 200)))
+                    .collect();
                 return Some(format!(
-                    "the snippet's first line matches line {}, but the rest does not \
-                     match exactly",
-                    i + 1
+                    "near miss: the snippet's first line is line {} of the file. From there \
+                     the file holds:\n{}\nQuote those lines exactly - the leading spaces and \
+                     the line breaks are part of the match.",
+                    i + 1,
+                    excerpt.join("\n")
+                ));
+            }
+        }
+        // The first line exists only *inside* a longer line: the snippet cut a line in
+        // half, or the file wrapped it.
+        for (i, line) in file.lines().enumerate() {
+            if line.contains(first) {
+                return Some(format!(
+                    "near miss: line {} holds the snippet's first line inside a longer line: {}",
+                    i + 1,
+                    clip_line(line, 200)
                 ));
             }
         }
     }
     None
+}
+
+/// One line, bounded. An excerpt of a minified file would otherwise be a wall.
+fn clip_line(line: &str, max: usize) -> String {
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let kept: String = line.chars().take(max).collect();
+    format!("{kept}\u{2026}")
 }
 
 fn sibling_tmp(path: &std::path::Path) -> std::path::PathBuf {
@@ -910,6 +952,98 @@ mod tests {
         assert!(r.ok, "{:?}", r.error);
         assert!(std::fs::read_to_string(d.join("p.py")).unwrap().contains("return 2"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The old message ended with "Use read_file first", which is a second call for
+    /// information the tool already had. The near miss has to carry the file's own
+    /// bytes - line numbers, leading spaces and all - and the retry written from that
+    /// quote has to work.
+    #[tokio::test]
+    async fn a_failed_edit_quotes_the_lines_it_wanted_instead_of_sending_a_read() {
+        let d = tmp("nearquote");
+        std::fs::write(
+            d.join("a.py"),
+            "def f():\n    if x:\n        return 1\n    return 2\n",
+        )
+        .unwrap();
+        let r = EditFileTool
+            .run(
+                json!({"path": "a.py", "old_text": "def f():\nif x:\n    return 1", "new_text": "nope"}),
+                &ctx_in(&d),
+                &sink(),
+            )
+            .await;
+        assert!(!r.ok);
+        let msg = r.text();
+        assert!(msg.contains("near miss"), "{msg}");
+        // The file's own spacing, not a description of it.
+        assert!(msg.contains("        return 1"), "no exact spacing: {msg}");
+        assert!(msg.contains("2:     if x:"), "no line numbering: {msg}");
+        assert!(!msg.contains("Use read_file first"), "asked for a read: {msg}");
+
+        // The retry, written straight from that quote, applies.
+        let ok = EditFileTool
+            .run(
+                json!({
+                    "path": "a.py",
+                    "old_text": "def f():\n    if x:\n        return 1",
+                    "new_text": "def f():\n    if x:\n        return 3"
+                }),
+                &ctx_in(&d),
+                &sink(),
+            )
+            .await;
+        assert!(ok.ok, "a retry written from the quote must work: {}", ok.text());
+    }
+
+    /// A quote of a 40-line snippet in a minified file is a dump unless it is
+    /// bounded, and a tool result is not a file viewer.
+    #[tokio::test]
+    async fn a_near_miss_quote_stays_a_quote() {
+        let d = tmp("nearbound");
+        let long_line = "x".repeat(5000);
+        let mut body = String::new();
+        body.push_str(&format!("{long_line}\n"));
+        for i in 0..40 {
+            body.push_str(&format!("    line {i}\n"));
+        }
+        std::fs::write(d.join("big.txt"), &body).unwrap();
+        // The snippet starts on the unreadable line, which is the case that would
+        // otherwise paste 5000 characters back at the model.
+        let old: String = std::iter::once(long_line.clone())
+            .chain((0..40).map(|i| format!("line {i}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = EditFileTool
+            .run(json!({"path": "big.txt", "old_text": old, "new_text": "nope"}), &ctx_in(&d), &sink())
+            .await;
+        assert!(!r.ok);
+        let msg = r.text();
+        assert!(
+            msg.len() < 3000,
+            "a near miss leaked {} bytes of file: {}",
+            msg.len(),
+            &msg[..200.min(msg.len())]
+        );
+        assert!(
+            msg.lines().count() <= 15,
+            "the quote kept more than its share of the file:\n{msg}"
+        );
+        assert!(msg.contains('…'), "a 5000-char line was not clipped: {msg}");
+    }
+
+    /// And when there is genuinely nothing nearby, the advice to read the file is
+    /// still the right advice.
+    #[tokio::test]
+    async fn a_miss_with_nothing_nearby_still_says_read_the_file() {
+        let d = tmp("nearnone");
+        std::fs::write(d.join("q.txt"), "alpha\nbeta\n").unwrap();
+        let r = EditFileTool
+            .run(json!({"path": "q.txt", "old_text": "gamma delta", "new_text": "x"}), &ctx_in(&d), &sink())
+            .await;
+        let msg = r.text();
+        assert!(!msg.contains("near miss"), "{msg}");
+        assert!(msg.contains("Use read_file first"), "{msg}");
     }
 
     #[tokio::test]

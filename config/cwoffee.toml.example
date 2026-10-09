@@ -48,6 +48,12 @@ approval_timeout_secs = 300
 # calls. Set a number when you want a hard stop instead:
 # max_tool_iters = 40
 
+# How long an ask_user card stays open before the model is told nobody answered.
+# Default 180 (three minutes). Raise it when the answer is not yours to give - a
+# question you have to take to another person cannot be answered in three minutes,
+# and the model then decides the questions itself.
+# question_timeout_secs = 600
+
 # Sampling. Every key is optional, and a key you do not write is not sent at all:
 # the server's own default then decides, which is the right answer for an endpoint
 # somebody else tuned. Cwoffee deliberately ships no defaults here.
@@ -144,6 +150,31 @@ enabled = true
 # requests above it is clamped down and the clamp is reported back to the model,
 # because a silently clamped deadline just means it keeps asking for longer.
 timeout_secs = 120
+
+# What a command in the sandbox may reach over the network. Three settings, and
+# the honest difference between them is in docs; the short version:
+#   off    no network at all. Nothing to configure per host.
+#   proxy  network, but package managers and every other tool that reads a proxy
+#          variable are pointed at a proxy inside this process, which admits the
+#          hosts below and refuses the rest by name (default)
+#   open   network, nothing in between
+# proxy is a guardrail, not a wall: it filters what a tool sends, and a tool that
+# ignores HTTP_PROXY can still open its own route. Enforcing it for every program
+# would need privileges Cwoffee does not take.
+network = "proxy"
+
+# Hosts the proxy admits. Omit this key for the built-in list of 23 package
+# registries and open-source hosts: npm, Yarn, nodejs.org, PyPI and its file host,
+# crates.io (three hosts), GitHub (five hosts), GitLab, the Go module proxies,
+# RubyGems, Hugging Face, jsDelivr, unpkg, deno.land.
+# A leading "*." matches subdomains; ["*"] admits everything, with the proxy's
+# log still running. The proxy only serves ports 80 and 443; loopback is kept
+# direct (NO_PROXY), so a command in the sandbox can still reach a local endpoint.
+# allow = ["registry.npmjs.org", "pypi.org", "*.gitlab.com"]
+
+# Bytes through the proxy per exec call before the pipe is cut, so a broken
+# mirror cannot fill the workspace.
+max_mb_per_call = 512
 
 # ---------------------------------------------------------------------------
 # Environment overrides (no config keys - these win over the file)

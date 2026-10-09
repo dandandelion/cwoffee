@@ -315,12 +315,16 @@ impl Tool for SheetQueryTool {
         if !loaded.note.is_empty() {
             out.push_str(&format!("# {}\n", loaded.note));
         }
-        if shape.blank_headers {
-            out.push_str(
-                "# note: some header cells were empty, so those columns are named by position (c7, c8). \
-                 Pass header:false to name every column by position.\n",
-            );
+        if !shape.blank_names.is_empty() {
+            let list: Vec<&str> = shape.blank_names.iter().take(8).map(|s| s.as_str()).collect();
+            out.push_str(&format!(
+                "# note: {} of the header cells were empty, so those columns are named by position \
+                 ({}). If the real header is a different row, pass header_row=N.\n",
+                shape.blank_names.len(),
+                list.join(", ")
+            ));
         }
+        out.push_str(&shape.header_nudge);
         out.push_str("# blanks are NULL; columns whose cells are all numbers are numeric, so SUM/AVG work\n");
 
         let mut shown = 0usize;
@@ -549,6 +553,12 @@ fn pick_header_row(rows: &BTreeMap<usize, BTreeMap<usize, String>>, cols: &[usiz
         if filled.len() < 2 {
             continue;
         }
+        // A row of pure numbers is a row of a matrix, not a header. Without this,
+        // "1,2,3" over "4,5,6" turns 1/2/3 into column names and the note starts
+        // telling the model that row 1 looks like a header.
+        if !filled.iter().any(|v| v.chars().any(|c| c.is_alphabetic())) {
+            continue;
+        }
         let ratio = filled.len() as f64 / cols.len().max(1) as f64;
         if ratio < 0.34 {
             continue;
@@ -601,8 +611,15 @@ struct Shape {
     /// Rows above the header: a title block, not records. They are not loaded, and
     /// the output says so, because silently dropping rows is worse than naming it.
     skipped_above: Vec<usize>,
-    blank_headers: bool,
+    /// Column names that came from an empty header cell. Named by position, and the
+    /// list has to be the real one: the note used to carry the literal `(c7, c8)`
+    /// from an example, which matched nothing and taught the model to distrust it.
+    blank_names: Vec<String>,
     header_note: String,
+    /// A one-line push back when the caller passed `header:false` and the sheet has
+    /// a header the detector can see. Positional columns are workable but the named
+    /// form is what makes GROUP BY readable, so it is worth one line.
+    header_nudge: String,
 }
 
 impl Shape {
@@ -635,12 +652,20 @@ impl Shape {
                     ));
                 }
             }
-            Header::Auto => pick_header_row(&loaded.rows, &cols)
-                .or_else(|| loaded.rows.iter().find_map(|(r, m)| (!m.is_empty()).then_some(*r))),
+            // The fallback covers a single-column list, where the scorer's
+            // two-filled-cells rule cannot fire; it is limited to rows with a letter
+            // for the same reason.
+            Header::Auto => pick_header_row(&loaded.rows, &cols).or_else(|| {
+                loaded
+                    .rows
+                    .iter()
+                    .find(|(_, m)| m.values().any(|v| v.chars().any(|c| c.is_alphabetic())))
+                    .map(|(r, _)| *r)
+            }),
         };
         let mut names = Vec::with_capacity(cols.len());
         let mut seen: Vec<String> = Vec::new();
-        let mut blank_headers = false;
+        let mut blank_names: Vec<String> = Vec::new();
         for (i, c) in cols.iter().enumerate() {
             let raw = header_row
                 .and_then(|r| loaded.rows.get(&r))
@@ -648,8 +673,8 @@ impl Shape {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
             let mut name = normalize(&raw, i);
-            if raw.is_empty() {
-                blank_headers = true;
+            if raw.is_empty() && header_row.is_some() {
+                blank_names.push(name.clone());
             }
             let mut n = 2;
             while seen.iter().any(|s| s == &name) {
@@ -701,14 +726,58 @@ impl Shape {
             (Header::Explicit(h), _) => format!("# header: sheet row {} as you specified\n", h + 1),
             (Header::None, _) => "# header: none, so columns are c1..cN and every row is data\n".to_string(),
         };
+        // `header:false` with a visible header row: the model usually passes it
+        // because the automatic header looked wrong once, and then spends the rest of
+        // the turn counting rows instead of naming columns. Say which row the detector
+        // sees, and how to ask for it.
+        let header_nudge = match header {
+            Header::None => match pick_header_row(&loaded.rows, &cols) {
+                Some(h) => {
+                    let mut label: Vec<String> = cols
+                        .iter()
+                        .take(8)
+                        .map(|c| {
+                            loaded
+                                .rows
+                                .get(&h)
+                                .and_then(|m| m.get(c))
+                                .map(|v| v.trim().to_string())
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or_else(|| "·".into())
+                        })
+                        .collect();
+                    if cols.len() > 8 {
+                        label.push(format!("+{} more", cols.len() - 8));
+                    }
+                    let line = label.join(" | ");
+                    let line = if line.len() > 120 {
+                        format!("{}...", &line[..120])
+                    } else {
+                        line
+                    };
+                    format!(
+                        "# note: header:false, so the columns are c1..cN and row {} is data. \
+                         Row {} looks like a header ({}) - drop header:false, or pass \
+                         header_row={}, to query the columns by name.\n",
+                        h + 1,
+                        h + 1,
+                        line,
+                        h + 1
+                    )
+                }
+                None => String::new(),
+            },
+            _ => String::new(),
+        };
         Ok(Shape {
             names,
             cols,
             kinds,
             header_row,
             skipped_above,
-            blank_headers,
+            blank_names,
             header_note,
+            header_nudge,
         })
     }
 
@@ -1079,8 +1148,78 @@ mod tests {
         let r = call(&ctx, json!({"path": "bh.csv", "query": "SELECT name, c2, qty FROM t"})).await;
         assert!(r.ok, "{}", why(&r));
         let out = why(&r);
-        assert!(out.contains("some header cells were empty"), "{out}");
+        assert!(out.contains("header cells were empty"), "{out}");
+        // The note names the columns it actually produced. It used to carry "(c7,
+        // c8)" from an example, which matched no column in any file.
+        assert!(out.contains("(c2)"), "{out}");
+        assert!(!out.contains("c7, c8"), "a hardcoded example leaked into the note: {out}");
+        // It must not push the model toward turning headers off, which is what the
+        // old wording did and what session 1306 then did for a whole turn.
+        assert!(!out.contains("Pass header:false"), "{out}");
         assert!(out.contains("2025-01-15"), "an unlabelled date column should still arrive:\n{out}");
+
+        // With no header row there are no blank header cells, so the note cannot
+        // appear alongside "# header: none" - session 1306 printed both at once.
+        let r = call(
+            &ctx,
+            json!({"path": "bh.csv", "header": false, "query": "SELECT COUNT(*) AS n FROM t"}),
+        )
+        .await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(out.contains("# header: none"), "{out}");
+        assert!(!out.contains("header cells were empty"), "{out}");
+    }
+
+    /// One column is the case the scorer's "at least two filled cells" rule cannot
+    /// see. The name row must still not become a record: a COUNT over a list of
+    /// three cities that answers 4 is the kind of wrong number that survives into a
+    /// report.
+    #[tokio::test]
+    async fn a_single_column_list_keeps_its_name_out_of_the_records() {
+        let d = tmp("onecol");
+        csv(&d, "cities.csv", "City\nBerlin\nLima\nQuito\n");
+        let ctx = ctx_in(&d);
+        let r = call(&ctx, json!({"path": "cities.csv", "query": "SELECT COUNT(*) AS n FROM t"})).await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(out.contains("rownum | city"), "{out}");
+        assert!(
+            out.trim().ends_with("# 1 result row(s)") && out.contains("\n3"),
+            "three cities, not four:\n{out}"
+        );
+    }
+
+    /// `header:false` is not wrong, but on a sheet with a visible header it costs the
+    /// model named columns, and session 1306 paid that for every call of a long turn.
+    #[tokio::test]
+    async fn header_false_on_a_sheet_with_a_visible_header_is_pushed_back_on_once() {
+        let d = tmp("nudged");
+        let xlsx = d.join("cashflow.xlsx");
+        titled_workbook(&xlsx);
+        let ctx = ToolCtx { workspace: d.clone(), ..Default::default() };
+        let r = call(
+            &ctx,
+            json!({"path": "cashflow.xlsx", "header": false, "query": "SELECT COUNT(*) AS n FROM t"}),
+        )
+        .await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(out.contains("# header: none"), "{out}");
+        assert!(out.contains("looks like a header"), "{out}");
+        assert!(out.contains("DATE | DESCRIPTION"), "{out}");
+        assert!(out.contains("header_row=3"), "{out}");
+        // One line, not a lecture: these bytes are in every result.
+        assert_eq!(out.lines().filter(|l| l.starts_with("# note:")).count(), 1, "{out}");
+
+        // A sheet with nothing header-shaped gets no nudge.
+        let d2 = tmp("nudged2");
+        csv(&d2, "plain.csv", "1,2,3\n4,5,6\n");
+        let ctx2 = ctx_in(&d2);
+        let r = call(&ctx2, json!({"path": "plain.csv", "header": false, "query": "SELECT COUNT(*) AS n FROM t"})).await;
+        let out = why(&r);
+        assert!(r.ok, "{out}");
+        assert!(!out.contains("looks like a header"), "{out}");
     }
 
     #[tokio::test]
@@ -1315,6 +1454,8 @@ mod tests {
         assert!(r.ok, "{out}");
         assert!(out.contains("# header: none"), "{out}");
         assert!(out.contains("c1 | c2 | c3 | c4 | c5"), "{out}");
+        // And the tool does not leave it there: it says which row it can see.
+        assert!(out.contains("looks like a header"), "{out}");
         assert!(out.contains("6"), "header:false must load all 6 rows: {out}");
 
         // A row that does not exist is an error with the first real row in it, not a

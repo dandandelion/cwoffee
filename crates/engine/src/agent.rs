@@ -713,10 +713,22 @@ impl Agent {
                     exit_code: None,
                     changes: Vec::new(),
                 });
-                self.prompt.push_tool_result(
-                    &call.id,
-                    format!("DENIED BY USER ({reason}). Do not retry this call."),
-                );
+                // Two different facts, and the model needs the right one. A user
+                // pressing deny means "not this call". The denylist means "this
+                // shape is never run, by policy". Telling a model "DENIED BY USER"
+                // for a pattern match - which is what happened when the pattern
+                // `mount ` matched the letters inside *amount* - sends it off
+                // negotiating a refusal nobody made. Name the owner, and the way out.
+                let denied_by_policy = reason.starts_with("denylisted pattern")
+                    || reason == "pipe into shell";
+                let text = if denied_by_policy {
+                    format!(
+                        "BLOCKED BY THE DENYLIST ({reason}). No user refused this call: the shape                          of it is blocked in every mode. Do not retry it as written. If the                          pattern matched inside an unrelated word, rephrase the command; if it                          was writing a file, use write_file/edit_file instead."
+                    )
+                } else {
+                    format!("DENIED BY USER ({reason}). Do not retry this call.")
+                };
+                self.prompt.push_tool_result(&call.id, text);
                 return;
             }
             GateOutcome::Allow => {}
@@ -1666,6 +1678,40 @@ mod tests {
         let tr = h.iter().find(|m| m.tool_call_id.as_deref() == Some("d1")).expect("result exists");
         assert!(tr.content.contains("DENIED BY USER"));
         assert!(tr.content.contains("Do not retry"));
+    }
+
+    /// The denylist is not a user. A session that got "DENIED BY USER" for the
+    /// pattern `mount ` matching the word *amount* spent its next three calls
+    /// arguing with a refusal that was never made.
+    #[tokio::test]
+    async fn a_denylisted_call_says_who_blocked_it() {
+        let turns = vec![
+            vec![
+                Delta::ToolCallReady {
+                    id: "p1".into(),
+                    name: "exec".into(),
+                    arguments: "{\"cmd\":\"python3 -c 'print(1)'; sudo mount /dev/sdb /mnt\"}".into(),
+                },
+                Delta::Done(FinishReason::ToolCalls),
+            ],
+            vec![Delta::Text("changed tack".into()), Delta::Done(FinishReason::Stop)],
+        ];
+        // The gate answers *allow*: the denylist applies in every mode, so the
+        // refusal must come from policy, not from the answer.
+        let (mut agent, _ev, mut arx) = harness(turns, ApprovalAnswer::Allow);
+        tokio::spawn(async move { while let Some((_, reply)) = arx.recv().await {
+            reply.send(ApprovalAnswer::Allow).ok();
+        } });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        agent.run_turn("go", vec![], &tx).await;
+        let h = agent.prompt.history();
+        let tr = h
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("p1"))
+            .expect("result exists");
+        assert!(tr.content.contains("BLOCKED BY THE DENYLIST"), "{}", tr.content);
+        assert!(tr.content.contains("No user refused"), "{}", tr.content);
+        assert!(!tr.content.contains("DENIED BY USER"), "{}", tr.content);
     }
 
     #[tokio::test]

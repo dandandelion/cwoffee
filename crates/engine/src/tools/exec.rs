@@ -27,13 +27,30 @@ pub struct ExecTool {
     pub timeout_secs: u64,
     /// When false, refuse to run anything unless bwrap is available.
     pub allow_unsandboxed: bool,
+    /// What the sandbox may reach over the network: nothing, an allowlisted proxy,
+    /// or everything. See `tools::net` for what each one actually guarantees.
+    pub net: crate::tools::net::NetCfg,
+    /// The egress proxy, started on first use. Lazy because the registry is built
+    /// before anyone knows whether a turn will ever need the network, and a
+    /// listening socket is a thing to avoid when it is not needed.
+    pub(crate) proxy: tokio::sync::OnceCell<crate::tools::net::EgressProxy>,
+    /// The tool description, built once from the egress mode. It is a field rather
+    /// than a literal because "no network" is a lie in the default mode, and a
+    /// model that believes it spends the turn looking for an offline wheel.
+    desc: String,
 }
 
 impl Default for ExecTool {
     fn default() -> Self {
         // Matches the documented config default. Two different "defaults" for
         // the same knob is how a config key ends up looking ignored.
-        Self { timeout_secs: crate::config::default_exec_timeout(), allow_unsandboxed: false }
+        Self {
+            timeout_secs: crate::config::default_exec_timeout(),
+            allow_unsandboxed: false,
+            net: crate::tools::net::NetCfg::default(),
+            proxy: tokio::sync::OnceCell::new(),
+            desc: blurb(crate::tools::net::NetCfg::default().mode),
+        }
     }
 }
 
@@ -44,13 +61,7 @@ impl Tool for ExecTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in a sandbox (no network, host filesystem read-only, \
-         only the workspace is writable). Each call gets a fresh filesystem: /tmp and \
-         anything you create outside the workspace is gone before the next call, so \
-         scratch files belong in the workspace. Returns stdout and stderr combined. \
-         Do not author file contents here: no here-documents and no long echo/printf \
-         redirections. Write files with write_file, which takes the content as an \
-         argument and shows the approver a diff instead of a wall of text."
+        &self.desc
     }
 
     fn schema(&self) -> Value {
@@ -125,6 +136,37 @@ impl Tool for ExecTool {
         // configured ceiling is the user's, not the model's to raise.
         let (timeout_secs, timeout_note) = self.effective_timeout(&args);
 
+        // What this call may reach over the network. `off` keeps --unshare-net and
+        // nothing else changes; `proxy` shares the network namespace and points
+        // every tool that reads a proxy variable at a proxy in this process;
+        // `open` shares it with nothing in between.
+        let net = self.net.mode;
+        let egress: Option<&crate::tools::net::EgressProxy> = match net {
+            crate::tools::net::NetMode::Proxy => match self
+                .proxy
+                .get_or_try_init(|| async {
+                    crate::tools::net::start(
+                        self.net.allow.clone(),
+                        self.net.max_bytes_per_call,
+                    )
+                    .await
+                })
+                .await
+            {
+                Ok(p) => Some(p),
+                // A proxy that will not start is not a licence to go out unfiltered.
+                Err(e) => return ToolResult::err(format!("exec: {e}")),
+            },
+            _ => None,
+        };
+        if let Some(e) = egress {
+            // Reset per call, so the egress lines attached to a result describe
+            // that result. Two exec calls running in parallel share the counters;
+            // the note says "this call and any other running alongside it", which
+            // is what it actually is.
+            e.state.begin_call(self.net.max_bytes_per_call);
+        }
+
         let bwrap = which("bwrap");
         let use_sandbox = bwrap.is_some();
         if !use_sandbox && !self.allow_unsandboxed {
@@ -136,7 +178,7 @@ impl Tool for ExecTool {
 
         let (program, pre_args) = if use_sandbox {
             let b = bwrap.unwrap();
-            let mut a = sandbox_args(&ctx.workspace);
+            let mut a = sandbox_args(&ctx.workspace, net);
             // Deadline enforced inside the namespace; -k 2 forces SIGKILL if the
             // command ignores SIGTERM.
             a.extend([
@@ -182,6 +224,15 @@ impl Tool for ExecTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(e) = egress {
+            // Six spellings because six programs read six different names; see
+            // net::proxy_env. NO_PROXY keeps loopback direct, so a command in the
+            // sandbox can still reach the app's own gateway or a local model
+            // endpoint without detouring through an egress filter.
+            for (k, v) in crate::tools::net::proxy_env(e.port) {
+                c.env(k, v);
+            }
+        }
 
         let mut child = match c.spawn() {
             Ok(ch) => ch,
@@ -241,9 +292,52 @@ impl Tool for ExecTool {
         }
 
         let combined = clamp(combine(&out, &err), ctx.max_output_bytes);
+        // A failed command whose text says "the sandbox has no network" is a
+        // diagnosis the model has to read and interpret; the follow-up call it
+        // wastes is the cost of not saying it outright. Notes are only added on
+        // failure, and only for signatures with exactly one right answer.
+        let mut body = combined.0;
+        // Not gated on the exit code. `curl ... | head -2` exits 0 - the pipeline's
+        // status is head's - and the session that hit this saw a dead-network
+        // message with no explanation because of exactly that pipe. The note keys on
+        // phrases specific enough (an errno, an interpreter error, a shell quote
+        // error) that a command printing one by accident is rarer than a command
+        // hiding its status behind a pipe.
+        if let Some(note) = failure_note(&body, net) {
+            body.push_str(&format!("\n# note: {note}"));
+        }
+        // What the proxy decided, in the same place the model reads the answer.
+        // A 403 from an allowlist is otherwise a mystery: npm calls it ECONNREFUSED
+        // or a TLS error, and the model has no way to know a config line fixes it.
+        if let Some(e) = egress {
+            let hosts: Vec<String> = e
+                .state
+                .hosts_denied()
+                .into_iter()
+                .filter(|h| !h.starts_with("#bytes"))
+                .collect();
+            let bytes = e.state.bytes();
+            if !hosts.is_empty() {
+                body.push_str(&format!(
+                    "\n# egress blocked: {} - not in the sandbox allowlist. Add them to \
+                     allow = [...] under [sandbox] in config.toml, or ask the user to run the \
+                     command outside Cwoffee.",
+                    hosts.join(", ")
+                ));
+            }
+            if e.state.hosts_denied().iter().any(|h| h == "#bytes") {
+                body.push_str(&format!(
+                    "\n# egress budget spent for this call ({} MB through the proxy) - raise \
+                     max_bytes_per_call under [sandbox] if a download genuinely needs more.",
+                    bytes / 1_000_000
+                ));
+            } else if bytes > 2_000_000 {
+                body.push_str(&format!("\n# egress: {} MB through the proxy", bytes / 1_000_000));
+            }
+        }
         ToolResult {
             ok: code == Some(0),
-            output: combined.0,
+            output: body,
             exit_code: code,
             truncated: combined.1,
             error: None,
@@ -256,7 +350,117 @@ impl Tool for ExecTool {
     }
 }
 
+/// One line explaining a failure the **environment** caused, when the raw output
+/// is a dead end for something that cannot see the machine.
+///
+/// Every entry here came out of a real session: `npm error code ENETUNREACH`
+/// (the sandbox has no network, which is not visible from the text), and
+/// `ModuleNotFoundError: No module named 'openpyxl'` (followed by a hand-written
+/// xlsx parser). Adding the note costs one line; the wasted call it prevents is
+/// a full round trip of prefill.
+fn failure_note(text: &str, net: crate::tools::net::NetMode) -> Option<&'static str> {
+    const NETWORK: [&str; 8] = [
+        "enetunreach",
+        "enetdown",
+        "econnunreachable",
+        "could not resolve host",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "no route to host",
+    ];
+    let low = text.to_ascii_lowercase();
+    // curl's own words when a route does not exist, which are different words in
+    // every version and contain no errno. Only `off` reads them as "no network":
+    // in `proxy` mode the same words mean the proxy itself is unreachable, and in
+    // `open` mode they mean the machine has no route.
+    let curl_no_route = matches!(net, crate::tools::net::NetMode::Off)
+        && (low.contains("could not connect to server") || low.contains("failed to connect to"));
+    if NETWORK.iter().any(|p| low.contains(p)) || curl_no_route {
+        // The answer depends on the mode, and the model has to be told the right
+        // one: in `off` there is nothing to configure per host, in `proxy` one
+        // allowlist line fixes it, and in `open` the failure is the user's network.
+        return match net {
+            crate::tools::net::NetMode::Off => Some(
+                "the exec sandbox has no network access, by design. Package installs (apt, pip, npm, \
+             cargo) and any curl/wget to the internet will not work in here; web_fetch and \
+             download_file are the sanctioned network tools, and installing something on the \
+             machine is a step the user takes outside Cwoffee. To change this, set \
+             [sandbox] network = \"proxy\" (allowlisted egress) or \"open\".",
+            ),
+            crate::tools::net::NetMode::Proxy => Some(
+                "this looks like a network failure under the sandbox egress proxy. If the host \
+                 you needed is not listed in the `# egress blocked` line above, add it to \
+                 allow = [...] under [sandbox] in config.toml.",
+            ),
+            crate::tools::net::NetMode::Open => Some(
+                "network failure with the sandbox's network open, so this is the machine's own \
+                 connectivity, not the sandbox.",
+            ),
+        };
+    }
+    if low.contains("no module named") {
+        return Some(
+            "that python package is not installed on the host, and the sandbox cannot install one \
+             (no network). Do not write your own parser for the job: spreadsheets are sheet_read \
+             and sheet_query, documents are write_file.",
+        );
+    }
+    if low.contains("unexpected eof while looking for matching") {
+        return Some(
+            "the command's quotes do not balance, usually because the argument string was cut off \
+             part-way. Keep shell commands to one level of quoting, and put file content in \
+             write_file rather than a here-document.",
+        );
+    }
+    None
+}
+
+/// The exec description for one egress mode. One shared body plus one sentence
+/// about the network, so the mode the user configured is the mode the model is
+/// told about - and the sentence is short because these bytes sit in every turn.
+fn blurb(net: crate::tools::net::NetMode) -> String {
+    let network = match net {
+        crate::tools::net::NetMode::Off =>
+            "There is no network in here: package installs and any request to the \
+             internet cannot work, so do not try them.",
+        crate::tools::net::NetMode::Proxy =>
+            "Network goes through an allowlist proxy: package installs work for \
+             allowlisted hosts, and a refusal names the host and the config line \
+             that would admit it.",
+        crate::tools::net::NetMode::Open =>
+            "The network is open: failures there are the machine's connectivity, \
+             not the sandbox.",
+    };
+    format!(
+        "Run a shell command in a sandbox (host filesystem read-only, only the \
+         workspace is writable). {network} Each call gets a fresh filesystem: /tmp \
+         and anything you create outside the workspace is gone before the next \
+         call, so scratch files belong in the workspace. Returns stdout and stderr \
+         combined. Do not author file contents here: no here-documents and no long \
+         echo/printf redirections. Write files with write_file, which takes the \
+         content as an argument and shows the approver a diff instead of a wall of \
+         text."
+    )
+}
+
 impl ExecTool {
+    /// Build from the config-shaped knobs. A constructor rather than a struct
+    /// literal at every call site, so adding a field cannot silently drop a
+    /// configured value on the way in.
+    pub fn new(cfg: &crate::tools::ExecCfg) -> Self {
+        Self {
+            timeout_secs: cfg.timeout_secs,
+            // `enabled = false` is a debugging escape hatch; it flips the tool into
+            // unsandboxed mode, which is why the receiving side spells it
+            // allow_unsandboxed.
+            allow_unsandboxed: !cfg.sandbox_enabled,
+            net: cfg.net.clone(),
+            proxy: tokio::sync::OnceCell::new(),
+            desc: blurb(cfg.net.mode),
+        }
+    }
+
     /// Resolve the per-call deadline. Accepts a JSON number or a numeric string,
     /// because quantized models emit both. Never exceeds the configured ceiling.
     fn effective_timeout(&self, args: &Value) -> (u64, Option<String>) {
@@ -309,10 +513,12 @@ fn combine(out: &str, err: &str) -> String {
     }
 }
 
-/// The verified sandbox shape.
-fn sandbox_args(workspace: &std::path::Path) -> Vec<String> {
+/// The verified sandbox shape. `mode` decides only the network namespace: every
+/// other isolation (read-only root, own user, own PID, own IPC, workspace as the
+/// only writable bind) holds in all three modes.
+fn sandbox_args(workspace: &std::path::Path, net: crate::tools::net::NetMode) -> Vec<String> {
     let ws = workspace.to_string_lossy().to_string();
-    vec![
+    let mut out = vec![
         "--ro-bind".into(),
         "/".into(),
         "/".into(),
@@ -329,9 +535,15 @@ fn sandbox_args(workspace: &std::path::Path) -> Vec<String> {
         "--unshare-user".into(),
         "--unshare-ipc".into(),
         "--unshare-pid".into(),
-        "--unshare-net".into(),
         "--die-with-parent".into(),
-    ]
+    ];
+    // Adding it back is what takes the network away, and only `off` can afford
+    // it: with no network there is no route to the proxy either, so `proxy` mode
+    // without a namespace is the only shape where an allowlist decision can exist.
+    if crate::tools::net::unshare_net(net) {
+        out.push("--unshare-net".into());
+    }
+    out
 }
 
 fn drain<R>(
@@ -551,6 +763,225 @@ mod tests {
         (ToolCtx { workspace: dir, max_output_bytes: 4096, ..Default::default() }, WsGuard(std::env::temp_dir().join(format!("cwoffee_exec_test_{}_{n}", std::process::id()))))
     }
 
+    /// A tool pinned to one egress mode. `ExecTool::default()` is `proxy`, which
+    /// starts a proxy - a no-network test would then be measuring the proxy rather
+    /// than the network namespace.
+    fn tool(net: crate::tools::net::NetMode) -> ExecTool {
+        ExecTool {
+            timeout_secs: 20,
+            net: crate::tools::net::NetCfg { mode: net, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    async fn run(t: &ExecTool, ctx: &ToolCtx, cmd: &str) -> ToolResult {
+        t.run(json!({"cmd": cmd}), ctx, &sink()).await
+    }
+
+    /// The sandbox's no-network rule is invisible in npm's own words, and the
+    /// session that hit it spent calls probing for a toolchain that cannot exist in
+    /// there.
+    #[tokio::test]
+    async fn a_network_failure_says_the_sandbox_is_offline() {
+        let (ctx, _g) = ws();
+        let t = tool(crate::tools::net::NetMode::Off);
+        let r = run(
+            &t,
+            &ctx,
+            "{ echo 'npm error code ENETUNREACH'; echo 'npm error errno ENETUNREACH'; exit 1; }",
+        )
+        .await;
+        assert!(!r.ok, "{}", r.output);
+        assert!(
+            r.output.contains("# note: the exec sandbox has no network access"),
+            "{}",
+            r.output
+        );
+        assert!(
+            r.output.contains("[sandbox] network = \"proxy\""),
+            "the note must name the knob that changes the answer: {}",
+            r.output
+        );
+    }
+
+    /// `network = "open"` has to be more than the absence of --unshare-net: a
+    /// command inside the sandbox has to actually reach a socket. The listener is
+    /// loopback so the test does not depend on the internet, and loopback is
+    /// exactly what NO_PROXY keeps direct in proxy mode too.
+    #[tokio::test]
+    async fn open_mode_reaches_a_socket_outside_the_process() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut c, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = std::io::Read::read(&mut c, &mut buf);
+                let body = "OPEN-MODE-OK";
+                let _ = std::io::Write::write_all(
+                    &mut c,
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body)
+                        .as_bytes(),
+                );
+            }
+        });
+        let t = tool(crate::tools::net::NetMode::Open);
+        let (ctx, _g) = ws();
+        let r = t
+            .run(json!({"cmd": format!("curl -s -m 6 http://127.0.0.1:{port}/")}), &ctx, &sink())
+            .await;
+        assert!(
+            r.output.contains("OPEN-MODE-OK"),
+            "open mode could not reach loopback: {:?}",
+            r.output
+        );
+        let _ = server.join();
+    }
+
+    /// The other dead end from the same session: `import openpyxl` fails, and the
+    /// next thing a model writes is a 111-line xlsx parser.
+    #[tokio::test]
+    async fn a_missing_python_module_points_at_the_tools() {
+        let (ctx, _g) = ws();
+        let t = tool(crate::tools::net::NetMode::Off);
+        // Synthesise the interpreter's text: the note keys on the signature, and
+        // depending on which packages this machine happens to have installed makes
+        // a test pass or fail by host.
+        let r = run(
+            &t,
+            &ctx,
+            "printf 'ModuleNotFoundError: No module named %s\\n' openpyxl; exit 1",
+        )
+        .await;
+        assert!(!r.ok, "{}", r.output);
+        assert!(r.output.contains("# note: that python package is not installed"), "{}", r.output);
+        assert!(r.output.contains("sheet_read"), "{}", r.output);
+    }
+
+    /// In `proxy` mode the same network words get a different answer, because the
+    /// right fix is a line in the allowlist rather than a policy change.
+    /// curl's text carries no errno, and the off-mode note has to fire on it: the
+    /// probe that found this produced "Could not connect to server" for a registry
+    /// URL with no route.
+    #[test]
+    fn curl_words_without_an_errno_still_read_as_no_route_in_off_mode() {
+        use crate::tools::net::NetMode;
+        let curl = "curl: (7) Failed to connect to registry.npmjs.org port 443 after 16 ms: Could not connect to server";
+        assert!(failure_note(curl, NetMode::Off).unwrap().contains("no network access"));
+        // In proxy mode these words mean the proxy itself was unreachable, and the
+        // `# egress blocked` line the tool appends is the answer. What must not
+        // happen is the note claiming the sandbox has no network.
+        let proxy = failure_note(curl, NetMode::Proxy);
+        assert!(proxy.is_none() || !proxy.unwrap().contains("no network access"));
+    }
+
+    #[test]
+    fn the_network_note_depends_on_the_mode() {
+        use crate::tools::net::NetMode;
+        let en = "npm error code ENETUNREACH";
+        assert!(failure_note(en, NetMode::Off).unwrap().contains("no network access"));
+        let prox = failure_note(en, NetMode::Proxy).unwrap();
+        assert!(prox.contains("egress proxy") && prox.contains("allow = ["), "{prox}");
+        assert!(failure_note(en, NetMode::Open).unwrap().contains("machine's own"));
+    }
+
+    /// And no note where there is nothing to explain: an ordinary failure and a
+    /// successful command both stay exactly as long as they were.
+    #[tokio::test]
+    async fn notes_are_not_attached_to_ordinary_failures_or_success() {
+        let (ctx, _g) = ws();
+        let t = tool(crate::tools::net::NetMode::Off);
+        let plain = run(&t, &ctx, "{ echo 'boom'; exit 3; }").await;
+        assert!(!plain.ok);
+        assert!(!plain.output.contains("# note:"), "{}", plain.output);
+        let good = run(&t, &ctx, "echo fine").await;
+        assert!(good.ok);
+        assert!(good.output.trim_end().ends_with("fine"), "{}", good.output);
+        // A pipe hides the failing command's status, and the note must survive it.
+        let piped = run(
+            &t,
+            &ctx,
+            "curl -sS -m 10 -o /dev/null https://registry.npmjs.org/express 2>&1 | head -2",
+        )
+        .await;
+        assert_eq!(piped.exit_code, Some(0), "the pipe should hide the status");
+        assert!(
+            piped.output.contains("# note: the exec sandbox has no network access"),
+            "no note on a piped network failure: {:?}",
+            piped.output
+        );
+    }
+
+    #[test]
+    fn unbalanced_quotes_are_named() {
+        use crate::tools::net::NetMode;
+        assert!(
+            failure_note(r#"/bin/sh: -c: line 1: unexpected EOF while looking for matching `"'"#, NetMode::Off)
+                .unwrap()
+                .contains("quotes do not balance")
+        );
+        assert!(failure_note("Traceback: TypeError: NoneType is not callable", NetMode::Off).is_none());
+        // Same network text, three different correct answers.
+        let en = "npm error code ENETUNREACH";
+        assert!(failure_note(en, NetMode::Off).unwrap().contains("no network access"));
+        assert!(failure_note(en, NetMode::Proxy).unwrap().contains("egress blocked"));
+        assert!(failure_note(en, NetMode::Open).unwrap().contains("machine's own"));
+    }
+
+    /// The description is prompt bytes on every turn, so it is one sentence per
+    /// mode - but it must still be true, and the configured mode must survive the
+    /// trip from config to tool.
+    #[test]
+    fn the_description_says_what_the_mode_actually_allows() {
+        use crate::tools::net::NetMode;
+        let off = blurb(NetMode::Off);
+        assert!(off.contains("There is no network"));
+        assert!(!off.contains("allowlist proxy"));
+        let proxy = blurb(NetMode::Proxy);
+        assert!(proxy.contains("allowlist proxy"));
+        assert!(!proxy.contains("There is no network"));
+        assert!(blurb(NetMode::Open).contains("The network is open"));
+
+        let cfg = crate::tools::ExecCfg {
+            timeout_secs: 33,
+            sandbox_enabled: true,
+            net: crate::tools::net::NetCfg {
+                mode: NetMode::Open,
+                allow: vec!["example.org".into()],
+                max_bytes_per_call: 4096,
+            },
+        };
+        let t = ExecTool::new(&cfg);
+        assert_eq!(t.net, cfg.net, "ExecTool::new dropped a configured value");
+        assert_eq!(t.timeout_secs, 33);
+        assert!(t.description().contains("The network is open"));
+    }
+
+    /// The network namespace is the only part of the sandbox the knob moves. If a
+    /// future edit drops the filesystem binds or the PID namespace while someone
+    /// is "just turning the network on", this fails.
+    #[test]
+    fn only_the_network_namespace_moves_between_modes() {
+        use crate::tools::net::NetMode;
+        let ws = std::path::Path::new("/ws");
+        let off = sandbox_args(ws, NetMode::Off);
+        let proxy = sandbox_args(ws, NetMode::Proxy);
+        let open = sandbox_args(ws, NetMode::Open);
+        assert!(off.iter().any(|a| a == "--unshare-net"));
+        assert!(!proxy.iter().any(|a| a == "--unshare-net"));
+        assert!(!open.iter().any(|a| a == "--unshare-net"));
+        for arg in [
+            "--ro-bind",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--tmpfs",
+            "--die-with-parent",
+        ] {
+            assert!(proxy.iter().any(|a| a == arg), "{arg} missing in proxy mode");
+            assert!(open.iter().any(|a| a == arg), "{arg} missing in open mode");
+        }
+    }
+
     #[tokio::test]
     async fn runs_and_captures_stdout() {
         let t = ExecTool::default();
@@ -570,14 +1001,42 @@ mod tests {
         assert!(r.output.contains("oops"));
     }
 
+    /// `network = "off"` is the mode where the namespace really has no route.
     #[tokio::test]
-    async fn network_is_blocked() {
-        let t = ExecTool::default();
+    async fn off_mode_has_no_route_at_all() {
+        let t = tool(crate::tools::net::NetMode::Off);
         let (ctx, _g) = ws();
         let r = t
-            .run(json!({"cmd": "curl -s -m 3 -o /dev/null http://example.com || echo NET-BLOCKED"}), &ctx, &sink())
+            .run(
+                json!({"cmd": "curl -s -m 3 -o /dev/null http://example.com || echo NET-BLOCKED"}),
+                &ctx,
+                &sink(),
+            )
             .await;
         assert!(r.output.contains("NET-BLOCKED"), "network was reachable: {:?}", r.output);
+    }
+
+    /// The default mode: a real command inside the sandbox, a real request, and a
+    /// refusal the model can act on. curl reports success on a 403 (no --fail), so
+    /// the proof is the body it prints and the egress line the tool appends.
+    #[tokio::test]
+    async fn proxy_mode_refuses_an_unlisted_host_and_says_so_where_the_model_reads_it() {
+        let t = tool(crate::tools::net::NetMode::Proxy);
+        let (ctx, _g) = ws();
+        let r = t
+            .run(json!({"cmd": "curl -s -m 8 http://example.com/ 2>&1 | head -3"}), &ctx, &sink())
+            .await;
+        assert!(
+            r.output.contains("not in the sandbox egress allowlist"),
+            "no refusal body: {:?}",
+            r.output
+        );
+        assert!(
+            r.output.contains("# egress blocked: example.com"),
+            "the tool did not report the refusal: {:?}",
+            r.output
+        );
+        assert!(r.output.contains("allow = [\"example.com\"]"), "{}", r.output);
     }
 
     #[tokio::test]

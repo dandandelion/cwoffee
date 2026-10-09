@@ -55,6 +55,10 @@ pub struct HostConfig {
     pub env_override: Option<String>,
     /// How long an unanswered approval prompt waits before refusing.
     pub approval_timeout: std::time::Duration,
+    /// How long an `ask_user` card stays open. `question_timeout_secs` in
+    /// config.toml; three minutes is right for someone at the keyboard and wrong
+    /// for a question they have to take to someone else.
+    pub question_timeout: std::time::Duration,
     /// Attachment guardrails. Enforced at the host boundary rather than in the
     /// UI, because the UI is not the only client and never will be again.
     pub max_attachments: usize,
@@ -79,6 +83,7 @@ impl HostConfig {
             context_budget: None,
             env_override: None,
             approval_timeout: std::time::Duration::from_secs(300),
+            question_timeout: std::time::Duration::from_secs(180),
             max_attachments: 4,
             max_attachment_bytes: 2 * 1024 * 1024,
             sampling: crate::provider::Sampling::default(),
@@ -284,6 +289,10 @@ pub struct HostState {
     /// countdown: a turn blocked on a human looks identical to a turn still
     /// working, and that difference is the entire message.
     pub approval_timeout_secs: u64,
+    /// Seconds an unanswered `ask_user` card stays open, same reason as the approval
+    /// countdown: a turn parked on a person and a turn still working look identical.
+    #[serde(default)]
+    pub question_timeout_secs: u64,
     /// Why the last workspace change was refused, and a counter so a caller that
     /// polls `state()` can tell a fresh refusal from an old one.
     ///
@@ -352,6 +361,7 @@ impl SessionHost {
             context_tokens: 0,
             compactions: 0,
             approval_timeout_secs: cfg.approval_timeout.as_secs(),
+            question_timeout_secs: cfg.question_timeout.as_secs(),
             workspace_refusal: None,
             refusal_seq: 0,
             context_budget: cfg.context_budget.unwrap_or(FALLBACK_BUDGET),
@@ -381,6 +391,7 @@ impl SessionHost {
             workspace: cfg.workspace.clone(),
             max_output_bytes: 24 * 1024,
             ask: Some(ask_tx),
+            question_timeout: Some(cfg.question_timeout),
             events: None,
             permits: Vec::new(),
         };
@@ -2272,7 +2283,10 @@ mod tests {
             seen_wire: Default::default(),
         });
         let mut reg = Registry::new();
-        reg.register(Box::new(ExecTool { timeout_secs: 5, allow_unsandboxed: false }));
+        reg.register(Box::new(ExecTool::new(&crate::tools::ExecCfg {
+            timeout_secs: 5,
+            ..Default::default()
+        })));
 
         let mut h = SessionHost::spawn(
             p,

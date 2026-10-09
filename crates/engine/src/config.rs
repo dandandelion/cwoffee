@@ -83,6 +83,12 @@ pub struct Config {
     /// finished. Set a number when you want a hard stop on a runaway model.
     #[serde(default)]
     pub max_tool_iters: Option<usize>,
+    /// How long an `ask_user` card stays open before the model is told nobody
+    /// answered. Absent means 180 seconds. Raise it when the answer is not yours to
+    /// give: a question the user has to take to someone else cannot be answered
+    /// inside three minutes, which is what session 1306 found. Range 15..=3600.
+    #[serde(default)]
+    pub question_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +213,21 @@ pub struct SandboxCfg {
     pub enabled: bool,
     #[serde(default = "default_exec_timeout")]
     pub timeout_secs: u64,
+    /// What the exec sandbox may reach over the network:
+    ///   "off"   - no network at all (the old behaviour)
+    ///   "proxy" - network, but package managers go through an allowlist proxy
+    ///             in this process (default)
+    ///   "open"  - network, nothing in between
+    /// `tools::net` states what each one does and does not guarantee.
+    #[serde(default = "default_net_mode")]
+    pub network: String,
+    /// Hosts the proxy admits. Absent means the built-in package-registry list;
+    /// `["*"]` means everything, with the proxy's log still running.
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    /// Bytes through the proxy per exec call before it stops piping.
+    #[serde(default = "default_net_mb")]
+    pub max_mb_per_call: u64,
 }
 
 impl Default for SandboxCfg {
@@ -214,6 +235,9 @@ impl Default for SandboxCfg {
         Self {
             enabled: default_true(),
             timeout_secs: default_exec_timeout(),
+            network: default_net_mode(),
+            allow: None,
+            max_mb_per_call: default_net_mb(),
         }
     }
 }
@@ -221,6 +245,16 @@ impl Default for SandboxCfg {
 fn default_true() -> bool {
     true
 }
+pub fn default_net_mode() -> String {
+    // Proxy, not open: `npm install` should work out of the box, and an agent with
+    // shell access should not be able to dial an arbitrary host on day one either.
+    "proxy".into()
+}
+
+fn default_net_mb() -> u64 {
+    512
+}
+
 pub fn default_exec_timeout() -> u64 {
     120
 }
@@ -444,6 +478,28 @@ impl Config {
         self.max_tool_iters.unwrap_or(0)
     }
 
+    pub fn question_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.question_timeout_secs.unwrap_or(180))
+    }
+
+    /// Validate the question timeout. A tiny value makes `ask_user` useless (the card
+    /// closes before it can be read), and an enormous one can park a turn for an hour
+    /// on a phone that is in a pocket. Both are typos, so both name the key.
+    pub fn question_timeout_checked(&self) -> Result<std::time::Duration, String> {
+        match self.question_timeout_secs {
+            None => Ok(std::time::Duration::from_secs(180)),
+            Some(secs) => {
+                if !(15..=3600).contains(&secs) {
+                    return Err(format!(
+                        "question_timeout_secs = {secs} is outside 15..=3600 \
+                         (180 is the default)"
+                    ));
+                }
+                Ok(std::time::Duration::from_secs(secs))
+            }
+        }
+    }
+
     pub fn mode(&self) -> ApprovalMode {
         match self.mode.as_deref() {
             Some("session") => ApprovalMode::Session,
@@ -465,7 +521,45 @@ impl Config {
         crate::tools::ExecCfg {
             timeout_secs: self.sandbox.timeout_secs,
             sandbox_enabled: self.sandbox.enabled,
+            net: crate::tools::net::NetCfg {
+                mode: crate::tools::net::NetMode::parse(&self.sandbox.network)
+                    .unwrap_or_default(),
+                allow: self
+                    .sandbox
+                    .allow
+                    .clone()
+                    .unwrap_or_else(crate::tools::net::default_allow),
+                max_bytes_per_call: self.sandbox.max_mb_per_call.saturating_mul(1 << 20),
+            },
         }
+    }
+
+    /// Validate the egress block before anything runs. A mode word that does not
+    /// parse would otherwise fall back to the default silently, which is the worst
+    /// possible outcome for a security-shaped setting: the user writes `off`, gets
+    /// `proxy`, and sees no reason to doubt it.
+    pub fn net_checked(&self) -> Result<(), String> {
+        let mode = crate::tools::net::NetMode::parse(&self.sandbox.network)
+            .ok_or_else(|| format!("[sandbox] network = {:?} is not one of off, proxy, open", self.sandbox.network))?;
+        if let Some(list) = &self.sandbox.allow {
+            for h in list {
+                let h = h.trim();
+                if h.is_empty() {
+                    return Err("[sandbox] allow contains an empty entry".into());
+                }
+                if h.contains("://") || h.contains('/') || h.contains(' ') || h.contains(':') {
+                    return Err(format!(
+                        "[sandbox] allow entry {h:?} is not a hostname: list hosts (example.com)                          or wildcard subdomains (*.example.com), not URLs or host:port"
+                    ));
+                }
+            }
+        }
+        if self.sandbox.max_mb_per_call == 0 {
+            return Err("[sandbox] max_mb_per_call = 0 would stop every download; use \
+                        [sandbox] network = \"off\" to block the network instead".into());
+        }
+        let _ = mode;
+        Ok(())
     }
 
     /// Validate `[sampling]` before anything talks to the model. A typo'd range
@@ -690,6 +784,77 @@ base_url = "http://127.0.0.1:9/v1"
         assert_eq!(c.mode(), ApprovalMode::Ask);
     }
 
+    /// `ask_user` is the one tool that waits on a person, and the right wait depends
+    /// on who that person is. Absent means three minutes; a written value is
+    /// range-checked and names itself when out of range.
+    #[test]
+    fn question_timeout_is_a_knob_and_a_bad_value_names_itself() {
+        use std::time::Duration;
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.question_timeout(), Duration::from_secs(180), "absent means three minutes");
+        assert_eq!(c.question_timeout_checked().unwrap(), Duration::from_secs(180));
+
+        let c: Config = toml::from_str("question_timeout_secs = 900").expect("parses");
+        assert_eq!(c.question_timeout_checked().unwrap(), Duration::from_secs(900));
+
+        let c: Config = toml::from_str("question_timeout_secs = 5").expect("parses");
+        let err = c.question_timeout_checked().unwrap_err();
+        assert!(err.contains("question_timeout_secs"), "{err}");
+        assert!(err.contains("15..=3600"), "{err}");
+        let c: Config = toml::from_str("question_timeout_secs = 99999").expect("parses");
+        assert!(c.question_timeout_checked().is_err(), "a turn parked for a day is a typo");
+    }
+
+    /// The default is the proxy, and a written mode has to reach the layer that
+    /// builds the tool. Without the second half of this test a `[sandbox] network`
+    /// key could parse, validate, and then be dropped on the floor.
+    #[test]
+    fn egress_defaults_to_the_proxy_and_a_written_mode_reaches_the_tool_layer() {
+        use crate::tools::net::{default_allow, NetMode};
+        let c: Config = toml::from_str("").unwrap();
+        let ec = c.exec_cfg();
+        assert_eq!(ec.net.mode, NetMode::Proxy, "the default must be the proxy");
+        assert_eq!(ec.net.allow, default_allow(), "no allow key means the built-in list");
+        assert_eq!(ec.net.max_bytes_per_call, 512 << 20);
+
+        let off: Config = toml::from_str("[sandbox]\nnetwork = \"off\"\n").unwrap();
+        assert_eq!(off.exec_cfg().net.mode, NetMode::Off);
+
+        let open: Config = toml::from_str(
+            "[sandbox]\nnetwork = \"open\"\nallow = [\"*.gitlab.com\"]\nmax_mb_per_call = 40\n",
+        )
+        .unwrap();
+        let ec = open.exec_cfg();
+        assert_eq!(ec.net.mode, NetMode::Open);
+        assert_eq!(ec.net.allow, vec!["*.gitlab.com".to_string()]);
+        assert_eq!(ec.net.max_bytes_per_call, 40 << 20);
+        assert_eq!(ec.timeout_secs, default_exec_timeout(), "one key must not reset another");
+    }
+
+    /// A mode word that does not parse must stop the app. Falling back to the
+    /// default would be the worst outcome for a security-shaped key: the user
+    /// writes something, gets the default, and has no reason to doubt it.
+    #[test]
+    fn a_network_mode_that_does_not_parse_names_itself() {
+        let c: Config = toml::from_str("[sandbox]\nnetwork = \"disabled\"\n").unwrap();
+        let err = c.net_checked().unwrap_err();
+        assert!(err.contains("disabled"), "{err}");
+        assert!(err.contains("off, proxy, open"), "{err}");
+    }
+
+    #[test]
+    fn an_allow_entry_that_is_not_a_hostname_names_itself() {
+        let c: Config =
+            toml::from_str("[sandbox]\nallow = [\"https://pypi.org/simple\"]\n").unwrap();
+        let err = c.net_checked().unwrap_err();
+        assert!(err.contains("https://pypi.org/simple"), "{err}");
+        assert!(err.contains("hostname"), "{err}");
+        let ok: Config =
+            toml::from_str("[sandbox]\nallow = [\"pypi.org\",\"*.gitlab.com\",\"*\"]\n")
+                .unwrap();
+        assert!(ok.net_checked().is_ok(), "{:?}", ok.net_checked());
+    }
+
     #[test]
     fn parses_the_example_file() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/cwoffee.toml.example");
@@ -706,6 +871,15 @@ base_url = "http://127.0.0.1:9/v1"
             0,
             "copying the example must not reintroduce a work budget on turns"
         );
+        // The example states the egress default in words people can edit. Stating a
+        // value that is not the default would mean two defaults.
+        assert_eq!(
+            example.sandbox.network,
+            Config::default().sandbox.network,
+            "the example must state the egress default, not a second one"
+        );
+        assert!(example.sandbox.allow.is_none(), "the example leaves the built-in allowlist in place");
+        assert_eq!(example.sandbox.max_mb_per_call, Config::default().sandbox.max_mb_per_call);
         // The example is what people copy, so copying it must not change how the
         // model behaves. Sampling is documented but left unset.
         assert!(

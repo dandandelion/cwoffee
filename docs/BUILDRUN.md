@@ -2191,3 +2191,122 @@ binary predated the change. A probe is only as fresh as its last build, and a
 diagnostic that lies about the code under test is worse than no diagnostic. Any
 example run that decides whether a change works must be preceded by a build of
 that example.
+
+### Trap 117: a denylist pattern that matches inside a word blocks an innocent command
+
+Session 1306 had `DENIED BY USER (denylisted pattern "mount ")` on a command that
+never mentioned mounting: the text contained `amount`, and `normalize(cmd).contains("mount ")`
+found it there. Two bugs in one line. The match was a substring test, so any word
+containing the pattern hit; and the message blamed a person who had not spoken.
+
+The fix is a word-boundary test on the *pattern's* leading edge (`deny_at`): a
+pattern that starts with an alphanumeric or `_` only matches where the character
+before it is not one of those, so `amount` and `pseudo local` pass while
+`sudo mount /dev/sdb /mnt/x`, `mount ...` and `docker run --mount ...` still hit
+(the last because `--mount` is not `mount` at a word boundary either — hyphens join,
+so the pattern must be written `--mount` to mean the flag). Punctuation-led patterns
+(`; crontab`, `service `) keep matching anywhere, because their leading punctuation
+is the signal.
+
+The wording split matters as much as the matcher:
+
+```
+BLOCKED BY THE DENYLIST (...) - no user refused this call: the shape of it is blocked in every mode.
+DENIED BY USER (...) - do not retry this call.
+```
+
+A model that believes a person refused will try to negotiate. A model that believes
+policy refused will change the shape, or ask. Pin both with tests
+(`denylist_does_not_match_letters_inside_another_word`,
+`denylist_still_fires_when_the_pattern_starts_a_word`,
+`a_denylisted_call_says_who_blocked_it`).
+
+### Trap 118: an exit code is not evidence that a command failed
+
+`curl ... | head -2` exits with `head`'s status. The failure notes were gated on
+`exit != 0`, so a sandbox with no route printed `Could not connect to server` with no
+explanation, and the note that would have named the setting never appeared. Notes now
+key on the text alone: the signatures are specific enough (an errno, an interpreter
+error, a shell quote error) that a command printing one on purpose is rarer than a
+command hiding its status behind a pipe.
+
+### Trap 119: `ModuleNotFoundError` is a signpost, not a dead end
+
+The same session imported `openpyxl`, failed, and then wrote its own xlsx reader —
+111 lines of XML SAX — because nothing told it the engine already has two spreadsheet
+tools. A one-line note on that signature ("that package is not installed and the
+sandbox cannot install one; spreadsheets are `sheet_read` and `sheet_query`") is
+cheaper than the parser. The rule generalises: when a failure has exactly one correct
+response, the tool result should contain it.
+
+### Trap 120: a network allowlist is a guardrail, and calling it a wall is a bug
+
+`[sandbox] network = "proxy"` shares the network namespace and points
+`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (and npm/cargo/pip's own spellings) at a proxy
+in this process. That filters what well-behaved tools send. It does not stop a program
+that opens its own socket, and no amount of `HTTP_PROXY` strings changes that:
+enforcement for arbitrary programs needs a veth pair plus `nftables`/`tc` in a
+namespace, which needs root. So the docs, the config comments and the tool description
+say "guardrail", and `open` exists as an explicit setting rather than a hidden escape.
+
+What the proxy is strict about, and why:
+
+- the decision is made on the **CONNECT hostname** before any TLS bytes move — after
+  the tunnel is established there is nothing to inspect;
+- ports 80/443 only (`WEB_PORTS`), because a proxy that tunnels 25 or 6667 is a VPN
+  with extra steps;
+- plain HTTP is rewritten to a path before forwarding — the origin needs `/a/b`, not
+  the absolute URI the caller sent. Writing that rewritten request back to the
+  *client* instead of the peer is a bug that stalls the origin forever and looks like
+  a hang, which is what it did;
+- either direction ending closes both. `join!` on two pumps waits for a client that
+  sent its request and is only reading: use `select!` and drop the halves, which sends
+  FIN on both sides;
+- one request may be several HTTP requests (`npm` reuses the tunnel), so one
+  `CONNECT` gets one decision;
+- the byte budget is per call and reported, so `npm` cannot fill the workspace with a
+  mirror loop.
+
+### Trap 121: a refusal the model cannot see is the same as a silent failure
+
+npm reports a proxy refusal as `CONNECT tunnel failed, response 403`, which names
+neither the host nor the setting. The proxy therefore records the refused hosts for
+the call, and the tool appends:
+
+```
+# egress blocked: example.com - not in the sandbox allowlist. Add them to allow = [...]
+```
+
+Same rule as trap 119: the answer to a refusal has to be in the same text as the
+refusal.
+
+### Trap 122: header notes that are generated must not be generated wrong
+
+`sheet_query` printed `# note: some header cells were empty ... (c7, c8)` where `c7`
+and `c8` were a hardcoded example, next to `# header: none` where no header row had
+been used at all. Two contradictions in one result, and the model's response was to
+pass `header: false` forever, which costs named columns and produces `WHERE rownum>=4`
+queries. Notes now derive from state: the blank-header note lists the names actually
+produced and only exists when a header row was used; `header: false` gets one nudge
+naming the row the detector can see; a purely numeric row is never a header candidate,
+so `1,2,3` does not become column names.
+
+### Trap 123: "use read_file first" is a wasted call when you already have the file
+
+`edit_file` had the near text in hand and told the model to go read it. Quote the
+file's lines instead — numbered, with exact leading whitespace, bounded (12 lines,
+200 chars each) so a minified file does not turn a tool result into a file viewer.
+The test that pins it does two things: asserts the quote is byte-exact, and then
+applies a retry written from that quote, which is the loop the model is supposed to
+be able to close in one step.
+
+### Trap 124: a timeout that assumes the user is at the keyboard
+
+`ask_user` parked for 180 seconds, and a question whose answer lived with another
+person expired. `question_timeout_secs` (15..=3600, validated at boot) now sets the
+budget, the timeout message names the key, and the budget travels on `ToolCtx`
+(`question_timeout`) rather than on the tool, because it is a property of the host
+and the client — a phone in a pocket and a TUI in a terminal are not the same
+audience. Negative control: with the context value ignored, the test measures the
+wait and fails.
+

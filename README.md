@@ -545,11 +545,37 @@ Rows above the header are not records, so `COUNT(*)` counts entries rather than
 the school's name. `header_row` forces a row, `header: false` means "there is no
 header" and gives you `c1..cN` with every row kept as data.
 
+The notes about headers are generated from the sheet, and they only say what is
+true. A real session passed `header: false` to every query after one bad guess, then
+spent the turn addressing `c4` and counting `rownum` ranges while a named column sat
+there unqueried; the tool also printed a note about columns `(c7, c8)` that no column
+in that file had. So: the blank-header note lists the columns it actually produced,
+never appears when there is no header row at all, and no longer suggests turning
+headers off. `header: false` on a sheet where the detector can see a header gets one
+line naming that row and its cells:
+
+```
+# header: none, so columns are c1..cN and every row is data
+# note: header:false, so the columns are c1..cN and row 3 is data. Row 3 looks like a
+#       header (DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex) | Cash Flow)
+#       - drop header:false, or pass header_row=3, to query the columns by name.
+```
+
+A row of pure numbers is not a header either: `1,2,3` over `4,5,6` now loads as data
+with `c1..cN`, instead of naming the columns after the first row of the matrix.
+
 **`ask_user` stops the agent guessing.** One question, one to six options, one
 marked recommended, and a typed answer always available. The TUI answers with
 number keys. The turn parks while it waits; cancel does not make the question
 disappear but releases the parked tool with a "cancelled" result the model can act
 on. Over the gateway, a watch-only client sees the question and cannot answer it.
+
+The card stays open for **180 seconds** by default, and `question_timeout_secs` in
+config.toml changes that. The knob exists because of a real turn where the model
+asked something the user could only answer by asking someone else: at three minutes
+the questions expired, the model answered them itself, and the user apologised four
+messages later. A set gets one shared budget that grows with the number of questions,
+so asking three is not punished relative to asking one.
 
 When one step needs several decisions, the model asks them in **one call with
 `questions`** (2–4) instead of one call each. The card shows them one at a time —
@@ -613,6 +639,31 @@ on Escape or a click away, and stays open when the transcript scrolls itself to 
 stream. Inside the composer the **native** menu is deliberately left alone: the webview's own
 Paste entry is wired to the clipboard in a way a page cannot reach, so suppressing it would
 remove a capability rather than improve a menu.
+
+## When a call fails, the failure says what to do
+
+Three gaps from one long session, all of them cases where the tool result was true
+but not usable:
+
+- **A policy block does not claim to be the user.** A denylist pattern that matched
+  used to read `DENIED BY USER`, and the model spent its next two calls negotiating
+  with a person who had not said anything. Now a denylist block says
+  `BLOCKED BY THE DENYLIST (pattern "..." in every mode)`, and says what to do about
+  the shape. A real refusal still says `DENIED BY USER`, and that one does mean stop.
+  The matching itself is word-boundary aware, because `"mount "` used to match inside
+  `amount` — a heredoc about cash amounts was blocked as a filesystem operation.
+- **A failure the environment caused is labelled as one.** `npm error code
+  ENETUNREACH`, `ModuleNotFoundError: No module named 'openpyxl'`, and
+  `unexpected EOF while looking for matching '"'` each get one `# note:` line naming
+  the cause and the tool or config line that answers it. The second one matters most:
+  when a Python import fails, the next thing a model writes is a 111-line xlsx parser.
+  The note is attached on the text, not the exit code, because `cmd | head -2` exits
+  0 and hides the failure.
+- **A near-miss edit quotes the file.** `old_text was not found ... Use read_file
+  first` costs a call to obtain bytes the tool already had. The tool now quotes the
+  file's own lines from where the snippet's first line sits — line numbers and leading
+  spaces included, bounded to 12 lines and 200 characters per line — and the retry
+  written from that quote applies.
 
 ## What an approval actually gates
 
@@ -786,12 +837,54 @@ Two promises the code keeps rather than implies:
   that it used a tool. A card that prints the config value cannot tell "auto with a container"
   from "auto on a machine with no container runtime", and those need different fixes.
 
-## Two things that are security, not polish
+## The sandbox's network is a setting, and the setting says what it guarantees
 
-- **`exec` runs inside `bwrap`** — read-only root, workspace-only writes, no network,
-  PID namespace, deadline enforced inside the namespace. The denylist is a guardrail;
-  the sandbox is the boundary, and `sandbox-probe.sh` proves it rather than trusting
-  the flags.
+`[sandbox] network` takes three values. All three keep the rest of the sandbox
+identical — read-only root, workspace-only writes, own user/PID/IPC namespaces,
+deadline enforced inside the namespace. Only the network namespace moves.
+
+| value | what a command in the sandbox can do | how you widen it |
+|---|---|---|
+| `off` | nothing: there is no route | — |
+| `proxy` (**default**) | package managers and anything that reads `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` go through a proxy inside the Cwoffee process, which admits allowlisted hosts and refuses the rest **by name** | add the host to `allow = [...]` |
+| `open` | the machine's own network, nothing in between | — |
+
+`proxy` is a **guardrail, not a wall**, and the docs say so rather than implying
+otherwise: it filters what a tool *chooses* to send. A program that ignores proxy
+variables and opens its own route is not stopped, and stopping that would need
+privileges Cwoffee does not take — a network namespace with a veth pair plus
+`nftables`/`tc` rules, run as root, outside this process. What `proxy` buys is the
+two things that matter in practice: an allowlisted `npm ci` works out of the box, and
+an unlisted host produces a refusal the model can act on instead of a TLS mystery.
+
+The default allowlist is package registries and open-source mirrors — npm, PyPI,
+crates.io, GitHub, Go module proxies, RubyGems, Packagist, NuGet, Docker Hub,
+Debian/Fedora/Arch mirrors — plus the local search container. Ports are 80 and 443
+only; a proxy that tunnels port 25 is a VPN with extra steps. `max_mb_per_call`
+(default 512 MB) cuts the pipe so a broken mirror cannot fill the workspace, and
+`["*"]` admits every host with the proxy's log still running.
+
+Two things the proxy appends to the tool result, because a 403 from an allowlist is
+otherwise invisible:
+
+```
+curl: (56) CONNECT tunnel failed, response 403
+# egress blocked: example.com - not in the sandbox allowlist. Add them to allow = [...]
+# under [sandbox] in config.toml, or ask the user to run the command outside Cwoffee.
+```
+
+`./scripts/egress-probe.sh` proves all of this against real hosts: `npm install`
+inside the sandbox, an allowlisted registry over TLS, an unlisted host refused by
+name, `off` with no route, `open` reaching the internet. It drives the engine's own
+`exec` tool with the same `ExecCfg` and the same bwrap arguments the agent uses.
+
+## Three things that are security, not polish
+
+- **`exec` runs inside `bwrap`** — read-only root, workspace-only writes, PID
+  namespace, deadline enforced inside the namespace, and a network namespace that
+  only `network = "off"` keeps. The denylist is a guardrail; the sandbox is the
+  boundary, and `sandbox-probe.sh` plus `egress-probe.sh` prove it rather than
+  trusting the flags.
 - **Document writers escape before they emit any markup.** Model output quotes fetched
   web pages, so `<script>` and `javascript:` arrive in the text. A writer that passes
   them through is an injection path into a file the user opens in Word.

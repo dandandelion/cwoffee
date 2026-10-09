@@ -13,6 +13,7 @@ pub mod files;
 pub mod path;
 pub mod repair;
 pub mod sheet_sql;
+pub mod net;
 pub mod sheets;
 pub mod searxng;
 pub mod web;
@@ -235,6 +236,11 @@ pub struct ToolCtx {
     /// closed without an answer: the reply channel it was waiting on is gone, so
     /// nothing else can report that to the window still showing the card.
     pub events: Option<tokio::sync::mpsc::UnboundedSender<crate::event::EngineEvent>>,
+    /// How long an `ask_user` card may stay unanswered. The host fills it from
+    /// `question_timeout_secs` in config.toml; `None` means the tool's own default,
+    /// which is what examples and tests get. The knob exists because a question the
+    /// user has to ask someone else cannot be answered in three minutes.
+    pub question_timeout: Option<std::time::Duration>,
     /// Paths outside the workspace the **user approved for this one call**.
     /// Rebuilt per call by the agent loop; never inherited by the next call, and
     /// never widened by a session-level "allow for session" answer.
@@ -248,6 +254,7 @@ impl Default for ToolCtx {
             max_output_bytes: 32 * 1024,
             ask: None,
             events: None,
+            question_timeout: None,
             permits: Vec::new(),
         }
     }
@@ -278,10 +285,12 @@ pub trait Tool: Send + Sync {
 
 /// Exec knobs that come from config. Kept separate from ExecTool so the registry
 /// remains the single place that decides which tools exist and in what order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecCfg {
     pub timeout_secs: u64,
     pub sandbox_enabled: bool,
+    /// What the sandbox may reach over the network.
+    pub net: net::NetCfg,
 }
 
 impl Default for ExecCfg {
@@ -289,6 +298,7 @@ impl Default for ExecCfg {
         Self {
             timeout_secs: crate::config::default_exec_timeout(),
             sandbox_enabled: true,
+            net: net::NetCfg::default(),
         }
     }
 }
@@ -336,13 +346,9 @@ impl Registry {
     /// silently ignored.
     pub fn with_v1_tools_exec(search: web::SearchBackend, exec: ExecCfg) -> Self {
         let mut r = Self::new();
-        r.register(Box::new(exec::ExecTool {
-            timeout_secs: exec.timeout_secs,
-            // `enabled = false` is a debugging escape hatch; it flips the tool
-            // into unsandboxed mode, which is why it is spelled allow_unsandboxed
-            // on the receiving side.
-            allow_unsandboxed: !exec.sandbox_enabled,
-        }));
+        // Built from ExecCfg, so a `[sandbox]` key cannot be parsed, validated and
+        // then silently dropped on the way into the tool.
+        r.register(Box::new(exec::ExecTool::new(&exec)));
         r.register(Box::new(files::ReadFileTool));
         r.register(Box::new(files::WriteFileTool));
         r.register(Box::new(xlsx::WriteXlsxTool));
@@ -503,7 +509,7 @@ mod cfg_tests {
     fn sandbox_config_reaches_the_exec_tool() {
         let r = Registry::with_v1_tools_exec(
             web::SearchBackend::DuckDuckGo,
-            ExecCfg { timeout_secs: 777, sandbox_enabled: true },
+            ExecCfg { timeout_secs: 777, sandbox_enabled: true, ..Default::default() },
         );
         let schema = r.get("exec").unwrap().schema();
         let d = schema["properties"]["timeout"]["description"].as_str().unwrap();

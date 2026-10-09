@@ -355,3 +355,39 @@ of tab-separated text before.
 - **Header detection is a heuristic.** It is reported so it can be argued with,
   and `header_row` is the escape hatch. A future `sheet_query` error could
   suggest the fix when a query names a column like `c2`.
+
+## Stage 1d: the header notes stopped contradicting themselves (session 1306)
+
+Session 1306 used the new tools and still struggled, in a way that was the tools'
+fault:
+
+- the header note said columns `(c7, c8)` — a hardcoded example, matching nothing;
+- the same result said `# header: none` *and* "some header cells were empty";
+- the note advised `header:false`, and from call 3 onward every query in that session
+  passed it, which turned the work into `WHERE rownum >= 4` and `c4` instead of
+  `WHERE category = '...'`;
+- with `header:false` on the BES sheets, nothing said that row 3 is a header.
+
+What shipped:
+
+| change | why |
+|---|---|
+| blank-header note lists the names it actually produced | a note that names imaginary columns teaches the model to ignore notes |
+| that note never appears when no header row was used | two contradictory lines in one result |
+| the note no longer suggests `header:false` | the suggestion cost that turn its named columns |
+| `header:false` on a sheet with a visible header gets one nudge naming the row and its cells | one line is cheaper than 20 positional queries |
+| a purely numeric row is never a header candidate | `1,2,3` over `4,5,6` was being named as columns |
+
+Evidence on the real file:
+
+```
+# header: none, so columns are c1..cN and every row is data
+# note: header:false, so the columns are c1..cN and row 3 is data. Row 3 looks like a
+# header (DATE | DESCRIPTION | CATEGORY | INCOME (In) | Expenses (Ex) | Cash Flow) -
+# drop header:false, or pass header_row=3, to query the columns by name.
+```
+
+Still open for Stage 2 (writes): the safe-subset edit design, and a
+`sheet_query` that can reach two sheets at once (`ATTACH` is disabled on purpose, so
+today a cross-sheet question needs the model to read twice).
+

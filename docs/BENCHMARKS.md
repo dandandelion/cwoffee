@@ -1197,3 +1197,60 @@ frame cadence: 36 frames over 1535ms while a turn streamed; median 43.0ms, p95 5
 frame cadence baseline (nothing streaming): 31 frames, median 31.0ms, p95 35.0ms
 selftest note: the machine is starved (idle median 31.0ms), so the cadence is judged against the baseline rather than 60Hz
 ```
+
+## Batch: the sandbox can reach the internet, and says which setting it is using
+
+Session 1306 (`BES Cash Flow.xlsx`, 277 messages) failed in ways that had nothing to
+do with spreadsheets. It tried `npm ci`, got `ENETUNREACH` and read it as a broken
+mirror; it tried `import openpyxl`, failed, and started writing parsers; it wrote
+`amount` into a heredoc and was told `DENIED BY USER` for a `mount`; it asked the user
+two questions and the answers expired at 270s while the user was asking someone else;
+and every `edit_file` near miss cost a `read_file`.
+
+### The network knob
+
+`[sandbox] network` = `off` | `proxy` (default) | `open`, plus `allow = [...]` and
+`max_mb_per_call`. One bwrap argument moves between the three modes, and a test asserts
+that only that argument moves.
+
+`./scripts/egress-probe.sh`, driving the engine's own exec tool:
+
+| check | mode | result |
+|---|---|---|
+| `npm install` of two packages inside the sandbox | proxy | added 2 packages, `require("ms")("2 seconds")` → 2000 |
+| `GET https://registry.npmjs.org/express` over CONNECT + TLS | proxy | `200` |
+| `GET https://example.com` | proxy | `CONNECT tunnel failed, response 403` + `# egress blocked: example.com` naming the config line |
+| `curl` to the registry | off | `Could not connect to server` + the note naming `network = "proxy"` |
+| `curl https://example.com` | open | `200` |
+
+Prompt cost of the honest exec description (the mode sentence is one sentence per
+mode): `exec 1014 -> 1158` bytes, whole tool block `10,084 -> 10,228`, still under the
+11,000-byte ceiling that `the_tool_block_costs_what_it_says_it_costs` enforces.
+
+### The failure text has to carry the answer
+
+| symptom in session 1306 | what the result said | what it says now |
+|---|---|---|
+| `npm error code ENETUNREACH` | nothing | mode-specific note: no network / check `# egress blocked` / the machine's own route |
+| `ModuleNotFoundError: openpyxl` | nothing | not installed, sandbox cannot install it, use `sheet_read`/`sheet_query` |
+| `unexpected EOF while looking for matching '"'` | nothing | quotes do not balance, one level of quoting, content goes in `write_file` |
+| `DENIED BY USER (denylisted pattern "mount ")` on `amount` | blamed the user | `BLOCKED BY THE DENYLIST`, and word-boundary matching so `amount` is not `mount ` |
+| `old_text was not found ... Use read_file first` | a wasted call | the file's own numbered lines, quoted byte-exact |
+| `answered none of the 2 questions within 270s` | no way to change it | `question_timeout_secs` (15..=3600), named in the message |
+
+Negative control for the timeout, with the context value ignored:
+
+```
+waited on the tool default, not the host's budget: 30.001779123s   FAIL
+the same test with the fix: ok, finished in 0.15s
+```
+
+### Gate
+
+```
+tools:: approval:: agent:: prompt:: store:: config:: provider:: host::  375 passed, 0 failed   (was 343)
+mock_endpoint                                                            10 passed, 0 failed
+tools::net 9   tools::exec 31   tools::sheet_sql 15   tools::files 33
+egress-probe ok (proxy admits registries, refuses the rest by name, off has no route, open is open)
+```
+

@@ -227,7 +227,10 @@ impl Tool for AskUserTool {
         // sequential ones. Reading and answering three questions takes longer than
         // answering one, and a per-question timeout would punish the model for
         // asking them together - which is what the description just told it to do.
-        let budget = self.timeout.mul_f64(1.0 + 0.5 * (total - 1) as f64);
+        // The host's configured budget wins; the tool's own default covers callers
+        // that build a ToolCtx without a host.
+        let timeout = ctx.question_timeout.unwrap_or(self.timeout);
+        let budget = timeout.mul_f64(1.0 + 0.5 * (total - 1) as f64);
         let deadline = tokio::time::Instant::now() + budget;
         let mut got: Vec<Option<Answer>> = Vec::with_capacity(total);
         let mut timed_out = false;
@@ -304,8 +307,10 @@ impl Tool for AskUserTool {
                 None if timed_out => ToolResult::err(format!(
                     "ask_user: the user did not answer within {}s. Pick the option you \
                      recommended (or the most sensible one), say in your reply that you \
-                     asked and got no answer, and continue.",
-                    self.timeout.as_secs()
+                     asked and got no answer, and continue. If the answer needs asking \
+                     someone else, question_timeout_secs in config.toml sets how long this \
+                     card stays open.",
+                    timeout.as_secs()
                 )),
                 None => ToolResult::err(
                     "ask_user: the question was cancelled before it was answered. Stop and \
@@ -319,7 +324,8 @@ impl Tool for AskUserTool {
                     format!(
                         "ask_user: the user answered none of the {total} questions within {}s. \
                          Decide them yourself, say in your reply that you asked and got no \
-                         answer, and continue.",
+                         answer, and continue. question_timeout_secs in config.toml sets how \
+                         long these cards stay open.",
                         budget.as_secs()
                     )
                 } else {
@@ -586,6 +592,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: Some(etx),
             permits: Vec::new(),
@@ -617,6 +624,46 @@ mod tests {
 
     /// An answered question gets no expiry: the front end already settled the
     /// card, and a second "closed" signal would read as a contradiction.
+    /// The host's budget is the wait, not the tool's own default, and the expiry has
+    /// to name the key. Session 1306 lost a question the user needed to take to a
+    /// second person, and nothing in the transcript said a knob existed.
+    #[tokio::test]
+    async fn the_hosts_budget_is_the_wait_and_names_the_knob_when_it_bites() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            question_timeout: Some(std::time::Duration::from_millis(150)),
+            ask: Some(tx),
+            events: None,
+            permits: Vec::new(),
+        };
+        tokio::spawn(async move {
+            let (_q, _reply) = rx.recv().await.unwrap();
+            // Held open past the budget on purpose: dropping it early would take the
+            // cancelled arm instead of the timed-out one.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let started = std::time::Instant::now();
+        // AskUserTool::default() would wait 180s. If the context value were ignored
+        // this test would sit for three minutes instead of a sixth of one.
+        let r = AskUserTool::default()
+            .run(
+                json!({"question": "Ask the treasurer which month?", "options": [{"label": "January"}]}),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        let said = format!("{}{}", r.output, r.error.clone().unwrap_or_default());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited on the tool default, not the host's budget: {:?}",
+            started.elapsed()
+        );
+        assert!(said.contains("did not answer within"), "{said}");
+        assert!(said.contains("question_timeout_secs"), "the expiry must name the knob: {said}");
+    }
+
     #[tokio::test]
     async fn an_answered_question_is_not_reported_as_expired() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
@@ -624,6 +671,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: Some(etx),
             permits: Vec::new(),
@@ -648,6 +696,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -688,6 +737,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -727,6 +777,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -788,6 +839,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -830,6 +882,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -871,6 +924,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -890,6 +944,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -908,6 +963,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -961,6 +1017,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -1005,6 +1062,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -1043,6 +1101,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -1072,6 +1131,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: Some(etx),
             permits: Vec::new(),
@@ -1118,6 +1178,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
@@ -1170,6 +1231,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
+            question_timeout: None,
             ask: Some(tx),
             events: None,
             permits: Vec::new(),

@@ -33,7 +33,18 @@ mock logs every prompt it serves, so you can watch what the engine actually sent
 | Gateway | `node scripts/gateway-smoke.mjs` | none | auth, roles, workspace rules, boot shape from a phone |
 | Search | `node scripts/search-smoke.mjs` | none (HTTP to the search provider) | provider switching and the managed SearXNG container |
 | Sandbox | `./scripts/sandbox-probe.sh` | none | bwrap still isolates after a kernel update |
+| Egress | `./scripts/egress-probe.sh` | none (real HTTPS to registries) | the three `[sandbox] network` modes: an allowlisted `npm install` works, an unlisted host is refused by name, `off` has no route, `open` is open |
+| Tool probes | `cargo run -p cwoffee-engine --example exec_probe -- proxy <dir> "cmd"`, `--example sheet_probe -- <dir> <file> <json>` | none | one real tool call, driven by hand: the same `ExecCfg` and bwrap arguments the agent uses, so a line here is a line the model would get |
 | Budgets | `./scripts/memory.sh cwoffee-app 400`, `./scripts/gpu-check.sh cwoffee-app` | — | PSS ceiling, GPU pinned to the panel's iGPU |
+
+### What the egress probe covers, and what it does not
+
+`egress-probe.sh` checks the sandbox path end to end: a command inside bwrap, with the
+environment the tool really sets, reaching (or not reaching) a socket. It proves the
+allowlist, the byte accounting and the refusal text. It cannot prove enforcement
+against a program that ignores `HTTP_PROXY` and opens its own route — that needs a
+network namespace with `nftables`/`tc` and root, which Cwoffee does not take. Treat the
+proxy as a guardrail that makes the common case work and every refusal legible.
 
 ## The scripted endpoint
 
