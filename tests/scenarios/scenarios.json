@@ -313,7 +313,7 @@
      "delay_ms": 25
     },
     {
-     "content": "Right — that belongs in write_file, not in a shell.",
+     "content": "Right \u2014 that belongs in write_file, not in a shell.",
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 12
@@ -879,6 +879,460 @@
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 10
+    }
+   ]
+  },
+  {
+   "name": "live-ownership",
+   "_why": "a turn with thinking and a long tail, slow enough that the harness can leave the session mid-stream and come back: the two reports this pins are 'thinking from session A appeared in session B' and 'the loops I was watching are gone when I return'",
+   "match": "Selftest live ownership",
+   "steps": [
+    {
+     "reasoning": "plumline one\nplumline two\nplumline three\nplumline four\nplumline five\nplumline six\nplumline seven\nplumline eight\n",
+     "content": "seaglass alpha\nseaglass beta\nseaglass gamma\nseaglass delta\nseaglass epsilon\n",
+     "finish": "stop",
+     "chunk_chars": 5,
+     "delay_ms": 110
+    }
+   ]
+  },
+  {
+   "name": "history-page-fill",
+   "_why": "the transcript page holds 80 messages; a session with a few hundred and half a megabyte of text inside tool cards is the only honest way to test 'Load history' against the session on screen, and to measure frame cadence with a transcript that has actually grown the way a real one does",
+   "match": "Selftest history fill",
+   "steps": [
+    {
+     "reasoning": "Write the file this pass will walk.",
+     "tool_calls": [
+      {
+       "id": "mock-h0",
+       "name": "write_file",
+       "arguments": "{\"path\": \"$path\", \"content\": \"line 1: the quick brown fox logs itself to disk\\nline 2: the quick brown fox logs itself to disk\\nline 3: the quick brown fox logs itself to disk\\nline 4: the quick brown fox logs itself to disk\\nline 5: the quick brown fox logs itself to disk\\nline 6: the quick brown fox logs itself to disk\\nline 7: the quick brown fox logs itself to disk\\nline 8: the quick brown fox logs itself to disk\\nline 9: the quick brown fox logs itself to disk\\nline 10: the quick brown fox logs itself to disk\\nline 11: the quick brown fox logs itself to disk\\nline 12: the quick brown fox logs itself to disk\\nline 13: the quick brown fox logs itself to disk\\nline 14: the quick brown fox logs itself to disk\\nline 15: the quick brown fox logs itself to disk\\nline 16: the quick brown fox logs itself to disk\\nline 17: the quick brown fox logs itself to disk\\nline 18: the quick brown fox logs itself to disk\\nline 19: the quick brown fox logs itself to disk\\nline 20: the quick brown fox logs itself to disk\\nline 21: the quick brown fox logs itself to disk\\nline 22: the quick brown fox logs itself to disk\\nline 23: the quick brown fox logs itself to disk\\nline 24: the quick brown fox logs itself to disk\\nline 25: the quick brown fox logs itself to disk\\nline 26: the quick brown fox logs itself to disk\\nline 27: the quick brown fox logs itself to disk\\nline 28: the quick brown fox logs itself to disk\\nline 29: the quick brown fox logs itself to disk\\nline 30: the quick brown fox logs itself to disk\\nline 31: the quick brown fox logs itself to disk\\nline 32: the quick brown fox logs itself to disk\\nline 33: the quick brown fox logs itself to disk\\nline 34: the quick brown fox logs itself to disk\\nline 35: the quick brown fox logs itself to disk\\nline 36: the quick brown fox logs itself to disk\\nline 37: the quick brown fox logs itself to disk\\nline 38: the quick brown fox logs itself to disk\\nline 39: the quick brown fox logs itself to disk\\nline 40: the quick brown fox logs itself to disk\\nline 41: the quick brown fox logs itself to disk\\nline 42: the quick brown fox logs itself to disk\\nline 43: the quick brown fox logs itself to disk\\nline 44: the quick brown fox logs itself to disk\\nline 45: the quick brown fox logs itself to disk\\nline 46: the quick brown fox logs itself to disk\\nline 47: the quick brown fox logs itself to disk\\nline 48: the quick brown fox logs itself to disk\\nline 49: the quick brown fox logs itself to disk\\nline 50: the quick brown fox logs itself to disk\\nline 51: the quick brown fox logs itself to disk\\nline 52: the quick brown fox logs itself to disk\\nline 53: the quick brown fox logs itself to disk\\nline 54: the quick brown fox logs itself to disk\\nline 55: the quick brown fox logs itself to disk\\nline 56: the quick brown fox logs itself to disk\\nline 57: the quick brown fox logs itself to disk\\nline 58: the quick brown fox logs itself to disk\\nline 59: the quick brown fox logs itself to disk\\nline 60: the quick brown fox logs itself to disk\\nline 61: the quick brown fox logs itself to disk\\nline 62: the quick brown fox logs itself to disk\\nline 63: the quick brown fox logs itself to disk\\nline 64: the quick brown fox logs itself to disk\\nline 65: the quick brown fox logs itself to disk\\nline 66: the quick brown fox logs itself to disk\\nline 67: the quick brown fox logs itself to disk\\nline 68: the quick brown fox logs itself to disk\\nline 69: the quick brown fox logs itself to disk\\nline 70: the quick brown fox logs itself to disk\\nline 71: the quick brown fox logs itself to disk\\nline 72: the quick brown fox logs itself to disk\\nline 73: the quick brown fox logs itself to disk\\nline 74: the quick brown fox logs itself to disk\\nline 75: the quick brown fox logs itself to disk\\nline 76: the quick brown fox logs itself to disk\\nline 77: the quick brown fox logs itself to disk\\nline 78: the quick brown fox logs itself to disk\\nline 79: the quick brown fox logs itself to disk\\nline 80: the quick brown fox logs itself to disk\\nline 81: the quick brown fox logs itself to disk\\nline 82: the quick brown fox logs itself to disk\\nline 83: the quick brown fox logs itself to disk\\nline 84: the quick brown fox logs itself to disk\\nline 85: the quick brown fox logs itself to disk\\nline 86: the quick brown fox logs itself to disk\\nline 87: the quick brown fox logs itself to disk\\nline 88: the quick brown fox logs itself to disk\\nline 89: the quick brown fox logs itself to disk\\nline 90: the quick brown fox logs itself to disk\\nline 91: the quick brown fox logs itself to disk\\nline 92: the quick brown fox logs itself to disk\\nline 93: the quick brown fox logs itself to disk\\nline 94: the quick brown fox logs itself to disk\\nline 95: the quick brown fox logs itself to disk\\nline 96: the quick brown fox logs itself to disk\\nline 97: the quick brown fox logs itself to disk\\nline 98: the quick brown fox logs itself to disk\\nline 99: the quick brown fox logs itself to disk\\nline 100: the quick brown fox logs itself to disk\\nline 101: the quick brown fox logs itself to disk\\nline 102: the quick brown fox logs itself to disk\\nline 103: the quick brown fox logs itself to disk\\nline 104: the quick brown fox logs itself to disk\\nline 105: the quick brown fox logs itself to disk\\nline 106: the quick brown fox logs itself to disk\\nline 107: the quick brown fox logs itself to disk\\nline 108: the quick brown fox logs itself to disk\\nline 109: the quick brown fox logs itself to disk\\nline 110: the quick brown fox logs itself to disk\\nline 111: the quick brown fox logs itself to disk\\nline 112: the quick brown fox logs itself to disk\\nline 113: the quick brown fox logs itself to disk\\nline 114: the quick brown fox logs itself to disk\\nline 115: the quick brown fox logs itself to disk\\nline 116: the quick brown fox logs itself to disk\\nline 117: the quick brown fox logs itself to disk\\nline 118: the quick brown fox logs itself to disk\\nline 119: the quick brown fox logs itself to disk\\nline 120: the quick brown fox logs itself to disk\\nline 121: the quick brown fox logs itself to disk\\nline 122: the quick brown fox logs itself to disk\\nline 123: the quick brown fox logs itself to disk\\nline 124: the quick brown fox logs itself to disk\\nline 125: the quick brown fox logs itself to disk\\nline 126: the quick brown fox logs itself to disk\\nline 127: the quick brown fox logs itself to disk\\nline 128: the quick brown fox logs itself to disk\\nline 129: the quick brown fox logs itself to disk\\nline 130: the quick brown fox logs itself to disk\\nline 131: the quick brown fox logs itself to disk\\nline 132: the quick brown fox logs itself to disk\\nline 133: the quick brown fox logs itself to disk\\nline 134: the quick brown fox logs itself to disk\\nline 135: the quick brown fox logs itself to disk\\nline 136: the quick brown fox logs itself to disk\\nline 137: the quick brown fox logs itself to disk\\nline 138: the quick brown fox logs itself to disk\\nline 139: the quick brown fox logs itself to disk\\nline 140: the quick brown fox logs itself to disk\\nline 141: the quick brown fox logs itself to disk\\nline 142: the quick brown fox logs itself to disk\\nline 143: the quick brown fox logs itself to disk\\nline 144: the quick brown fox logs itself to disk\\nline 145: the quick brown fox logs itself to disk\\nline 146: the quick brown fox logs itself to disk\\nline 147: the quick brown fox logs itself to disk\\nline 148: the quick brown fox logs itself to disk\\nline 149: the quick brown fox logs itself to disk\\nline 150: the quick brown fox logs itself to disk\\nline 151: the quick brown fox logs itself to disk\\nline 152: the quick brown fox logs itself to disk\\nline 153: the quick brown fox logs itself to disk\\nline 154: the quick brown fox logs itself to disk\\nline 155: the quick brown fox logs itself to disk\\nline 156: the quick brown fox logs itself to disk\\nline 157: the quick brown fox logs itself to disk\\nline 158: the quick brown fox logs itself to disk\\nline 159: the quick brown fox logs itself to disk\\nline 160: the quick brown fox logs itself to disk\\nline 161: the quick brown fox logs itself to disk\\nline 162: the quick brown fox logs itself to disk\\nline 163: the quick brown fox logs itself to disk\\nline 164: the quick brown fox logs itself to disk\\nline 165: the quick brown fox logs itself to disk\\nline 166: the quick brown fox logs itself to disk\\nline 167: the quick brown fox logs itself to disk\\nline 168: the quick brown fox logs itself to disk\\nline 169: the quick brown fox logs itself to disk\\nline 170: the quick brown fox logs itself to disk\\nline 171: the quick brown fox logs itself to disk\\nline 172: the quick brown fox logs itself to disk\\nline 173: the quick brown fox logs itself to disk\\nline 174: the quick brown fox logs itself to disk\\nline 175: the quick brown fox logs itself to disk\\nline 176: the quick brown fox logs itself to disk\\nline 177: the quick brown fox logs itself to disk\\nline 178: the quick brown fox logs itself to disk\\nline 179: the quick brown fox logs itself to disk\\nline 180: the quick brown fox logs itself to disk\\nline 181: the quick brown fox logs itself to disk\\nline 182: the quick brown fox logs itself to disk\\nline 183: the quick brown fox logs itself to disk\\nline 184: the quick brown fox logs itself to disk\\nline 185: the quick brown fox logs itself to disk\\nline 186: the quick brown fox logs itself to disk\\nline 187: the quick brown fox logs itself to disk\\nline 188: the quick brown fox logs itself to disk\\nline 189: the quick brown fox logs itself to disk\\nline 190: the quick brown fox logs itself to disk\\nline 191: the quick brown fox logs itself to disk\\nline 192: the quick brown fox logs itself to disk\\nline 193: the quick brown fox logs itself to disk\\nline 194: the quick brown fox logs itself to disk\\nline 195: the quick brown fox logs itself to disk\\nline 196: the quick brown fox logs itself to disk\\nline 197: the quick brown fox logs itself to disk\\nline 198: the quick brown fox logs itself to disk\\nline 199: the quick brown fox logs itself to disk\\nline 200: the quick brown fox logs itself to disk\\n\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created"
+     ],
+     "reasoning": "Pass 1 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h1",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 2 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h2",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 3 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h3",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 4 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h4",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 5 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h5",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 6 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h6",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 7 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h7",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 8 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h8",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 9 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h9",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 10 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h10",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 11 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h11",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 12 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h12",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 13 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h13",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 14 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h14",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 15 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h15",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 16 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h16",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 17 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h17",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 18 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h18",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 19 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h19",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 20 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h20",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 21 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h21",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 22 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h22",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 23 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h23",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 24 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h24",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "created",
+      "quick brown fox"
+     ],
+     "reasoning": "Pass 25 of the read.",
+     "tool_calls": [
+      {
+       "id": "mock-h25",
+       "name": "read_file",
+       "arguments": "{\"path\": \"$path\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 4
+    },
+    {
+     "require": [
+      "quick brown fox"
+     ],
+     "content": "Read it 25 times. It is still two rows.",
+     "finish": "stop",
+     "chunk_chars": 12,
+     "delay_ms": 4
+    }
+   ]
+  },
+  {
+   "name": "cadence-heavy",
+   "_why": "the plain cadence turn streams four short paragraphs, which is not what a real answer looks like: a real one is thousands of deltas of headings, lists and tables committed into a transcript that already holds hundreds of kilobytes. If the page is where native smoothness dies, this is where it dies.",
+   "match": "Selftest cadence heavy",
+   "steps": [
+    {
+     "content": "# Roast curves, read slowly\n\n## Section 1: how a roast profile is read\n\nHeat transfer at the start of a roast is mostly **conduction** from the drum wall, and the bean surface temperature climbs while the core lags behind it. Around the turning point the curve flattens, and from there convection carries most of the energy. A profile that stalls here usually means the charge was too large for the drum, or the gas was turned down to protect the surface, and the beans ended up baked rather than developed. Section 1 continues the same argument with more numbers: rate of rise per minute, measured at thirty-second intervals across a twelve minute roast.\n- charge 12 kg, drum 15 mm\n- charge 18 kg, drum 11 mm\n- turning point at 1:21\n\n## Section 2: how a roast profile is read\n\nHeat transfer at the start of a roast is mostly **conduction** from the drum wall, and the bean surface temperature climbs while the core lags behind it. Around the turning point the curve flattens, and from there convection carries most of the energy. A profile that stalls here usually means the charge was too large for the drum, or the gas was turned down to protect the surface, and the beans ended up baked rather than developed. Section 2 continues the same argument with more numbers: rate of rise per minute, measured at thirty-second intervals across a twelve minute roast.\n| minute | surface | core | rate |\n|---|---|---|---|\n| 1 | 124 | 63 | 2.35 |\n| 2 | 128 | 66 | 2.30 |\n| 3 | 132 | 69 | 2.25 |\n| 4 | 136 | 72 | 2.20 |\n| 5 | 140 | 75 | 2.15 |\n| 6 | 144 | 78 | 2.10 |\n| 7 | 148 | 81 | 2.05 |\n| 8 | 152 | 84 | 2.00 |\n| 9 | 156 | 87 | 1.95 |\n| 10 | 160 | 90 | 1.90 |\n\n## Section 3: how a roast profile is read\n\nHeat transfer at the start of a roast is mostly **conduction** from the drum wall, and the bean surface temperature climbs while the core lags behind it. Around the turning point the curve flattens, and from there convection carries most of the energy. A profile that stalls here usually means the charge was too large for the drum, or the gas was turned down to protect the surface, and the beans ended up baked rather than developed. Section 3 continues the same argument with more numbers: rate of rise per minute, measured at thirty-second intervals across a twelve minute roast.\n- charge 32 kg, drum 35 mm\n- charge 38 kg, drum 31 mm\n- turning point at 1:23\n\n## Section 4: how a roast profile is read\n\nHeat transfer at the start of a roast is mostly **conduction** from the drum wall, and the bean surface temperature climbs while the core lags behind it. Around the turning point the curve flattens, and from there convection carries most of the energy. A profile that stalls here usually means the charge was too large for the drum, or the gas was turned down to protect the surface, and the beans ended up baked rather than developed. Section 4 continues the same argument with more numbers: rate of rise per minute, measured at thirty-second intervals across a twelve minute roast.\n| minute | surface | core | rate |\n|---|---|---|---|\n| 1 | 124 | 63 | 2.35 |\n| 2 | 128 | 66 | 2.30 |\n| 3 | 132 | 69 | 2.25 |\n| 4 | 136 | 72 | 2.20 |\n| 5 | 140 | 75 | 2.15 |\n| 6 | 144 | 78 | 2.10 |\n| 7 | 148 | 81 | 2.05 |\n| 8 | 152 | 84 | 2.00 |\n| 9 | 156 | 87 | 1.95 |\n| 10 | 160 | 90 | 1.90 |\n\n## Section 5: how a roast profile is read\n\nHeat transfer at the start of a roast is mostly **conduction** from the drum wall, and the bean surface temperature climbs while the core lags behind it. Around the turning point the curve flattens, and from there convection carries most of the energy. A profile that stalls here usually means the charge was too large for the drum, or the gas was turned down to protect the surface, and the beans ended up baked rather than developed. Section 5 continues the same argument with more numbers: rate of rise per minute, measured at thirty-second intervals across a twelve minute roast.\n- charge 52 kg, drum 55 mm\n- charge 58 kg, drum 51 mm\n- turning point at 1:25\n\n## Section 6: how a roast profile is read\n\nHeat transfer at the start of a roast is mostly **conduction** from the drum wall, and the bean surface temperature climbs while the core lags behind it. Around the turning point the curve flattens, and from there convection carries most of the energy. A profile that stalls here usually means the charge was too large for the drum, or the gas was turned down to protect the surface, and the beans ended up baked rather than developed. Section 6 continues the same argument with more numbers: rate of rise per minute, measured at thirty-second intervals across a twelve minute roast.\n| minute | surface | core | rate |\n|---|---|---|---|\n| 1 | 124 | 63 | 2.35 |\n| 2 | 128 | 66 | 2.30 |\n| 3 | 132 | 69 | 2.25 |\n| 4 | 136 | 72 | 2.20 |\n| 5 | 140 | 75 | 2.15 |\n| 6 | 144 | 78 | 2.10 |\n| 7 | 148 | 81 | 2.05 |\n| 8 | 152 | 84 | 2.00 |\n| 9 | 156 | 87 | 1.95 |\n| 10 | 160 | 90 | 1.90 |\n\n```text\nmin   surface   core    rate\n0     98        18      12.4\n4     141       71      6.1\n8     178       112     3.4\n```\n\nThe last section is the one that matters: a curve is a record of decisions, not a prediction, and the only honest way to use one is to compare it with the cup in front of you.\n",
+     "finish": "stop",
+     "chunk_chars": 4,
+     "delay_ms": 0
     }
    ]
   }

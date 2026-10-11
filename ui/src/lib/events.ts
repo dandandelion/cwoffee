@@ -90,7 +90,7 @@ export interface ModelInfo {
 
 export type EngineEvent =
   | { kind: 'sessionChanged'; d: { session_id: number; title: string } }
-  | { kind: 'turnStart'; d: { turn_id: number; model: string } }
+  | { kind: 'turnStart'; d: { turn_id: number; model: string; session_id: number } }
   | { kind: 'text'; d: string }
   | { kind: 'reasoning'; d: string }
   | { kind: 'toolCallBegin'; d: { id: string; name: string } }
@@ -134,6 +134,16 @@ export interface HostState {
   turns: number
   context_tokens: number
   compactions: number
+  /**
+   * The engine's own prompt budget: the line history is trimmed past. It is not
+   * the model's window, and the difference is the whole complaint - a session at
+   * 53k of a 262k window was being trimmed because the budget was a constant.
+   */
+  context_budget: number
+  /** What the endpoint stated as the window, or null when it never said. */
+  model_window: number | null
+  /** How long an `ask_user` card stays open. Names itself in the timeout text. */
+  question_timeout_secs: number
   approval_timeout_secs: number
   workspace: string
   /**

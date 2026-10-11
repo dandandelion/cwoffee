@@ -53,6 +53,13 @@ pub struct AgentConfig {
     /// Sampling overrides for the endpoint. Empty by default: the server's own
     /// defaults are its decision, not ours.
     pub sampling: crate::provider::Sampling,
+    /// What the prompt costs, shared with whoever is showing the number.
+    ///
+    /// The agent is the only thing that knows the real size of the prompt it is
+    /// about to send, and the toolbar is the only place the user sees it. Writing
+    /// it here - rather than having the host snapshot it at the end of a turn -
+    /// is what makes the number in the bar the number the next prefill pays.
+    pub gauge: Arc<std::sync::Mutex<crate::prompt::ContextGauge>>,
 }
 
 impl Default for AgentConfig {
@@ -72,6 +79,8 @@ impl Default for AgentConfig {
             // comes back as `length` rather than the model ever stopping.
             max_tokens: None,
             sampling: crate::provider::Sampling::default(),
+            // A private gauge is fine for a test agent: nothing is reading it.
+            gauge: Arc::new(std::sync::Mutex::new(crate::prompt::ContextGauge::default())),
         }
     }
 }
@@ -125,6 +134,20 @@ impl Agent {
 
     pub fn prompt_mut(&mut self) -> &mut PromptBuilder {
         &mut self.prompt
+    }
+
+    /// Copy the prompt's current cost into the shared gauge.
+    pub(crate) fn publish_gauge(&self, schemas: &str) {
+        let mut g = self.cfg.gauge.lock().unwrap();
+        g.tokens = self.prompt.estimate_tokens(schemas);
+        g.budget = self.prompt.token_budget;
+        g.window = self.prompt.context_window;
+        g.compactions = self.prompt.compactions;
+    }
+
+    /// What the prompt costs right now, as this agent measured it.
+    pub fn context_tokens(&self) -> usize {
+        self.cfg.gauge.lock().unwrap().tokens
     }
 
     /// Point the tools at a different workspace.
@@ -250,22 +273,30 @@ impl Agent {
         user_text: &str,
         attachments: Vec<crate::provider::Attachment>,
         out: &EngineSink,
+        session_id: i64,
     ) -> TurnTelemetry {
         self.turn_id += 1;
         let turn = self.turn_id;
         self.cancel.store(false, Ordering::Relaxed);
 
+        // Which conversation this turn belongs to is a fact about the engine, not
+        // something a client can infer from what it happens to be looking at.
+        // Without it, a second client (the gateway on a phone) that sees a turn
+        // start while it is viewing another session has no way to know the turn
+        // is not its own - and it paints the running turn's thinking into the
+        // conversation on its screen.
         let _ = out.send(EngineEvent::TurnStart {
             turn_id: turn,
             model: self.cfg.model.clone(),
+            session_id,
         });
 
         self.prompt.push_user_with(user_text, attachments);
 
         let defs = self.registry.defs();
         let schemas = serde_json::to_string(&defs).unwrap_or_default();
-        let dropped = self.prompt.compact_to_budget(&schemas);
-        if dropped > 0 {
+        let c = self.prompt.compact_to_budget(&schemas);
+        if c.did_anything() {
             // Say so, with the numbers: "context full" without them is a claim the
             // user cannot check, and it used to fire at 43k tokens of a 262k
             // window because the budget was a constant rather than the model's.
@@ -276,13 +307,25 @@ impl Agent {
                 .context_window
                 .map(|w| w.to_string())
                 .unwrap_or_else(|| "unstated".into());
+            let what = match (c.stubbed, c.dropped) {
+                (s, 0) => format!(
+                    "trimmed {s} older tool result(s) to one line each - no turn was deleted, \
+                     and the full output is still in the session file"
+                ),
+                (0, d) => format!("dropped the oldest {d} message(s)"),
+                (s, d) => format!(
+                    "trimmed {s} older tool result(s) to one line each, then dropped the oldest {d} message(s)"
+                ),
+            };
             let _ = out.send(EngineEvent::Note {
                 message: format!(
                     "history over budget: ~{est} tokens now, budget {budget} (model window {window}); \
-                     dropped the oldest {dropped} message(s), compaction #{} - the next prefill will be slow",
+                     {what}, ~{} tokens back, compaction #{} - the next prefill will be slow",
+                    c.reclaimed,
                     self.prompt.compactions
                 ),
             });
+            self.publish_gauge(&schemas);
         }
 
         let mut agg = TurnTelemetry::default();
@@ -312,6 +355,11 @@ impl Agent {
                 });
             }
             iters += 1;
+            // Every round-trip adds messages, and the number the toolbar quotes
+            // is the one this loop is about to pay for. Measuring here (once per
+            // round-trip, not per token) keeps it honest without a second pass
+            // over the history per delta.
+            self.publish_gauge(&schemas);
             if self.cancel.load(Ordering::Relaxed) {
                 self.emit_turn_files(turn, out);
                 let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Cancelled });
@@ -978,7 +1026,7 @@ mod tests {
             AgentConfig::default(),
             ToolCtx::default(),
         );
-        agent.run_turn("q", vec![], &etx).await;
+        agent.run_turn("q", vec![], &etx, 7).await;
 
         let h = agent.prompt_mut().history();
         let a = h.iter().find(|m| matches!(m.role, crate::provider::Role::Assistant)).expect("assistant message");
@@ -1000,11 +1048,69 @@ mod tests {
             AgentConfig::default(),
             ToolCtx::default(),
         );
-        agent.run_turn("q", vec![], &etx).await;
+        agent.run_turn("q", vec![], &etx, 7).await;
         let h = agent.prompt_mut().history();
         let a = h.iter().find(|m| matches!(m.role, crate::provider::Role::Assistant)).expect("assistant message");
         assert_eq!(a.reasoning, None);
         assert_eq!(a.reasoning_ms, None);
+    }
+
+    /// The toolbar quotes `context_tokens`. It used to be refreshed only when a
+    /// turn ended, so a session that had just been compacted from 53k to 4k kept
+    /// reporting 53k for the whole turn: the number in the bar and the number the
+    /// model was actually reading were two different facts, and the bar was the
+    /// one the user trusted.
+    #[tokio::test]
+    async fn a_compaction_moves_the_number_the_toolbar_quotes() {
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let gauge = Arc::new(std::sync::Mutex::new(crate::prompt::ContextGauge::default()));
+        let mut agent = Agent::new(
+            std::sync::Arc::new(Scripted {
+                turns: vec![vec![
+                    Delta::Text("short answer".into()),
+                    Delta::Done(FinishReason::Stop),
+                ]],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Registry::new(),
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            AgentConfig {
+                gauge: gauge.clone(),
+                ..Default::default()
+            },
+            ToolCtx::default(),
+        );
+
+        // A resumed session's shape: a long history already in the window.
+        let hist: Vec<Message> = (0..40)
+            .map(|i| Message::user(format!("question {i}: {}", "long text ".repeat(300))))
+            .collect();
+        agent.prompt_mut().with_history(hist);
+        agent.prompt_mut().token_budget = 4_000;
+        let before = agent.prompt_mut().estimate_tokens("");
+        assert!(before > 20_000, "fixture should be well over the budget, got {before}");
+
+        agent.run_turn("now summarise", vec![], &etx, 7).await;
+
+        let g = gauge.lock().unwrap().clone();
+        assert!(g.tokens < before, "the gauge still reports the pre-compaction size: {g:?}");
+        assert!(g.tokens <= 4_000, "the gauge quotes a prompt that would not fit: {}", g.tokens);
+        assert_eq!(g.compactions, 1);
+        let mut seen: Vec<String> = Vec::new();
+        while let Ok(e) = erx.try_recv() {
+            if let EngineEvent::Note { message } = e {
+                if message.contains("history over budget") {
+                    seen.push(message);
+                }
+            }
+        }
+        assert_eq!(seen.len(), 1, "compaction happened without saying so once: {seen:?}");
+        assert!(
+            seen[0].contains("dropped the oldest"),
+            "a user-text history has nothing to trim, so it must say what it dropped: {}",
+            seen[0]
+        );
     }
 
     /// A tool that returns a result but streams nothing, which is what every
@@ -1132,7 +1238,7 @@ mod tests {
             ToolCtx::default(),
         );
         let _ = arx; // nobody to answer: if a prompt were raised, fail-closed would deny it
-        agent.run_turn("go", vec![], &etx).await;
+        agent.run_turn("go", vec![], &etx, 7).await;
 
         let ran = agent
             .prompt_mut()
@@ -1202,7 +1308,7 @@ mod tests {
             AgentConfig::default(),
             ToolCtx::default(),
         );
-        agent.run_turn("go", vec![], &etx).await;
+        agent.run_turn("go", vec![], &etx, 7).await;
         let prompts = responder.await.unwrap();
         assert_eq!(prompts.len(), 2, "both escapes must prompt: {prompts:?}");
         for (summary, escapes) in &prompts {
@@ -1250,7 +1356,7 @@ mod tests {
             ToolCtx::default(),
         );
         // Producer reports a change of its own, the way write_file does.
-        agent.run_turn("go", vec![], &etx).await;
+        agent.run_turn("go", vec![], &etx, 7).await;
 
         let mut saw_live = false;
         while let Ok(e) = erx.try_recv() {
@@ -1321,7 +1427,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.run_turn("go", vec![], &etx).await;
+        agent.run_turn("go", vec![], &etx, 7).await;
 
         let files = agent.take_turn_files();
         assert_eq!(files.len(), 1, "one file, seen twice: {files:?}");
@@ -1371,7 +1477,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.run_turn("go", vec![], &etx).await;
+        agent.run_turn("go", vec![], &etx, 7).await;
         // The cleanup call, arriving as a real deletion on disk.
         std::fs::remove_file(dir.join("report.md")).unwrap();
 
@@ -1409,7 +1515,7 @@ mod tests {
             AgentConfig::default(),
             ToolCtx::default(),
         );
-        agent.run_turn("go", vec![], &etx).await;
+        agent.run_turn("go", vec![], &etx, 7).await;
 
         let mut seen: Vec<String> = Vec::new();
         while let Ok(ev) = erx.try_recv() {
@@ -1475,7 +1581,7 @@ mod tests {
             AgentConfig::default(),
             ToolCtx::default(),
         );
-        agent.run_turn("go", vec![], &etx).await;
+        agent.run_turn("go", vec![], &etx, 7).await;
 
         let h = agent.prompt_mut().history();
         let tr = h
@@ -1506,7 +1612,7 @@ mod tests {
             ToolCtx::default(),
         );
         let cancel = agent.cancel_handle();
-        let run = tokio::spawn(async move { agent.run_turn("go", vec![], &etx).await });
+        let run = tokio::spawn(async move { agent.run_turn("go", vec![], &etx, 7).await });
 
         // Let a few tokens arrive, then stop.
         let mut got = 0usize;
@@ -1573,7 +1679,7 @@ mod tests {
             ToolCtx::default(),
         );
         let cancel = agent.cancel_handle();
-        let run = tokio::spawn(async move { agent.run_turn("go", vec![], &etx).await });
+        let run = tokio::spawn(async move { agent.run_turn("go", vec![], &etx, 7).await });
 
         let (req, reply) = arx.recv().await.expect("an approval prompt");
         assert_eq!(req.tool, "escaper");
@@ -1621,7 +1727,7 @@ mod tests {
             }
         });
         let (tx, rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", vec![], &tx).await;
+        agent.run_turn("go", vec![], &tx, 7).await;
         drop(tx);
         let mut rx = rx;
         let mut events = Vec::new();
@@ -1650,7 +1756,7 @@ mod tests {
         ];
         let (mut agent, _ev, _arx) = harness(turns, ApprovalAnswer::Allow);
         let (tx, rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", vec![], &tx).await;
+        agent.run_turn("go", vec![], &tx, 7).await;
         drop(rx);
         let h = agent.prompt.history();
         let tr = h.iter().find(|m| m.tool_call_id.as_deref() == Some("b1")).expect("tool_result exists");
@@ -1673,7 +1779,7 @@ mod tests {
             }
         });
         let (tx, _rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", vec![], &tx).await;
+        agent.run_turn("go", vec![], &tx, 7).await;
         let h = agent.prompt.history();
         let tr = h.iter().find(|m| m.tool_call_id.as_deref() == Some("d1")).expect("result exists");
         assert!(tr.content.contains("DENIED BY USER"));
@@ -1703,7 +1809,7 @@ mod tests {
             reply.send(ApprovalAnswer::Allow).ok();
         } });
         let (tx, _rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", vec![], &tx).await;
+        agent.run_turn("go", vec![], &tx, 7).await;
         let h = agent.prompt.history();
         let tr = h
             .iter()
@@ -1725,7 +1831,7 @@ mod tests {
         ];
         let (mut agent, _ev, _arx) = harness(turns, ApprovalAnswer::Allow);
         let (tx, _rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", vec![], &tx).await;
+        agent.run_turn("go", vec![], &tx, 7).await;
         let h = agent.prompt.history();
         let tr = h.iter().find(|m| m.tool_call_id.as_deref() == Some("u1")).expect("result exists");
         assert!(tr.content.contains("unknown tool"));
@@ -1758,7 +1864,7 @@ mod tests {
         });
         agent.cfg.max_tool_iters = 3;
         let (tx, rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", vec![], &tx).await;
+        agent.run_turn("go", vec![], &tx, 7).await;
         drop(tx);
 
         let mut rx = rx;
@@ -1821,7 +1927,7 @@ mod tests {
         });
         agent.cfg.max_tool_iters = 3;
         let (tx, rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", vec![], &tx).await;
+        agent.run_turn("go", vec![], &tx, 7).await;
         drop(tx);
         let mut rx = rx;
         let mut saw_cap = false;
@@ -1864,7 +1970,7 @@ mod tests {
         });
         agent.cfg.max_tool_iters = 0;
         let (tx, rx) = mpsc::unbounded_channel();
-        agent.run_turn("go", vec![], &tx).await;
+        agent.run_turn("go", vec![], &tx, 7).await;
         drop(tx);
         let mut rx = rx;
         let mut uncapped_notes = 0usize;

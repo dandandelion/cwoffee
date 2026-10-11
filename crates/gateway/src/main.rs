@@ -115,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
 
     let configured_model = appcfg.provider.model.clone();
     let mut cfg = HostConfig::new(configured_model.clone(), workspace.clone());
+    cfg.cfg_path = Some(config_path.clone());
     if let Some(m) = &appcfg.mode {
         cfg.mode = match m.as_str() {
             "ask" => cwoffee_engine::ApprovalMode::Ask,
@@ -128,6 +129,12 @@ async fn main() -> anyhow::Result<()> {
     cfg.max_tokens = appcfg.max_output_tokens;
     // 0 = no cap. The hardcoded 14 was cutting real tasks short; see Config.
     cfg.max_tool_iters = appcfg.max_tool_iters();
+    // The thinking level the window persists is the level the phone sees on connect.
+    // Two clients of one engine showing different levels is the same drift the mode
+    // persistence closed, one dial further along the console.
+    if let Some(r) = appcfg.reasoning_checked().map_err(anyhow::Error::msg)? {
+        cfg.reasoning = r;
+    }
     // Validated at boot, not per request: see Config::sampling_checked.
     cfg.sampling = appcfg.sampling_checked().map_err(anyhow::Error::msg)?;
     // The exec sandbox's egress block, validated here so a mode word that does not

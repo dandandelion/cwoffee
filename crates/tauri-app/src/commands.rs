@@ -604,6 +604,21 @@ pub fn remove_workspace(state: tauri::State<'_, AppState>, path: String) -> Resu
     Ok(state.store.remove_workspace(&path).map_err(|e| e.to_string())?)
 }
 
+/// Is the in-app harness allowed to run?
+///
+/// The self-test bundle is baked into `ui/dist` by `scripts/selftest.sh`, and the
+/// release binary embeds whatever `ui/dist` holds at build time. So a production
+/// start right after a harness run ships a bundle that drives *whatever endpoint
+/// and config the user has* - which is exactly what happened once: it opened
+/// sessions in the real store, wrote `mode` and `reasoning` into the real
+/// `config.toml`, and ran turns against the real model. The build-time flag alone
+/// is not a gate; the harness also has to be armed by the process that launched
+/// it, and a bundle that is not armed says so in the log instead of going quiet.
+#[tauri::command]
+pub fn selftest_armed() -> bool {
+    std::env::var("CWOFFEE_SELFTEST").map(|v| v == "1").unwrap_or(false)
+}
+
 #[tauri::command]
 pub fn switch_session(state: tauri::State<'_, AppState>, id: i64) {
     state.host.send(HostCmd::SwitchSession { id });
@@ -629,7 +644,7 @@ pub async fn list_models(
 
 #[tauri::command]
 pub fn set_model(state: tauri::State<'_, AppState>, model: String) {
-    state.host.send(HostCmd::SetModel { model });
+    state.host.send(HostCmd::SetModel { model, persist: true });
 }
 
 #[tauri::command]

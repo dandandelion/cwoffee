@@ -454,7 +454,33 @@ impl Provider for OpenAiProvider {
         let url = self.endpoint();
         let body = Self::build_body(req, self.flavor);
 
-        let mut call = self.http.post(&url).json(&body);
+        // Serialize once, and say what that cost when it is big enough to matter.
+        //
+        // The desktop build runs the engine in the same process as the webview, so a
+        // multi-megabyte body rebuilt on every round trip is CPU the UI pays for
+        // without seeing it; the gateway build does the identical work in a separate
+        // process and a browser never feels it. That asymmetry is the only honest
+        // explanation left for "the native window is slow during inference and the
+        // browser is smooth", and the harness cannot reproduce it with a scripted
+        // endpoint. Until it is measured it stays a hypothesis, so the hypothesis
+        // ships with a number attached to it.
+        let t_ser = std::time::Instant::now();
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        let ser_ms = t_ser.elapsed().as_secs_f64() * 1000.0;
+        if bytes.len() >= 256 * 1024 {
+            eprintln!(
+                "[cwoffee] request body {:.2} MB serialized in {:.1} ms over {} messages (the desktop build pays for this inside the app process)",
+                bytes.len() as f64 / 1_048_576.0,
+                ser_ms,
+                req.messages.len(),
+            );
+        }
+
+        let mut call = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes);
         if let Some(k) = &self.api_key {
             call = call.bearer_auth(k);
         }

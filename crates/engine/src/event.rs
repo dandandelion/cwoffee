@@ -55,6 +55,11 @@ pub enum EngineEvent {
     TurnStart {
         turn_id: u64,
         model: String,
+        /// The conversation this turn writes into. Every client needs this rather
+        /// than a guess from what it is looking at: a second client watching a
+        /// different session cannot otherwise tell "not mine" from "mine", and it
+        /// paints another conversation's thinking into the transcript on screen.
+        session_id: i64,
     },
 
     /// Visible answer text, one delta at a time.

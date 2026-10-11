@@ -144,7 +144,11 @@ fi
 # port, so it coexists with an app the user already has open.
 
 note "launching the app"
-./target/release/cwoffee-app >>"$log" 2>&1 &
+# Two keys arm the harness: a self-test bundle *and* an armed process. See
+# commands.rs::selftest_armed - the release binary embeds whatever ui/dist holds,
+# so a production start right after this script unarms the same bundle and must
+# not drive the user's endpoint, config or session store.
+CWOFFEE_SELFTEST=1 ./target/release/cwoffee-app >>"$log" 2>&1 &
 APP_PID=$!
 
 # ---- wait for a verdict -----------------------------------------------------

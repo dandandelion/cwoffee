@@ -74,7 +74,23 @@ Behaviour lives in `tests/scenarios/scenarios.json`. Selection is stateless:
   interpolate its own temp paths and the canned call still names the right file.
 
 Each step may set `reasoning`, `content`, `tool_calls`, `finish` (`stop` | `tool_calls` | `abort`),
-`chunk_chars`, `delay_ms`, and `arg_fragments`.
+`chunk_chars`, `delay_ms`, `arg_fragments`, and `require`.
+
+`require` is a list of strings that must all appear in the tool results accumulated since the
+scenario's user message. It exists because a tool loop that advances while the tools say nothing
+useful is indistinguishable from a tool loop that works, and a step that runs against the wrong
+state still produces a green check. In the last batch it caught three mistakes in the fixture
+rather than in the app:
+
+- a fill scenario wrote the same file three times, so the engine said `overwrote 9892 bytes`, not
+  `created`, and step 1's `require: ["created"]` was a claim about the fixture's own naming;
+- the fixture's content was rewritten from two rows to two hundred, and the reads still required
+  the old `row one`;
+- step 1 required text that only the *first read* can return, one step too early.
+
+All three failed loudly, with the engine's actual tool output quoted in the error. That is the
+point: the needles are assertions, and an assertion that fails because the fixture drifted is the
+harness doing its job.
 
 Three deliberate behaviours:
 
@@ -116,6 +132,33 @@ and uses its own gateway port. Consequences worth knowing:
 - two instances coexist, so the script never `pkill`s your app — it kills only the PID it started.
 
 `--keep` leaves the scratch dirs behind when you want to inspect the DB or the workspace a test wrote.
+
+### The second key: a self-test bundle is inert unless the process is armed
+
+`VITE_SELFTEST=1` is baked into `ui/dist`, and the release binary embeds `ui/dist` as it stands. At
+the file level, the binary `selftest.sh` produces is indistinguishable from a production build - so
+if you start that binary yourself, which is what a production gate does, a harness bundle drives
+*your* endpoint, *your* `config.toml` and *your* session store.
+
+That happened once in this batch. Two sessions appeared in the real store (`selftest`, `selftest
+approval`), `mode` and `reasoning` were rewritten in the real config file, and turns went to the
+live model with 99 % cache hits, which is how it looked normal in the log. Nothing in the harness was
+wrong; the launch was.
+
+So the harness now needs two keys: the build-time flag *and* `CWOFFEE_SELFTEST=1` in the environment
+of the process that starts the app (`commands.rs::selftest_armed`). `selftest.sh` sets it; a
+production start does not, and an unarmed bundle says so out loud rather than going quiet:
+
+```
+[cwoffee/page] boot: main.ts executing (self-test bundle embedded; it stays inert unless the host is armed)
+[cwoffee/page] self-test bundle, harness NOT armed: set CWOFFEE_SELFTEST=1 to run the checks. Nothing
+               else happens here - the checks drive the configured endpoint, the config file and the
+               session store, which is not what a production start should touch.
+```
+
+For anyone running gates by hand: after `selftest.sh`, `target/release/cwoffee-app` is a harness
+build. Rebuild the product bundle (`npx vite build` in `ui/`, then `cargo build --release -p
+cwoffee-app`) before restarting the app.
 
 ## Adding a behaviour the harness needs
 
@@ -167,6 +210,11 @@ This box usually runs a 50 GB model on nine cores, so `selftest.sh` keeps two ho
   attributes long tasks to the page or to the machine (`docs/BENCHMARKS.md` has both rows);
 - geometry checks verify that the page is actually being laid out before measuring rects, and count
   the skips. Four skipped geometry checks fail the run: a run that measured nothing is not a pass.
+- a cadence or layout check states **what is on screen** before it measures it: mounted messages,
+  block count, and the character count of the transcript. A "big transcript" check that is really
+  holding 80 small rows measures nothing, and the run that added that assertion is the run that
+  found the second `Load history` bug - the transcript was losing 319 KB of loaded history when a
+  turn started, which no cadence number would ever have reported.
 
 Neither rule exists to make failures disappear. Both exist because a failure that is really about the
 machine gets ignored, and an ignored suite is a suite that stops protecting anything.

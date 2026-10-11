@@ -54,7 +54,7 @@ const probe = arg('probe')
 const keep = flag('keep')
 const url = arg('url')
 
-const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+const ws = new WebSocket(url || `ws://127.0.0.1:${port}/ws`)
 let nextId = 1
 const pending = new Map()
 const rpc = (cmd, args = {}) =>

@@ -44,7 +44,12 @@ impl Default for FakeScript {
 /// spawn it (the Tauri host does exactly that).
 pub fn fake_turn<F: FnMut(EngineEvent)>(turn_id: u64, script: &FakeScript, mut emit: F) {
     let start = Instant::now();
-    emit(EngineEvent::TurnStart { turn_id, model: script.model.to_string() });
+    // A scripted turn belongs to no stored conversation.
+    emit(EngineEvent::TurnStart {
+        turn_id,
+        model: script.model.to_string(),
+        session_id: 0,
+    });
 
     let gap = Duration::from_secs_f64(1.0 / script.tok_per_sec.max(1.0));
 

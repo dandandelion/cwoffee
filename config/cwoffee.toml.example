@@ -26,6 +26,16 @@ workspace = "~/cwoffee-workspace"
 # auto    - no prompts; the denylist still applies
 mode = "ask"
 
+# off | low | medium | high | xhigh - the thinking chip in the composer.
+#
+# Absent means the shell's own default (the window and the gateway start at xhigh,
+# because that is what this endpoint's chat template asks for). The app writes this
+# line itself when you change the chip, which is the whole point of it being a
+# documented key: an undocumented key is rejected at startup, so a writer inventing
+# one produces an app that will not boot rather than a setting that does nothing.
+# A word that is not one of the five stops startup and names the key.
+# reasoning = "xhigh"
+
 # Seconds an unanswered approval prompt waits before refusing. Fail closed:
 # an unreachable UI must not leave the agent waiting forever.
 approval_timeout_secs = 300

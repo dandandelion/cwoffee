@@ -132,7 +132,7 @@ impl App {
             // turn ends; redrawing a status line a few times a second would fight
             // the transcript for no information the final line does not carry.
             EngineEvent::TurnStats(_) => {}
-            EngineEvent::TurnStart { turn_id, model } => {
+            EngineEvent::TurnStart { turn_id, model, .. } => {
                 self.busy = true;
                 self.tel = TurnTelemetry::default();
                 self.items.push(Item::Note(format!("── turn {turn_id} · {model} ──")));
@@ -385,7 +385,14 @@ async fn main() -> Result<()> {
     };
 
     let mut cfg = HostConfig::new(model, workspace.clone());
+    cfg.cfg_path = Some(Config::default_path());
     cfg.mode = appcfg.mode();
+    // The thinking level is written back by the host when it is changed, so it is
+    // read back here as well. A word that is not a level stops the TUI at boot
+    // rather than running the model at a level nobody chose.
+    if let Some(r) = appcfg.reasoning_checked().map_err(anyhow::Error::msg)? {
+        cfg.reasoning = r;
+    }
     cfg.context_budget = appcfg.context.target_tokens;
     // None means the server's own output cap applies; see Config.
     cfg.max_tokens = appcfg.max_output_tokens;
@@ -404,6 +411,7 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(appcfg.approval_timeout_secs.unwrap_or(300));
 
     let mode = cfg.mode;
+    let reasoning = cfg.reasoning;
     let model = cfg.model.clone();
 
     let mut host = SessionHost::spawn(
@@ -436,7 +444,7 @@ async fn main() -> Result<()> {
             );
         }
     }
-    let result = run(terminal, &mut host, model, mode).await;
+    let result = run(terminal, &mut host, model, mode, reasoning).await;
     ratatui::restore();
     result
 }
@@ -446,9 +454,14 @@ async fn run(
     host: &mut SessionHost,
     model: String,
     mode: ApprovalMode,
+    reasoning: Reasoning,
 ) -> Result<()> {
     let mut app = App::new(model);
     app.mode = mode;
+    // The level the file asked for is the level the chip shows. Showing the
+    // constructor's default instead would put a number on screen that the model is
+    // not running at - and the TUI persists changes, so the two would then fight.
+    app.reasoning = reasoning;
 
     // The receivers move out of the host once: recv() needs &mut, and two
     // consumers would silently split one event stream.

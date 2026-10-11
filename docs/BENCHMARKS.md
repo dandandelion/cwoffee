@@ -1254,3 +1254,226 @@ tools::net 9   tools::exec 31   tools::sheet_sql 15   tools::files 33
 egress-probe ok (proxy admits registries, refuses the rest by name, off has no route, open is open)
 ```
 
+
+## Batch: six reports, and the two that had a second cause
+
+### A turn belongs to the conversation the engine says it belongs to
+
+Thinking from one session painted itself into another session's transcript, and coming back from a
+session switch lost the loops that had already run. Both were the same bug: the client decided
+ownership by asking "which session am I looking at?", which since browsing stopped moving the host
+is a question about a different conversation.
+
+`EngineEvent::TurnStart` now carries `session_id`, and the UI routes on that owner *before* the
+event is applied - after is already too late, the first delta lands in the wrong transcript.
+
+```
+live turn ownership ok (turnStart named session 13; session B stayed clean across 10 samples;
+coming back kept the thinking and the tail; 41 events replayed from 3 buffer entries)
+```
+
+The replay buffer changed shape as well. It used to store raw deltas under a 4 000-event cap, which
+for a long turn means it kept the head and threw away the tail - the part the user came back to
+read. It now stores merged blocks (`text`, `reasoning`, `toolCallArgs` merged; `toolExecOutput`
+merged per id+stream; `turnStats` skipped, because a live gauge is not answer text), the cap counts
+merged entries, and overflow says so out loud. 41 events out of 3 entries is the ratio for a whole
+turn: the buffer is doing the coalescing the pump does, but for history.
+
+### "Load history" had two causes, and the second one was invisible
+
+The button asked the engine for rows of the session the *engine* was working on, which is a
+different conversation from the one on screen:
+
+```
+load history ok (80 -> 160 rows of session 15 while the engine worked on 16; button still offered)
+```
+
+That fix was right and incomplete. The cadence check, which now states its premise, printed this:
+
+```
+the big-transcript turn added -319280 characters, -120 blocks and 3 rendered table(s)
+```
+
+Negative three hundred thousand. The rows were loaded, and then a repaint put the default page back:
+a host `sessionChanged` naming the session *already on screen* ran `resyncView`, which clears the
+transcript and loads one page. So the history the user asked for arrived and then left, which is
+exactly how the complaint reads from the chair.
+
+`resyncView` now hands back the window the reader is looking at (`keepRows`, ceiling 1 200 rows,
+with a log line when the ceiling bites), and the cadence check asserts the window survives the turn:
+
+```
+big transcript cadence: 240 blocks / 162 messages / 638221 characters mounted (1 older page(s) pulled in)
+```
+
+### The budget that was a wrecking ball
+
+The toolbar quoted `~53132 tokens of a 8000 token budget` next to a model picker stating 262 144.
+8 000 was a constant used when the endpoint had not answered `/models` yet, which on a cold start is
+most starts. Resuming a 61-message session then deleted 57 messages of a conversation the model had
+room for.
+
+- `FALLBACK_BUDGET` 8 000 → 32 000 (a floor for "the endpoint would not say", not a licence to trim);
+- `auto_budget(window)` = 80 % of the window, floor 4 096: `auto_budget(262144) = 209715`,
+  `auto_budget(8192) = 6553`, `auto_budget(4096) = 4096`;
+- the host re-asks the endpoint every turn until it answers, quietly - the boot line prints once,
+  re-reads print `context budget re-read: 209715 tokens (model window 262144)`;
+- compaction trims old tool results to one line each *before* deleting a whole turn, and the note
+  says which it did, with the numbers, and that the full output is still in the session file.
+
+The readout now shows the number that actually trims, with a tick on the bar:
+
+```
+context readout ok (2738 of 262144, trim line at 80.0%, "context 2,738 / 262k trims at 210k")
+```
+
+Engine side, the ones that matter: `old_tool_output_is_trimmed_before_any_turn_is_deleted`,
+`small_tool_results_are_left_alone`, `a_compaction_moves_the_number_the_toolbar_quotes`,
+`a_window_the_endpoint_was_quiet_about_is_asked_for_again`.
+
+### Native frame cadence with a grown transcript: measured, and it does not reproduce
+
+The report: native drops well under 30 fps as history grows and during inference; the browser is
+smooth. The first harness attempt streamed four short paragraphs against 80 small rows, which is not
+the situation being described. So the fixture grew: three scripted fill turns, 168 stored rows of
+200-line tool results, then the older pages are pulled in, then a 5 KB markdown answer streams in
+~1 300 deltas.
+
+The check states what is mounted before it measures, and what the stream added after:
+
+```
+big transcript cadence: 240 blocks / 162 messages / 638221 characters mounted (1 older page(s) pulled in);
+94 frames over 1540ms while a turn streamed, median 17.0ms, p95 23.0ms, worst 24.0ms,
+page long tasks 0 totalling 0ms; the stream itself added 13148 characters / 3 blocks / 3 tables;
+idle baseline 83 frames, median 15.0ms (stream/idle x1.13)
+```
+
+638 KB of transcript, 240 blocks, real tables committed mid-stream: **59 fps, zero long tasks, and
+the same interval as the same page idling.** An earlier run measured the idle interval as 9.0 ms
+(120 Hz) against 17.0 ms streaming, which is 2x idle - frame pacing, not the app slowing down. That
+is why the guard is two numbers now: fail at an absolute 33.4 ms (the report's own "under 30 fps"),
+or fail at more than 2.2x *this page's own* idle interval. A 1.6x relative guard would have failed
+on the pacing case without ever measuring a regression.
+
+So the harness does not reproduce the report, and that is worth writing down rather than
+quietly shipping. It rules out, at that size: markdown parsing, reveal, follow, DOM growth, and the
+UI's own work. It does not rule out: a ~1 MB request body re-serialised on every round trip for a
+293 k-token prompt, which in the desktop build happens **inside the app process** that also owns the
+webview, while the gateway build does the identical work in a different process and a browser never
+feels it. That asymmetry is the only one left that matches "browser smooth, native slow", so the
+provider now prints the cost when it is large enough to matter:
+
+```rust
+if bytes.len() >= 256 * 1024 {
+    eprintln!(
+        "[cwoffee] request body {:.2} MB serialized in {:.1} ms over {} messages (the desktop build pays for this inside the app process)",
+        ...);
+}
+```
+
+Measured in the user's own session, that line either names the cost or clears the engine, and it
+costs no prompt cache to find out.
+
+### Two clients, one engine: the mode is written down
+
+Full auto in the window and `ask` in the gateway is one engine contradicting itself, and the file
+was the liar: choices made in the UI lived only in process memory. `HostConfig.cfg_path` now points
+at `config.toml` from every shell, and mode / reasoning / model are written *before* the running
+value is announced - if they disagree, the one the user reads is the one that has to be right.
+
+Top-level keys land **before the first `[table]`**: a bare key written after `[provider]` parses as
+`provider.mode` and does nothing at all, which is how a saved setting looks saved and then isn't.
+`resolve_model` sends `persist: false`, because "this endpoint's first model" is not a choice the
+user made.
+
+```
+a_mode_chosen_through_the_host_is_written_down            ok
+negative control, persistence disabled:
+  the file still said: mode = "ask"                       FAIL (as intended)
+footer truth ok (..., mode chip "Ask" for mode=ask)
+```
+
+### What the fixture learned
+
+`history-page-fill` and `cadence-heavy` failed three times before they passed, and every failure was
+the fixture, not the app: a needle that assumed `created` when the engine said `overwrote`, a needle
+left behind after the fixture's content was rewritten, and a needle required one step before the
+tool that produces it had run. The mock quotes the engine's actual tool output in the error, which
+is what made each one a thirty-second detour instead of an afternoon.
+
+### One mistake of mine, written down
+
+After the harness run I started `target/release/cwoffee-app` for the production gate. That binary
+embeds the harness bundle, so the harness ran against the user's real endpoint, config and store:
+sessions `selftest` and `selftest approval` in the real session list, `mode` and `reasoning`
+rewritten in `config.toml`, turns at 99 % cache hit. The scratch-home guarantee in TESTING.md covers
+`selftest.sh`, not a hand-started binary, and nothing in the code noticed.
+
+Fixed with a second key: `commands.rs::selftest_armed()` requires `CWOFFEE_SELFTEST=1` in the
+launching process, `selftest.sh` sets it, and an unarmed bundle prints what it is instead of running.
+The config line went back to `reasoning = "xhigh"` and the two sessions were deleted through the
+store's own delete path (messages, FTS, turns, session).
+
+### A setting that will not parse is a broken start, not a saved one
+
+The persistence layer wrote `reasoning` and `model` as top-level keys. The parser
+declares neither, and this parser rejects unknown keys on purpose - so the file the app
+had just written made the **next** start refuse to boot:
+
+```
+malformed ~/.config/cwoffee/config.toml: TOML parse error at line 22, column 1
+   | reasoning = "xhigh"
+unknown field `reasoning`, expected one of `provider`, `workspace`, `mode`, ...
+```
+
+The three tests that already existed for this writer all asserted *placement* - key above
+the first table, commented key replaced not duplicated, file parses. Every one of them
+passed on a file that boots nothing.
+
+Three fixes, in order of importance:
+
+1. `Config::set_keys` reads its own output back (`toml::from_str::<Config>`) before it
+   renames the file. A file the next boot cannot read is now a refused write and one log
+   line, rather than an app that will not start hours later in a different process with
+   nothing pointing at the click that caused it.
+2. `reasoning` is a declared key, with `reasoning_checked()`: five words, and a word that
+   is not one of them names the key and stops startup. All three shells read it at boot,
+   so the window, the phone and the TUI show the level the model is actually running at.
+3. `model` is written where the reader declares it - `[provider] model`, replacing the
+   line instead of adding a second one. Two `model` lines are two answers to one
+   question, and the host test asserts the file holds exactly one.
+
+The guard then caught a bug that was already there. The region arithmetic started looking
+at `h + 1`, which is right inside a table (line `h` is the `[header]`) and wrong at the
+top level, where line 0 is a key row. A file whose very first line was `mode = "ask"` had
+that line skipped, so the writer appended a **second** `mode` - a duplicate key, i.e. a
+file that does not parse:
+
+```
+a_top_level_key_on_the_very_first_line_is_replaced_not_duplicated   ok
+```
+
+Negative control, with the routing put back to top-level `model` and the parse guard
+removed - the exact state the real config was left in:
+
+```
+host::tests::a_thinking_level_and_model_written_through_the_host_parse_back ... FAILED
+  panicked at crates/engine/src/host.rs:1803:
+  a file this app wrote will not boot the next start: ...
+```
+
+The damage from the accidental run was cleaned by hand: `reasoning = "xhigh"` put back
+(now a legal key), the illegal top-level `model` line removed, and sessions `selftest`
+and `selftest approval` deleted from the real store through the store's own delete path
+(messages, FTS, turns, session row).
+
+### Gate
+
+```
+prompt:: agent:: host:: config:: provider::   125 passed, 0 failed
+selftest                                      ok (a9 a10 a11 a12 included)
+negative controls                             persistence refused (twice: mode, then the parse guard)
+mock endpoint                                 no unmatched prompts
+svelte-check                                  0 errors, 0 warnings
+cargo check --workspace --all-targets         clean
+```

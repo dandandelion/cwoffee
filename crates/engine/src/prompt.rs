@@ -58,6 +58,69 @@ pub struct PromptBuilder {
 /// attributed to a specific change rather than appearing as mysterious slowness.
 pub const SYSTEM_VERSION: &str = "cwoffee-v1";
 
+/// What the prompt costs, as the thing that builds it measured it.
+///
+/// Shared (behind a mutex) between the agent and the host so a client reading
+/// host state *mid-turn* sees the number the next prefill will pay. Before this,
+/// `context_tokens` was refreshed only at the end of a turn, so a session that
+/// had just been compacted from 53k to 4k kept reporting 53k in the toolbar for
+/// the whole turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextGauge {
+    pub tokens: usize,
+    pub budget: usize,
+    pub window: Option<usize>,
+    pub compactions: u32,
+}
+
+/// The estimate's own constants, named because `compact_to_budget` works in
+/// characters and must convert the token budget with the *same* numbers, not a
+/// copy of them that can drift.
+const CHARS_PER_TOKEN: f64 = 3.5;
+const FRAMING_TOKENS: usize = 64;
+const MSG_FRAMING_CHARS: usize = 12;
+const CALL_FRAMING_CHARS: usize = 16;
+/// Tool results newer than this stay whole during compaction.
+pub const KEEP_TAIL: usize = 12;
+/// Shorter than this, and replacing a tool result with a note about it saves
+/// nothing.
+const STUB_MIN_CHARS: usize = 400;
+
+fn budget_chars(token_budget: usize) -> usize {
+    (token_budget.saturating_sub(FRAMING_TOKENS) as f64 * CHARS_PER_TOKEN) as usize
+}
+
+/// call id -> tool name, so a trimmed tool result can say which tool it came
+/// from. A stub that says "tool output trimmed" tells the model nothing it can
+/// act on; one that says `sheet_read output trimmed` tells it exactly what to
+/// re-run.
+fn tool_names(history: &[Message]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for m in history {
+        for c in &m.tool_calls {
+            map.insert(c.id.clone(), c.name.clone());
+        }
+    }
+    map
+}
+
+/// What one compaction did, in the two units the note has to report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Compaction {
+    /// Tool results replaced by a one-line note about their size.
+    pub stubbed: usize,
+    /// Whole oldest turns removed.
+    pub dropped: usize,
+    /// Rough tokens this bought back.
+    pub reclaimed: usize,
+}
+
+impl Compaction {
+    pub fn did_anything(&self) -> bool {
+        self.stubbed > 0 || self.dropped > 0
+    }
+}
+
 /// The stable system prompt. Deliberately contains no clock, no path, no git
 /// state — see the module comment.
 pub fn system_prompt() -> String {
@@ -273,48 +336,118 @@ impl PromptBuilder {
         ChatRequest::new(model, msgs)
     }
 
-    /// Rough token estimate. We cannot get an exact count before prefill, and
+        /// Rough token estimate. We cannot get an exact count before prefill, and
     /// asking for one would cost a prefill — so the estimate only has to be good
     /// enough to decide *when* to compact, and it must never be so optimistic
     /// that we overflow the window. 1 token per ~3.5 chars plus per-message
     /// overhead is conservative for CJK-heavy text, which tokenizes worse.
     pub fn estimate_tokens(&self, tool_schemas: &str) -> usize {
-        let mut chars = self.system.chars().count() + tool_schemas.chars().count();
-        for m in &self.history {
-            chars += m.content.chars().count() + 12; // role + framing
-            for c in &m.tool_calls {
-                chars += c.name.len() + c.arguments.len() + 16;
-            }
-        }
-        (chars as f64 / 3.5).ceil() as usize + 64
+        (self.estimate_chars(tool_schemas) as f64 / CHARS_PER_TOKEN).ceil() as usize
+            + FRAMING_TOKENS
     }
 
-    /// Drop the oldest turns until the estimate fits. Returns the number of
-    /// messages dropped.
+    /// The same estimate in the unit the compaction loop actually works in.
+    ///
+    /// Compaction re-measures after every edit; re-scanning every message each
+    /// time is O(n²) over a 600-message session. Tracking the character total
+    /// and subtracting what each edit reclaimed is exact under this formula and
+    /// keeps the loop linear.
+    fn estimate_chars(&self, tool_schemas: &str) -> usize {
+        let mut chars = self.system.chars().count() + tool_schemas.chars().count();
+        for m in &self.history {
+            chars += m.content.chars().count() + MSG_FRAMING_CHARS;
+            for c in &m.tool_calls {
+                chars += c.name.len() + c.arguments.len() + CALL_FRAMING_CHARS;
+            }
+        }
+        chars
+    }
+
+    /// Trim the window until the estimate fits, in the cheapest order.
     ///
     /// This is the one cache-destroying operation, which is why it is a named
     /// call rather than something build() does silently.
-    pub fn compact_to_budget(&mut self, tool_schemas: &str) -> usize {
-        if self.estimate_tokens(tool_schemas) <= self.token_budget {
-            return 0;
+    ///
+    /// Two stages, cheapest first, because the two kinds of bytes are not equally
+    /// valuable:
+    ///
+    /// 1. **Old tool output.** A 40k-cell spreadsheet dump from nine turns ago is
+    ///    the fattest and least useful thing in the window. Replace it with one
+    ///    line saying what was there. The call, the answer it produced and the
+    ///    model's own reasoning all survive.
+    /// 2. **Whole oldest turns.** Only reached if stage 1 was not enough.
+    ///
+    /// Doing it the other way round is how a session loses its reasoning while a
+    /// stale file dump is still sitting in the prompt.
+    pub fn compact_to_budget(&mut self, tool_schemas: &str) -> Compaction {
+        let before = self.estimate_tokens(tool_schemas);
+        let need = budget_chars(self.token_budget);
+        let mut chars = self.estimate_chars(tool_schemas);
+        let mut out = Compaction::default();
+        if chars <= need {
+            return out;
         }
-        // Never drop the system prompt or the newest turn. Drop in whole turns,
-        // and keep tool_call/tool_result pairs together: an orphaned
-        // tool_result with no preceding call is a hard 400 from every provider.
-        let mut dropped = 0;
-        while self.estimate_tokens(tool_schemas) > self.token_budget && self.history.len() > 2 {
+
+        // Stage 1. The newest KEEP_TAIL messages stay whole: those are the ones
+        // the model is reading right now, and a stub there would be a stub the
+        // model actually needs.
+        let names = tool_names(&self.history);
+        let floor = self.history.len().saturating_sub(KEEP_TAIL);
+        for i in 0..floor {
+            if chars <= need {
+                break;
+            }
+            let m = &mut self.history[i];
+            if m.role != Role::Tool {
+                continue;
+            }
+            let full = m.content.chars().count();
+            // Below this there is nothing to win, and a stub longer than what it
+            // replaces would make the window bigger.
+            if full <= STUB_MIN_CHARS {
+                continue;
+            }
+            let name = m
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| names.get(id))
+                .cloned()
+                .unwrap_or_else(|| "tool".into());
+            let stub = format!(
+                "[{name} output trimmed to fit the context window: {full} chars. \
+                 Still in the session file - re-run the tool if you need it again.]"
+            );
+            let after = stub.chars().count();
+            m.content = stub;
+            chars = chars.saturating_sub(full - after);
+            out.stubbed += 1;
+        }
+
+        // Stage 2. Never drop the system prompt or the newest turn. Drop in
+        // whole turns, and keep tool_call/tool_result pairs together: an
+        // orphaned tool_result with no preceding call is a hard 400 from every
+        // provider.
+        while chars > need && self.history.len() > 2 {
             let remove = self.first_safe_prefix();
             if remove == 0 {
                 break;
             }
+            for m in &self.history[..remove] {
+                chars = chars.saturating_sub(m.content.chars().count() + MSG_FRAMING_CHARS);
+                for c in &m.tool_calls {
+                    chars = chars.saturating_sub(c.name.len() + c.arguments.len() + CALL_FRAMING_CHARS);
+                }
+            }
             self.history.drain(0..remove);
             self.first_seq += remove as u64;
-            dropped += remove;
+            out.dropped += remove;
         }
-        if dropped > 0 {
+
+        if out.did_anything() {
             self.compactions += 1;
+            out.reclaimed = before.saturating_sub(self.estimate_tokens(tool_schemas));
         }
-        dropped
+        out
     }
 
     /// Index of the leading run of messages we may drop without orphaning a
@@ -528,8 +661,8 @@ mod tests {
             p.push_tool_result("c1", "a file");
         }
         p.token_budget = 100;
-        let dropped = p.compact_to_budget("");
-        assert!(dropped > 0, "should have compacted");
+        let c = p.compact_to_budget("");
+        assert!(c.did_anything(), "should have compacted");
         // no message may be a tool result whose parent call was dropped
         let h = p.history();
         for (i, m) in h.iter().enumerate() {
@@ -559,7 +692,7 @@ mod tests {
         p.context_window = Some(262_144);
         assert_eq!(
             p.compact_to_budget(""),
-            0,
+            Compaction::default(),
             "{est} tokens was dropped against a 262 144 token window"
         );
 
@@ -567,7 +700,7 @@ mod tests {
         // quietly regress back into a constant.
         p.token_budget = 8_000;
         assert!(
-            p.compact_to_budget("") > 0,
+            p.compact_to_budget("").did_anything(),
             "an 8k budget no longer compacts this, so it no longer proves the bug"
         );
     }
@@ -575,13 +708,13 @@ mod tests {
     #[test]
     fn compaction_is_counted_and_only_happens_when_needed() {
         let mut p = built();
-        assert_eq!(p.compact_to_budget(""), 0);
+        assert_eq!(p.compact_to_budget(""), Compaction::default());
         assert_eq!(p.compactions, 0);
 
         // A two-message history cannot be compacted further without deleting the
         // live exchange, so nothing happens and nothing is claimed.
         p.token_budget = 10;
-        assert_eq!(p.compact_to_budget(""), 0);
+        assert_eq!(p.compact_to_budget(""), Compaction::default());
         assert_eq!(p.compactions, 0);
 
         // A real history does compact, and the count reflects it.
@@ -592,12 +725,83 @@ mod tests {
         }
         let before = q.len();
         q.token_budget = 200;
-        let d = q.compact_to_budget("");
-        assert!(d > 0, "60 messages should compact at a 200 token budget");
-        assert_eq!(q.len(), before - d);
+        let c = q.compact_to_budget("");
+        assert!(c.did_anything(), "60 messages should compact at a 200 token budget");
+        assert_eq!(q.len(), before - c.dropped);
         assert_eq!(q.compactions, 1);
         // the newest turn must survive
         assert!(q.history().last().unwrap().content.contains("answer number 59"));
+    }
+
+    /// The whole point of the two stages: a big old tool dump is worth more
+    /// window than it is worth keeping, and paying for it by deleting turns is
+    /// how a session loses the reasoning the user cared about.
+    #[test]
+    fn old_tool_output_is_trimmed_before_any_turn_is_deleted() {
+        let mut p = PromptBuilder::new();
+        for i in 0..12 {
+            p.push_user(format!("question {i}: read the sheet again"));
+            p.push_assistant_calls(
+                "looking",
+                &[ToolCall {
+                    id: format!("c{i}"),
+                    name: "sheet_read".into(),
+                    arguments: "{\"path\":\"book.xlsx\"}".into(),
+                }],
+            );
+            p.push_tool_result(&format!("c{i}"), "1:\tRegion\tUnits\n".repeat(2_000));
+        }
+        p.push_user("now total the Units column");
+        let before = p.history().len();
+        let est = p.estimate_tokens("");
+        // Enough to need the dump, not enough to need the conversation.
+        p.token_budget = est - 4_000;
+        let c = p.compact_to_budget("");
+        assert!(c.stubbed > 0, "the dump should be trimmed, not the chat: {c:?}");
+        assert_eq!(c.dropped, 0, "no turn was deleted while 40k of old tool output was still in the window");
+        assert_eq!(p.history().len(), before, "trimming is not deletion");
+        // Trimmed results say which tool they came from and how big they were,
+        // which is the one thing the model needs to decide whether to re-run it.
+        let stub = p
+            .history()
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .unwrap()
+            .content
+            .clone();
+        assert!(stub.contains("sheet_read"), "stub does not name the tool: {stub}");
+        assert!(stub.contains("chars"), "stub does not say what it removed: {stub}");
+        // The newest tool result is the one the model is reading now.
+        let last_tool = p
+            .history()
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .unwrap();
+        assert!(last_tool.content.len() > 1_000, "the live tool result was trimmed");
+        assert!(p.estimate_tokens("") <= p.token_budget, "still over budget after trimming");
+    }
+
+    /// A stub shorter than what it replaces would make the window bigger.
+    #[test]
+    fn small_tool_results_are_left_alone() {
+        let mut p = PromptBuilder::new();
+        for i in 0..30 {
+            p.push_user(format!("question {i} with some length to it, enough to matter"));
+            p.push_assistant_calls(
+                "thinking",
+                &[ToolCall {
+                    id: format!("s{i}"),
+                    name: "exec".into(),
+                    arguments: "{\"cmd\":\"ls\"}".into(),
+                }],
+            );
+            p.push_tool_result(&format!("s{i}"), "ok");
+        }
+        p.token_budget = 300;
+        let c = p.compact_to_budget("");
+        assert_eq!(c.stubbed, 0, "`ok` is not worth a 120 character note about it");
+        assert!(c.dropped > 0, "the history still has to fit somehow: {c:?}");
     }
 
     #[test]

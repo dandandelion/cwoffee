@@ -76,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_tool_iters: 8,
             reasoning: Reasoning::Low,
             max_tokens: Some(1400),
+            ..Default::default()
         },
         ctx,
     );
@@ -95,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let render = tokio::spawn(async move { render(&mut erx).await });
 
     println!("task: {TASK}\n");
-    let tel = agent.run_turn(TASK, vec![], &etx).await;
+    let tel = agent.run_turn(TASK, vec![], &etx, 1).await;
     drop(etx);
     render.await?;
 

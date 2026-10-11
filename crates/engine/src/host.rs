@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, AgentConfig};
 use crate::approval::{ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalRequest};
+use crate::config::Config;
 use crate::event::EngineEvent;
 use crate::prompt::PromptBuilder;
 use crate::provider::{Provider, Reasoning, Role};
@@ -68,6 +69,15 @@ pub struct HostConfig {
     /// is the default and the honest one: these numbers change what the model
     /// does, and a harness that sets them silently changes the product.
     pub sampling: crate::provider::Sampling,
+    /// Where choices made through the UI get written, when there is a file to
+    /// write them to.
+    ///
+    /// `None` (the default, and what every test uses) means the host is ephemeral:
+    /// a mode picked in the window is forgotten at the next start. The shells set
+    /// this to `config.toml`, because a toggle the user can see is a toggle they
+    /// expect to still be there tomorrow - and because two clients of one engine
+    /// otherwise disagree with each other about what the app is doing.
+    pub cfg_path: Option<PathBuf>,
 }
 
 impl HostConfig {
@@ -87,30 +97,44 @@ impl HostConfig {
             max_attachments: 4,
             max_attachment_bytes: 2 * 1024 * 1024,
             sampling: crate::provider::Sampling::default(),
+            cfg_path: None,
         }
     }
 }
 
-/// Budget when the caller did not pin one: most of the window, minus headroom
-/// for the reply and for the token estimate's own optimism.
-const FALLBACK_BUDGET: usize = 8_000;
+/// Budget when the caller did not pin one **and the endpoint would not say its
+/// window**.
+///
+/// This used to be 8 000, and it was a wrecking ball: a resumed session of 61
+/// messages (~53k tokens) got trimmed to 4k against a model that had told the
+/// model picker it holds 262 144, because this endpoint had not answered
+/// `/models` at the moment the host asked. Compacting against a number nobody
+/// measured is how gold gets thrown away, so the fallback is now large enough
+/// not to bite a normal conversation, and the host re-asks the endpoint every
+/// turn until it answers.
+const FALLBACK_BUDGET: usize = 32_000;
 
 fn auto_budget(window: usize) -> usize {
-    // 72% of the window: the estimate is chars/3.5 plus framing, which is
-    // conservative for CJK and short on code, and the model still needs room to
-    // answer after the history is loaded.
-    ((window as f64 * 0.72) as usize)
-        .saturating_sub(2_048)
-        .max(4_096)
+    // 80% of the window. The other 20% is the reply plus the estimate's own
+    // error: chars/3.5 is close on prose and short on code. The failure this is
+    // guarding against is not "we compacted too early" - it is a prompt that
+    // overflows the window, which the server truncates from the front with no
+    // note attached to it at all.
+    ((window as f64 * 0.80) as usize).max(4_096)
 }
 
 /// Read the loaded model's advertised window and set the compaction budget.
+///
+/// `announce` is false on a re-read: a boot-shaped line printed once per turn
+/// while an endpoint is unreachable is noise that hides the one line that matters.
 async fn apply_context_budget(
     agent: &mut Agent,
     provider: &Arc<dyn crate::provider::Provider>,
     pinned: Option<usize>,
     state: &Arc<std::sync::Mutex<HostState>>,
     sampling: &crate::provider::Sampling,
+    gauge: &Arc<std::sync::Mutex<crate::prompt::ContextGauge>>,
+    announce: bool,
 ) {
     let model = agent.model();
     let info = provider
@@ -122,32 +146,77 @@ async fn apply_context_budget(
     let window = info.as_ref().and_then(|m| m.context_tokens).map(|t| t as usize);
 
     let budget = pinned.unwrap_or_else(|| window.map(auto_budget).unwrap_or(FALLBACK_BUDGET));
-    {
+    let compactions = {
         let p = agent.prompt_mut();
         p.token_budget = budget;
         p.context_window = window;
+        p.compactions
+    };
+    {
+        let mut g = gauge.lock().unwrap();
+        g.budget = budget;
+        g.window = window;
+        g.compactions = compactions;
+        g.tokens = agent.prompt_mut().estimate_tokens("");
     }
     let mut s = state.lock().unwrap();
     s.context_budget = budget;
     s.model_window = window;
     drop(s);
-    eprintln!(
-        "[cwoffee] context budget {budget} tokens (model window {}, budget {})",
-        window.map(|w| w.to_string()).unwrap_or_else(|| "unknown".into()),
-        if pinned.is_some() { "pinned in config" } else { "derived" }
-    );
-    // Sampling is a claim about behaviour, so the boot line states both halves:
-    // what this app sends and what the endpoint says it uses when nothing is
-    // sent. A user who never opens `[sampling]` should still be able to see that
-    // their server is running at temperature 1.0.
-    eprintln!(
-        "[cwoffee] sampling: {}",
-        sampling.describe(info.as_ref().map(|m| &m.sampling))
-    );
+    if announce {
+        eprintln!(
+            "[cwoffee] context budget {budget} tokens (model window {}, budget {})",
+            window.map(|w| w.to_string()).unwrap_or_else(|| "unknown".into()),
+            if pinned.is_some() { "pinned in config" } else { "derived" }
+        );
+        // Sampling is a claim about behaviour, so the boot line states both halves:
+        // what this app sends and what the endpoint says it uses when nothing is
+        // sent. A user who never opens `[sampling]` should still be able to see that
+        // their server is running at temperature 1.0.
+        eprintln!(
+            "[cwoffee] sampling: {}",
+            sampling.describe(info.as_ref().map(|m| &m.sampling))
+        );
+    } else {
+        eprintln!(
+            "[cwoffee] context budget re-read: {budget} tokens (model window {})",
+            window.map(|w| w.to_string()).unwrap_or_else(|| "still unknown".into())
+        );
+    }
 }
 
-fn context_budget_note(state: &Arc<std::sync::Mutex<HostState>>, model: &str) -> String {
-    let s = state.lock().unwrap();
+/// Write one top-level setting to the config file the shells pointed us at.
+///
+/// Written *before* the live value is announced, for the same reason the search
+/// panel does it that way: if the running app and `config.toml` disagree, then
+/// one of them is lying, and the one the user reads is the file.
+fn persist_setting(path: &Option<std::path::PathBuf>, key: &str, toml_value: &str) {
+    let Some(p) = path.as_ref() else { return };
+    // `model` belongs to `[provider]`; everything else here is top-level. Writing a
+    // bare `model` at the top level - which is what this used to do - produced a file
+    // the next start could not read, because the parser rejects keys it has not
+    // declared and it had not declared that one. `Config::set_keys` now re-parses the
+    // edited text before replacing the file, so the same mistake is a refused write
+    // instead of an app that will not boot.
+    let wrote = if key == "model" {
+        crate::config::Config::set_provider_keys(p, &[(key, toml_value)])
+    } else {
+        crate::config::Config::set_top_keys(p, &[(key, toml_value)])
+    };
+    match wrote {
+        Ok(changed) => {
+            for c in changed {
+                eprintln!("[cwoffee] setting saved: {c} ({})", p.display());
+            }
+        }
+        Err(e) => eprintln!(
+            "[cwoffee] setting NOT saved ({key} = {toml_value}): {e}. \
+             This start keeps the choice; the next one will not."
+        ),
+    }
+}
+
+fn context_budget_note(state: &Arc<std::sync::Mutex<HostState>>, model: &str) -> String {    let s = state.lock().unwrap();
     match s.model_window {
         Some(w) => format!(
             "{model}: {w} token window, compaction budget {} tokens",
@@ -250,7 +319,11 @@ pub enum HostCmd {
     SetMode { mode: ApprovalMode },
     SetReasoning { reasoning: Reasoning },
     /// Change the model id for subsequent turns. Does not rewrite history.
-    SetModel { model: String },
+    ///
+    /// `persist` is false when the host chose the id itself (an empty config
+    /// resolved against the endpoint's list): writing that back would pin whatever
+    /// happened to be first in the list, which is not a choice anybody made.
+    SetModel { model: String, persist: bool },
     /// Move the tools to a different workspace. Refused while a turn is running.
     SetWorkspace { path: String },
     /// Drop to draft state: no session row, empty prompt. Used after deleting
@@ -314,6 +387,8 @@ pub struct SessionHost {
     approvals: Option<mpsc::UnboundedReceiver<ApprovalRx>>,
     questions: Option<mpsc::UnboundedReceiver<crate::tools::ask::QuestionRx>>,
     state: Arc<Mutex<HostState>>,
+    /// Written by the agent, read by `state()`. See `ContextGauge`.
+    gauge: Arc<Mutex<crate::prompt::ContextGauge>>,
     cancel: Arc<AtomicBool>,
     /// The host keeps a handle so the shell can ask the endpoint questions that
     /// are not turns - the composer's model picker being the obvious one.
@@ -367,12 +442,21 @@ impl SessionHost {
             context_budget: cfg.context_budget.unwrap_or(FALLBACK_BUDGET),
             model_window: None,
         }));
+        // What the prompt costs, owned here and written by the agent. `state()`
+        // reads from this rather than from the snapshot, so a client that asks
+        // mid-turn gets the number the next prefill will pay instead of the one
+        // left over from the end of the last turn.
+        let gauge = Arc::new(Mutex::new(crate::prompt::ContextGauge {
+            budget: cfg.context_budget.unwrap_or(FALLBACK_BUDGET),
+            window: None,
+            ..Default::default()
+        }));
         let limits = AttachmentLimits {
             max_count: cfg.max_attachments,
-            max_bytes: cfg.max_attachment_bytes,
-        };
+            max_bytes: cfg.max_attachment_bytes,        };
 
         let state_bg = Arc::clone(&state);
+        let gauge_bg = Arc::clone(&gauge);
         // The task takes the provider; the host keeps a second handle for
         // non-turn questions like the model list.
         let host_provider = Arc::clone(&provider);
@@ -405,6 +489,7 @@ impl SessionHost {
                 reasoning: cfg.reasoning,
                 max_tokens: cfg.max_tokens,
                 sampling: cfg.sampling.clone(),
+                gauge: gauge.clone(),
             },
             ctx,
         );
@@ -519,6 +604,11 @@ impl SessionHost {
                             s.session_id = id;
                             s.context_tokens = agent.prompt_mut().estimate_tokens("");
                             s.compactions = 0;
+                            // Publish before the cold-cache note reads it: the note
+                            // and the toolbar must quote the same number, and the
+                            // number has to be the one this conversation actually
+                            // costs, not the one the previous one cost.
+                            agent.publish_gauge("");
                             if let Some(p) = follow_ws {
                                 s.workspace = p.display().to_string();
                             }
@@ -570,6 +660,8 @@ impl SessionHost {
                 cfg.context_budget,
                 &state_bg,
                 &cfg.sampling,
+                &gauge_bg,
+                true,
             ).await;
 
             while let Some(cmd) = cmd_rx.recv().await {
@@ -599,6 +691,7 @@ impl SessionHost {
                             let mut s = state_bg.lock().unwrap();
                             s.session_id = 0;
                             s.context_tokens = 0;
+                            agent.publish_gauge("");
                         }
                         let _ = ev_tx.send(EngineEvent::SessionChanged {
                             session_id: 0,
@@ -659,7 +752,7 @@ impl SessionHost {
                             message: format!("workspace is now {}", p.display()),
                         });
                     }
-                    HostCmd::SetModel { model } => {
+                    HostCmd::SetModel { model, persist } => {
                         // Empty would send `"model": ""` to the endpoint, which
                         // is a confusing 400 rather than an obvious bug.
                         if model.trim().is_empty() {
@@ -671,17 +764,22 @@ impl SessionHost {
                             agent.set_model(model.clone());
                             let model_now = agent.model();
                             state_bg.lock().unwrap().model = model;
+                            if persist {
+                                persist_setting(&cfg.cfg_path, "model", &Config::toml_str(&model_now));
+                            }
                             // Different model, different window. A budget carried
                             // over from the previous model is how a compaction
                             // warning shows up in a session that is nowhere near
                             // full.
                             apply_context_budget(
-                &mut agent,
-                &budget_provider,
-                cfg.context_budget,
-                &state_bg,
-                &cfg.sampling,
-            ).await;
+                                &mut agent,
+                                &budget_provider,
+                                cfg.context_budget,
+                                &state_bg,
+                                &cfg.sampling,
+                                &gauge_bg,
+                                true,
+                            ).await;
                             let _ = ev_tx.send(EngineEvent::Note {
                                 message: context_budget_note(&state_bg, &model_now),
                             });
@@ -691,11 +789,17 @@ impl SessionHost {
                     HostCmd::SetMode { mode } => {
                         agent.set_mode(mode);
                         state_bg.lock().unwrap().mode = mode;
+                        persist_setting(&cfg.cfg_path, "mode", &Config::toml_str(mode.as_str()));
                     }
 
                     HostCmd::SetReasoning { reasoning } => {
                         agent.set_reasoning(reasoning);
                         state_bg.lock().unwrap().reasoning = reasoning;
+                        let word = serde_json::to_value(reasoning)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| "low".into());
+                        persist_setting(&cfg.cfg_path, "reasoning", &Config::toml_str(&word));
                     }
 
                     HostCmd::NewSession { title } => {
@@ -827,8 +931,26 @@ impl SessionHost {
                         agent.prompt_mut().set_env(env);
 
                         set_busy(&state_bg, true);
+                        // The window is the one fact the whole budget is derived
+                        // from. If the endpoint was busy starting up when the host
+                        // asked at boot, asking again here costs two GETs and is
+                        // the difference between a 209k budget and a 32k one - and
+                        // the smaller number is the one that deletes history.
+                        if cfg.context_budget.is_none()
+                            && agent.prompt_mut().context_window.is_none()
+                        {
+                            apply_context_budget(
+                                &mut agent,
+                                &budget_provider,
+                                cfg.context_budget,
+                                &state_bg,
+                                &cfg.sampling,
+                                &gauge_bg,
+                                false,
+                            ).await;
+                        }
                         let tel: TurnTelemetry =
-                            agent.run_turn(&text, attachments, &ev_tx).await;
+                            agent.run_turn(&text, attachments, &ev_tx, session_id).await;
 
                         // Persist whatever the turn added. Sequence numbers make
                         // this correct even if compaction shifted the window.
@@ -879,6 +1001,7 @@ impl SessionHost {
                             let mut s = state_bg.lock().unwrap();
                             s.context_tokens = agent.prompt_mut().estimate_tokens("");
                             s.compactions = agent.prompt_mut().compactions;
+                            agent.publish_gauge("");
                             s.busy = false;
                             s.turns += 1;
                         }
@@ -893,6 +1016,7 @@ impl SessionHost {
             approvals: Some(ap_rx),
             questions: Some(ask_rx),
             state,
+            gauge,
             cancel,
             provider: host_provider,
             search: search_tool,
@@ -909,7 +1033,7 @@ impl SessionHost {
             return None;
         }
         let first = self.provider.list_models().await.ok()?.into_iter().next()?;
-        self.send(HostCmd::SetModel { model: first.clone() });
+        self.send(HostCmd::SetModel { model: first.clone(), persist: false });
         Some(first)
     }
 
@@ -1001,7 +1125,16 @@ impl SessionHost {
     }
 
     pub fn state(&self) -> HostState {
-        self.state.lock().unwrap().clone()
+        let mut s = self.state.lock().unwrap().clone();
+        // The gauge outranks the snapshot for these four: it is written by the
+        // thing that actually builds the prompt, and it is written while a turn
+        // is running rather than only when one ends.
+        let g = self.gauge.lock().unwrap();
+        s.context_tokens = g.tokens;
+        s.context_budget = g.budget;
+        s.model_window = g.window;
+        s.compactions = g.compactions;
+        s
     }
 
     /// Move the workspace and wait (bounded) for the host to accept it.
@@ -1222,6 +1355,12 @@ mod tests {
         /// What the endpoint advertises as the loaded model's context window.
         /// `None` is the honest "the server never said".
         window: Option<u64>,
+        /// Report that window only from this `/models` call onward, counting
+        /// `list_models_info` calls. 0 always reports it. This exists to model
+        /// the real case: a server that was still loading when the host asked
+        /// at boot, and answers on the next ask.
+        window_from_call: usize,
+        asks: std::sync::atomic::AtomicUsize,
         calls: AtomicUsize,
         /// What the provider actually received, so a test can prove an
         /// attachment survived the host, the prompt builder and the request.
@@ -1285,9 +1424,11 @@ mod tests {
         }
 
         async fn list_models_info(&self) -> Result<Vec<crate::provider::ModelInfo>, ProviderError> {
+            let n = self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let window = if n >= self.window_from_call.max(1) { self.window } else { None };
             Ok(vec![crate::provider::ModelInfo {
                 id: "test-model".into(),
-                context_tokens: self.window,
+                context_tokens: window,
                 ..Default::default()
             }])
         }
@@ -1298,6 +1439,8 @@ mod tests {
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(replies),
             window: None,
+            window_from_call: 0,
+            asks: std::sync::atomic::AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
@@ -1326,6 +1469,8 @@ mod tests {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {
             window: None,
+            window_from_call: 0,
+            asks: std::sync::atomic::AtomicUsize::new(0),
             replies: std::sync::Mutex::new(vec!["ok".into(), "ok".into()]),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
@@ -1523,8 +1668,9 @@ mod tests {
     /// 262 144-token window and then announced "context full".
     #[test]
     fn the_budget_sized_from_a_real_window() {
-        assert_eq!(auto_budget(262_144), 186_695);
-        assert_eq!(auto_budget(8_192), 4_096, "a small window cannot go below the floor");
+        assert_eq!(auto_budget(262_144), 209_715);
+        assert_eq!(auto_budget(8_192), 6_553, "80% of the window, not 72% minus a constant");
+        assert_eq!(auto_budget(4_096), 4_096, "a tiny window cannot go below the floor");
         assert_eq!(auto_budget(0), 4_096);
     }
 
@@ -1534,6 +1680,8 @@ mod tests {
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(vec!["ok".into()]),
             window: Some(262_144),
+            window_from_call: 0,
+            asks: std::sync::atomic::AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
@@ -1555,12 +1703,202 @@ mod tests {
         assert_eq!(h.state().model_window, Some(262_144));
     }
 
+    /// The report was: the window was on full-auto, the gateway said ask, and
+    /// then the window started asking for approvals again. A choice that lives
+    /// only in the running process is re-read from the file by the next client,
+    /// so the app contradicts the user. This drives the host the way the UI does
+    /// and reads the file back.
+    #[tokio::test]
+    async fn a_mode_chosen_through_the_host_is_written_down() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "mode = \"ask\"\n\n[provider]\nbase_url = \"http://127.0.0.1:8090/v1\"\n",
+        )
+        .unwrap();
+
+        let mut cfg = HostConfig::new("m", dir.join("ws"));
+        cfg.cfg_path = Some(path.clone());
+        let h = SessionHost::spawn(
+            Arc::new(Scripted {
+                replies: std::sync::Mutex::new(vec![]),
+                window: Some(262_144),
+                window_from_call: 0,
+                asks: std::sync::atomic::AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                seen_attachments: Arc::new(AtomicUsize::new(0)),
+                seen_wire: Default::default(),
+            }),
+            Registry::new(),
+            Arc::new(Store::in_memory().unwrap()),
+            cfg,
+        );
+        ready(&h).await;
+        h.send(HostCmd::SetMode { mode: ApprovalMode::Auto });
+
+        let mut seen = String::new();
+        for _ in 0..80 {
+            seen = std::fs::read_to_string(&path).unwrap_or_default();
+            if seen.contains("mode = \"auto\"") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(seen.contains("mode = \"auto\""), "the file still said: {seen}");
+        assert!(!seen.contains("mode = \"ask\""), "{seen}");
+        // The provider section the person already had is untouched.
+        assert!(seen.contains("[provider]\nbase_url = \"http://127.0.0.1:8090/v1\""), "{seen}");
+        // And the running host agrees with the file.
+        assert_eq!(h.state().mode, ApprovalMode::Auto);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "Saved" means the next start can read it back, and the check above only ever
+    /// looked at the text. When the writer put `reasoning` and `model` where the
+    /// parser declares neither, every text assertion passed and the app still
+    /// refused to boot on the next launch. So this test ends by parsing the file the
+    /// way a boot does.
+    #[tokio::test]
+    async fn a_thinking_level_and_model_written_through_the_host_parse_back() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_cfg_lr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "mode = \"ask\"\n\n[provider]\nbase_url = \"http://127.0.0.1:8090/v1\"\nmodel = \"old-model\"\n",
+        )
+        .unwrap();
+
+        let mut cfg = HostConfig::new("old-model", dir.join("ws"));
+        cfg.cfg_path = Some(path.clone());
+        let h = SessionHost::spawn(
+            Arc::new(Scripted {
+                replies: std::sync::Mutex::new(vec![]),
+                window: Some(262_144),
+                window_from_call: 0,
+                asks: std::sync::atomic::AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                seen_attachments: Arc::new(AtomicUsize::new(0)),
+                seen_wire: Default::default(),
+            }),
+            Registry::new(),
+            Arc::new(Store::in_memory().unwrap()),
+            cfg,
+        );
+        ready(&h).await;
+        h.send(HostCmd::SetReasoning { reasoning: Reasoning::High });
+        h.send(HostCmd::SetModel { model: "picked-model".into(), persist: true });
+
+        let mut seen = String::new();
+        for _ in 0..80 {
+            seen = std::fs::read_to_string(&path).unwrap_or_default();
+            if seen.contains("reasoning = \"high\"") && seen.contains("picked-model") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(seen.contains("reasoning = \"high\""), "the file still said: {seen}");
+        // One answer to one question: the model line was replaced in [provider], not
+        // duplicated at the top level.
+        assert_eq!(seen.matches("model = ").count(), 1, "{seen}");
+        assert!(seen.contains("model = \"picked-model\""), "{seen}");
+
+        let parsed: crate::config::Config = toml::from_str(&seen)
+            .unwrap_or_else(|e| panic!("a file this app wrote will not boot the next start: {e}\n{seen}"));
+        assert_eq!(parsed.reasoning_checked().unwrap(), Some(Reasoning::High), "{seen}");
+        assert_eq!(parsed.provider.model, "picked-model", "{seen}");
+        assert_eq!(h.state().reasoning, Reasoning::High);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host with no file to write to writes nothing: tests, and any shell that
+    /// did not ask for persistence, must not end up editing the user's config.
+    #[tokio::test]
+    async fn a_host_with_no_config_path_keeps_its_choices_to_itself() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_cfg_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = HostConfig::new("m", dir.join("ws"));
+        cfg.cfg_path = None;
+        let h = SessionHost::spawn(
+            Arc::new(Scripted {
+                replies: std::sync::Mutex::new(vec![]),
+                window: Some(262_144),
+                window_from_call: 0,
+                asks: std::sync::atomic::AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                seen_attachments: Arc::new(AtomicUsize::new(0)),
+                seen_wire: Default::default(),
+            }),
+            Registry::new(),
+            Arc::new(Store::in_memory().unwrap()),
+            cfg,
+        );
+        ready(&h).await;
+        h.send(HostCmd::SetMode { mode: ApprovalMode::Auto });
+        for _ in 0..20 {
+            if h.state().mode == ApprovalMode::Auto {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(h.state().mode, ApprovalMode::Auto);
+        assert!(!dir.join("config.toml").exists(), "a host not given a file must not invent one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The wrecking-ball case, in one test: the server had not finished loading
+    /// when the host asked at boot, so the budget stayed at the fallback and a
+    /// session got trimmed against a number nobody measured - while the model
+    /// picker was already showing 262 144 for the same model.
+    #[tokio::test]
+    async fn a_window_the_endpoint_was_quiet_about_is_asked_for_again() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p = Arc::new(Scripted {
+            replies: std::sync::Mutex::new(vec!["one".into(), "two".into()]),
+            window: Some(262_144),
+            // silent at boot, answers from the second ask onward - which is what a
+            // server that is still loading does
+            window_from_call: 2,
+            asks: std::sync::atomic::AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            seen_attachments: Arc::new(AtomicUsize::new(0)),
+            seen_wire: Default::default(),
+        });
+        let h = SessionHost::spawn(
+            p,
+            Registry::new(),
+            Arc::clone(&store),
+            HostConfig::new("test-model", std::env::temp_dir()),
+        );
+        ready(&h).await;
+        assert_eq!(h.state().model_window, None, "the boot ask got nothing, as scripted");
+        assert_eq!(
+            h.state().context_budget, FALLBACK_BUDGET,
+            "an endpoint that said nothing must not invent a window"
+        );
+
+        h.submit("first");
+        turns_done(&h, 1).await;
+        assert_eq!(
+            h.state().model_window, Some(262_144),
+            "the host never asked the endpoint again, so every later turn kept the fallback"
+        );
+        assert_eq!(h.state().context_budget, auto_budget(262_144));
+    }
+
     #[tokio::test]
     async fn a_pinned_budget_is_not_overridden_by_the_window() {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(vec!["ok".into()]),
             window: Some(262_144),
+            window_from_call: 0,
+            asks: std::sync::atomic::AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
@@ -1584,6 +1922,8 @@ mod tests {
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(vec!["one".into(), "two".into()]),
             window: None,
+            window_from_call: 0,
+            asks: std::sync::atomic::AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
@@ -1939,6 +2279,8 @@ mod tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let p = Arc::new(Scripted {
             window: None,
+            window_from_call: 0,
+            asks: std::sync::atomic::AtomicUsize::new(0),
             replies: std::sync::Mutex::new(vec!["noted".into()]),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::clone(&seen),
@@ -2242,7 +2584,7 @@ mod tests {
         let (mut ev, _ap) = h.take_receivers().expect("receivers");
         ready(&h).await;
 
-        h.send(HostCmd::SetModel { model: "second-model".into() });
+        h.send(HostCmd::SetModel { model: "second-model".into(), persist: true });
         wait_for("model change".into(), || h.state().model == "second-model").await;
 
         h.submit("after switch");
@@ -2257,7 +2599,7 @@ mod tests {
 
         // An empty id would send `"model": ""` and produce a confusing 400 from
         // the endpoint instead of an obvious local error.
-        h.send(HostCmd::SetModel { model: "   ".into() });
+        h.send(HostCmd::SetModel { model: "   ".into(), persist: true });
         let mut rejected = false;
         for _ in 0..400 {
             if drain_events(&mut ev).await.iter().any(|e| {
@@ -2277,6 +2619,8 @@ mod tests {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {
             window: None,
+            window_from_call: 0,
+            asks: std::sync::atomic::AtomicUsize::new(0),
             replies: std::sync::Mutex::new(vec!["tool".into()]),
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),

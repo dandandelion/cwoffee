@@ -178,7 +178,22 @@ fn main() {
     };
 
     let mut cfg = HostConfig::new(model, workspace.clone());
+    // A mode or thinking level chosen in the window is written back to this file, so the
+    // next start - and the gateway on a phone - agrees with the one you just made.
+    cfg.cfg_path = Some(config_path.clone());
     cfg.mode = mode;
+    // The thinking chip is persisted the same way the mode is, so it has to be read
+    // back at boot or the file and the running app disagree from the first second.
+    // A word that is not a level stops the app: an ignored typo here means the model
+    // runs at a level nobody chose.
+    match appcfg.reasoning_checked() {
+        Ok(Some(r)) => cfg.reasoning = r,
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("[cwoffee] bad {e} - fix it in {}", config_path.display());
+            std::process::exit(1);
+        }
+    }
     cfg.context_budget = appcfg.context.target_tokens;
     // None means the server's own output cap applies; see Config.
     cfg.max_tokens = appcfg.max_output_tokens;
@@ -224,6 +239,10 @@ fn main() {
     // The engine spawns tasks, so it must be constructed inside a tokio
     // context. Tauri's async runtime is tokio, so entering it here is enough;
     // calling SessionHost::spawn from bare `main` panics with "no reactor".
+    // Read the level the file asked for before `cfg` moves into the host: the boot
+    // line states the dials the app actually started with, which is the only way a
+    // drift between `config.toml` and the running app is visible in a log.
+    let reasoning_at_boot = cfg.reasoning;
     let (mut host, adopted_model) = tauri::async_runtime::block_on(async {
         let h = SessionHost::spawn(
             provider,
@@ -248,8 +267,8 @@ fn main() {
     // applied by the host task, so state() can still show the old value here.
     let model_label = adopted_model.unwrap_or(configured_model);
     eprintln!(
-        "[cwoffee] engine up: url={url} model={model_label} workspace={} mode={:?}",
-        workspace.display(), mode
+        "[cwoffee] engine up: url={url} model={model_label} workspace={} mode={:?} reasoning={:?}",
+        workspace.display(), mode, reasoning_at_boot
     );
     // The exec deadline used to be invisible: a [sandbox] block that parsed,
     // validated, and then went nowhere looked identical to one that worked.
@@ -491,6 +510,7 @@ fn main() {
             commands::delete_session,
             commands::clear_session,
             commands::switch_session,
+            commands::selftest_armed,
             commands::gpu_report,
             commands::render_report,
             commands::boot_log

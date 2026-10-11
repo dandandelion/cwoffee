@@ -5,6 +5,7 @@
   import type {
     ApprovalAnswer,
     EngineEvent,
+    ExecStream,
     GpuReport,
     HostState,
     ModelInfo,
@@ -1027,7 +1028,57 @@
   // Empty view = draft, or a session with nothing in it yet.
   const showEmpty = $derived(viewId === null || (viewMsgCount === 0 && !busy))
   let sentDraft: { text: string; atts: { mime: string; name: string; bytes: number }[] } | null = null
-  const LIVE_CAP = 4000
+  // A cap on *entries*, and entries are merged blocks, not tokens: see
+  // `bufferLive`. 4000 raw deltas was the number that lost a turn's tail.
+  const LIVE_CAP = 3000
+  let liveDropped = 0
+
+  /**
+   * Add one event of a running turn to the replay buffer.
+   *
+   * Consecutive deltas of the same kind are the same text, so they merge into
+   * one entry. Without that, a long turn - thinking plus a dozen tool loops -
+   * emits thousands of deltas, hits the cap, and the buffer silently keeps the
+   * *oldest* ones. Coming back to the session then showed the early loops and
+   * nothing since, which is the report: "those loops and turns are lost".
+   *
+   * Merging is safe because the buffer is replayed into a cleared transcript:
+   * the whole turn is rebuilt from the buffer, so one big delta and a thousand
+   * small ones produce the same blocks.
+   */
+  function bufferLive(ev: EngineEvent) {
+    // Live telemetry is not part of the answer. A replay rebuilds the transcript
+    // and then gets the real numbers from `usage`/`turnEnd`, so buffering the
+    // gauge - which arrives a few times a second, one per streaming burst - is
+    // what used to eat the buffer while contributing nothing to it.
+    if (ev.kind === 'turnStats') return
+    const prev = liveBuf[liveBuf.length - 1]
+    if (prev && prev.kind === ev.kind) {
+      if (prev.kind === 'text' || prev.kind === 'reasoning' || prev.kind === 'toolCallArgs') {
+        // Buffered events are not in the DOM: the view that showed them was
+        // cleared before this buffer is read again.
+        ;(prev.d as string) += ev.d as string
+        return
+      }
+      if (prev.kind === 'toolExecOutput') {
+        const a = prev.d as { id: string; stream: ExecStream; chunk: string }
+        const b = ev.d as { id: string; stream: ExecStream; chunk: string }
+        if (a.id === b.id && a.stream === b.stream) {
+          a.chunk += b.chunk
+          return
+        }
+      }
+    }
+    if (liveBuf.length >= LIVE_CAP) {
+      // Loud rather than silent: a replay that is missing something is a bug
+      // the log has to admit to.
+      liveDropped++
+      if (liveDropped === 1)
+        pageLog(`live buffer full at ${LIVE_CAP} entries: this turn's later output is not replayable`)
+      return
+    }
+    liveBuf.push(ev)
+  }
   let eventTaps: ((e: EngineEvent) => void)[] = []
   function beginEventTap(fn: (e: EngineEvent) => void) {
     eventTaps.push(fn)
@@ -1072,16 +1123,24 @@
   function handle(ev: EngineEvent) {
     for (const t of eventTaps) t(ev)
 
-    // Live output belongs to the session that started the turn. Buffer it when
-    // the user is looking elsewhere, and replay it when they come back.
-    const inFlight = turnSessionId !== null && ev.kind !== 'sessionChanged'
+    // Which conversation this event belongs to is decided *before* it is routed,
+    // and from the engine's own words. `turnStart` names the session the turn
+    // writes into; guessing from `viewId` is what let a phone on the gateway -
+    // which sees every turn and started none of them - claim a turn as its own
+    // and paint another conversation's thinking into the transcript on screen.
+    const owner =
+      ev.kind === 'turnStart' ? (ev.d.session_id ?? viewId ?? null) : turnSessionId
+
+    // Live output belongs to the session that owns the turn. Buffer it when the
+    // user is looking elsewhere, and replay it when they come back.
+    const inFlight = owner !== null && ev.kind !== 'sessionChanged'
     if (inFlight) {
       // Buffer every event of the running turn, not just the ones that arrive
       // while the user is looking elsewhere. Buffering only the latter lost the
       // output that had already been painted before the switch, so coming back
       // showed an empty session - the very thing this is meant to prevent.
-      if (liveBuf.length < LIVE_CAP) liveBuf.push(ev)
-      if (viewId !== turnSessionId || resyncing > 0) {
+      bufferLive(ev)
+      if (viewId !== owner || resyncing > 0) {
         // painted by the replay once the view settles
       } else {
         transcript?.apply(ev)
@@ -1113,7 +1172,9 @@
         break
       case 'turnStart':
         model = ev.d.model
-        if (turnSessionId === null) turnSessionId = viewId
+        // The engine named the conversation. Trust it over what this window
+        // happens to be looking at - see the routing above.
+        turnSessionId = owner
         if (turnSessionId !== null) {
           const next = new Set(runningSessions)
           next.add(turnSessionId)
@@ -2014,6 +2075,15 @@
   async function resyncView(id: number) {
     const mySeq = ++resyncSeq
     resyncing++
+    // A repaint of the conversation already on screen has to hand back the window
+    // the reader is looking at, not the default page. Loading two pages of history
+    // and then having the host announce a session switch that names the same
+    // conversation used to snap the transcript back to the last 80 rows: the rows
+    // the user asked for were there, then they were not, which is what "Load
+    // history disappears" looks like from the chair. Switching *to* a different
+    // conversation starts a fresh window instead, so a big view of one session does
+    // not inflate the first paint of another.
+    const keepRows = viewId === id ? viewMsgCount : 0
     viewId = id
     // The transcript owns buttons that name a conversation (export), so it needs
     // the id of what is on screen - which is not the same as the session the
@@ -2021,7 +2091,7 @@
     if (transcript) transcript.sessionId = id
     transcript?.clear()
     try {
-      await loadTranscript(id)
+      await loadTranscript(id, keepRows)
     } catch (e) {
       pageLog(`session_messages failed: ${e}`)
     }
@@ -2029,10 +2099,14 @@
     // A newer resync has already taken the view; painting this one's result
     // would show a session the user has since moved away from.
     if (mySeq !== resyncSeq) return
-    // Returning to the session that owns a running turn: the stored history
-    // does not contain that turn yet, so replay what we buffered.
-    if (turnSessionId === id && sentDraft) {
-      transcript?.addUser(sentDraft.text, sentDraft.atts)
+    // Returning to the session that owns a running turn: the store does not
+    // hold that turn yet (the host persists a turn when it ends), so what is
+    // replayed here comes from the buffer. `sentDraft` only decides whether this
+    // client can also paint the question it typed - a phone watching a turn it
+    // did not send still has to show the answer it watched, which is the whole
+    // reason the buffer exists.
+    if (turnSessionId === id) {
+      if (sentDraft) transcript?.addUser(sentDraft.text, sentDraft.atts)
       for (const e of liveBuf) transcript?.apply(e)
     }
     await refreshState()
@@ -2119,10 +2193,21 @@
   let oldestId = $state<number | null>(null)
   let loadingOlder = $state(false)
 
-  async function loadTranscript(id: number) {
+  /** What `session_messages` returns when nobody asks for a size. */
+  const PAGE_ROWS = 80
+  /** Ceiling on a repaint that has to preserve an already-loaded window. */
+  const RESYNC_MAX_ROWS = 1200
+
+  async function loadTranscript(id: number, atLeastRows = 0) {
     viewMsgCount = 0
+    const want = Math.max(PAGE_ROWS, atLeastRows)
+    if (want > RESYNC_MAX_ROWS)
+      pageLog(
+        `resync: the view held ${atLeastRows} rows; the repaint keeps ${RESYNC_MAX_ROWS} and leaves the rest one click away`,
+      )
     const page = await invoke<{ messages: any[]; has_older: boolean }>('session_messages', {
       id,
+      limit: Math.min(RESYNC_MAX_ROWS, want),
     })
     pageLog(`history: ${page.messages.length} row(s) for session ${id}`)
     transcript?.loadHistory(page.messages)
@@ -2135,11 +2220,18 @@
   }
 
   async function loadOlder() {
-    if (oldestId === null || loadingOlder) return
+    // The session on screen, not the one the engine happens to be working on.
+    // These two are different since browsing stopped moving the host, and asking
+    // the host's session for older rows while the user is reading another one
+    // returned a page that belonged to a different conversation - or nothing at
+    // all, which is what made the button simply vanish: `has_older` for the wrong
+    // session was false.
+    const target = viewId
+    if (target === null || oldestId === null || loadingOlder) return
     loadingOlder = true
     try {
       const page = await invoke<{ messages: any[]; has_older: boolean }>('session_messages', {
-        id: hostState?.session_id ?? 0,
+        id: target,
         before: oldestId,
       })
       if (page.messages.length) {
@@ -2149,6 +2241,11 @@
         const sc = transcript?.scrollEl()
         if (sc) sc.scrollTop += shift
         oldestId = page.messages[0].id
+        viewMsgCount += page.messages.length
+      } else if (page.has_older) {
+        // The store says there is more and returned none: keep the button, say
+        // what happened, and do not let `oldestId` walk off the end.
+        pageLog(`load_older: session ${target} reported older messages but returned 0 (before id ${oldestId})`)
       }
       hasOlder = page.has_older
     } catch (e) {
@@ -2277,16 +2374,32 @@
           )
         const g = await invoke<{ running: boolean; port: number; note: string }>('gateway_status')
         const gwVal = footVal('gateway')
+        // The approval chip is the control the drift report was about: the window
+        // was on full-auto, the gateway said ask, and then the window asked for
+        // approvals again. The chip has to read the engine's mode, never its own
+        // default, and the engine now writes its mode to config.toml so a second
+        // client and the next start see the same thing.
+        const hostBoot = await invoke<HostState>('session_state')
+        const modeChip = [...document.querySelectorAll('.cbtn.chip')]
+          .map((c) => (c.textContent ?? '').trim())
+          .find((t) => Object.values(MODE_LABEL).some((v) => t.includes(v)))
         if (gwVal === 'unknown' || gwVal === '<no control>')
           fail(`the gateway control says "${gwVal}" while the engine reports running=${g.running}`)
         else if (g.running && !gwVal.includes(String(g.port)))
           fail(`the gateway control says "${gwVal}" while it is serving on :${g.port}`)
         else if (!g.running && !gwVal.startsWith('off'))
           fail(`the gateway control says "${gwVal}" while it is not running`)
+        else if (!modeChip)
+          fail('the composer shows no approval-mode chip')
+        else if (!modeChip.includes(MODE_LABEL[hostBoot.mode]))
+          fail(
+            `the mode chip reads "${modeChip}" while the engine is in mode=${hostBoot.mode}: ` +
+              'two clients of one engine are showing two different answers',
+          )
         else
           pageLog(
             `footer truth ok (search "${searchVal}" for backend=${view.backend}, ` +
-              `gateway "${gwVal}" running=${g.running})`,
+              `gateway "${gwVal}" running=${g.running}, mode chip "${modeChip}" for mode=${hostBoot.mode})`,
           )
       }
 
@@ -4455,6 +4568,386 @@
             )
         }
 
+        // (a9) a turn belongs to the conversation the engine says it belongs to
+        //
+        // Two reports, one root: `turnStart` never said which session a turn
+        // wrote into, so the UI guessed from whatever was on screen. Thinking
+        // from session A appeared inside session B; and coming back to A showed
+        // nothing, because the buffer that exists to replay a partial turn held
+        // one entry per delta, hit its cap, and kept the *oldest* 4000 - so the
+        // part that was lost was the part still being written.
+        {
+          const sessA = await invoke<number>('new_session', { title: 'selftest ownership A' })
+          const sessB = await invoke<number>('new_session', { title: 'selftest ownership B' })
+          await useSession(sessA)
+          let wireOwner: number | null = null
+          let evBuf = 0
+          let bufEntries = 0
+          let bufEvents = 0
+          const unTap = beginEventTap((e) => {
+            if (e.kind === 'turnStart') wireOwner = e.d.session_id ?? null
+            if (e.kind === 'turnEnd') return
+            // Count only what the buffer is for: the live gauge is dropped on
+            // purpose, so it must not count as something the buffer failed to keep.
+            if (e.kind !== 'turnStats') evBuf++
+            // Keep the fullest sample. A ratio measured two deltas into a turn
+            // says nothing; measured at the end of one it says whether the tail
+            // would have survived a longer turn.
+            if (liveBuf.length > 0 && evBuf > bufEvents) {
+              bufEvents = evBuf
+              bufEntries = liveBuf.length
+            }
+          })
+          const turnsBeforeOwn = await turnCount()
+          draft =
+            'Selftest live ownership: think in lines about plumlines, then list five seaglass items.'
+          await send()
+          const sawOwn = await waitFor('the ownership turn to start', () => busy && turnSessionId === sessA, 90_000)
+          if (!sawOwn) {
+            fail('the ownership turn never started')
+          } else if (wireOwner !== sessA) {
+            fail(
+              `turnStart named session ${wireOwner}, not ${sessA}: the engine does not say which ` +
+                'conversation a running turn writes into, so every client has to guess',
+            )
+          } else {
+            await openSession(sessB)
+            const whileAway: string[] = []
+            for (let i = 0; i < 10; i++) {
+              whileAway.push(rootEl?.innerText ?? '')
+              await new Promise((r) => setTimeout(r, 60))
+            }
+            const leaked = whileAway.find((t) => t.includes('plumline') || t.includes('seaglass'))
+            if (leaked)
+              fail(
+                `session B showed another conversation's output while it was being written ` +
+                    `(${whileAway.length} samples): "${leaked.slice(0, 120)}"`,
+              )
+            else if (turnSessionId !== sessA)
+              fail(`looking at session B moved the turn: turnSessionId=${turnSessionId}`)
+            else {
+              await resyncView(sessA)
+              const back = rootEl?.innerText ?? ''
+              if (!back.includes('plumline'))
+                fail(
+                  `coming back to the running session lost what it had already thought: ` +
+                    `"${back.slice(0, 140)}" (${bufEvents} events streamed so far)`,
+                )
+              else if (!(await waitTurnDone(turnsBeforeOwn, 90_000)))
+                fail('the ownership turn never finished')
+              else {
+                const done = rootEl?.innerText ?? ''
+                if (!done.includes('seaglass epsilon'))
+                  fail(
+                    `the turn ended but its tail is not in the transcript: "${done.slice(-160)}" - ` +
+                      `the replay buffer held ${bufEntries} entries for ${bufEvents} events`,
+                  )
+                else if (bufEntries * 2 >= bufEvents)
+                  fail(
+                    `the replay buffer held ${bufEntries} entries for ${bufEvents} events: nothing ` +
+                      'merged, so a long turn overflows the cap and loses the part still being written',
+                  )
+                else
+                  pageLog(
+                    `live turn ownership ok (turnStart named session ${sessA}; session B stayed clean ` +
+                      `across ${whileAway.length} samples; coming back kept the thinking and the tail; ` +
+                      `${bufEvents} events replayed from ${bufEntries} buffer entries)`,
+                  )
+              }
+            }
+          }
+          unTap()
+          if ((await invoke<HostState>('session_state')).busy) {
+            await invoke('cancel_turn').catch(() => {})
+            const idleBy = performance.now() + 30000
+            while (performance.now() < idleBy) {
+              if (!(await invoke<HostState>('session_state')).busy) break
+              await new Promise((r) => setTimeout(r, 250))
+            }
+          }
+          await invoke('delete_session', { id: sessA }).catch((e) => pageLog(`cleanup A: ${e}`))
+          await invoke('delete_session', { id: sessB }).catch((e) => pageLog(`cleanup B: ${e}`))
+          await useSession(target.id)
+        }
+
+        // (a10) "Load older messages" reads the conversation on screen
+        //
+        // The button vanished on click. It asked the engine for the session the
+        // *engine* was working on, which - since browsing stopped moving the
+        // host - is a different conversation, and `has_older` for that one was
+        // false. So the button was told to hide itself by a question about
+        // somewhere else. This fills a session past the 80-message page, starts
+        // a turn in a *different* session, and then clicks.
+        {
+          const sessH = await invoke<number>('new_session', { title: 'selftest history fill' })
+          const ws = (hostState?.workspace ?? '').replace(/\/+$/, '')
+          if (!ws) fail('the self-test host has no workspace, so the history fixture path is unknown')
+          // Three passes, each writing a file of its own. One pass stores ~56
+          // rows, which is barely past the page limit; three make a session that
+          // behaves like the one in the report - a few hundred messages, most of
+          // them not in the DOM. A different file per pass matters: overwriting
+          // the same path is a Workspace-risk write, and the engine's answer for
+          // an overwrite is "overwrote N bytes", not "created" - the mock's
+          // `require` caught the harness assuming otherwise.
+          for (let pass = 0; pass < 3; pass++) {
+            const file = `${ws}/selftest-fill-${pass + 1}.txt`
+            const grewBefore = await invoke<any>('session_messages', { id: sessH, limit: 2000 })
+            const beforeRows: number = (grewBefore.messages ?? []).length
+            const turnsBeforeFill = await turnCount()
+            await invoke('start_turn', {
+              text: `Selftest history fill pass ${pass + 1}: write ${file} with two rows, then read it back 25 times.`,
+              session: sessH,
+            }).catch((e) => pageLog(`selftest note: history fill turn failed: ${e}`))
+            if (!(await waitTurnDone(turnsBeforeFill, 180000))) {
+              fail(`the history fill turn (pass ${pass + 1}) never finished`)
+              break
+            }
+            const grewAfter = await invoke<any>('session_messages', { id: sessH, limit: 2000 })
+            const afterRows: number = (grewAfter.messages ?? []).length
+            // The premise of everything below is a long session. A turn that ended
+            // in a provider error still counts as "finished" to the counter, so the
+            // rows it stored are the evidence, not the turn counter.
+            if (afterRows - beforeRows < 40)
+              fail(
+                `history fill pass ${pass + 1} stored ${afterRows - beforeRows} rows (expected ~56): ` +
+                  `the turn ended early - session ${sessH} holds ${afterRows} rows total`,
+              )
+          }
+          await useSession(sessH)
+
+          const stored = await invoke<any>('session_messages', { id: sessH, limit: 2000 })
+          const total: number = (stored.messages ?? []).length
+          const btnText = 'Load older messages'
+          const btn = () =>
+            [...document.querySelectorAll('button')].find((b) =>
+              (b.textContent ?? '').includes(btnText),
+            )
+          if (total <= 80)
+            fail(`the fill turn stored ${total} messages; the check needs more than the 80-message page`)
+          else if (!hasOlder)
+            fail(`session ${sessH} holds ${total} messages and the page said has_older=false`)
+          else if (!btn())
+            fail('a session with older messages shows no "Load older messages" button')
+          else {
+            // Make the engine's session and the session on screen disagree, which
+            // is the exact situation the old code got wrong.
+            const sessOther = await invoke<number>('new_session', { title: 'selftest history other' })
+            const turnsBeforeOther = await turnCount()
+            await invoke('start_turn', {
+              text: 'Selftest live ownership: think in lines about plumlines, then list five seaglass items.',
+              session: sessOther,
+            })
+            const sawOther = await waitFor(
+              'the other session to start a turn',
+              () => busy && turnSessionId === sessOther,
+              90_000,
+            )
+            await refreshState()
+            const hostNow = hostState?.session_id ?? null
+            if (!sawOther) fail('the second session never started a turn')
+            else if (hostNow === sessH)
+              fail('the check could not make the engine work on a different session, so it proves nothing')
+            else {
+              const beforeCount = viewMsgCount
+              const beforeOldest = oldestId
+              await loadOlder()
+              const page = await invoke<any>('session_messages', {
+                id: sessH,
+                before: beforeOldest,
+                limit: 80,
+              })
+              const got: number = (page.messages ?? []).length
+              if (viewMsgCount === beforeCount)
+                fail(
+                  `"Load older messages" added nothing while session ${sessH} (on screen) had ` +
+                    `${total - beforeCount} older rows and the engine was on ${hostNow}: it asked the ` +
+                    'wrong conversation and then hid the button',
+                )
+              else if (got !== viewMsgCount - beforeCount)
+                fail(
+                  `the view grew by ${viewMsgCount - beforeCount} but the store's page for ${sessH} ` +
+                    `held ${got} - the rows came from somewhere else`,
+                )
+              else if (hasOlder !== page.has_older)
+                fail(`the button's visibility (${hasOlder}) disagrees with the store (${page.has_older})`)
+              else if (hasOlder && !btn())
+                fail('the store says older rows remain but the button is gone')
+              else if (!hasOlder && btn())
+                fail('the button stayed after the history was exhausted')
+              else
+                pageLog(
+                  `load history ok (${beforeCount} -> ${viewMsgCount} rows of session ${sessH} while ` +
+                    `the engine worked on ${hostNow}; button ${hasOlder ? 'still offered' : 'retired at the end of the history'})`,
+                )
+            }
+            if ((await invoke<HostState>('session_state')).busy) {
+              await invoke('cancel_turn').catch(() => {})
+              const idleBy = performance.now() + 30000
+              while (performance.now() < idleBy) {
+                if (!(await invoke<HostState>('session_state')).busy) break
+                await new Promise((r) => setTimeout(r, 250))
+              }
+            }
+            await invoke('delete_session', { id: sessOther }).catch((e) => pageLog(`cleanup other: ${e}`))
+
+            // (a11) the same turn with a full transcript on screen
+            //
+            // "Native UI performance drops badly when history grows and during
+            // inference; the browser build is smooth." The browser comparison is
+            // the clue: same page, same JS, different engine. So the measurement
+            // has to be the native window holding a full page of history while a
+            // turn streams into it, judged against the same page idling - an
+            // absolute 60Hz number on a box serving a 50 GB model measures the
+            // box, not the app.
+            {
+              // Pull the rest of the history in first: the complaint is about a
+              // transcript that has grown, and a page that only holds the last
+              // 80 rows does not measure that.
+              let pages = 0
+              while (hasOlder && pages < 6) {
+                await loadOlder()
+                pages++
+              }
+              const nodes = document.querySelectorAll('.transcript .blk').length
+              // Verify the premise before measuring it. The complaint is about a
+              // transcript that has grown, and the only thing that makes this check
+              // different from the plain cadence check below is that the grown
+              // history is actually mounted. Count the characters, not the rows: a
+              // page of empty assistant rows is cheap to paint whatever the row
+              // count says, and this fixture's bulk lives inside the tool cards.
+              const mountedMsgs = viewMsgCount
+              const chars = (document.querySelector('.transcript')?.textContent ?? '').length
+              if (mountedMsgs < 150 || chars < 100_000)
+                fail(
+                  `the big-transcript cadence check measured ${mountedMsgs} messages / ${nodes} blocks / ` +
+                    `${chars} characters on screen: the fill session holds ~168 rows and most of them are ` +
+                    `200-line tool results, so the older pages are not mounted and this check would be ` +
+                    `measuring the same small transcript the plain cadence check already measures`,
+                )
+              await invoke('set_reasoning', { level: 'off' })
+              const cadBefore = await turnCount()
+              const charsBefore = chars
+              const blocksBefore = nodes
+              draft =
+                'Selftest cadence heavy: write the long roast-curve note again, in the chat only, ' +
+                'with every table and heading kept. Use no tools and create no files.'
+              await send()
+              const stopBig = startFrameCadence()
+              const cadDone = await waitTurnDone(cadBefore, 120000)
+              const big = stopBig()
+              // The measurement is only about a big streaming answer if a big streaming
+              // answer actually arrived, as structure. Four short paragraphs against a
+              // grown transcript is the plain cadence check with extra steps.
+              const charsAfter = (document.querySelector('.transcript')?.textContent ?? '').length
+              const blocksAfter = document.querySelectorAll('.transcript .blk').length
+              const tables = document.querySelectorAll('.transcript table').length
+              const grew = charsAfter - charsBefore
+              if (cadDone && viewMsgCount < mountedMsgs)
+                fail(
+                  `a turn started in ${sessH}, which was already on screen, and the view fell from ` +
+                    `${mountedMsgs} mounted rows to ${viewMsgCount}: the repaint that a session switch ` +
+                    `triggers handed back the default page instead of the window the reader had loaded. ` +
+                    `This is "Load history disappears" - the rows arrive, and then a repaint elsewhere undoes them.`,
+                )
+              if (cadDone && (grew < 4000 || tables < 2 || blocksAfter <= blocksBefore))
+                fail(
+                  `the big-transcript turn added ${grew} characters, ${blocksAfter - blocksBefore} blocks ` +
+                    `and ${tables} rendered table(s): a real answer streams thousands of deltas of headings, ` +
+                    `lists and tables, and the cadence check has to be measured against that`,
+                )
+              await invoke('set_reasoning', { level: 'medium' })
+              const idleBig = await idleFrameSample(900)
+              pageLog(
+                `big transcript cadence: ${nodes} blocks / ${mountedMsgs} messages / ${chars} characters mounted (${pages} older page(s) pulled in); ` +
+                  `${big.frames} frames over ${big.ms}ms while a turn streamed, median ${big.median.toFixed(1)}ms, ` +
+                  `p95 ${big.p95.toFixed(1)}ms, worst ${big.worst.toFixed(1)}ms, ` +
+                  `page long tasks ${big.longN} totalling ${Math.round(big.longMs)}ms; ` +
+                  `the stream itself added ${grew} characters / ${blocksAfter - blocksBefore} blocks / ${tables} tables; ` +
+                  `idle baseline ${idleBig.frames} frames, median ${idleBig.median.toFixed(1)}ms (stream/idle x${(big.median / idleBig.median).toFixed(2)})`,
+              )
+              if (!cadDone) pageLog('selftest note: the big-transcript cadence turn did not finish')
+              // Two guards, because one number answers two different questions. The
+              // panel here idles at ~9 ms (120 Hz) and composites a streaming turn at
+              // ~17 ms: exactly 2x idle, which is frame pacing - the compositor
+              // painting every other vsync - not the app getting slower. A 1.6x ratio
+              // would have failed on that. So the relative guard is loose enough to
+              // tolerate pacing, and the absolute one states the number the report
+              // actually used: under 30 fps with a grown transcript on screen.
+              else if (big.median > 33.4)
+                fail(
+                  `a grown transcript streams at ${big.median.toFixed(1)}ms/frame (` +
+                    `${(1000 / big.median).toFixed(0)} fps): the report says the native window drops well ` +
+                    `under 30 fps as history grows, and ${nodes} blocks / ${chars} characters is the size that has to hold`,
+                )
+              else if (big.median > idleBig.median * 2.2 + 3)
+                fail(
+                  `a full transcript makes the turn ${big.median.toFixed(1)}ms/frame against ` +
+                    `${idleBig.median.toFixed(1)}ms idle on the same page (x${(big.median / idleBig.median).toFixed(1)}): ` +
+                    `the cost is in the history, ${nodes} blocks were mounted`,
+                )
+              else if (big.worst > Math.max(250, idleBig.worst * 2))
+                fail(
+                  `a full transcript produced a ${big.worst.toFixed(0)}ms hitch while streaming ` +
+                    `(idle worst ${idleBig.worst.toFixed(0)}ms)`,
+                )
+            }
+          }
+          await invoke('delete_session', { id: sessH }).catch((e) => pageLog(`cleanup fill: ${e}`))
+          await useSession(target.id)
+        }
+
+        // (a12) the toolbar quotes the number that actually trims history
+        //
+        // The report read "61 message(s), ~53132 tokens of a 8000 token budget"
+        // next to a model picker that said 262144. Two different ceilings were on
+        // screen and only one of them was real. The engine now carries the budget
+        // and the window side by side; this checks the panel renders both, and
+        // that the budget is derived from the window rather than left at a
+        // fallback - which is the difference between keeping a conversation and
+        // deleting its oldest 57 messages.
+        {
+          const h = await invoke<HostState>('session_state')
+          if (h.model_window && h.context_budget < h.model_window * 0.75)
+            fail(
+              `the engine budgets ${h.context_budget} tokens of a ${h.model_window} token window: ` +
+                'that is a fallback, not a derivation, and it trims history nobody asked to trim',
+            )
+          const btnM = document.querySelector('button[aria-label="Session telemetry"]')
+          const row = () => document.querySelector('.mbar-row')
+          if (!btnM) fail('the footer has no telemetry button')
+          else {
+            ;(btnM as HTMLElement).click()
+            await new Promise((r) => setTimeout(r, 250))
+            const r0 = row()
+            const txt = (r0?.textContent ?? '').replace(/\s+/g, ' ').trim()
+            const tick = r0?.querySelector('.mbar u') as HTMLElement | null
+            const left = tick ? parseFloat(tick.style.left) : NaN
+            const want = h.model_window
+              ? Math.min(100, (h.context_budget / h.model_window) * 100)
+              : NaN
+            window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+            if (!r0) fail('the telemetry panel shows no context row')
+            else if (!txt.includes(h.context_tokens.toLocaleString()))
+              fail(
+                `the context row does not quote the engine's own token count (${h.context_tokens}): "${txt}"`,
+              )
+            else if (h.context_budget && !txt.includes('trims at'))
+              fail(
+                `the row shows a window but not the line history is trimmed past (${h.context_budget}): "${txt}"`,
+              )
+            else if (!Number.isNaN(want) && (Number.isNaN(left) || Math.abs(left - want) > 1.5))
+              fail(
+                `the trim tick sits at ${left}% of the bar but the budget is ${want.toFixed(1)}% ` +
+                  `of the stated window (${h.context_budget} / ${h.model_window})`,
+              )
+            else
+              pageLog(
+                `context readout ok (${h.context_tokens} of ${h.model_window ?? 'unreported'}, ` +
+                  `trim line at ${Number.isNaN(want) ? 'n/a' : want.toFixed(1)}%, "${txt}")`,
+              )
+          }
+        }
+
         // (a) structure while the tokens arrive, not when they stop
         {
           const before = await turnCount()
@@ -4837,7 +5330,7 @@
       // concatenate back to exactly what the model sent.
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         const deltas = [
           'thinking about the first clause, ',
           'then the second clause carries on ',
@@ -4977,7 +5470,7 @@
       if (await blind('before the streaming markdown checks')) return
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 2, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 2, model: 'selftest', session_id: 0 } })
         const parts = [
           '# Roast levels\n\n',
           'Light roasts keep **bright acidity** and hold ',
@@ -5141,7 +5634,7 @@
       // with a paragraph, because that is what an answer usually starts with.
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'The first words of the answer are landing ' })
         await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
         transcript?.flushNow()
@@ -5203,7 +5696,7 @@
         // that too: heading line-height and margins differ from a paragraph's, and
         // the label hangs off the block, not off the first paragraph.
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 4, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 4, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: '## The Copy\n\nThe photocopier in the basement started printing again ' })
         await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
         transcript?.flushNow()
@@ -5240,7 +5733,7 @@
       // painted at all.
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 7, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 7, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'The photocopier printed ' })
         await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
         transcript?.flushNow()
@@ -5298,7 +5791,7 @@
       // case reports an empty thinking block, prose in the answer, and tables=0.
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 11, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 11, model: 'selftest', session_id: 0 } })
         transcript?.addUser('Reply with ONLY a markdown table, no prose.')
         transcript?.apply({ kind: 'reasoning', d: 'The user wants just a table in markdown format.' })
         transcript?.apply({
@@ -5336,7 +5829,7 @@
       // while the recording kept showing jumps.
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest', session_id: 0 } })
         const sc = document.querySelector('.scroller') as HTMLElement
         if (!sc) fail('no scroller for the follow check')
         const filler = Array.from(
@@ -5648,7 +6141,7 @@
         document.addEventListener('animationcancel', onCancel, true)
 
         // (a) a live turn: reveals, three kinds of structural commit, a tool card.
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 91, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 91, model: 'selftest', session_id: 0 } })
         const parts = [
           'Six parts of one streamed answer, so that a heading, a list and a table ',
           'all commit while the model is still talking.\n\n',
@@ -5781,7 +6274,7 @@
           // counted skip; blind() logged why
         } else {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'reasoning', d: 'a thought worth reading, long enough to wrap a little.' })
         transcript?.apply({ kind: 'text', d: 'an answer in the normal column' })
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
@@ -5852,7 +6345,7 @@
       // pass, or the turn visibly shifts as it finishes.
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         const gap = () => {
           const blk = document.querySelector('.blk-answer') as HTMLElement
           if (!blk) return null
@@ -5910,7 +6403,7 @@
       // --- a finished turn offers copy, share, and an honest branch button -----
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'the answer to copy' })
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
@@ -5943,12 +6436,12 @@
         // turn ended up wearing the files it had just deleted, because the strip
         // carried over and the next `addFiles` re-parented it.
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'downloaded the sources' })
         transcript?.addFiles([{ path: 'metr_report.html', name: 'metr_report.html', mime: 'text/html', bytes: 430006 }])
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 2, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 2, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'Cleaned up. Deleted the files I created.' })
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 2, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
@@ -5970,7 +6463,7 @@
       // --- right-click gives app actions, not Back/Forward/Reload --------------
       {
         transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest' } })
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'right click me' })
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
@@ -6456,7 +6949,29 @@
       }, 1500)
     }
     if (import.meta.env.VITE_SELFTEST) {
-      setTimeout(() => void selfTest(), 1200)
+      // Two keys, not one. The bundle was built by scripts/selftest.sh, and the
+      // process that launched it also has to say the harness is expected.
+      //
+      // The release binary embeds whatever `ui/dist` holds at build time, so a
+      // production start straight after a harness run ships this same bundle - and
+      // a build-time flag alone then runs the checks against the user's real
+      // endpoint, their real config and their real session store. That happened:
+      // two sessions appeared in the store, `mode` and `reasoning` were rewritten
+      // in `config.toml`, and turns went to the live model. So the gate is armed
+      // at runtime, and a bundle that is not armed says so instead of going quiet.
+      void invoke<boolean>('selftest_armed')
+        .then((armed) => {
+          if (armed) setTimeout(() => void selfTest(), 1200)
+          else
+            pageLog(
+              'self-test bundle, harness NOT armed: set CWOFFEE_SELFTEST=1 to run the checks. ' +
+                'Nothing else happens here - the checks drive the configured endpoint, the config ' +
+                'file and the session store, which is not what a production start should touch.',
+            )
+        })
+        .catch((e) =>
+          pageLog(`self-test bundle could not ask the host whether it is armed (${e}); not running`),
+        )
     }
   })
 
@@ -7182,12 +7697,28 @@
         {/if}
         <div class="mbar-row">
           <span class="mlbl">context</span>
-          <span class="mbar" title="prompt tokens against the ceiling the endpoint states">
+          <span
+            class="mbar"
+            title="prompt tokens against the ceiling the endpoint states; the tick marks the engine's own prompt budget, the line history is trimmed past"
+          >
             <i style="width:{Math.min(100, ctxPct)}%"></i>
+            {#if ctxLimit && hostState?.context_budget}
+              <u
+                style="left:{Math.min(100, (hostState.context_budget / ctxLimit) * 100)}%"
+                title="{hostState.context_budget.toLocaleString()} tokens: the engine's prompt budget"
+              ></u>
+            {/if}
           </span>
           <span class="mval mono">
             {(hostState?.context_tokens ?? 0).toLocaleString()} /
             {ctxLimit ? fmtTokens(ctxLimit) : 'not reported'}
+            {#if hostState?.context_budget}
+              <small
+                class="ctxtrim"
+                title="history is trimmed past this, not past the model's window"
+                >trims at {fmtTokens(hostState.context_budget)}</small
+              >
+            {/if}
           </span>
         </div>
         <div class="mbar-row">

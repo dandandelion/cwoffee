@@ -1246,7 +1246,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         }
         "set_model" => {
             need_drive(role)?;
-            h.host.send(HostCmd::SetModel { model: arg_str(&args, "model")? });
+            h.host.send(HostCmd::SetModel { model: arg_str(&args, "model")?, persist: true });
             Ok(json!(true))
         }
         "list_models" => serde_json::to_value(

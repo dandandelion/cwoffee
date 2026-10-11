@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cwoffee_engine::approval::{ApprovalAnswer, ApprovalGate, ApprovalMode};
 use cwoffee_engine::event::EngineEvent;
 use cwoffee_engine::provider::{openai::{Flavor, OpenAiProvider}, Reasoning};
-use cwoffee_engine::tools::{exec::ExecTool, Registry, ToolCtx};
+use cwoffee_engine::tools::{exec::ExecTool, ExecCfg, Registry, ToolCtx};
 use cwoffee_engine::{Agent, AgentConfig};
 use tokio::sync::mpsc;
 
@@ -31,7 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = OpenAiProvider::new("llama.cpp", Flavor::LlamaCpp, base)?;
 
     let mut reg = Registry::new();
-    reg.register(Box::new(ExecTool { timeout_secs: 30, allow_unsandboxed: false }));
+    reg.register(Box::new(ExecTool::new(&ExecCfg {
+        timeout_secs: 30,
+        ..Default::default()
+    })));
 
     let (areq, mut ars) = mpsc::unbounded_channel();
     let gate = ApprovalGate::new(mode, areq);
@@ -48,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_tool_iters: 6,
             reasoning: Reasoning::Low,
             max_tokens: Some(900),
+            ..Default::default()
         },
         ctx,
     );
@@ -78,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 likely written in. Use the exec tool.";
 
     println!("mode={:?}  task: {task}", agent.mode());
-    let tel = agent.run_turn(task, vec![], &etx).await;
+    let tel = agent.run_turn(task, vec![], &etx, 1).await;
     drop(etx);
     render.await?;
 
@@ -119,7 +123,7 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
             EngineEvent::QuestionExpired { id } => {
                 println!("[ask] question {id} closed without an answer");
             }
-            EngineEvent::TurnStart { turn_id, model } => {
+            EngineEvent::TurnStart { turn_id, model, .. } => {
                 println!("=== turn {turn_id} ({model}) ===");
             }
             EngineEvent::TurnFiles { files, .. } => {

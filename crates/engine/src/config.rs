@@ -38,6 +38,17 @@ pub struct Config {
     #[serde(default)]
     pub mode: Option<String>,
 
+    /// off | low | medium | high | xhigh - the thinking chip in the composer.
+    ///
+    /// Declared here because it has to be: this parser rejects unknown keys on
+    /// purpose, and the persistence layer writes the choices a user makes in the
+    /// window. When that writer invented `reasoning` and `model` at the top level
+    /// without the reader knowing either name, the file stopped parsing on the next
+    /// boot and the app refused to start. A key the writer produces and the reader
+    /// does not declare is not a missing feature - it is a broken start.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+
     #[serde(default)]
     pub context: ContextCfg,
 
@@ -380,35 +391,75 @@ impl Config {
     /// Values are TOML literals, already quoted: `toml_str("auto")` or `"8899"`.
     /// Returns a description of each change so the caller can say what it did.
     pub fn set_search_keys_in(text: &str, kvs: &[(&str, &str)]) -> (String, Vec<String>) {
+        Self::set_keys_in(text, Some("search"), kvs)
+    }
+
+    /// Edit keys in one region of a TOML file.
+    ///
+    /// `table` is a section name without brackets; `None` is the **top level**,
+    /// which in TOML means "before the first `[header]`". That distinction is not
+    /// cosmetic: a bare key written after `[provider]` parses as `provider.mode`
+    /// and does nothing at all, which is how a saved setting appears to be saved
+    /// and then does not apply.
+    pub fn set_keys_in(
+        text: &str,
+        table: Option<&str>,
+        kvs: &[(&str, &str)],
+    ) -> (String, Vec<String>) {
         let mut lines: Vec<String> = text.lines().map(String::from).collect();
-        let header = lines.iter().position(|l| l.trim() == "[search]");
-        let mut changed = Vec::new();
-        let Some(h) = header else {
-            if !text.is_empty() && !text.ends_with('\n') {
-                lines.push(String::new());
+        let is_header = |l: &str| {
+            let t = l.trim();
+            match table {
+                Some(name) => t == format!("[{name}]"),
+                None => t.starts_with('[') && t.ends_with(']'),
             }
-            lines.push("[search]".into());
-            for (k, v) in kvs {
-                lines.push(format!("{k} = {v}"));
-                changed.push(format!("{k} = {v} (new)"));
-            }
-            let mut out = lines.join("\n");
-            out.push('\n');
-            return (out, changed)
         };
-        // The section ends at the next header, so a `[sandbox] backend = ...` (no
-        // such key today, but any future collision) cannot be edited by accident.
-        let end = (h + 1..lines.len())
-            .find(|i| {
-                let t = lines[*i].trim();
-                t.starts_with('[') && t.ends_with(']')
-            })
-            .unwrap_or(lines.len());
+        let mut changed = Vec::new();
+
+        // (start, end) of the region the keys belong to, in line indices.
+        let region = match table {
+            Some(name) => {
+                let h = lines.iter().position(|l| is_header(l));
+                let Some(h) = h else {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        lines.push(String::new());
+                    }
+                    lines.push(format!("[{name}]"));
+                    for (k, v) in kvs {
+                        lines.push(format!("{k} = {v}"));
+                        changed.push(format!("{k} = {v} (new)"));
+                    }
+                    let mut out = lines.join("\n");
+                    out.push('\n');
+                    return (out, changed);
+                };
+                // The section ends at the next header, so a `[sandbox] backend = ...` (no
+                // such key today, but any future collision) cannot be edited by accident.
+                let end = (h + 1..lines.len())
+                    .find(|i| {
+                        let t = lines[*i].trim();
+                        t.starts_with('[') && t.ends_with(']')
+                    })
+                    .unwrap_or(lines.len());
+                (h, end)
+            }
+            // Top level: everything before the first table header.
+            None => {
+                let end = lines.iter().position(|l| is_header(l)).unwrap_or(lines.len());
+                (0, end)
+            }
+        };
+        let (h, end) = region;
+        // Inside a table, line `h` is the `[header]` itself and is not a key row. At
+        // the top level `h` is 0 and line 0 is a key row - and a file whose very first
+        // line is `mode = "ask"` used to have that line skipped, so the writer added a
+        // second `mode` and the file then held one key twice.
+        let body = if table.is_some() { h + 1 } else { h };
         for (k, v) in kvs {
             // A commented-out key counts: `# searxng_url = "..."` is the example in
             // the shipped config, and adding a second line would leave two, one of
             // them a lie.
-            let at = (h + 1..end).find(|i| {
+            let at = (body..end).find(|i| {
                 let t = lines[*i].trim();
                 let t = t.trim_start_matches('#').trim();
                 t.starts_with(&format!("{k} ")) || t.starts_with(&format!("{k}="))
@@ -423,7 +474,7 @@ impl Config {
                     // Insert at the end of the section rather than at the top: the
                     // first key in a section often carries the section's comment.
                     let mut insert = end;
-                    while insert > h + 1 && lines[insert - 1].trim().is_empty() {
+                    while insert > body && lines[insert - 1].trim().is_empty() {
                         insert -= 1;
                     }
                     lines.insert(insert, format!("{k} = {v}"));
@@ -448,12 +499,58 @@ impl Config {
     /// needed one. This is the persistence behind the settings panel: a provider
     /// that resets on restart is a provider that was never really enabled.
     pub fn set_search_keys(path: &std::path::Path, kvs: &[(&str, &str)]) -> Result<Vec<String>, String> {
+        Self::set_keys(path, Some("search"), kvs)
+    }
+
+    /// Write **top-level** keys to `path`.
+    ///
+    /// Legal top-level keys are the ones declared on `Config` itself: `workspace`,
+    /// `mode`, `reasoning`, `theme`, `max_tool_iters`, `approval_timeout_secs`,
+    /// `question_timeout_secs`, `max_output_tokens`. `model` is **not** one of them:
+    /// it belongs to `[provider]`, and a second one at the top level is a file the
+    /// next start cannot read.
+    ///
+    /// The reason these are written at all: a choice made in the UI used to live only
+    /// in the running process, so the next start read `mode = "ask"` from the file and
+    /// the app was doing something the user had explicitly turned off. Two clients of
+    /// one engine (the window and the gateway on a phone) then disagreed with each
+    /// other as well, because whichever one started last re-read the file. A toggle
+    /// you can see is a toggle that survives a restart.
+    pub fn set_top_keys(path: &std::path::Path, kvs: &[(&str, &str)]) -> Result<Vec<String>, String> {
+        Self::set_keys(path, None, kvs)
+    }
+
+    /// Write a key inside `[provider]` - today that means `model`.
+    pub fn set_provider_keys(
+        path: &std::path::Path,
+        kvs: &[(&str, &str)],
+    ) -> Result<Vec<String>, String> {
+        Self::set_keys(path, Some("provider"), kvs)
+    }
+
+    fn set_keys(
+        path: &std::path::Path,
+        table: Option<&str>,
+        kvs: &[(&str, &str)],
+    ) -> Result<Vec<String>, String> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
-        let (out, changed) = Self::set_search_keys_in(&text, kvs);
+        let (out, changed) = Self::set_keys_in(&text, table, kvs);
+        // Read the edited file back before replacing it. The parser rejects unknown
+        // keys on purpose, so a writer that invents a key produces a config the
+        // *next start* cannot open - and that failure surfaces hours later, in a
+        // different process, with nothing pointing at the click that caused it. This
+        // app did exactly that: `reasoning` and `model` were written at the top level,
+        // where no such field is declared, and the app stopped booting. Verifying here
+        // turns it into a refused write and one log line.
+        if let Err(e) = toml::from_str::<Config>(&out) {
+            return Err(format!(
+                "the edited file would not parse, so nothing was written: {e}"
+            ));
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -505,6 +602,29 @@ impl Config {
             Some("session") => ApprovalMode::Session,
             Some("auto") | Some("full") => ApprovalMode::Auto,
             _ => ApprovalMode::Ask,
+        }
+    }
+
+    /// The thinking level written in the file, or `None` when the file says nothing
+    /// and the shell's own default applies.
+    ///
+    /// Checked rather than defaulted quietly: `reasoning = "thinking"` is a typo, and
+    /// an ignored typo here means the model runs at a level nobody chose - the same
+    /// class of problem as a sampling value that gets bent instead of refused.
+    pub fn reasoning_checked(&self) -> Result<Option<crate::provider::Reasoning>, String> {
+        use crate::provider::Reasoning;
+        let Some(word) = self.reasoning.as_deref() else {
+            return Ok(None);
+        };
+        match word {
+            "off" => Ok(Some(Reasoning::Off)),
+            "low" => Ok(Some(Reasoning::Low)),
+            "medium" => Ok(Some(Reasoning::Medium)),
+            "high" => Ok(Some(Reasoning::High)),
+            "xhigh" => Ok(Some(Reasoning::XHigh)),
+            other => Err(format!(
+                "reasoning = {other:?} is not a thinking level; expected one of: off, low, medium, high, xhigh"
+            )),
         }
     }
 
@@ -715,6 +835,120 @@ mod tests {
             }
             other => panic!("expected the managed backend, got {other:?}"),
         }
+    }
+
+    /// The trap this writer exists to avoid: in TOML a bare key belongs to
+    /// whichever `[table]` is open, so `mode = "auto"` written after `[provider]`
+    /// parses as `provider.mode`, is rejected as an unknown field, and the
+    /// setting the user just made does nothing.
+    #[test]
+    fn a_top_level_key_lands_before_the_first_table() {
+        let text = "workspace = \"~/cwoffee-workspace\"\nmode = \"ask\"\n\n[provider]\nbase_url = \"http://127.0.0.1:8090/v1\"\n";
+        let (out, changed) = Config::set_keys_in(text, None, &[("mode", &Config::toml_str("auto"))]);
+        assert!(out.contains("mode = \"auto\""), "{out}");
+        assert!(!out.contains("mode = \"ask\""), "{out}");
+        let at_mode = out.find("mode =").unwrap();
+        let at_table = out.find("[provider]").unwrap();
+        assert!(at_mode < at_table, "a top-level key written after a table is that table's key: {out}");
+        assert_eq!(changed.len(), 1);
+        // The file still parses, and the value is the one the user chose.
+        let cfg: Config = toml::from_str(&out).expect("the rewritten file must parse");
+        assert_eq!(cfg.mode.as_deref(), Some("auto"));
+    }
+
+    /// A file that starts with a table has no top-level region at all. The key
+    /// still has to go above every table, not inside the first one.
+    #[test]
+    fn a_top_level_key_goes_above_every_table_when_there_is_no_top_level() {
+        let text = "[provider]\nbase_url = \"http://127.0.0.1:8090/v1\"\n";
+        let (out, _) = Config::set_keys_in(text, None, &[("mode", &Config::toml_str("session"))]);
+        let at_mode = out.find("mode =").unwrap();
+        let at_table = out.find("[provider]").unwrap();
+        assert!(at_mode < at_table, "{out}");
+        let cfg: Config = toml::from_str(&out).expect("the rewritten file must parse");
+        assert_eq!(cfg.mode.as_deref(), Some("session"));
+        assert_eq!(cfg.provider.base_url, "http://127.0.0.1:8090/v1", "{out}");
+    }
+
+    /// A commented-out top-level key is the shipped example's shape. Adding a second
+    /// line would leave two answers to one question, one of them inactive.
+    #[test]
+    fn a_commented_top_level_key_is_replaced_not_added_to() {
+        let text = "mode = \"ask\"\n# reasoning = \"low\"\n\n[provider]\n";
+        let (out, _) = Config::set_keys_in(text, None, &[("reasoning", &Config::toml_str("xhigh"))]);
+        assert_eq!(out.matches("reasoning").count(), 1, "{out}");
+        assert!(out.contains("reasoning = \"xhigh\""), "{out}");
+        let cfg: Config = toml::from_str(&out).expect("the rewritten file must parse");
+        assert_eq!(cfg.reasoning_checked().unwrap(), Some(crate::provider::Reasoning::XHigh));
+    }
+
+    /// A file whose first line is the key being written. The old region arithmetic
+    /// started looking one line in, missed it, and appended a second copy - which is
+    /// a duplicate key, i.e. a file the next start cannot parse.
+    #[test]
+    fn a_top_level_key_on_the_very_first_line_is_replaced_not_duplicated() {
+        let text = "mode = \"ask\"\n\n[provider]\nbase_url = \"http://127.0.0.1:8090/v1\"\n";
+        let (out, changed) = Config::set_keys_in(text, None, &[("mode", &Config::toml_str("auto"))]);
+        assert_eq!(out.matches("mode = ").count(), 1, "{out}");
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert!(changed[0].contains("->"), "should read as a replacement: {changed:?}");
+        let cfg: Config = toml::from_str(&out).expect("one key, once: {out}");
+        assert_eq!(cfg.mode.as_deref(), Some("auto"));
+    }
+
+    /// Placement is not the same as validity, and the difference cost a real start:
+    /// the writer put `model` and `reasoning` at the top level, perfectly above the
+    /// first table, in a parser that declares neither - so the file the app had just
+    /// written made the **next** boot refuse to open it. Every assertion above passes
+    /// on that file.
+    ///
+    /// So `set_keys` reads its own output back before replacing anything, and this
+    /// pins both halves: the refusal, and the file left exactly as it was.
+    #[test]
+    fn a_written_config_the_next_boot_cannot_read_is_refused_and_the_file_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_cfg_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original =
+            "mode = \"ask\"\n\n[provider]\nbase_url = \"http://127.0.0.1:8090/v1\"\nmodel = \"old-model\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        // `model` is not a top-level key: it belongs to [provider]. Writing it at the
+        // top level is the mistake that broke the start, and it is now a refused write
+        // rather than an app that will not boot.
+        let err = Config::set_top_keys(&path, &[("model", &Config::toml_str("new-model"))])
+            .expect_err("a key the parser does not declare must not be written");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original, "a refused write must leave the file alone: {err}");
+        assert!(err.contains("would not parse"), "{err}");
+
+        // The same value in the place the reader declares works, and replaces rather
+        // than adds: two `model` lines would be two answers to one question.
+        Config::set_provider_keys(&path, &[("model", &Config::toml_str("new-model"))]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let cfg: Config = toml::from_str(&text).expect("the rewritten file must parse");
+        assert_eq!(cfg.provider.model, "new-model", "{text}");
+        assert_eq!(text.matches("model = ").count(), 1, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A thinking level is persisted by the host, so the parser has to declare it and
+    /// the reader has to name the key when the word is wrong.
+    #[test]
+    fn a_thinking_level_is_read_back_and_a_strange_word_names_the_key() {
+        let c: Config = toml::from_str("reasoning = \"xhigh\"\n")
+            .expect("the key the writer produces must parse");
+        assert_eq!(c.reasoning_checked().unwrap(), Some(crate::provider::Reasoning::XHigh));
+
+        let c: Config = toml::from_str("reasoning = \"thinking\"\n").unwrap();
+        let err = c.reasoning_checked().expect_err("a word that is not a level is a typo");
+        assert!(err.contains("reasoning"), "{err}");
+        assert!(err.contains("xhigh"), "the message should list the choices: {err}");
+
+        // Absent means the shell's own default, not an invented one.
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.reasoning_checked().unwrap(), None);
     }
 
     /// The trap the shipped example config fell into: a top-level key written

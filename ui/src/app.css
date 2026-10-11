@@ -2430,6 +2430,18 @@ body {
   background: var(--color-paper);
   border: 1px solid var(--color-hairline);
   overflow: hidden;
+  /* The trim tick is positioned against the bar, not the panel. */
+  position: relative;
+}
+/* Where the engine actually trims history. It is not the right edge of the bar -
+   that is the model's window - and showing only the window is how a session read
+   as "0.7% used" while the engine was about to delete its oldest 57 messages. */
+.mbar u {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 1px;
+  background: var(--color-ink-3);
 }
 .mbar i {
   display: block;
@@ -2440,6 +2452,7 @@ body {
 }
 .mbar i.ok { background: var(--color-ok); }
 .mbar-row .mval { font-size: 11px; color: var(--color-ink-2); white-space: nowrap; }
+.mbar-row .mval .ctxtrim { display: block; font-size: 10px; color: var(--color-ink-3); }
 .mgrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
