@@ -227,7 +227,7 @@ impl App {
                 self.avg.push(u.clone());
                 self.tel = u;
             }
-            EngineEvent::Note { message } => self.items.push(Item::Note(message)),
+            EngineEvent::Note { message, .. } => self.items.push(Item::Note(message)),
             EngineEvent::Error { message, fatal } => {
                 if fatal {
                     self.items.push(Item::Fail(message));
@@ -394,6 +394,9 @@ async fn main() -> Result<()> {
         cfg.reasoning = r;
     }
     cfg.context_budget = appcfg.context.target_tokens;
+    // The prompt states the egress mode; take it from the same ExecCfg the tool
+    // registry was built with rather than restating it here.
+    cfg.egress = appcfg.exec_cfg().net.mode;
     // None means the server's own output cap applies; see Config.
     cfg.max_tokens = appcfg.max_output_tokens;
     // 0 = no cap. The hardcoded 14 was cutting real tasks short; see Config.

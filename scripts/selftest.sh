@@ -126,9 +126,60 @@ cleanup() {
   # and data dirs are why two instances can coexist.
   [ -n "${APP_PID:-}" ] && kill "$APP_PID" >/dev/null 2>&1
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" >/dev/null 2>&1
+  # The clipboard goes back before anything is deleted: a test that quietly eats
+  # what you had copied is a test that costs you an afternoon of work.
+  if [ "${CLIP_ARMED:-0}" = 1 ] && [ -d "${SCRATCH:-}/clip" ]; then
+    if [ -s "$SCRATCH/clip/image.png" ]; then
+      wl-copy --type image/png < "$SCRATCH/clip/image.png" >/dev/null 2>&1
+    elif [ -s "$SCRATCH/clip/text.txt" ]; then
+      wl-copy < "$SCRATCH/clip/text.txt" >/dev/null 2>&1
+    else
+      wl-copy --clear >/dev/null 2>&1
+    fi
+    rm -f "$CLIP_MARKER" "$CLIP_BACKUP_IMG" "$CLIP_BACKUP_TXT"
+  fi
+  rm -f /tmp/cwoffee-selftest-fixture.png
   if [ -n "$SCRATCH" ] && [ "$KEEP" = 0 ]; then rm -rf "$SCRATCH"; fi
 }
 trap cleanup EXIT INT TERM
+
+# ---- can this machine do the clipboard check at all? ------------------------
+# One check pastes an image that lives in the desktop selection. That needs
+# wl-clipboard; without it the build records the fact, and the check says out loud
+# that it was skipped rather than printing an ok it did not earn.
+CLIP_TOOL=0
+if command -v wl-copy >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1 \
+   && { [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; }; then
+  CLIP_TOOL=1
+fi
+if [ "$CLIP_TOOL" = 0 ]; then
+  export VITE_SELFTEST_NOCLIP=1
+  note "clipboard  : no wl-clipboard here; the paste check will say it was skipped"
+fi
+
+# A run that dies mid-flight (SIGKILL, a crash, a closed terminal) never reaches
+# cleanup(), and the last thing it did to your desktop was put a test image on the
+# clipboard. Nothing else will put yours back, so the previous run leaves a receipt
+# saying what it saved and what it installed, and the next run honours it before
+# touching anything.
+CLIP_MARKER=/tmp/cwoffee-clipboard.marker
+CLIP_BACKUP_IMG=/tmp/cwoffee-clipboard-backup.png
+CLIP_BACKUP_TXT=/tmp/cwoffee-clipboard-backup.txt
+if [ "$CLIP_TOOL" = 1 ] && [ -f "$CLIP_MARKER" ]; then
+  prev_img=$(sed -n '1p' "$CLIP_MARKER")
+  fixture_hash=$(sed -n '2p' "$CLIP_MARKER")
+  now_hash=$(wl-paste -n -t image/png 2>/dev/null | sha256sum | cut -d' ' -f1)
+  if [ -n "$now_hash" ] && [ "$now_hash" = "$fixture_hash" ]; then
+    if [ -s "$prev_img" ]; then
+      wl-copy --type image/png < "$prev_img" >/dev/null 2>&1
+      note "clipboard  : a previous run left its fixture on the selection; the image you had went back"
+    else
+      wl-copy --clear >/dev/null 2>&1
+      note "clipboard  : a previous run left its fixture on the selection and its backup is gone; cleared rather than leaving a test image where your paste lives"
+    fi
+  fi
+  rm -f "$CLIP_MARKER" "$CLIP_BACKUP_IMG" "$CLIP_BACKUP_TXT"
+fi
 
 # ---- build ------------------------------------------------------------------
 if [ "$NO_BUILD" = 0 ]; then
@@ -144,6 +195,32 @@ fi
 # port, so it coexists with an app the user already has open.
 
 note "launching the app"
+# The paste check needs an image on the selection. Whatever was there is saved
+# first and put back by cleanup(), in the same order it was found.
+if [ "$CLIP_TOOL" = 1 ]; then
+  mkdir -p "$SCRATCH/clip"
+  wl-paste -l 2>/dev/null | grep -qx 'image/png' && wl-paste -n -t image/png > "$SCRATCH/clip/image.png" 2>/dev/null
+  wl-paste -l 2>/dev/null | grep -qx 'text/plain' && wl-paste -n -t text/plain > "$SCRATCH/clip/text.txt" 2>/dev/null
+  # Outlive $SCRATCH: cleanup() deletes that directory, and a run that survives to
+  # cleanup() does not need this copy. A run that does not reach cleanup() does.
+  cp "$SCRATCH/clip/image.png" "$CLIP_BACKUP_IMG" 2>/dev/null || true
+  cp "$SCRATCH/clip/text.txt" "$CLIP_BACKUP_TXT" 2>/dev/null || true
+  # The check compares the pasted bytes against a file at an agreed path. The app
+  # cannot see the harness fixture directory, so the fixture is staged where both
+  # sides know to look - otherwise the byte comparison silently does nothing.
+  cp tests/fixtures/clipboard.png /tmp/cwoffee-selftest-fixture.png 2>/dev/null || true
+  if wl-copy --type image/png < tests/fixtures/clipboard.png 2>/dev/null; then
+    # The receipt is written only once the fixture is actually installed: a marker
+    # for a run that never touched the clipboard would "restore" something nobody
+    # took.
+    { printf '%s\n' "$CLIP_BACKUP_IMG"; sha256sum tests/fixtures/clipboard.png | cut -d' ' -f1; } \
+      > "$CLIP_MARKER" 2>/dev/null || true
+    CLIP_ARMED=1
+    note "clipboard  : a $(wc -c < tests/fixtures/clipboard.png)-byte PNG is on the selection; the old content goes back after"
+  else
+    note "clipboard  : wl-copy refused the fixture; the paste check will report the failure"
+  fi
+fi
 # Two keys arm the harness: a self-test bundle *and* an armed process. See
 # commands.rs::selftest_armed - the release binary embeds whatever ui/dist holds,
 # so a production start right after this script unarms the same bundle and must

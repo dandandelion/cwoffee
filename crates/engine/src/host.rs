@@ -78,6 +78,14 @@ pub struct HostConfig {
     /// expect to still be there tomorrow - and because two clients of one engine
     /// otherwise disagree with each other about what the app is doing.
     pub cfg_path: Option<PathBuf>,
+    /// What the exec sandbox may reach over the network, mirrored from
+    /// `[sandbox] network` in config.toml.
+    ///
+    /// The registry already knows (the exec tool was built from ExecCfg), but the
+    /// prompt is written by the agent, and letting the prompt guess produced the
+    /// most confidently wrong sentence in the system prompt: "no network access"
+    /// on a product that defaults to an allowlist proxy.
+    pub egress: crate::tools::net::NetMode,
 }
 
 impl HostConfig {
@@ -98,6 +106,7 @@ impl HostConfig {
             max_attachment_bytes: 2 * 1024 * 1024,
             sampling: crate::provider::Sampling::default(),
             cfg_path: None,
+            egress: crate::tools::net::NetCfg::default().mode,
         }
     }
 }
@@ -487,6 +496,7 @@ impl SessionHost {
                 model: cfg.model.clone(),
                 max_tool_iters: cfg.max_tool_iters,
                 reasoning: cfg.reasoning,
+                egress: cfg.egress,
                 max_tokens: cfg.max_tokens,
                 sampling: cfg.sampling.clone(),
                 gauge: gauge.clone(),
@@ -512,10 +522,10 @@ impl SessionHost {
             // into a sidebar full of identical blanks. A session row now appears
             // when the first message is sent.
             let mut session_id: i64 = 0;
-            // Sessions already told about a cold prompt cache. Saying it once per
+            // Sessions already told about a resumed history. Saying it once per
             // session per process is enough; the user re-clicking a row in the
             // sidebar does not make the cache warmer.
-            let mut cold_announced: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            let mut resume_announced: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
             {
                 let mut s = state_bg.lock().unwrap();
@@ -579,6 +589,7 @@ impl SessionHost {
                                         Ok(p) => {
                                             agent.set_workspace(p.clone());
                                             let _ = ev_tx.send(EngineEvent::Note {
+                                                session: Some(id),
                                                 message: format!(
                                                     "workspace is now {} (from this session)",
                                                     p.display()
@@ -625,16 +636,18 @@ impl SessionHost {
                             // than a warning for the same reason - a cold cache
                             // is the expected state after a restart, not a
                             // fault.
-                            if n > 0 && cold_announced.insert(id) {
+                            if n > 0 && resume_announced.insert(id) {
                                 // `s` already holds the state lock; re-entering
                                 // it here deadlocks the host task (Trap 30).
                                 let est = s.context_tokens;
                                 let budget = s.context_budget;
                                 let _ = ev_tx.send(EngineEvent::Note {
+                                    session: Some(id),
                                     message: format!(
                                         "resumed session {id}: {n} message(s), ~{est} tokens of a \
-                                         {budget} token budget; the prompt cache is cold after a \
-                                         restart, so the first reply re-prefills the history"
+                                         {budget} token budget. Whether the endpoint still holds this \
+                                         session's prefix cache is its own business; the first reply \
+                                         settles it in numbers.",
                                     ),
                                 });
                             }
@@ -749,6 +762,7 @@ impl SessionHost {
                         let _ = store.set_session_workspace(session_id, &p);
                         state_bg.lock().unwrap().workspace = p.display().to_string();
                         let _ = ev_tx.send(EngineEvent::Note {
+                            session: Some(session_id),
                             message: format!("workspace is now {}", p.display()),
                         });
                     }
@@ -780,7 +794,15 @@ impl SessionHost {
                                 &gauge_bg,
                                 true,
                             ).await;
+                            // Read the session id in its own statement. A guard
+                            // created inside a call's argument list lives until the
+                            // end of the *statement*, so writing it inline above
+                            // held the state lock while context_budget_note() asked
+                            // for the same lock - and the host task deadlocked,
+                            // which is how this test sat for twenty minutes.
+                            let sess_now = state_bg.lock().unwrap().session_id;
                             let _ = ev_tx.send(EngineEvent::Note {
+                                session: Some(sess_now),
                                 message: context_budget_note(&state_bg, &model_now),
                             });
                         }
@@ -926,7 +948,7 @@ impl SessionHost {
                         // than from anything captured at startup.
                         let env = cfg.env_override.clone()
                             .unwrap_or_else(|| {
-                                default_env_block(agent.workspace(), "linux")
+                                default_env_block(agent.workspace(), "linux", cfg.egress)
                             });
                         agent.prompt_mut().set_env(env);
 
@@ -1271,10 +1293,18 @@ mod question_wire_tests {
 /// Build the volatile environment block. Kept out of the system prompt on
 /// purpose: putting a date there changes the leading bytes of every prompt and
 /// guarantees a prefix-cache miss on every single turn.
-pub fn default_env_block(workspace: &std::path::Path, os: &str) -> String {
+pub fn default_env_block(workspace: &std::path::Path, os: &str, egress: crate::tools::net::NetMode) -> String {
+    // One line, three truths. It said "no network" whatever the config said, which
+    // is a second place (after the system prompt) where the model was told it was
+    // offline by an app whose default mode routes package installs through a proxy.
+    let egress_line = match egress {
+        crate::tools::net::NetMode::Off => "no network",
+        crate::tools::net::NetMode::Proxy => "network via an allowlist proxy",
+        crate::tools::net::NetMode::Open => "network open",
+    };
     format!(
         "<env>\nos: {os}\nworkspace: {}\nshell: sh\n\
-         commands run sandboxed: no network, only the workspace is writable\n\
+         commands run sandboxed: {egress_line}, only the workspace is writable\n\
          </env>",
         workspace.display()
     )
@@ -1913,11 +1943,11 @@ mod tests {
         assert_eq!(h.state().context_budget, 12_000, "the window overrode the pin");
     }
 
-    /// Cold-cache information, not a fault: it belongs to a session with history
-    /// to re-prefill, and an empty one must not be marked as though something went
-    /// wrong. This was the "warning on every new session" complaint.
+    /// Cache information is measured, not asserted, and it belongs to a session
+    /// with history to reload: an empty one must say nothing at all. This was the
+    /// "warning on every new session" complaint.
     #[tokio::test]
-    async fn an_empty_session_is_not_announced_as_cold() {
+    async fn an_empty_session_is_not_announced_as_a_problem() {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(vec!["one".into(), "two".into()]),
@@ -1951,8 +1981,8 @@ mod tests {
         let cold: Vec<String> = (|| {
             let mut out = Vec::new();
             while let Ok(e) = ev.try_recv() {
-                if let EngineEvent::Note { message } = e {
-                    if message.contains("prompt cache") {
+                if let EngineEvent::Note { message, .. } = e {
+                    if message.contains("resumed session") {
                         out.push(message);
                     }
                 }
@@ -1961,23 +1991,40 @@ mod tests {
         })();
         assert!(
             cold.is_empty(),
-            "an empty session was told about a cold cache: {cold:?}"
+            "an empty session was told about a resumed history: {cold:?}"
         );
 
         // Same session again: still nothing. And the seeded session says so once,
-        // as a note, with numbers.
+        // as a note, with numbers - and without claiming a cache state the engine
+        // has no window onto.
         h.send(HostCmd::SwitchSession { id: sid });
         wait_for("back".into(), || h.state().session_id == sid).await;
-        let mut saw_cold = false;
+        let mut saw_resume = false;
         while let Ok(e) = ev.try_recv() {
-            if let EngineEvent::Note { message } = e {
-                if message.contains("prompt cache") {
-                    saw_cold = true;
+            if let EngineEvent::Note { message, session } = e {
+                if message.contains("resumed session") {
+                    saw_resume = true;
+                    // The note has to name the conversation it is about. The client
+                    // used to stamp notes from what it happened to be showing, and
+                    // the note a switch emits arrives while the window is still on
+                    // the conversation being left - so it got filed in the wrong
+                    // transcript and the repaint of the right one dropped it.
+                    assert_eq!(
+                        session,
+                        Some(sid),
+                        "the resume note did not name the conversation it is about: {message:?} / session={session:?}"
+                    );
                     assert!(message.contains("token"), "the note had no numbers: {message}");
+                    for claim in ["cold", "warm", "re-prefill"] {
+                        assert!(
+                            !message.to_lowercase().contains(claim),
+                            "the resume note asserted {claim:?} about a cache it cannot see: {message}"
+                        );
+                    }
                 }
             }
         }
-        assert!(saw_cold, "a resumed history did not mention the cold cache");
+        assert!(saw_resume, "a resumed history did not say what it restored");
     }
 
     /// Same lock, session row created the way the desktop command does it: a row in
@@ -2714,9 +2761,16 @@ mod tests {
 
     #[test]
     fn env_block_names_the_sandbox_so_the_model_does_not_guess() {
-        let b = default_env_block(std::path::Path::new("/home/u/ws"), "linux");
+        use crate::tools::net::NetMode as N;
+        let b = default_env_block(std::path::Path::new("/home/u/ws"), "linux", N::Off);
         assert!(b.contains("/home/u/ws"));
         assert!(b.contains("no network"));
         assert!(b.contains("sandbox"));
+        // The default product mode is a proxy, and this line used to deny it.
+        let p = default_env_block(std::path::Path::new("/home/u/ws"), "linux", N::Proxy);
+        assert!(p.contains("allowlist proxy"), "{p}");
+        assert!(!p.contains("no network"), "the env block called a proxy sandbox offline: {p}");
+        let o = default_env_block(std::path::Path::new("/home/u/ws"), "linux", N::Open);
+        assert!(o.contains("network open"), "{o}");
     }
 }

@@ -3,6 +3,7 @@
 //! Thin by design. Everything interesting lives in `crates/engine`; this file
 //! wires one up and gets out of the way.
 
+mod clipboard;
 mod commands;
 mod gateway_ctl;
 mod gpu;
@@ -195,6 +196,10 @@ fn main() {
         }
     }
     cfg.context_budget = appcfg.context.target_tokens;
+    // The prompt states what the sandbox may reach. Read from the same ExecCfg the
+    // registry got, so the sentence and the sandbox cannot disagree: the model's
+    // willingness to run `npm install` or `git pull` hinges on it.
+    cfg.egress = appcfg.exec_cfg().net.mode;
     // None means the server's own output cap applies; see Config.
     cfg.max_tokens = appcfg.max_output_tokens;
     // 0 = no cap. The hardcoded 14 was cutting real tasks short; see Config.
@@ -451,6 +456,23 @@ fn main() {
                 if let Err(e) = w.set_icon(tauri::include_image!("icons/64x64.png")) {
                     eprintln!("[cwoffee] window icon not set: {e}");
                 }
+                // The self-test measures layout and animation in a page the
+                // compositor is painting. An occluded or minimized window stops
+                // requestAnimationFrame dead and freezes every CSS animation at its
+                // start value, at which point those checks measure the window
+                // manager rather than the app - and the run used to discover that as
+                // a fifteen-minute timeout with no verdict at all. So the armed
+                // harness asks for the window it needs, and the log says so: a run
+                // that moved your windows should say it moved your windows.
+                if commands::selftest_armed() {
+                    let _ = w.unminimize();
+                    let _ = w.set_always_on_top(true);
+                    let _ = w.set_focus();
+                    eprintln!(
+                        "[selftest] window un-minimized, pinned above others and focused: the layout and \
+                         reveal checks need a page the compositor is actually painting"
+                    );
+                }
             }
             let cfg = app.config();
             let cfg_build = cfg.build.clone();
@@ -512,6 +534,7 @@ fn main() {
             commands::switch_session,
             commands::selftest_armed,
             commands::gpu_report,
+            commands::clipboard_image,
             commands::render_report,
             commands::boot_log
         ]);

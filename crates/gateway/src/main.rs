@@ -125,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
         };
     }
     cfg.context_budget = appcfg.context.target_tokens;
+    // Same ExecCfg the registry got: the system prompt states the egress mode, so a
+    // phone driving this host gets the same network story as the desktop window.
+    cfg.egress = appcfg.exec_cfg().net.mode;
     // None means the server's own output cap applies; see Config.
     cfg.max_tokens = appcfg.max_output_tokens;
     // 0 = no cap. The hardcoded 14 was cutting real tasks short; see Config.

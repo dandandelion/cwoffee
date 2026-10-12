@@ -123,6 +123,62 @@ pub struct OutputFile {
     pub name: String,
     pub mime: String,
     pub bytes: u64,
+    /// Whether this is a deliverable to open from the chat or a file the model
+    /// changed on its way through a codebase. The transcript treats them
+    /// differently, so the distinction is carried rather than re-guessed by the
+    /// renderer from a filename.
+    #[serde(default)]
+    pub kind: FileKind,
+}
+
+/// Which kind of file this is, from the reader's point of view.
+///
+/// The complaint this answers: implementing one feature in a real repository
+/// touched 38 files, and the turn printed 38 chips for them - a strip of chips
+/// in which the one thing worth clicking (the HTML page the model also wrote)
+/// was invisible. Neither category is more important than the other; they want
+/// different shapes. A deliverable wants a chip you can click. A codebase edit
+/// wants a count and a list you can open when you want one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    /// Something to open from the transcript: a downloaded file, a generated
+    /// document or spreadsheet, a standalone HTML/SVG page, an image.
+    Artifact,
+    /// A file the model wrote or edited as part of working in a tree.
+    Edit,
+    /// A row stored before the distinction existed. Rendered as it always was:
+    /// guessing a category for data that never carried one would be inventing
+    /// a fact about a turn we no longer have.
+    #[default]
+    Unknown,
+}
+
+/// Deliverable extensions: things a person opens, previews, or takes away.
+/// Notably absent: `.md`, `.txt`, `.json`, `.toml`, and every source extension.
+/// A repository feature that rewrites 20 READMEs and 15 JSON fixtures is a set
+/// of *changes*, and the reader reviews those in a diff, not in a chip strip.
+const ARTIFACT_EXTS: &[&str] = &[
+    "html", "htm", "svg", "pdf", "docx", "doc", "xlsx", "xls", "xlsm", "pptx", "csv", "tsv",
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "zip", "tar", "gz", "ics", "ipynb", "ogg",
+    "mp3", "mp4", "wav", "webm", "exe", "AppImage",
+];
+
+/// Classify one path. Deliberately by extension, not by tool: `write_file` is
+/// used for both a single-file HTML app and a source file, and the tool cannot
+/// tell them apart either. What the tool *can* say, and does, is that a
+/// downloaded file is a deliverable whatever its name.
+pub fn kind_for(path: &std::path::Path) -> FileKind {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ARTIFACT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(&ext)) {
+        FileKind::Artifact
+    } else {
+        FileKind::Edit
+    }
 }
 
 impl OutputFile {
@@ -140,6 +196,20 @@ impl OutputFile {
             path: rel,
             mime: mime_for(path).to_string(),
             bytes,
+            kind: kind_for(path),
+        }
+    }
+
+    /// A file that arrived from outside the workspace. Its name comes from a URL
+    /// or the model's choice, so extension-based classification is a poor guide
+    /// here; the act of downloading is the fact.
+    pub fn artifact(path: String, name: String, mime: String, bytes: u64) -> OutputFile {
+        OutputFile {
+            path,
+            name,
+            mime,
+            bytes,
+            kind: FileKind::Artifact,
         }
     }
 }
@@ -581,5 +651,63 @@ mod cfg_tests {
             total < 11_000,
             "the whole tool block is {total} bytes: two spreadsheet tools now, and              a description longer than this is a per-turn tax on every session"
         );
+    }
+
+    // ---- artifact or change: the shape of a turn's file list ---------------
+
+    /// A feature in a real repository touches dozens of files. The turn used to
+    /// print one chip per file, and the single HTML page the model also wrote -
+    /// the one thing worth clicking - drowned in them. So the engine labels the
+    /// two kinds, and the transcript gives them different shapes.
+    #[test]
+    fn a_deliverable_is_an_artifact_and_a_source_change_is_an_edit() {
+        use std::path::Path;
+        for ext in [
+            "html", "htm", "svg", "pdf", "docx", "xlsx", "csv", "tsv", "png", "jpg", "zip",
+            "ipynb",
+        ] {
+            let name = format!("out/build.{ext}");
+            let p = Path::new(&name);
+            assert_eq!(kind_for(p), FileKind::Artifact, "{ext} should be a deliverable");
+        }
+        for ext in ["rs", "py", "ts", "js", "json", "toml", "yaml", "md", "txt", "css"] {
+            let name = format!("src/deep/mod.{ext}");
+            let p = Path::new(&name);
+            assert_eq!(kind_for(p), FileKind::Edit, "{ext} should read as a change");
+        }
+        // A file with no extension is not something you open from a chat.
+        assert_eq!(kind_for(Path::new("Makefile")), FileKind::Edit);
+        // Case does not change what a file is.
+        assert_eq!(kind_for(Path::new("a/b/report.PDF")), FileKind::Artifact);
+        // from_path carries the label, so every tool that describes a file on
+        // disk gets it without remembering to ask.
+        let dir = std::env::temp_dir().join(format!("cwoffee_kind_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dash.html"), b"<html></html>").unwrap();
+        std::fs::write(dir.join("handler.rs"), b"fn h(){}").unwrap();
+        let f = OutputFile::from_path(&dir, &dir.join("dash.html"));
+        assert_eq!(f.kind, FileKind::Artifact, "a written HTML page is a deliverable");
+        let g = OutputFile::from_path(&dir, &dir.join("handler.rs"));
+        assert_eq!(g.kind, FileKind::Edit, "a written source file is a change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Old rows have no kind. Defaulting them to Artifact or Edit would invent a
+    /// fact about turns that were never labelled; `unknown` keeps the old
+    /// rendering and says what is actually true.
+    #[test]
+    fn rows_written_before_the_kind_existed_still_decode_and_say_unknown() {
+        let old = r#"{"path":"notes/x.md","name":"x.md","mime":"text/markdown","bytes":12}"#;
+        let f: OutputFile = serde_json::from_str(old).unwrap();
+        assert_eq!(f.kind, FileKind::Unknown, "an unlabelled row claimed a kind");
+        let wire = serde_json::to_string(&OutputFile {
+            path: "p.html".into(),
+            name: "p.html".into(),
+            mime: "text/html".into(),
+            bytes: 1,
+            kind: FileKind::Artifact,
+        })
+        .unwrap();
+        assert!(wire.contains("\"kind\":\"artifact\""), "wire form: {wire}");
     }
 }

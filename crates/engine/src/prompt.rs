@@ -32,6 +32,10 @@ pub struct PromptBuilder {
     system: String,
     /// Thinking level the prompt argues for. Part of the system bytes.
     reasoning: crate::provider::Reasoning,
+    /// What the sandbox may reach over the network. Part of the system bytes for
+    /// the same reason the thinking level is: it is the sentence that decides
+    /// whether the model attempts a `git pull` or explains why it cannot.
+    egress: crate::tools::net::NetMode,
     history: Vec<Message>,
     /// Environment block appended to the newest user message only.
     env_block: String,
@@ -136,9 +140,25 @@ pub fn system_prompt() -> String {
 /// system message, so the prefix changes on any level switch whether we write
 /// anything or not. docs/MODELS.md carries the measurements.
 pub fn system_prompt_for(reasoning: crate::provider::Reasoning) -> String {
+    system_prompt_with(reasoning, crate::tools::net::NetCfg::default().mode)
+}
+
+/// The system prompt for a thinking level *and* the sandbox's egress mode.
+///
+/// The egress mode belongs in the prompt bytes because the sentence it replaces
+/// was the model's belief about what it may try. Written as "commands run in a
+/// sandbox with no network access" while the config said `proxy`, the system
+/// prompt told the model the network was gone, the tool output told it the
+/// network worked, and the model spent a couple of loops believing the more
+/// authoritative of the two - the sentence we had just written down.
+pub fn system_prompt_with(
+    reasoning: crate::provider::Reasoning,
+    egress: crate::tools::net::NetMode,
+) -> String {
+    let body = system_body(egress);
     match deliberation_line(reasoning) {
-        Some(line) => format!("{SYSTEM_VERSION}\n{}\n{}", system_body(), line),
-        None => format!("{SYSTEM_VERSION}\n{}", system_body()),
+        Some(line) => format!("{SYSTEM_VERSION}\n{body}\n{line}"),
+        None => format!("{SYSTEM_VERSION}\n{body}"),
     }
 }
 
@@ -162,8 +182,17 @@ pub fn deliberation_line(reasoning: crate::provider::Reasoning) -> Option<&'stat
 
 /// The instructions, kept separate from the version tag so the "no volatile
 /// data" test can assert on the body without tripping on the version digit.
-fn system_body() -> String {
-    r#"You are Cwoffee, a capable local assistant that works on real files and runs real commands.
+fn system_body(egress: crate::tools::net::NetMode) -> String {
+    let environment = match egress {
+        crate::tools::net::NetMode::Off =>
+            "Environment: commands run in a sandbox with no network access; only the workspace is writable.",
+        crate::tools::net::NetMode::Proxy =>
+            "Environment: commands run in a sandbox; the network is reachable through an allowlist proxy, so package installs and git operations against common hosts work, and only the workspace is writable.",
+        crate::tools::net::NetMode::Open =>
+            "Environment: commands run in a sandbox with the network open; only the workspace is writable.",
+    };
+    format!(
+        r#"You are Cwoffee, a capable local assistant that works on real files and runs real commands.
 
 Working style:
 - Be concise. Prefer doing over explaining.
@@ -176,8 +205,8 @@ Tool use:
 - Emit exactly one JSON object per tool call.
 - If you cannot do something, say so plainly rather than inventing an answer.
 
-Environment: commands run in a sandbox with no network access; only the workspace is writable."#
-        .to_string()
+{environment}"#
+    )
 }
 
 impl PromptBuilder {
@@ -185,6 +214,7 @@ impl PromptBuilder {
         Self {
             system: system_prompt(),
             reasoning: crate::provider::Reasoning::default(),
+            egress: crate::tools::net::NetCfg::default().mode,
             history: Vec::new(),
             env_block: String::new(),
             // A fallback, not a policy: the host replaces this with a budget
@@ -205,7 +235,21 @@ impl PromptBuilder {
             return;
         }
         self.reasoning = r;
-        self.system = system_prompt_for(r);
+        self.system = system_prompt_with(r, self.egress);
+    }
+
+    /// Tell the prompt which egress the sandbox actually has.
+    ///
+    /// Called once, at agent construction, for exactly the reason `set_reasoning`
+    /// is careful about bytes: this text is the head of every prompt in the
+    /// session, and rewriting it per turn would throw away the prefix cache the
+    /// whole design exists to protect.
+    pub fn set_egress(&mut self, mode: crate::tools::net::NetMode) {
+        if self.egress == mode {
+            return;
+        }
+        self.egress = mode;
+        self.system = system_prompt_with(self.reasoning, mode);
     }
 
     /// Volatile context (date, cwd, model). Appended to the newest user message,
@@ -572,9 +616,50 @@ mod tests {
         assert_eq!(after, p.build("m").messages[0].content);
     }
 
+    /// The sentence that decides whether the model *tries* an `npm install`.
+    ///
+    /// It used to read "no network access" in every mode, on a product whose
+    /// default mode is an allowlist proxy. The model believed the system prompt
+    /// over its own successful tool output, and burned tool loops arguing with
+    /// itself. So the sentence is now a function of the sandbox that exists, and
+    /// the default is the documented product default rather than an assumption.
+    #[test]
+    fn the_environment_sentence_matches_the_sandbox_that_exists() {
+        use crate::provider::Reasoning as R;
+        use crate::tools::net::NetMode as N;
+        let off = system_prompt_with(R::Off, N::Off);
+        assert!(off.contains("no network access"), "off mode said nothing about the network");
+        let proxy = system_prompt_with(R::Off, N::Proxy);
+        assert!(
+            !proxy.contains("no network"),
+            "the proxy sandbox was described as offline: {proxy}"
+        );
+        assert!(proxy.contains("allowlist proxy"));
+        assert!(proxy.contains("package installs"));
+        let open = system_prompt_with(R::Off, N::Open);
+        assert!(open.contains("network open"));
+
+        // The bare constructor must land on the same mode the config declares as
+        // the default, or a stray PromptBuilder quietly rewrites the environment.
+        assert_eq!(system_prompt(), system_prompt_with(R::default(), N::Proxy));
+
+        let mut p = PromptBuilder::new();
+        let before = p.build("m").messages[0].content.clone();
+        p.set_egress(N::Proxy);
+        assert_eq!(before, p.build("m").messages[0].content, "a no-op egress set churned bytes");
+        p.set_egress(N::Off);
+        let after = p.build("m").messages[0].content.clone();
+        assert_ne!(before, after, "egress off changed nothing");
+        assert!(after.contains("no network access"));
+        // And the level still composes with it.
+        p.set_reasoning(R::XHigh);
+        let both = p.build("m").messages[0].content.clone();
+        assert!(both.contains("no network access") && both.contains("reason at length"));
+    }
+
     #[test]
     fn system_prompt_body_contains_no_volatile_data() {
-        let body = system_body();
+        let body = system_body(crate::tools::net::NetMode::Proxy);
         // no digits at all: rules out dates, times, and anything session-specific
         assert!(
             !body.contains(|c: char| c.is_ascii_digit()),
@@ -582,7 +667,7 @@ mod tests {
              would churn the prefix and miss the cache every turn"
         );
         assert!(!body.contains("/home"), "absolute path in the system prompt");
-        assert_eq!(body, system_body(), "system prompt must be deterministic");
+        assert_eq!(body, system_body(crate::tools::net::NetMode::Proxy), "system prompt must be deterministic");
         assert_eq!(
             serde_json::to_string(&PromptBuilder::new().build("m").messages).unwrap(),
             serde_json::to_string(&PromptBuilder::new().build("m").messages).unwrap()

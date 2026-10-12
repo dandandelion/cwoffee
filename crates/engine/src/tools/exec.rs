@@ -22,6 +22,14 @@ use super::path::lexical_resolve;
 use super::{ExecChunk, ExecSink, Risk, Tool, ToolCtx, ToolResult, clamp};
 use crate::event::ExecStream;
 
+/// The prefix of the line a sandbox refusal appends to a command's output.
+///
+/// It is one constant because two facts have to agree: the tool description tells
+/// the model to look for this exact string, and the execution path is what writes
+/// it. Written separately, they drift, and a model told to distrust its own
+/// instincts starts describing a refusal that never happened.
+pub const EGRESS_BLOCKED_MARK: &str = "# egress blocked:";
+
 pub struct ExecTool {
     /// Seconds before the command is killed.
     pub timeout_secs: u64,
@@ -319,7 +327,7 @@ impl Tool for ExecTool {
             let bytes = e.state.bytes();
             if !hosts.is_empty() {
                 body.push_str(&format!(
-                    "\n# egress blocked: {} - not in the sandbox allowlist. Add them to \
+                    "\n{EGRESS_BLOCKED_MARK} {} - not in the sandbox allowlist. Add them to \
                      allow = [...] under [sandbox] in config.toml, or ask the user to run the \
                      command outside Cwoffee.",
                     hosts.join(", ")
@@ -400,10 +408,36 @@ fn failure_note(text: &str, net: crate::tools::net::NetMode) -> Option<&'static 
         };
     }
     if low.contains("no module named") {
+        // The note is the same either way; only the parenthetical is mode-dependent,
+        // because under a proxy the package *could* be installed by the user and it
+        // would be a lie to say the sandbox has no network.
+        return Some(match net {
+            crate::tools::net::NetMode::Off =>
+                "that python package is not installed on the host, and the sandbox has no network \
+                 to install it with. Do not write your own parser for the job: spreadsheets are \
+                 sheet_read and sheet_query, documents are write_file.",
+            _ =>
+                "that python package is not installed on the host. Do not write your own parser \
+                 for the job: spreadsheets are sheet_read and sheet_query, documents are \
+                 write_file; a package the user can install, they install outside Cwoffee.",
+        });
+    }
+    // The other half of the same misunderstanding as ENETUNREACH behind a proxy. A
+    // git+ssh remote is not refused here, it hangs, and the words it dies with
+    // ("Permission denied (publickey)", a banner-exchange timeout) read like a bad
+    // key or a flaky network. They are neither: no route carries that transport, and
+    // the fix is one `git remote set-url` the model can run itself. Without this it
+    // spends several tool loops rediscovering https.
+    if matches!(net, crate::tools::net::NetMode::Proxy)
+        && (low.contains("permission denied (publickey)")
+            || low.contains("banner exchange")
+            || low.contains("ssh: connect to host")
+            || low.contains("could not read username"))
+    {
         return Some(
-            "that python package is not installed on the host, and the sandbox cannot install one \
-             (no network). Do not write your own parser for the job: spreadsheets are sheet_read \
-             and sheet_query, documents are write_file.",
+            "the sandbox egress route carries HTTP and HTTPS only, so an ssh remote hangs rather \
+             than being refused. Rewrite the remote (git remote set-url origin https://...) instead \
+             of debugging keys, or ask the user to set [sandbox] network = \"open\".",
         );
     }
     if low.contains("unexpected eof while looking for matching") {
@@ -420,17 +454,27 @@ fn failure_note(text: &str, net: crate::tools::net::NetMode) -> Option<&'static 
 /// about the network, so the mode the user configured is the mode the model is
 /// told about - and the sentence is short because these bytes sit in every turn.
 fn blurb(net: crate::tools::net::NetMode) -> String {
-    let network = match net {
+    let network: String = match net {
         crate::tools::net::NetMode::Off =>
             "There is no network in here: package installs and any request to the \
-             internet cannot work, so do not try them.",
+             internet cannot work, so do not try them.".into(),
         crate::tools::net::NetMode::Proxy =>
-            "Network goes through an allowlist proxy: package installs work for \
-             allowlisted hosts, and a refusal names the host and the config line \
-             that would admit it.",
+            format!(
+                "Network access IS available here: the sandbox routes out through an allowlist \
+                 proxy, and it already admits the hosts package managers dial - npm, Yarn, PyPI, \
+                 crates.io, Go, RubyGems, GitHub (including git clone/pull/fetch), GitLab, \
+                 jsDelivr, unpkg, deno, Hugging Face. So run the command: do not assume you are \
+                 offline, do not tell the user you have no internet, and do not hand-write a \
+                 substitute for `npm install`, `pip install`, `cargo add` or `git pull`. A real \
+                 refusal is a line in the tool result that begins `{EGRESS_BLOCKED_MARK}` and names \
+                 the host; any other failure is an ordinary network error, not the sandbox. A \
+                 proxy filters where you go; it does not hide that you went. The route carries HTTP \
+                 and HTTPS only, so an ssh:// or git@ remote hangs here instead of being refused: \
+                 rewrite the remote to https:// rather than waiting on a transport that cannot exist."
+            ),
         crate::tools::net::NetMode::Open =>
             "The network is open: failures there are the machine's connectivity, \
-             not the sandbox.",
+             not the sandbox.".into(),
     };
     format!(
         "Run a shell command in a sandbox (host filesystem read-only, only the \
@@ -939,6 +983,24 @@ mod tests {
         let proxy = blurb(NetMode::Proxy);
         assert!(proxy.contains("allowlist proxy"));
         assert!(!proxy.contains("There is no network"));
+        // The complaint this answers: a model that reads "allowlist proxy" as
+        // "probably blocked" and spends two tool loops talking itself out of a
+        // command it could have run on the first try.
+        for needle in [
+            "Network access IS available",
+            "run the command",
+            "do not assume you are offline",
+            "npm install",
+            EGRESS_BLOCKED_MARK,
+        ] {
+            assert!(proxy.contains(needle), "the proxy blurb lacked {needle:?}");
+        }
+        // The promise and the behaviour are one constant: if the execution path
+        // stops writing the mark the description points at, this fails.
+        assert!(
+            crate::tools::exec::EGRESS_BLOCKED_MARK.starts_with("# egress blocked"),
+            "the mark drifted from what the description quotes"
+        );
         assert!(blurb(NetMode::Open).contains("The network is open"));
 
         let cfg = crate::tools::ExecCfg {
@@ -1100,6 +1162,42 @@ mod tests {
         let r = t.run(json!({"command": "echo hi"}), &ctx, &sink()).await;
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap_or("").contains("cmd"));
+    }
+
+    #[test]
+    fn an_ssh_failure_under_a_proxy_names_the_transport_not_the_key() {
+        // What the model actually did: `git pull` on a git@ remote hung, it read
+        // "Permission denied (publickey)", spent two more loops on ssh-agent and
+        // known_hosts, and only then tried https. The sandbox cannot carry ssh at
+        // all, so the note has to say that in the first failure.
+        for probe in [
+            "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.",
+            "ssh: connect to host github.com port 22: Connection timed out during banner exchange",
+        ] {
+            let note = failure_note(probe, crate::tools::net::NetMode::Proxy).unwrap();
+            assert!(
+                note.contains("HTTP and HTTPS only") && note.contains("git remote set-url"),
+                "the ssh note said: {note}"
+            );
+        }
+        // The same words with no proxy in play are not the sandbox's business.
+        assert!(
+            failure_note("Permission denied (publickey).", crate::tools::net::NetMode::Open).is_none(),
+            "an auth failure with the network open was blamed on the sandbox"
+        );
+    }
+
+    #[test]
+    fn the_proxy_blurb_rules_out_ssh_by_name() {
+        let proxy = blurb(crate::tools::net::NetMode::Proxy);
+        assert!(
+            proxy.contains("ssh://") && proxy.contains("https://"),
+            "the blurb advertised the proxy without saying which transports it carries"
+        );
+        assert!(
+            !blurb(crate::tools::net::NetMode::Open).contains("ssh://"),
+            "the open-network blurb carried a restriction that is not in place"
+        );
     }
 
     #[test]

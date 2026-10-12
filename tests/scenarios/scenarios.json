@@ -313,7 +313,7 @@
      "delay_ms": 25
     },
     {
-     "content": "Right \u2014 that belongs in write_file, not in a shell.",
+     "content": "Right — that belongs in write_file, not in a shell.",
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 12
@@ -1333,6 +1333,59 @@
      "finish": "stop",
      "chunk_chars": 4,
      "delay_ms": 0
+    }
+   ]
+  },
+  {
+   "name": "attachment-flood",
+   "_why": "a feature in a real repository writes a dozen files; the turn must not print a dozen chips and bury the one page worth opening",
+   "match": "Selftest attachment flood",
+   "steps": [
+    {
+     "reasoning": "Five source files and one standalone page.",
+     "tool_calls": [
+      {
+       "id": "mock-flood-1",
+       "name": "write_file",
+       "arguments": "{\"path\": \"src/selftest-flood-1.ts\", \"content\": \"// flood module 1\\nexport const marker1 = 'seafret1'\\n\"}"
+      },
+      {
+       "id": "mock-flood-2",
+       "name": "write_file",
+       "arguments": "{\"path\": \"src/selftest-flood-2.ts\", \"content\": \"// flood module 2\\nexport const marker2 = 'seafret2'\\n\"}"
+      },
+      {
+       "id": "mock-flood-3",
+       "name": "write_file",
+       "arguments": "{\"path\": \"src/selftest-flood-3.ts\", \"content\": \"// flood module 3\\nexport const marker3 = 'seafret3'\\n\"}"
+      },
+      {
+       "id": "mock-flood-4",
+       "name": "write_file",
+       "arguments": "{\"path\": \"src/selftest-flood-4.ts\", \"content\": \"// flood module 4\\nexport const marker4 = 'seafret4'\\n\"}"
+      },
+      {
+       "id": "mock-flood-5",
+       "name": "write_file",
+       "arguments": "{\"path\": \"notes/selftest-flood-5.md\", \"content\": \"// flood module 5\\nexport const marker5 = 'seafret5'\\n\"}"
+      },
+      {
+       "id": "mock-flood-html",
+       "name": "write_file",
+       "arguments": "{\"path\": \"selftest-flood-panel.html\", \"content\": \"<!doctype html>\\n<title>selftest flood panel</title>\\n<h1>espresso-panel</h1>\\n\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 15
+    },
+    {
+     "content": "Five modules and a panel page.",
+     "finish": "stop",
+     "chunk_chars": 6,
+     "delay_ms": 10,
+     "require": [
+      "created"
+     ]
     }
    ]
   }

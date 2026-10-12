@@ -202,7 +202,7 @@ impl Harness {
                                 EngineEvent::Text(s) => t.answer.push_str(s),
                                 EngineEvent::Reasoning(s) => t.reasoning.push_str(s),
                                 EngineEvent::Error { message, .. } => t.errors.push(message.clone()),
-                                EngineEvent::Note { message } => t.notes.push(message.clone()),
+                                EngineEvent::Note { message, .. } => t.notes.push(message.clone()),
                                 EngineEvent::ToolExecEnd { ok, .. } => t.tool_results.push(*ok),
                                 EngineEvent::ToolExecOutput { chunk, .. } => t.tool_out.push_str(&chunk),
                                 EngineEvent::TurnFiles { files, .. } => t.files.extend(files.clone()),

@@ -226,14 +226,21 @@ async function streamCompletion(res, step, opts) {
     }
   }
 
+  // `ci` is the slot of this call within the assistant message - the field the
+  // OpenAI wire format calls tool_calls[].index. It used to be 0 for every call,
+  // so a step that batched six write_file calls arrived as one call holding six
+  // concatenated argument strings. Real models batch; the harness has to be able
+  // to say so.
+  let ci = -1
   for (const call of step.tool_calls ?? []) {
+    ci++
     res.write(
       chunk(id, created, {
         choices: [
           {
             index: 0,
             delta: {
-              tool_calls: [{ index: 0, id: call.id ?? `mock-call-${stats.turns}`, type: 'function', function: { name: call.name, arguments: '' } }],
+              tool_calls: [{ index: ci, id: call.id ?? `mock-call-${stats.turns}-${ci}`, type: 'function', function: { name: call.name, arguments: '' } }],
             },
             finish_reason: null,
           },
@@ -249,7 +256,7 @@ async function streamCompletion(res, step, opts) {
       res.write(
         chunk(id, created, {
           choices: [
-            { index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: p } }] }, finish_reason: null },
+            { index: 0, delta: { tool_calls: [{ index: ci, function: { arguments: p } }] }, finish_reason: null },
           ],
         }),
       )

@@ -1813,6 +1813,7 @@ mod tests {
         // and that race, not the mechanism, is what made this test flaky under load.
         use futures_util::StreamExt;
         let _ = h.events.send(EngineEvent::Note {
+            session: None,
             message: "warm-up: the pump is subscribed".into(),
         });
         let warmed = tokio::time::timeout(
@@ -1834,6 +1835,7 @@ mod tests {
         for chunk in 0..6u32 {
             for i in 0..100u32 {
                 let _ = h.events.send(EngineEvent::Note {
+            session: None,
                     message: "x".repeat(2048) + &(chunk * 100 + i).to_string(),
                 });
             }

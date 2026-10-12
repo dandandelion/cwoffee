@@ -203,6 +203,15 @@ pub enum EngineEvent {
     /// workspace moving. Not an error: nothing went wrong.
     Note {
         message: String,
+        /// Which conversation this note is about, when there is one.
+        ///
+        /// The client cannot infer it. The note a session switch emits arrives while
+        /// the window is still showing the conversation the reader is leaving, so
+        /// stamping a note from `viewId` attached it to the wrong transcript - and
+        /// the repaint of the right one dropped it. Same lesson as `turnStart`: the
+        /// engine names the conversation, the client does not guess it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<i64>,
     },
 
     /// A non-fatal or fatal problem. `fatal` means the turn is over.

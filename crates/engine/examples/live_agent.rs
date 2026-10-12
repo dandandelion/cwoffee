@@ -184,7 +184,7 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
                     u.server_prefill_tps, u.server_decode_tps, u.ttft_ms
                 );
             }
-            EngineEvent::Note { message } => println!("\n  [note] {message}"),
+            EngineEvent::Note { message, .. } => println!("\n  [note] {message}"),
             EngineEvent::Error { message, fatal } => {
                 println!("\n[{}] {message}", if fatal { "FATAL" } else { "warn" });
             }

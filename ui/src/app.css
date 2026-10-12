@@ -42,6 +42,12 @@
   --color-warn-bg: #fdf9ef;
   --color-warn-hairline: #e6d9b8;
   --color-note: #7a4fa0;
+  /* A note is the app talking about itself, not about the work. It wants to be
+     skippable and findable at the same time, which is a tint problem rather
+     than a weight problem: quiet fill, one rule of hue down the left, smaller
+     type than the answer it interrupts. */
+  --color-note-bg: #f4eefb;
+  --color-note-hairline: #e3d6f1;
 
   --radius-card: 14px;
   --radius-pill: 999px;
@@ -84,6 +90,8 @@
   --color-warn-bg: #2e2718;
   --color-warn-hairline: #5b4a24;
   --color-note: #b79ad8;
+  --color-note-bg: #2b2334;
+  --color-note-hairline: #4b3c58;
 }
 
 html,
@@ -422,6 +430,30 @@ body {
 }
 .blk-warn .blk-body { color: var(--color-warn); }
 .blk-fail .blk-body { color: var(--color-danger); }
+
+/* Engine-side notes: "resumed session 1307: 277 message(s)...", "compacted...",
+   "no network in this sandbox...". They are neither an error nor part of the
+   answer, and a full-size body line of them reads like one. The tint and the
+   left rule make them scannable; the smaller face makes them cheap to skip.
+   max-width keeps a long note from becoming a full-measure paragraph. */
+.blk-note {
+  margin: 4px 0 6px;
+  padding: 5px 10px 5px 12px;
+  background: var(--color-note-bg);
+  border: 1px solid var(--color-note-hairline);
+  border-left: 2px solid var(--color-note);
+  border-radius: 8px;
+}
+.blk-note .blk-body {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-ink-2);
+  max-width: 78ch;
+}
+.blk-note .blk-body strong {
+  color: var(--color-note);
+  font-weight: 600;
+}
 
 /* tool card */
 /* Not a 62px/1fr grid. The head is display:none, so it is not a grid item, and
@@ -1657,6 +1689,52 @@ body {
   flex-wrap: wrap;
   gap: 8px;
   margin: 10px 0 4px 62px;
+}
+/* "the model wrote 38 files": one pill, expandable, every path inside it still a
+   chip you can open. Sits in the same row as the artifact chips so a turn that
+   produced both a deliverable and a codebase change shows the deliverable first
+   and the diff-shaped bulk second. */
+.fileroll {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.fileroll-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  align-self: flex-start;
+  padding: 6px 12px;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-pill);
+  background: var(--color-paper-2);
+  color: var(--color-ink-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.fileroll-head:hover {
+  border-color: var(--color-hairline-2);
+  color: var(--color-ink);
+}
+.fileroll-head::after {
+  content: ' \25B8';
+  opacity: 0.6;
+}
+.fileroll-head.open::after {
+  content: ' \25BE';
+}
+.fileroll-count {
+  font-weight: 550;
+  color: var(--color-ink);
+}
+.fileroll-size {
+  color: var(--color-ink-3);
+}
+.fileroll-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .filechip {
   display: flex;

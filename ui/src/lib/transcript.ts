@@ -248,6 +248,12 @@ export class Transcript {
   /** Files produced so far this turn, deduped by path, and the one row that
    *  shows them. */
   private turnFiles: OutputFile[] = []
+  /**
+   * The last few announcements about the app itself, with the conversation each
+   * one was about. Kept across repaints of that conversation, dropped when the
+   * memory overflows - oldest first.
+   */
+  private notes: { text: string; session: number | null }[] = []
   private questionCards = new Map<number, HTMLElement>()
   private fileStrip: HTMLElement | null = null
   private live = new LiveMarkdown()
@@ -1200,6 +1206,10 @@ export class Transcript {
         // rendered by the composer overlay, not inline: it needs the keyboard
         break
       case 'note':
+        // Rendered inline, and deliberately *not* recorded in the note memory:
+        // an event that arrives through apply() carries no conversation id, so
+        // replaying it would follow the reader into unrelated sessions. Real
+        // engine notes are routed by App through showNote(msg, viewId) instead.
         this.flushNow()
         this.block('note', 'note').textContent = ev.d.message
         break
@@ -1294,7 +1304,28 @@ export class Transcript {
 
   /** Surface a shell-level failure in the transcript, not just the log. */
   /** A quiet informational line: migration notices, backend defaults. */
-  showNote(msg: string) {
+  /**
+   * Show an announcement about the app itself: a resumed history, a compaction,
+   * a backend default. Not part of any answer, and deliberately not part of any
+   * turn's replay buffer either - a note about *this app* is not evidence about
+   * the conversation, and gating it by turn ownership made it vanish (the switch
+   * that emits it also triggers the repaint that would have shown it).
+   *
+   * `session` says which conversation the note is about; `null` means the app as
+   * a whole. The last few are kept so a repaint of that conversation brings them
+   * back rather than leaving the reader with a transcript that lost its only
+   * explanation.
+   */
+  showNote(msg: string, session?: number, paintHere = true) {
+    this.notes.push({ text: msg, session: session ?? null })
+    if (this.notes.length > NOTE_MEMORY) this.notes.shift()
+    // A note about conversation 18 does not belong on screen while the reader is
+    // looking at 3. It is kept, and replayNotes brings it back the moment 18 is on
+    // screen - which, for the note a session switch emits, is one repaint later.
+    if (paintHere) this.appendNote(msg)
+  }
+
+  private appendNote(msg: string) {
     const el = document.createElement('div')
     el.className = 'blk blk-note'
     const body = document.createElement('div')
@@ -1306,6 +1337,18 @@ export class Transcript {
     this.ensureTurn()
     this.turn!.appendChild(el)
     this.scrollIfNeeded()
+  }
+
+  /**
+   * Re-render the notes that belong to a conversation after its transcript is
+   * rebuilt. Only notes stamped with a session come back: an unstamped note has no
+   * conversation to be loyal to, and replaying one into every transcript turns a
+   * one-line notice into a stalker.
+   */
+  replayNotes(session: number) {
+    for (const n of this.notes) {
+      if (n.session === session) this.appendNote(n.text)
+    }
   }
 
   showError(msg: string) {
@@ -1827,22 +1870,69 @@ export class Transcript {
 
   private fileRow(files: OutputFile[]): HTMLElement {
     const row = this.el('filestrip')
-    for (const f of files) {
-      const chip = document.createElement('button')
-      chip.className = 'filechip'
-      chip.type = 'button'
-      chip.dataset.path = f.path
-      chip.title = `Open ${f.path}`
-      const ico = this.el('file-ico')
-      ico.append(fileIcon(f.mime))
-      chip.append(ico)
-      const meta = this.el('file-meta')
-      meta.append(this.el('file-name', f.name))
-      meta.append(this.el('file-sub', `${shortMime(f.mime)} · ${fmtSize(f.bytes)}`))
-      chip.append(meta)
-      row.append(chip)
+    // Two kinds of file, two shapes. A deliverable - the downloaded archive, the
+    // xlsx, the one-file HTML page - wants a chip you can click. A file the model
+    // changed while implementing a feature wants a count and a list: a real
+    // feature in a real repository is dozens of files, and a strip of 38 chips
+    // used to bury the one artifact in the turn. Below the threshold, chips are
+    // the right shape for changes too - two edited files are worth seeing.
+    const deliverables = files.filter((f) => f.kind === 'artifact')
+    const changes = files.filter((f) => f.kind !== 'artifact')
+    for (const f of deliverables) row.append(this.fileChip(f))
+    if (changes.length <= ROLL_FILES_AT) {
+      for (const f of changes) row.append(this.fileChip(f))
+    } else if (changes.length) {
+      row.append(this.changeRoll(changes))
     }
     return row
+  }
+
+  private fileChip(f: OutputFile): HTMLElement {
+    const chip = document.createElement('button')
+    chip.className = 'filechip'
+    chip.type = 'button'
+    chip.dataset.path = f.path
+    chip.title = `Open ${f.path}`
+    const ico = this.el('file-ico')
+    ico.append(fileIcon(f.mime))
+    chip.append(ico)
+    const meta = this.el('file-meta')
+    meta.append(this.el('file-name', f.name))
+    meta.append(this.el('file-sub', `${shortMime(f.mime)} · ${fmtSize(f.bytes)}`))
+    chip.append(meta)
+    return chip
+  }
+
+  /**
+   * One line for "the model changed a lot of files", expandable to the list.
+   *
+   * Every path stays clickable: collapsing a strip into a count must not cost
+   * access to any file in it. The folders are named when there are few, because
+   * "38 files · src, tests" answers the question the reader actually has.
+   */
+  private changeRoll(files: OutputFile[]): HTMLElement {
+    const wrap = this.el('fileroll')
+    const head = document.createElement('button')
+    head.type = 'button'
+    head.className = 'fileroll-head'
+    head.setAttribute('aria-expanded', 'false')
+    const bytes = files.reduce((sum, f) => sum + (f.bytes || 0), 0)
+    const dirs = [...new Set(files.map((f) => (f.path.includes('/') ? f.path.split('/')[0] : '.')))]
+    head.append(
+      this.el('fileroll-count', `${files.length} files written`),
+      this.el('fileroll-size', `${fmtSize(bytes)}${dirs.length <= 3 ? ` · ${dirs.join(', ')}` : ''}`),
+    )
+    const list = this.el('fileroll-list')
+    list.hidden = true
+    for (const f of files) list.append(this.fileChip(f))
+    head.onclick = () => {
+      const show = list.hidden
+      list.hidden = !show
+      head.classList.toggle('open', show)
+      head.setAttribute('aria-expanded', String(show))
+    }
+    wrap.append(head, list)
+    return wrap
   }
 
   /**
@@ -2288,6 +2378,21 @@ export class Transcript {
 }
 
 /** Minimum interval between live markdown passes. */
+/**
+ * How many changed files a turn can list as individual chips before they become
+ * one line. Four is the point where "files the model worked through" stops being
+ * a list you read and starts being a wall you skip - and where the deliverable in
+ * the same turn (an artifact, always shown as its own chip) disappears.
+ */
+const ROLL_FILES_AT = 4
+
+/**
+ * How many app announcements stay attachable to a transcript. Enough that the
+ * explanation for a slow turn is still there after a few switches back and forth;
+ * small enough that a long-lived window cannot accumulate a wall of old notes.
+ */
+const NOTE_MEMORY = 6
+
 const LIVE_RENDER_MS = 120
 
 /**

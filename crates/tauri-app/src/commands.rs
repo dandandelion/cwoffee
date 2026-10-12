@@ -712,6 +712,18 @@ pub fn gpu_report() -> gpu::GpuReport {
     gpu::report()
 }
 
+/// A paste of an image that lives only in the system clipboard.
+///
+/// The page cannot read it: WebKitGTK gives the paste event no file and no image
+/// item for a screenshot, and there is no `navigator.clipboard.read()` in an
+/// embedded webview. So the shell reads the selection and hands back the same
+/// shape a pasted file would have had. Always answers; `note` says why there is
+/// no image when the user plainly copied one.
+#[tauri::command]
+pub async fn clipboard_image() -> crate::clipboard::ClipProbe {
+    crate::clipboard::read_image().await
+}
+
 /// What the front end actually rendered.
 ///
 /// This exists because every machine-checkable gate in M0 passed while the

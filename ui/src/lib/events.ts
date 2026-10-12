@@ -43,6 +43,10 @@ export type OutputFile = {
   name: string
   mime: string
   bytes: number
+  // Mirrors engine FileKind. `artifact` is a deliverable to open from the chat;
+  // `edit` is a file the model changed in a tree; `unknown` is a row stored
+  // before the distinction existed, and is rendered the way those always were.
+  kind?: 'artifact' | 'edit' | 'unknown'
 }
 
 // Mirrors engine `Risk`. Harmless never prompts; Workspace changes a file that
@@ -113,7 +117,7 @@ export type EngineEvent =
   | { kind: 'turnStats'; d: TurnStats }
   | { kind: 'usage'; d: TurnTelemetry }
   | { kind: 'turnEnd'; d: { turn_id: number; finish: FinishReason } }
-  | { kind: 'note'; d: { message: string } }
+  | { kind: 'note'; d: { message: string; session?: number } }
   | { kind: 'error'; d: { message: string; fatal: boolean } }
 
 export interface GpuReport {

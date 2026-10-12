@@ -218,3 +218,31 @@ This box usually runs a 50 GB model on nine cores, so `selftest.sh` keeps two ho
 
 Neither rule exists to make failures disappear. Both exist because a failure that is really about the
 machine gets ignored, and an ignored suite is a suite that stops protecting anything.
+
+## What the newest checks measure
+
+Three checks exist because a user read a symptom, not because a number moved:
+
+- **A turn's files are split into deliverables and changes.** The scripted turn writes six files - five
+  source modules under `src/` and one standalone HTML page at the workspace root - and the check reads
+  the engine's own labels (`kind`) before it reads the DOM. It then requires the page to be its own
+  chip, the five changes to be one expandable count, and every rolled path to still be reachable after
+  one click. A collapse that costs access to a file is the failure this guards.
+- **A note looks like a note.** The check measures the resumed-history note against the answer next to
+  it: smaller type (11.5px against 14px in the last run), a tinted block, a rule at least 2px wide. It
+  also fails if the note's own text claims a cache state - the engine cannot see the endpoint's prefix
+  cache, so it is not allowed to say "cold", "warm" or "re-prefill".
+- **An image copied by another program pastes.** The harness puts a 97-byte PNG on the desktop selection
+  before launch (saving what was there and putting it back in `cleanup()`), stages the same file at an
+  agreed path, and the check compares the pasted bytes against it. The PNG magic is read by code point,
+  not by `startsWith`: the first byte is not printable, and an earlier version of the check failed on a
+  payload that had arrived intact. Where wl-clipboard is missing the run says the check was skipped.
+
+Two harness fixes came out of the check that needed them:
+
+- the mock emitted `tool_calls[].index: 0` for every call, so a scripted step that batched six writes
+  arrived as one call holding six concatenated argument strings. Real models batch; the harness could
+  not express it, which is why the flood fixture produced one file instead of six.
+- popover placement cleared the *pill* it opened from, not the footer bar the pill sits inside. The
+  search panel's lower edge landed 4px inside the footer, and the check's tolerance had been 4px. It
+  now measures the enclosing bar and the tolerance is 1px.

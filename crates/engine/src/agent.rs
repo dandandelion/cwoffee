@@ -49,6 +49,10 @@ pub struct AgentConfig {
     /// a hard stop sets `max_tool_iters` in the config.
     pub max_tool_iters: usize,
     pub reasoning: Reasoning,
+    /// What the exec sandbox may reach over the network. The prompt states it, so
+    /// the model's belief about `npm install` matches the sandbox it is running
+    /// in instead of the sentence written before the knob existed.
+    pub egress: crate::tools::net::NetMode,
     pub max_tokens: Option<u32>,
     /// Sampling overrides for the endpoint. Empty by default: the server's own
     /// defaults are its decision, not ours.
@@ -70,6 +74,7 @@ impl Default for AgentConfig {
             // session mid-task. See the field comment.
             max_tool_iters: 0,
             reasoning: Reasoning::Low,
+            egress: crate::tools::net::NetCfg::default().mode,
             // None means "whatever the server defaults to", which for llama.cpp
             // is -1: generate until the model stops or the context fills.
             // This used to be Some(2048), and that single number was the reason
@@ -105,6 +110,14 @@ pub struct Agent {
     /// never enter the prompt, so they cost no prefill and cannot invalidate the
     /// prefix cache.
     turn_files: Vec<crate::tools::OutputFile>,
+    /// Set when the prompt was rebuilt from the session file rather than built
+    /// in this process. The engine cannot see the endpoint's KV cache, so it is
+    /// not allowed to claim anything about it - cold or warm. It marks the next
+    /// token count as the one that settles the question, and says what came
+    /// back. A user with one slot and a resident model was told "the prompt
+    /// cache is cold after a restart" as if that were a law; their server had
+    /// not dropped a byte.
+    resumed_pending: Option<usize>,
 }
 
 impl Agent {
@@ -119,6 +132,10 @@ impl Agent {
         // seed it here rather than leaving PromptBuilder at its default.
         let mut prompt = PromptBuilder::new();
         prompt.set_reasoning(cfg.reasoning);
+        // Before the first prompt is built: this is system-prompt text, so it has
+        // to be right once rather than corrected later (which would cost the
+        // session its prefix cache).
+        prompt.set_egress(cfg.egress);
         Self {
             provider,
             registry,
@@ -128,8 +145,74 @@ impl Agent {
             ctx,
             turn_id: 0,
             turn_files: Vec::new(),
+            resumed_pending: None,
             cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The host calls this after rebuilding a prompt from stored rows. It is a
+    /// promise about the *next* token count, not a statement about the cache.
+    pub fn note_resumed(&mut self, messages: usize) {
+        self.resumed_pending = Some(messages);
+    }
+
+    /// One honest sentence about prefix caching, written from the server's own
+    /// numbers after the first reply that follows a resume.
+    ///
+    /// Warm (the endpoint kept its prefix) is the common case and says nothing:
+    /// a note that reports good news on every resume is noise that trains the
+    /// reader to ignore notes. Silent when the counts themselves are missing:
+    /// an endpoint that publishes nothing leaves the question open, and the log
+    /// says so rather than the transcript pretending an answer.
+    fn report_resume_warmth(
+        &mut self,
+        tel: &crate::telemetry::TurnTelemetry,
+        out: &EngineSink,
+        session_id: i64,
+    ) {
+        let Some(msgs) = self.resumed_pending.take() else {
+            return;
+        };
+        let prompt = tel.prompt_tokens;
+        if prompt == 0 {
+            eprintln!(
+                "[cwoffee] resume warmth: {} message(s) came from the session file; this endpoint \
+                 reports no token counts, so the cache state is unknown",
+                msgs
+            );
+            return;
+        }
+        let hit = tel.cached_tokens as f64 / prompt as f64;
+        let re_prefilled = prompt.saturating_sub(tel.cached_tokens);
+        eprintln!(
+            "[cwoffee] resume warmth: {} message(s), {}/{} prompt tokens cached ({:.1}%), \
+             {re_prefilled} re-prefilled in {}ms",
+            msgs, tel.cached_tokens, prompt, hit * 100.0, tel.ttft_ms
+        );
+        // Below half the prompt reused, or with less than a few hundred tokens
+        // at stake, there is nothing the reader could do with the number.
+        if hit >= 0.5 || re_prefilled < 600 {
+            return;
+        }
+        let rate = if tel.server_prefill_tps > 0.0 {
+            format!("{:.0} tok/s", tel.server_prefill_tps)
+        } else {
+            "prefill rate not reported".to_string()
+        };
+        let _ = out.send(EngineEvent::Note {
+            session: Some(session_id),
+            message: format!(
+                "resume warmth: the endpoint held {} of {} prompt tokens ({:.0}%), so {} tokens were \
+                 re-prefilled before the first token - {}s at {}. That is what resuming a session of \
+                 this size costs here; it is not a fault in the session.",
+                tel.cached_tokens,
+                prompt,
+                hit * 100.0,
+                re_prefilled,
+                tel.ttft_ms as f64 / 1000.0,
+                rate
+            ),
+        });
     }
 
     pub fn prompt_mut(&mut self) -> &mut PromptBuilder {
@@ -318,6 +401,7 @@ impl Agent {
                 ),
             };
             let _ = out.send(EngineEvent::Note {
+            session: Some(session_id),
                 message: format!(
                     "history over budget: ~{est} tokens now, budget {budget} (model window {window}); \
                      {what}, ~{} tokens back, compaction #{} - the next prefill will be slow",
@@ -349,6 +433,7 @@ impl Agent {
                 // what is happening and how to bound it - without pretending the
                 // turn is out of road.
                 let _ = out.send(EngineEvent::Note {
+            session: Some(session_id),
                     message: format!(
                         "{iters} tool calls so far and no cap set; set max_tool_iters in config.toml to bound a turn"
                     ),
@@ -381,7 +466,7 @@ impl Agent {
                 ));
             }
 
-            let collected = match self.stream_once(&req, out).await {
+            let collected = match self.stream_once(&req, out, session_id).await {
                 Ok(c) => c,
                 Err(msg) => {
                     let _ = out.send(EngineEvent::Error { message: msg, fatal: true });
@@ -434,6 +519,7 @@ impl Agent {
                         cut_short += 1;
                         carry_on = true;
                         let _ = out.send(EngineEvent::Note {
+            session: Some(session_id),
                             message: format!(
                                 "the answer hit the output limit after {} tokens - continuing where it stopped ({cut_short} of {MAX_CONTINUATIONS})",
                                 collected.telemetry.completion_tokens
@@ -442,6 +528,7 @@ impl Agent {
                         continue;
                     }
                     let _ = out.send(EngineEvent::Note {
+            session: Some(session_id),
                         message: format!(
                             "the answer is still cut short at the output limit ({} tokens).                              Raise max_output_tokens in config.toml, or the server's -np.",
                             collected.telemetry.completion_tokens
@@ -475,7 +562,7 @@ impl Agent {
         // that was just done. So spend no more tools - one last round-trip with
         // the tool list removed, whose only job is to say what it did and what is
         // left.
-        self.wrap_up_without_tools(out, &mut agg).await;
+        self.wrap_up_without_tools(out, &mut agg, session_id).await;
 
         self.emit_turn_files(turn, out);
                 let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: FinishReason::Length });
@@ -488,8 +575,9 @@ impl Agent {
     /// The instruction is added to the *request*, never to history. It is a
     /// control message rather than something the user said, and pushing it through
     /// `push_user` would store it and render a user bubble the user never typed.
-    async fn wrap_up_without_tools(&mut self, out: &EngineSink, agg: &mut TurnTelemetry) {
+    async fn wrap_up_without_tools(&mut self, out: &EngineSink, agg: &mut TurnTelemetry, session_id: i64) {
         let _ = out.send(EngineEvent::Note {
+            session: Some(session_id),
             message: format!(
                 "tool budget spent ({} iterations); summarising without running anything else",
                 self.cfg.max_tool_iters
@@ -505,7 +593,7 @@ impl Agent {
             "You have used up your tool budget. Do not request any more tools.              In the user's own language, say in a few sentences what you actually              did, what you produced or changed (by name), and what is still              unfinished or unverified. Plain prose, no tool calls.",
         ));
 
-        match self.stream_once(&req, out).await {
+        match self.stream_once(&req, out, session_id).await {
             Ok(c) if !c.text.trim().is_empty() => {
                 agg.merge_server(&c.telemetry);
                 self.prompt
@@ -538,7 +626,12 @@ impl Agent {
         }
     }
 
-    async fn stream_once(&mut self, req: &ChatRequest, out: &EngineSink) -> Result<Collected, String> {
+    async fn stream_once(
+        &mut self,
+        req: &ChatRequest,
+        out: &EngineSink,
+        session_id: i64,
+    ) -> Result<Collected, String> {
         let (tx, mut rx) = mpsc::unbounded_channel::<Delta>();
 
         // The consumer runs as a task, not inline. `Provider::stream` borrows
@@ -674,6 +767,7 @@ impl Agent {
         }
 
         let _ = out.send(EngineEvent::Usage(tel.clone()));
+        self.report_resume_warmth(&tel, out, session_id);
         Ok(Collected { text, calls, telemetry: tel, finish, reasoning: think, reasoning_ms })
     }
 
@@ -1099,7 +1193,7 @@ mod tests {
         assert_eq!(g.compactions, 1);
         let mut seen: Vec<String> = Vec::new();
         while let Ok(e) = erx.try_recv() {
-            if let EngineEvent::Note { message } = e {
+            if let EngineEvent::Note { message, .. } = e {
                 if message.contains("history over budget") {
                     seen.push(message);
                 }
@@ -1173,6 +1267,7 @@ mod tests {
                 name: "report.md".into(),
                 mime: "text/markdown".into(),
                 bytes: (100 * (n as u64 + 1)) as u64,
+                kind: crate::tools::FileKind::Edit,
             });
             r
         }
@@ -1872,7 +1967,7 @@ mod tests {
         let mut saw_complaint = false;
         while let Ok(e) = rx.try_recv() {
             match e {
-                EngineEvent::Note { message } => {
+                EngineEvent::Note { message, .. } => {
                     if message.contains("tool budget spent") {
                         saw_note = true;
                     }
@@ -1935,7 +2030,7 @@ mod tests {
         while let Ok(e) = rx.try_recv() {
             match e {
                 EngineEvent::Error { message, .. } if message.contains("tool iterations") => saw_cap = true,
-                EngineEvent::Note { message } if message.contains("tool budget spent (3 iterations)") => {
+                EngineEvent::Note { message, .. } if message.contains("tool budget spent (3 iterations)") => {
                     named_cap = true
                 }
                 _ => {}
@@ -1976,7 +2071,7 @@ mod tests {
         let mut uncapped_notes = 0usize;
         let mut claimed_budget = false;
         while let Ok(e) = rx.try_recv() {
-            if let EngineEvent::Note { message } = e {
+            if let EngineEvent::Note { message, .. } = e {
                 if message.contains("no cap set") {
                     uncapped_notes += 1;
                 }
@@ -2016,5 +2111,154 @@ mod tests {
         use crate::tools::{Risk, Tool};
         let t = crate::tools::exec::ExecTool::default();
         assert_eq!(t.risk(), Risk::Sensitive);
+    }
+
+    // ---- resume warmth: measured, never asserted ---------------------------
+    //
+    // The engine cannot see the endpoint's KV cache. Before this, every resume
+    // announced "the prompt cache is cold after a restart" - a claim about
+    // someone else's memory, stated as fact, on a machine where one slot and a
+    // resident model meant the prefix was usually still there.
+
+    fn warmth_agent(
+        tel: Option<TurnTelemetry>,
+    ) -> (
+        Agent,
+        mpsc::UnboundedSender<EngineEvent>,
+        mpsc::UnboundedReceiver<EngineEvent>,
+    ) {
+        let (etx, erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel::<(
+            crate::approval::ApprovalRequest,
+            tokio::sync::oneshot::Sender<ApprovalAnswer>,
+        )>();
+        let mut seq = vec![Delta::Text("resumed answer".into())];
+        if let Some(t) = tel {
+            seq.push(Delta::Telemetry(t));
+        }
+        seq.push(Delta::Done(FinishReason::Stop));
+        let agent = Agent::new(
+            std::sync::Arc::new(Scripted {
+                turns: vec![seq],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Registry::new(),
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        (agent, etx, erx)
+    }
+
+    fn notes_of(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            if let EngineEvent::Note { message, .. } = e {
+                out.push(message);
+            }
+        }
+        out
+    }
+
+    /// The endpoint said it reused 120 of 5000 prompt tokens. That is a fact
+    /// worth showing, with the cost attached.
+    #[tokio::test]
+    async fn a_resumed_turn_that_re_prefilled_says_so_with_the_endpoint_s_numbers() {
+        let (mut agent, etx, mut erx) = warmth_agent(Some(TurnTelemetry {
+            prompt_tokens: 5000,
+            cached_tokens: 120,
+            completion_tokens: 9,
+            ttft_ms: 7300,
+            server_prefill_tps: 68.0,
+            ..Default::default()
+        }));
+        agent.note_resumed(180);
+        agent.run_turn("continue", vec![], &etx, 7).await;
+        let warmth: Vec<String> = notes_of(&mut erx)
+            .into_iter()
+            .filter(|m| m.contains("resume warmth"))
+            .collect();
+        assert_eq!(warmth.len(), 1, "no measured warmth note: {:?}", warmth);
+        let m = &warmth[0];
+        for needle in ["120 of 5000", "2%", "4880", "7.3s", "68 tok/s"] {
+            assert!(m.contains(needle), "the warmth note lacked {needle:?}: {m}");
+        }
+    }
+
+    /// Warm is the ordinary case and the reader already knows: a note on every
+    /// resume is noise that trains people to skip notes.
+    #[tokio::test]
+    async fn a_resumed_turn_the_endpoint_still_holds_says_nothing() {
+        let (mut agent, etx, mut erx) = warmth_agent(Some(TurnTelemetry {
+            prompt_tokens: 5000,
+            cached_tokens: 4900,
+            completion_tokens: 9,
+            ttft_ms: 180,
+            server_prefill_tps: 300.0,
+            ..Default::default()
+        }));
+        agent.note_resumed(180);
+        agent.run_turn("continue", vec![], &etx, 7).await;
+        let warmth: Vec<String> = notes_of(&mut erx)
+            .into_iter()
+            .filter(|m| m.contains("resume warmth"))
+            .collect();
+        assert!(warmth.is_empty(), "a warm resume was narrated: {warmth:?}");
+    }
+
+    /// An endpoint that publishes no token counts leaves the question open. The
+    /// old code filled that gap with a guess; this one stays quiet in the
+    /// transcript and says "unknown" in the log.
+    #[tokio::test]
+    async fn an_endpoint_that_reports_no_counts_leaves_the_cache_state_unknown() {
+        let (mut agent, etx, mut erx) = warmth_agent(None);
+        agent.note_resumed(3);
+        agent.run_turn("continue", vec![], &etx, 7).await;
+        let warmth: Vec<String> = notes_of(&mut erx)
+            .into_iter()
+            .filter(|m| m.contains("cache"))
+            .collect();
+        assert!(warmth.is_empty(), "an unmeasured cache state was asserted: {warmth:?}");
+    }
+
+    /// A turn after the first is not a resume: the flag is one-shot, or every
+    /// tool iteration of a long turn would narrate the same measurement.
+    #[tokio::test]
+    async fn warmth_is_measured_once_per_resume_not_once_per_request() {
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel::<(
+            crate::approval::ApprovalRequest,
+            tokio::sync::oneshot::Sender<ApprovalAnswer>,
+        )>();
+        let cold = TurnTelemetry {
+            prompt_tokens: 5000,
+            cached_tokens: 10,
+            completion_tokens: 3,
+            ttft_ms: 9000,
+            server_prefill_tps: 50.0,
+            ..Default::default()
+        };
+        let agent = Agent::new(
+            std::sync::Arc::new(Scripted {
+                turns: vec![
+                    vec![Delta::Text("one".into()), Delta::Telemetry(cold.clone()), Delta::Done(FinishReason::Stop)],
+                    vec![Delta::Text("two".into()), Delta::Telemetry(cold.clone()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Registry::new(),
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        let mut agent = agent;
+        agent.note_resumed(12);
+        agent.run_turn("first", vec![], &etx, 7).await;
+        agent.run_turn("second", vec![], &etx, 7).await;
+        let warmth: Vec<String> = notes_of(&mut erx)
+            .into_iter()
+            .filter(|m| m.contains("resume warmth"))
+            .collect();
+        assert_eq!(warmth.len(), 1, "warmth narrated {} times for one resume", warmth.len());
     }
 }

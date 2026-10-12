@@ -413,6 +413,10 @@ impl Tool for DownloadTool {
                 .unwrap_or_else(|| rel.clone()),
             mime,
             bytes: written,
+            // A download is a deliverable whatever it is named: the name came from
+            // a URL or the model's choice, so extension-guessing is the weaker fact
+            // here and the act of fetching is the stronger one.
+            kind: super::FileKind::Artifact,
         };
         ToolResult::ok(format!(
             "saved {} to {} ({})",

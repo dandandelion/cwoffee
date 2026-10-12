@@ -153,6 +153,14 @@
     right: number
     top: number
     bottom: number
+    /**
+     * Top edge of the bar the opener lives in (the footer, for the search /
+     * telemetry / gateway pills), or the opener's own top when it is not in a bar.
+     * A panel that flips upward has to clear this, not just the pill: the pill sits
+     * inside the bar with padding above it, and clearing only the pill left the
+     * panel painted over the footer's own text.
+     */
+    barTop: number
   }
   let menu = $state<Menu | null>(null)
   let menuPos = $state<{ x: number; y: number } | null>(null)
@@ -487,6 +495,7 @@
       right: r.right,
       top: r.top,
       bottom: r.bottom,
+      barTop: anchor.closest('footer')?.getBoundingClientRect().top ?? r.top,
     }
   }
 
@@ -505,7 +514,10 @@
     x = Math.max(8, Math.min(x, vw - w - 8))
     let y = m.bottom + 6
     if (y + h + 8 > vh) {
-      const above = m.top - h - 6
+      // Flip above the opener - but above the *bar* the opener sits in. Clearing
+      // only the pill left the panel's lower edge 4px inside the footer band, and
+      // the footer text showed through the panel's shadow.
+      const above = Math.min(m.top, m.barTop) - h - 6
       y = above >= 8 ? above : Math.max(8, vh - h - 8)
     }
     menuPos = { x, y }
@@ -1133,7 +1145,14 @@
 
     // Live output belongs to the session that owns the turn. Buffer it when the
     // user is looking elsewhere, and replay it when they come back.
-    const inFlight = owner !== null && ev.kind !== 'sessionChanged'
+    //
+    // An announcement about the app itself (a resumed history, a compaction, a
+    // refusal) is not turn output and has no owner session to buffer against.
+    // Treating it as turn output meant the note a session switch emits was parked
+    // in the buffer during the repaint that same switch triggered - so it never
+    // reached the screen at all.
+    const announcement = ev.kind === 'note' || ev.kind === 'error'
+    const inFlight = !announcement && owner !== null && ev.kind !== 'sessionChanged'
     if (inFlight) {
       // Buffer every event of the running turn, not just the ones that arrive
       // while the user is looking elsewhere. Buffering only the latter lost the
@@ -1145,6 +1164,26 @@
       } else {
         transcript?.apply(ev)
       }
+    } else if (ev.kind === 'note') {
+      // Stamped with the conversation the reader is looking at, so the note comes
+      // back when they come back - and does not follow them somewhere else. With
+      // no conversation open there is nothing to stamp it to; it stays where it
+      // was painted.
+      // The engine names the conversation the note is about; the client no longer
+      // guesses it from what happens to be on screen. Stamping from `viewId` was how
+      // the note announcing a switch got filed under the conversation the reader was
+      // leaving, and then dropped by the repaint of the one they were entering.
+      transcript?.showNote(
+        ev.d.message,
+        ev.d.session ?? viewId ?? undefined,
+        ev.d.session == null || ev.d.session === viewId,
+      )
+    } else if (ev.kind === 'error') {
+      // Painted now, and kept: an error that only exists in the view it happened in
+      // is gone when the reader moves away and comes back, which is how a failed
+      // turn gets remembered as a finished one.
+      if (owner !== null) bufferLive(ev)
+      transcript?.apply(ev)
     } else {
       transcript?.apply(ev)
     }
@@ -1545,9 +1584,117 @@
 
   function onPaste(e: ClipboardEvent) {
     const files = filesFromTransfer(e.clipboardData)
-    if (!files.length) return
-    e.preventDefault()
-    void addFiles(files)
+    if (files.length) {
+      e.preventDefault()
+      void addFiles(files)
+      return
+    }
+    // Nothing in the paste event. On this desktop that is normal for a
+    // screenshot: WebKitGTK reports a paste with no file and no image item even
+    // when the selection plainly holds a PNG, and there is no
+    // navigator.clipboard.read() in an embedded webview either. So ask the shell
+    // what the clipboard actually offers. An ordinary text paste is excluded
+    // here - it is the common case and must not pay for a subprocess.
+    const types = Array.from(e.clipboardData?.types ?? [])
+    const imageish = types.some((t) => t.startsWith('image/') || t === 'text/uri-list')
+    if (!imageish && types.includes('text/plain')) return
+    void addClipboardImage()
+  }
+
+  /** Name for an image that arrived from the clipboard rather than a file. */
+  function pastedName(mime: string) {
+    const ext = (mime.split('/')[1] ?? 'png').replace('jpeg', 'jpg')
+    const d = new Date()
+    const pad = (n: number) => String(n).padStart(2, '0')
+    return `clipboard-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${ext}`
+  }
+
+  /**
+   * Attach an image that is already base64 - the shape the shell hands back for a
+   * clipboard image, and the shape the browser's Clipboard API produces.
+   *
+   * The same guardrails as addFiles apply, because an oversized or unsupported
+   * image has to be refused in the composer with a reason rather than at the
+   * engine boundary a second later.
+   */
+  async function addBase64Image(mime: string, bytes: number, b64: string, name: string) {
+    attachErr = ''
+    if (!OK_MIME.includes(mime)) {
+      attachErr = `${name}: ${mime} is not a supported image`
+      return false
+    }
+    if (bytes > MAX_ATTACH_BYTES) {
+      attachErr = `${name}: ${fmtBytes(bytes)} exceeds ${fmtBytes(MAX_ATTACH_BYTES)}`
+      return false
+    }
+    if (pending.length >= MAX_ATTACH) {
+      attachErr = `at most ${MAX_ATTACH} images per message`
+      return false
+    }
+    // A data: URL stands in for the blob URL a File would have produced. The
+    // payload is already in memory; making a blob out of it would copy it again.
+    pending = [...pending, { name, mime, bytes, b64, url: `data:${mime};base64,${b64}` }]
+    return true
+  }
+
+  /**
+   * Read an image off the system clipboard.
+   *
+   * The native path asks the shell (wl-paste / xclip), which is the only way a
+   * screenshot taken outside this window can reach the composer. The browser path
+   * uses the Clipboard API, which needs the user's gesture and shows a permission
+   * prompt once - and says so when it is refused, rather than failing quietly.
+   */
+  async function addClipboardImage() {
+    if (pending.length >= MAX_ATTACH) {
+      attachErr = `at most ${MAX_ATTACH} images per message`
+      return false
+    }
+    if (isTauri()) {
+      try {
+        const probe = await invoke<{
+          image: { mime: string; bytes: number; data_b64: string; source: string } | null
+          offered: string[]
+          note: string
+        }>('clipboard_image')
+        if (!probe.image) {
+          if (probe.note) attachErr = probe.note
+          else pageLog(`clipboard offered [${probe.offered.join(', ')}]: nothing sendable`)
+          return false
+        }
+        return await addBase64Image(
+          probe.image.mime,
+          probe.image.bytes,
+          probe.image.data_b64,
+          pastedName(probe.image.mime),
+        )
+      } catch (err) {
+        attachErr = `clipboard image failed: ${String(err)}`
+        return false
+      }
+    }
+    try {
+      const items = await navigator.clipboard.read()
+      for (const it of items) {
+        const type = it.types.find((t) => OK_MIME.includes(t))
+        if (!type) continue
+        const blob = await it.getType(type)
+        const buf = new Uint8Array(await blob.arrayBuffer())
+        // Chunked: String.fromCharCode(...buf) with a 2 MB image blows the stack,
+        // which looks exactly like "paste does not work".
+        let s = ''
+        for (let i = 0; i < buf.length; i += 0x8000) {
+          s += String.fromCharCode(...buf.subarray(i, i + 0x8000))
+        }
+        return await addBase64Image(type, buf.byteLength, btoa(s), pastedName(type))
+      }
+      pageLog('clipboard had no image the browser would hand over')
+      return false
+    } catch (err) {
+      attachErr = `the browser would not let the page read the clipboard (${String(err)}); `
+        + 'use Ctrl+V inside the window, or the image button'
+      return false
+    }
   }
 
   let dragIdx = $state<number | null>(null)
@@ -2006,6 +2153,7 @@
         viewId = b.session_id
         transcript?.clear()
         transcript?.loadHistory(page.messages)
+        transcript?.replayNotes(b.session_id)
         viewMsgCount = page.messages.length
         hasOlder = page.has_older
         oldestId = page.messages.length ? page.messages[0].id : null
@@ -2211,6 +2359,9 @@
     })
     pageLog(`history: ${page.messages.length} row(s) for session ${id}`)
     transcript?.loadHistory(page.messages)
+    // The note explaining this conversation is not stored in it: a resumed history
+    // announces itself once, and a repaint used to drop that announcement.
+    transcript?.replayNotes(id)
     // A queued session switch can land before the turn has persisted anything,
     // and reloading then would report an in-flight session as empty and drop
     // the view back to the greeting mid-turn.
@@ -2325,7 +2476,7 @@
         // it measures is a history row that arrives afterwards - which is exactly how
         // "expanded thinking block has no width: 0" came back even with the view open.
         await waitFor('history to paint', () => document.querySelectorAll('.turn').length > 0, 4000)
-        await new Promise<void>((r) => requestAnimationFrame(() => r()))
+        await frame(0)
         // Width, not presence: the transcript element stays in the document while the
         // empty screen is up, and a 0x0 box measures just as uselessly as none.
         const ok = await waitFor(
@@ -2476,6 +2627,55 @@
     if (await blind('at the start')) {
       pageLog('SELFTEST ABORTED: nothing was measured')
       return
+    }
+    // rAF is not a clock. An occluded, minimized or workspace-switched window stops
+    // compositing, and a wait built only on requestAnimationFrame then never settles:
+    // the run prints no verdict and no failure, and the harness's only signal is a
+    // fifteen-minute watchdog. Settle on a floor instead and say so once per episode,
+    // so a long chain of frame waits costs one honest skip rather than thirty.
+    let rafStalls = 0
+    let lastStallLogged = 0
+    // Paints the compositor actually delivered. Animation progress is only
+    // observable while this moves: an occluded window freezes CSS animations at
+    // their starting values, and a check that then asks "is this word still
+    // half-drawn?" is measuring the window manager.
+    let framePaints = 0
+    /** Wait for `paints` real paints, settling on a floor if they never come.
+     *  Resolves true when the page actually painted, false when the floor won. */
+    function frame(settleMs = 0, paints = 1): Promise<boolean> {
+      return new Promise((res) => {
+        let left = paints
+        let settled = false
+        let timer = 0
+        const step = () => {
+          if (settled) return
+          left -= 1
+          if (left <= 0) {
+            settled = true
+            clearTimeout(timer)
+            framePaints += 1
+            setTimeout(() => res(true), settleMs)
+            return
+          }
+          requestAnimationFrame(step)
+        }
+        requestAnimationFrame(step)
+        timer = setTimeout(() => {
+          if (settled) return
+          settled = true
+          rafStalls += 1
+          const now = Date.now()
+          if (now - lastStallLogged > 5000) {
+            lastStallLogged = now
+            blindSkips += 1
+            pageLog(
+              `selftest note: requestAnimationFrame stayed silent for ${400 + settleMs}ms - the page is not ` +
+                'being composited, so the frame-paced checks are settling on a timeout floor instead of on paints',
+            )
+          }
+          setTimeout(() => res(false), settleMs)
+        }, 400 + settleMs)
+      })
     }
       // Sessions created lazily by a check's `newSession(); send()` pair are not
       // the `selftest` session this harness deletes by id, and auto-titling renames
@@ -2873,7 +3073,7 @@
           const sc = document.querySelector('.scroller') as HTMLElement | null
           const beforeTop = sc?.scrollTop ?? 0
           body.scrollTop = 400
-          await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
+          await frame(0, 2)
           if (body.scrollTop < 200) fail(`the command body refused to scroll (scrollTop ${body.scrollTop})`)
           if (sc && Math.abs(sc.scrollTop - beforeTop) > 1) fail('scrolling the command moved the transcript behind it')
           pageLog(
@@ -3286,10 +3486,12 @@
                 fail(`the search panel is off-screen vertically: ${pr.top.toFixed(0)}..${pr.bottom.toFixed(0)} of ${innerHeight}`)
               if (pr.left < -1 || pr.right > innerWidth + 1)
                 fail(`the search panel is cut off sideways: ${pr.left.toFixed(0)}..${pr.right.toFixed(0)} of ${innerWidth}`)
-              // A panel that opens upward from the footer should end at the footer's
-              // top; a pixel of overlap is rounding, not a layout fault. What must not
-              // happen is the panel sitting *inside* or behind the footer.
-              if (footer && pr.bottom > footer.top + 4 && pr.top < footer.bottom - 4)
+              // A panel that opens upward from the footer must clear the footer it
+              // sits on, not just the pill it opens from: the pill lives inside the
+              // bar with padding above it, and clearing only the pill left the panel
+              // painted over the footer's text with its shadow on top. A pixel is
+              // rounding; four was a layout fault and the check used to allow it.
+              if (footer && pr.bottom > footer.top + 1 && pr.top < footer.bottom - 1)
                 fail(
                   `the search panel sits on top of the footer it opens from: panel ${pr.top.toFixed(0)}..${pr.bottom.toFixed(0)}, footer ${footer.top.toFixed(0)}..${footer.bottom.toFixed(0)}`,
                 )
@@ -3320,7 +3522,7 @@
             l3.textContent = 'port 8899 · idle 120s · config /home/user/.config/cwoffee/searxng'
             synth.append(l1, l2, l3)
             panel.appendChild(synth)
-            await new Promise<void>((r) => requestAnimationFrame(() => setTimeout(r, 60)))
+            await frame(60)
             const lineBad: string[] = []
             for (const [a, b, na, nb] of [
               [l1, l2, 'label', 'runtime line'],
@@ -4948,6 +5150,215 @@
           }
         }
 
+        // (a13) a turn that wrote a dozen files shows one line, not a dozen chips
+        //
+        // Implementing a feature in a real repository touches dozens of files, and
+        // every one of them became a chip - which made the one thing worth opening
+        // (the standalone page the model also wrote) impossible to find. The engine
+        // now labels each produced file as a deliverable or a change, and the
+        // transcript gives the two shapes: a chip each, or one expandable count.
+        {
+          const hostWas = hostState?.session_id ?? 0
+          const viewWas = viewId ?? 0
+          const sessF = await invoke<number>('new_session', { title: 'selftest attachment flood' })
+          const bF = await turnCount()
+          await invoke('start_turn', {
+            text: 'Selftest attachment flood: implement five modules under src/ and a standalone panel page at the workspace root.',
+            session: sessF,
+          }).catch((e) => pageLog(`selftest note: flood turn failed: ${e}`))
+          if (!(await waitTurnDone(bF, 120000))) fail('the attachment flood turn never finished')
+          await useSession(sessF)
+          await new Promise((r) => setTimeout(r, 400))
+          const storedF = await invoke<any>('session_messages', { id: sessF, limit: 40 })
+          const produced = (storedF.messages ?? []).flatMap((m: any) => m.files ?? [])
+          const kinds = produced.map((f: any) => f.kind ?? 'missing')
+          const strip = [...document.querySelectorAll('.filestrip')].pop() as HTMLElement | undefined
+          if (produced.length < 6) {
+            fail(
+              `the flood turn produced ${produced.length} files (expected 6): ${produced
+                .map((f: any) => f.path)
+                .join(', ') || 'nothing'}` +
+                ' - the fixture did not run as written',
+            )
+          } else if (!kinds.includes('edit') || !kinds.includes('artifact')) {
+            fail(`the engine labelled none of the ${produced.length} produced files: ${kinds.join(',')}`)
+          } else if (!strip) {
+            fail('the flood turn shows no produced-files strip at all')
+          } else {
+            const topChips = [...strip.querySelectorAll(':scope > .filechip')] as HTMLElement[]
+            const roll = strip.querySelector('.fileroll') as HTMLElement | null
+            const head = roll?.querySelector('.fileroll-head') as HTMLElement | null
+            const list = roll?.querySelector('.fileroll-list') as HTMLElement | null
+            const panel = topChips.find((c) => (c.dataset.path ?? '').endsWith('selftest-flood-panel.html'))
+            if (!panel) {
+              fail(
+                `the standalone page is not its own chip (chips: ${
+                  topChips.map((c) => c.dataset.path).join(', ') || 'none'
+                })`,
+              )
+            } else if (!roll || !head || !list) {
+              fail(
+                `the ${kinds.filter((k: string) => k === 'edit').length} changed files are individual chips: a codebase ` +
+                  'change buries the deliverable in the same turn',
+              )
+            } else if (!/5 files written/.test(head.textContent ?? '')) {
+              fail(`the roll does not count the changes: "${(head.textContent ?? '').trim()}"`)
+            } else {
+              const closedAtFirst = list.hidden
+              head.click()
+              await new Promise((r) => setTimeout(r, 150))
+              const rolled = [...list.querySelectorAll('.filechip')] as HTMLElement[]
+              const cs = getComputedStyle(head)
+              if (!closedAtFirst) fail('the rolled list is expanded before anyone asked for it')
+              else if (rolled.length !== 5)
+                fail(`expanding the roll reveals ${rolled.length} of the changed files, not 5`)
+              else if (!rolled.every((c) => (c.dataset.path ?? '').includes('selftest-flood')))
+                fail('a rolled file lost the path that makes it clickable')
+              else if (cs.backgroundColor === 'rgba(0, 0, 0, 0)' || cs.backgroundColor === 'transparent')
+                fail('the roll has no fill: it reads as loose text rather than a control')
+              else
+                pageLog(
+                  `attachment roll ok (${produced.length} files: 1 deliverable chip + a roll of ` +
+                    `${rolled.length} changes, every path reachable on expand)`,
+                )
+            }
+          }
+          // Leave the way it was found, in the order that cannot strand the host:
+          // a session the engine is standing in cannot be deleted underneath it -
+          // that is how a previous version of this check left the host on session 0
+          // and broke every check that followed.
+          if (hostWas) await invoke('switch_session', { id: hostWas }).catch((e) => pageLog(`switch back failed: ${e}`))
+          await invoke('delete_session', { id: sessF }).catch((e) => pageLog(`delete_session failed: ${e}`))
+          if (viewWas) await resyncView(viewWas)
+        }
+
+        // (a14) an engine note is quiet to read and obvious to find
+        //
+        // Notes about the app itself ("resumed session 14: 160 message(s)...") used
+        // to render as full-size body text, indistinguishable from the answer, which
+        // is both intrusive and easy to miss. They now sit in a tinted block at a
+        // smaller size. The CSS is part of the contract, so the check reads the
+        // computed style rather than the class name, and also holds the engine to its
+        // own rule: a note may not claim a cache state it cannot see.
+        {
+          const hostWas2 = hostState?.session_id ?? 0
+          const viewWas2 = viewId ?? 0
+          const sessN = await invoke<number>('new_session', { title: 'selftest notes' })
+          const bN = await turnCount()
+          await invoke('start_turn', { text: 'Selftest notes: what is 6 times 7?', session: sessN }).catch((e) =>
+            pageLog(`selftest note: seed turn failed: ${e}`),
+          )
+          if (!(await waitTurnDone(bN, 90000))) fail('the note seed turn never finished')
+          // Leave and come back: that is the switch the engine announces with the
+          // resumed-history note, and it is the note this check styles.
+          const away = await invoke<number>('new_session', { title: 'selftest notes away' })
+          await useSession(away)
+          await useSession(sessN)
+          const findNote = () =>
+            [...document.querySelectorAll('.blk-note')].find((n) =>
+              (n.textContent ?? '').includes('resumed session'),
+            ) as HTMLElement | undefined
+          let noteEl = findNote()
+          // The note and the repaint race: the switch emits both. It is remembered
+          // by the transcript and re-rendered after a repaint; give that a moment
+          // before deciding it never arrived.
+          for (let i = 0; !noteEl && i < 12; i++) {
+            await new Promise((r) => setTimeout(r, 150))
+            noteEl = findNote()
+          }
+          const noteBody = noteEl?.querySelector('.blk-body') as HTMLElement | null
+          const answerBody = [
+            ...document.querySelectorAll('.blk-answer .blk-body'),
+          ].pop() as HTMLElement | null
+          if (!noteEl || !noteBody) {
+            fail('the resumed-history note never reached the screen (buffered, or dropped by the repaint)')
+          } else if (!answerBody) {
+            fail('no answer block on screen to compare a note against')
+          } else {
+            const nCs = getComputedStyle(noteBody)
+            const aCs = getComputedStyle(answerBody)
+            const wrapCs = getComputedStyle(noteEl)
+            const nSize = parseFloat(nCs.fontSize)
+            const aSize = parseFloat(aCs.fontSize)
+            const text = (noteEl.textContent ?? '').replace(/\s+/g, ' ').trim()
+            if (!/resumed session/.test(text))
+              fail(`the note on screen is not the resumed-history note: "${text}"`)
+            else if (!(nSize < aSize))
+              fail(`a note is set at ${nSize}px against an answer at ${aSize}px: nothing distinguishes them`)
+            else if (wrapCs.backgroundColor === 'rgba(0, 0, 0, 0)' || wrapCs.backgroundColor === 'transparent')
+              fail('the note block has no tinted background: it is still a bare line of text')
+            else if (parseFloat(wrapCs.borderLeftWidth) < 2)
+              fail(`the note block's rule is ${wrapCs.borderLeftWidth} wide: no edge to find it by`)
+            else if (/\bcold\b|\bwarm\b|re-?prefill/i.test(text))
+              fail(`the note asserts a cache state the engine cannot see: "${text}"`)
+            else
+              pageLog(
+                `note styling ok (${nSize}px against ${aSize}px, ${wrapCs.backgroundColor} block, ` +
+                  `${wrapCs.borderLeftWidth} rule: "${text.slice(0, 64)}...")`,
+              )
+          }
+          // switch the host out before deleting: see the note in the check above
+          if (hostWas2) await invoke('switch_session', { id: hostWas2 }).catch((e) => pageLog(`switch back failed: ${e}`))
+          for (const id of [sessN, away])
+            await invoke('delete_session', { id }).catch((e) => pageLog(`delete_session failed: ${e}`))
+          if (viewWas2) await resyncView(viewWas2)
+        }
+
+        // (a15) an image copied by another program reaches the composer
+        //
+        // The webview cannot see it: a screenshot sits in the Wayland/X11 selection,
+        // and WebKitGTK's paste event carries no file and no image item for it. The
+        // shell reads the selection instead. The fixture is placed on the clipboard
+        // by scripts/selftest.sh (which puts whatever was there back afterwards).
+        {
+          const noClip = import.meta.env.VITE_SELFTEST_NOCLIP === '1'
+          const btn = document.querySelector('button[aria-label="Paste image from clipboard"]') as HTMLElement | null
+          const why = (document.querySelector('.att-err')?.textContent ?? '').trim()
+          if (!btn) {
+            fail('the composer has no clipboard-image control')
+          } else if (!isTauri()) {
+            fail('the clipboard check ran somewhere other than the desktop shell')
+          } else if (noClip) {
+            pageLog('clipboard paste SKIPPED: this machine has no wl-clipboard, so nothing was placed on the selection')
+          } else {
+            const had = pending.length
+            btn.click()
+            const grew = await waitFor('the clipboard image to attach', () => pending.length > had, 9000)
+            const pend = pending[pending.length - 1]
+            if (!grew || !pend) {
+              fail(`pasting the clipboard attached nothing${why ? `: ${why}` : ''}`)
+            } else {
+              // The bytes are the proof: a PNG magic number and the fixture's
+              // dimensions, not just "something appeared in the composer".
+              const raw = atob(pend.b64)
+              // 0x89 P N G \r \n 0x1a \n. atob decodes to a Latin-1 string, so the
+              // magic number has to be read by code point, not by startsWith: the
+              // first byte is not printable, and the earlier version of this check
+              // failed on a payload that had arrived perfectly.
+              const isPng =
+                raw.charCodeAt(0) === 0x89 &&
+                raw.charCodeAt(1) === 0x50 &&
+                raw.charCodeAt(2) === 0x4e &&
+                raw.charCodeAt(3) === 0x47 &&
+                raw.length > 40
+              if (pend.mime !== 'image/png') fail(`the clipboard image came in as ${pend.mime}, not image/png`)
+              else if (!isPng) fail(`the pasted payload is not a PNG (${raw.length} bytes, first bytes ${raw.charCodeAt(0)},${raw.charCodeAt(1)},${raw.charCodeAt(2)},${raw.charCodeAt(3)})`)
+              else if (raw.length > 2 * 1024 * 1024)
+                fail(`the pasted payload is ${raw.length} bytes, past the engine's attachment ceiling`)
+              else if (!/^clipboard-\d{6}\.png$/.test(pend.name))
+                fail(`the pasted image is named "${pend.name}": a pasted screenshot should say where it came from`)
+              else if (!document.querySelector('.attrow .attchip img'))
+                fail('the pasted image has no preview in the composer')
+              else
+                pageLog(
+                  `clipboard paste ok (${raw.length} bytes of image/png read off the desktop selection, ` +
+                    `named ${pend.name}, previewed in the composer)`,
+                )
+              dropAttachment(pending.length - 1)
+            }
+          }
+        }
+
         // (a) structure while the tokens arrive, not when they stop
         {
           const before = await turnCount()
@@ -5342,6 +5753,9 @@
         const seen: HTMLElement[] = []
         const seenText: string[] = []
         let maxInFlight = 0
+        // How many of this check's samples landed on a real paint. Opacity and
+        // filter are only evidence while the compositor is advancing animations.
+        let animPaints = 0
         let judged = 0
         // The host element must not be restyled paint by paint. Writing the reveal
         // duration as a custom property on the paragraph used to re-resolve the
@@ -5380,7 +5794,8 @@
           // paint, and a check that applies them in one microtask tests one chunk.
           // Spaced out so a later paint has words from an earlier one that have
           // finished: that is exactly the population the at-rest checks need.
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 150)))
+          const painted = await frame(150)
+          if (painted) animPaints += 1
           transcript?.flushNow()
           const body = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
           const tins = [...(body?.querySelectorAll('.tin') ?? [])] as HTMLElement[]
@@ -5407,8 +5822,8 @@
           // are appended at the end, so "at rest" is a question about age, not
           // about position in the list.
           const atRest = seen.filter((t) => (bornAt.get(t) ?? nowMs()) + REVEAL_BUDGET < nowMs())
-          judged += atRest.length
-          for (const t of atRest.slice(-8)) {
+          if (painted) judged += atRest.length
+          for (const t of painted ? atRest.slice(-8) : []) {
             const cs = getComputedStyle(t)
             if (cs.filter !== 'none') fail(`a settled word is still under a filter: ${cs.filter}`)
             if (Number(cs.opacity) < 0.98)
@@ -5417,7 +5832,9 @@
           // The other direction: a reveal nobody can see is not a feature. Counting
           // words mid-fade right after a paint is how "subtle but noticeable" gets
           // settled with a number instead of an opinion.
-          const inFlight = tins.filter((t) => Number(getComputedStyle(t).opacity) < 0.9).length
+          const inFlight = painted
+            ? tins.filter((t) => Number(getComputedStyle(t).opacity) < 0.9).length
+            : 0
           if (inFlight > maxInFlight) maxInFlight = inFlight
           if (inFlight > 24)
             fail(`${inFlight} words fading at once: the newest line is grey for lines of reading`)
@@ -5436,9 +5853,16 @@
           fail('the thinking block is one line wide, not filling the column')
         if (seen.length < deltas.length)
           fail(`${seen.length} spans for ${deltas.length} arrivals: words are being merged or dropped`)
-        if (maxInFlight < 4)
+        // Both claims are about animation, so both need animation to be observable.
+        if (animPaints < 2) {
+          blindSkips++
+          pageLog(
+            `selftest note: skipped the reveal-visibility and settled-word claims; this check saw ` +
+              `${animPaints} real paint(s), and an un-composited window freezes every reveal at its start`,
+          )
+        } else if (maxInFlight < 4)
           fail(`only ${maxInFlight} words were ever mid-fade at once: the reveal is invisible`)
-        if (judged < 4)
+        if (animPaints >= 2 && judged < 4)
           fail(`only ${judged} spans were ever old enough to judge: the reveal check sampled too early`)
         moRef.o?.disconnect()
         if (!watched) fail('no streaming paragraph to watch for style churn')
@@ -5449,7 +5873,7 @@
         // body itself must not keep pre-wrap: it holds real markdown elements
         // too, and the parser's own newlines would show up as blank lines.
         transcript?.apply({ kind: 'text', d: 'x\n\ny' })
-        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        await frame(40)
         transcript?.flushNow()
         const ans = document.querySelector('.blk-answer .blk-body') as HTMLElement
         const ansTail = ans.querySelector('.live-para') as HTMLElement | null
@@ -5481,7 +5905,7 @@
         ]
         for (const d of parts) {
           transcript?.apply({ kind: 'text', d })
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          await frame(40)
           transcript?.flushNow()
         }
         const body = document.querySelector('.blk-answer .blk-body') as HTMLElement
@@ -5502,7 +5926,7 @@
             kind: 'text',
             d: '\n\n| name | value |\n|---|---|\n| alpha | 1 |\n| beta | 2 |\n\n',
           })
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          await frame(40)
           transcript?.flushNow()
           const tb = document.querySelector('.blk-answer .blk-body') as HTMLElement
           const tbl = tb?.querySelector('table')
@@ -5526,7 +5950,7 @@
             kind: 'text',
             d: '\n\n## The Copy\nThe photocopier in the basement started printing again at 3:14.',
           })
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          await frame(40)
           transcript?.flushNow()
           const b3 = document.querySelector('.blk-answer .blk-body') as HTMLElement
           const h2 = b3?.querySelector('h2')
@@ -5554,7 +5978,7 @@
             // contains `*` anywhere has to go through the parser.
             d: '\n\nPlain sentences with no markup whatsoever keep their spans and their box across a commit.\n\n',
           })
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          await frame(40)
           transcript?.flushNow()
           const body2 = document.querySelector('.blk-answer .blk-body') as HTMLElement
           const para = [...body2.querySelectorAll('p')].find((n) =>
@@ -5575,7 +5999,7 @@
               kind: 'text',
               d: 'The next paragraph lands underneath and pushes nothing around.\n\n',
             })
-            await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+            await frame(40)
             transcript?.flushNow()
             const body3 = document.querySelector('.blk-answer .blk-body') as HTMLElement
             const gone = spans.filter((n) => !n.isConnected)
@@ -5596,7 +6020,7 @@
         }
         // The unfinished block is still raw, still revealing, and still one run.
         transcript?.apply({ kind: 'text', d: 'Dark roasts are still arriving and *not* committed yet' })
-        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        await frame(40)
         transcript?.flushNow()
         const live = document.querySelector('.blk-answer .blk-body') as HTMLElement
         const tail = live.querySelector('.live-para') as HTMLElement | null
@@ -5611,11 +6035,22 @@
         // that is still half-drawn after the animation window (200ms duration +
         // 100ms stagger cap) is text the reader has already moved past, sitting
         // grey two lines up - the flicker that got the reveal blamed.
-        await new Promise((r) => setTimeout(r, 400))
+        // Wait on the frame clock so the window below is measurable: if the page
+        // painted nothing in that window, "still half-drawn" says nothing about the
+        // reveal, so the claim is skipped by name rather than failed.
+        const tailPainted = await frame(400)
         const faint = [...document.querySelectorAll('.blk-answer .tin')].filter(
           (t) => Number(getComputedStyle(t).opacity) < 0.9,
         ).length
-        if (faint) fail(`${faint} word spans are still half-drawn after 400ms: the ghost tail is back`)
+        if (faint && tailPainted)
+          fail(`${faint} word spans are still half-drawn after 400ms: the ghost tail is back`)
+        else if (faint) {
+          blindSkips++
+          pageLog(
+            `selftest note: skipped the ghost-tail claim; ${faint} span(s) sat at their start values ` +
+              'and the page delivered no paint in 400ms, so animation progress was not observable',
+          )
+        }
         pageLog('markdown mid-stream ok (h1+bold+list committed, no tail left half-drawn)')
         // Turn end leaves nothing half-rendered.
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 2, finish: 'stop' } })
@@ -5636,7 +6071,7 @@
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'The first words of the answer are landing ' })
-        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        await frame(40)
         transcript?.flushNow()
         const alignPx = (where: string) => {
           const b = document.querySelector('.blk-answer .blk-body') as HTMLElement
@@ -5698,7 +6133,7 @@
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 4, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: '## The Copy\n\nThe photocopier in the basement started printing again ' })
-        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        await frame(40)
         transcript?.flushNow()
         const head1 = alignPx('heading answer, generating')
         if (document.querySelector('.blk-answer h2, .blk-answer h3, .blk-answer h1') === null)
@@ -5735,7 +6170,7 @@
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 7, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'The photocopier printed ' })
-        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        await frame(40)
         transcript?.flushNow()
         const body = document.querySelector('.blk-answer .blk-body') as HTMLElement
         const para = body?.querySelector('.live-para') as HTMLElement | null
@@ -5744,7 +6179,7 @@
         if (!para || !before) fail('the streaming paragraph did not open')
         else {
           transcript?.apply({ kind: 'text', d: '**the copy** and `git status` quietly ' })
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          await frame(40)
           transcript?.flushNow()
           if (!para.isConnected) fail('the streaming paragraph was replaced when emphasis arrived')
           const strong = para.querySelector('strong') as HTMLElement | null
@@ -5941,7 +6376,7 @@
         const rng = anchor as Range
         const anchorTop = rng.getBoundingClientRect().top
         transcript?.apply({ kind: 'text', d: '\n\n## A committed heading ends the paragraph\n\n' })
-        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        await frame(40)
         transcript?.flushNow()
         if (!rng.startContainer.isConnected)
           fail("the line a reader had stopped on was replaced when a block committed below it")
@@ -6154,7 +6589,7 @@
         let kids = 0
         for (const d of parts) {
           transcript?.apply({ kind: 'text', d })
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 60)))
+          await frame(60)
           transcript?.flushNow()
           const t = document.querySelector('.turn') as HTMLElement | null
           if (!t) {
@@ -6176,7 +6611,7 @@
         transcript?.apply({ kind: 'toolCallReady', d: { id: 'e1', args: { cmd: 'true' } } })
         transcript?.apply({ kind: 'toolExecEnd', d: { id: 'e1', ok: true, exit_code: 0, changes: [] } })
         transcript?.apply({ kind: 'note', d: { message: 'a note lands in the same turn' } })
-        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 60)))
+        await frame(60)
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 91, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 150))
 
@@ -6372,7 +6807,7 @@
         } else
         for (const p of ['first streamed line, ', 'second streamed line arrives ', 'and a third ']) {
           transcript?.apply({ kind: 'text', d: p })
-          await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+          await frame(40)
           transcript?.flushNow()
           const g = gap()
           if (g === null) fail('no streamed text to measure the label gap against')
@@ -6628,7 +7063,7 @@
           // Svelte flushes on a microtask, so the DOM a click produces is not
           // there on the next statement. Reading it too early is a test bug, not
           // a product bug, and it reads as one.
-          await new Promise<void>((r) => requestAnimationFrame(() => r()))
+          await frame(0)
           if (!document.querySelector('.empty-ws'))
             fail('the greeting does not say which folder the draft will use')
           const after = await invoke<Session[]>('list_sessions')
@@ -6656,6 +7091,11 @@
             `${endpointSkips} checks were skipped: the endpoint never completed a turn during this run (last measured prefill ${lastPrefill === null ? 'unknown' : lastPrefill.toFixed(1)} tok/s), so the turn-dependent behaviour above was not verified`,
           )
       }
+      if (rafStalls > 0)
+        pageLog(
+          `selftest note: ${rafStalls} frame wait(s) settled on the timeout floor because requestAnimationFrame ` +
+            'stopped firing; the window was not being composited for part of this run',
+        )
       if (blindSkips > 0) {
         pageLog(`selftest note: ${blindSkips} geometry check(s) were skipped because the page was not being laid out`)
         if (blindSkips >= 4)
@@ -7464,6 +7904,19 @@
               />
               <button class="cbtn sq" title="Attach images (png, jpeg, webp, gif)" onclick={() => fileInput?.click()}>
                 <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+              </button>
+              <!-- A screenshot lives in the system clipboard, not in the paste
+                   event, so this is the only way it reaches the composer on the
+                   desktop; in a browser it is the gesture the Clipboard API
+                   requires. Named for the source, not the mechanism: a user who
+                   took a screenshot reads "clipboard" as "the thing I just did". -->
+              <button
+                class="cbtn sq"
+                title="Paste the image on the clipboard (screenshot or copied image file)"
+                aria-label="Paste image from clipboard"
+                onclick={() => void addClipboardImage()}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3.5h6v3H9z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 5h-1A2.5 2.5 0 0 0 5 7.5v11A2.5 2.5 0 0 0 7.5 21h9a2.5 2.5 0 0 0 2.5-2.5v-11A2.5 2.5 0 0 0 16.5 5h-1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M8.5 13.5h7M8.5 17h4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
               </button>
 
               <button class="cbtn chip" data-menu onclick={(e) => openMenu('mode', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'mode'}>
