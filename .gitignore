@@ -23,3 +23,6 @@ assets/working/
 *.log
 ui/dist/*
 !ui/dist/.gitkeep
+
+# spike build output (5 MB binary, never commit)
+spike/cwshim

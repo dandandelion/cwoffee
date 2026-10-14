@@ -1,5 +1,11 @@
 # Cwoffee
 
+> **This clone is `pi-cwoffee`: the experiment where `pi` becomes the core and cwoffee
+> stays the surface.** The plan, the protocol map, and a *working* spike are in
+> [`PI-CORE-PLAN.md`](PI-CORE-PLAN.md), [`docs/PI-CORE-PROTOCOL.md`](docs/PI-CORE-PROTOCOL.md)
+> and [`spike/`](spike/README.md). `master` still runs the Rust engine below — nothing has
+> been cut over yet. Upstream: `origin` → `../cwoffee`.
+
 *Cwoffee — a coworker that happens to run on your machine. Same warm palette in
 light and dark, now with a cup instead of a cow.*
 
