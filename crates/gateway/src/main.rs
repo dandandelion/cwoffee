@@ -221,7 +221,14 @@ async fn main() -> anyhow::Result<()> {
         // credential handling is S4.1's decision and not this line's.
         let key = appcfg.api_key().unwrap_or_else(|| "unused".into());
         let models =
-            cwoffee_bridge::mount::write_dev_provider(&agent_dir, PI_PROVIDER, &appcfg.provider.base_url, &configured_model, &key)?;
+            cwoffee_bridge::mount::write_dev_provider(
+                &agent_dir,
+                PI_PROVIDER,
+                &appcfg.provider.base_url,
+                &configured_model,
+                &key,
+                cwoffee_bridge::mount::pi_api_for_kind(&appcfg.provider.kind),
+            )?;
         println!(
             "[cwoffee/pi] provider {PI_PROVIDER} -> {} (written to {})",
             appcfg.provider.base_url,

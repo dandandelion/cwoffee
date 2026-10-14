@@ -94,7 +94,10 @@ async fn run() -> anyhow::Result<()> {
     std::fs::create_dir_all(&session_dir)?;
     std::fs::create_dir_all(db.parent().unwrap_or(std::path::Path::new(".")))?;
     if !flag("--keep-models") {
-        let path = cwoffee_bridge::mount::write_dev_provider(&agent_dir, &provider, &url, &model, "mock")?;
+        // The mock endpoint speaks the OpenAI wire, which is what pi's `openai-completions`
+        // api means; a real endpoint's kind comes from cwoffee's config instead.
+        let path =
+            cwoffee_bridge::mount::write_dev_provider(&agent_dir, &provider, &url, &model, "mock", "openai-completions")?;
         eprintln!("[probe] wrote {provider} -> {url} in {}", path.display());
     }
 

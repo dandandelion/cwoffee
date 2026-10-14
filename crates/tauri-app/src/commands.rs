@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use cwoffee_engine::approval::{ApprovalAnswer, ApprovalMode};
 use cwoffee_engine::event::EngineEvent;
-use cwoffee_engine::host::{HostCmd, HostState, SessionHost};
+use cwoffee_engine::host::{HostCmd, HostOps, HostState};
 use cwoffee_engine::provider::Reasoning;
 use cwoffee_engine::store::{SearchHit, Session, Store};
 use tauri::ipc::Channel;
@@ -27,8 +27,15 @@ use crate::gpu;
 /// forbids an `invoke()` per token, and a long-lived channel is how we honour it.
 pub struct AppState {
     /// Shared so the gateway can drive the *same* host the window drives.
-    pub host: Arc<SessionHost>,
+    /// `dyn HostOps`, not `SessionHost`, because the core behind it is now a choice:
+    /// the Rust engine or a `pi --mode rpc` child (PI-CORE-PLAN decision 12). Every
+    /// verb the window uses is on the trait, which is the whole point of Move 0.
+    pub host: Arc<dyn HostOps>,
     pub store: Arc<Store>,
+    /// A note straight into the webview queue. The quit-while-busy refusal uses it,
+    /// and it is the only way to say something to the window without editing the UI:
+    /// notes are already a rendered concept.
+    pub note_tx: mpsc::UnboundedSender<EngineEvent>,
     /// Taken by `attach` exactly once and forwarded to the webview.
     pub queue_rx: Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>,
     /// Open approval requests, waiting on an answer from the UI.
@@ -475,7 +482,7 @@ pub async fn save_markdown_file(
 pub async fn search_settings(
     state: tauri::State<'_, AppState>,
 ) -> Result<cwoffee_engine::settings::SearchView, String> {
-    Ok(cwoffee_engine::settings::search_view(&state.host, &state.config_path).await)
+    Ok(state.host.search_view(&state.config_path).await)
 }
 
 #[tauri::command]
@@ -484,13 +491,10 @@ pub async fn set_search_backend(
     backend: String,
     searxng_url: Option<String>,
 ) -> Result<cwoffee_engine::settings::SearchView, String> {
-    cwoffee_engine::settings::set_search_backend(
-        &state.host,
-        &state.config_path,
-        &backend,
-        &searxng_url.unwrap_or_default(),
-    )
-    .await
+    state
+        .host
+        .set_search_backend(&state.config_path, &backend, &searxng_url.unwrap_or_default())
+        .await
 }
 
 #[tauri::command]
@@ -498,7 +502,7 @@ pub async fn search_probe(
     state: tauri::State<'_, AppState>,
     query: Option<String>,
 ) -> Result<cwoffee_engine::settings::SearchProbe, String> {
-    cwoffee_engine::settings::search_probe(&state.host, query).await
+    state.host.search_probe(query).await
 }
 
 
@@ -632,10 +636,13 @@ pub async fn list_models(
 ) -> Result<Vec<cwoffee_engine::provider::ModelInfo>, String> {
     // An endpoint with no /models is a normal configuration, not a failure the
     // user should see as an error banner.
+    // On the trait, not `host.provider()`: a pi core has no cwoffee `Provider` to
+    // hand out, and reaching past the seam here would have quietly pinned this
+    // command to one core. `models_info` answers for both — the Rust core asks the
+    // endpoint, the bridge answers from pi or from its own configuration.
     state
         .host
-        .provider()
-        .list_models_info()
+        .models_info()
         .await
         .inspect_err(|e| eprintln!("[cwoffee] list_models: {e}"))
         .map(Ok)

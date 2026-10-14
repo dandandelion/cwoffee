@@ -16,11 +16,11 @@
 
 ## STATUS (update every session)
 
-- **Phase:** 1 — **S1.2 is DONE in the browser path**: `cwoffee-gateway --core pi` passes
-  `gateway-smoke.mjs` and the new `gateway-approval.mjs` with **zero UI edits**, and the
-  same approval gate passes on `--core rust`. The desktop half (S5) is not wired yet, and
-  `master` still runs the Rust core as the only core.
-- **Last updated:** 2026-10-15T02:10Z (assistant, session 4)
+- **Phase:** 1 — **S1.2 is DONE on both paths.** `cwoffee-gateway --core pi` passes
+  `gateway-smoke.mjs` + `gateway-approval.mjs`, and the **desktop app opens with pi as its
+  core** (`CWOFFEE_CORE=pi`), in-process, answering approval cards from the normal UI, with
+  **zero `ui/` edits**. `master` still defaults to the Rust core; nothing is cut over yet.
+- **Last updated:** 2026-10-15T03:00Z (assistant, session 5)
 - **Verdict:** feasible, and cheaper than it looks — because the UI and the tools both
   survive untouched. Measured, not assumed. Three real costs: **+~90 MB PSS**, **two
   languages in the runtime**, and **pi gives you no sandbox** (that stays ours to own).
@@ -279,7 +279,7 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
       `cached=491/1039`) and the store kept 4 rows.
 - [ ] **S1.2** frame emulation: bridge emits the **existing** `event`/`resync`/`bootstrap`
       payloads; `ui/` untouched. *Exit:* desktop app runs a live turn with **zero UI edits**.
-      **Half done — the browser half is met, the desktop half is S5.**
+      **Met on both paths** — browser via the gateway, desktop in-process.
       `cwoffee-gateway --core pi` (new flags: `--core`, `--pi`, `--pi-ext`, `--pi-tools`,
       `--pi-agent-dir`, `--pi-idle-reap`, `--pi-version`, `--any-pi`) builds the same
       `EngineHandle` over `Arc<dyn HostOps>` with a `PiHost` in place of `SessionHost`, and
@@ -289,6 +289,16 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
       `scripts/gateway-approval.mjs` (new) drives one tool call through the gateway and
       answers the card as a client would; it passes **allow and deny on both cores**, and it
       is what found two real bridge bugs (gotchas 23–24).
+      The desktop half: `AppState.host` became `Arc<dyn HostOps>` (three call sites had
+      reached past the seam — `host.provider().list_models_info()` and two
+      `settings::*` free functions — which is how a "neutral" shell quietly pinned itself
+      to one core), `CWOFFEE_CORE=pi` swaps the engine at boot, and decision 15's
+      quit-while-busy refusal is wired on `CloseRequested` with a `Note` so it needs no UI
+      edit. **Proven against the user's own endpoint** (`llama.cpp`, model
+      `qwen3.8-flash-next-iq3_s`, reasoning XHigh, sandbox on): one approval card naming
+      `read_file` and `OUTSIDE the workspace: /etc/hostname`, allow and deny both green from
+      a client, and a turn that ran *after* the 600 s idle reaper had closed pi — so
+      reap-then-resume works in the shipped binary, not only in the probe.
 - [x] **S1.2a** `bridge::mount`: extensions copied into the isolated agent dir with pi's own
       `node_modules` symlinked, and a dev-only `models.json`, shared by probe and gateway
       instead of written twice.
@@ -498,6 +508,23 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     bridge answers the menu from its own configuration — one entry, the model this
     conversation can run. A smaller lie than an empty menu, and the kind of thing that reads
     obvious in hindsight and invisible beforehand.
+27. **A moved repo poisons its target dir, in *both* profiles.** The `tauri` build script
+    caches absolute `OUT_DIR` paths, so after cwoffee moved from `~/Projects/cwoffee` to
+    `~/AI/Harness/cwoffee`, every build of `cwoffee-app` failed with
+    *failed to read plugin permissions: … /home/dandandelion/Projects/cwoffee/target/…* —
+    the blocker that had made the desktop crate untypeable here for five sessions. It is
+    not a code problem and `cargo check` will keep reporting it as one. Fix (both profiles,
+    because each caches separately):
+    `rm -rf target/{debug,release}/build/{tauri-*,cwoffee-app-*} target/{debug,release}/.fingerprint/{tauri*,cwoffee-app-*}`.
+    Say so out loud in the log of any session that hits it, or the next one loses hours.
+28. **A shell that says it is core-neutral must not reach past the seam.** `AppState.host`
+    was `Arc<SessionHost>`, and three commands used methods only the Rust core has
+    (`host.provider().list_models_info()`, `settings::search_view(&state.host, …)`,
+    `settings::search_probe(&state.host, …)`), so the type system was quietly siding with
+    one core while the docs claimed a trait. On `Arc<dyn HostOps>` they are compile errors —
+    which is the good outcome: the trait verbs (`models_info`, `search_view`,
+    `search_probe`) answer for both cores, and pi's answer comes from pi or from the
+    bridge's own configuration.
 
 ---
 
@@ -603,6 +630,28 @@ CWOFFEE_SHIM=$PWD/spike/cwshim cargo run --offline -p cwoffee-bridge --bin cwoff
 The probe exits nonzero if no turn ended, which is what makes it usable as a gate rather
 than a demo.
 
+### The desktop app with pi as its core (what to click)
+
+```bash
+# one build, two cores. CWOFFEE_CORE is the switch; CWOFFEE_PI_EXT/CWOFFEE_SHIM mount the
+# Rust tool shims, which is development packaging (S2.5) standing in for the real thing.
+CWOFFEE_SHIM=$PWD/spike/cwshim \
+CWOFFEE_PI_EXT=$PWD/spike/pi-extension-cwoffee-tools.ts \
+CWOFFEE_PI_AGENT_DIR=/tmp/cw-app-pi \
+CWOFFEE_CORE=pi CWOFFEE_MODE=ask CWOFFEE_GATEWAY_PORT=8122 CWOFFEE_GATEWAY_TOKEN=DESKTOK \
+  target/release/cwoffee-app
+
+# drive the live app as a client would, from the other side of the seam:
+node scripts/gateway-approval.mjs --port 8122 --token DESKTOK \
+  --workspace "$HOME/cwoffee-workspace" --answer allow
+# and without pi: drop CWOFFEE_CORE/CWOFFEE_PI_*/CWOFFEE_SHIM/CWOFFEE_PI_EXT
+```
+
+`CWOFFEE_PI_KEEP_MODELS=1` leaves an existing provider file (and a real pi login) alone;
+`CWOFFEE_PI_ANY` drops the version handshake for exploration only. A fresh clone has no
+`ui/dist` (gitignored) — copy the upstream one or `npm --prefix ui run build`; the UI source
+is byte-identical to upstream at this commit, which is the point of the zero-UI-edit claim.
+
 ### The gateway with a pi core, and the approval round trip
 
 ```bash
@@ -628,6 +677,36 @@ behaviour, and exactly why the gate prints the mode it ran in.
 ---
 
 ## PROGRESS JOURNAL (newest on top)
+
+### 2026-10-15T03:00Z — session 5 — the app opens, and pi is the thing behind it ✅
+
+- **S1.2 desktop half met, and the blocker fell.** The desktop crate compiles here for the
+  first time in five sessions — the failure was never code, it was absolute paths cached by
+  `tauri`'s build script from the repo's *previous* location (gotcha 27; the same poison
+  waited in the `release` profile and had to be cleaned twice).
+- **Wired:** `AppState.host: Arc<dyn HostOps>` (three call sites had been reaching past the
+  seam — gotcha 28), `CWOFFEE_CORE=rust|pi` at boot, `pi_host()` in `tauri-app` staging
+  extensions + a provider file through `bridge::mount` (never overwriting an existing
+  `models.json`), and decision 15's quit-while-busy refusal on `CloseRequested`, carried by
+  a `Note` so the UI needed no edit: first close refuses and says so, a second within 8 s
+  aborts, waits ≤2 s for settle, then exits. **The quit policy is compiled and wired but not
+  yet exercised by a human or a test** — say that plainly rather than banking it.
+- **Measured on the user's own machine, release build, real local model**
+  (`llama.cpp` @ 127.0.0.1:8090, `qwen3.8-flash-next-iq3_s`, XHigh, sandbox on):
+  one approval card, `read_file`, `OUTSIDE the workspace: /etc/hostname`;
+  `gateway-approval` **allow and deny both OK** against the live app on 8122; a turn that
+  ran after the 600 s reaper had closed pi, i.e. respawn works in the shipped binary.
+- **Memory, whole tree, pi core live:** app 106 MB + WebKitWebProcess 129 MB +
+  WebKitNetworkProcess 37 MB + **pi 79 MB** ≈ **351 MB**, against the 400 MB ceiling and the
+  ≤110 MB pi-core budget. The web content process, not pi, is the largest single item in
+  this picture — worth knowing before anyone blames the new core for the total.
+- **Boots with what it mounted printed:** `core pi 1.2.0 up in ~/cwoffee-workspace; 1
+  extension(s); tools -read,-bash,-edit,-write` — the guardrail line is in the log because a
+  switch that is silently off is the failure mode this project keeps running into.
+- **Debt taken on deliberately:** the pi-core construction now exists twice (gateway
+  `main.rs`, tauri `main.rs`) with slightly different policy knobs. S4.2's dual-core A/B is
+  the point where that duplication must be merged into one `bridge` constructor, because two
+  cores that start differently cannot be compared.
 
 ### 2026-10-15T02:10Z — session 4 — the gateway serves a pi core, and the browser never noticed ✅
 

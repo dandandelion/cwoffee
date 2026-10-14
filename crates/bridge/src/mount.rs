@@ -87,6 +87,17 @@ pub fn mount_extensions(
     Ok(out)
 }
 
+/// cwoffee's `kind` word to pi's `api` word. The two projects name the same thing
+/// differently, and guessing wrong here means a request pi cannot route — so the
+/// mapping is written down rather than inferred. `llama.cpp` speaks the OpenAI wire,
+/// which is why cwoffee's own provider for it is an OpenAI one with a different base.
+pub fn pi_api_for_kind(kind: &str) -> &'static str {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => "anthropic-messages",
+        _ => "openai-completions",
+    }
+}
+
 /// Write a single-provider `models.json` pointing at `base_url`.
 ///
 /// **Development and smoke only.** The gateway needs *some* provider file to point
@@ -101,11 +112,12 @@ pub fn write_dev_provider(
     base_url: &str,
     model: &str,
     api_key: &str,
+    api: &str,
 ) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(agent_dir)?;
     let models = serde_json::json!({
         "providers": { provider: {
-            "baseUrl": base_url, "api": "openai-completions", "apiKey": api_key,
+            "baseUrl": base_url, "api": api, "apiKey": api_key,
             "models": [{ "id": model }]
         }}
     });

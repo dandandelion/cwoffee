@@ -37,4 +37,5 @@ serde.workspace = true
 serde_json.workspace = true
 cwoffee-engine.workspace = true
 cwoffee-gateway = { path = "../gateway" }
+cwoffee-bridge = { path = "../bridge" }
 tokio.workspace = true

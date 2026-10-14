@@ -19,6 +19,11 @@ use cwoffee_engine::store::{Store, StoreOps};
 use cwoffee_engine::tools::Registry;
 use cwoffee_engine::Config;
 use tokio::sync::{mpsc, oneshot};
+
+/// The provider entry this app writes into pi's provider file (see `pi_host`). Named
+/// because the same word appears in the boot log, and a log that cannot be grepped for
+/// is a log that will not be grepped.
+const PI_PROVIDER: &str = "cwoffee";
 use tauri::Manager;
 
 use commands::AppState;
@@ -241,38 +246,69 @@ fn main() {
     cfg.approval_timeout =
         std::time::Duration::from_secs(appcfg.approval_timeout_secs.unwrap_or(300));
 
-    // The engine spawns tasks, so it must be constructed inside a tokio
-    // context. Tauri's async runtime is tokio, so entering it here is enough;
-    // calling SessionHost::spawn from bare `main` panics with "no reactor".
+    // Two cores behind one seam, chosen at boot (PI-CORE-PLAN decision 12: the desktop
+    // joins in-process, it does not open a second localhost socket to talk to itself).
+    // `CWOFFEE_CORE=pi` puts a `pi --mode rpc` child where the Rust engine used to be,
+    // and everything after this point — the window's pump, the gateway handle, every
+    // command — is identical, because it only ever spoke `HostOps`.
+    let core = std::env::var("CWOFFEE_CORE").unwrap_or_else(|_| "rust".into());
+    if core != "rust" && core != "pi" {
+        eprintln!("[cwoffee] CWOFFEE_CORE={core:?} is neither \"rust\" nor \"pi\"; refusing to guess which core you meant");
+        std::process::exit(1);
+    }
     // Read the level the file asked for before `cfg` moves into the host: the boot
     // line states the dials the app actually started with, which is the only way a
     // drift between `config.toml` and the running app is visible in a log.
     let reasoning_at_boot = cfg.reasoning;
-    let (mut host, adopted_model) = tauri::async_runtime::block_on(async {
-        let h = SessionHost::spawn(
-            provider,
-            Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg()),
-            Arc::clone(&store),
-            cfg,
-        );
-        // No config file means no model id. Ask the endpoint rather than sending
-        // an empty one and taking a 400.
-        let adopted = h.adopt_first_model().await;
-        if let Some(m) = &adopted {
-            eprintln!("[cwoffee] no model configured; using the endpoint's first: {m}");
+    let (host, receivers, questions, model_label): (
+        Arc<dyn HostOps>,
+        Option<(
+            cwoffee_engine::host::EventRx,
+            tokio::sync::mpsc::UnboundedReceiver<cwoffee_engine::host::ApprovalRx>,
+        )>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<cwoffee_engine::tools::ask::QuestionRx>>,
+        String,
+    ) = tauri::async_runtime::block_on(async {
+        if core == "pi" {
+            match pi_host(&appcfg, &cfg, &store, &workspace, &configured_model).await {
+                Err(e) => {
+                    eprintln!("[cwoffee] pi core did not start: {e}");
+                    std::process::exit(1);
+                }
+                Ok(mut h) => {
+                    // Receivers can only be taken once, and they need &mut: take them
+                    // before the host becomes the Arc the window and gateway share.
+                    let r = h.take_receivers();
+                    let q = h.take_questions();
+                    (Arc::new(h) as Arc<dyn HostOps>, r, q, configured_model.clone())
+                }
+            }
+        } else {
+            // The engine spawns tasks, so it must be constructed inside a tokio
+            // context. Tauri's async runtime is tokio, so entering it here is enough;
+            // calling SessionHost::spawn from bare `main` panics with "no reactor".
+            let mut h = SessionHost::spawn(
+                provider,
+                Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg()),
+                Arc::clone(&store),
+                cfg,
+            );
+            // No config file means no model id. Ask the endpoint rather than sending
+            // an empty one and taking a 400.
+            let adopted = h.adopt_first_model().await;
+            if let Some(m) = &adopted {
+                eprintln!("[cwoffee] no model configured; using the endpoint's first: {m}");
+            }
+            let r = h.take_receivers();
+            let q = h.take_questions();
+            // Read the adopted id from the return value, not host.state(): SetModel is
+            // applied by the host task, so state() can still show the old value here.
+            let label = adopted.unwrap_or_else(|| configured_model.clone());
+            (Arc::new(h) as Arc<dyn HostOps>, r, q, label)
         }
-        (h, adopted)
     });
-    // Receivers can only be taken once and need &mut, so take them before the
-    // host goes behind the Arc that the gateway shares.
-    let receivers = host.take_receivers();
-    let questions = host.take_questions();
-    let host = std::sync::Arc::new(host);
-    // Read the adopted id from the return value, not host.state(): SetModel is
-    // applied by the host task, so state() can still show the old value here.
-    let model_label = adopted_model.unwrap_or(configured_model);
     eprintln!(
-        "[cwoffee] engine up: url={url} model={model_label} workspace={} mode={:?} reasoning={:?}",
+        "[cwoffee] engine up: core={core} url={url} model={model_label} workspace={} mode={:?} reasoning={:?}",
         workspace.display(), mode, reasoning_at_boot
     );
     // The exec deadline used to be invisible: a [sandbox] block that parsed,
@@ -384,7 +420,7 @@ fn main() {
     // question has to be answerable about a gateway started from the environment
     // as well as one started by clicking the footer.
     let gw_handle = Arc::new(cwoffee_gateway::EngineHandle {
-        host: Arc::clone(&host) as Arc<dyn HostOps>,
+        host: Arc::clone(&host),
         store: Arc::clone(&store) as Arc<dyn StoreOps>,
         events: bcast_tx.clone(),
         pending: Arc::clone(&pending),
@@ -398,6 +434,7 @@ fn main() {
     let state = AppState {
         host,
         store,
+        note_tx: queue_tx.clone(),
         queue_rx: Mutex::new(Some(queue_rx)),
         pending_approvals: Arc::clone(&pending),
         pending_questions: Arc::clone(&pending_q),
@@ -435,6 +472,7 @@ fn main() {
         }
     }
 
+    let quit_armed: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
     let rendered_flag = state.rendered.clone();
     let app = tauri::Builder::default()
         // Rendered markdown contains links to pages the model fetched. Those must
@@ -497,6 +535,43 @@ fn main() {
             });
             Ok(())
         })
+        // Decision 15: quitting with a turn running is a question, not a silent kill.
+        // The refusal rides on a `Note`, which the window already knows how to render —
+        // so the policy needs no UI edit. A second close within 8 s means "stop it and
+        // quit": abort, give the turn 2 s to settle so the transcript flushes, then let
+        // the window close. A window that vanishes and leaves an agent working
+        // unattended is the same failure the approval gate exists to prevent.
+        .on_window_event(move |window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else { return };
+            let state = window.app_handle().state::<AppState>();
+            let busy = state.host.state().busy;
+            let mut armed = quit_armed.lock().unwrap();
+            let already = armed.map(|t| t.elapsed() < std::time::Duration::from_secs(8)).unwrap_or(false);
+            if !busy {
+                return;
+            }
+            if !already {
+                *armed = Some(std::time::Instant::now());
+                api.prevent_close();
+                let st = state.host.state();
+                let _ = state.note_tx.send(cwoffee_engine::EngineEvent::Note {
+                    message: "a turn is still running — closing was refused. Close again within 8 seconds to stop it and quit.".into(),
+                    session: Some(st.session_id),
+                });
+                return;
+            }
+            state.host.send(cwoffee_engine::host::HostCmd::Cancel);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while state.host.state().busy && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let still_busy = state.host.state().busy;
+            eprintln!(
+                "[cwoffee] quit asked while busy: aborted, {}the turn settled{}",
+                if still_busy { "and " } else { "" },
+                if still_busy { " — its children are being killed" } else { "" }
+            );
+        })
         .invoke_handler(tauri::generate_handler![
             commands::attach,
             commands::start_turn,
@@ -543,4 +618,127 @@ fn main() {
         eprintln!("[cwoffee] error while running: {e}");
         std::process::exit(1);
     }
+}
+
+/// Start a `pi --mode rpc` core for the desktop.
+///
+/// The `CWOFFEE_PI_*` variables are development switches for this experiment: the
+/// packaging decisions (S2.5 for extensions, S4.1 for the pinned runtime) are what
+/// replace them. Until then the boot line states exactly what was mounted, because a
+/// guardrail that is silently off is the failure mode worth making visible.
+async fn pi_host(
+    appcfg: &Config,
+    cfg: &HostConfig,
+    store: &Arc<Store>,
+    workspace: &std::path::Path,
+    model: &str,
+) -> Result<cwoffee_bridge::PiHost, String> {
+    if model.trim().is_empty() {
+        return Err(
+            "a pi core needs a model id: pi selects by provider+model and does not adopt              an endpoint's first model"
+                .into(),
+        );
+    }
+    let env_path = |v: &str| std::env::var(v).ok().filter(|s| !s.is_empty()).map(PathBuf::from);
+    let bin = env_path("CWOFFEE_PI").unwrap_or_else(|| PathBuf::from("pi"));
+    let agent_dir = env_path("CWOFFEE_PI_AGENT_DIR").unwrap_or_else(|| {
+        let base = std::env::var("XDG_STATE_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/share")
+            });
+        base.join("cwoffee").join("pi")
+    });
+    let session_dir = env_path("CWOFFEE_PI_SESSION_DIR").unwrap_or_else(|| agent_dir.join("sessions"));
+    std::fs::create_dir_all(&session_dir).map_err(|e| format!("cannot create {}: {e}", session_dir.display()))?;
+
+    // Never overwrite a provider the user or their own pi setup already put there. The
+    // dev file exists so the experiment runs against cwoffee's own config; keeping an
+    // existing one is what lets a real pi login be used instead.
+    let models = agent_dir.join("models.json");
+    if models.exists() || std::env::var("CWOFFEE_PI_KEEP_MODELS").is_ok() {
+        println!("[cwoffee/pi] leaving the provider config in {} alone", agent_dir.display());
+    } else {
+        let key = appcfg.api_key().unwrap_or_else(|| "unused".into());
+        let path = cwoffee_bridge::mount::write_dev_provider(
+            &agent_dir,
+            PI_PROVIDER,
+            &appcfg.provider.base_url,
+            model,
+            &key,
+            cwoffee_bridge::mount::pi_api_for_kind(&appcfg.provider.kind),
+        )
+        .map_err(|e| format!("cannot write {}: {e}", models.display()))?;
+        println!("[cwoffee/pi] provider cwoffee -> {} (written to {})", appcfg.provider.base_url, path.display());
+    }
+
+    let srcs: Vec<PathBuf> = std::env::var("CWOFFEE_PI_EXT")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let exts = cwoffee_bridge::mount::mount_extensions(&agent_dir, &bin, &srcs)
+        .map_err(|e| format!("mounting extensions failed: {e}"))?;
+    let ext_count = exts.len();
+
+    // pi's own coding tools stay off: the tools that matter here are cwoffee's, and the
+    // sandbox and approvals live with them. CWOFFEE_PI_TOOLS exists to add ours, not to
+    // drop the minus signs by omission.
+    let tools: Vec<String> = match std::env::var("CWOFFEE_PI_TOOLS") {
+        Ok(v) => v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Err(_) => vec!["-read".into(), "-bash".into(), "-edit".into(), "-write".into()],
+    };
+    let mut extra_env = Vec::new();
+    if let Ok(v) = std::env::var("CWOFFEE_SHIM") {
+        extra_env.push(("CWOFFEE_SHIM".to_string(), v));
+    }
+    let pinned = if std::env::var("CWOFFEE_PI_ANY").is_ok() {
+        None
+    } else {
+        Some(cwoffee_bridge::process::PINNED_PI.to_string())
+    };
+
+    let host = cwoffee_bridge::PiHost::spawn(cwoffee_bridge::PiHostConfig {
+        launch: cwoffee_bridge::PiLaunch {
+            bin,
+            workdir: workspace.to_path_buf(),
+            provider: "cwoffee".into(),
+            model: model.to_string(),
+            agent_dir: agent_dir.clone(),
+            session_dir,
+            session_file: None,
+            extensions: exts,
+            tools: tools.clone(),
+            extra_env,
+            pinned_version: pinned,
+        },
+        store: Arc::clone(store) as Arc<dyn StoreOps>,
+        mode: cfg.mode,
+        reasoning: cfg.reasoning,
+        approval_timeout: cfg.approval_timeout,
+        question_timeout: cfg.question_timeout,
+        idle_reap: std::time::Duration::from_secs(
+            std::env::var("CWOFFEE_PI_IDLE_REAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
+        ),
+        context_budget: cfg.context_budget.unwrap_or(cwoffee_engine::host::FALLBACK_BUDGET),
+        model_window: None,
+        session_map: agent_dir.join("cwoffee-pi-sessions.json"),
+    })
+    .await
+    .map_err(|e| format!("{e}"))?;
+    println!(
+        "[cwoffee/pi] core pi {} up in {}; {} extension(s); tools {}",
+        host.pi_version,
+        workspace.display(),
+        ext_count,
+        if tools.is_empty() { "pi defaults".to_string() } else { tools.join(",") }
+    );
+    Ok(host)
 }

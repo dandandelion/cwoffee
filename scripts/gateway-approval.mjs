@@ -16,6 +16,10 @@ const get = (f, d) => {
 const port = get('--port', '8106')
 const token = get('--token', 'T-PI')
 const answer = get('--answer', 'allow') // allow | deny | allowSession
+// The workspace matters as much as the port: a session started in a folder the app
+// does not know about is a different conversation from the one in the sidebar.
+const workspace = get('--workspace', '/tmp/cw-smoke-ws')
+const turnTimeoutMs = Number(get('--turn-timeout', '30000'))
 const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 const t = (ms) => new Promise((r) => setTimeout(r, ms))
 let id = 0
@@ -25,7 +29,7 @@ const seen = { card: null, cards: 0, notes: [], toolEvents: 0, execEnd: 0, kinds
 ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', token })))
 ws.addEventListener('message', (ev) => {
   const v = JSON.parse(ev.data)
-  if (v.type === 'auth_ok') rpc('new_session', { title: 'approval round trip', workspace: '/tmp/cw-smoke-ws' })
+  if (v.type === 'auth_ok') rpc('new_session', { title: 'approval round trip', workspace })
   if (v.ok === true && v.id === 1 && !sid) {
     sid = v.data
     rpc('start_turn', {
@@ -64,9 +68,9 @@ if (!sid) {
   console.error('FAIL never created a session (auth or new_session failed)')
   process.exit(1)
 }
-// The scenario's own latency is ~800 ms per round trip plus the tool; 12 s is generous
-// without being a test that hides a hang.
-for (let i = 0; i < 60 && !seen.turnEnd; i++) await t(200)
+// A mock answers in 800 ms; a real local model can take many seconds with a high
+// reasoning level, so the wait is a parameter and not a magic number.
+for (let i = 0; i < turnTimeoutMs / 200 && !seen.turnEnd; i++) await t(200)
 
 const fail = []
 if (!seen.card) fail.push('no approval card ever arrived')
