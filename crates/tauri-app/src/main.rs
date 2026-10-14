@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cwoffee_engine::approval::ApprovalAnswer;
-use cwoffee_engine::host::{approval_event, question_event, HostConfig, SessionHost};
+use cwoffee_engine::host::{approval_event, question_event, HostConfig, HostOps, SessionHost};
 use cwoffee_engine::provider::Provider;
-use cwoffee_engine::store::Store;
+use cwoffee_engine::store::{Store, StoreOps};
 use cwoffee_engine::tools::Registry;
 use cwoffee_engine::Config;
 use tokio::sync::{mpsc, oneshot};
@@ -384,8 +384,8 @@ fn main() {
     // question has to be answerable about a gateway started from the environment
     // as well as one started by clicking the footer.
     let gw_handle = Arc::new(cwoffee_gateway::EngineHandle {
-        host: Arc::clone(&host),
-        store: Arc::clone(&store),
+        host: Arc::clone(&host) as Arc<dyn HostOps>,
+        store: Arc::clone(&store) as Arc<dyn StoreOps>,
         events: bcast_tx.clone(),
         pending: Arc::clone(&pending),
         pending_questions: Arc::clone(&pending_q),

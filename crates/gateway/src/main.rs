@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cwoffee_engine::approval::ApprovalAnswer;
-use cwoffee_engine::host::{HostConfig, SessionHost};
-use cwoffee_engine::store::Store;
+use cwoffee_engine::host::{HostConfig, HostOps, SessionHost};
+use cwoffee_engine::store::{Store, StoreOps};
 use cwoffee_engine::tools::Registry;
 use cwoffee_engine::Config;
 use tokio::sync::{broadcast, oneshot};
@@ -232,8 +232,8 @@ async fn main() -> anyhow::Result<()> {
         watch_token,
     };
     let handle = Arc::new(cwoffee_gateway::EngineHandle {
-        host: Arc::clone(&host),
-        store: Arc::clone(&store),
+        host: Arc::clone(&host) as Arc<dyn HostOps>,
+        store: Arc::clone(&store) as Arc<dyn StoreOps>,
         events: ev_tx.clone(),
         pending,
         pending_questions: Arc::clone(&pending_q),

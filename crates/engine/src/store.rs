@@ -994,6 +994,88 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The slice of the store that a **client** reads and writes.
+///
+/// Paired with [`crate::host::HostOps`]: together they are the whole contract a
+/// front end needs, and the contract a second core has to satisfy. The gateway uses
+/// all **fourteen** of these, and none of them is an engine internal.
+///
+/// Note for the pi-backed implementation: pi keeps sessions as JSONL trees, so its
+/// implementation of this trait is a **derived index** over pi's session directory,
+/// not the source of truth. `HostOps` decides what a conversation *is*; this trait
+/// only answers "what is in it, and what is in the sidebar".
+pub trait StoreOps: Send + Sync {
+    fn add_workspace(&self, path: &str) -> Result<(), StoreError>;
+    fn remove_workspace(&self, path: &str) -> Result<usize, StoreError>;
+    fn list_workspaces(&self) -> Result<Vec<WorkspaceEntry>, StoreError>;
+    fn create_session(&self, title: &str, workspace: &str, model: &str) -> Result<i64, StoreError>;
+    fn delete_session(&self, id: i64) -> Result<(), StoreError>;
+    fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError>;
+    fn append_message(&self, session_id: i64, m: &Message) -> Result<i64, StoreError>;
+    fn messages_page(&self, session_id: i64, before_id: Option<i64>, limit: usize)
+        -> Result<MessagesPage, StoreError>;
+    fn messages(&self, session_id: i64) -> Result<Vec<StoredMessage>, StoreError>;
+    fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError>;
+
+    /// Full-text search across conversations — the search panel, not the transcript.
+    fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>, StoreError>;
+    /// One sidebar row, by id: the share path needs its title and workspace before
+    /// it renders anything.
+    fn session(&self, id: i64) -> Result<Option<Session>, StoreError>;
+    fn rename_session(&self, id: i64, title: &str) -> Result<(), StoreError>;
+    fn set_workspace_label(&self, path: &str, label: &str) -> Result<usize, StoreError>;
+}
+
+impl StoreOps for Store {
+    fn add_workspace(&self, path: &str) -> Result<(), StoreError> {
+        Store::add_workspace(self, path)
+    }
+    fn remove_workspace(&self, path: &str) -> Result<usize, StoreError> {
+        Store::remove_workspace(self, path)
+    }
+    fn list_workspaces(&self) -> Result<Vec<WorkspaceEntry>, StoreError> {
+        Store::list_workspaces(self)
+    }
+    fn create_session(&self, title: &str, workspace: &str, model: &str) -> Result<i64, StoreError> {
+        Store::create_session(self, title, workspace, model)
+    }
+    fn delete_session(&self, id: i64) -> Result<(), StoreError> {
+        Store::delete_session(self, id)
+    }
+    fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError> {
+        Store::list_sessions(self, limit)
+    }
+    fn append_message(&self, session_id: i64, m: &Message) -> Result<i64, StoreError> {
+        Store::append_message(self, session_id, m)
+    }
+    fn messages_page(
+        &self,
+        session_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<MessagesPage, StoreError> {
+        Store::messages_page(self, session_id, before_id, limit)
+    }
+    fn messages(&self, session_id: i64) -> Result<Vec<StoredMessage>, StoreError> {
+        Store::messages(self, session_id)
+    }
+    fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError> {
+        Store::history(self, session_id)
+    }
+    fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>, StoreError> {
+        Store::search(self, query, limit)
+    }
+    fn session(&self, id: i64) -> Result<Option<Session>, StoreError> {
+        Store::session(self, id)
+    }
+    fn rename_session(&self, id: i64, title: &str) -> Result<(), StoreError> {
+        Store::rename_session(self, id, title)
+    }
+    fn set_workspace_label(&self, path: &str, label: &str) -> Result<usize, StoreError> {
+        Store::set_workspace_label(self, path, label)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,9 +16,10 @@
 
 ## STATUS (update every session)
 
-- **Phase:** 0 — **spike DONE** (S0.1–S0.5 ✅). The bridge (Phase 1) is **not started**.
-  Nothing in `crates/engine` has been deleted. `master` is still the Rust-core product.
-- **Last updated:** 2026-10-14T14:44Z (assistant, session 1)
+- **Phase:** 1 — **Move 0 (the trait seam) DONE**, so every later step is additive. The
+  bridge itself (S1.1) is **not started**. Nothing in `crates/engine` has been deleted;
+  `master` still runs the Rust core as the only core.
+- **Last updated:** 2026-10-14T23:40Z (assistant, session 2)
 - **Verdict:** feasible, and cheaper than it looks — because the UI and the tools both
   survive untouched. Measured, not assumed. Three real costs: **+~90 MB PSS**, **two
   languages in the runtime**, and **pi gives you no sandbox** (that stays ours to own).
@@ -154,6 +155,32 @@ Our side today: `engine 28,952 · ui 13,066 · gateway 2,658 · tauri-app 2,454 
    Our bar shows TTFT "the moment the first delta lands" and a character-derived rate —
    the bridge computes both from `message_update` arrival times.
 10. **Nothing is deleted until Phase 5.** The Rust engine stays buildable as the fallback.
+11. **Workspace pool policy** (user decision, 2026-10-14): **no process cap**; idle pi
+    processes are reaped on a timeout. A workspace/session switch **never disturbs an
+    in-flight turn**: each workspace owns its own pi process, so "switching" is a routing
+    decision in the bridge — which process's event stream this client is looking at — not
+    an interrupt. Safe because every `EngineEvent` already carries its conversation
+    (`TurnStart { session }` exists precisely so a second client cannot confuse "not mine"
+    with "mine"), and the `Send{session}` assertion (S1.3) is what keeps a stale tab from
+    writing into another conversation. Concurrent turns are the user's choice and we do
+    not pay for their restraint — but the UI must **show how many turns are running**, so
+    the cost is visible rather than mysterious.
+12. **The desktop joins in-process, not over a second socket** (user decision,
+    2026-10-14). The bridge is a library in the app binary implementing the same
+    `HostOps`/`StoreOps` traits the gateway already consumes; `gateway_ctl` mounts that
+    same handle as a task, as it does today. A localhost-WS desktop would add a hop, a
+    second fan-out, and a process to the PSS total, and it would break the invariant this
+    repo's own gateway doc defends: one core, so a phone answers the approval the desktop
+    is waiting on.
+13. **Pin pi 1.2.0, and keep upstream fixes cheap** (user decision, 2026-10-14).
+    Consume the **published** `@earendil-works/pi-coding-agent` at an exact version +
+    lockfile hash — never a vendored copy. Everything that is *ours* (tools, extensions,
+    bridge) lives in this repo, so a pi bump never touches it. The bridge checks
+    `pi --version` at spawn and **refuses to run on a mismatch** — a silent protocol drift
+    is worse than a refused start. Upgrade path: bump pin → `rpc-conformance.mjs` →
+    `selftest.sh` on both cores → event-stream diff → ship. If a fix genuinely belongs in
+    pi, it is a fork branch rebased onto an upstream tag consumed as a tarball alias, and
+    it gets re-verified by the same gates.
 
 ---
 
@@ -209,6 +236,15 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
 
 ### Phase 1 — the bridge, and the gates that make it real
 
+- [x] **S1.0 / Move 0 — the trait seam** (2026-10-14, 266 insertions / 28 deletions).
+      `EngineHandle` now holds `Arc<dyn HostOps>` + `Arc<dyn StoreOps>` rather than
+      `Arc<SessionHost>` / `Arc<Store>`; both traits are defined and implemented in
+      `crates/engine`. Measured surface: **9 host verbs + 14 store verbs = 23**, not the
+      "16" this plan first guessed (gotcha 13). Proved neutral rather than assumed: engine
+      **427+10 tests** and gateway **31 tests** green, and `scripts/gateway-smoke.mjs`
+      against a binary built from upstream HEAD versus one from this branch diffs **only
+      the port in its header line** — after both were seeded identically by
+      `scripts/gateway-seed.mjs` (session created, one turn, 2 transcript rows each).
 - [ ] **S1.1** `crates/bridge`: spawn/supervise `pi --mode rpc` per workspace; LF-binary
       JSONL framing (never a line reader that splits U+2028/9); id correlation; shutdown by
       closing stdin. ~1k LOC. *Exit:* a CLI debug client prints a real streamed turn.
@@ -316,16 +352,43 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     first measurement. Use `split(/\s+/)`.
 12. **Our `TurnFiles`/`+N -M` diff badges are ours to invent.** pi reports tool results, not
     workspace diffs. The Rust tools must keep emitting their own change reports.
+13. **Method-surface greps lie.** `grep -oE "h\.(host|store)\.[a-z_]+"` found 16 methods;
+    the real surface was **23**, because Rust spreads call chains across lines
+    (`h.store\n    .search(...)`). The compiler found the other seven. Measure a surface
+    with `cargo check`; use grep only to orient.
+14. **`cargo check -p cwoffee-app` is already broken at upstream HEAD in this
+    environment**, before any of our edits: the cached `tauri` build-script output under
+    `target/` records absolute paths from an older location of this repo
+    (`/home/dandandelion/Projects/cwoffee/...`), so it reads plugin permissions from a
+    directory that no longer exists. Confirmed by running the identical command in
+    `../cwoffee`. The fix is a dependency-artifact refresh (`cargo clean -p tauri`, then
+    rebuild) and it is their call, because it costs a long rebuild. Until then the desktop
+    crate cannot be typechecked here — which is why the gateway carries
+    `handle_builds_from_concrete_engine_types_and_dispatches`: the same `EngineHandle`
+    construction `crates/tauri-app/src/main.rs:386` uses, compiled and dispatched.
+15. **Two environment notes that cost time:** `cargo`/`rustc` are not on `PATH` here
+    (use `~/.cargo/bin/cargo`), and a fresh clone has **no `ui/dist`** (gitignored), so
+    `cwoffee-gateway` refuses to start — point `--dist` at a built frontend, with an
+    absolute path.
+16. **Share `../cwoffee/target` with `CARGO_TARGET_DIR`** instead of building the clone
+    from scratch (its target is 37 GB). `cargo check` writes metadata only and cannot
+    overwrite their binaries; `cargo build` *does* write `target/debug/cwoffee-gateway`, so
+    copy each artifact out before building the other core, and `cmp` the two binaries before
+    believing a parity result — an unforced `cargo build` said "Finished" and left a stale
+    binary in place, which would have made a fake comparison.
 
 ---
 
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
-1. **Workspace pool policy** — cap live pi processes, idle-kill timeout, and what a
-   workspace switch does to an in-flight turn (refuse? drain? fork the pi?).
-2. **Packaging** — embed Node + pi in RPM/AppImage (size, updates, and the supply-chain
-   surface of shipping a JS runtime next to a sandboxed Rust core). Vendor + hash, or
-   system-node + clear refusal when absent?
+1. ~~**Workspace pool policy**~~ **ANSWERED** — no cap, idle reaper, a switch never
+   interrupts an in-flight turn, concurrent turns allowed with the count made visible.
+   Still to settle in code: the timeout value (proposal: idle **and** not busy for 10 min;
+   never reap mid-turn) and what app-quit does while something is running (quit all, or
+   refuse and say why).
+2. ~~**Desktop: in-process vs embedded localhost gateway**~~ **ANSWERED for in-process**
+   (decision 12). Sub-question left: does the AppImage still ship `cwoffee-gateway` as a
+   separate binary for headless / phone-only use, over the same bridge crate?
 3. **`share_markdown` / `render_report`** — pi `export_html`, or our renderer over our index?
 4. **Compaction parity** — pi's default `reserveTokens` 16,384 / `keepRecentTokens` 20k vs our
    `context_budget` and window reporting. Do we tune them to keep our append-only cache story?
@@ -361,9 +424,71 @@ scripts/selftest.sh ; scripts/memory.sh cwoffee-app 400 ; scripts/sandbox-probe.
 node scripts/gateway-smoke.mjs
 ```
 
+### Parity check (what "no behavioural change" looks like, Move 0 onward)
+
+```bash
+# build both cores' gateway into the shared target dir, copying each artifact out
+CARGO_TARGET_DIR=../cwoffee/target ~/.cargo/bin/cargo build --offline -p cwoffee-gateway
+cp ../cwoffee/target/debug/cwoffee-gateway /tmp/gw-branch        # this tree
+(cd ../cwoffee && ~/.cargo/bin/cargo clean -p cwoffee-gateway \
+   && CARGO_TARGET_DIR=../cwoffee/target ~/.cargo/bin/cargo build --offline -p cwoffee-gateway)
+cp ../cwoffee/target/debug/cwoffee-gateway /tmp/gw-upstream
+cmp /tmp/gw-branch /tmp/gw-upstream || echo "binaries differ (expected)"   # do not skip this
+
+# start each on its own port + fresh db, seed identically, run the same gate
+for tag in upstream branch; do
+  port=$([ $tag = upstream ] && echo 8101 || echo 8102)
+  /tmp/gw-$tag --url http://127.0.0.1:8190/v1 --model cwoffee-mock --port $port \
+     --token SMOKE-TOKEN-123 --workspace /tmp/cw-smoke-ws --db /tmp/gw-$tag.db \
+     --dist "$PWD/../cwoffee/ui/dist" & gp=$!
+  sleep 2
+  node scripts/gateway-seed.mjs $port SMOKE-TOKEN-123          # one real turn per core
+  node scripts/gateway-smoke.mjs --url ws://127.0.0.1:$port/ws --token SMOKE-TOKEN-123 \
+       > /tmp/smoke-$tag.txt 2>&1
+  kill $gp; sleep 1
+done
+diff /tmp/smoke-upstream.txt /tmp/smoke-branch.txt   # only the port line may differ
+```
+
+The mock endpoint (`../cwoffee/scripts/mock-llm.mjs --port 8190`) must be running, and
+`cargo`/`rustc` are at `~/.cargo/bin/` here.
+
 ---
 
 ## PROGRESS JOURNAL (newest on top)
+
+### 2026-10-14T23:40Z — session 2 — three decisions locked, and Move 0 lands ✅
+
+- **User decisions recorded as 11–13:** no workspace-process cap with an idle reaper;
+  switching never interrupts an in-flight turn (it is bridge routing, not an interrupt —
+  the per-event `session` on `TurnStart` plus the `Send` assertion are what make that
+  safe, and the UI has to show the running-turn count so the cost is not hidden); the
+  desktop joins **in-process** on the same traits; pi is pinned, consumed as a published
+  package, with a version handshake that refuses to run on mismatch and a fork-rebased-on-
+  tag route if a fix truly belongs upstream.
+- **Move 0 done:** `HostOps` (9 verbs) + `StoreOps` (14 verbs) defined and implemented in
+  `crates/engine`; `EngineHandle` holds `Arc<dyn …>`. 266 insertions / 28 deletions, and
+  every changed call site is delegation, no logic.
+- **My own earlier estimate was wrong and is corrected here:** the surface is **23 verbs,
+  not 16** — the one-line grep could not see multi-line call chains, and the compiler found
+  the other seven (`search`, `session`, `rename_session`, `set_workspace_label`, and the
+  three live search-panel capabilities). The seam is still small; it is just not that small.
+- **Proven neutral, not asserted:** `cwoffee-engine` 427 + 10 tests pass, `cwoffee-gateway`
+  31 pass, and `gateway-smoke.mjs` against a binary from upstream HEAD versus one from this
+  branch differs **only in the port it prints** — with both stores seeded by the same new
+  `scripts/gateway-seed.mjs` (one real turn through the mock endpoint, 2 transcript rows
+  each). That seed script is deliberately a client, not a test: it is the cheapest way to
+  make the smoke gate stop reading an empty database.
+- **Caught a pre-existing break, not ours:** `cargo check -p cwoffee-app` fails at upstream
+  HEAD in this environment because the cached `tauri` build-script output still points at
+  `/home/dandandelion/Projects/cwoffee/target/...`. Reproduced in `../cwoffee` to be sure.
+  Consequence: the desktop crate can't be typechecked here, so the identical `EngineHandle`
+  construction is asserted by a gateway test instead. Their call whether to pay the
+  `cargo clean -p tauri` rebuild.
+- **Next:** S1.1 `crates/bridge` implementing `HostOps`/`StoreOps` over a pi child process.
+  The exit criterion is unchanged and still the real test: a live turn in the existing
+  desktop UI with zero UI edits (S1.2). Two decisions worth making before S1.1 starts, both
+  small: the idle-reap threshold, and what app-quit does while a turn is running.
 
 ### 2026-10-14T14:44Z — session 1 — clone + Phase 0 spike ✅
 

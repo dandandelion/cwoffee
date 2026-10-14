@@ -12,9 +12,11 @@
 //! preemptible would mean restructuring the agent loop around `select!` at every
 //! await point; for v1 that complexity is not worth it, but it is worth naming.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -24,6 +26,7 @@ use crate::config::Config;
 use crate::event::EngineEvent;
 use crate::prompt::PromptBuilder;
 use crate::provider::{Provider, Reasoning, Role};
+use crate::settings::{SearchProbe, SearchView};
 use crate::store::Store;
 use crate::telemetry::TurnTelemetry;
 use crate::tools::{Registry, ToolCtx};
@@ -1214,6 +1217,115 @@ fn set_busy(state: &Arc<Mutex<HostState>>, busy: bool) {
 ///
 /// Shared so the TUI and the webview cannot drift into asking different
 /// questions about the same call.
+/// The slice of a core that a **client** drives.
+///
+/// This is the seam that lets a second core (a `pi` RPC bridge) sit behind the
+/// desktop window and the phone client without either front end learning that the
+/// engine underneath changed. The surface is measured, not guessed: the gateway
+/// calls **nine** verbs and `crates/tauri-app` calls five of those same nine
+/// (`state`, `send`, `send_turn_to`, `cancel`, `set_workspace_checked`), so this
+/// trait is that surface written down — not a new abstraction.
+///
+/// Keep it small on purpose. Every verb added here is a promise that *both* cores
+/// must keep, in the same way, forever. In particular, do not widen it with things
+/// that are really engine internals (`provider`, `search_tool`, `take_receivers`):
+/// the moment a client reaches through this trait for a `dyn Provider`, the
+/// pi-backed implementation has to invent one, and the seam stops meaning anything.
+#[async_trait]
+pub trait HostOps: Send + Sync {
+    /// The command mailbox. See [`HostCmd`] — including the session assertion on
+    /// `Send`, which this trait cannot and must not weaken: an unaddressed send
+    /// lands in whatever conversation the last switch left active.
+    fn send(&self, cmd: HostCmd);
+
+    /// A send addressed to a specific conversation. `session: None` means "wherever
+    /// the host is"; a number is an assertion, and refusing a mismatched one is what
+    /// keeps a stale phone tab from appending to the desktop's chat. Both cores have
+    /// to refuse it the same way.
+    fn send_turn_to(
+        &self,
+        text: String,
+        attachments: Vec<crate::provider::Attachment>,
+        session: Option<i64>,
+    );
+
+    /// Stop the running turn and release whatever it is parked on.
+    fn cancel(&self);
+
+    /// Snapshot for status lines and the composer's current-state labels.
+    fn state(&self) -> HostState;
+
+    /// Move the tools to another workspace, refusing anything the checks reject.
+    async fn set_workspace_checked(&self, path: &str) -> Result<String, String>;
+
+    /// Models for the model menu. The error must survive: the gateway renders an
+    /// empty list plus an inline reason rather than blanking the app, and "no models"
+    /// and "cannot reach the endpoint" are different claims to a user.
+    async fn models_info(&self) -> Result<Vec<crate::provider::ModelInfo>, String>;
+
+    /// The web-search panel: which provider is on and what it says about itself.
+    ///
+    /// Named as a capability deliberately. Handing a client `provider()` or
+    /// `search_tool()` would make every future core grow those internals just to
+    /// satisfy the trait, and the seam would stop meaning anything.
+    async fn search_view(&self, cfg_path: &Path) -> SearchView;
+
+    /// Choose the search provider. Both cores write the *same* config file, so a
+    /// provider picked on a phone is still picked after a restart, and the two shells
+    /// never disagree.
+    async fn set_search_backend(
+        &self,
+        cfg_path: &Path,
+        backend: &str,
+        searxng_url: &str,
+    ) -> Result<SearchView, String>;
+
+    /// One real search, so "is search working?" gets answered by the host instead of
+    /// by asking the model to demonstrate it.
+    async fn search_probe(&self, query: Option<String>) -> Result<SearchProbe, String>;
+}
+
+#[async_trait]
+impl HostOps for SessionHost {
+    fn send(&self, cmd: HostCmd) {
+        SessionHost::send(self, cmd)
+    }
+    fn send_turn_to(
+        &self,
+        text: String,
+        attachments: Vec<crate::provider::Attachment>,
+        session: Option<i64>,
+    ) {
+        SessionHost::send_turn_to(self, text, attachments, session)
+    }
+    fn cancel(&self) {
+        SessionHost::cancel(self)
+    }
+    fn state(&self) -> HostState {
+        SessionHost::state(self)
+    }
+    async fn set_workspace_checked(&self, path: &str) -> Result<String, String> {
+        SessionHost::set_workspace_checked(self, path).await
+    }
+    async fn models_info(&self) -> Result<Vec<crate::provider::ModelInfo>, String> {
+        self.provider().list_models_info().await.map_err(|e| e.to_string())
+    }
+    async fn search_view(&self, cfg_path: &Path) -> SearchView {
+        crate::settings::search_view(self, cfg_path).await
+    }
+    async fn set_search_backend(
+        &self,
+        cfg_path: &Path,
+        backend: &str,
+        searxng_url: &str,
+    ) -> Result<SearchView, String> {
+        crate::settings::set_search_backend(self, cfg_path, backend, searxng_url).await
+    }
+    async fn search_probe(&self, query: Option<String>) -> Result<SearchProbe, String> {
+        crate::settings::search_probe(self, query).await
+    }
+}
+
 pub fn approval_event(req: &ApprovalRequest) -> EngineEvent {
     EngineEvent::ApprovalRequested {
         id: req.id,

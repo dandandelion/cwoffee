@@ -46,13 +46,23 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, oneshot};
 use cwoffee_engine::approval::ApprovalAnswer;
 use cwoffee_engine::event::EngineEvent;
-use cwoffee_engine::host::{HostCmd, SessionHost};
-use cwoffee_engine::store::Store;
+use cwoffee_engine::host::{HostCmd, HostOps};
+use cwoffee_engine::store::StoreOps;
 
 /// Everything `serve` needs to reach the live engine.
 pub struct EngineHandle {
-    pub host: Arc<SessionHost>,
-    pub store: Arc<Store>,
+    /// The live core, behind a trait on purpose. This is the seam that lets another
+    /// core (a `pi` RPC bridge) answer for the Rust engine without the desktop window
+    /// or a phone learning which one is running.
+    ///
+    /// Still exactly **one** core per process, and the one the desktop window drives:
+    /// a second core with its own host would look identical on the surface and be a
+    /// different conversation, which is the whole thing this file exists to prevent.
+    pub host: Arc<dyn HostOps>,
+    /// Transcript/sidebar reads, also behind a trait. A core that keeps its sessions
+    /// somewhere else (pi: JSONL trees) supplies a derived index here, and the client
+    /// cannot tell the difference.
+    pub store: Arc<dyn StoreOps>,
     /// Fan-out of the same events the desktop webview receives.
     pub events: broadcast::Sender<EngineEvent>,
     /// The same pending map the desktop's `respond_approval` uses, so an
@@ -946,10 +956,8 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         // a payload); choosing one and running a probe are drive-only: the first
         // edits the host's config, the second spends the host's network and CPU.
         "search_settings" => {
-            serde_json::to_value(
-                cwoffee_engine::settings::search_view(&h.host, &h.config_path).await,
-            )
-            .map_err(|e| e.to_string())
+            serde_json::to_value(h.host.search_view(&h.config_path).await)
+                .map_err(|e| e.to_string())
         }
         "session_messages" => {
             let id = arg_i64(&args, "id")?;
@@ -974,7 +982,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                     .map_err(|e| e.to_string())?;
             // A model list that fails must not blank the app; the client shows the
             // error in the model menu instead.
-            let models = match h.host.provider().list_models_info().await {
+            let models = match h.host.models_info().await {
                 Ok(m) => serde_json::to_value(m).unwrap_or_else(|_| json!([])),
                 Err(_) => json!([]),
             };
@@ -1081,13 +1089,14 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             need_drive(role)?;
             // Audited and drive-only: this edits the host's config file. A watch
             // token may see which provider is on, not change it.
-            let v = cwoffee_engine::settings::set_search_backend(
-                &h.host,
-                &h.config_path,
-                &arg_str(&args, "backend")?,
-                &args.get("searxng_url").and_then(|v| v.as_str()).unwrap_or_default(),
-            )
-            .await?;
+            let v = h
+                .host
+                .set_search_backend(
+                    &h.config_path,
+                    &arg_str(&args, "backend")?,
+                    &args.get("searxng_url").and_then(|v| v.as_str()).unwrap_or_default(),
+                )
+                .await?;
             serde_json::to_value(v).map_err(|e| e.to_string())
         }
         "search_probe" => {
@@ -1095,7 +1104,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             // One real search, so "is search working" can be answered on a machine
             // where the model is not being asked to demonstrate it.
             let q = args.get("query").and_then(|v| v.as_str()).map(String::from);
-            serde_json::to_value(cwoffee_engine::settings::search_probe(&h.host, q).await?)
+            serde_json::to_value(h.host.search_probe(q).await?)
                 .map_err(|e| e.to_string())
         }
         "respond_approval" => {
@@ -1251,8 +1260,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         }
         "list_models" => serde_json::to_value(
             h.host
-                .provider()
-                .list_models_info()
+                .models_info()
                 .await
                 .map_err(|e| format!("{e}"))?,
         )
@@ -1311,6 +1319,43 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cwoffee_engine::host::SessionHost;
+    use cwoffee_engine::store::Store;
+
+    /// Both shells build the handle the same way: `Arc::clone` of the **concrete**
+    /// `SessionHost`/`Store`, coerced to the trait objects. `crates/tauri-app` does
+    /// exactly this and cannot be type-checked in every environment (its build script
+    /// needs the desktop toolchain), so the pattern is asserted here instead.
+    ///
+    /// It also calls one verb through each trait object: a `dyn` field that compiles
+    /// but is never dispatched is a type that proves nothing.
+    #[tokio::test]
+    async fn handle_builds_from_concrete_engine_types_and_dispatches() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p: Arc<dyn cwoffee_engine::provider::Provider> = Arc::new(FakeProvider);
+        let host = Arc::new(SessionHost::spawn(
+            p,
+            cwoffee_engine::tools::Registry::new(),
+            Arc::clone(&store),
+            cwoffee_engine::host::HostConfig::new("m", std::env::temp_dir()),
+        ));
+        let h = EngineHandle {
+            host: Arc::clone(&host) as Arc<dyn HostOps>,
+            store: Arc::clone(&store) as Arc<dyn StoreOps>,
+            events: broadcast::channel(8).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(Mutex::new(BTreeMap::new())),
+            migration_notes: vec![],
+            config_path: PathBuf::from("/nonexistent/cwoffee.toml"),
+        };
+        // The state the composer labels itself from, and the sidebar list the phone
+        // draws. If either dispatch were wrong this would not link.
+        let st = h.host.state();
+        assert_eq!(st.turns, 0, "a fresh host has run no turns");
+        let rows = h.store.list_sessions(50).expect("in-memory store lists sessions");
+        assert!(rows.is_empty(), "a fresh store has no sessions");
+    }
 
     #[test]
     fn token_comparison_accepts_equal_and_rejects_different() {
