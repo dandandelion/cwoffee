@@ -1,0 +1,28 @@
+[package]
+name = "cwoffee-bridge"
+version = "0.0.0"
+edition = "2021"
+description = "Run `pi --mode rpc` as a cwoffee core: the HostOps/StoreOps surface over a pi child process, with the sandbox, the approvals, and the transcript still ours."
+
+[lib]
+name = "cwoffee_bridge"
+path = "src/lib.rs"
+
+# A CLI client over the same traits the desktop and the gateway use. It exists to
+# answer one question early, and answer it without a UI: does a real streamed
+# turn survive the translation?
+[[bin]]
+name = "cwoffee-bridge-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+cwoffee-engine = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "rt-multi-thread", "macros", "time", "sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

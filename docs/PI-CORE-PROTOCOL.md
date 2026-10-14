@@ -92,7 +92,7 @@ pi does not emit it.**
 
 | cwoffee `HostCmd` | pi RPC | Notes |
 |---|---|---|
-| `Send {text, attachments, session}` | `prompt {message}` (+ `steer`, `follow_up` — new capability we did not have) | ⚠ the `session: Option<i64>` **assertion is ours**: pi has no concept of "this prompt belongs to conversation X, refuse otherwise". Enforce in bridge (S1.3) or two clients will edit each other's conversation. Attachments: pi handles images/files via message content + its own image limits. |
+| `Send {text, attachments, session}` | `prompt {message}` (+ `steer`, `follow_up` — new capability we did not have) | ⚠ the `session: Option<i64>` **assertion is ours** — and it is *addressing*, not a mismatch check: naming a conversation **moves the bridge to it** (the Rust core does exactly this, and its `resume` is what makes it work), while an id with no stored row is refused. A silent no-op is the failure mode to design against: two clients would otherwise edit each other's conversation. pi has no such notion at all. Attachments: pi handles images/files via message content + its own image limits — **not wired in S1.1**, which refuses them with a note. |
 | `Cancel` | `abort` | |
 | — (new) | `steer`, `follow_up`, `clear_queue` | pi's mid-run steering/follow-up queue is a feature the Rust core never had; `queue_update` feeds the UI |
 | `SetMode {ask,auto,allow}` | `tool_call` handler + `ctx.ui.confirm` in our extension | our three-way mode lives in the bridge/extension, not in pi |
@@ -181,3 +181,54 @@ Tool call → approval → Rust tool → second step (our `read-file-approval` s
 
 The `engine:"rust"` in that result is the point of the whole document: the tool ran as a Rust
 binary, its guardrails enforced in Rust, with pi only orchestrating.
+
+## 7. Verified against pi 1.2.0 (fixture: `crates/bridge/tests/fixtures/pi-events-read-file-approval.jsonl`)
+
+Everything below came from recording one real turn (`scripts/pi-event-capture.mjs`) against
+cwoffee's own mock endpoint, not from the docs. Regenerate the fixture whenever the pin moves:
+it is also the translator's test input, so a pi bump that changes the wire moves a failing
+test rather than leaving a stale paragraph here.
+
+**One prompt, two pi turns.** 47 records for one prompt that called one tool: `agent_start`,
+then **two** `turn_start`/`turn_end` pairs (the tool round trip, then the answer after its
+result), 5 `message_start`/`message_end` pairs (system, user, assistant, toolResult,
+assistant), 25 `message_update`, one `extension_ui_request`, `agent_end`, `agent_settled`.
+Hence the mapping rule in §2: cwoffee's turn spans `agent_start` → `agent_settled`, and pi's
+inner boundaries emit nothing. Note the order: `agent_end` arrives **before**
+`agent_settled`, so closing a turn on `agent_end` is off by whatever pi queues in between.
+
+**Message shapes.** `message_start` carries the skeleton (`role`, empty `content`); blocks are
+filled by `message_update.assistantMessageEvent` — `text_start/text_delta/text_end`,
+`thinking_start/thinking_delta/thinking_end`, `toolCall_start/toolCall_delta/toolCall_end`,
+with `contentIndex` as the block slot. `message_end` carries the **whole** assistant message
+plus its `usage` trailer and `stopReason` (`toolUse` / `stop`). pi's `toolCall` blocks use
+`name` + `args`; cwoffee's wire says `function.name` + `arguments` — the translator
+translates, it does not forward.
+
+`toolResult` messages are `{role:"toolResult", toolCallId, toolName, content:[{type:"text",…}],
+isError, durationMs}`. Our Rust envelope (`{ok, tool, …}` as text) survives intact, so
+`TurnFiles` can still come from a tool's own `changes`/`files` — with nothing synthesised
+when a tool reports none.
+
+**Dialogs.** `extension_ui_request` has only `id`, `method`, and per-method fields:
+`confirm {title, message, timeout}`, `select {title, options[], timeout}`, `input {title,
+placeholder, timeout}`. **No tool name, no risk, no escapes** — hence the `Allow <tool>?`
+title convention for our extensions. It also names a real danger: an arbitrary extension can
+ask a `confirm` about anything at all, and our UI would render it as an approval card. The
+bridge marks such cards so they can be labelled differently before cutover.
+
+**`get_state` fields that matter here:** `sessionFile`, `sessionId`, `model`,
+`thinkingLevel`, `isStreaming`, `messageCount`, `pendingMessageCount`. `sessionFile` is what
+makes resume — and therefore the idle reaper — lossless (PI-CORE-PLAN decision 14).
+
+**Numbers worth keeping (this box, pi 1.2.0, mock endpoint, one extension):** ready
+190–290 ms per workspace; respawn after an idle reap 191 ms; 4.1 s for a two-round-trip tool
+turn (the mock simulates 800 ms of latency per round trip). Resume stores 4 rows → **6**, not
+4+4+2, so replay does not duplicate the conversation. `usage` is per round trip, so a cwoffee
+turn's totals are the sum over its pi turns — and `usage.input` **excludes** cached tokens:
+prompt = `input + cacheRead + cacheWrite` (a measured turn: `prompt=1177 cached=617`).
+
+**CLI traps.** `--tools` takes the *next token* (a denylist like `-read,-bash,-edit,-write`
+only works that way) and **`--tools=x` is not accepted at all** — it falls into pi's
+unknown-flag path. A guardrail flag that is silently ignored is worse than one that errors,
+so the bridge's argv builder keeps the space form in code with a comment saying why.

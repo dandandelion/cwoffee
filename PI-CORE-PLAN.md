@@ -16,10 +16,12 @@
 
 ## STATUS (update every session)
 
-- **Phase:** 1 — **Move 0 (the trait seam) DONE**, so every later step is additive. The
-  bridge itself (S1.1) is **not started**. Nothing in `crates/engine` has been deleted;
-  `master` still runs the Rust core as the only core.
-- **Last updated:** 2026-10-14T23:40Z (assistant, session 2)
+- **Phase:** 1 — **Move 0 (trait seam) and S1.1 (the bridge) are DONE**: `crates/bridge`
+  runs pi as a cwoffee core and a CLI client streamed a real turn through it, with
+  approvals answered by the client and the transcript landing in cwoffee's SQLite.
+  **S1.2 (wire it to the gateway/desktop) is the next step and is not started.**
+  Nothing in `crates/engine` has been deleted; `master` still runs the Rust core only.
+- **Last updated:** 2026-10-15T00:40Z (assistant, session 3)
 - **Verdict:** feasible, and cheaper than it looks — because the UI and the tools both
   survive untouched. Measured, not assumed. Three real costs: **+~90 MB PSS**, **two
   languages in the runtime**, and **pi gives you no sandbox** (that stays ours to own).
@@ -161,8 +163,12 @@ Our side today: `engine 28,952 · ui 13,066 · gateway 2,658 · tauri-app 2,454 
     decision in the bridge — which process's event stream this client is looking at — not
     an interrupt. Safe because every `EngineEvent` already carries its conversation
     (`TurnStart { session }` exists precisely so a second client cannot confuse "not mine"
-    with "mine"), and the `Send{session}` assertion (S1.3) is what keeps a stale tab from
-    writing into another conversation. Concurrent turns are the user's choice and we do
+    with "mine"), and the send address is what keeps a stale tab from writing into
+    another conversation. **Corrected against the Rust core's real behaviour, not my
+    paraphrase:** naming a conversation in `Send{session: Some(id)}` *moves the host to
+    it* and runs the turn there; what is refused is a name that matches no stored row
+    (`SessionHost::a_turn_moves_the_host_to_the_conversation_it_names` is the spec, and the
+    bridge reproduces it). Concurrent turns are the user's choice and we do
     not pay for their restraint — but the UI must **show how many turns are running**, so
     the cost is visible rather than mysterious.
 12. **The desktop joins in-process, not over a second socket** (user decision,
@@ -181,6 +187,25 @@ Our side today: `engine 28,952 · ui 13,066 · gateway 2,658 · tauri-app 2,454 
     `selftest.sh` on both cores → event-stream diff → ship. If a fix genuinely belongs in
     pi, it is a fork branch rebased onto an upstream tag consumed as a tarball alias, and
     it gets re-verified by the same gates.
+14. **Idle reaper: 600 s, and reaping is lossless** (settled 2026-10-15, implemented in
+    `crates/bridge`). A pi process is closed when it has been idle **10 minutes**, is
+    **not** mid-turn, and has **no dialog outstanding** anywhere. The next turn respawns
+    it against the same pi session file (`get_state` reports `sessionFile`; the bridge
+    pairs it with the cwoffee row id in `cwoffee-pi-sessions.json`), so the model keeps
+    everything it knew. Measured: respawn + ready = **190–290 ms**, and the resumed turn
+    showed `prompt=1072 cached=506` — the earlier context came back and hit the prefix
+    cache. Reaping is therefore a memory decision, not a user-visible interruption; the
+    transcript says so in a `Note` either way.
+15. **Quit while busy: refuse, then confirm, then a bounded kill** (settled 2026-10-15;
+    **not yet implemented** — it belongs to the desktop quit path, S5). A close/quit
+    with a turn running does not silently kill it: the app stays up and says *N turns are
+    still running — stop them and quit, or keep working*. On confirm: `abort` every busy
+    session, wait up to **2 s** for `agent_settled`, let the store flush (it persists per
+    message, so a partial answer is already durable), then exit; if a session has not
+    settled in 2 s, SIGKILL the pi children and exit, logging what was killed. The reason
+    for the refusal rather than the silent kill is the same reason the approval gate fails
+    closed: a UI that disappears must not leave an agent acting unattended, and a turn
+    truncated without saying so is indistinguishable from one that finished.
 
 ---
 
@@ -245,18 +270,36 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
       against a binary built from upstream HEAD versus one from this branch diffs **only
       the port in its header line** — after both were seeded identically by
       `scripts/gateway-seed.mjs` (session created, one turn, 2 transcript rows each).
-- [ ] **S1.1** `crates/bridge`: spawn/supervise `pi --mode rpc` per workspace; LF-binary
+- [x] **S1.1** `crates/bridge`: spawn/supervise `pi --mode rpc` per workspace; LF-binary
       JSONL framing (never a line reader that splits U+2028/9); id correlation; shutdown by
-      closing stdin. ~1k LOC. *Exit:* a CLI debug client prints a real streamed turn.
+      closing stdin. **Actual size: ~2.8k lines, not the ~1k this plan guessed** — the
+      extra went into addressing, approvals/questions, the idle reaper, resume, and
+      telemetry synthesis, all of which turned out to be the part with the bugs in it.
+      *Exit met:* `cwoffee-bridge-probe` streamed a real turn (`6 text`, `11 reasoning`
+      deltas, one tool card, one approval card answered by the client, `usage` with
+      `cached=491/1039`) and the store kept 4 rows.
 - [ ] **S1.2** frame emulation: bridge emits the **existing** `event`/`resync`/`bootstrap`
       payloads; `ui/` untouched. *Exit:* desktop app runs a live turn with **zero UI edits**.
-- [ ] **S1.3** session-identity assertion in the bridge (`Send{session:Some(id)}` refuses
-      when the host moved on) — pi has no such notion; 20 lines here protects the
-      desktop-vs-phone invariant.
-- [ ] **S1.4** approvals + `ask_user` → `respond_approval` / `respond_question` mapping,
-      incl. `question_set` grouping (multi-question cards: OPEN QUESTION 6).
-- [ ] **S1.5** telemetry in the bridge: TTFT, live tok/s (`≈`), `Usage`, `context_tokens`,
-      `compactions`, cache state from `usage.input + cacheRead (+cacheWrite)`.
+      This is now the whole distance between the probe and a usable product: the gateway
+      already consumes `Arc<dyn HostOps>` + the same three receivers, so mounting the
+      bridge there is a construction change, not a rewrite.
+- [x] **S1.3** the send address, as the Rust core actually behaves it (see decision 11):
+      a named conversation moves the bridge, an unknown id is refused, and the cwoffee
+      row ↔ pi session file pairing makes switching and resume real. Proven by probe run B
+      (`resume Some(...jsonl)` across a process restart, 6 rows, no duplicates). Not yet
+      exercised through the gateway — that is S1.2.
+- [x] **S1.4** approvals + questions: pi's `confirm` → `ApprovalRequested` (with the tool
+      name from our `Allow <tool>?` title convention and the out-of-workspace paths
+      listed verbatim), `select`/`input` → `QuestionRequested`, answers back as
+      `extension_ui_response`. Four closure paths proven: allow, deny, silence (pi's own
+      timeout denies), and a vanished viewer (dropped oneshot). In every non-allow case the
+      Rust tool did **not** run. cwoffee's `ask_user` *tool* is still S2.2.
+- [x] **S1.5** telemetry: TTFT and live tok/s from our own clock, `Usage` summed over pi's
+      per-message `usage` with the cache terms added back, `context_tokens` from the real
+      prompt size. pi reports no server timings and no speculative counters, so those
+      fields stay 0 rather than being invented. One trap fixed: wall clock counted time
+      parked on a human, so a 4 s approval made the turn read **2 tok/s**; it now reports
+      the model's **119 tok/s**, and a test pins it.
 - [ ] **S1.6** `scripts/rpc-conformance.mjs` — pinned-version protocol guard (fails on
       unknown names). Add to CI next to `selftest.sh`.
 - [ ] **S1.7** `memory.sh` tree-summing + new `core ≤ 110 MB` line; report both cores.
@@ -376,16 +419,54 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     copy each artifact out before building the other core, and `cmp` the two binaries before
     believing a parity result — an unforced `cargo build` said "Finished" and left a stale
     binary in place, which would have made a fake comparison.
+17. **pi's "turn" is not cwoffee's turn, and translating 1:1 breaks the UI.** pi emits
+    `turn_start`/`turn_end` per *model round trip*: the recorded fixture's one prompt has
+    **two** of each (tool round trip, then the answer). cwoffee's turn is one prompt
+    including its tool loop, and `TurnEnd` is where markdown is parsed once and where
+    `state().turns` advances. Mapping pi's pairs 1:1 would re-render a half-finished answer
+    after every tool call and count one prompt as four turns. The bridge opens a turn at
+    `agent_start` and closes it at `agent_settled`; pi's inner boundaries emit nothing.
+    Pinned by `one_prompt_is_one_turn_even_when_pi_runs_two_of_its_own`.
+18. **`--tools` needs the space form; the `=` form silently does nothing.** pi 1.2.0's
+    argument parser is hand-rolled: it takes the *next token* for `--tools` (which is how a
+    denylist like `-read,-bash` works at all), and it does **not** accept `--tools=x` — that
+    lands in its unknown-flag path. Our first bridge run died with `Unknown option:
+    --tools`; had pi been more forgiving, the flag that keeps pi's own `read`/`bash`/
+    `edit`/`write` off would simply have been ignored. A guardrail that switches itself off
+    quietly is the failure mode to design against, so the argv builder says why in a comment.
+19. **Wall-clock rates lie when a turn parks on a person.** The first live run reported
+    **2 tok/s** for a turn where a human had four seconds to answer an approval card. The
+    fix is to accumulate time spent parked on a dialog (including a card still open when
+    the run ends, because that wait ended too) and subtract it from the generation window.
+    Same turn: 119 tok/s. This matters most for the S4.2 dual-core A/B, where a
+    human-answered turn on one core would otherwise look 50× slower than the same turn on
+    the other.
+20. **pi's `confirm` dialog carries no tool name.** `extension_ui_request` has `title`,
+    `message`, `timeout` — that is all. cwoffee's approval card needs the tool (header, and
+    `AllowSession`, which is per tool), so our extensions own the convention: title
+    `Allow <tool>?`. Anything else prints "the tool" rather than guessing. Escapes are
+    derived from the message text, which is what makes the card answerable: `read_file —
+    /etc/hostname escapes=["/etc/hostname"]` is a question a person can actually answer.
+21. **Resume replays only new messages (verified, not assumed).** The worry was that
+    `--session <file>` would re-stream the old conversation and store it twice. It does not:
+    after a resume the store went from 4 rows to 6, not 4+4+2. Worth re-checking when pi is
+    bumped, because the duplicate-index path would be silent and expensive.
+22. **One engine test flaked under three-package load and I could not name it.** In the
+    first combined `cargo test -p engine -p gateway -p bridge` run, one `cwoffee-engine`
+    lib test failed (426 passed, 1 failed) and my grep lost the name. Five engine-only runs
+    and two further combined runs were clean. Unresolved: a named flake is fixable, an
+    unnamed one can hide a real bug. Next time, capture the name before re-running
+    (`sed -n '/^failures:$/,/^$/p'` on the raw output, not `grep test result`).
 
 ---
 
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
-1. ~~**Workspace pool policy**~~ **ANSWERED** — no cap, idle reaper, a switch never
+1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
+   (never mid-turn, never with a card open), resume by pi session file, switch never
    interrupts an in-flight turn, concurrent turns allowed with the count made visible.
-   Still to settle in code: the timeout value (proposal: idle **and** not busy for 10 min;
-   never reap mid-turn) and what app-quit does while something is running (quit all, or
-   refuse and say why).
+   See decision 14 for the measurements. Remaining *UI* work for this decision: the
+   running-turn count in the composer/status area, so the cost of concurrency is visible.
 2. ~~**Desktop: in-process vs embedded localhost gateway**~~ **ANSWERED for in-process**
    (decision 12). Sub-question left: does the AppImage still ship `cwoffee-gateway` as a
    separate binary for headless / phone-only use, over the same bridge crate?
@@ -453,9 +534,81 @@ diff /tmp/smoke-upstream.txt /tmp/smoke-branch.txt   # only the port line may di
 The mock endpoint (`../cwoffee/scripts/mock-llm.mjs --port 8190`) must be running, and
 `cargo`/`rustc` are at `~/.cargo/bin/` here.
 
+### The bridge probe (what a turn looks like with pi as the core)
+
+```bash
+# scenario fixtures, regenerated whenever pi is bumped
+cd ../cwoffee && node scripts/mock-llm.mjs --port 8190
+cd ../pi-cwoffee/spike && ./build-shim.sh && cd ..
+SCENARIO=read-file-approval node scripts/pi-event-capture.mjs   # writes the test fixture
+
+# one streamed turn, with the client answering the approval card
+CWOFFEE_SHIM=$PWD/spike/cwshim cargo run --offline -p cwoffee-bridge --bin cwoffee-bridge-probe -- \
+  --url http://127.0.0.1:8190/v1 --provider cwoffee-mock --model cwoffee-mock \
+  --workspace /tmp/pi-ws --agent-dir /tmp/cw-bridge-probe --db /tmp/cw-bridge-probe/store.db \
+  --ext spike/pi-extension-cwoffee-tools.ts --tools "-read,-bash,-edit,-write" \
+  --prompt "Use read_file to read the file /etc/hostname" --approve allow
+
+# the same conversation across a process restart (resume by pi session file)
+... --switch 1 --prompt "What is 6 times 7?"
+# the reaper closing an idle process mid-conversation, then resuming it
+... --idle-reap-secs 1 --gap-secs 6 --prompt "What is 6 times 7?" --prompt "Use read_file to read the file /etc/hostname"
+# fail-closed: denied, and unanswered two ways
+... --approve deny
+... --no-answer --approval-timeout-secs 4
+... --drop-card  --approval-timeout-secs 4
+```
+
+The probe exits nonzero if no turn ended, which is what makes it usable as a gate rather
+than a demo.
+
 ---
 
 ## PROGRESS JOURNAL (newest on top)
+
+### 2026-10-15T00:40Z — session 3 — two numbers settled, and pi now runs as a cwoffee core ✅
+
+- **The two open numbers are closed (decisions 14–15).** Idle reaper: **600 s**, never
+  mid-turn, never with a dialog open anywhere, and *lossless* because a respawn passes
+  `--session <file>` from the row↔file pairing. Quit while busy: refuse and say how many
+  turns are running, then on confirm `abort` all, wait 2 s for `agent_settled`, exit;
+  SIGKILL only as a bounded fallback. The quit path is **decided but not built** — it lives
+  in the desktop shell (S5), and saying so here keeps it from looking finished.
+- **S1.1 built:** `crates/bridge` — `process.rs` (spawn, LF framing, id correlation, version
+  handshake, stdin-close shutdown), `translate.rs` (pi records → `EngineEvent` + store rows
+  + telemetry), `host.rs` (`HostOps` over a pi child: addressing, dialogs, reaper,
+  workspace move, session switch), `sessions.rs` (row↔pi-file pairing), plus
+  `cwoffee-bridge-probe`, a client that talks only through `HostOps`/`StoreOps`. **~2.8k
+  lines, against this plan's ~1k estimate** — the gap is the parts that turned out to hold
+  the decisions, not the plumbing.
+- **Recorded, not remembered:** `scripts/pi-event-capture.mjs` writes a real pi turn to
+  `crates/bridge/tests/fixtures/pi-events-read-file-approval.jsonl` (47 records: 2 pi turns,
+  5 messages, 25 streamed updates, a tool call, a `confirm` dialog, the usage trailer). The
+  translator is tested against that, so a pi bump moves the test, not just the docs.
+- **Gates:** engine 427 + 10, gateway 31, bridge **12** (5 unit + 7 fixture/replay) — 480
+  passing. Gateway smoke still OK on the branch with the new crate in the workspace.
+- **Six probe runs, all reproducible from the commands in §5:** allow (4 store rows, one
+  approval card with `escapes=["/etc/hostname"]`, `cached=491/1039`); resume across a process
+  restart (`resume Some(…jsonl)`, 4 rows → 6, no duplicates); reaper + resume (`prompt=1072
+  cached=506` after a respawn at 191 ms); deny (tool row became `blocked: user denied
+  approval`, the Rust shim never ran); silence (pi's own 4 s timeout denied — `ok=false`);
+  dropped viewer (note said the tool did not run). Ready latency 190–290 ms per workspace.
+- **Four bugs the tests caught before anything shipped:** (1) transcript rows were stored
+  twice — once per message and again at settle, caught by the role-sequence assertion;
+  (2) `message_start`/`response` counted as unknown records, which would have made the
+  "pi sent something new" signal useless; (3) `--tools=…` is silently ignored by pi's
+  parser, so the switch that disables pi's built-in coding tools would have been a no-op;
+  (4) wall-clock rates counted time parked on a human as generation — 2 tok/s instead of
+  119 for a turn with a 4 s approval wait, which would have poisoned the dual-core A/B.
+- **Also found:** my own description of the send address was wrong. The Rust core does not
+  "refuse a mismatched session"; it *moves* to the named conversation and refuses only an
+  id with no row. The bridge reproduces the real behaviour, and decision 11 now says so.
+- **Unresolved:** one engine test failed in the first three-package run and my grep lost the
+  name (gotcha 22). Seven later runs were clean. Name it next time.
+- **Next (S1.2):** construct `EngineHandle` from `PiHost` in `crates/gateway/src/main.rs`
+  behind a `--core pi` flag — the gateway already takes `Arc<dyn HostOps>` plus the same
+  three receivers the bridge hands out, so the browser client should work with **no UI
+  edits at all**. That is the S1.2 exit criterion, and it is now a construction change.
 
 ### 2026-10-14T23:40Z — session 2 — three decisions locked, and Move 0 lands ✅
 
