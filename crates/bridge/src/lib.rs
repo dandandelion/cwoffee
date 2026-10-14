@@ -15,11 +15,13 @@
 //! cannot tell which core it is talking to.
 
 pub mod host;
+pub mod mount;
 pub mod process;
 pub mod sessions;
 pub mod translate;
 
 pub use host::{EventRx, PiHost, PiHostConfig};
+pub use mount::{mount_extensions, pi_node_modules, write_dev_provider};
 pub use process::{PiChild, PiError, PiLaunch};
 pub use sessions::SessionMap;
 pub use translate::{Translator, UiRequest};

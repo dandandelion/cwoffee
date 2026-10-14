@@ -207,11 +207,11 @@ impl HostOps for PiHost {
         if self.state().busy {
             return Err("a turn is running; stop it before moving the tools".into());
         }
-        let p = std::path::PathBuf::from(path);
-        let p = std::fs::canonicalize(&p).map_err(|e| format!("{path}: {e}"))?;
-        if !p.is_dir() {
-            return Err(format!("{} is not a folder", p.display()));
-        }
+        // The engine's own probe, not a copy of it: empty, missing, the system temp
+        // root, and an unwritable folder are refused with the same words on both
+        // cores. A sidebar that accepts a folder the tools then cannot write to is a
+        // UI that lies about where your files are about to be written.
+        let p = cwoffee_engine::host::check_workspace(path).map_err(|reason| format!("{path}: {reason}"))?;
         let want = p.display().to_string();
         let before = self.state().refusal_seq;
         self.push(HostCmd::SetWorkspace { path: want.clone() });
@@ -369,8 +369,26 @@ impl Engine {
                 },
                 req = rpc_rx.recv() => match req {
                     Some((cmd, reply)) => {
-                        let out = self.request(cmd, Duration::from_secs(30)).await;
-                        let _ = reply.send(out);
+                        // A model list costs nothing when a child is up and a whole pi
+                        // process when one is not. Bootstrap asks on every client connect
+                        // — including a phone that only watches and will never send a
+                        // prompt — so with no child the answer comes from this bridge's
+                        // own configuration: the one model this conversation can run.
+                        // pi's fuller catalogue is used whenever a process exists. What
+                        // that costs is a one-entry model menu between reaps, which is a
+                        // smaller lie than an empty one.
+                        let wants_models =
+                            cmd.get("type").and_then(|t| t.as_str()) == Some("get_available_models");
+                        if wants_models && self.child.is_none() {
+                            let _ = reply.send(Ok(json!({ "models": [{
+                                "id": self.cfg.launch.model,
+                                "provider": self.cfg.launch.provider,
+                                "contextWindow": self.cfg.model_window,
+                            }] })));
+                        } else {
+                            let out = self.request(cmd, Duration::from_secs(30)).await;
+                            let _ = reply.send(out);
+                        }
                     }
                     None => break,
                 },
@@ -577,11 +595,25 @@ impl Engine {
                 if let Some(child) = self.child.take() {
                     child.reap(Duration::from_secs(3)).await;
                 }
-                self.cfg.launch.workdir = PathBuf::from(&path);
+                // Same probe again, from the other side of the mailbox: a direct
+                // `HostCmd` push must not be able to skip what the public verb checks.
+                let checked = match cwoffee_engine::host::check_workspace(&path) {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        self.refuse(format!("{path}: {reason}"));
+                        return;
+                    }
+                };
+                let path = checked.display().to_string();
+                self.cfg.launch.workdir = checked.clone();
                 {
                     let mut st = self.state.lock().unwrap();
                     st.workspace = path.clone();
-                    st.refusal_seq += 1;
+                    // Do NOT bump refusal_seq here. It is the caller's signal that a
+                    // refusal landed, and bumping it on success made every successful
+                    // move look like a refusal to the poller — the gateway smoke proved
+                    // it: the folder really moved and the client was told "the move was
+                    // refused". Success clears the last refusal and says nothing new.
                     st.workspace_refusal = None;
                 }
                 let _ = self.cfg.store.add_workspace(&path);
@@ -833,17 +865,42 @@ impl Engine {
                 }
                 let id = self.next_id;
                 self.next_id += 1;
+                // The summary is what a person reads before deciding, so it says what
+                // the Rust core says: the tool, the thing it wants, and which paths
+                // leave the workspace. pi's dialog carries only title and message, so
+                // the escape list is derived here from the message text.
+                let summary = if escapes.is_empty() {
+                    if message.is_empty() { format!("{tool}: {title}") } else { format!("{tool}: {message}") }
+                } else {
+                    format!(
+                        "{tool}: {} — OUTSIDE the workspace: {}",
+                        if message.is_empty() { title.clone() } else { message.clone() },
+                        escapes.join(", ")
+                    )
+                };
                 let req = ApprovalRequest {
                     id,
                     tool: tool.clone(),
                     risk,
-                    summary: if message.is_empty() { title.clone() } else { message.clone() },
+                    summary,
                     args: json!({ "title": title, "message": message }),
                     escapes,
                 };
                 let (tx, rx) = oneshot::channel();
-                let _ = self.ev.send(approval_event(&req));
-                let _ = self.ap.send((req, tx));
+                // One card, one owner. The shell that took the approvals receiver turns
+                // the request into the event every front end renders — `approval_event`
+                // is shared precisely so the desktop, the gateway and this bridge cannot
+                // disagree about the card. Emitting it here too put **two identical cards
+                // on screen** under the gateway, which the pi-core smoke caught. Only if
+                // nobody took the receiver do we render it ourselves, and then we answer
+                // cancelled rather than leave pi waiting on a client that does not exist.
+                if self.ap.send((req.clone(), tx)).is_err() {
+                    self.tr.dialog_resolved(now);
+                    self.reply(&pi_id, json!({ "cancelled": true }));
+                    let _ = self.ev.send(approval_event(&req));
+                    self.err("an approval arrived with nobody to answer it; it was cancelled instead of left open");
+                    return;
+                }
                 let secs = timeout_ms.max(1000) / 1000;
                 self.waits.insert(
                     id,
@@ -877,8 +934,14 @@ impl Engine {
                     set: None,
                 };
                 let (tx, rx) = oneshot::channel();
-                let _ = self.ev.send(question_event(&q));
-                let _ = self.q.send((q, tx));
+                // Same rule as the approval above: the shell renders it. A second send
+                // would show the question twice and answer it once.
+                if self.q.send((q.clone(), tx)).is_err() {
+                    self.tr.dialog_resolved(now);
+                    self.reply(&pi_id, json!({ "cancelled": true }));
+                    let _ = self.ev.send(question_event(&q));
+                    return;
+                }
                 let secs = timeout_ms.max(1000) / 1000;
                 self.waits.insert(
                     id,
@@ -911,8 +974,14 @@ impl Engine {
                     set: None,
                 };
                 let (tx, rx) = oneshot::channel();
-                let _ = self.ev.send(question_event(&q));
-                let _ = self.q.send((q, tx));
+                // Same rule as the approval above: the shell renders it. A second send
+                // would show the question twice and answer it once.
+                if self.q.send((q.clone(), tx)).is_err() {
+                    self.tr.dialog_resolved(now);
+                    self.reply(&pi_id, json!({ "cancelled": true }));
+                    let _ = self.ev.send(question_event(&q));
+                    return;
+                }
                 let secs = timeout_ms.max(1000) / 1000;
                 self.waits.insert(
                     id,

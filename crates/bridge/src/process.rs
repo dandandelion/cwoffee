@@ -42,6 +42,11 @@ pub enum PiError {
     Io(#[from] std::io::Error),
 }
 
+/// The pi release this bridge is built against (locked decision 13). The version
+/// handshake compares `pi --version` to this at spawn, so an upgrade is a commit
+/// that also re-runs the protocol gates, not a surprise at boot on a user's box.
+pub const PINNED_PI: &str = "1.2.0";
+
 /// How to start one pi process. One process per workspace: pi has no RPC verb
 /// that changes the working directory of a live session, so moving the tools to
 /// another folder is process lifecycle, not a command (PI-CORE-PROTOCOL.md).

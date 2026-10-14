@@ -16,12 +16,11 @@
 
 ## STATUS (update every session)
 
-- **Phase:** 1 — **Move 0 (trait seam) and S1.1 (the bridge) are DONE**: `crates/bridge`
-  runs pi as a cwoffee core and a CLI client streamed a real turn through it, with
-  approvals answered by the client and the transcript landing in cwoffee's SQLite.
-  **S1.2 (wire it to the gateway/desktop) is the next step and is not started.**
-  Nothing in `crates/engine` has been deleted; `master` still runs the Rust core only.
-- **Last updated:** 2026-10-15T00:40Z (assistant, session 3)
+- **Phase:** 1 — **S1.2 is DONE in the browser path**: `cwoffee-gateway --core pi` passes
+  `gateway-smoke.mjs` and the new `gateway-approval.mjs` with **zero UI edits**, and the
+  same approval gate passes on `--core rust`. The desktop half (S5) is not wired yet, and
+  `master` still runs the Rust core as the only core.
+- **Last updated:** 2026-10-15T02:10Z (assistant, session 4)
 - **Verdict:** feasible, and cheaper than it looks — because the UI and the tools both
   survive untouched. Measured, not assumed. Three real costs: **+~90 MB PSS**, **two
   languages in the runtime**, and **pi gives you no sandbox** (that stays ours to own).
@@ -280,9 +279,19 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
       `cached=491/1039`) and the store kept 4 rows.
 - [ ] **S1.2** frame emulation: bridge emits the **existing** `event`/`resync`/`bootstrap`
       payloads; `ui/` untouched. *Exit:* desktop app runs a live turn with **zero UI edits**.
-      This is now the whole distance between the probe and a usable product: the gateway
-      already consumes `Arc<dyn HostOps>` + the same three receivers, so mounting the
-      bridge there is a construction change, not a rewrite.
+      **Half done — the browser half is met, the desktop half is S5.**
+      `cwoffee-gateway --core pi` (new flags: `--core`, `--pi`, `--pi-ext`, `--pi-tools`,
+      `--pi-agent-dir`, `--pi-idle-reap`, `--pi-version`, `--any-pi`) builds the same
+      `EngineHandle` over `Arc<dyn HostOps>` with a `PiHost` in place of `SessionHost`, and
+      `gateway-smoke.mjs` — auth refusal, bootstrap with sessions/models/folders/current
+      session/transcript rows, workspace refusals with their explanations — prints
+      **GATEWAY SMOKE OK** on a cold bridge and a warm one, with no edits to `ui/`.
+      `scripts/gateway-approval.mjs` (new) drives one tool call through the gateway and
+      answers the card as a client would; it passes **allow and deny on both cores**, and it
+      is what found two real bridge bugs (gotchas 23–24).
+- [x] **S1.2a** `bridge::mount`: extensions copied into the isolated agent dir with pi's own
+      `node_modules` symlinked, and a dev-only `models.json`, shared by probe and gateway
+      instead of written twice.
 - [x] **S1.3** the send address, as the Rust core actually behaves it (see decision 11):
       a named conversation moves the bridge, an unknown id is refused, and the cwoffee
       row ↔ pi session file pairing makes switching and resume real. Proven by probe run B
@@ -457,6 +466,38 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     and two further combined runs were clean. Unresolved: a named flake is fixable, an
     unnamed one can hide a real bug. Next time, capture the name before re-running
     (`sed -n '/^failures:$/,/^$/p'` on the raw output, not `grep test result`).
+23. **One card, one owner — and the bridge was showing it twice.** The bridge emitted
+    `ApprovalRequested` *and* handed the same request to the approvals channel, which the
+    gateway fan-out renders with the shared `approval_event`. Under the probe (which reads
+    the channel) that looked fine; under the gateway the UI got **two identical cards for one
+    decision**, and answering one leaves the other staring at you. Questions had the same
+    double-send in two places. Now the bridge sends to the channel only, and renders itself
+    solely when nobody took the receiver — in which case it answers `cancelled` rather than
+    leaving pi waiting on a client that does not exist.
+24. **A success path must not look like a refusal.** The bridge bumped `refusal_seq` on a
+    *successful* workspace move, and `set_workspace_checked` reads that counter as "a refusal
+    landed" — so the folder really moved to `/etc` while the client was told "the move was
+    refused", and the smoke's "the host is still in the folder it started in" caught it. Two
+    fixes: success clears the last refusal and says nothing new, and the bridge now runs the
+    engine's own `check_workspace` instead of a private weaker version, which is why a
+    pi-core refusal reads *"/tmp: is the system temp folder, which is where sessions with no
+    workspace live…"* in exactly the Rust core's words.
+25. **A cross-core gate must not quote one core's dialect.** My first approval script
+    asserted the pi envelope (`engine:"rust"`) and an `escapes` field: the first is pi-only,
+    and the second never reaches the wire at all — `approval_event` deliberately drops
+    `escapes` so every shell renders one shape, and the escape rides inside `summary`. Both
+    assertions failed on the Rust core and taught nothing. Now they are about what a person
+    reads and what the tool did: the card names the file and says OUTSIDE the workspace;
+    allow ends in a tool-result event with no denial anywhere; deny ends with no success and
+    an explicit denial the user can see. Parity note found on the way: the pi core emits no
+    `toolExecOutput` for this tool (our extension returns its result in one piece) where the
+    Rust core streams one.
+26. **RPC verbs need a live child, and a cold bridge has none.** `get_available_models`
+    through pi means a process; bootstrap asks on every connect, including from a phone that
+    will never send a prompt, so paying ~75 MB to answer it is wrong. With no child the
+    bridge answers the menu from its own configuration — one entry, the model this
+    conversation can run. A smaller lie than an empty menu, and the kind of thing that reads
+    obvious in hindsight and invisible beforehand.
 
 ---
 
@@ -562,9 +603,63 @@ CWOFFEE_SHIM=$PWD/spike/cwshim cargo run --offline -p cwoffee-bridge --bin cwoff
 The probe exits nonzero if no turn ended, which is what makes it usable as a gate rather
 than a demo.
 
+### The gateway with a pi core, and the approval round trip
+
+```bash
+# the browser protocol, unchanged, with pi behind it
+CWOFFEE_SHIM=$PWD/spike/cwshim cargo run --offline -p cwoffee-gateway -- \
+  --core pi --mode ask --url http://127.0.0.1:8190/v1 --model cwoffee-mock \
+  --port 8109 --token T-PI --workspace /tmp/cw-smoke-ws --db /tmp/gw-pi.db \
+  --dist ../cwoffee/ui/dist --pi-agent-dir /tmp/gw-pi-agent \
+  --pi-ext spike/pi-extension-cwoffee-tools.ts
+node scripts/gateway-seed.mjs 8109 T-PI
+node scripts/gateway-smoke.mjs --url ws://127.0.0.1:8109/ws --token T-PI
+
+# the same gate on the Rust core: drop --core / --pi-* and CWOFFEE_SHIM.
+# then the approval round trip, both ways, on whichever core is up:
+node scripts/gateway-approval.mjs --port 8109 --token T-PI --answer allow
+node scripts/gateway-approval.mjs --port 8109 --token T-PI --answer deny
+```
+
+`--mode ask` matters: the gateway inherits the desktop config's mode, and the first run of
+this gate silently ran in Auto and answered itself ("allowed without asking") — faithful
+behaviour, and exactly why the gate prints the mode it ran in.
+
 ---
 
 ## PROGRESS JOURNAL (newest on top)
+
+### 2026-10-15T02:10Z — session 4 — the gateway serves a pi core, and the browser never noticed ✅
+
+- **S1.2 (browser half) met.** `cwoffee-gateway --core pi` boots pi 1.2.0 behind the same
+  `EngineHandle` Move 0 left behind and passes `gateway-smoke.mjs` — cold (no turn yet) and
+  warm — with **no edits to `ui/`**. Boot prints what it mounted: provider, extension count,
+  and `tools -read,-bash,-edit,-write`, because a guardrail that is silently off is the
+  failure mode worth a log line.
+- **New gate:** `scripts/gateway-approval.mjs` — one tool call through the gateway, one card
+  answered by a client, and an assertion about the stored transcript. **allow and deny pass
+  on both cores**, one card each, same `risk=sensitive`, same "OUTSIDE the workspace"
+  wording. That is the security property the whole move hinged on, now measurable from a
+  browser client instead of argued.
+- **Three real bugs, all found by wiring rather than by reading:** the double approval card
+  (gotcha 23), success reported as refusal (24), and `get_available_models` failing on a cold
+  bridge (26). Plus a bug in the gate itself (25): it had quietly started asserting one
+  core's dialect.
+- **Shared rather than duplicated:** `bridge::mount` stages extensions and writes the dev
+  `models.json` for probe *and* gateway; the gateway calls the engine's `check_workspace` so
+  both cores refuse a workspace in the same words. `FALLBACK_BUDGET` became `pub` for the
+  same reason — two cores, one context meter.
+- **What was not covered before, said plainly:** `gateway-smoke.mjs` had zero matches for
+  `respond_approval`, so the gateway's approval plumbing was unit-tested only. The new script
+  closes the round trip; keep both in CI.
+- **Still open for S1.2/S5:** the desktop half (the same handle in-process, plus the
+  quit-while-busy policy of decision 15 — decided, unbuilt); attachments (refused with a
+  note); `search_probe` (Phase 2 refusal); the running-turn count in the UI; extension
+  packaging so a card carries a tool's real arguments instead of the dialog's title/message
+  (S2.5).
+- **Gates after this session:** engine 427 + 10, gateway 31, bridge 15 (7 unit incl. mount,
+  7 fixture/replay incl. the parked-time one), `gateway-smoke` OK on both cores,
+  `gateway-approval` OK both ways on both cores.
 
 ### 2026-10-15T00:40Z — session 3 — two numbers settled, and pi now runs as a cwoffee core ✅
 

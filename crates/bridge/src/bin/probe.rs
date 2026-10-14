@@ -94,24 +94,18 @@ async fn run() -> anyhow::Result<()> {
     std::fs::create_dir_all(&session_dir)?;
     std::fs::create_dir_all(db.parent().unwrap_or(std::path::Path::new(".")))?;
     if !flag("--keep-models") {
-        let models = serde_json::json!({
-            "providers": { &provider: {
-                "baseUrl": url, "api": "openai-completions", "apiKey": "mock",
-                "models": [{ "id": model }]
-            }}
-        });
-        let path = agent_dir.join("models.json");
-        std::fs::write(&path, serde_json::to_string_pretty(&models)?)?;
+        let path = cwoffee_bridge::mount::write_dev_provider(&agent_dir, &provider, &url, &model, "mock")?;
         eprintln!("[probe] wrote {provider} -> {url} in {}", path.display());
     }
 
     // Extensions are copied into the isolated agent dir and pi's own
     // node_modules is linked beside them, so their imports resolve without
     // touching the `pi` the user has in ~/.pi. Same trick as the capture script.
-    let mut ext_paths = Vec::new();
-    for src in many("--ext").iter().map(PathBuf::from) {
-        ext_paths.push(prepare_extension(&agent_dir, &src)?);
-    }
+    let ext_paths = cwoffee_bridge::mount::mount_extensions(
+        &agent_dir,
+        &pi_bin,
+        &many("--ext").into_iter().map(PathBuf::from).collect::<Vec<_>>(),
+    )?;
 
     let store = Arc::new(Store::open(&db)?);
     let launch = PiLaunch {
@@ -356,39 +350,8 @@ async fn run() -> anyhow::Result<()> {
 /// `node_modules` resolves for it. An extension that cannot import its types is a
 /// silent no-op at best and a confusing startup error at worst, so the probe does
 /// the setup the product will do in Phase 2.
-fn prepare_extension(agent_dir: &std::path::Path, src: &std::path::Path) -> anyhow::Result<PathBuf> {
-    let name = src
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "extension.ts".into());
-    let dst = agent_dir.join("extensions").join(&name);
-    std::fs::create_dir_all(dst.parent().unwrap())?;
-    std::fs::copy(src, &dst)?;
-    let link = agent_dir.join("node_modules");
-    if !link.exists() {
-        if let Some(mods) = pi_node_modules() {
-            std::os::unix::fs::symlink(&mods, &link)?;
-            eprintln!("[probe] linked {} for extension imports", mods.display());
-        } else {
-            eprintln!("[probe] could not find node_modules next to the installed pi; {name} may fail to load");
-        }
-    }
-    Ok(dst)
-}
 
 /// Walk up from the installed `pi` binary looking for the package it came from.
-fn pi_node_modules() -> Option<PathBuf> {
-    let bin = which("pi").and_then(|p| std::fs::canonicalize(p).ok())?;
-    let mut dir = bin.parent()?;
-    for _ in 0..8 {
-        let cand = dir.join("node_modules").join("@earendil-works").join("pi-coding-agent");
-        if cand.exists() {
-            return dir.join("node_modules").into();
-        }
-        dir = dir.parent()?;
-    }
-    None
-}
 
 fn which(name: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PATH") {

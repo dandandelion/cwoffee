@@ -124,7 +124,11 @@ impl HostConfig {
 /// measured is how gold gets thrown away, so the fallback is now large enough
 /// not to bite a normal conversation, and the host re-asks the endpoint every
 /// turn until it answers.
-const FALLBACK_BUDGET: usize = 32_000;
+/// What a session's context meter shows when neither the user pinned a budget nor
+/// the endpoint told us the model's window. `pub` because the pi core has to agree:
+/// two cores showing different context meters on one screen is the same drift the
+/// mode and reasoning persistence closed, one dial further along.
+pub const FALLBACK_BUDGET: usize = 32_000;
 
 fn auto_budget(window: usize) -> usize {
     // 80% of the window. The other 20% is the reply plus the estimate's own
