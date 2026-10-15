@@ -99,8 +99,11 @@ fn mode() -> ApprovalMode {
 fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
     ToolCtx {
         workspace: workspace(),
-        // The host's own cap; a tool that truncates late costs a real prefill turn.
-        max_output_bytes: 64 * 1024,
+        // The Rust core's host uses 24 KiB (`SessionHost`'s ToolCtx). Match it exactly:
+        // a tool dump is prompt bytes, so a second core that lets three times as much in
+        // per read is a core with a different context meter, a different prefix cache and
+        // a larger process. The number belongs to the host, not to whoever wrote a runner.
+        max_output_bytes: 24 * 1024,
         ask: None,
         events: None,
         question_timeout: None,

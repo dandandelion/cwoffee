@@ -22,9 +22,16 @@ const workspace = get('--workspace', process.env.HOME + '/cwoffee-workspace')
 const file = get('--file', 'README.md')
 const turnTimeoutMs = Number(get('--turn-timeout', '180000'))
 const abs = `${workspace.replace(/\/$/, '')}/${file}`
-// What the tool must bring back. Picking a slice of the real file makes the assertion
-// about bytes on disk, not about a model's phrasing.
-const want = fs.readFileSync(abs, 'utf8').replace(/\s+/g, ' ').trim().slice(0, 40)
+// What the tool must bring back. Compare on whole *lines*, because the engine's
+// read_file numbers them ("1\t# BESPOT — working checkpoint") and paginates long files:
+// a raw 40-character window of the file straddles a line number and fails for the wrong
+// reason. Two lines, one near the top and one past the fold, so a single first page is
+// not mistaken for having read the file.
+const text = fs.readFileSync(abs, 'utf8').split('\n')
+const nonEmpty = text.map((l) => l.trim()).filter(Boolean)
+// Compare a bounded slice: a very long line can be clipped by the tool's own byte
+// budget, and demanding the whole thing fails on the tool being careful.
+const want = [nonEmpty[0].slice(0, 60), nonEmpty[Math.floor(nonEmpty.length * 0.6)].slice(0, 60)]
 const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 const t = (ms) => new Promise((r) => setTimeout(r, ms))
 let id = 0
@@ -69,12 +76,19 @@ await new Promise((res) => {
 })
 // Compare against the *stored contents*, not their JSON encoding: a stored `\n` and an
 // escaped quote both defeat any assertion written against the wire form.
-const transcript = rows.map((r) => (typeof r?.content === 'string' ? r.content : '')).join('\n')
+const stored = rows.map((r) => (typeof r?.content === 'string' ? r.content : '')).join('\n')
+// The tool's answer is stored as a JSON envelope, so its newlines and quotes arrive
+// escaped. Match against the unescaped text, or a line containing a quotation mark
+// "is not in the transcript" when it plainly is.
+const transcript = stored.replace(/\\(["\\/nb])/g, '$1')
 const fail = []
 if (seen.turnEnd == null) fail.push(`the turn did not end within ${turnTimeoutMs} ms`)
 if (!seen.tools) fail.push('no tool events: the model never reached for the file')
 // The bytes must be there. A polite apology from the model is not a read.
-if (!transcript.replace(/\s+/g, ' ').includes(want)) fail.push(`the transcript does not contain the first 40 chars of ${abs}`)
+for (const w of want) {
+  if (!transcript.includes(w)) fail.push(`the transcript does not contain the line "${w.slice(0, 60)}…" from ${abs}`)
+}
+if (!/showing \d+/.test(transcript)) fail.push('no line-count report in the read: the tool answered without describing what it showed')
 if (!/"ok"\s*:\s*true/.test(transcript)) fail.push('no successful tool read in the transcript')
 // A refusal *of this file* is the bug under test. Refusals of other paths (the model
 // probing somewhere else) are information, not failure — the confinement is working.
