@@ -40,6 +40,19 @@ fn ui_dist_dir() -> PathBuf {
             return PathBuf::from(d);
         }
     }
+    // The path recorded when this binary was compiled, if it still exists. Preferred
+    // over anything derived from the executable's location, because the executable's
+    // location says where the build directory was, not which UI was embedded.
+    if let Some(baked) = option_env!("CWOFFEE_UI_DIST_BAKED") {
+        let p = PathBuf::from(baked);
+        if p.is_dir() {
+            return p;
+        }
+        eprintln!(
+            "[cwoffee] the UI this binary was built with is gone ({}); falling back to looking near the executable",
+            baked
+        );
+    }
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))

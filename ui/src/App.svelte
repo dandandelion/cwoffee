@@ -165,6 +165,77 @@
   let menu = $state<Menu | null>(null)
   let menuPos = $state<{ x: number; y: number } | null>(null)
   let menuEl = $state<HTMLElement | null>(null)
+
+  /* Settings got a screen because a popup is a decision you make once and then can
+     never look at again. The same choices were spread over six popups, each of which
+     closes the moment you use it, so "what search am I on?" meant opening three menus.
+     The sections below are the popups' own bodies - one copy of each control, rendered
+     into either surface - so a setting cannot mean two different things depending on
+     where you reached it from. */
+  const SET_TABS: { kind: MenuKind; label: string; hint: string }[] = [
+    { kind: 'model', label: 'Model', hint: 'what answers here' },
+    { kind: 'think', label: 'Thinking', hint: 'how hard it deliberates' },
+    { kind: 'mode', label: 'Approvals', hint: 'what may run without asking' },
+    { kind: 'ws', label: 'Folders', hint: 'where the tools may work' },
+    { kind: 'search', label: 'Search', hint: 'how web_search reaches out' },
+    { kind: 'gateway', label: 'Devices', hint: 'browsers and phones joining' },
+    { kind: 'metrics', label: 'This session', hint: 'context, cache, cost' },
+    { kind: 'keys', label: 'Shortcuts', hint: 'keys the app answers' },
+  ]
+  let settings = $state<{ tab: MenuKind } | null>(null)
+  let settingsEl = $state<HTMLElement | null>(null)
+
+  function openSettings(tab: MenuKind = 'model') {
+    closeMenu()
+    void loadSettingsFor(tab)
+    settings = { tab }
+    // Focus follows the surface: a screen nothing can tab into is a screen nothing can use.
+    queueMicrotask(() => settingsEl?.focus())
+  }
+  function closeSettings() {
+    settings = null
+  }
+
+  /* Settings is a place now, so a link can point at it: a phone opening
+     http://host:8122/?token=…#settings should land on the section it asked for rather
+     than on a transcript it did not ask for. Applied once, at boot, and the hash is
+     left alone afterwards so reloading does not fight a hand that navigated away. */
+  let deepLinked = false
+  $effect(() => {
+    if (deepLinked) return
+    deepLinked = true
+    const want = location.hash.replace(/^#/, '')
+    if (!want) return
+    if (SET_TABS.some((t) => t.kind === want)) openSettings(want as MenuKind)
+  })
+  function pickSettingsTab(tab: MenuKind) {
+    if (!settings || settings.tab === tab) return
+    void loadSettingsFor(tab)
+    settings = { tab }
+  }
+  /// The same lazy reads the popups do, so a section never shows a state older than the
+  /// last time anyone asked. A container status probe (podman ps) has no business
+  /// running before someone cares about search.
+  function loadSettingsFor(tab: MenuKind) {
+    if (tab === 'model' && (modelErr || !models.length)) void loadModels()
+    if (tab === 'search' && !webSearch) void loadWebSearch()
+  }
+  /// The bodies were written against a `Menu` because that is what carries the anchor
+  /// geometry they never read. In the screen the geometry is meaningless, so it is
+  /// zeroed rather than faked, and the folder the Folders section describes is the one
+  /// the engine is actually working in.
+  function menuFor(tab: MenuKind): Menu {
+    return {
+      kind: tab,
+      sessionId: undefined,
+      wsPath: hostState?.workspace,
+      left: 0,
+      right: 0,
+      top: 0,
+      bottom: 0,
+      barTop: 0,
+    }
+  }
   // Genuinely unread: a session whose stored message count grew since it was last
   // opened, and which is not the session currently on screen.
   let unread = $state<Set<number>>(new Set())
@@ -7163,8 +7234,9 @@
   }
 
   function onApprovalKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' && menu) {
+    if (e.key === 'Escape' && (menu || settings)) {
       closeMenu()
+      closeSettings()
       return
     }
     if (!approval) return
@@ -8008,18 +8080,7 @@
     </main>
   </div>
 
-  <!-- One menu for everything, positioned fixed. A popover inside .cbox or a
-       sidebar row is clipped by that ancestor's overflow and by the window edge.
-       Fixed positioning escapes the ancestors, and the coordinates are clamped
-       to the viewport. A webview still cannot paint outside its own window, so
-       placement is chosen to fit rather than allowed to overflow. -->
-  {#if menu}
-    <div
-      class="pop {menuPos ? '' : 'measuring'} {menu.kind === 'metrics' ? 'pop-wide' : ''}"
-      style={menuPos ? `left:${menuPos.x}px; top:${menuPos.y}px` : 'left:0px; top:0px'}
-      role="menu"
-      bind:this={menuEl}
-    >
+  {#snippet body(menu: Menu)}
       {#if menu.kind === 'mode'}
         <div class="pop-title">Approvals</div>
         {#each MODES as m}
@@ -8432,6 +8493,56 @@
           </button>
         {/if}
       {/if}
+  {/snippet}
+
+  <!-- One menu for everything, positioned fixed. A popover inside .cbox or a
+       sidebar row is clipped by that ancestor's overflow and by the window edge.
+       Fixed positioning escapes the ancestors, and the coordinates are clamped
+       to the viewport. A webview still cannot paint outside its own window, so
+       placement is chosen to fit rather than allowed to overflow. -->
+  {#if menu}
+    <div
+      class="pop {menuPos ? '' : 'measuring'} {menu.kind === 'metrics' ? 'pop-wide' : ''}"
+      style={menuPos ? `left:${menuPos.x}px; top:${menuPos.y}px` : 'left:0px; top:0px'}
+      role="menu"
+      bind:this={menuEl}
+    >
+      {@render body(menu)}
+    </div>
+  {/if}
+
+  {#if settings}
+    <div class="scrim" onclick={closeSettings} role="presentation"></div>
+    <div
+      class="settings"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Settings"
+      tabindex="-1"
+      bind:this={settingsEl}
+    >
+      <header class="set-head">
+        <span class="set-title">Settings</span>
+        <span class="set-sub">the choices the popups make, kept somewhere you can come back to</span>
+        <button class="set-x" onclick={closeSettings} aria-label="Close settings" title="Close (Esc)">Esc</button>
+      </header>
+      <div class="set-grid">
+        <nav class="set-rail" aria-label="Settings sections">
+          {#each SET_TABS as t}
+            <button
+              class="set-tab {settings.tab === t.kind ? 'on' : ''}"
+              onclick={() => pickSettingsTab(t.kind)}
+              aria-current={settings.tab === t.kind ? 'true' : undefined}
+            >
+              <span class="set-lbl">{t.label}</span>
+              <span class="set-hint">{t.hint}</span>
+            </button>
+          {/each}
+        </nav>
+        <div class="set-body">
+          {@render body(menuFor(settings.tab))}
+        </div>
+      </div>
     </div>
   {/if}
 
@@ -8504,6 +8615,15 @@
         onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}
       >
         {theme === 'dark' ? '\u2600' : '\u263e'}
+      </button>
+      <button
+        class="keyhelp"
+        title="Settings"
+        aria-label="Settings"
+        aria-expanded={settings != null}
+        onclick={() => openSettings()}
+      >
+        &#8987;
       </button>
       <button
         class="keyhelp"
