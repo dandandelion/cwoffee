@@ -1474,6 +1474,74 @@ body {
   padding-left: 16px;
 }
 
+/* Selection mode. The box is drawn rather than a native checkbox: a UA control in a
+   sidebar this tight reads as somebody else's app, and the row itself is the toggle, so
+   the box only has to report state. Picked rows get a tint, not a border - a border
+   would change the row height and make the list jump while you are picking. */
+.sesshead-r {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.ws-fold {
+  opacity: 0.35;
+}
+.sesshead:hover .ws-fold,
+.ws-fold:focus-visible {
+  opacity: 1;
+}
+.pickbox {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin-right: 4px;
+  border-radius: 4px;
+  border: 1.5px solid color-mix(in srgb, var(--color-shell) 55%, var(--color-hairline-2));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-paper);
+}
+.sessrow.picked,
+.wsrow.picked {
+  background: color-mix(in srgb, var(--color-shell) 18%, transparent);
+}
+.sessrow.picked .pickbox,
+.wsrow.picked .pickbox {
+  background: var(--color-shell);
+  border-color: var(--color-shell);
+}
+/* The bar spells out what is about to go, because the basket was filled with modifier
+   clicks and nobody remembers exactly which rows they hit. */
+.bulkbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 4px 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-shell) 10%, var(--color-paper));
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.bulkbar .bulk-n {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-ink-2);
+}
+.bulkbar .armed {
+  border-color: var(--color-danger-hairline);
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
+}
+.pickhint {
+  margin: 8px 6px 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-ink-3);
+}
+
 /* Which folder a session that does not exist yet will write into. */
 .empty-ws {
   display: inline-flex;

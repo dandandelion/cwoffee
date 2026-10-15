@@ -420,9 +420,173 @@
     }
   }
 
+  function foldAll() {
+    wsCollapsed = new Set(wsGroups.map((g) => g.path))
+    saveWsCollapsed()
+  }
+
+  function unfoldAll() {
+    wsCollapsed = new Set()
+    saveWsCollapsed()
+  }
+
+  /* A fold you have to redo every time you open the app is not a fold. The set of
+     collapsed paths lives in localStorage (see WS_KEY) and is keyed by folder path, so
+     it survives restarts. What must not survive is a preference for a folder that no
+     longer exists: re-adding one would otherwise inherit a stale "closed". */
+  let foldLogged = false
+
+  function pruneWsCollapsed() {
+    const live = new Set<string>(workspaces.map((w) => w.path))
+    for (const s of sessions) live.add(wsBucket(s.workspace))
+    let changed = false
+    const next = new Set<string>()
+    for (const p of wsCollapsed) {
+      if (live.has(p)) next.add(p)
+      else changed = true
+    }
+    if (changed) {
+      wsCollapsed = next
+      saveWsCollapsed()
+    }
+  }
+
+  /* Selection mode, for when the sidebar gets cluttered. Nothing is selected until you
+     ask for it: Ctrl/ Cmd-click adds a row to the basket, Shift-click paints the run
+     between the last row and this one, and while the basket is open a plain click picks
+     instead of navigating (a sidebar you cannot empty is a sidebar you stop using). The
+     basket holds keys, not objects, so a pick cannot outlive the row it came from. */
+  let picking = $state(false)
+  let picked = $state<Set<string>>(new Set()) // 's<id>' = conversation, 'w<path>' = folder
+  let pickAnchor = $state<string | null>(null)
+  let bulkArm = $state(0)
+
+  const pickedFolders = $derived([...picked].filter((k) => k[0] === 'w').map((k) => k.slice(1)))
+
+  // A folder in the basket means it and what is inside it. Picking the row and leaving
+  // twelve conversations behind is not deleting the folder, and the count on the confirm
+  // step is the number that actually goes.
+  const pickedSessions = $derived.by(() => {
+    const ids = new Set<number>()
+    for (const k of picked) {
+      if (k[0] === 's') ids.add(Number(k.slice(1)))
+      else {
+        const g = wsGroups.find((x) => x.path === k.slice(1))
+        for (const s of g?.list ?? []) ids.add(s.id)
+      }
+    }
+    return [...ids]
+  })
+
+  const pickedRunning = $derived(pickedSessions.filter((id) => runningSessions.has(id)))
+
+  function pickOrder(): string[] {
+    const out: string[] = []
+    for (const g of wsGroups) {
+      out.push('w' + g.path)
+      for (const s of g.list) out.push('s' + s.id)
+    }
+    return out
+  }
+
+  function pickToggle(key: string, range: boolean) {
+    picking = true
+    const order = pickOrder()
+    const next = new Set(picked)
+    const a = pickAnchor ? order.indexOf(pickAnchor) : -1
+    const b = order.indexOf(key)
+    if (range && a >= 0 && b >= 0) {
+      for (let i = Math.min(a, b); i <= Math.max(a, b); i++) next.add(order[i])
+    } else if (next.has(key)) next.delete(key)
+    else next.add(key)
+    picked = next
+    pickAnchor = key
+    // Any change to the basket invalidates the first press of the confirm.
+    bulkArm = 0
+  }
+
+  function rowClick(e: MouseEvent, key: string, navigate: () => void) {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault()
+      pickToggle(key, false)
+      return
+    }
+    if (e.shiftKey) {
+      e.preventDefault()
+      pickToggle(key, true)
+      return
+    }
+    if (picking) {
+      pickToggle(key, false)
+      return
+    }
+    navigate()
+  }
+
+  function clearPick() {
+    picking = false
+    picked = new Set()
+    pickAnchor = null
+    bulkArm = 0
+  }
+
+  /** Two presses, because a basket of folders is a pile of work, and the count named on
+   *  the first press is the count the second press deletes. */
+  async function deletePicked() {
+    if (!picked.size) return
+    const doomed = pickedSessions.filter((id) => !runningSessions.has(id))
+    const busy = pickedSessions.length - doomed.length
+    if (!bulkArm) {
+      bulkArm = Date.now()
+      const bits = [`${doomed.length} conversation${doomed.length === 1 ? '' : 's'}`]
+      if (pickedFolders.length)
+        bits.push(`${pickedFolders.length} folder${pickedFolders.length === 1 ? '' : 's'}`)
+      if (busy) bits.push(`${busy} ${busy === 1 ? 'is' : 'are'} answering and will be skipped`)
+      say(`delete ${bits.join(', ')} — press Delete again to confirm`, true)
+      setTimeout(() => {
+        if (bulkArm && Date.now() - bulkArm > 8000) bulkArm = 0
+      }, 8100)
+      return
+    }
+    const wasOpen = viewId !== null && doomed.includes(viewId)
+    let failed = 0
+    for (const id of doomed) {
+      // The same verb the row menu uses. A bulk action must not grow its own private
+      // idea of what deleting means.
+      await invoke('delete_session', { id }).catch((e) => {
+        failed++
+        pageLog(`delete_session ${id} failed: ${e}`)
+      })
+    }
+    const folders = pickedFolders.length
+    for (const p of pickedFolders) {
+      await invoke('remove_workspace', { path: p }).catch((e) =>
+        pageLog(`remove_workspace ${p}: ${e}`),
+      )
+    }
+    await loadSessions()
+    await refreshState()
+    if (wasOpen) {
+      const rest = sessions.find((s) => s.id !== viewId)
+      if (rest) openSession(rest.id)
+      else newSession()
+    }
+    if (failed) say(`${doomed.length - failed} deleted, ${failed} refused — see the log`, true)
+    else say(`deleted ${doomed.length} conversation(s), removed ${folders} folder(s)`)
+    clearPick()
+  }
+
   async function loadWorkspaces() {
     try {
       workspaces = await invoke<WorkspaceRow[]>('list_workspaces')
+      pruneWsCollapsed()
+      // Said once, in the log, because "it should have remembered" is not checkable
+      // otherwise, and an empty count here is the difference between a lost preference
+      // and one that was never set.
+      if (!foldLogged) {
+        foldLogged = true
+        pageLog(`sidebar: ${wsCollapsed.size} folder(s) remembered closed, ${workspaces.length} folder row(s) known`)
+      }
     } catch (e) {
       // The grouping still works from the sessions themselves; this list only
       // adds the empty folders nobody has written to yet.
@@ -3666,6 +3830,88 @@
             }
           }
         }
+      }
+
+      // --- picking in the sidebar: ctrl-click, shift for a run, then bulk delete --
+      // The gesture is invisible, so it is tested through the DOM the way a user does
+      // it, and the final assertion is against the store: what a bulk delete promises to
+      // remove has to actually be gone.
+      {
+        const rowOf = (title: string) =>
+          [...document.querySelectorAll('.sessrow')].find((r) =>
+            r.textContent?.includes(title),
+          ) as HTMLElement | undefined
+        const clickRow = (el: HTMLElement, mods: { ctrlKey?: boolean; shiftKey?: boolean }) => {
+          const btn = (el.querySelector('.sessbtn') ?? el) as HTMLElement
+          btn.dispatchEvent(
+            new MouseEvent('click', {
+              bubbles: true,
+              cancelable: true,
+              ctrlKey: !!mods.ctrlKey,
+              shiftKey: !!mods.shiftKey,
+            }),
+          )
+        }
+        const gone = async (ids: number[]) => {
+          const rest = await invoke<Session[]>('list_sessions')
+          return ids.filter((id) => rest.some((x) => x.id === id))
+        }
+        const pa = await invoke<number>('new_session', { title: 'selftest pick a' })
+        const pb = await invoke<number>('new_session', { title: 'selftest pick b' })
+        await loadSessions()
+        await new Promise((r) => setTimeout(r, 300))
+        const ra = rowOf('selftest pick a')
+        const rb = rowOf('selftest pick b')
+        if (!ra || !rb) {
+          fail(`pick rows were not rendered (a=${!!ra} b=${!!rb})`)
+        } else {
+          // A plain click must still navigate. If it selects, the sidebar has changed
+          // meaning and people will lose the thing they use it for.
+          clickRow(ra, {})
+          await new Promise((r) => setTimeout(r, 250))
+          if (document.querySelectorAll('.picked').length) fail('a plain click selected a row')
+          clickRow(ra, { ctrlKey: true })
+          await new Promise((r) => setTimeout(r, 250))
+          const n1 = document.querySelectorAll('.picked').length
+          const boxes = document.querySelectorAll('.pickbox').length
+          if (n1 !== 1 || !boxes)
+            fail(`ctrl-click picked ${n1} row(s), drew ${boxes} checkbox(es); wanted 1 and some`)
+          clickRow(rb, { shiftKey: true })
+          await new Promise((r) => setTimeout(r, 250))
+          const bar = document.querySelector('.bulkbar')
+          if (!bar) {
+            fail('no bulk bar after shift-clicking a second row')
+          } else {
+            const txt = (bar.textContent ?? '').replace(/\s+/g, ' ').trim()
+            if (!/2 conversation/.test(txt))
+              fail(`the bulk bar does not name what it will delete: "${txt}"`)
+            const delBtn = () =>
+              [...(bar.querySelectorAll('button') as NodeListOf<HTMLElement>)].find((x) =>
+                /^(Delete|Confirm)$/.test((x.textContent ?? '').trim()),
+              )
+            const first = delBtn()
+            if (!first) fail('the bulk bar has no Delete button')
+            else {
+              first.click()
+              await new Promise((r) => setTimeout(r, 250))
+              const second = delBtn()
+              if (!second || (second.textContent ?? '').trim() !== 'Confirm') {
+                fail(`first press did not arm the confirm (button says "${second?.textContent?.trim()}")`)
+              } else {
+                second.click()
+                await new Promise((r) => setTimeout(r, 900))
+                const left = await gone([pa, pb])
+                if (left.length) fail(`bulk delete left ${left.length} conversation(s) in the store`)
+                if (document.querySelectorAll('.picked').length)
+                  fail('the basket stayed full after deleting')
+                pageLog('picking ok (plain click navigates, ctrl-click picks, shift extends, confirm deletes for real)')
+              }
+            }
+          }
+        }
+        // Tidy up whatever a failed branch left behind, so the scratch store stays clean
+        // and the next run's row count means the same thing.
+        for (const id of await gone([pa, pb])) await invoke('delete_session', { id }).catch(() => {})
       }
 
       // --- the message you just sent must survive the session being created --
@@ -7234,10 +7480,17 @@
   }
 
   function onApprovalKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' && (menu || settings)) {
-      closeMenu()
-      closeSettings()
-      return
+    if (e.key === 'Escape') {
+      // Esc unwinds one layer at a time: the basket before the popup before the screen.
+      if (picking) {
+        clearPick()
+        return
+      }
+      if (menu || settings) {
+        closeMenu()
+        closeSettings()
+        return
+      }
     }
     if (!approval) return
     const t = e.target as HTMLElement | null
@@ -7629,16 +7882,34 @@
              clutter. -->
         <div class="sesshead mt-2">
           <span>Workspaces</span>
-          <button
-            class="iconbtn ws-addall"
-            aria-label="Add a folder"
-            title={transportKind === 'tauri'
-              ? 'Add a folder to the sidebar (opens the folder picker)'
-              : 'Add a folder on the host by path'}
-            onclick={addWorkspaceFromHeader}
-          >
-            <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2.6v6.8M2.6 6h6.8" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
-          </button>
+          <span class="sesshead-r">
+            <button
+              class="iconbtn ws-fold"
+              aria-label="Fold every folder"
+              title="Fold every folder"
+              onclick={foldAll}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 7.4L6 4.4L9 7.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+            </button>
+            <button
+              class="iconbtn ws-fold"
+              aria-label="Unfold every folder"
+              title="Unfold every folder"
+              onclick={unfoldAll}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.4L6 7.4L9 4.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+            </button>
+            <button
+              class="iconbtn ws-addall"
+              aria-label="Add a folder"
+              title={transportKind === 'tauri'
+                ? 'Add a folder to the sidebar (opens the folder picker)'
+                : 'Add a folder on the host by path'}
+              onclick={addWorkspaceFromHeader}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2.6v6.8M2.6 6h6.8" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
+            </button>
+          </span>
         </div>
         {#if wsAdding}
           <div class="wsadd">
@@ -7665,7 +7936,7 @@
         {#each wsGroups as g (g.path || '\u0000none')}
           {@const open = isOpen(g.path)}
           <div class="wsgrp {open ? 'open' : 'closed'}">
-            <div class="wsrow">
+            <div class="wsrow {picked.has('w' + g.path) ? 'picked' : ''}">
               {#if wsRenaming === g.path}
                 <input
                   class="pill px-2 py-1 text-[12px] w-full"
@@ -7680,7 +7951,19 @@
               {:else}
                 <!-- The chevron is part of the label button: folding a folder is
                      a navigation act and needs a target a thumb can hit. -->
-                <button class="wsbtn" onclick={() => toggleWs(g.path)} aria-expanded={open}>
+                <button
+                  class="wsbtn"
+                  aria-expanded={open}
+                  aria-pressed={picking ? picked.has('w' + g.path) : undefined}
+                  onclick={(e) => rowClick(e, 'w' + g.path, () => toggleWs(g.path))}
+                >
+                  {#if picking}
+                    <span class="pickbox" aria-hidden="true">
+                      {#if picked.has('w' + g.path)}
+                        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.4 5.2L4.2 7L7.6 3.2" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
+                      {/if}
+                    </span>
+                  {/if}
                   <svg class="ws-chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
                     <path d={open ? 'M2 3.5L5 6.5L8 3.5' : 'M3.5 2L6.5 5L3.5 8'} stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>
                   </svg>
@@ -7710,7 +7993,7 @@
             {#if open}
               {#each g.list as s (s.id)}
                 <div
-                  class="sessrow {viewId === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''}"
+                  class="sessrow {viewId === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''} {picked.has('s' + s.id) ? 'picked' : ''}"
                 >
                   {#if editingId === s.id}
                     <input
@@ -7727,7 +8010,18 @@
                          not a report. Rename/delete live in a menu so the row stays
                          quiet, and the dot is always laid out (invisible until unread)
                          so titles do not shift when one arrives. -->
-                    <button class="sessbtn" onclick={() => openSession(s.id)}>
+                    <button
+                      class="sessbtn"
+                      aria-pressed={picking ? picked.has('s' + s.id) : undefined}
+                      onclick={(e) => rowClick(e, 's' + s.id, () => openSession(s.id))}
+                    >
+                      {#if picking}
+                        <span class="pickbox" aria-hidden="true">
+                          {#if picked.has('s' + s.id)}
+                            <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.4 5.2L4.2 7L7.6 3.2" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
+                          {/if}
+                        </span>
+                      {/if}
                       <span
                         class="sess-dot"
                         class:busy={runningSessions.has(s.id)}
@@ -7751,6 +8045,30 @@
         {/each}
       {/if}
       </div>
+      {#if picking && picked.size}
+        <div class="bulkbar" role="toolbar" aria-label="Bulk delete">
+          <span class="bulk-n">
+            {pickedSessions.length} conversation{pickedSessions.length === 1 ? '' : 's'}
+            {#if pickedFolders.length}
+              · {pickedFolders.length} folder{pickedFolders.length === 1 ? '' : 's'}
+            {/if}
+            {#if pickedRunning.length}
+              · {pickedRunning.length} answering, skipped
+            {/if}
+          </span>
+          <button
+            class="pill px-2 py-1 text-[12px] {bulkArm ? 'armed' : ''}"
+            onclick={() => void deletePicked()}
+          >
+            {bulkArm ? 'Confirm' : 'Delete'}
+          </button>
+          <button class="pill px-2 py-1 text-[12px]" onclick={clearPick}>Done</button>
+        </div>
+      {:else if picking}
+        <!-- The gesture is invisible until somebody discovers it, so once the mode is on
+             it gets said out loud. -->
+        <div class="pickhint">Ctrl-click or ⌘-click to pick, Shift-click for a run, Esc to stop.</div>
+      {/if}
     </aside>
 
     <!-- main -->
