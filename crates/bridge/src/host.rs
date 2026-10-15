@@ -493,6 +493,11 @@ impl Engine {
             "CWOFFEE_WORKSPACE".to_string(),
             launch.workdir.to_string_lossy().to_string(),
         ));
+        // The tools ask the engine how risky a call is, and the answer depends on the
+        // approval mode. Named here so a tool host never guesses it. (Fixed for the life
+        // of the child: changing the mode mid-session is not seen by an already-spawned
+        // pi — noted in the plan.)
+        launch.extra_env.push(("CWOFFEE_MODE".to_string(), self.state.lock().unwrap().mode.as_str().to_string()));
         let (child, mut rx) = PiChild::spawn(&launch).await.map_err(|e| self.explain_now(&e))?;
         let pid = child.pid;
         self.child = Some(child);

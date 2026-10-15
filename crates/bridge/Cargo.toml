@@ -15,6 +15,14 @@ path = "src/lib.rs"
 name = "cwoffee-bridge-probe"
 path = "src/bin/probe.rs"
 
+# The tool runtime for a pi-backed session: `specs` (what the tools are), `check`
+# (the risk of this call, in the engine's own words), `run` (execute it under the
+# workspace, sandbox, net policy and search backend read from cwoffee's config.toml).
+# All policy lives here rather than in a JavaScript extension.
+[[bin]]
+name = "cwtool"
+path = "src/bin/cwtool.rs"
+
 [dependencies]
 cwoffee-engine = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "rt-multi-thread", "macros", "time", "sync"] }
