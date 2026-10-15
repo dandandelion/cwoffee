@@ -30,14 +30,47 @@ fn main() {
     }
 }
 
+/// The guardrail: the file must live inside the workspace this process was started for.
+///
+/// `CWOFFEE_WORKSPACE` is set by the bridge on every spawn (`PiHost::ensure_child`), so
+/// confinement is a named fact and not a guess from an inherited cwd. An out-of-workspace
+/// path is refused **naming the root that refused it**: a refusal that does not say what
+/// it is confined to sends a model flailing through ten variants of one path, and a
+/// recorded transcript from the desktop app shows exactly that waste.
+///
+/// The earlier spike version allowed only `/etc/*`, which read as "the engine guardrail
+/// is broken" to a user whose files were nowhere near /etc. A demo rule that a user cannot
+/// distinguish from a real one is the failure mode to design out.
 fn read_file(path: &str) {
-    // The guardrail is the engine's, not a promise in a prompt. This is the part that
-    // must not move to the extension.
-    if !path.starts_with("/etc/") || path.contains("..") {
-        print!(r#"{{"ok":false,"error":"read_file refused: {}"}}"#, path);
-        return;
+    let root = match std::env::var("CWOFFEE_WORKSPACE") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => match std::env::current_dir() {
+            Ok(d) => d.to_string_lossy().to_string(),
+            Err(e) => return deny(&format!("there is no workspace root to read within: {e}")),
+        },
+    };
+    if path.contains("..") {
+        return deny(&format!("{path}: path traversal is refused (workspace root: {root})"));
     }
-    match std::fs::read_to_string(path) {
+    let joined = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{root}/{path}")
+    };
+    // canonicalize resolves symlinks, which is the point: a link out of the workspace is
+    // an out-of-workspace read, whatever the path the model was given looked like.
+    let canon = match std::path::PathBuf::from(&joined).canonicalize() {
+        Ok(c) => c,
+        Err(e) => return deny(&format!("{joined}: {e} (workspace root: {root})")),
+    };
+    if !canon.starts_with(&root) {
+        return deny(&format!(
+            "{} is outside the workspace root {root}",
+            canon.display()
+        ));
+    }
+    let path = canon.to_string_lossy().to_string();
+    match std::fs::read_to_string(&path) {
         Ok(s) => print!(
             r#"{{"ok":true,"tool":"read_file","engine":"rust","bytes":{},"content":"{}"}}"#,
             s.len(),
@@ -46,3 +79,7 @@ fn read_file(path: &str) {
         Err(e) => print!(r#"{{"ok":false,"error":"{}"}}"#, e),
     }
 }
+fn deny(msg: &str) {
+    print!(r#"{{"ok":false,"error":"read_file refused: {}"}}"#, msg);
+}
+

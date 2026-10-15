@@ -103,9 +103,17 @@ const transcript = JSON.stringify(rows)
 // tool and finished, and nothing on the way reported a denial. (An earlier version
 // grepped for the bridge's own `engine:"rust"` envelope, which only the pi core emits
 // — a gate that flatters one core is not a gate.)
+// Answering "allow" does not lift the tool's own confinement: an out-of-workspace read
+// is refused by the Rust tool even after a human approved it, and that is the point of
+// having the rule in the tool rather than only in the prompt. So allow means "the call
+// reached the tool and the tool answered", and the answer is allowed to be a refusal —
+// as long as it names the root it is confined to.
 if (answer === 'allow') {
   if (seen.execEnd < 1) fail.push(`answered allow, but no tool-result event arrived (kinds: ${JSON.stringify(seen.kinds)})`)
-  if (/denied|blocked|refus/i.test(transcript + JSON.stringify(seen.notes))) fail.push('answered allow, yet something reports a denial')
+  if (/blocked|denied approval|user denied/i.test(transcript)) fail.push('answered allow, yet something reports the *human* denied')
+  if (!/"ok":true/.test(transcript) && !/outside the workspace root/i.test(transcript)) {
+    fail.push('answered allow, and the tool neither read the file nor said which root it is confined to')
+  }
 }
 if (answer === 'deny') {
   if (/\"ok\":true/.test(transcript)) fail.push('answered deny, yet the tool reported success')

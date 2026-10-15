@@ -25,5 +25,8 @@ fi
   --extern serde_json="$sj" -L dependency="$cwoffee_target" || exit 1
 
 echo "built $here/cwshim"
-printf '{"path":"/etc/hostname"}' | "$here/cwshim" read_file; echo
-printf '{"path":"/etc/../proc/sys/kernel/hostname"}' | "$here/cwshim" read_file; echo
+# The guardrail, tested at build time: inside the root reads, outside it does not, and
+# the refusal names the root it was confined to.
+printf '{"path":"rust-shim.rs"}' | CWOFFEE_WORKSPACE="$here" "$here/cwshim" read_file | head -c 120; echo
+printf '{"path":"../../etc/hostname"}' | CWOFFEE_WORKSPACE="$here" "$here/cwshim" read_file; echo
+printf '{"path":"/etc/hostname"}' | CWOFFEE_WORKSPACE="$here" "$here/cwshim" read_file; echo

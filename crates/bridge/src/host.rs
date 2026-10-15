@@ -479,6 +479,13 @@ impl Engine {
         }
         let mut launch = self.cfg.launch.clone();
         launch.session_file = self.map.get(self.row()).map(str::to_string).map(PathBuf::from);
+        // Name the root for the tools instead of trusting an inherited cwd. A shim that
+        // guesses its confinement from the shell that spawned it is a shim that will be
+        // right until someone changes how it is started.
+        launch.extra_env.push((
+            "CWOFFEE_WORKSPACE".to_string(),
+            launch.workdir.to_string_lossy().to_string(),
+        ));
         let (child, mut rx) = PiChild::spawn(&launch).await.map_err(|e| self.explain_now(&e))?;
         let pid = child.pid;
         self.child = Some(child);
@@ -642,7 +649,9 @@ impl Engine {
                 }
             }
             HostCmd::SwitchSession { id } => match self.cfg.store.session(id) {
-                Ok(Some(s)) => self.enter_row(id, &s.title).await,
+                Ok(Some(s)) => {
+                    self.enter_row(id, &s.title).await;
+                }
                 Ok(None) => self.err(format!(
                     "there is no conversation {id} to open; the list was not changed and this window stayed on {}",
                     self.state.lock().unwrap().session_id
@@ -665,7 +674,60 @@ impl Engine {
     /// store, and pi starts a fresh thread with it said out loud — which is what
     /// a conversation carried over from the Rust core needs until Phase 4 feeds
     /// history in.
-    async fn enter_row(&mut self, id: i64, title: &str) {
+    /// A conversation and the folder it lives in travel together.
+    ///
+    /// The Rust core rebuilds its tool context from the stored session row, so opening
+    /// a conversation that lives somewhere else moves the tools with it. A pi process
+    /// cannot change the working directory of a live session (PI-CORE-PROTOCOL), so the
+    /// move is process lifecycle: close the child, relaunch it in the other folder, and
+    /// let `ensure_child` resume this row's session file there.
+    ///
+    /// Refusing while a turn runs is the other half of the rule (decision 11): moving
+    /// the folder out from under an in-flight turn would send its writes into a tree the
+    /// user never chose for that conversation. Returns false when the move — and so the
+    /// turn that asked for it — was refused.
+    async fn follow_workspace(&mut self, id: i64) -> bool {
+        if id == self.row() {
+            // The same conversation: a folder the user chose by hand wins over whatever
+            // the row still says.
+            return true;
+        }
+        let want = match self.cfg.store.session(id) {
+            Ok(Some(s)) => s.workspace.trim().to_string(),
+            _ => return true,
+        };
+        let have = self.cfg.launch.workdir.to_string_lossy().to_string();
+        if want.is_empty() || want == have {
+            return true;
+        }
+        if self.state.lock().unwrap().busy || self.tr.running() {
+            self.err(format!(
+                "conversation {id} lives in {want}, but the tools are working in {have} and a turn is running                  there; nothing was moved and nothing was sent. Stopping that turn first is what makes the                  folder change safe — its writes would otherwise land in the wrong tree."
+            ));
+            return false;
+        }
+        if let Some(child) = self.child.take() {
+            child.reap(Duration::from_secs(3)).await;
+        }
+        self.cfg.launch.workdir = PathBuf::from(&want);
+        {
+            let mut st = self.state.lock().unwrap();
+            st.workspace = want.clone();
+            st.workspace_refusal = None;
+        }
+        let _ = self.cfg.store.add_workspace(&want);
+        // Said out loud because the alternative is the bug this closes: the model is told
+        // one folder by pi's own prompt and the user is looking at another in the sidebar.
+        self.note(format!(
+            "the tools moved to {want} — that is where conversation {id} lives; the model's own folder moved              with them"
+        ));
+        true
+    }
+
+    async fn enter_row(&mut self, id: i64, title: &str) -> bool {
+        if !self.follow_workspace(id).await {
+            return false;
+        }
         {
             let mut st = self.state.lock().unwrap();
             st.session_id = id;
@@ -700,6 +762,7 @@ impl Engine {
                 }
             }
         }
+        true
     }
 
     async fn on_send(&mut self, text: String, attachments: Vec<Attachment>, session: Option<i64>) {
@@ -743,7 +806,11 @@ impl Engine {
         };
         if target != current {
             let title = self.title_for(target, &text);
-            self.enter_row(target, &title).await;
+            if !self.enter_row(target, &title).await {
+                // The refusal said why. Sending anyway would have put this turn into the
+                // conversation the user was *leaving*, in the folder they were not in.
+                return;
+            }
         }
         let row = self.row();
         let row = if row == 0 {
