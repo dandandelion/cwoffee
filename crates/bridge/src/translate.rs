@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use cwoffee_engine::event::{EngineEvent, ExecStream, FinishReason};
-use cwoffee_engine::provider::{Message, Role, ToolCall};
+use cwoffee_engine::provider::{Attachment, Message, Role, ToolCall};
 use cwoffee_engine::telemetry::{TurnStats, TurnTelemetry};
 use cwoffee_engine::tools::changes::FileChange;
 use serde_json::Value;
@@ -134,11 +134,26 @@ pub struct Translator {
     /// Record types we do not know, counted. A pi bump that adds records shows up
     /// here rather than quietly dropping features on the floor.
     pub unknown: BTreeMap<String, usize>,
+    /// What this run sent, so the stored row can carry the client's own name and
+    /// size for a picture. pi echoes the bytes back but knows nothing about
+    /// "probe.png"; taking only the echo would lose what the transcript shows.
+    sent_att: Vec<Attachment>,
 }
 
 impl Translator {
     pub fn running(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// What the host is about to send. Set before the prompt, consumed by the
+    /// echoed user row. A failed send has to clear it, or the next turn's row
+    /// would claim somebody else's picture.
+    pub fn expect_attachments(&mut self, atts: Vec<Attachment>) {
+        self.sent_att = atts;
+    }
+
+    pub fn clear_attachments(&mut self) {
+        self.sent_att.clear();
     }
 
     /// A dialog closed — answered, denied, expired, or left unanswered until the
@@ -275,9 +290,54 @@ impl Translator {
         match role.as_str() {
             "user" => {
                 let mut m = Message::user(text);
-                // pi echoes attachments as its own blocks; the image bytes are
-                // not carried across yet (Phase 2), so nothing is invented here.
-                m.attachments = Vec::new();
+                // pi echoes the picture as its own image block. Reading the mime and
+                // bytes back off that block is what puts the image in the stored row,
+                // so reopening the conversation shows the same picture on either core.
+                // A block whose shape is not recognised is skipped rather than guessed
+                // at - an attachment row with the wrong mime is a lie about the file.
+                let echoed = msg
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("image"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if !self.sent_att.is_empty() {
+                    // We sent N, pi echoed M. The row keeps what was sent - name and
+                    // byte count are ours, and the Rust core stores those - but a
+                    // shortfall is reported rather than smoothed over, because an
+                    // attachment that never reached the model is the one failure mode
+                    // a user cannot see for themselves.
+                    if echoed != self.sent_att.len() {
+                        out.events.push(EngineEvent::Note {
+                            message: format!(
+                                "the picture was sent but pi echoed {echoed} of {} image block(s) back; the transcript keeps what was sent",
+                                self.sent_att.len()
+                            ),
+                            session: Some(self.session),
+                        });
+                    }
+                    m.attachments = std::mem::take(&mut self.sent_att);
+                } else if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+                    for b in blocks {
+                        if b.get("type").and_then(|t| t.as_str()) != Some("image") {
+                            continue;
+                        }
+                        let mime = b.get("mimeType").and_then(|v| v.as_str()).unwrap_or_default();
+                        let data = b.get("data").and_then(|v| v.as_str()).unwrap_or_default();
+                        if mime.is_empty() || data.is_empty() {
+                            continue;
+                        }
+                        m.attachments.push(cwoffee_engine::provider::Attachment {
+                            mime: mime.to_string(),
+                            data_b64: data.to_string(),
+                            name: b.get("name").and_then(|v| v.as_str()).map(str::to_string),
+                        });
+                    }
+                }
                 out.rows.push(m);
             }
             "assistant" => {

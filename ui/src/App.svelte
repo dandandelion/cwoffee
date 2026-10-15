@@ -3272,6 +3272,50 @@
         }
       }
 
+      // --- the picture has to reach the endpoint, not merely the store -----------
+      // The check above proves the row kept its metadata; it does not prove the model
+      // was handed the bytes. A core that dropped the attachment and stored it anyway
+      // would pass that and lie. The scripted endpoint now answers with the image
+      // blocks it actually received, so the transcript is the receipt, and the same
+      // case runs against either core.
+      {
+        const attSess = await invoke<number>('new_session', { title: 'selftest attach' })
+        await useSession(attSess)
+        const turnsBeforeAtt = await turnCount()
+        // The same 1x1 PNG the vision check sends. It is declared inside that block;
+        // re-declaring the literal here is cheaper than rewiring a passing check, and
+        // both are named for what they are: a probe image, not a picture of anything.
+        const PNG_PROBE =
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg=='
+        await invoke('start_turn', {
+          text: 'ATTACHMENT ECHO',
+          attachments: [{ mime: 'image/png', data_b64: PNG_PROBE, name: 'echo.png' }],
+          session: attSess,
+        })
+        const attDone = await waitTurnDone(turnsBeforeAtt)
+        if (!attDone) {
+          pageLog('selftest note: skipped the endpoint-side attachment check; the turn did not finish')
+        } else {
+          const st = await invoke<HostState>('session_state')
+          const page = await invoke<any>('session_messages', { id: st.session_id })
+          const said = (page.messages ?? [])
+            .filter((m: any) => m.role === 'assistant')
+            .map((m: any) => String(m.content ?? ''))
+          const receipt = said.find((t: string) => t.includes('Attachment seen:'))
+          if (!receipt)
+            fail(`the endpoint never reported an attachment (last answer: ${said.slice(-1)[0] ?? 'nothing'})`)
+          else if (!receipt.includes('1 image(s): image/png'))
+            fail(`the endpoint saw the wrong thing: "${receipt}"`)
+          const kept = (page.messages ?? [])
+            .filter((m: any) => Array.isArray(m.attachments) && m.attachments.length)
+            .flatMap((m: any) => m.attachments)
+            .find((x: any) => x.name === 'echo.png')
+          if (!kept) fail('the attachment name the client sent did not survive into the store')
+          else pageLog(`attachment reaches the model (${receipt})`)
+        }
+        await invoke('delete_session', { id: attSess }).catch(() => {})
+      }
+
       // A here-document write used to make the approval card taller than the
       // window: Allow/Deny sat below the fold, nothing scrolled, and the only
       // way out was to let the approval time out. The card caps its height and
@@ -8069,6 +8113,18 @@
              it gets said out loud. -->
         <div class="pickhint">Ctrl-click or ⌘-click to pick, Shift-click for a run, Esc to stop.</div>
       {/if}
+      <div class="side-foot">
+        <!-- Pinned to the end of the sidebar, outside the scrolling list: a control that
+             scrolls away with the conversations is not a control you can find when the
+             list is what you are lost in. -->
+        <button class="side-item" aria-expanded={settings != null} onclick={() => openSettings()}>
+          <svg width="13" height="13" viewBox="0 0 14 14" aria-hidden="true">
+            <circle cx="7" cy="7" r="2.3" fill="none" stroke="currentColor" stroke-width="1.3"/>
+            <path d="M7 1.3v1.7M7 11v1.7M1.3 7h1.7M11 7h1.7M2.95 2.95l1.2 1.2M9.85 9.85l1.2 1.2M11.05 2.95l-1.2 1.2M4.15 9.85l-1.2 1.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+          </svg>
+          <span>Settings</span>
+        </button>
+      </div>
     </aside>
 
     <!-- main -->
@@ -8541,9 +8597,15 @@
               ></u>
             {/if}
           </span>
-          <span class="mval mono">
-            {(hostState?.context_tokens ?? 0).toLocaleString()} /
-            {ctxLimit ? fmtTokens(ctxLimit) : 'not reported'}
+          <span
+            class="mval mono"
+            title="{(hostState?.context_tokens ?? 0).toLocaleString()} tokens used against a {ctxLimit ? ctxLimit.toLocaleString() : 'unknown'} token window the endpoint itself stated. The percentage is the number worth watching; the exact counts live here rather than on screen."
+          >
+            {#if ctxLimit}
+              {ctxPct}%
+            {:else}
+              no window reported
+            {/if}
             {#if hostState?.context_budget}
               <small
                 class="ctxtrim"
@@ -8558,7 +8620,7 @@
           <span class="mbar" title="how much of the prompt the server already had">
             <i class="ok" style="width:{Math.min(100, cacheHit)}%"></i>
           </span>
-          <span class="mval mono">{cacheLabel} ({cachedTokens}/{promptTokens})</span>
+          <span class="mval mono">{cacheLabel}</span>
         </div>
         <div class="mgrid">
           <div class="mcell">
@@ -8933,15 +8995,6 @@
         onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}
       >
         {theme === 'dark' ? '\u2600' : '\u263e'}
-      </button>
-      <button
-        class="keyhelp"
-        title="Settings"
-        aria-label="Settings"
-        aria-expanded={settings != null}
-        onclick={() => openSettings()}
-      >
-        &#8987;
       </button>
       <button
         class="keyhelp"

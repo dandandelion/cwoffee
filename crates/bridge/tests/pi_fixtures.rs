@@ -48,6 +48,32 @@ impl Clock {
     }
 }
 
+// An attachment that survives into the transcript is the difference between "the model
+// saw my picture" and a row that says the user typed nothing. pi echoes the image as its
+// own block; the bridge has to read it back, and must not invent one when the block is
+// malformed.
+#[test]
+fn a_picture_the_user_attached_comes_back_in_the_stored_row() {
+    let mut tr = Translator::default();
+    let rec = serde_json::json!({
+        "type": "message_end",
+        "message": {
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is in this?" },
+                { "type": "image", "mimeType": "image/png", "data": "aGVsbG8=" },
+                { "type": "image", "mimeType": "image/png" }
+            ]
+        }
+    });
+    let out = tr.on_record(&rec, Instant::now());
+    let row = out.rows.iter().find(|m| m.role == Role::User).expect("a user row");
+    assert_eq!(row.content, "what is in this?");
+    assert_eq!(row.attachments.len(), 1, "a block with no bytes is not an attachment");
+    assert_eq!(row.attachments[0].mime, "image/png");
+    assert_eq!(row.attachments[0].data_b64, "aGVsbG8=");
+}
+
 #[test]
 fn one_prompt_is_one_turn_even_when_pi_runs_two_of_its_own() {
     let recs = fixture("pi-events-read-file-approval.jsonl");

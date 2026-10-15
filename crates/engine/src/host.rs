@@ -105,8 +105,8 @@ impl HostConfig {
             env_override: None,
             approval_timeout: std::time::Duration::from_secs(300),
             question_timeout: std::time::Duration::from_secs(180),
-            max_attachments: 4,
-            max_attachment_bytes: 2 * 1024 * 1024,
+            max_attachments: DEFAULT_MAX_ATTACHMENTS,
+            max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             sampling: crate::provider::Sampling::default(),
             cfg_path: None,
             egress: crate::tools::net::NetCfg::default().mode,
@@ -130,7 +130,10 @@ impl HostConfig {
 /// mode and reasoning persistence closed, one dial further along.
 pub const FALLBACK_BUDGET: usize = 32_000;
 
-fn auto_budget(window: usize) -> usize {
+/// The ceiling the engine gives itself for a window: a share of what the endpoint
+/// states, never more, so a prompt cannot overflow the model and have the server
+/// truncate it from the front with no note attached.
+pub fn auto_budget(window: usize) -> usize {
     // 80% of the window. The other 20% is the reply plus the estimate's own
     // error: chars/3.5 is close on prose and short on code. The failure this is
     // guarding against is not "we compacted too early" - it is a prompt that
@@ -1438,6 +1441,12 @@ pub struct AttachmentLimits {
 /// interpret an arbitrary data blob.
 const ALLOWED_MIME: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
+/// One owner for the numbers a shell that has no opinion gets. The pi bridge reads
+/// these through `default_attachment_limits` so that an over-large picture is refused
+/// with the same sentence whichever core is running.
+const DEFAULT_MAX_ATTACHMENTS: usize = 4;
+const DEFAULT_MAX_ATTACHMENT_BYTES: usize = 2 * 1024 * 1024;
+
 fn b64_ok(s: &str) -> bool {
     if s.is_empty() || s.len() % 4 != 0 {
         return false
@@ -1447,7 +1456,20 @@ fn b64_ok(s: &str) -> bool {
     })
 }
 
-fn check_attachments(atts: &[crate::provider::Attachment], limits: AttachmentLimits) -> Result<(), String> {
+impl AttachmentLimits {
+    /// The limits a default host applies. Shared with the bridge deliberately: two
+    /// cores with two different attachment rules feel like flakiness to the user.
+    pub fn defaults() -> Self {
+        AttachmentLimits {
+            max_count: DEFAULT_MAX_ATTACHMENTS,
+            max_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+        }
+    }
+}
+
+/// The one place an attachment is accepted or refused. The pi bridge calls this too,
+/// so a blob that is rejected says the same sentence whichever core is running.
+pub fn check_attachments(atts: &[crate::provider::Attachment], limits: AttachmentLimits) -> Result<(), String> {
     if atts.len() > limits.max_count {
         return Err(format!(
             "{} attachments exceeds the limit of {}",

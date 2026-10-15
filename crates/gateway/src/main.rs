@@ -220,6 +220,16 @@ async fn main() -> anyhow::Result<()> {
         // one is the development shape — see `mount::write_dev_provider` for why real
         // credential handling is S4.1's decision and not this line's.
         let key = appcfg.api_key().unwrap_or_else(|| "unused".into());
+        // The endpoint's own number, probed the way the Rust core probes it: the
+        // metrics percentage and the context meter both need a ceiling that somebody
+        // stated, not one cwoffee invented.
+        let window = match appcfg.build_provider() {
+            Ok(p) => cwoffee_bridge::mount::probe_window(p.as_ref(), &configured_model).await,
+            Err(e) => {
+                eprintln!("[cwoffee/pi] no window probe: {e}");
+                None
+            }
+        };
         let models =
             cwoffee_bridge::mount::write_dev_provider(
                 &agent_dir,
@@ -228,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
                 &configured_model,
                 &key,
                 cwoffee_bridge::mount::pi_api_for_kind(&appcfg.provider.kind),
+                window,
             )?;
         println!(
             "[cwoffee/pi] provider {PI_PROVIDER} -> {} (written to {})",
@@ -308,8 +319,8 @@ async fn main() -> anyhow::Result<()> {
             ),
             // Same fallback the Rust core uses: a context meter that reads
             // differently per core is drift, not a difference in the model.
-            context_budget: cfg.context_budget.unwrap_or(cwoffee_engine::host::FALLBACK_BUDGET),
-            model_window: None,
+            context_budget: cwoffee_bridge::mount::context_budget(cfg.context_budget, window.map(|w| w as usize)),
+            model_window: window.map(|w| w as usize),
             session_map: agent_dir.join("cwoffee-pi-sessions.json"),
         })
         .await?;

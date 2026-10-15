@@ -1158,6 +1158,36 @@ body {
   display: flex;
 }
 
+/* The sidebar's own footer: pinned to the end of the column, outside the scrolling
+   conversation list, so it cannot scroll away. Kept inside the aside rather than in the
+   window status strip because on a phone the strip is hidden while the drawer is shut. */
+.side-foot {
+  margin-top: auto;
+  flex: none;
+  padding-top: 6px;
+  border-top: 1px solid var(--color-hairline);
+}
+.side-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: 8px;
+  color: var(--color-ink-2);
+  font-size: 12.5px;
+  text-align: left;
+}
+.side-item:hover {
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+}
+.side-item[aria-expanded='true'] {
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+}
+
 .sidemenu {
   display: none;
 }

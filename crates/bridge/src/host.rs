@@ -874,15 +874,17 @@ impl Engine {
     }
 
     async fn on_send(&mut self, text: String, attachments: Vec<Attachment>, session: Option<i64>) {
+        // pi carries images on the prompt itself, so an attachment is not something
+        // this core refuses: it is the same bytes handed to the same model. The gate
+        // is the engine's own `check_attachments` with the engine's own default limits,
+        // because a bridge that invents its own rules would reject a picture the Rust
+        // core accepts, and that is a difference the user feels as flakiness.
         if !attachments.is_empty() {
-            // Silent attachment loss is the worst possible outcome: the user asked
-            // about a spreadsheet and the model answers from its imagination.
-            self.err(format!(
-                "the pi core cannot carry {} attachment(s) yet — name the file and its path instead, and the \
-                 file tools will open it (PI-CORE-PLAN Phase 2)",
-                attachments.len()
-            ));
-            return;
+            let limits = cwoffee_engine::host::AttachmentLimits::defaults();
+            if let Err(reason) = cwoffee_engine::host::check_attachments(&attachments, limits) {
+                self.err(format!("attachment rejected: {reason}"));
+                return;
+            }
         }
         if text.trim().is_empty() {
             self.err("an empty message was refused before it reached the model");
@@ -952,7 +954,19 @@ impl Engine {
             let mut st = self.state.lock().unwrap();
             st.busy = true;
         }
-        match self.request(json!({ "type": "prompt", "message": text }), Duration::from_secs(30)).await {
+        // `images` is pi's own ImageContent shape: unprefixed base64 plus the mime the
+        // boundary check just allowed. A non-image attachment is refused above rather
+        // than smuggled through as something the model was never meant to interpret.
+        let images: Vec<Value> = attachments
+            .iter()
+            .map(|a| json!({ "type": "image", "data": a.data_b64, "mimeType": a.mime }))
+            .collect();
+        self.tr.expect_attachments(attachments.clone());
+        let mut prompt = json!({ "type": "prompt", "message": text });
+        if !images.is_empty() {
+            prompt["images"] = Value::Array(images);
+        }
+        match self.request(prompt, Duration::from_secs(30)).await {
             Ok(data) => {
                 // "started" is an acceptance, not a finished turn; the stream
                 // says when it is over. Saying otherwise would double-count.

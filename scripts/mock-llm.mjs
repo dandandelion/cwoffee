@@ -107,6 +107,39 @@ function lastUserText(messages) {
   return ''
 }
 
+/**
+ * Images the request actually carried, in OpenAI's shape (`image_url` with a data:
+ * URL) or pi's (`{ type: "image", mimeType, data }`). A scenario can ask for this with
+ * `{images}` in its content: the endpoint then reports what it received, which is the
+ * only proof that an attachment travelled from the client to the model rather than
+ * being dropped one hop short.
+ */
+function imageSummary(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (!Array.isArray(m?.content)) continue
+    const imgs = m.content.filter((p) => p && (p.type === 'image' || p.type === 'image_url' || p.image_url))
+    if (!imgs.length) continue
+    const mimes = imgs.map((p) => {
+      if (p.mimeType) return p.mimeType
+      const u = typeof p.image_url === 'string' ? p.image_url : (p.image_url?.url ?? '')
+      const mm = /^data:([^;,]+);/.exec(u)
+      return mm ? mm[1] : 'unknown'
+    })
+    return `${imgs.length} image(s): ${mimes.join(', ')}`
+  }
+  return '0 image(s): none'
+}
+
+/** Fill `{images}` in a scripted step with what this request carried. */
+function renderStep(step, messages) {
+  if (!step) return step
+  const out = { ...step }
+  if (typeof out.content === 'string' && out.content.includes('{images}'))
+    out.content = out.content.replaceAll('{images}', imageSummary(messages))
+  return out
+}
+
 function textOf(m) {
   if (typeof m.content === 'string') return m.content
   if (Array.isArray(m.content))

@@ -671,6 +671,21 @@ async fn pi_host(
     // dev file exists so the experiment runs against cwoffee's own config; keeping an
     // existing one is what lets a real pi login be used instead.
     let models = agent_dir.join("models.json");
+    // One probe against the endpoint, through the same call the Rust core uses, and
+    // the window it states goes into pi's model entry and into the host state. Without
+    // it there is no denominator: the metrics panel can only say "no window reported",
+    // and a context meter with no ceiling is a gauge with no numbers on it.
+    let window = match appcfg.build_provider() {
+        Ok(p) => cwoffee_bridge::mount::probe_window(p.as_ref(), model).await,
+        Err(e) => {
+            println!("[cwoffee/pi] no window probe: {e}");
+            None
+        }
+    };
+    println!(
+        "[cwoffee/pi] context window for {model}: {}",
+        window.map(|w| w.to_string()).unwrap_or_else(|| "the endpoint did not say".into())
+    );
     if models.exists() || std::env::var("CWOFFEE_PI_KEEP_MODELS").is_ok() {
         println!("[cwoffee/pi] leaving the provider config in {} alone", agent_dir.display());
     } else {
@@ -682,6 +697,7 @@ async fn pi_host(
             model,
             &key,
             cwoffee_bridge::mount::pi_api_for_kind(&appcfg.provider.kind),
+            window,
         )
         .map_err(|e| format!("cannot write {}: {e}", models.display()))?;
         println!("[cwoffee/pi] provider cwoffee -> {} (written to {})", appcfg.provider.base_url, path.display());
@@ -740,8 +756,8 @@ async fn pi_host(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600),
         ),
-        context_budget: cfg.context_budget.unwrap_or(cwoffee_engine::host::FALLBACK_BUDGET),
-        model_window: None,
+        context_budget: cwoffee_bridge::mount::context_budget(cfg.context_budget, window.map(|w| w as usize)),
+        model_window: window.map(|w| w as usize),
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
     })
     .await

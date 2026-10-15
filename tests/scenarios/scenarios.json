@@ -84,6 +84,19 @@
  ],
  "scenarios": [
   {
+   "name": "attachment-echo",
+   "_why": "attachment parity: the endpoint reports the image blocks it received, so a core that drops the picture fails this",
+   "match": "ATTACHMENT ECHO",
+   "steps": [
+    {
+     "content": "Attachment seen: {images}",
+     "finish": "stop",
+     "chunk_chars": 12,
+     "delay_ms": 5
+    }
+   ]
+  },
+  {
    "name": "one-word-image",
    "_why": "vision over the wire: the attachment has to reach the request, and thinking is off for this one so no reasoning deltas may appear",
    "match": "What colour is this image?",
@@ -313,7 +326,7 @@
      "delay_ms": 25
     },
     {
-     "content": "Right — that belongs in write_file, not in a shell.",
+     "content": "Right \u2014 that belongs in write_file, not in a shell.",
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 12

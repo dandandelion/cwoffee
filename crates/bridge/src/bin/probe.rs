@@ -97,7 +97,7 @@ async fn run() -> anyhow::Result<()> {
         // The mock endpoint speaks the OpenAI wire, which is what pi's `openai-completions`
         // api means; a real endpoint's kind comes from cwoffee's config instead.
         let path =
-            cwoffee_bridge::mount::write_dev_provider(&agent_dir, &provider, &url, &model, "mock", "openai-completions")?;
+            cwoffee_bridge::mount::write_dev_provider(&agent_dir, &provider, &url, &model, "mock", "openai-completions", None)?;
         eprintln!("[probe] wrote {provider} -> {url} in {}", path.display());
     }
 

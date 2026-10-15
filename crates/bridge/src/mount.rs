@@ -106,6 +106,26 @@ pub fn pi_api_for_kind(kind: &str) -> &'static str {
 /// user's config, is never written into a world-readable file, and probably uses pi's
 /// own auth store instead — is S4.1's decision, and pretending this solved it would
 /// be worse than admitting it is a fixture.
+/// The same ceiling the Rust core would compute: the pin from config if there is one,
+/// otherwise the engine's share of the window the endpoint states, otherwise the shared
+/// fallback. Both cores draw one meter from one formula, or a dual-core comparison
+/// turns into an argument about arithmetic.
+pub fn context_budget(pinned: Option<usize>, window: Option<usize>) -> usize {
+    pinned
+        .or_else(|| window.map(cwoffee_engine::host::auto_budget))
+        .unwrap_or(cwoffee_engine::host::FALLBACK_BUDGET)
+}
+
+/// Ask the endpoint what window this model has, through the same probe the Rust core
+/// uses. `None` means the endpoint never said, which the UI reports rather than guesses.
+pub async fn probe_window(provider: &dyn cwoffee_engine::provider::Provider, model: &str) -> Option<u64> {
+    let infos = provider.list_models_info().await.ok()?;
+    infos
+        .into_iter()
+        .find(|m| m.id == model)
+        .and_then(|m| m.context_tokens)
+}
+
 pub fn write_dev_provider(
     agent_dir: &Path,
     provider: &str,
@@ -113,12 +133,21 @@ pub fn write_dev_provider(
     model: &str,
     api_key: &str,
     api: &str,
+    window: Option<u64>,
 ) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(agent_dir)?;
+    // The context window goes in when we know it. Without it pi reports no window for
+    // this model, cwoffee's metrics panel has no denominator, and the user sees "no
+    // window reported" where a percentage should be. A number nobody probed is worse
+    // than nothing: it would draw a full-looking meter out of a guess.
+    let mut entry = serde_json::json!({ "id": model });
+    if let Some(w) = window {
+        entry["contextWindow"] = serde_json::json!(w);
+    }
     let models = serde_json::json!({
         "providers": { provider: {
             "baseUrl": base_url, "api": api, "apiKey": api_key,
-            "models": [{ "id": model }]
+            "models": [entry]
         }}
     });
     let path = agent_dir.join("models.json");
