@@ -30,10 +30,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use cwoffee_engine::approval::{ApprovalAnswer, ApprovalMode, ApprovalRequest};
 use cwoffee_engine::config::Config;
+use cwoffee_engine::tools::searxng::{runtime as searxng_runtime, AutoSearXNG, AutoStatus};
+use cwoffee_engine::tools::web::WebSearchTool;
 use cwoffee_engine::event::EngineEvent;
 use cwoffee_engine::host::{approval_event, question_event, ApprovalRx, HostCmd, HostOps, HostState};
 use cwoffee_engine::provider::{Attachment, ModelInfo, Reasoning};
-use cwoffee_engine::settings::{SearchProbe, SearchView};
+use cwoffee_engine::settings::{ProbeHit, SearchProbe, SearchView};
 use cwoffee_engine::store::StoreOps;
 use cwoffee_engine::tools::ask::{Answer, Question, QuestionOption, QuestionRx};
 use cwoffee_engine::tools::Risk;
@@ -75,11 +77,28 @@ pub struct PiHost {
     /// A request that needs an answer, run by the model task against the live
     /// child: the model list, and anything else a front end asks and waits on.
     rpc_tx: mpsc::UnboundedSender<(Value, oneshot::Sender<Result<Value, String>>)>,
+    /// Shared with the model task: when a network tool last ran. The panel's own probe
+    /// counts, so asking "try one search" keeps alive for the idle window what the probe
+    /// just started.
+    web_last: Arc<Mutex<Option<Instant>>>,
     state: Arc<Mutex<HostState>>,
     ev_rx: Option<EventRx>,
     ap_rx: Option<ApprovalIn>,
     q_rx: Option<QuestionIn>,
     pub pi_version: String,
+}
+
+/// The managed instance, when the config asks Cwoffee to run one. Built from the same
+/// config the tool host reads, so the bridge's idea of the container and the tool's are
+/// about one container rather than two.
+fn managed_searxng() -> Option<AutoSearXNG> {
+    match Config::load(None) {
+        Ok((cfg, _)) => match cfg.search_backend() {
+            cwoffee_engine::tools::web::SearchBackend::Auto(a) => Some(a),
+            _ => None,
+        },
+        Err(_) => None,
+    }
 }
 
 impl PiHost {
@@ -114,6 +133,7 @@ impl PiHost {
             refusal_seq: 0,
         }));
         let map = SessionMap::open(cfg.session_map.clone());
+        let web_last = Arc::new(Mutex::new(None::<Instant>));
         let engine = Engine {
             cfg,
             state: Arc::clone(&state),
@@ -127,6 +147,11 @@ impl PiHost {
             map,
             cmd_tx: cmd_tx.clone(),
             deferred: Vec::new(),
+            auto: managed_searxng(),
+            auto_idle: Config::load(None).map(|(c, _)| c.search.auto_idle_secs).unwrap_or(120),
+            auto_checked: None,
+            auto_seen: None,
+            web_last: Arc::clone(&web_last),
             auto_allow: HashSet::new(),
             waits: HashMap::new(),
             next_id: 1,
@@ -138,6 +163,7 @@ impl PiHost {
         tokio::spawn(async move { engine.run(cmd_rx, rec_rx, ui_rx, rpc_rx).await });
         Ok(PiHost {
             cmd_tx,
+            web_last: Arc::clone(&web_last),
             rpc_tx,
             state,
             ev_rx: Some(ev_rx),
@@ -279,11 +305,19 @@ impl HostOps for PiHost {
             auto_port: cfg.search.auto_port,
             auto_idle_secs: cfg.search.auto_idle_secs,
             auto_dir: cfg.search_auto_dir().display().to_string(),
-            describing: "search is a cwoffee tool, and this bridge does not mount the tool extensions into pi yet \
-                          (PI-CORE-PLAN Phase 2); the panel shows the saved choice, not a live tool"
-                .into(),
-            runtime: None,
-            auto: None,
+            // The same answers the Rust core's panel gets, from the same code: what the
+            // live tool says it is doing, whether a container runtime exists on this
+            // machine, and whether the managed container is answering on its port right
+            // now. A panel that says "no container runtime" on a box with podman, while a
+            // search through the tool host starts one and answers, has been asked nothing.
+            describing: cfg.search_backend().describe(),
+            runtime: searxng_runtime().map(str::to_string),
+            auto: if cfg.search.backend == "auto" {
+                let a = AutoSearXNG::new(cfg.search.auto_port, cfg.search.auto_idle_secs, cfg.search_auto_dir());
+                Some(a.status().await)
+            } else {
+                None
+            },
             env_override: None,
             saved_to: None,
         }
@@ -310,10 +344,34 @@ impl HostOps for PiHost {
         Ok(view)
     }
 
-    async fn search_probe(&self, _query: Option<String>) -> Result<SearchProbe, String> {
-        Err("search runs as a cwoffee tool through the pi extension, which this bridge does not mount yet \
-            (PI-CORE-PLAN Phase 2)"
-            .into())
+    /// "Try one search", asking the provider rather than the model — the same probe the
+    /// Rust core runs, through the same tool a session will use. Under a pi core this is
+    /// also how the managed container can be started from the panel; the bridge's tick
+    /// then owns its idle clock like any other search.
+    async fn search_probe(&self, query: Option<String>) -> Result<SearchProbe, String> {
+        let (cfg, _) = Config::load(None).map_err(|e| format!("config could not be read: {e}"))?;
+        let backend = cfg.search_backend();
+        let tool = WebSearchTool::from_backend(backend.clone());
+        let q = query.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "coffee roasting".into());
+        let t0 = Instant::now();
+        *self.web_last.lock().unwrap() = Some(Instant::now());
+        let (note, res) = tool.search_with(&q).await;
+        Ok(match res {
+            Ok(results) => SearchProbe {
+                ms: t0.elapsed().as_millis(),
+                note,
+                backend: backend.describe(),
+                results: results.into_iter().take(5).map(|r| ProbeHit { title: r.title, url: r.url }).collect(),
+                error: None,
+            },
+            Err(e) => SearchProbe {
+                ms: t0.elapsed().as_millis(),
+                note,
+                backend: backend.describe(),
+                results: Vec::new(),
+                error: Some(e),
+            },
+        })
     }
 }
 
@@ -351,6 +409,20 @@ struct Engine {
     /// command verbs until the turn finishes; a `select!` loop owes the same, or the rest
     /// of a running turn lands in whichever conversation the user clicked.
     deferred: Vec<HostCmd>,
+    /// The managed SearXNG the config asks for, when that is the managed choice. The
+    /// tool host starts it lazily, exactly as the Rust core's tool does. What the bridge
+    /// has to own is the **idle clock**: the reaper that stops an idle container lives in
+    /// the process that started it, and under a pi core that process is a `cwtool` call
+    /// that exits seconds later — so the container would otherwise run forever.
+    auto: Option<AutoSearXNG>,
+    auto_idle: u64,
+    auto_checked: Option<Instant>,
+    /// When this app first saw an adopted container answering. Only used as the idle
+    /// clock when the app itself has not run a search through it.
+    auto_seen: Option<Instant>,
+    /// When a network tool last actually ran (in a turn, or the panel's own probe). The
+    /// bridge cannot see inside the tool host's clock, so it keeps its own.
+    web_last: Arc<Mutex<Option<Instant>>>,
     /// Approvals granted with `AllowSession`: the same tool is not asked again.
     auto_allow: HashSet<String>,
     waits: HashMap<u64, Wait>,
@@ -401,6 +473,14 @@ impl Engine {
                 },
                 rec = rec_rx.recv() => match rec {
                     Some(r) => {
+                        if r.get("type").and_then(|v| v.as_str()) == Some("tool_execution_start") {
+                            if matches!(
+                                r.get("toolName").and_then(|v| v.as_str()),
+                                Some("web_search") | Some("web_fetch") | Some("download_file")
+                            ) {
+                                *self.web_last.lock().unwrap() = Some(Instant::now());
+                            }
+                        }
                         let out = self.tr.on_record(&r, Instant::now());
                         self.apply(out);
                     }
@@ -1195,6 +1275,41 @@ impl Engine {
     }
 
     async fn on_tick(&mut self) {
+        // Someone has to be alive long enough to stop an idle container. The reaper
+        // inside `AutoSearXNG` is armed in the process that started it, and a tool call
+        // is gone in a second, so under a pi core its timer would die with it and the
+        // container would sit there indefinitely.
+        if let Some(a) = self.auto.clone() {
+            let due = self.auto_checked.map(|t| t.elapsed() >= Duration::from_secs(15)).unwrap_or(true);
+            if due {
+                self.auto_checked = Some(Instant::now());
+                let st: AutoStatus = a.status().await;
+                if !st.up {
+                    self.auto_seen = None;
+                }
+                if st.up {
+                    // "Never used here" is not the same as "used a moment ago": a
+                    // container the tool host started before this app existed, or before
+                    // this app saw a search, still has to be reaped. So the adopted
+                    // container's own sighting is the fallback clock.
+                    if self.auto_seen.is_none() {
+                        self.auto_seen = Some(Instant::now());
+                    }
+                    let used = self.web_last.lock().unwrap().map(|t| t.elapsed());
+                    let idle_for = match used {
+                        Some(t) => t,
+                        None => self.auto_seen.map(|t| t.elapsed()).unwrap_or_default(),
+                    };
+                    if idle_for >= Duration::from_secs(self.auto_idle) {
+                        a.stop().await;
+                        self.note(format!(
+                            "the search container was stopped: {} seconds without a search; it starts again with the next one",
+                            idle_for.as_secs()
+                        ));
+                    }
+                }
+            }
+        }
         // Close cards that timed out. pi denies/forgets the dialog on its own;
         // what the bridge owes the UI is that a card cannot sit there offering a
         // choice nothing will ever take.
