@@ -124,6 +124,11 @@ async fn run() -> anyhow::Result<()> {
         // coding tool as `-read,-bash,-edit,-write` and add ours with `+`; that
         // switch is what Phase 2 turns on, and the probe reports what is on.
         tools: many("--tools"),
+        // The probe drives the coworker shape: tool set chosen by --tools above, pi's
+        // own prompt left alone. Chat mode is a different process and the gateway and
+        // the desktop window are where that switch is user-visible.
+        no_tools: false,
+        system_prompt: None,
         extra_env: Vec::new(),
         pinned_version: pinned.clone(),
     };
@@ -139,6 +144,8 @@ async fn run() -> anyhow::Result<()> {
         context_budget: 8_000,
         model_window: None,
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
+        persona: cwoffee_engine::host::Persona::Cowork,
+        cfg_path: None,
     })
     .await?;
     println!("pi {} at {}", host.pi_version, pi_bin.display());

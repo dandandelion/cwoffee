@@ -141,23 +141,78 @@ pub fn write_dev_provider(
     // window reported" where a percentage should be. A number nobody probed is worse
     // than nothing: it would draw a full-looking meter out of a guess.
     let mut entry = serde_json::json!({ "id": model });
+    // cwoffee accepts image attachments and hands them to pi on the prompt. If the entry
+    // says nothing about modalities, pi classifies the model as text-only and drops the
+    // picture before the request — quietly, with no error anywhere. Declaring text+image
+    // matches what the app already promises the user; an endpoint that cannot see images
+    // then says so in the response, which is a failure the user can actually read.
+    entry["input"] = serde_json::json!(["text", "image"]);
     if let Some(w) = window {
         entry["contextWindow"] = serde_json::json!(w);
     }
-    let models = serde_json::json!({
-        "providers": { provider: {
-            "baseUrl": base_url, "api": api, "apiKey": api_key,
-            "models": [entry]
-        }}
-    });
     let path = agent_dir.join("models.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&models)?)?;
+    // Merge, and overwrite only the section this app owns. Skipping the whole file when it
+    // already exists — which this used to do — left whatever entry was there first: no
+    // `input`, and pi then dropped image attachments before the request, quietly. And
+    // clobbering a `models.json` that belongs to somebody else's pi setup (same provider
+    // name, different baseUrl) would edit a config we do not own.
+    let mut doc: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    };
+    let ours = doc
+        .get("providers")
+        .and_then(|p| p.get(provider))
+        .map(|p| p.get("baseUrl").and_then(|b| b.as_str()) == Some(base_url))
+        .unwrap_or(true);
+    if !ours {
+        eprintln!(
+            "[cwoffee/pi] {} already defines provider {provider} for another baseUrl ({}). Not overwriting a config we do not own — cwoffee's context window and modality claims will not apply, so a picture may be dropped by pi before the request.",
+            path.display(),
+            doc["providers"][provider]["baseUrl"]
+                .as_str()
+                .unwrap_or("(none)")
+        );
+        return Ok(path);
+    }
+    if doc.get("providers").is_none() {
+        doc["providers"] = serde_json::json!({});
+    }
+    doc["providers"][provider] = serde_json::json!({
+        "baseUrl": base_url, "api": api, "apiKey": api_key,
+        "models": [entry]
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
     Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_provider_entry_we_write_carries_the_window_and_both_modalities() {
+        let root = std::env::temp_dir().join(format!("cw-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let p = write_dev_provider(&root, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(262144)).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let entry = &doc["providers"]["cwoffee"]["models"][0];
+        assert_eq!(entry["contextWindow"].as_u64(), Some(262144), "the probed window goes in");
+        assert_eq!(entry["input"].as_array().map(|a| a.len()), Some(2), "text and image, or pi drops pictures");
+        // Same baseUrl: refreshed in place, so a window learned later actually lands.
+        write_dev_provider(&root, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(131072)).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(doc["providers"]["cwoffee"]["models"][0]["contextWindow"].as_u64(), Some(131072));
+        // Someone else's provider of the same name is left alone.
+        let other = root.join("other");
+        write_dev_provider(&other, "cwoffee", "http://elsewhere/v1", "x", "k", "openai-completions", None).unwrap();
+        std::fs::create_dir_all(&other).ok();
+        std::fs::write(other.join("models.json"), std::fs::read_to_string(&p).unwrap()).unwrap();
+        write_dev_provider(&other, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(9)).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&other.join("models.json")).unwrap()).unwrap();
+        assert_eq!(doc["providers"]["cwoffee"]["baseUrl"].as_str(), Some("http://127.0.0.1:8090/v1"), "ours was replaced, not theirs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_mounted_extension_lands_inside_the_agent_dir_and_keeps_its_name() {

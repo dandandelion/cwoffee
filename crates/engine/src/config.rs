@@ -49,6 +49,12 @@ pub struct Config {
     #[serde(default)]
     pub reasoning: Option<String>,
 
+    /// `cowork` or `chat`. Declared here because the window writes what a user picks:
+    /// this parser rejects unknown keys on purpose, so a key the writer produces and
+    /// the reader does not declare is a config file that stops booting.
+    #[serde(default)]
+    pub persona: Option<String>,
+
     #[serde(default)]
     pub context: ContextCfg,
 
@@ -285,6 +291,7 @@ fn table_hint(err: &toml::de::Error) -> String {
     let top_level = [
         "workspace",
         "mode",
+        "persona",
         "approval_timeout_secs",
         "theme",
         "provider",

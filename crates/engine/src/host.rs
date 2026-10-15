@@ -36,6 +36,10 @@ pub struct HostConfig {
     pub model: String,
     pub workspace: PathBuf,
     pub mode: ApprovalMode,
+    /// Cowork or chat, as the shells report it. The UI reads this rather than
+    /// remembering what it last asked for, so a second client cannot be shown a
+    /// switch that the host did not make.
+    pub persona: Persona,
     pub reasoning: Reasoning,
     /// Cap on provider round-trips in one turn; 0 = no cap. See AgentConfig: the
     /// old hardcoded 14 acted as a work budget and cut real tasks short.
@@ -97,6 +101,7 @@ impl HostConfig {
             model: model.into(),
             workspace: workspace.into(),
             mode: ApprovalMode::Ask,
+            persona: Persona::Cowork,
             reasoning: Reasoning::XHigh,
             // Uncapped by default; set max_tool_iters in config.toml for a hard stop.
             max_tool_iters: 0,
@@ -129,6 +134,33 @@ impl HostConfig {
 /// two cores showing different context meters on one screen is the same drift the
 /// mode and reasoning persistence closed, one dial further along.
 pub const FALLBACK_BUDGET: usize = 32_000;
+
+/// One tool, as a settings screen shows it.
+///
+/// Built from the registry the tools actually run from. A list copied into the UI is a
+/// list that goes stale the first time a description changes - and the description is
+/// also what the model is handed, so a UI-side copy drifts from the prompt without
+/// anyone deciding anything.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolView {
+    pub name: String,
+    pub description: String,
+}
+
+/// The tool list, read under the same config the tools run under. Names and
+/// descriptions only: nothing here is a permission, and the settings screen says so
+/// rather than implying a switch that does nothing.
+pub fn tool_views() -> Vec<ToolView> {
+    let cfg = crate::config::Config::load(None)
+        .ok()
+        .map(|(c, _)| c)
+        .unwrap_or_default();
+    let reg = crate::tools::Registry::with_v1_tools_exec(cfg.search_backend(), cfg.exec_cfg());
+    reg.defs()
+        .into_iter()
+        .map(|d| ToolView { name: d.name, description: d.description })
+        .collect()
+}
 
 /// The ceiling the engine gives itself for a window: a share of what the endpoint
 /// states, never more, so a prompt cannot overflow the model and have the server
@@ -314,7 +346,48 @@ fn refuse_workspace(
 
 /// Commands the UI sends. Everything the agent does on its own goes out over
 /// `events`, so the UI never has to poll for state.
+/// Whether this session has a workspace and a tool set at all.
+///
+/// Deliberately not an `ApprovalMode`: ask/auto decides whether a tool may run, which
+/// presumes there are tools. In Chat there is nothing to ask about - no tools are
+/// mounted, no folder is claimed, and the system prompt is one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Persona {
+    /// The coworker: eleven Rust tools, a workspace, the full prompt.
+    #[default]
+    Cowork,
+    /// Nothing but the model. One line of system prompt, no tools, no folder.
+    Chat,
+}
+
+impl Persona {
+    /// The whole prompt Chat mode gets. Short on purpose: everything longer is a
+    /// claim about what the assistant can do, and in this mode it can do nothing
+    /// but answer.
+    pub const CHAT_PROMPT: &'static str = "You are cwoffee, a helpful assistant";
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "cowork" | "coworker" => Some(Self::Cowork),
+            "chat" => Some(Self::Chat),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cowork => "cowork",
+            Self::Chat => "chat",
+        }
+    }
+}
+
 pub enum HostCmd {
+    /// Switch between the coworker and a bare chat. Relaunching the core is part of
+    /// this on the pi side: the tool set and the system prompt are decided when the
+    /// process starts, so switching is process lifecycle, not a request parameter.
+    SetPersona { persona: Persona },
     /// `attachments` are validated at this boundary, before anything reaches the
     /// provider: an unbounded or arbitrary-mime payload from a UI would be a
     /// memory and SSRF-adjacent problem downstream.
@@ -363,6 +436,10 @@ pub struct HostState {
     pub workspace: String,
     pub model: String,
     pub mode: ApprovalMode,
+    /// Cowork or chat, as the host has it. The shells read this instead of
+    /// remembering what they last asked for, so a second client is never shown a
+    /// switch the host did not make.
+    pub persona: Persona,
     pub reasoning: Reasoning,
     pub busy: bool,
     /// Turns completed so far. A UI uses this to know a turn finished without
@@ -449,6 +526,7 @@ impl SessionHost {
             workspace: cfg.workspace.display().to_string(),
             model: cfg.model.clone(),
             mode: cfg.mode,
+            persona: cfg.persona,
             reasoning: cfg.reasoning,
             busy: false,
             turns: 0,
@@ -691,6 +769,20 @@ impl SessionHost {
                 match cmd {
                     HostCmd::Shutdown => break,
 
+                    HostCmd::SetPersona { persona } => {
+                        // Half-applied would be worse than refused: this core's prompt,
+                        // registry and workspace are one package, and a "chat" that
+                        // still has eleven tools and a folder is a different product
+                        // wearing the same label.
+                        let sess = state_bg.lock().unwrap().session_id;
+                        let _ = ev_tx.send(EngineEvent::Note {
+                            message: format!(
+                                "chat mode is not available on the rust core - it runs the coworker prompt and the tool set. {} stays as it is.",
+                                persona.as_str()
+                            ),
+                            session: Some(sess),
+                        });
+                    }
                     HostCmd::Cancel => {
                         agent_cancel.store(true, Ordering::Relaxed);
                     }
@@ -1264,6 +1356,22 @@ pub trait HostOps: Send + Sync {
 
     /// Move the tools to another workspace, refusing anything the checks reject.
     async fn set_workspace_checked(&self, path: &str) -> Result<String, String>;
+
+    /// Cowork or chat. The default refuses in words, because the shells all render a
+    /// refusal, and "unavailable" without a reason reads like a broken button.
+    /// The tool list, for the settings screen. Both cores answer from the same Rust
+    /// registry: on the pi core the tools are mounted from it, so the list a user reads
+    /// and the tools the model is offered cannot be two different things.
+    fn tools_view(&self) -> Vec<ToolView> {
+        tool_views()
+    }
+
+    fn set_persona(&self, persona: Persona) -> Result<String, String> {
+        Err(format!(
+            "this core keeps the coworker prompt and the tool set; chat mode is wired on the pi core only ({})",
+            persona.as_str()
+        ))
+    }
 
     /// Models for the model menu. The error must survive: the gateway renders an
     /// empty list plus an inline reason rather than blanking the app, and "no models"

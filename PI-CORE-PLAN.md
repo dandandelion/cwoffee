@@ -16,11 +16,12 @@
 
 ## STATUS (update every session)
 
-- **Phase:** 1 — **S1.2 is DONE on both paths.** `cwoffee-gateway --core pi` passes
-  `gateway-smoke.mjs` + `gateway-approval.mjs`, and the **desktop app opens with pi as its
-  core** (`CWOFFEE_CORE=pi`), in-process, answering approval cards from the normal UI, with
-  **zero `ui/` edits**. `master` still defaults to the Rust core; nothing is cut over yet.
-- **Last updated:** 2026-10-15T03:00Z (assistant, session 5)
+- **Phase:** 1 done on both paths, and the product surface is now **on** the pi core: eleven
+  Rust tools mounted from the registry, approval cards, workspace-following, mid-turn switching,
+  search panel, attachments, metrics with a probed window, **Chat mode**, and a settings screen
+  with categories. `cwoffee-gateway --core pi` and `CWOFFEE_CORE=pi` on the desktop; `master`
+  still defaults to the Rust core, which stays the fallback and the A/B half.
+- **Last updated:** 2026-10-16T04:30Z (assistant, session 7)
 - **Verdict:** feasible, and cheaper than it looks — because the UI and the tools both
   survive untouched. Measured, not assumed. Three real costs: **+~90 MB PSS**, **two
   languages in the runtime**, and **pi gives you no sandbox** (that stays ours to own).
@@ -541,6 +542,80 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
 39. **A probe that fires nothing can report a clean pass.** A same-origin parent page driving the app in an iframe with synthetic `MouseEvent`/`PointerEvent` dispatch got no response from the iframe - not even a plain click on a folder chevron that works for a real user - while printing rows and zeros as if it had tested something. Deleted. Verification goes through the app's own page harness instead: `VITE_SELFTEST=1` build *plus* runtime arming via the `selftest_armed` verb (`CWOFFEE_SELFTEST=1` in the host), because a build-time flag alone once ran the checks against the user's real endpoint, config and store. Note `selftest_armed` is a Tauri command only: the page harness cannot be armed through the gateway.
 40. **A settings screen must hold the same controls, not copies of them.** The sections render the popups' own body snippet, so a setting cannot mean one thing in the menu and another in the screen; the screen is addressable (`#search`) because a place you cannot link to is a place a phone cannot go to directly.
 
+41. **Chat mode changes the process, not the label.** Tools and the system prompt are chosen
+    when pi is exec'd — there is no RPC to take them away afterwards. So switching is process
+    lifecycle: reap the child, start the next one with `--no-tools`, no extension mounted, and
+    `--system-prompt "You are cwoffee, a helpful assistant"`, and refuse to follow a
+    conversation into a folder while in chat. A switch asked for during a turn is deferred by the
+    same queue as conversation retargeting (gotcha 29). The Rust core refuses in words: that core
+    *is* the coworker prompt plus the registry, and a "chat" that still has eleven tools is a
+    different product wearing the same label.
+42. **An extension that fails to load is silent in RPC mode.** `pi-tools/cwoffee-tools.ts`
+    prints `[cwoffee-tools] no tools: CWOFFEE_CWTOOL is not set` on stderr — and in RPC mode that
+    print never reaches us; pi keeps its child output to itself. The session then answers
+    "Tool read_file not found" with nothing in the log explaining it. The bridge now says it at
+    launch, in the log that *does* reach the operator. Rule: complain where the log goes, not
+    where the failure is.
+43. **A line about the child must be printed by whoever owns the child.** The gateway's boot line
+    claimed `1 extension(s); tools -read,-bash,-edit,-write` from its own config, and once the
+    mode could change per process that became a false claim about a guardrail. The bridge logs
+    every launch with the flags that process actually received; the shells state only what they
+    know (pinned version, persona, extensions staged).
+44. **Two nulls are not a comparison.** The first chat gate "passed" its chat half because the
+    trigger phrase did not match any scripted scenario, so *neither* mode ran a tool: cards=0,
+    toolsRan=0 on both sides. The gate now asserts the baseline (cowork must open a card for the
+    same prompt) before it is allowed to be impressed by the absence.
+45. **`HostState` has a hand-written mirror in `ui/src/lib/events.ts`.** Adding a field to the
+    Rust struct (`persona`) does not add it to the UI's type; svelte-check catches it only if the
+    UI reads it. Until something ties the mirror to the struct, every new state field needs both
+    edits — and a selftest that reads it is the cheapest tie.
+46. **A percentage needs a denominator somebody stated.** The dev provider entry we write for pi
+    was `{"id": model}` — no `contextWindow` — so pi had no window, the panel had no limit, and
+    the bridge carried a pinned 32k while the Rust core derived 80% of the window. Now the shells
+    probe the endpoint (as the Rust core already did), write `contextWindow` into pi's model
+    entry, and take the ceiling from `mount::context_budget` → the engine's `auto_budget`.
+    Measured on the pi core against the mock: window 262144, budget 209715.
+47. **Attachment validation belongs to the engine's function, and the proof belongs at the
+    endpoint.** The bridge now runs `check_attachments` (same mime list, count, byte cap, base64
+    shape as the Rust core) and forwards pi's `ImageContent`. The assertion is the scripted
+    endpoint reporting the blocks it received (`Attachment seen: 1 image(s): image/png`) — a
+    check against the store alone passes for a core that saves the file and never sends it.
+48. **Report what was echoed, and say when the echo is short.** pi knows nothing about the
+    client's filename, so the stored row keeps the *client's* name and byte count; if pi echoes
+    fewer image blocks than the bridge sent, the bridge emits a note rather than filing the
+    difference. An attachment that never reached the model is the one failure a user cannot see.
+49. **`pkill -f` matched its own command line twice and killed the harness.** The pattern
+    (`… 8153`) also appeared in the *shell* that was running the kill, because the same command
+    line started the gateway. Self-inflicted exit 143, twice, each costing a rerun. Use
+    `pkill -x <process-name>`, or put the kill in a command that does not also start the thing.
+
+50. **pi omits image blocks when the model entry says nothing about modalities.** The dev
+    provider entry we write carried `{"id": model, "contextWindow": …}`; pi classified the model
+    as text-only and dropped the picture **before the request**, with no error and no event. The
+    entry now declares `"input": ["text", "image"]` (`mount::write_dev_provider`). Proof of the
+    whole path is `scripts/gateway-attach.mjs`: the scripted endpoint reports
+    `Attachment seen: 1 image(s): image/png`, and the stored row keeps the client's `probe.png`.
+51. **The gateway used to drop `attachments` on the floor, in silence.** `start_turn` carried a
+    commented decision not to accept them, and the client was never told — a phone that attached
+    a picture watched the answer a turn as if it had been shown one. A decision that is not
+    communicated to the person who made the gesture is not a decision, it is a disappearance.
+    `start_turn` now parses them and applies the engine's own `check_attachments` +
+    `AttachmentLimits::defaults()` at the boundary (mime list, count, 2 MiB each), so both cores
+    refuse the same way: `attachment refused: attachment 1: mime "application/x-msdownload" is
+    not allowed (…)`.
+52. **A helper that is never called is the same bug as a fake guardrail.** `mock-llm.mjs` had
+    `renderStep(step, messages)` — written, correct, and wired into nothing, so `{images}` came
+    back literally and the check "passed" while proving nothing. Grep for the call site, not the
+    definition.
+53. **A harness block must not print success after failing.** `fail()` in the page harness records
+    and *continues*, so a block that fails halfway and reaches its own `pageLog("… ok")` produces
+    a log line that is false. The mode block now guards its tail on an `ok` flag; earlier it
+    logged "mode toggle ok" on the same run that had just failed twice.
+54. **Two assertions the metrics change forced, learned the slow way:** the context row now leads
+    with the *share* of the window the endpoint states, with the exact counts in the tooltip — so
+    the selftest asserts both halves (`%` on screen, `context_tokens` in the `title`) rather than
+    the count it used to read off the row.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -690,6 +765,71 @@ behaviour, and exactly why the gate prints the mode it ran in.
 ---
 
 ## PROGRESS JOURNAL (newest on top)
+### 2026-10-16T04:30Z — session 7 — chat mode, pictures, a meter with a ceiling, and a settings page with categories ✅
+
+- **Chat mode is real on the pi core.** `--persona chat` / config `persona = "chat"` / the Cowork–Chat
+  tab in the composer all reach one verb, `set_persona`, and the bridge treats it as process
+  lifecycle: no extension mounted, `--no-tools`, `--system-prompt` set to the one line
+  `"You are cwoffee, a helpful assistant"`, and no folder followed. `session_state.persona` is what
+  the tab reads back, so a second window sees the same truth and a refused switch cannot leave the
+  tab claiming a mode the host never took.
+- **Proof is an A/B on one prompt.** `scripts/gateway-chat.mjs`: the scripted endpoint answers
+  `Use read_file to read the file /etc/hostname` with a tool call on both halves. Chat: 0 cards,
+  0 tools. Switch to cowork (note says the process restarts and the prefix cache starts cold):
+  1 card for the same prompt. `CHAT GATE OK`. The Rust core refuses at boot
+  (`--persona chat --core rust` exits 1 with the reason) and at runtime (`set_persona` → refusal,
+  state stays `cowork`).
+- **Attachments reach the model on the pi core.** The bridge runs the engine's own
+  `check_attachments` (`AttachmentLimits::defaults()` shared by both cores) and sends pi's
+  `images` blocks; the translator keeps the client's filename and size in the stored row and notes
+  when pi echoes fewer blocks than were sent. Proven endpoint-side: the mock now reports the image
+  parts it received, and the harness asserts `Attachment seen: 1 image(s): image/png` plus the
+  stored name.
+- **Metrics finally have a ceiling, and the number leads with the ratio.** Context is shown as a
+  percentage of the window the endpoint states (exact counts moved to the tooltip), pi's model
+  entry carries `contextWindow`, and the ceiling comes from the engine's own `auto_budget`
+  through `mount::context_budget`. Measured on the pi core: window 262144, budget 209715, tokens
+  517 after a seeded turn — the same formula the Rust core uses.
+- **Settings**: the entry point moved to the bottom of the sidebar (`aside-foot`, outside the
+  scrolling conversation list — a control that scrolls away with the conversations is not findable
+  when the list is what you are lost in), the rail is grouped (Answering / Working / Reaching out /
+  This app), and there is a **Tools** section listing what `tools_view` returns — the engine's
+  registry, so the list a user reads and the tools the model is offered are one thing. It says in
+  plain words that nothing there is switchable yet, because per-tool permission is not wired.
+- **Harness**: three new page cases — attachment round trip, the mode toggle through the actual
+  tab (with an honest skip-and-check-the-refusal branch for the Rust core), and the Tools section
+  asserting `read_file`/`sheet_query` arrive from the registry. svelte-check 0 errors/0 warnings.
+- **Found and fixed on the way:** the gateway's boot line was lying about extensions and tools
+  once the mode could change per process (gotcha 43); a missing `CWOFFEE_CWTOOL` made the
+  extension register nothing and the model answered "Tool read_file not found" with no log line
+  explaining it (gotcha 42).
+- **Attachments: fixed twice over.** The harness said `Attachment seen: 0 image(s): none`, and the
+  two causes were in series, which is why each looked like the other: the **gateway** dropped
+  `attachments` from `start_turn` (a documented decision that never told the client — gotcha 51),
+  and **pi** silently omitted image blocks because the model entry declared no modalities
+  (gotcha 50). With both fixed, `scripts/gateway-attach.mjs` shows the endpoint receiving
+  `1 image(s): image/png` and the stored row keeping `probe.png`; a non-image is refused in the
+  engine's own words at the boundary, on either core.
+- **What the pi-core harness actually says today (honest count, not a green checkmark).**
+  `scripts/selftest.sh` on the pi core: **15 failures**, and they are a parity backlog, not noise:
+  output files never attached to stored rows (`TurnFiles` not emitted by the bridge); the flood
+  turn's 6 files missing (same cause); the `sheet_read` card showing no cells and the query grid
+  empty (tool metadata not carried); "which row named the columns" note missing; the uncapped-turn
+  note missing (that guard lives in the Rust engine, not in pi); `useSession(17): the host is on
+  18` (addressing race); the resumed-history note never reaching the screen; `ask_user`'s scripted
+  card never appearing (`ToolCtx.ask = None` in `cwtool`); a braceless tool call running without
+  the engine saying so (`ToolCallParseError` not translated); an endpoint that dropped mid-stream
+  surfacing nothing. Also fixed since that run: the attachment case above. This list is the next
+  piece of work, and it is exactly what the dual-core A/B was always meant to produce.
+
+- **Owed after this batch:** `/compact` and MCP are still not surfaced in the UI; `ask_user` still
+  has `ToolCtx.ask = None`, so the tool says nobody can answer instead of raising a card; `exec`
+  output is not streamed as `ToolExecOutput`; `CWOFFEE_MODE` is frozen for an already-spawned pi
+  child; the settings sections for sandbox / `base_url` / core / idle-reap are still read-only for
+  want of a write verb; the UI's `HostState` mirror is hand-written (gotcha 45); and the tree was
+  **414 MB PSS** at the end of last session — over the 400 MB ceiling — and has not been re-measured
+  since this batch landed.
+
 
 ### 2026-10-15T03:00Z — session 5 — the app opens, and pi is the thing behind it ✅
 

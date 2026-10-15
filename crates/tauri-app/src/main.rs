@@ -269,6 +269,30 @@ fn main() {
         eprintln!("[cwoffee] CWOFFEE_CORE={core:?} is neither \"rust\" nor \"pi\"; refusing to guess which core you meant");
         std::process::exit(1);
     }
+    // Cowork or chat, resolved before the core starts: in chat the model process gets
+    // no tools and a one-line prompt, which is not something you can change afterwards.
+    // `appcfg.persona` is what the window writes when the user clicks the tab, so the
+    // app comes back in the mode the user left it in.
+    let persona_raw = std::env::var("CWOFFEE_PERSONA")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| appcfg.persona.clone())
+        .unwrap_or_else(|| "cowork".into());
+    let persona = match cwoffee_engine::host::Persona::parse(&persona_raw) {
+        Some(p) => p,
+        None => {
+            eprintln!("[cwoffee] persona: {persona_raw:?} is neither \"cowork\" nor \"chat\"; refusing to guess which mode you meant");
+            std::process::exit(1);
+        }
+    };
+    if persona == cwoffee_engine::host::Persona::Chat && core != "pi" {
+        eprintln!(
+            "[cwoffee] persona: chat is not available on the rust core — that core is the coworker prompt, \
+             the tool registry and a workspace. Set CWOFFEE_CORE=pi for a tool-less chat, or persona = cowork."
+        );
+        std::process::exit(1);
+    }
+
     // Read the level the file asked for before `cfg` moves into the host: the boot
     // line states the dials the app actually started with, which is the only way a
     // drift between `config.toml` and the running app is visible in a log.
@@ -283,7 +307,7 @@ fn main() {
         String,
     ) = tauri::async_runtime::block_on(async {
         if core == "pi" {
-            match pi_host(&appcfg, &cfg, &store, &workspace, &configured_model).await {
+            match pi_host(&appcfg, &cfg, &store, &workspace, &configured_model, persona).await {
                 Err(e) => {
                     eprintln!("[cwoffee] pi core did not start: {e}");
                     std::process::exit(1);
@@ -321,8 +345,8 @@ fn main() {
         }
     });
     eprintln!(
-        "[cwoffee] engine up: core={core} url={url} model={model_label} workspace={} mode={:?} reasoning={:?}",
-        workspace.display(), mode, reasoning_at_boot
+        "[cwoffee] engine up: core={core} persona={} url={url} model={model_label} workspace={} mode={:?} reasoning={:?}",
+        persona.as_str(), workspace.display(), mode, reasoning_at_boot
     );
     // The exec deadline used to be invisible: a [sandbox] block that parsed,
     // validated, and then went nowhere looked identical to one that worked.
@@ -541,7 +565,7 @@ fn main() {
                 tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                 if !painted.load(std::sync::atomic::Ordering::SeqCst) {
                     eprintln!(
-                        "[cwoffee] SUSPECT: no render report after 8s - the window is probably blank.                          frontend_dist={:?}; a debug build loads devUrl and needs vite running.",
+                        "[cwoffee] SUSPECT: no render report after 8s - the window is probably blank. frontend_dist={:?}; a debug build loads devUrl and needs vite running.",
                         cfg_build.frontend_dist
                     );
                 }
@@ -595,6 +619,8 @@ fn main() {
             commands::respond_question,
             commands::set_mode,
             commands::set_reasoning,
+            commands::set_persona,
+            commands::tools_view,
             commands::list_models,
             commands::migration_notes,
             commands::gateway_status,
@@ -645,10 +671,11 @@ async fn pi_host(
     store: &Arc<Store>,
     workspace: &std::path::Path,
     model: &str,
+    persona: cwoffee_engine::host::Persona,
 ) -> Result<cwoffee_bridge::PiHost, String> {
     if model.trim().is_empty() {
         return Err(
-            "a pi core needs a model id: pi selects by provider+model and does not adopt              an endpoint's first model"
+            "a pi core needs a model id: pi selects by provider+model and does not adopt an endpoint's first model"
                 .into(),
         );
     }
@@ -686,8 +713,16 @@ async fn pi_host(
         "[cwoffee/pi] context window for {model}: {}",
         window.map(|w| w.to_string()).unwrap_or_else(|| "the endpoint did not say".into())
     );
-    if models.exists() || std::env::var("CWOFFEE_PI_KEEP_MODELS").is_ok() {
-        println!("[cwoffee/pi] leaving the provider config in {} alone", agent_dir.display());
+    // Skipping the whole file because it exists used to be the rule, and it cost an
+    // attachment: the first entry written had no `input`, and pi drops image blocks for a
+    // model it thinks is text-only, without saying so. Now the entry this app owns is
+    // refreshed every boot (merge, not clobber — see `mount::write_dev_provider`), and only
+    // an explicit CWOFFEE_PI_KEEP_MODELS keeps cwoffee out of the file.
+    if std::env::var("CWOFFEE_PI_KEEP_MODELS").is_ok() {
+        println!(
+            "[cwoffee/pi] CWOFFEE_PI_KEEP_MODELS is set: leaving {} alone. pi's entry, not cwoffee's, decides the window and which modalities a picture may travel through.",
+            agent_dir.display()
+        );
     } else {
         let key = appcfg.api_key().unwrap_or_else(|| "unused".into());
         let path = cwoffee_bridge::mount::write_dev_provider(
@@ -742,6 +777,10 @@ async fn pi_host(
             session_file: None,
             extensions: exts,
             tools: tools.clone(),
+            // Chat shaping is the bridge's, per process: a chat starts with no
+            // extension mounted and --no-tools.
+            no_tools: false,
+            system_prompt: None,
             extra_env,
             pinned_version: pinned,
         },
@@ -759,6 +798,10 @@ async fn pi_host(
         context_budget: cwoffee_bridge::mount::context_budget(cfg.context_budget, window.map(|w| w as usize)),
         model_window: window.map(|w| w as usize),
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
+        persona,
+        // The tab the user clicks writes `persona` back to the same config file the
+        // app booted from, so the mode is a property of the install, not of one window.
+        cfg_path: cfg.cfg_path.clone(),
     })
     .await
     .map_err(|e| format!("{e}"))?;

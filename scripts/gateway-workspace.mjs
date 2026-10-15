@@ -92,10 +92,17 @@ if (!/showing \d+/.test(transcript)) fail.push('no line-count report in the read
 if (!/"ok"\s*:\s*true/.test(transcript)) fail.push('no successful tool read in the transcript')
 // A refusal *of this file* is the bug under test. Refusals of other paths (the model
 // probing somewhere else) are information, not failure — the confinement is working.
-// A refusal *of this file* is the bug under test. Refusals of other paths (the model
-// probing somewhere else) are information, not failure — the confinement is working.
 const refusals = (transcript.match(/refused/gi) ?? []).length
-const refusedThis = (transcript.match(new RegExp('refused[\\s\\S]{0,160}' + file, 'gi')) ?? []).length
+// Name the path the refusal actually names. A window of N characters around the file
+// name matched prose in the model's own summary ("...refused to guess; CHECKPOINT.md
+// says...") and failed a run where every read of the file succeeded: the shape of the
+// engine's refusal is `refused: <path>: <reason>`, so read the path out of it and
+// compare the basename.
+let refusedThis = 0
+for (const m of transcript.matchAll(/refused[:\s]*([^"\n\\]{0,200})/gi)) {
+  const base = String(m[1] ?? '').trim().split('/').pop()
+  if (base === file) refusedThis++
+}
 if (refusedThis) fail.push(`the tool refused ${file} — that is the workspace-confinement bug`)
 console.log(`workspace gate: session ${sid} in ${workspace}; file=${file} cards=${seen.cards} toolEvents=${seen.tools} finish=${seen.turnEnd} refused=${refusals} refusedThis=${refusedThis} rows=${Array.isArray(rows) ? rows.length : '?'}`)
 for (const n of seen.notes) console.log(`  note: ${n}`)

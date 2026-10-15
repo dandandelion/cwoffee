@@ -67,6 +67,13 @@ pub struct PiHostConfig {
     pub model_window: Option<usize>,
     /// cwoffee row id <-> pi session file. See `sessions.rs`.
     pub session_map: PathBuf,
+    /// Cowork or chat at boot. In Chat the process itself is different: no extension
+    /// mounted, `--no-tools`, pi's prompt replaced by one line, and the conversation's
+    /// folder left where it is.
+    pub persona: cwoffee_engine::host::Persona,
+    /// The config file the shells started from, so a mode switch is written down and
+    /// survives a restart instead of being a fact about one window.
+    pub cfg_path: Option<std::path::PathBuf>,
 }
 
 /// The handle the gateway and the desktop window hold, deliberately shaped like
@@ -120,6 +127,7 @@ impl PiHost {
             workspace: cfg.launch.workdir.display().to_string(),
             model: cfg.launch.model.clone(),
             mode: cfg.mode.clone(),
+            persona: cfg.persona,
             reasoning: cfg.reasoning.clone(),
             busy: false,
             turns: 0,
@@ -134,7 +142,9 @@ impl PiHost {
         }));
         let map = SessionMap::open(cfg.session_map.clone());
         let web_last = Arc::new(Mutex::new(None::<Instant>));
+        let boot_workdir = cfg.launch.workdir.clone();
         let engine = Engine {
+            boot_workdir,
             cfg,
             state: Arc::clone(&state),
             ev: ev_tx,
@@ -231,6 +241,16 @@ impl HostOps for PiHost {
     /// they are not is silent — a move that did not happen says why, in the same
     /// two places the Rust core puts it (`state().workspace_refusal` and an
     /// `Error` event), and a move that happened reports the canonical path.
+    fn set_persona(&self, persona: cwoffee_engine::host::Persona) -> Result<String, String> {
+        // The switch is applied by the model task, which owns the process. What this
+        // returns is what will happen; `session_state().persona` is what did.
+        self.push(HostCmd::SetPersona { persona });
+        Ok(format!(
+            "{} requested — applied between turns, since the tool set is chosen when the model process starts",
+            persona.as_str()
+        ))
+    }
+
     async fn set_workspace_checked(&self, path: &str) -> Result<String, String> {
         if self.state().busy {
             return Err("a turn is running; stop it before moving the tools".into());
@@ -395,6 +415,9 @@ enum UiAnswer {
 
 struct Engine {
     cfg: PiHostConfig,
+    /// Where the app was started. Chat mode runs its process here instead of in a
+    /// conversation's folder; nothing in a chat reads or writes that folder.
+    boot_workdir: std::path::PathBuf,
     state: Arc<Mutex<HostState>>,
     ev: mpsc::UnboundedSender<EngineEvent>,
     ap: mpsc::UnboundedSender<ApprovalRx>,
@@ -565,6 +588,19 @@ impl Engine {
             c.reap(Duration::from_secs(2)).await;
         }
         let mut launch = self.cfg.launch.clone();
+        if self.state.lock().unwrap().persona == cwoffee_engine::host::Persona::Chat {
+            // A chat has no tools and no folder. The extension is not mounted at all,
+            // so its tool declarations never reach the prompt; `--no-tools` covers
+            // pi's own four; and the conversation's workspace is ignored, because
+            // claiming a folder while offering no file tools is a claim with nothing
+            // behind it. The boot workspace is used purely so pi has somewhere to put
+            // its scratch files.
+            launch.extensions.clear();
+            launch.no_tools = true;
+            launch.system_prompt =
+                Some(cwoffee_engine::host::Persona::CHAT_PROMPT.to_string());
+            launch.workdir = self.boot_workdir.clone();
+        }
         launch.session_file = self.map.get(self.row()).map(str::to_string).map(PathBuf::from);
         // Name the root for the tools instead of trusting an inherited cwd. A shim that
         // guesses its confinement from the shell that spawned it is a shim that will be
@@ -580,6 +616,35 @@ impl Engine {
         launch.extra_env.push(("CWOFFEE_MODE".to_string(), self.state.lock().unwrap().mode.as_str().to_string()));
         let (child, mut rx) = PiChild::spawn(&launch).await.map_err(|e| self.explain_now(&e))?;
         let pid = child.pid;
+        // Log the launch the child actually got, every time. The shells used to print
+        // their own guess at boot; once the tool set and prompt could change with the
+        // mode and per conversation, that guess became a line claiming a guardrail
+        // that was not in the process at all.
+        if !launch.extensions.is_empty() && std::env::var("CWOFFEE_CWTOOL").is_err() {
+            // The extension prints its own complaint when the tool host is missing, but
+            // in RPC mode that print does not reach us — pi keeps its child output to
+            // itself. So the bridge says it here, where the log actually goes, in terms
+            // of what the user will see: a model that answers "tool not found".
+            eprintln!(
+                "[cwoffee/pi] {} extension(s) mounted but CWOFFEE_CWTOOL is unset — the Rust tools will not \
+                 register and the model will be told \"tool not found\". Point CWOFFEE_CWTOOL at cwtool, \
+                 or run scripts/run-pi-app.sh.",
+                launch.extensions.len()
+            );
+        }
+        eprintln!(
+            "[cwoffee/pi] process up in {} — persona {}, {} extension(s), tools {}",
+            launch.workdir.display(),
+            self.state.lock().unwrap().persona.as_str(),
+            launch.extensions.len(),
+            if launch.no_tools {
+                "none (--no-tools)".to_string()
+            } else if launch.tools.is_empty() {
+                "pi's own defaults".to_string()
+            } else {
+                launch.tools.join(",")
+            }
+        );
         self.child = Some(child);
         // One hop per record into the bridge's own stream, so a respawn does not
         // change the `select!` arm the main loop reads.
@@ -643,13 +708,17 @@ impl Engine {
         // assistant row while session B received A's tool result and final answer; the
         // same script against the Rust core left A with all four rows and B empty.
         // `scripts/gateway-midturn-switch.mjs` gates the rule on both cores.
-        if matches!(cmd, HostCmd::SwitchSession { .. } | HostCmd::ClearSession | HostCmd::NewSession { .. })
+        if matches!(
+            cmd,
+            HostCmd::SwitchSession { .. } | HostCmd::ClearSession | HostCmd::NewSession { .. } | HostCmd::SetPersona { .. }
+        )
             && (self.tr.running() || self.state.lock().unwrap().busy)
         {
             self.deferred.push(cmd);
             return;
         }
         match cmd {
+            HostCmd::SetPersona { persona } => self.set_persona(persona).await,
             HostCmd::Send { text, attachments, session } => self.on_send(text, attachments, session).await,
             HostCmd::Cancel => {
                 if let Err(e) = self.request(json!({ "type": "abort" }), Duration::from_secs(10)).await {
@@ -794,10 +863,51 @@ impl Engine {
     /// the folder out from under an in-flight turn would send its writes into a tree the
     /// user never chose for that conversation. Returns false when the move — and so the
     /// turn that asked for it — was refused.
+    /// Cowork <-> chat. The running process is killed rather than reconfigured: what
+    /// tools exist and what the system prompt says are decided when pi is exec'd, and
+    /// there is no verb to change either afterwards.
+    async fn set_persona(&mut self, want: cwoffee_engine::host::Persona) {
+        use cwoffee_engine::host::Persona;
+        let had = self.state.lock().unwrap().persona;
+        if had == want {
+            return;
+        }
+        self.state.lock().unwrap().persona = want;
+        if let Some(p) = &self.cfg.cfg_path.clone() {
+            let written = format!("\"{}\"", want.as_str());
+            match cwoffee_engine::config::Config::set_top_keys(p, &[("persona", written.as_str())]) {
+                Ok(_) => {}
+                Err(e) => self.err(format!(
+                    "the mode is live but was NOT written to {}: {e}. this start keeps it; the next one will not",
+                    p.display()
+                )),
+            }
+        }
+        if let Some(c) = self.child.take() {
+            c.reap(std::time::Duration::from_secs(2)).await;
+        }
+        self.note(format!(
+            "{} mode: {} — the model process restarts on the next turn, which starts that prefix cache cold",
+            want.as_str(),
+            match want {
+                Persona::Chat => "no tools, no folder, one line of system prompt".to_string(),
+                Persona::Cowork => format!(
+                    "tools mounted again, folder {}",
+                    self.state.lock().unwrap().workspace
+                ),
+            }
+        ));
+    }
+
     async fn follow_workspace(&mut self, id: i64) -> bool {
         if id == self.row() {
             // The same conversation: a folder the user chose by hand wins over whatever
             // the row still says.
+            return true;
+        }
+        if self.state.lock().unwrap().persona == cwoffee_engine::host::Persona::Chat {
+            // Chat mode owns no folder. Following a conversation into one would put a
+            // path back into the process that has no file tools to use it.
             return true;
         }
         let want = match self.cfg.store.session(id) {
@@ -810,7 +920,7 @@ impl Engine {
         }
         if self.state.lock().unwrap().busy || self.tr.running() {
             self.err(format!(
-                "conversation {id} lives in {want}, but the tools are working in {have} and a turn is running                  there; nothing was moved and nothing was sent. Stopping that turn first is what makes the                  folder change safe — its writes would otherwise land in the wrong tree."
+                "conversation {id} lives in {want}, but the tools are working in {have} and a turn is running there; nothing was moved and nothing was sent. Stopping that turn first is what makes the folder change safe — its writes would otherwise land in the wrong tree."
             ));
             return false;
         }
@@ -827,7 +937,7 @@ impl Engine {
         // Said out loud because the alternative is the bug this closes: the model is told
         // one folder by pi's own prompt and the user is looking at another in the sidebar.
         self.note(format!(
-            "the tools moved to {want} — that is where conversation {id} lives; the model's own folder moved              with them"
+            "the tools moved to {want} — that is where conversation {id} lives; the model's own folder moved with them"
         ));
         true
     }

@@ -123,7 +123,7 @@
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
-  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'search'
+  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'search' | 'tools'
 
   /** Mirror of the desktop's GatewayStatus. Not reachable over the gateway
       itself: the payload carries the token inside ready-to-open URLs. */
@@ -172,16 +172,36 @@
      The sections below are the popups' own bodies - one copy of each control, rendered
      into either surface - so a setting cannot mean two different things depending on
      where you reached it from. */
-  const SET_TABS: { kind: MenuKind; label: string; hint: string }[] = [
-    { kind: 'model', label: 'Model', hint: 'what answers here' },
-    { kind: 'think', label: 'Thinking', hint: 'how hard it deliberates' },
-    { kind: 'mode', label: 'Approvals', hint: 'what may run without asking' },
-    { kind: 'ws', label: 'Folders', hint: 'where the tools may work' },
-    { kind: 'search', label: 'Search', hint: 'how web_search reaches out' },
-    { kind: 'gateway', label: 'Devices', hint: 'browsers and phones joining' },
-    { kind: 'metrics', label: 'This session', hint: 'context, cache, cost' },
-    { kind: 'keys', label: 'Shortcuts', hint: 'keys the app answers' },
+  const SET_TABS: { kind: MenuKind; label: string; hint: string; group: string }[] = [
+    { kind: 'model', label: 'Model', hint: 'what answers here', group: 'Answering' },
+    { kind: 'think', label: 'Thinking', hint: 'how hard it deliberates', group: 'Answering' },
+    { kind: 'tools', label: 'Tools', hint: 'what the coworker can do', group: 'Working' },
+    { kind: 'mode', label: 'Approvals', hint: 'what may run without asking', group: 'Working' },
+    { kind: 'ws', label: 'Folders', hint: 'where the tools may work', group: 'Working' },
+    { kind: 'search', label: 'Search', hint: 'how web_search reaches out', group: 'Reaching out' },
+    { kind: 'gateway', label: 'Devices', hint: 'browsers and phones joining', group: 'This app' },
+    { kind: 'metrics', label: 'This session', hint: 'context, cache, cost', group: 'This app' },
+    { kind: 'keys', label: 'Shortcuts', hint: 'keys the app answers', group: 'This app' },
   ]
+  // The tool list is read from the engine, never typed here: the description a tool
+  // carries is the same text the model is handed, so a UI-side copy is a second copy of
+  // prompt bytes that will drift.
+  let toolViews = $state<{ name: string; description: string }[]>([])
+  let toolsErr = $state('')
+  async function loadTools() {
+    try {
+      toolViews = await invoke<{ name: string; description: string }[]>('tools_view')
+      toolsErr = ''
+    } catch (e) {
+      toolsErr = String(e)
+    }
+  }
+  /** Tool descriptions run long — they are written for a model. The screen shows the
+      first sentence and the rest stays where it belongs, in the prompt. */
+  function toolBlurb(d: string) {
+    const first = d.split(/(?<=[.!?])\s/)[0] ?? d
+    return first.length > 180 ? `${first.slice(0, 177)}...` : first
+  }
   let settings = $state<{ tab: MenuKind } | null>(null)
   let settingsEl = $state<HTMLElement | null>(null)
 
@@ -219,6 +239,7 @@
   function loadSettingsFor(tab: MenuKind) {
     if (tab === 'model' && (modelErr || !models.length)) void loadModels()
     if (tab === 'search' && !webSearch) void loadWebSearch()
+    if (tab === 'tools' && !toolViews.length) void loadTools()
   }
   /// The bodies were written against a `Menu` because that is what carries the anchor
   /// geometry they never read. In the screen the geometry is meaningless, so it is
@@ -2652,6 +2673,29 @@
   }
 
   /**
+   * Cowork or chat. The host decides, and the tab follows `session_state` rather than
+   * what this window last clicked: the switch restarts the model process (tools and the
+   * system prompt are chosen when it starts), a second window sees the same truth, and
+   * a switch asked for during a turn waits for the turn.
+   */
+  const personaNow = $derived<'cowork' | 'chat'>(
+    hostState?.persona === 'chat' ? 'chat' : hostState?.persona === 'cowork' ? 'cowork' : modeTab,
+  )
+  async function setPersona(p: 'cowork' | 'chat') {
+    if (personaNow === p) return
+    modeTab = p // optimistic; refreshState below replaces it with the host's answer
+    try {
+      const r: any = await invoke('set_persona', { persona: p })
+      if (r?.note) pageLog(`persona: ${r.note}`)
+    } catch (e) {
+      // The rust core refuses this in words. Say so here rather than leaving the tab
+      // flipped over a change that never happened.
+      pageLog(`set_persona: ${e}`)
+    }
+    await refreshState()
+  }
+
+  /**
    * Dev-only end-to-end check of the session commands. Clicking is not always
    * available (CI, scripted runs), and "the button exists" is not evidence that
    * rename/delete/search round-trip through the store correctly.
@@ -3311,9 +3355,127 @@
             .flatMap((m: any) => m.attachments)
             .find((x: any) => x.name === 'echo.png')
           if (!kept) fail('the attachment name the client sent did not survive into the store')
-          else pageLog(`attachment reaches the model (${receipt})`)
+          else if (receipt?.includes('1 image(s): image/png'))
+            pageLog(`attachment reaches the model (${receipt})`)
         }
         await invoke('delete_session', { id: attSess }).catch(() => {})
+      }
+
+      // The settings screen must show the tool list the engine owns, not a list typed
+      // into the UI. Asserting a known id arrives proves the verb round-tripped; the
+      // group headers are asserted because a screen whose sections are unreadable is a
+      // screen people don't open.
+      {
+        openSettings('tools')
+        await new Promise((r) => setTimeout(r, 900))
+        const tabsN = document.querySelectorAll('.set-rail .set-tab').length
+        const groupsN = document.querySelectorAll('.set-rail .set-group').length
+        const rows = Array.from(document.querySelectorAll('.toolrow .toolname')).map((e) => e.textContent?.trim())
+        if (tabsN < SET_TABS.length) fail(`settings rail shows ${tabsN} of ${SET_TABS.length} sections`)
+        if (groupsN < 2) fail(`settings rail has ${groupsN} group label(s) — the sections are unlabelled`)
+        if (!rows.length) fail('the Tools section lists nothing (tools_view returned no rows)')
+        else if (!rows.includes('read_file') || !rows.includes('sheet_query'))
+          fail(`the Tools section is not the engine's list: ${JSON.stringify(rows)}`)
+        else pageLog(`settings tools section ok (${rows.length} tools from the registry, ${groupsN} groups)`)
+        closeSettings()
+      }
+
+      // Cowork <-> chat, driven through the tab the user actually clicks. The scripted
+      // endpoint answers the same prompt with a tool call on both halves: in chat nothing
+      // may run and no card may open; in cowork the card must come back. A toggle that
+      // only repaints a button passes a click test and fails this one.
+      //
+      // Two lessons this check enforces because it got them wrong first. It needs a
+      // baseline: an earlier block can leave the host in Auto, where no card opens in
+      // EITHER mode, and then the halves look identical and the check is worth nothing —
+      // so it puts the host in ask mode for its own duration. And it must judge only the
+      // rows the chat turn added: the cowork half writes its own tool rows into the same
+      // conversation, and reading the whole transcript blamed those instead.
+      {
+        const modeSess = await invoke<number>('new_session', { title: 'selftest mode' })
+        await useSession(modeSess)
+        const mode0 = (await invoke<HostState>('session_state')).mode
+        await invoke('set_mode', { mode: 'ask' }).catch(() => {})
+        const TRIG = 'Use read_file to read the file /etc/hostname'
+        const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('.modesel'))
+        const chatTab = tabs.find((b) => b.textContent?.trim() === 'Chat')
+        const workTab = tabs.find((b) => b.textContent?.trim() === 'Cowork')
+        if (!chatTab || !workTab) {
+          fail('the Cowork/Chat tabs are missing from the composer')
+        } else {
+          const personaOf = async () => (await invoke<HostState>('session_state')).persona
+          const cardUp = async (ms: number) => {
+            const until = Date.now() + ms
+            while (Date.now() < until) {
+              if (document.querySelector('.approval')) return true
+              await new Promise((r) => setTimeout(r, 60))
+            }
+            return false
+          }
+          const dismissCard = () =>
+            document.querySelector<HTMLButtonElement>('.approval .btn-bad')?.click()
+          const rowsNow = async () =>
+            (((await invoke<any>('session_messages', { id: modeSess })).messages ?? []) as any[])
+          let ok = true
+          if ((await personaOf()) !== 'cowork') {
+            fail(`a cowork host reports ${(await personaOf())}`)
+            ok = false
+          }
+          let before = await turnCount()
+          await invoke('start_turn', { text: TRIG, session: modeSess })
+          if (!(await cardUp(6000))) {
+            fail('cowork in ask mode raised no approval card for a tool call — the comparison has no baseline')
+            ok = false
+            await waitTurnDone(before).catch(() => {})
+          } else {
+            dismissCard()
+            if (!(await waitTurnDone(before))) {
+              fail('the cowork turn never finished after Deny')
+              ok = false
+            }
+          }
+          if (ok) {
+            chatTab.click()
+            await new Promise((r) => setTimeout(r, 500))
+            const after = await personaOf()
+            if (after !== 'chat' && after !== 'cowork') fail(`the host reports ${after} after a mode switch`)
+            else if (after === 'cowork')
+              // The rust core refuses this switch in words. What must hold either way is
+              // that the tab does not claim a mode the host refused to enter.
+              pageLog('selftest note: this core refused chat mode and the tab stayed honest (cowork)')
+            else {
+              before = await turnCount()
+              const rowMark = (await rowsNow()).length
+              await invoke('start_turn', { text: TRIG, session: modeSess })
+              if (await cardUp(3000)) {
+                dismissCard()
+                fail('chat mode opened an approval card — a chat with tools is still the coworker')
+              } else if (!(await waitTurnDone(before))) fail('the chat turn never finished')
+              else {
+                const added = (await rowsNow()).slice(rowMark)
+                // pi answers a call for a tool it does not have with its own "not found"
+                // result; anything else means a cwoffee tool ran inside a chat.
+                const ranTool = added
+                  .filter((m: any) => m.role === 'tool')
+                  .filter((m: any) => !/not found/i.test(String(m.content ?? '')))
+                if (ranTool.length)
+                  fail(
+                    `a tool ran inside chat mode: ${JSON.stringify(ranTool.map((m: any) => String(m.content).slice(0, 40)))}`,
+                  )
+                else {
+                  workTab.click()
+                  await new Promise((r) => setTimeout(r, 500))
+                  if ((await personaOf()) !== 'cowork')
+                    fail(`clicking Cowork left the host at ${await personaOf()}`)
+                  else
+                    pageLog('mode toggle ok (chat runs no tools and opens no card, cowork opens the card again)')
+                }
+              }
+            }
+          }
+          await invoke('set_mode', { mode: mode0 }).catch(() => {})
+          await invoke('delete_session', { id: modeSess }).catch(() => {})
+        }
       }
 
       // A here-document write used to make the approval card taller than the
@@ -5490,9 +5652,22 @@
               : NaN
             window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
             if (!r0) fail('the telemetry panel shows no context row')
-            else if (!txt.includes(h.context_tokens.toLocaleString()))
+            // The number that leads is the share of the window the endpoint states; the
+            // exact counts live in the tooltip. Both halves are asserted, because a
+            // percentage with no counts behind it is a bar chart, and counts with no
+            // percentage is what this row used to be.
+            else if (!txt.includes('%'))
               fail(
-                `the context row does not quote the engine's own token count (${h.context_tokens}): "${txt}"`,
+                `the context row leads with something other than the share of the window: "${txt}"`,
+              )
+            else if (
+              !(r0.querySelector('.mval')?.getAttribute('title') ?? '').includes(
+                h.context_tokens.toLocaleString(),
+              )
+            )
+              fail(
+                `the exact token count (${h.context_tokens}) is not where the row says it lives, in the tooltip: ` +
+                  `"${r0.querySelector('.mval')?.getAttribute('title') ?? ''}"`,
               )
             else if (h.context_budget && !txt.includes('trims at'))
               fail(
@@ -7878,18 +8053,20 @@
            do is worse than one that is missing. New session keeps a key on the
            shortcut, a `+` here, and the `+` on each workspace row. -->
       <div class="flex items-center gap-1.5">
-        <div class="modegrid flex-1" class:chat={modeTab === 'chat'}>
+        <div class="modegrid flex-1" class:chat={personaNow === 'chat'}>
           <button
             class="modesel"
             role="tab"
-            aria-selected={modeTab === 'cowork'}
-            onclick={() => (modeTab = 'cowork')}
+            aria-selected={personaNow === 'cowork'}
+            title="the coworker: tools, a workspace, and the approval cards that go with them"
+            onclick={() => void setPersona('cowork')}
           >Cowork</button>
           <button
             class="modesel"
             role="tab"
-            aria-selected={modeTab === 'chat'}
-            onclick={() => (modeTab = 'chat')}
+            aria-selected={personaNow === 'chat'}
+            title="nothing but the model: no tools, no folder, one line of system prompt"
+            onclick={() => void setPersona('chat')}
           >Chat</button>
         </div>
         <button class="newbtn" title="New session (Ctrl+N)" aria-label="New session" onclick={newSession}>
@@ -8908,7 +9085,10 @@
       </header>
       <div class="set-grid">
         <nav class="set-rail" aria-label="Settings sections">
-          {#each SET_TABS as t}
+          {#each SET_TABS as t, i}
+            {#if i === 0 || SET_TABS[i - 1].group !== t.group}
+              <div class="set-group">{t.group}</div>
+            {/if}
             <button
               class="set-tab {settings.tab === t.kind ? 'on' : ''}"
               onclick={() => pickSettingsTab(t.kind)}
@@ -8920,7 +9100,34 @@
           {/each}
         </nav>
         <div class="set-body">
-          {@render body(menuFor(settings.tab))}
+          {#if settings.tab === 'tools'}
+            <div class="toolsec">
+              <p class="set-note">
+                Every tool below is defined once, in the Rust engine, and the model is handed
+                these same words. {#if personaNow === 'chat'}
+                  <b>Chat mode right now: none of them are mounted</b> — the model is answering
+                  with nothing attached.
+                {:else}
+                  All of them are mounted in this conversation.
+                {/if}
+              </p>
+              {#if toolsErr}<p class="set-note set-err">{toolsErr}</p>{/if}
+              {#each toolViews as t (t.name)}
+                <div class="toolrow">
+                  <code class="toolname">{t.name}</code>
+                  <p class="tooldesc">{toolBlurb(t.description)}</p>
+                </div>
+              {:else}
+                <p class="set-note">The engine reported no tools. That is a fault, not an empty list — check the app log.</p>
+              {/each}
+              <p class="set-note">
+                Nothing here is switchable yet. Per-tool permission is not wired into either
+                core, and a control that did nothing would be worse than no control.
+              </p>
+            </div>
+          {:else}
+            {@render body(menuFor(settings.tab))}
+          {/if}
         </div>
       </div>
     </div>

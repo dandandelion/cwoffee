@@ -818,6 +818,7 @@ const AUDITED: &[&str] = &[
     "set_model",
     "set_mode",
     "set_reasoning",
+    "set_persona",
     "set_workspace",
     "add_workspace",
     "remove_workspace",
@@ -840,6 +841,42 @@ fn drain<T>(map: &Arc<Mutex<HashMap<u64, oneshot::Sender<T>>>>) -> usize {
 
 /// Args rendered without their payloads: the fact that a turn was started and of
 /// what size matters in a log; the user's message text does not belong in one.
+/// `args.attachments` -> engine attachments. The shape is the one the UI already sends on
+/// the desktop path: `{ mime, data_b64, name }`. Anything else is an error naming the
+/// field, because a malformed list that parses as "no attachments" is how a picture goes
+/// missing with nobody saying so.
+fn arg_attachments(args: &serde_json::Value) -> Result<Vec<cwoffee_engine::provider::Attachment>, String> {
+    let Some(list) = args.get("attachments") else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = list.as_array() else {
+        return Err("attachments: expected a list of {{ mime, data_b64, name }}".to_string());
+    };
+    if list.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for (i, a) in list.iter().enumerate() {
+        let mime = a
+            .get("mime")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("attachments[{i}]: no mime"))?
+            .to_string();
+        let data_b64 = a
+            .get("data_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("attachments[{i}]: no data_b64"))?
+            .to_string();
+        let name = a
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| a.get("filename").and_then(|v| v.as_str()).map(str::to_string));
+        out.push(cwoffee_engine::provider::Attachment { mime, data_b64, name });
+    }
+    Ok(out)
+}
+
 fn arg_hint(args: &serde_json::Value) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(map) = args.as_object() {
@@ -1028,17 +1065,29 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         "start_turn" => {
             need_drive(role)?;
             let text = arg_str(&args, "text")?;
-            // Attachments are deliberately not accepted over the gateway in this
-            // slice: an image is a large base64 blob on an unauthenticated-by-
-            // default channel, and the phone case is watching and answering, not
-            // composing with images.
+            // Attachments ARE carried here, and the bound is the engine's own
+            // `AttachmentLimits::defaults()` — same mime list, same count, same per-file
+            // cap as the desktop path — applied *before* the turn is handed to a core.
+            // The earlier choice here was to drop them quietly, which meant a phone that
+            // attached a picture watched a turn answer as if it had been shown one.
+            // Refusing in words is the fix; a silent drop was the bug.
             // `session` is the sender's view, and it is not optional in practice:
             // two clients share one host, and a turn without an address lands in
             // whichever conversation the last switch left active. The engine refuses
             // a mismatch, so a phone tab that has gone stale gets an error instead of
             // appending to the desktop's chat.
             let session = args.get("session").and_then(|v| v.as_i64());
-            h.host.send_turn_to(text, Vec::new(), session);
+            let atts = match arg_attachments(&args) {
+                Ok(a) => a,
+                Err(e) => return Err(e),
+            };
+            if let Err(e) = cwoffee_engine::host::check_attachments(
+                &atts,
+                cwoffee_engine::host::AttachmentLimits::defaults(),
+            ) {
+                return Err(format!("attachment refused: {e}"));
+            }
+            h.host.send_turn_to(text, atts, session);
             Ok(json!(true))
         }
         "cancel_turn" => {
@@ -1084,6 +1133,27 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             };
             h.host.send(HostCmd::SetReasoning { reasoning: r });
             Ok(json!(true))
+        }
+        "tools_view" => {
+            // Read-only, and from the registry rather than a copy: the list a client
+            // shows is the list the model is offered.
+            Ok(json!(h.host.tools_view()))
+        }
+        "set_persona" => {
+            need_drive(role)?;
+            // Cowork or chat. Audited and drive-only: it decides whether the agent has
+            // any tools at all. On the pi core it restarts the model process between
+            // turns; the rust core refuses in words. The client reads the resulting
+            // state from session_state rather than trusting this reply.
+            let want = arg_str(&args, "persona")?;
+            let p = match cwoffee_engine::host::Persona::parse(&want) {
+                Some(p) => p,
+                None => return Err(format!("unknown persona {want:?}: cowork or chat")),
+            };
+            match h.host.set_persona(p) {
+                Ok(note) => Ok(json!({ "note": note })),
+                Err(e) => Err(e),
+            }
         }
         "set_search_backend" => {
             need_drive(role)?;

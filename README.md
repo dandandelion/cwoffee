@@ -6,8 +6,12 @@
 > [`PI-CORE-PLAN.md`](PI-CORE-PLAN.md), [`docs/PI-CORE-PROTOCOL.md`](docs/PI-CORE-PROTOCOL.md)
 > and [`spike/`](spike/README.md). **The core is now a switch, on both shells:**
 > `CWOFFEE_CORE=pi` (desktop) and `--core pi` (gateway) run `pi --mode rpc` behind the same
-> `HostOps` the UI already talks to — same windows, same cards, no `ui/` edits. `master`
-> still defaults to the Rust engine; nothing is cut over. Upstream: `origin` → `../cwoffee`.
+> `HostOps` the UI already talks to — same windows, same approval cards, and the core swap
+> itself needed no `ui/` edits. Product features have since been added on top of that seam
+> (Chat mode, a settings screen, sidebar folding and multi-select delete), so `ui/` differs
+> from upstream; the *protocol* did not change to accommodate them. `master` still defaults to
+> the Rust engine, which stays the fallback and the other half of every A/B.
+> Upstream: `origin` → `../cwoffee`.
 
 *Cwoffee — a coworker that happens to run on your machine. Same warm palette in
 light and dark, now with a cup instead of a cow.*
@@ -33,6 +37,28 @@ TUI — is **7.0 MB PSS**. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 > document output, image attachments and the token-guarded remote-access gateway are
 > live and verified against a real local model. Packaging produces an installable
 > RPM and an AppImage. Not yet done: Knowledge Center, browser module, MCP.
+
+## What the pi core answers today
+
+Eleven tools mounted from the Rust registry (`cwtool specs/check/run`, `pi-tools/cwoffee-tools.ts`
+— no policy in the extension), approval cards with the engine's own summary, workspace following,
+attachments on the prompt, a context meter with a probed window, and **Chat mode**: `persona =
+"chat"` gives the model nothing — no tools, no folder, one line of system prompt — and the Cowork
+tab puts the tools back by restarting the model process between turns.
+
+```bash
+# desktop, pi core, tools mounted
+CWOFFEE_CORE=pi CWOFFEE_CWTOOL=$PWD/../cwoffee/target/release/cwtool \
+  CWOFFEE_PI_EXT=$PWD/pi-tools/cwoffee-tools.ts ./scripts/run-pi-app.sh
+# gateway, pi core, chat from the first turn
+cwoffee-gateway --core pi --persona chat --pi-ext pi-tools/cwoffee-tools.ts …
+```
+
+Gates that must stay green (each asserts a user-visible fact, not one core's dialect):
+`gateway-smoke`, `gateway-approval` (allow and deny), `gateway-workspace`,
+`gateway-midturn-switch`, `gateway-excel`, `gateway-search`, **`gateway-chat`** (tools absent in
+chat, card back in cowork), plus the in-app harness (`scripts/selftest.sh`) which now covers
+attachments, the mode toggle and the Tools list.
 
 ## Run it
 

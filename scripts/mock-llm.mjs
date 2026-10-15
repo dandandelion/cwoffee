@@ -471,8 +471,13 @@ const server = http.createServer(async (req, res) => {
   const wantPath = /\$path/.test(JSON.stringify(step))
   const realPath = wantPath ? extractPath(prompt) : ''
   if (wantPath && !realPath) log(`scenario ${scenario.name} asked for $path but the prompt names none`)
-  const stepCopy = JSON.parse(
-    JSON.stringify(step).replaceAll('$path', wantPath ? JSON.stringify(realPath).slice(1, -1) : '$path'),
+  // `{images}` is filled from *this request*, which is the only way to prove an
+  // attachment travelled all the way to the model instead of being dropped a hop short.
+  const stepCopy = renderStep(
+    JSON.parse(
+      JSON.stringify(step).replaceAll('$path', wantPath ? JSON.stringify(realPath).slice(1, -1) : '$path'),
+    ),
+    messages,
   )
 
   // Pretend the prefix cache hit for everything already in the request: the point

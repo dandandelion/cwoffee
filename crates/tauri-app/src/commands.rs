@@ -355,6 +355,25 @@ pub fn set_mode(state: tauri::State<'_, AppState>, mode: String) -> Result<(), S
     Ok(())
 }
 
+/// The tool list for the settings screen, straight from the Rust registry the tools run
+/// from - on either core. Read-only: there is no per-tool permission to set yet, and the
+/// screen says so instead of showing a switch that goes nowhere.
+#[tauri::command]
+pub fn tools_view(state: tauri::State<'_, AppState>) -> Vec<cwoffee_engine::host::ToolView> {
+    let _ = &state;
+    cwoffee_engine::host::tool_views()
+}
+
+/// Cowork or chat. Both cores answer through the same verb: the pi bridge restarts the
+/// model process between turns, the rust core refuses in words. `session_state` is what
+/// the window reads back, so the tab cannot end up claiming a mode the host did not take.
+#[tauri::command]
+pub fn set_persona(state: tauri::State<'_, AppState>, persona: String) -> Result<String, String> {
+    let p = cwoffee_engine::host::Persona::parse(&persona)
+        .ok_or_else(|| "persona: write cowork or chat".to_string())?;
+    state.host.set_persona(p)
+}
+
 #[tauri::command]
 pub fn set_reasoning(state: tauri::State<'_, AppState>, level: String) -> Result<(), String> {
     let r = match level.as_str() {

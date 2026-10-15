@@ -3038,6 +3038,35 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 .set-body .pop-empty { max-width: 62ch; }
 .set-body .pop-actions { display: flex; gap: 8px; margin-top: 10px; }
 
+/* Rail groups. Nine sections in a flat list read as nothing being categorised; the
+   labels say which decisions belong together without inventing another page. */
+.set-group {
+  margin: 12px 8px 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--color-ink-3);
+}
+.set-group:first-child { margin-top: 2px; }
+
+/* The Tools section lists what the engine owns. The name is monospace because it is
+   the exact id the model calls, and the sentence beside it is the engine's own. */
+.toolsec { display: flex; flex-direction: column; gap: 8px; max-width: 74ch; }
+.set-note { font-size: 11.5px; line-height: 1.45; color: var(--color-ink-2); }
+.set-note.set-err { color: var(--color-danger); }
+.toolrow {
+  display: grid;
+  grid-template-columns: minmax(92px, auto) minmax(0, 1fr);
+  gap: 3px 10px;
+  align-items: baseline;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: var(--color-paper-2);
+}
+.toolname { font-family: var(--font-mono); font-size: 12px; color: var(--color-ink); }
+.tooldesc { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--color-ink-2); }
+
 /* Phones and narrow windows: the rail becomes a strip along the top. A settings
    screen you have to zoom sideways to navigate is not a settings screen. */
 @media (max-width: 720px) {
@@ -3050,4 +3079,5 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   }
   .set-tab { min-width: 116px; }
   .set-hint { display: none; }
+  .set-group { display: none; }
 }

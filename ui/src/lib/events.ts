@@ -133,6 +133,13 @@ export interface HostState {
   session_id: number
   model: string
   mode: 'ask' | 'session' | 'auto'
+  /**
+   * Cowork or chat: whether the host has tools and a folder at all, as opposed to
+   * `mode`, which decides whether a tool needs asking. Optional because a window may
+   * talk to a gateway built before the verb existed; a missing field means "the host
+   * never told us", and the UI then shows what it last heard rather than inventing.
+   */
+  persona?: 'cowork' | 'chat'
   reasoning: ReasoningLevel
   busy: boolean
   turns: number

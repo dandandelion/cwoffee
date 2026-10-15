@@ -69,6 +69,13 @@ pub struct PiLaunch {
     /// pi's own `read`/`bash`/`edit`/`write` stay off: the tools that matter are
     /// ours, and the guardrails live with them.
     pub tools: Vec<String>,
+    /// Chat mode: `--no-tools`, which covers built-in *and* extension tools, and no
+    /// extension is mounted either. Asking pi to be a plain assistant means taking the
+    /// tools out of the process, not telling a tool host to behave.
+    pub no_tools: bool,
+    /// Replaces pi's own prompt. In Chat mode cwoffee's prompt is one line, and it is
+    /// the whole prompt: anything longer claims capabilities this mode does not have.
+    pub system_prompt: Option<String>,
     pub extra_env: Vec<(String, String)>,
     /// Refuse to start unless `pi --version` says exactly this. A silent protocol
     /// drift between a shipped runtime and a pinned bridge is the worst possible
@@ -96,7 +103,9 @@ impl PiLaunch {
             a.push("-e".into());
             a.push(e.display().to_string());
         }
-        if !self.tools.is_empty() {
+        if self.no_tools {
+            a.push("--no-tools".into());
+        } else if !self.tools.is_empty() {
             // **Space form, deliberately.** pi 1.2.0's argument parser is
             // hand-rolled and takes the next token for `--tools` even when that
             // token starts with `-` (which is what a `-read,-bash` denylist looks
@@ -106,6 +115,11 @@ impl PiLaunch {
             // itself off without saying so is the failure mode to avoid here.
             a.push("--tools".into());
             a.push(self.tools.join(","));
+        }
+        if let Some(sp) = &self.system_prompt {
+            // Space form again: pi's hand-rolled parser does not take `--flag=value`.
+            a.push("--system-prompt".into());
+            a.push(sp.clone());
         }
         a
     }

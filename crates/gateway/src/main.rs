@@ -40,6 +40,9 @@ cwoffee-gateway - serve the cwoffee UI and engine over HTTP
   --db PATH          session database
   --mode ask|session|auto
   --core rust|pi     engine behind the gateway (default rust; pi = `pi --mode rpc`)
+  --persona cowork|chat
+                     cowork = tools + workspace (default). chat = the model with nothing
+                     mounted: no tools, no folder, one line of system prompt
   --pi PATH          pi binary for --core pi (default: whatever PATH resolves)
   --pi-version V     refuse a pi that is not exactly this version (default pinned)
   --any-pi           skip the version handshake; development only
@@ -102,9 +105,24 @@ async fn main() -> anyhow::Result<()> {
     if let Some(w) = get("--workspace", None) {
         appcfg.workspace = Some(w);
     }
+    if let Some(pm) = get("--persona", None) {
+        appcfg.persona = Some(pm);
+    }
     if let Some(m) = get("--mode", None) {
         appcfg.mode = Some(m);
     }
+
+    // Persona is resolved before any core starts, because it decides what the model
+    // process IS: which tools exist at all, and what the system prompt says. An
+    // unparseable value stops startup rather than quietly handing the user the
+    // coworker they did not ask for.
+    let persona = match appcfg.persona.as_deref() {
+        None => cwoffee_engine::host::Persona::Cowork,
+        Some(raw) => cwoffee_engine::host::Persona::parse(raw).unwrap_or_else(|| {
+            eprintln!("[cwoffee] persona: {raw} is not a mode. Write cowork or chat.");
+            std::process::exit(1);
+        }),
+    };
 
     let workspace = appcfg
         .workspace
@@ -181,6 +199,13 @@ async fn main() -> anyhow::Result<()> {
     // instead of a rewrite: nothing below this point knows, or can tell, which core it
     // is serving — which is exactly the claim the smoke test has to prove.
     let core = get("--core", None).unwrap_or_else(|| "rust".into());
+    if persona == cwoffee_engine::host::Persona::Chat && core != "pi" {
+        eprintln!(
+            "[cwoffee] persona: chat is not available on the rust core — that core is the coworker prompt, \
+             the tool registry and a workspace. Run with --core pi for a tool-less chat, or set persona = cowork."
+        );
+        std::process::exit(1);
+    }
     if core != "rust" && core != "pi" {
         anyhow::bail!("unknown --core {core:?} (rust or pi)");
     }
@@ -268,14 +293,6 @@ async fn main() -> anyhow::Result<()> {
                 "-write".into(),
             ],
         };
-        // Said before the launch owns the list, because what pi was told is worth
-        // printing on every boot: this is the switch that keeps pi's own coding tools
-        // off, and a silent change to it should be visible in a log line.
-        let tools_note = if tools.is_empty() {
-            "pi defaults".to_string()
-        } else {
-            tools.join(",")
-        };
         // How the Rust tool shims find their binary today. Packaging that properly is
         // S2.5; forwarding the variable is the stand-in that keeps this gate honest.
         let mut extra_env = Vec::new();
@@ -290,6 +307,12 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| cwoffee_bridge::process::PINNED_PI.to_string()),
             )
         };
+        if persona == cwoffee_engine::host::Persona::Chat {
+            eprintln!(
+                "[cwoffee/pi] persona chat: no extension mounted, --no-tools, no folder claimed, system prompt \"{}\"",
+                cwoffee_engine::host::Persona::CHAT_PROMPT
+            );
+        }
         let mut host = cwoffee_bridge::PiHost::spawn(cwoffee_bridge::PiHostConfig {
             launch: cwoffee_bridge::PiLaunch {
                 bin: pi_bin,
@@ -301,6 +324,10 @@ async fn main() -> anyhow::Result<()> {
                 session_file: None,
                 extensions: exts,
                 tools,
+                // Persona shaping is the bridge's, per process: a chat starts with no
+                // extension mounted and --no-tools.
+                no_tools: false,
+                system_prompt: None,
                 extra_env,
                 pinned_version: pinned,
             },
@@ -322,14 +349,23 @@ async fn main() -> anyhow::Result<()> {
             context_budget: cwoffee_bridge::mount::context_budget(cfg.context_budget, window.map(|w| w as usize)),
             model_window: window.map(|w| w as usize),
             session_map: agent_dir.join("cwoffee-pi-sessions.json"),
+            persona,
+            // A mode the user picks in the window is written back to the same config
+            // file, so the next start continues the kind of conversation they chose
+            // instead of resetting to the coworker.
+            cfg_path: Some(config_path.clone()),
         })
         .await?;
+        // Not a claim about tools or extensions: those are chosen per process by the
+        // bridge, which logs every launch with the flags that process actually got. A
+        // boot line asserting a guardrail the child never received is how a silently
+        // off guardrail stays invisible.
         println!(
-            "[cwoffee/pi] core pi {} up in {}; {} extension(s); tools {}",
+            "[cwoffee/pi] core {} pinned; persona {}; {} extension(s) staged — the bridge logs each \
+             model process it starts, with the tools that process actually got",
             host.pi_version,
-            workspace.display(),
-            ext_count,
-            tools_note
+            persona.as_str(),
+            ext_count
         );
         let receivers = host.take_receivers();
         let questions = host.take_questions();
