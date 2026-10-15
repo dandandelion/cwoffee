@@ -125,6 +125,8 @@ impl PiHost {
             child: None,
             tr: Translator::default(),
             map,
+            cmd_tx: cmd_tx.clone(),
+            deferred: Vec::new(),
             auto_allow: HashSet::new(),
             waits: HashMap::new(),
             next_id: 1,
@@ -344,6 +346,11 @@ struct Engine {
     child: Option<PiChild>,
     tr: Translator,
     map: SessionMap,
+    cmd_tx: mpsc::UnboundedSender<HostCmd>,
+    /// Conversation-retargeting verbs that arrived during a turn. The Rust core queues
+    /// command verbs until the turn finishes; a `select!` loop owes the same, or the rest
+    /// of a running turn lands in whichever conversation the user clicked.
+    deferred: Vec<HostCmd>,
     /// Approvals granted with `AllowSession`: the same tool is not asked again.
     auto_allow: HashSet<String>,
     waits: HashMap<u64, Wait>,
@@ -541,6 +548,22 @@ impl Engine {
 
     async fn on_cmd(&mut self, cmd: HostCmd) {
         self.last_activity = Instant::now();
+        // Retargeting the conversation in the middle of a turn is deferred, not obeyed.
+        //
+        // The Rust core queues command verbs until the turn finishes (module doc,
+        // `crates/engine/src/host.rs`). A pi bridge is a `select!` loop, so without this
+        // the click is answered *during* the turn and the rest of that turn — its tool
+        // result and its closing answer — is written into the conversation the user just
+        // clicked. Recorded reproduction: session A kept only the prompt and an empty
+        // assistant row while session B received A's tool result and final answer; the
+        // same script against the Rust core left A with all four rows and B empty.
+        // `scripts/gateway-midturn-switch.mjs` gates the rule on both cores.
+        if matches!(cmd, HostCmd::SwitchSession { .. } | HostCmd::ClearSession | HostCmd::NewSession { .. })
+            && (self.tr.running() || self.state.lock().unwrap().busy)
+        {
+            self.deferred.push(cmd);
+            return;
+        }
         match cmd {
             HostCmd::Send { text, attachments, session } => self.on_send(text, attachments, session).await,
             HostCmd::Cancel => {
@@ -907,6 +930,15 @@ impl Engine {
                 st.busy = false;
                 st.turns += 1;
                 self.last_activity = Instant::now();
+            }
+        }
+        if out.settled && !self.deferred.is_empty() {
+            // The turn boundary: whatever the user asked this window to become while a
+            // turn was running is applied now, in the order it arrived. Re-sent through
+            // the mailbox rather than run inline, because this function is sync and a
+            // command that still finds a turn running re-queues itself the same way.
+            for c in std::mem::take(&mut self.deferred) {
+                let _ = self.cmd_tx.send(c);
             }
         }
         let compactions = out.compaction_start;
