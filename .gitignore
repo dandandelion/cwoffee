@@ -26,3 +26,7 @@ ui/dist/*
 
 # spike build output (5 MB binary, never commit)
 spike/cwshim
+
+# python helpers (scripts/titlegen.py and friends)
+__pycache__/
+*.pyc

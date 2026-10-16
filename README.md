@@ -193,14 +193,57 @@ matters: too low and the app throws away history it did not need to, and tells y
 context is full when the model has room for six times the transcript.
 
 Unpinned, the budget is derived from the window the **endpoint advertises for the loaded
-model** - `window * 0.72 - 2048`, floored at 4096 - and it is re-derived whenever you switch
-models. On this machine that is 186,695 tokens against a stated 262,144, and a 43k transcript
-sits comfortably inside it. Pin `context.target_tokens` in the config only to keep
+model**: **half of it**, floored at 4096 - and it is re-derived whenever you switch models.
+On this machine that is 131,072 tokens against a stated 262,144, and a 43k transcript sits
+comfortably inside it. Half, rather than 72%: the other half is the answer's room. A prompt
+that fills the window leaves the model nowhere to reply, and on a local endpoint the cost of
+getting that wrong is a truncated tool call in the middle of a long turn. The same derivation
+gives the generated model entry its `maxTokens` (never below pi's 16384 default, never above
+the window minus the prompt), and an endpoint that states no window gets no claimed number. Pin `context.target_tokens` in the config only to keep
 conversations short on purpose; a pin is a decision, and the engine honours it and says
 "budget pinned in config" in the log rather than silently preferring its own arithmetic.
 
 The old default was a hardcoded 8000 regardless of model, which compacted a 43k conversation
 on a 262k model and reported "context full". That is why the number now comes from the server.
+
+### What a conversation is called
+
+A conversation starts out named after its own first line, cut at 48 characters. That is
+truthful, and it is why nobody uses the sidebar to find anything: forty rows that begin
+"hey can you", "can you look", "I want to".
+
+Turn on `titlegen = true` and a 230M-parameter model **running on this machine** proposes a
+phrase instead, after the first turn finishes:
+
+```bash
+# once per machine: a private venv (CPU-only torch) and the weights, ~460 MB
+uv venv ~/.local/share/cwoffee/titlegen/venv --python 3.12   # py 3.12, torch 2.14.1+cpu
+~/.local/share/cwoffee/titlegen/venv/bin/python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu torch transformers
+hf download LiquidAI/LFM2.5-230M --cache-dir ~/.local/share/cwoffee/titlegen/models
+```
+
+```toml
+# ~/.config/cwoffee/config.toml, before the first [table]
+titlegen = true
+```
+
+Measured on this box, per new conversation: **2.6–2.8 s to load, 0.4–0.7 s to generate,
+861–864 MB peak resident**, then straight back down. That number is why the helper is a
+one-shot subprocess rather than a resident server, and why it runs *after* the turn — a
+conversation is never made to wait for its name. It is why the feature is opt-in.
+
+Three rules keep it honest:
+
+* **A name you chose is never overwritten.** The helper is only offered a row whose title is
+  still the one the store derived from the first message (or `new session`).
+* **A refusal changes nothing.** The helper rejects output that answers instead of naming
+  ("Sure, here's a summary of your cashflow…"), the opening-line title stays, and the reason
+  appears in the log and as a note. A wrong title is a false claim about the conversation.
+* **Availability is answerable cheaply.** Settings → Titles quotes the model, the paths, what
+  is missing, and the 870 MB cost; `scripts/titlegen.py --check` reports the same in about a
+  second without loading the weights. `node scripts/gateway-titlegen.mjs` is the gate.
+
+Nothing is sent anywhere for this: no endpoint call, no network once the weights are cached.
 
 ### When the model runs out of tool budget
 

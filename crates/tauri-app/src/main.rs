@@ -621,6 +621,7 @@ fn main() {
             commands::set_reasoning,
             commands::set_persona,
             commands::tools_view,
+            commands::titlegen_status,
             commands::list_models,
             commands::migration_notes,
             commands::gateway_status,

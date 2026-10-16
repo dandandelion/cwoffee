@@ -779,7 +779,10 @@ fn attach_meta(conn: &Connection, msgs: &mut [StoredMessage]) -> Result<(), Stor
 ///
 /// Sessions otherwise stay titled "new session" forever, which turns a list of
 /// real conversations into a list of identical rows.
-fn derive_title(text: &str) -> String {
+/// The automatic title: the opening line, whitespace-collapsed, cut at forty-eight
+/// characters with an ellipsis. Public so the eligibility test for a *model* title can
+/// be "is this still the title we made up?", rather than a guess about who named it.
+pub fn derive_title(text: &str) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out: String = String::new();
     for ch in one_line.chars() {

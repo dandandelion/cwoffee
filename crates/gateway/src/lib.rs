@@ -1136,6 +1136,17 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             h.host.send(HostCmd::SetReasoning { reasoning: r });
             Ok(json!(true))
         }
+        // What the local titler is and does. Read-only by design: the switch that turns
+        // it on is a config key, because the cost is an ~870 MB spike per new conversation
+        // and that belongs in a file someone chose, not in a toggle pressed by accident.
+        "titlegen_status" => {
+            let (cfg, path) = cwoffee_engine::config::Config::load(None).unwrap_or_default();
+            let v = serde_json::to_value(cfg.titlegen_cfg().status(None)).map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({
+                "status": v,
+                "config_path": path.map(|p| p.display().to_string()),
+            }))
+        }
         "tools_view" => {
             // Read-only, and from the registry rather than a copy: the list a client
             // shows is the list the model is offered.

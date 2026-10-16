@@ -185,6 +185,11 @@ impl PiHost {
             tr: Translator::with_iter_cap(iter_cap),
             turn_files: Vec::new(),
             last_assistant_row: None,
+            titlegen: cwoffee_engine::titlegen::TitleGen::new(
+                cwoffee_engine::config::Config::load(None)
+                    .map(|(c, _)| c.titlegen_cfg())
+                    .unwrap_or_default(),
+            ),
             map,
             cmd_tx: cmd_tx.clone(),
             deferred: Vec::new(),
@@ -483,6 +488,9 @@ struct Engine {
     /// for, so a faithful per-call stamp produced a turn with six files and no strip.
     turn_files: Vec<cwoffee_engine::tools::OutputFile>,
     last_assistant_row: Option<i64>,
+    /// The same local title helper the rust core offers, from the same config, so the
+    /// sidebar names conversations the same way whichever core is behind it.
+    titlegen: cwoffee_engine::titlegen::TitleGen,
     map: SessionMap,
     cmd_tx: mpsc::UnboundedSender<HostCmd>,
     /// Conversation-retargeting verbs that arrived during a turn. The Rust core queues
@@ -1275,6 +1283,20 @@ impl Engine {
         }
         // Stamp at the end of the run, on the answer, once. `take()` so a second settle
         // in the same process cannot re-attach the same files to a later answer.
+        if out.settled {
+            // Named after the turn, not during it: the row already carries an honest
+            // automatic title, and a phrase from a 230 M-parameter model is worth waiting
+            // a settled turn for but never worth delaying an answer.
+            let session = self.state.lock().unwrap().session_id;
+            if session != 0 {
+                cwoffee_engine::titlegen::maybe_name(
+                    &self.titlegen,
+                    &self.cfg.store,
+                    &self.ev,
+                    session,
+                );
+            }
+        }
         if out.settled && !self.turn_files.is_empty() {
             let files = std::mem::take(&mut self.turn_files);
             match self.last_assistant_row.take() {

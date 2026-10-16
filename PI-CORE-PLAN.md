@@ -21,7 +21,10 @@
   search panel, attachments, metrics with a probed window, **Chat mode**, and a settings screen
   with categories. `cwoffee-gateway --core pi` and `CWOFFEE_CORE=pi` on the desktop; `master`
   still defaults to the Rust core, which stays the fallback and the A/B half.
-- **Last updated:** 2026-10-16T04:30Z (assistant, session 7)
+- **Last updated:** 2026-10-16T07:10Z (assistant, session 10) — conversations are now
+  named by a **230M model running on this machine** (`LiquidAI/LFM2.5-230M`, CPU only),
+  after the first turn, out of process, opt-in; live on the pi core ("hey, I want to go
+  over the quarterly cashflow numbers…" → **"Quarterly cashflow numbers"**).
 - **Verdict:** feasible, and cheaper than it looks — because the UI and the tools both
   survive untouched. Measured, not assumed. Three real costs: **+~90 MB PSS**, **two
   languages in the runtime**, and **pi gives you no sandbox** (that stays ours to own).
@@ -207,6 +210,45 @@ Our side today: `engine 28,952 · ui 13,066 · gateway 2,658 · tauri-app 2,454 
     closed: a UI that disappears must not leave an agent acting unattended, and a turn
     truncated without saying so is indistinguishable from one that finished.
 
+### D12 — a conversation gets its name from a small local model, after the turn, out of
+process, opt-in, and never over a name a human chose (locked 2026-10-16)
+
+The store's automatic title has always been `derive_title`: the opening line, whitespace
+collapsed, cut at 48 characters. It is honest, and useless in exactly one place — a sidebar
+of forty rows that begin "hey can you", "can you look", "I want to". Nobody finds a
+conversation by reading those.
+
+Locked shape:
+
+* **Model:** `LiquidAI/LFM2.5-230M`, CPU-only bf16, ~460 MB of weights, 4 threads. Chosen
+  because it is untied-small, already on this class of machine, and needs no endpoint:
+  titling must not spend a round trip on the expensive model, and it must work offline.
+* **Out of process, one shot.** `scripts/titlegen.py` reads the opening message on stdin,
+  prints one line on stdout, JSON stats on stderr, and exits. Measured: **2.6–2.8 s to
+  load, 0.4–0.7 s to generate, 861–864 MB peak RSS**. That single number is why it is not
+  a library and not a resident server: 870 MB is more than the whole desktop tree normally
+  costs (290 MB with no model up), and it comes straight back. `--serve` exists for a caller
+  with an idle reaper, and nobody has one yet.
+* **After the turn, never on its path.** Both cores call `titlegen::maybe_name` at settle.
+  The row already has an honest title the instant the first message is stored, so a name is
+  always an improvement on something readable; the conversation never waits for decoration.
+* **Eligibility is a comparison, not a flag.** Offer the helper only a row whose stored title
+  still equals `derive_title(first user message)` (or `new session`). That is what "nobody
+  has named this" means, and it makes a hand-named row untouchable by construction.
+* **Refusal is a first-class result.** The helper *rejects* output that answers instead of
+  naming ("Sure, here's a summary…"), and then the automatic title stays and the reason is
+  said — in the log, and on screen when the feature was switched on by hand. A wrong title
+  is a false claim about the conversation; a dull true one is not.
+* **Opt-in.** `titlegen = true` (or `CWOFFEE_TITLEGEN=1`) in the config. The default is off
+  because the cost is a ~870 MB spike and this is an app people leave open on a laptop. The
+  Titles section of Settings quotes that cost next to the model, the paths and what is
+  missing, from one second's work rather than a model load.
+
+Gated by `scripts/gateway-titlegen.mjs`: a scripted helper proves the app honours a name and
+changes *nothing* on a refusal; the real model then names a real sentence
+("…quarterly cashflow numbers, they look short to me" → "Check your quarterly cashflow
+numbers"), and `titlegen.py --check` answers availability without loading weights.
+
 ---
 
 ## MEMORY BUDGET (measured 2026-10-14, pi 1.2.0, this box)
@@ -378,6 +420,7 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
 | remote/phone | `node scripts/gateway-smoke.mjs` | ✅ the frames the bridge must satisfy |
 | gpu/render | `scripts/gpu-check.sh` | ✅ unchanged |
 | **NEW** protocol drift | `node scripts/rpc-conformance.mjs` | the pin's teeth |
+| **NEW** local titling | `node scripts/gateway-titlegen.mjs` | the name arrives after the turn, a refusal changes nothing, and the real model names a real sentence |
 
 ---
 
@@ -725,6 +768,36 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     builds were running beside it. Before believing a stalled-page report, look at what
     else was on the box; the fix for a load-induced failure is sequencing, not a relaxed
     threshold.
+71. **"The title changed" is not an assertion — the store already renamed it.** The row
+    leaves `new session` the moment its first message lands, so a gate that waits for
+    `title !== 'new session'` passes before the title helper is even asked, and then passes
+    forever while the model does nothing. Assert the row moved *off* `derive_title(text)` —
+    which is the same comparison the app uses to decide whether it is allowed to name it.
+72. **A 230M model will answer you, and few-shot examples make it worse.** Asked cold for
+    "a short title", LFM2.5-230M returns sentences about itself ("I can't access external
+    files…", "Sorry for the confusion"). Few-shot examples in the prompt raised verbosity,
+    leaked the examples' language into the answer, and sometimes copied an example. What
+    worked: one strict instruction ("2 to 6 words… a noun phrase, never a sentence"),
+    **prime the answer with an opening quote** so it generates inside quotation marks (a
+    noun phrase is what sits inside quotes), and use the closing quote as a stop signal —
+    then reject what is left with words, because the model is small and will occasionally
+    answer anyway.
+73. **Availability has to be answerable without paying for the thing.** A Settings panel
+    that reports "the weights are not installed" by loading the weights freezes for three
+    seconds and spends 870 MB to introduce itself. `titlegen.py --check` answers in ~1 s
+    (versions from `importlib.metadata`, weights by walking the cache), and the Rust side
+    answers the same question from the filesystem alone — no python spawn at all.
+74. **A bare program name is a path question, and `is_file()` says "no".** `titlegen_python
+    = "python3"` means the one on PATH; a presence check that stats the literal string
+    reported "no python" beside a working interpreter. Resolve through `$PATH` first, and
+    then the check means what it says. Same class as gotcha 22 (a CLI list spelled wrong
+    parses as nothing): a knob that silently fails is worse than a missing knob.
+75. **A gate that mispoints the real thing looks like a broken feature.** The title gate's
+    "real model" phase first failed because the app was passing the gate's *placeholder*
+    cache (an empty `.safetensors` for the scripted helper) to the real helper, which
+    correctly refused to download 460 MB. The failure read as "the model did not name it".
+    When a real-thing phase fails, read which paths the caller handed it before believing
+    the thing itself.
 
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
@@ -875,6 +948,46 @@ behaviour, and exactly why the gate prints the mode it ran in.
 ---
 
 ## PROGRESS JOURNAL (newest on top)
+### Session 10 — titles: a 230M model on this machine names the conversation ✅
+
+The ask was small and specific: stop titling conversations with their first line, use
+`LiquidAI/LFM2.5-230M` on CPU. What that turned out to touch, in order:
+
+- **The helper, measured before it was wired.** venv with CPU torch 2.14.1 + transformers
+  5.20.0, weights in `~/.local/share/cwoffee/titlegen/models` (443 MB, untied, not gated).
+  One-shot: **2.6–2.8 s load, 0.4–0.7 s generate, 861–864 MB peak RSS, ~1 s of CPU per
+  title.** That cost is the design: out of process, once per new conversation, never
+  resident, and never on the turn's path.
+- **The prompt was the hard part, not the integration.** Gotchas 72. Ending: strict
+  one-line instruction + generating *inside an opening quote* + rejecting answer-shaped
+  output with words. Selftest titles it now produces: "Cashflow shortfall analysis",
+  "Rename photos by exif date".
+- **Eligibility is `still_automatic(stored, first)`** — stored title equals
+  `derive_title(first)` or `new session`. A row you renamed yourself is never touched, and
+  that is a comparison rather than a flag someone has to remember to set.
+- **Both cores ask after settle** (`titlegen::maybe_name` from the rust host loop and from
+  the bridge at `agent_settled`), one helper at a time process-wide (`claim()`), rename via
+  the store's `rename_session`, announce with `SessionChanged` so the row moves without a
+  reload. Failures: log always, on-screen note when the feature was explicitly on.
+- **Settings got a Titles section** fed by one read verb (`titlegen_status`, both
+  transports) that quotes the model, the paths, what is missing, the config file to edit,
+  and the measured 870 MB. `in_flight` is `Option<bool>` — the gateway genuinely does not
+  know, and saying `false` would be a placeholder wearing a fact (gotcha 43 family).
+- **Gate** `scripts/gateway-titlegen.mjs`: scripted helper names a row (rename + event +
+  the helper was handed the conversation's own first message); a refusing helper changes
+  nothing and says why in both the transcript and the log; the **real** model then names a
+  real sentence on the real paths. First run red on the real phase — gotchas 74 and 75 were
+  both real bugs found by that gate, one in the app and one in the gate.
+- **Live on the user's install, pi core, after restart:** session 1352 opened with
+  "hey, I want to go over the quarterly cashflow numbers, they look short to me" and the
+  sidebar row became **"Quarterly cashflow numbers"**. `titlegen_status` reported
+  enabled/script/python/weights all true, `in_flight:null`.
+- **Cost stated where it is chosen:** `titlegen = true` now sits in the user config with a
+  comment quoting 870 MB, because an opt-in that hides its price is a surprise later.
+- **Still open:** the four page-harness parity failures from session 9 (sheet grid/header
+  note into the answer, the resumed-history note, the scripted `ask_user` card — `cwtool`
+  still passes `ask = None`, so a tool's question has no road back to a card), and a real
+  compaction of a ~200k conversation end-to-end.
 ### 2026-10-16T04:30Z — session 7 — chat mode, pictures, a meter with a ceiling, and a settings page with categories ✅
 
 - **Chat mode is real on the pi core.** `--persona chat` / config `persona = "chat"` / the Cowork–Chat

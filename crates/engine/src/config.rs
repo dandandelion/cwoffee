@@ -114,6 +114,25 @@ pub struct Config {
     /// broken, and the user pays for the summary twice.
     #[serde(default)]
     pub compact_timeout_secs: Option<u64>,
+    /// Name conversations with a small model running on this machine, instead of cutting
+    /// the opening line at forty-eight characters. **Off by default**: the helper peaks
+    /// near 870 MB of resident memory for a few seconds per conversation, on a machine
+    /// that is also running the model process and the UI, and it is not on any critical
+    /// path — a conversation is never made to wait for its name.
+    #[serde(default)]
+    pub titlegen: Option<bool>,
+    #[serde(default)]
+    pub titlegen_python: Option<String>,
+    #[serde(default)]
+    pub titlegen_script: Option<String>,
+    #[serde(default)]
+    pub titlegen_model: Option<String>,
+    #[serde(default)]
+    pub titlegen_cache: Option<String>,
+    #[serde(default)]
+    pub titlegen_threads: Option<usize>,
+    #[serde(default)]
+    pub titlegen_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -302,6 +321,9 @@ fn table_hint(err: &toml::de::Error) -> String {
         "persona",
         "approval_timeout_secs",
         "compact_timeout_secs",
+        "titlegen",
+        "titlegen_python",
+        "titlegen_script",
         "question_timeout_secs",
         "theme",
         "provider",
@@ -594,6 +616,83 @@ impl Config {
 
     pub fn question_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.question_timeout_secs.unwrap_or(180))
+    }
+
+    /// Accept either a path or a bare program name. Someone writing `titlegen_python =
+    /// "python3"` means the one on PATH, and a check that only looks for a file at the
+    /// literal string reports "no python" while a perfectly good python sits right there.
+    fn resolve_exec(p: &std::path::Path) -> std::path::PathBuf {
+        if p.components().count() == 1 {
+            if let Ok(path) = std::env::var("PATH") {
+                for dir in std::env::split_paths(&path) {
+                    let cand = dir.join(p);
+                    if cand.is_file() {
+                        return cand;
+                    }
+                }
+            }
+        }
+        p.to_path_buf()
+    }
+
+    /// Assemble the title-helper settings: config file first, then the environment, so a
+    /// gate can point the feature at a scripted helper without editing anyone's config.
+    pub fn titlegen_cfg(&self) -> crate::titlegen::TitleGenCfg {
+        let mut cfg = crate::titlegen::TitleGenCfg::default();
+        let s = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        // Held as owned strings first: the environment values are temporaries, and a
+        // reference into one of them would not outlive the call.
+        let env_python = s("CWOFFEE_TITLEGEN_PYTHON");
+        let env_script = s("CWOFFEE_TITLEGEN_SCRIPT");
+        let env_model = s("CWOFFEE_TITLEGEN_MODEL");
+        let env_cache = s("CWOFFEE_TITLEGEN_CACHE");
+        let env_threads = s("CWOFFEE_TITLEGEN_THREADS");
+        let env_timeout = s("CWOFFEE_TITLEGEN_TIMEOUT_SECS");
+        let env_flag = s("CWOFFEE_TITLEGEN");
+        cfg.enabled = self.titlegen.unwrap_or(false);
+        cfg.python = self
+            .titlegen_python
+            .as_deref()
+            .or_else(|| env_python.as_deref())
+            .map(PathBuf::from)
+            .map(|p| Self::resolve_exec(&p))
+            .unwrap_or(cfg.python);
+        cfg.script = self
+            .titlegen_script
+            .as_deref()
+            .or_else(|| env_script.as_deref())
+            .map(PathBuf::from)
+            .map(|p| Self::resolve_exec(&p))
+            .unwrap_or(cfg.script);
+        cfg.model = self
+            .titlegen_model
+            .as_deref()
+            .or_else(|| env_model.as_deref())
+            .map(str::to_string)
+            .unwrap_or(cfg.model);
+        cfg.cache = self
+            .titlegen_cache
+            .as_deref()
+            .or_else(|| env_cache.as_deref())
+            .map(PathBuf::from)
+            .unwrap_or(cfg.cache);
+        cfg.threads = self
+            .titlegen_threads
+            .or_else(|| env_threads.as_deref().and_then(|v| v.parse().ok()))
+            .unwrap_or(cfg.threads)
+            .clamp(1, 16);
+        cfg.timeout = std::time::Duration::from_secs(
+            self.titlegen_timeout_secs
+                .or_else(|| env_timeout.as_deref().and_then(|v| v.parse().ok()))
+                .unwrap_or(45),
+        );
+        if matches!(env_flag.as_deref(), Some("1") | Some("true") | Some("yes")) {
+            cfg.enabled = true;
+        }
+        if matches!(env_flag.as_deref(), Some("0") | Some("false") | Some("no")) {
+            cfg.enabled = false;
+        }
+        cfg
     }
 
     /// The budget for one manual compaction. Deliberately generous, and deliberately a

@@ -533,6 +533,19 @@ impl SessionHost {
         // the model asking for input, and conflating them means a "yes" answers
         // both.
         let (ask_tx, ask_rx) = mpsc::unbounded_channel::<crate::tools::ask::QuestionRx>();
+        // The local title helper, if the config asks for one. Read from the app config
+        // here rather than threaded through HostConfig: HostConfig describes the *turn*
+        // (model, mode, workspace), and whether a subprocess may load a 870 MB model on
+        // this machine is a property of the installation.
+        let appcfg = crate::config::Config::load(None).map(|(c, _)| c).unwrap_or_default();
+        let titlegen = crate::titlegen::TitleGen::new(appcfg.titlegen_cfg());
+        if titlegen.cfg.enabled && !titlegen.cfg.usable() {
+            let st = titlegen.cfg.status(None);
+            eprintln!(
+                "[cwoffee] titlegen is on but cannot run: script {} found={} python {} found={} weights={}; conversations keep their automatic titles",
+                st.script, st.script_found, st.python, st.python_found, st.weights_cached
+            );
+        }
         // The folder you start in is a workspace too. Registering it means the
         // sidebar shows where a brand-new session would write, instead of an
         // empty list until the first message happens to create a row.
@@ -1130,6 +1143,13 @@ impl SessionHost {
                                 }
                             }
                         }
+
+                        // A conversation's name. The store already gave it an honest one —
+                        // the opening line, cut short — the moment that line was stored;
+                        // this only ever improves on a name nobody chose, and it runs
+                        // after the turn so the conversation never waits for its title.
+                        let dynstore: Arc<dyn crate::store::StoreOps> = store.clone();
+                        crate::titlegen::maybe_name(&titlegen, &dynstore, &ev_tx, session_id);
 
                         if tel.prompt_tokens > 0 {
                             let _ = store.record_turn(session_id, &tel);

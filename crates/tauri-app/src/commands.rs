@@ -364,6 +364,19 @@ pub fn tools_view(state: tauri::State<'_, AppState>) -> Vec<cwoffee_engine::host
     cwoffee_engine::host::tool_views()
 }
 
+/// What the local titler is, where it is, and what it costs. Read from the config rather
+/// than from the running host: the helper is a subprocess that comes and goes, and the
+/// question the panel is answering is "would this work here, and what does it cost", not
+/// "is one running this instant" - which the status reports as unknown rather than guessed.
+#[tauri::command]
+pub fn titlegen_status() -> serde_json::Value {
+    let (cfg, path) = cwoffee_engine::config::Config::load(None).unwrap_or_default();
+    serde_json::json!({
+        "status": cfg.titlegen_cfg().status(None),
+        "config_path": path.map(|p| p.display().to_string()),
+    })
+}
+
 /// Cowork or chat. Both cores answer through the same verb: the pi bridge restarts the
 /// model process between turns, the rust core refuses in words. `session_state` is what
 /// the window reads back, so the tab cannot end up claiming a mode the host did not take.

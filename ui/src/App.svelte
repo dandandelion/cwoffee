@@ -123,7 +123,7 @@
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
-  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'search' | 'tools'
+  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'search' | 'tools' | 'naming'
 
   /** Mirror of the desktop's GatewayStatus. Not reachable over the gateway
       itself: the payload carries the token inside ready-to-open URLs. */
@@ -180,12 +180,39 @@
     { kind: 'ws', label: 'Folders', hint: 'where the tools may work', group: 'Working' },
     { kind: 'search', label: 'Search', hint: 'how web_search reaches out', group: 'Reaching out' },
     { kind: 'gateway', label: 'Devices', hint: 'browsers and phones joining', group: 'This app' },
+    { kind: 'naming', label: 'Titles', hint: 'what a conversation is called', group: 'This app' },
     { kind: 'metrics', label: 'This session', hint: 'context, cache, cost', group: 'This app' },
     { kind: 'keys', label: 'Shortcuts', hint: 'keys the app answers', group: 'This app' },
   ]
   // The tool list is read from the engine, never typed here: the description a tool
   // carries is the same text the model is handed, so a UI-side copy is a second copy of
   // prompt bytes that will drift.
+  type TitleStatus = {
+    enabled: boolean
+    script: string
+    script_found: boolean
+    python: string
+    python_found: boolean
+    weights_cached: boolean
+    model: string
+    cache: string
+    threads: number
+    peak_rss_mb: number
+    in_flight: boolean | null
+  }
+  // Every fact on the Titles screen comes from the host. The one number that does not is
+  // the peak memory, and that is quoted from a measurement rather than invented - the
+  // screen exists so the cost is visible before someone turns the feature on.
+  let titleInfo = $state<{ status: TitleStatus; config_path?: string } | null>(null)
+  let titlesErr = $state('')
+  async function loadTitles() {
+    try {
+      titleInfo = await invoke<{ status: TitleStatus; config_path?: string }>('titlegen_status')
+      titlesErr = ''
+    } catch (e) {
+      titlesErr = String(e)
+    }
+  }
   let toolViews = $state<{ name: string; description: string }[]>([])
   let toolsErr = $state('')
   async function loadTools() {
@@ -238,6 +265,7 @@
   /// running before someone cares about search.
   function loadSettingsFor(tab: MenuKind) {
     if (tab === 'model' && (modelErr || !models.length)) void loadModels()
+    if (tab === 'naming' && !titleInfo) void loadTitles()
     if (tab === 'search' && !webSearch) void loadWebSearch()
     if (tab === 'tools' && !toolViews.length) void loadTools()
   }
@@ -3428,6 +3456,20 @@
         else if (!rows.includes('read_file') || !rows.includes('sheet_query'))
           fail(`the Tools section is not the engine's list: ${JSON.stringify(rows)}`)
         else pageLog(`settings tools section ok (${rows.length} tools from the registry, ${groupsN} groups)`)
+        // The Titles screen holds the same rule as every status panel here: it says what is
+        // on this machine, including "not installed", and it quotes the cost next to the
+        // switch that turns it on. A screen that only says "on" is an advertisement.
+        {
+          openSettings('naming')
+          await new Promise((r) => setTimeout(r, 1200))
+          const txt = document.querySelector('.set-body')?.textContent ?? ''
+          if (!/LFM2\.5-230M/.test(txt))
+            fail(`the Titles section does not name the model it is talking about: ${txt.slice(0, 140)}`)
+          else if (!/MB for a few seconds/.test(txt))
+            fail('the Titles section hides what the feature costs to run')
+          else if (!/on|off/i.test(txt)) fail('the Titles section does not say whether the feature is on')
+          else pageLog('settings titles section ok (model, cost and availability are all stated)')
+        }
         closeSettings()
       }
 
@@ -9291,6 +9333,54 @@
                 Nothing here is switchable yet. Per-tool permission is not wired into either
                 core, and a control that did nothing would be worse than no control.
               </p>
+            </div>
+          {:else if settings.tab === 'naming'}
+            <div class="toolsec">
+              <p class="set-note">
+                A conversation starts out called after its own first line, cut at 48
+                characters — true, and useless when the line is "hey can you look at this".
+                When this is on, a small model that runs on this machine proposes a phrase
+                after the first turn finishes, and the row renames itself. The conversation
+                never waits for its name, and a title you typed is never overwritten.
+              </p>
+              {#if titlesErr}<p class="set-note set-err">{titlesErr}</p>{/if}
+              {#if titleInfo}
+                <div class="pop-item static">
+                  <span class="pop-lbl">{titleInfo.status.enabled ? 'Naming conversations locally: on' : 'Naming conversations locally: off'}</span>
+                  <span class="pop-sub">
+                    {#if titleInfo.status.enabled && titleInfo.status.script_found && titleInfo.status.python_found && titleInfo.status.weights_cached}
+                      ready: the helper, its python and the weights are all present
+                    {:else if titleInfo.status.enabled}
+                      on, but it cannot run: {titleInfo.status.script_found ? '' : 'no helper script; '}{titleInfo.status.python_found ? '' : 'no python; '}{titleInfo.status.weights_cached ? '' : 'no weights'} — conversations keep the automatic title, and the reason is in the log
+                    {:else}
+                      put <code>titlegen = true</code> in {titleInfo.config_path ?? 'the config file'} to turn it on
+                    {/if}
+                  </span>
+                </div>
+                <div class="toolrow">
+                  <code class="toolname">{titleInfo.status.model}</code>
+                  <p class="tooldesc">
+                    230M parameters, CPU only, weights in <code>{titleInfo.status.cache}</code>
+                    ({titleInfo.status.weights_cached ? 'cached' : 'not downloaded'}). Threads capped at
+                    {titleInfo.status.threads} because the real model and this window share the machine.
+                  </p>
+                </div>
+                <div class="toolrow">
+                  <code class="toolname">≈{titleInfo.status.peak_rss_mb} MB for a few seconds</code>
+                  <p class="tooldesc">
+                    Measured, not promised: loading torch and the model peaks near this and
+                    falls straight back. That is more than the whole app normally costs, which
+                    is why this is opt-in and why the helper runs once per new conversation
+                    instead of staying resident.
+                  </p>
+                </div>
+                <p class="set-note">
+                  Helper <code>{titleInfo.status.script}</code> {titleInfo.status.script_found ? 'found' : 'missing'} ·
+                  python <code>{titleInfo.status.python}</code> {titleInfo.status.python_found ? 'found' : 'missing'}
+                </p>
+              {:else}
+                <p class="set-note">Reading…</p>
+              {/if}
             </div>
           {:else}
             {@render body(menuFor(settings.tab))}
