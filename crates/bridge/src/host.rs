@@ -115,6 +115,15 @@ impl PiHost {
     /// user may not use in this session.
     pub async fn spawn(cfg: PiHostConfig) -> Result<PiHost, PiError> {
         let pi_version = pi_version(&cfg.launch.bin).await?;
+        // A bridge that died badly leaves its pi behind, and a pi has no reason to notice:
+        // it goes on serving a client that is gone and keeps its context loaded while it
+        // does. Two such orphans from killed runs measured 205 MB between them, with no
+        // idle clock anywhere. Adopt the ledger's processes before starting our own.
+        crate::process::adopt_orphans(
+            &cfg.launch.agent_dir,
+            &cfg.launch.bin,
+            |m| eprintln!("{m}"),
+        );
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (ap_tx, ap_rx) = mpsc::unbounded_channel();
@@ -616,6 +625,8 @@ impl Engine {
         launch.extra_env.push(("CWOFFEE_MODE".to_string(), self.state.lock().unwrap().mode.as_str().to_string()));
         let (child, mut rx) = PiChild::spawn(&launch).await.map_err(|e| self.explain_now(&e))?;
         let pid = child.pid;
+        // Name the process we started, in a file the next bridge to start reads.
+        crate::process::note_children(&launch.agent_dir, &[pid]);
         // Log the launch the child actually got, every time. The shells used to print
         // their own guess at boot; once the tool set and prompt could change with the
         // mode and per conversation, that guess became a line claiming a guardrail

@@ -126,6 +126,101 @@ impl PiLaunch {
 }
 
 /// A live pi process plus the two ends of its RPC pipe.
+/// The bridge's own pid ledger, one pid per line. `kill_on_drop(true)` only fires on a
+/// normal Rust drop: SIGKILL the app or let it panic and the pi it started keeps running,
+/// holding whatever it had loaded — two orphans from killed runs were still sitting at
+/// 205 MB with no idle clock anywhere. So the agent dir keeps a ledger of the processes
+/// this bridge started, and the next bridge to start adopts them and ends them.
+pub fn children_file(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("pi-children.txt")
+}
+
+pub fn note_children(agent_dir: &Path, pids: &[u32]) {
+    let _ = std::fs::write(
+        children_file(agent_dir),
+        pids.iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
+/// The parent of a process, from `/proc/<pid>/stat`. The comm field is parenthesised and
+/// may hold spaces and parentheses, so the fields are counted after the *last* `)`.
+fn ppid_of(pid: u32) -> Option<u32> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = raw.rfind(')')?;
+    raw[close + 1..].split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The three things that must hold before a signal is allowed, as a pure function so it can
+/// be tested against process lines that are not on this machine:
+///
+///   * `ppid == 1` — an orphan in the kernel's sense. A live parent means somebody else
+///     owns that process and its idle clock, including a second gateway sharing the same
+///     agent dir. This is also what keeps the check from ever reaching a pi a user is
+///     talking through: an interactive pi has a parent, and it does not run `--mode rpc`.
+///     (An earlier version of this check matched on the process line alone, and a name-based
+///     sweep of `pi` processes is how a session somebody is typing into gets ended.)
+///   * the process line says `--mode rpc` — only a driven pi is a bridge's child.
+///   * the executable is the launcher's own — pid reuse is real, and a recycled pid must not
+///     inherit an old claim.
+fn is_orphan_rpc_pi(pid: u32, ppid: Option<u32>, parts: &[String], bin: &Path) -> bool {
+    if pid == 0 || pid == std::process::id() || ppid != Some(1) {
+        return false;
+    }
+    let Some(head) = parts.first() else {
+        return false;
+    };
+    let same_launcher = Path::new(head)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Path::new(bin).file_name().and_then(|s| s.to_str());
+    same_launcher && parts.iter().any(|p| p == "rpc") && parts.iter().any(|p| p == "--mode")
+}
+
+fn is_our_pi(pid: u32, bin: &Path) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let parts: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    is_orphan_rpc_pi(pid, ppid_of(pid), &parts, bin)
+}
+
+/// Kill pi processes a previous bridge started and never finished reaping.
+pub fn adopt_orphans(agent_dir: &Path, bin: &Path, mut log: impl FnMut(String)) -> usize {
+    let path = children_file(agent_dir);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut killed = 0;
+    for line in raw.lines() {
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 || pid == std::process::id() {
+            continue;
+        }
+        if is_our_pi(pid, bin) {
+            // The owner is gone, and an idle clock needs an owner: end it rather than let
+            // it serve a client that no longer exists.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        log(format!(
+            "[cwoffee/pi] adopted and ended {killed} pi process(es) left over from an earlier bridge —              nothing was reaping them"
+        ));
+    }
+    let _ = std::fs::remove_file(&path);
+    killed
+}
+
 pub struct PiChild {
     to_stdin: mpsc::UnboundedSender<Vec<u8>>,
     /// Told to the writer task when we want stdin closed, which is pi's own

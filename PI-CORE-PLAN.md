@@ -616,6 +616,23 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     the selftest asserts both halves (`%` on screen, `context_tokens` in the `title`) rather than
     the count it used to read off the row.
 
+55. **Never signal a process by name, and never take over a process that has a parent.** While
+    cleaning up leftover model processes I ran a `kill` on pids chosen from `pgrep -x pi`, and one
+    of them was the interactive pi session I was working inside. A name is not an identity. The
+    bridge's adopt step now requires three things before any signal, as a pure predicate with
+    tests: `ppid == 1` (the kernel's own definition of an orphan — a live parent means somebody
+    else owns that process and its idle clock, including a second gateway sharing the agent dir),
+    a `--mode rpc` marker in the process line (only a driven pi is a bridge's child), and the
+    launcher's own executable name (pid reuse is real; a recycled pid inherits no old claim). The
+    tests include "a pi somebody is talking through is not a target".
+56. **A half-deleted database is a corrupt database.** Removing `foo.sqlite` and leaving
+    `foo.sqlite-wal` / `-shm` behind makes the next gateway exit with `sqlite: disk I/O error`.
+    Throwaway gates must use a fresh path, or delete the trio.
+57. **`kill_on_drop` is not a reaper.** It runs on a normal Rust drop, not when the process is
+    SIGKILLed. Two pi processes from dead hosts were measured holding 205 MB between them, with
+    no idle clock anywhere; hence the ledger (`<agent_dir>/pi-children.txt`) that the next bridge
+    reads and adopts.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -821,6 +838,21 @@ behaviour, and exactly why the gate prints the mode it ran in.
   the engine saying so (`ToolCallParseError` not translated); an endpoint that dropped mid-stream
   surfacing nothing. Also fixed since that run: the attachment case above. This list is the next
   piece of work, and it is exactly what the dual-core A/B was always meant to produce.
+
+- **Orphans, and a lesson learned the hard way.** A pi whose host died keeps running: `kill_on_drop`
+  needs a normal drop, and two leftovers from killed runs measured 205 MB between them. The bridge
+  now writes a ledger of the model processes it starts (`<agent_dir>/pi-children.txt`), removes the
+  line when the process goes, and on startup adopts what the ledger names — under a three-part
+  predicate (`ppid == 1`, `--mode rpc`, our own executable name) that is unit-tested, including the
+  case that bit me: a pi with a live parent is somebody's session and is never a target. While I
+  was writing that guard I killed pids chosen by name and ended the very pi session this work runs
+  in; the user lost a session to my cleanup, and the predicate exists so the code never does that.
+- **Attachments, release build, same proof:** `gateway-attach.mjs` against the release gateway says
+  `ATTACH GATE OK (bytes reached the model …)` with `endpoint receipt: "Attachment seen: 1 image(s):
+  image/png"`. The workspace gate also had to be fixed: its refusal check was a ±160-character
+  window around the filename, which matched the model's own prose and failed a run in which every
+  read of the file had succeeded; it now reads the path out of the refusal's own shape
+  (`refused: <path>: <reason>`) and compares the basename.
 
 - **Owed after this batch:** `/compact` and MCP are still not surfaced in the UI; `ask_user` still
   has `ToolCtx.ask = None`, so the tool says nobody can answer instead of raising a card; `exec`

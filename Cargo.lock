@@ -785,6 +785,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cwoffee-engine",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
