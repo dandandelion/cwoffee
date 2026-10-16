@@ -676,6 +676,56 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     is not true. The composer says so where the folder line used to be, and offers no approvals
     control where nothing can need approving.
 
+64. **Compaction's ceiling is a config key, not a guess.** A ~200 k-token fold is a model
+    call over the whole conversation and on a local endpoint it runs for many minutes —
+    300 s was a number that had never been measured against a real session. So
+    `compact_timeout_secs` (default 1800) sizes the wait, the bridge's own outer wait is
+    that plus 15 s so the side that holds the token counts and the reassurance answers
+    first, and a timeout states what is actually known: nothing was thrown away, pi may
+    still be summarizing, the context meter after the next turn is the fact, and the knob
+    is named. A ceiling that fires early does not make compaction quicker — it makes a
+    working compaction look broken and charges for the summary twice.
+65. **A rule one core states and the other silently violates is two rules.** The harness
+    reported three failures — a session's folder moved, the refusal had no reason, the
+    refused move still landed — and they were one cause: the bridge never had the folder
+    lock the rust core has had for a long time. `host::folder_lock` is that sentence now,
+    in the engine, called by both cores. Two ordering faults rode along: the path was
+    checked *after* the model process was reaped, so a refusal cost a process and a warm
+    prefix cache, and the reaping came before the store's own probe. **A refusal must
+    change nothing.**
+66. **pi retries a dead endpoint without telling the user, and the bridge translated
+    none of it.** Captured off the wire: an endpoint that closes the socket mid-answer
+    produces an assistant `message_end` with `stopReason: "error"` and
+    `errorMessage: "terminated"`, then `auto_retry_start` ×3 (waits 2 s, 4 s, 8 s), then
+    `auto_retry_end{success:false, finalError}`. Naive translation stacks four error cards
+    on one half-answer; ignoring it leaves a sentence that simply stops. The translator
+    holds the error, notes the retry (attempt N of 3, waiting M s), and fails once when the
+    run closes: *"the endpoint closed the connection in the middle of the answer: terminated
+    (after 3 attempts)"*. The half-answer stays stored, because it happened.
+67. **pi repairs truncated tool arguments silently.** For a call whose streamed JSON is
+    missing its closing brace, pi's parser hands over a finished object and runs it. The
+    rust core repairs the same way but says so — a call something else finished is not the
+    call the model wrote. pi leaves no trace of the decision, so the bridge compares the
+    streamed `toolcall_delta` fragments (which carry no id: the id comes from the
+    `toolcall_start` that opened the block) with what actually ran, and when the wire text
+    does not parse it says `agent::repaired_args_note`'s sentence.
+68. **Files stored on a tool row are invisible.** The flood case stopped failing on "0
+    files" and started failing on "no produced-files strip": the bridge was faithfully
+    stamping each tool's output on its own tool row, and the transcript builds a strip only
+    under an **answer** — which is where the rust core puts the whole run's output ("a
+    reload shows the same attachments the live turn showed"). Collect across the run, stamp
+    once at settle, on the assistant row that closed the turn; and a run that made files
+    but stored no answer says so instead of losing them quietly.
+69. **An icon's shape is a claim.** The Settings button used a circle with rays — the
+    glyph every UI in the world uses for brightness — so in dark theme the sidebar footer
+    appeared to hold a light-mode switch. A cog, stroked in `currentColor`, follows the
+    theme instead of assuming one.
+70. **A perf gate measures the machine, not just the page.** The frame-cadence check
+    failed once with "53 frames in 1407 ms while the clock idle was 17 ms" — while cargo
+    builds were running beside it. Before believing a stalled-page report, look at what
+    else was on the box; the fix for a load-induced failure is sequencing, not a relaxed
+    threshold.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -930,6 +980,30 @@ endpoint-drop surfacing nothing (`pi`'s provider error never becomes a cwoffee `
 braceless tool call running without the engine saying so (`ToolCallParseError` is a Rust-core
 concept; pi parses its own arguments), `useSession(N): the host is on M` (an addressing race under
 the harness's rapid switching), and the resumed-history note not reaching the screen.
+
+### Session 9 — a longer compaction ceiling, a cog, and the first real cuts into the failure list
+
+Three asks: compaction's 300 s was too short for a ~200 k-token fold; the Settings glyph
+was the light-theme icon; and go on with the harness plus the parity list.
+
+- Numbers on the list: **17 → 13 → 12 → (run in flight)**. Gone so far: the budget
+  assertion, the chat list and approvals chip in chat mode, attachments, the sheet cells /
+  query grid / header-row note on the live card, the uncapped-turn note, the output file
+  missing from the stored row, and — this session, waiting on the run — the workspace-move
+  trio, the braceless tool call, the dead mid-stream endpoint, and the flood's missing
+  strip.
+- The list is being cut by **root cause, not by symptom**. The trio (move adopted, refusal
+  silent, move landed) was one missing rule (gotcha 65). The flood's "0 files" becoming
+  "no strip" was the difference between *stored* and *rendered* (gotcha 68). The dead
+  stream and the repaired call were both cases where pi does something on its own that the
+  bridge never surfaced (gotchas 66, 67) — both now have wire-captured fixtures, and the
+  capture script can drive a scenario by its trigger text (`PROMPT`, `MODELS_JSON`) and
+  point at its own endpoint, because two captures on one port read each other's traffic.
+- Two of the four fixes in this session came from **reading pi's actual records** rather
+  than reasoning about them: the retry sequence and the silent repair are both invisible in
+  the RPC docs' examples. That is the argument for `pi-event-capture.mjs` staying part of
+  the routine: a translation written against a doc example passes whether or not pi behaves
+  that way.
 
 - **Two loose ends from this batch, named so they are not forgotten.** (1) The file-row pairing
   fix is tested only at the translator half; the page harness's two file checks (the espresso chip
