@@ -168,6 +168,8 @@ impl PiHost {
             rec_tx,
             child: None,
             tr: Translator::with_iter_cap(iter_cap),
+            row_of_call: HashMap::new(),
+            staged_files: HashMap::new(),
             map,
             cmd_tx: cmd_tx.clone(),
             deferred: Vec::new(),
@@ -454,6 +456,11 @@ struct Engine {
     rec_tx: mpsc::UnboundedSender<Value>,
     child: Option<PiChild>,
     tr: Translator,
+    /// Tool-call id -> the store row that holds that call's result, and files whose row
+    /// has not landed yet. pi splits the two across records; the pairing is what makes the
+    /// file chips appear on the right row on this core.
+    row_of_call: HashMap<String, i64>,
+    staged_files: HashMap<String, Vec<cwoffee_engine::tools::OutputFile>>,
     map: SessionMap,
     cmd_tx: mpsc::UnboundedSender<HostCmd>,
     /// Conversation-retargeting verbs that arrived during a turn. The Rust core queues
@@ -1174,7 +1181,7 @@ impl Engine {
 
     // ---- the stream -------------------------------------------------------
 
-    fn apply(&mut self, out: Output) {
+    fn apply(&mut self, mut out: Output) {
         let row = self.row();
         for m in &out.rows {
             match self.cfg.store.append_message(row, m) {
@@ -1185,10 +1192,21 @@ impl Engine {
                     // echoes the row before it reports the result - the same ordering the
                     // Rust core has, stamping with this same store verb.
                     if let Some(tcid) = m.tool_call_id.as_deref() {
-                        if let Some((_, files)) = out.files_by_call.iter().find(|(c, _)| c == tcid) {
-                            if let Err(e) = self.cfg.store.set_message_files(mid, files) {
+                        // pi echoes the tool's row and reports the result in two records, so
+                        // the row and its files arrive in different batches — in either
+                        // order. Pair them by the call id and stamp whichever shows up last.
+                        let stamp = out
+                            .files_by_call
+                            .iter()
+                            .find(|(c, _)| c == tcid)
+                            .map(|(_, f)| f.clone())
+                            .or_else(|| self.staged_files.remove(tcid));
+                        if let Some(files) = stamp {
+                            if let Err(e) = self.cfg.store.set_message_files(mid, &files) {
                                 self.err(format!("could not record what that tool made: {e}"));
                             }
+                        } else {
+                            self.row_of_call.insert(tcid.to_string(), mid);
                         }
                     }
                 }
@@ -1196,6 +1214,19 @@ impl Engine {
                     // The transcript is the user's record of what happened; failing to
                     // write it is worth saying out loud, not logging quietly.
                     self.err(format!("could not store that message: {e}"));
+                }
+            }
+        }
+        // Files whose row has not been written yet wait for it (see above).
+        for (call, files) in out.files_by_call.drain(..) {
+            match self.row_of_call.remove(&call) {
+                Some(mid) => {
+                    if let Err(e) = self.cfg.store.set_message_files(mid, &files) {
+                        self.err(format!("could not record what that tool made: {e}"));
+                    }
+                }
+                None => {
+                    self.staged_files.insert(call, files);
                 }
             }
         }
