@@ -3060,8 +3060,21 @@
       async function useSession(id: number) {
         await invoke('switch_session', { id })
         await resyncView(id)
-        const h = await invoke<HostState>('session_state')
-        if (h.session_id !== id) fail(`useSession(${id}): the host is on ${h.session_id}`)
+        // The host moves between commands, and on the pi core the command queue can be
+        // holding a model round trip, so the row that was clicked and the session the host
+        // names can differ for a moment. Wait for the move — bounded, and timed — because a
+        // switch that lands late is a different fact from one that never lands, and the
+        // message has to be able to tell them apart.
+        let h = await invoke<HostState>('session_state')
+        let waited = 0
+        while (h.session_id !== id && waited < 2000) {
+          await new Promise((r) => setTimeout(r, 100))
+          waited += 100
+          h = await invoke<HostState>('session_state')
+        }
+        if (h.session_id !== id)
+          fail(`useSession(${id}): the host is still on ${h.session_id} after ${waited}ms`)
+        if (waited >= 400) pageLog(`switch_session(${id}) took ${waited}ms to land`)
       }
       const before = await invoke<Session[]>('list_sessions')
       await invoke('new_session', { title: 'selftest' })

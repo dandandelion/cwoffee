@@ -983,6 +983,30 @@ the harness's rapid switching), and the resumed-history note not reaching the sc
 
 ### Session 9 — a longer compaction ceiling, a cog, and the first real cuts into the failure list
 
+**The page harness went 17 → 13 → 12 → 4 failures.** Confirmed fixed by the harness itself:
+`scripted repair ok (repaired malformed arguments for exec: the arguments as streamed did
+not parse as JSON (42 bytes)…)` and `scripted dead stream ok (the endpoint closed the
+connection in the middle of the answer: terminated (after 3 attempts); turn ended=true)`;
+the workspace-move trio; and the flood, which now lists its six files and renders the strip
+with the standalone page as its own chip. The `useSession(N): the host is on M` race did not
+reproduce in that run; `useSession` now waits up to 2 s for the host to name the row it was
+asked for and prints how long a switch took, so a switch that lands late and a switch that
+never lands are different failures — that change is not yet gated.
+
+Four left, in the order they are worth attacking: the scripted sheet loop stopping before
+its last step (the grid and the header-row note reach the *card* but never the *answer*),
+the resumed-history note not reaching the screen, and `ask_user` producing no card because
+`cwtool` runs tools with `ToolCtx.ask = None` — that one needs a real channel from the Rust
+tool back through the extension to the bridge, which is the largest remaining piece.
+
+On the live app after this batch: `persona=cowork budget=131072 window=262144`,
+`tools_view` 11, `compact` refuses in words with no process up (`nothing to compact yet:
+this conversation has no running model process`), the search panel answers and owns the
+managed container (`up=true exists=true`, probe 3.0 s / 5 hits), and the tree measured
+**290 MB PSS** with no model process up yet (a live turn adds pi's ~75-90 MB). The app
+reaped its own pi child on exit and removed its ledger line, which is the adoption path
+being exercised for real.
+
 Three asks: compaction's 300 s was too short for a ~200 k-token fold; the Settings glyph
 was the light-theme icon; and go on with the harness plus the parity list.
 
@@ -1014,6 +1038,13 @@ was the light-theme icon; and go on with the harness plus the parity list.
   It should say which persona the process will start with, or be dropped: a log line about a child
   that has not started is a prediction, and predictions printed as facts are how "the guardrail was
   mounted" got believed when the child never had it.
+- **`ask_user` is the biggest thing left on the parity list.** A Rust tool asks by calling
+  back into the host through `ToolCtx.ask`; `cwtool` hands it `None`, because a subprocess
+  that has already printed its answer has no way back. Wiring it means a line protocol
+  between `cwtool` and the extension, and the extension asking pi (which asks the bridge,
+  which already owns the card and its timeout). Until that exists, every scripted question a
+  tool asks silently goes unanswered — which is the same class of bug as a card that never
+  arrives: the model waits, the user sees nothing, nobody is at fault.
 - **Owed after this batch:** `/compact` and MCP are still not surfaced in the UI; `ask_user` still
   has `ToolCtx.ask = None`, so the tool says nobody can answer instead of raising a card; `exec`
   output is not streamed as `ToolExecOutput`; `CWOFFEE_MODE` is frozen for an already-spawned pi
