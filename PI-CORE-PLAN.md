@@ -931,6 +931,15 @@ braceless tool call running without the engine saying so (`ToolCallParseError` i
 concept; pi parses its own arguments), `useSession(N): the host is on M` (an addressing race under
 the harness's rapid switching), and the resumed-history note not reaching the screen.
 
+- **Two loose ends from this batch, named so they are not forgotten.** (1) The file-row pairing
+  fix is tested only at the translator half; the page harness's two file checks (the espresso chip
+  and the six-file flood) are the gate for the pairing itself, and they were still failing when
+  this was committed. (2) The app's boot line prints `[cwoffee/pi] core pi up … 1 extension(s);
+  tools -read,-bash,-edit,-write` even when the persona is chat — the *per-process* line the bridge
+  prints at spawn is correct, so this is wording on a line that reads like a fact about the process.
+  It should say which persona the process will start with, or be dropped: a log line about a child
+  that has not started is a prediction, and predictions printed as facts are how "the guardrail was
+  mounted" got believed when the child never had it.
 - **Owed after this batch:** `/compact` and MCP are still not surfaced in the UI; `ask_user` still
   has `ToolCtx.ask = None`, so the tool says nobody can answer instead of raising a card; `exec`
   output is not streamed as `ToolExecOutput`; `CWOFFEE_MODE` is frozen for an already-spawned pi
