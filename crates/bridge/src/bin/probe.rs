@@ -146,6 +146,7 @@ async fn run() -> anyhow::Result<()> {
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
         persona: cwoffee_engine::host::Persona::Cowork,
         cfg_path: None,
+        max_tool_iters: 0,
     })
     .await?;
     println!("pi {} at {}", host.pi_version, pi_bin.display());

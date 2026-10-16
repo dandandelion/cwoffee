@@ -682,6 +682,35 @@ pub fn rename_session(state: tauri::State<'_, AppState>, id: i64, title: String)
     state.store.rename_session(id, &title).map_err(|e| e.to_string())
 }
 
+/// Say which mode a conversation belongs to, so the chat list can show chats and the cowork
+/// sidebar can show folders. The store defaults a row to "cowork"; the client that created it
+/// in chat mode says so here.
+#[tauri::command]
+pub fn set_session_persona(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    persona: String,
+) -> Result<(), String> {
+    if persona != "chat" && persona != "cowork" {
+        return Err("persona: write cowork or chat".into());
+    }
+    state
+        .store
+        .set_session_persona(id, &persona)
+        .map_err(|e| e.to_string())
+}
+
+/// Fold the conversation down to a summary, on request. On the pi core this is pi's own
+/// compaction, and the note quotes pi's own token counts; on the rust core the verb
+/// refuses in words, because that core folds the prompt when it reaches its budget.
+#[tauri::command]
+pub async fn compact(
+    state: tauri::State<'_, AppState>,
+    instructions: Option<String>,
+) -> Result<String, String> {
+    state.host.compact(instructions).await
+}
+
 #[tauri::command]
 pub fn delete_session(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
     let st = state.host.state();

@@ -166,12 +166,15 @@ pub fn tool_views() -> Vec<ToolView> {
 /// states, never more, so a prompt cannot overflow the model and have the server
 /// truncate it from the front with no note attached.
 pub fn auto_budget(window: usize) -> usize {
-    // 80% of the window. The other 20% is the reply plus the estimate's own
-    // error: chars/3.5 is close on prose and short on code. The failure this is
-    // guarding against is not "we compacted too early" - it is a prompt that
-    // overflows the window, which the server truncates from the front with no
-    // note attached to it at all.
-    ((window as f64 * 0.80) as usize).max(4_096)
+    // Half the window, and it used to be 80%. The 20% that was left over was meant to
+    // cover "the reply plus the estimate's own error", and a reply is not a fixed cost:
+    // a chat turn asked for an SVG of a pelican on a bicycle and the answer is thousands
+    // of lines of markup, which ran into the ceiling and was cut off mid-drawing. A
+    // ceiling that truncates an answer is not a ceiling, it is a truncation. So the
+    // split is honest: half the window for the conversation, half for what comes back.
+    // The failure this guards is still a prompt that overflows the window, which the
+    // server truncates from the front with no note attached to it at all.
+    ((window as f64 * 0.50) as usize).max(4_096)
 }
 
 /// Read the loaded model's advertised window and set the compaction budget.
@@ -1366,6 +1369,13 @@ pub trait HostOps: Send + Sync {
         tool_views()
     }
 
+    /// Fold this conversation down to a summary, on request. The default refuses in
+    /// words: a core that folds the prompt when it reaches its own budget has no manual
+    /// lever, and a button that does nothing is worse than no button.
+    async fn compact(&self, _instructions: Option<String>) -> Result<String, String> {
+        Err("this core folds the prompt when it reaches its own budget; there is no manual compaction to ask for".into())
+    }
+
     fn set_persona(&self, persona: Persona) -> Result<String, String> {
         Err(format!(
             "this core keeps the coworker prompt and the tool set; chat mode is wired on the pi core only ({})",
@@ -1944,8 +1954,8 @@ mod tests {
     /// 262 144-token window and then announced "context full".
     #[test]
     fn the_budget_sized_from_a_real_window() {
-        assert_eq!(auto_budget(262_144), 209_715);
-        assert_eq!(auto_budget(8_192), 6_553, "80% of the window, not 72% minus a constant");
+        assert_eq!(auto_budget(262_144), 131_072, "half the window: the other half is the reply");
+        assert_eq!(auto_budget(8_192), 4_096, "half, floored - not a percentage minus a constant");
         assert_eq!(auto_budget(4_096), 4_096, "a tiny window cannot go below the floor");
         assert_eq!(auto_budget(0), 4_096);
     }

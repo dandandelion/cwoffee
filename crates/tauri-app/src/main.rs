@@ -643,6 +643,8 @@ fn main() {
             commands::remove_workspace,
             commands::set_workspace_label,
             commands::rename_session,
+            commands::set_session_persona,
+            commands::compact,
             commands::delete_session,
             commands::clear_session,
             commands::switch_session,
@@ -802,6 +804,7 @@ async fn pi_host(
         // The tab the user clicks writes `persona` back to the same config file the
         // app booted from, so the mode is a property of the install, not of one window.
         cfg_path: cfg.cfg_path.clone(),
+        max_tool_iters: appcfg.max_tool_iters(),
     })
     .await
     .map_err(|e| format!("{e}"))?;

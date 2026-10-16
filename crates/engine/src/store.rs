@@ -52,7 +52,7 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Current schema version. Bump with a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// A workspace the user has registered (or that holds sessions).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +73,11 @@ pub struct Session {
     pub created_at: i64,
     pub updated_at: i64,
     pub message_count: i64,
+    /// Which mode made this conversation: "cowork" (tools, a folder, approval cards)
+    /// or "chat" (nothing but the model). It is recorded once, at creation, because it
+    /// describes how the conversation came to exist — a chat opened while the app happens
+    /// to be in cowork mode is still a chat, and it belongs in the chat list.
+    pub persona: String,
 }
 
 /// One bounded page of transcript history.
@@ -248,6 +253,19 @@ impl Store {
         Ok(())
     }
 
+    /// Record the mode a conversation belongs to. The default is "cowork", and anything
+    /// that is not "chat" normalises to it: an unknown value from a stale client must not
+    /// make a row vanish from both lists.
+    pub fn set_session_persona(&self, id: i64, persona: &str) -> Result<(), StoreError> {
+        let p = if persona == "chat" { "chat" } else { "cowork" };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET persona = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, p, now_ts()],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, id: i64) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
@@ -261,7 +279,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
-                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                    s.persona
              FROM sessions s
              ORDER BY s.updated_at DESC, s.id DESC
              LIMIT ?1",
@@ -275,6 +294,7 @@ impl Store {
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
                 message_count: r.get(6)?,
+                persona: r.get(7)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -285,7 +305,8 @@ impl Store {
         let row = conn
             .query_row(
                 "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
-                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                        s.persona
                  FROM sessions s WHERE s.id = ?1",
                 params![id],
                 |r| {
@@ -297,6 +318,7 @@ impl Store {
                         created_at: r.get(4)?,
                         updated_at: r.get(5)?,
                         message_count: r.get(6)?,
+                        persona: r.get(7)?,
                     })
                 },
             )
@@ -946,6 +968,17 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
             "reasoning_ms INTEGER NOT NULL DEFAULT 0",
         )?;
     }
+    if from < 11 {
+        // v11: which mode made the conversation. Chat is not a label on the same list:
+        // a chat has no folder and no tools, so filing it under a workspace makes the
+        // sidebar claim something about it that is not true.
+        add_column_if_missing(
+            conn,
+            "sessions",
+            "persona",
+            "persona TEXT NOT NULL DEFAULT 'cowork'",
+        )?;
+    }
     if from < 10 {
         // v10: workspaces became things you can add, not just side effects of the
         // last path you typed. The sidebar groups sessions by workspace and lets
@@ -1024,6 +1057,15 @@ pub trait StoreOps: Send + Sync {
     fn session(&self, id: i64) -> Result<Option<Session>, StoreError>;
     fn rename_session(&self, id: i64, title: &str) -> Result<(), StoreError>;
     fn set_workspace_label(&self, path: &str, label: &str) -> Result<usize, StoreError>;
+    /// Say which mode a conversation belongs to. Not part of `create_session` because the
+    /// store creates rows in several places (boot, resume, import) that know nothing about
+    /// personas; the default is the honest one, and the client that *does* know says so.
+    fn set_session_persona(&self, id: i64, persona: &str) -> Result<(), StoreError>;
+    /// Attach the files a tool produced to the row that produced them. Not a nicety:
+    /// the file chips under an answer, and "what did this run make?", are read from
+    /// this column. Both cores learn the files only after the row is written, so both
+    /// need the same verb.
+    fn set_message_files(&self, message_id: i64, files: &[crate::tools::OutputFile]) -> Result<(), StoreError>;
 }
 
 impl StoreOps for Store {
@@ -1041,6 +1083,12 @@ impl StoreOps for Store {
     }
     fn delete_session(&self, id: i64) -> Result<(), StoreError> {
         Store::delete_session(self, id)
+    }
+    fn set_session_persona(&self, id: i64, persona: &str) -> Result<(), StoreError> {
+        Store::set_session_persona(self, id, persona)
+    }
+    fn set_message_files(&self, message_id: i64, files: &[crate::tools::OutputFile]) -> Result<(), StoreError> {
+        Store::set_message_files(self, message_id, files)
     }
     fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError> {
         Store::list_sessions(self, limit)
@@ -1264,6 +1312,37 @@ mod tests {
         // Renaming to blank must not blank the row out of usefulness either.
         s.rename_session(c, "").unwrap();
         assert_eq!(s.session(c).unwrap().unwrap().title, "new session");
+    }
+
+    #[test]
+    fn a_row_remembers_which_mode_made_it() {
+        let s = store();
+        let id = s.create_session("chat with no folder", "/tmp", "m").unwrap();
+        // The default is the one that describes most conversations, and it is set by the
+        // schema rather than by every caller remembering to pass it.
+        assert_eq!(s.session(id).unwrap().unwrap().persona, "cowork");
+        s.set_session_persona(id, "chat").unwrap();
+        assert_eq!(s.list_sessions(10).unwrap()[0].persona, "chat");
+        // An unknown value from a stale client normalises; it must not make the row
+        // disappear from both lists.
+        s.set_session_persona(id, "sideways").unwrap();
+        assert_eq!(s.session(id).unwrap().unwrap().persona, "cowork");
+        // An old database (no column at all) still comes up with the default on it.
+        let path = std::env::temp_dir().join(format!("cw-persona-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let st = Store::open(&path).unwrap();
+            st.create_session("one", "/tmp", "m").unwrap();
+            st.conn.lock().unwrap().execute_batch("ALTER TABLE sessions DROP COLUMN persona;").ok();
+            st.conn.lock().unwrap().pragma_update(None, "user_version", 10).unwrap();
+        }
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.list_sessions(10).unwrap()[0].persona,
+            "cowork",
+            "a pre-v11 store gains the column and the default, it does not fail to open"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

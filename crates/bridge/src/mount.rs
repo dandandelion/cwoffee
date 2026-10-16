@@ -149,6 +149,14 @@ pub fn write_dev_provider(
     entry["input"] = serde_json::json!(["text", "image"]);
     if let Some(w) = window {
         entry["contextWindow"] = serde_json::json!(w);
+        // pi's provider composer defaults a model's max output tokens to 16384 when the
+        // entry says nothing (`definition.maxTokens ?? 16384`). For a long single answer —
+        // an SVG of a pelican on a bicycle, a table of a quarter's expenses — that shows up
+        // as a reply that stops in the middle with no error anywhere. Declare the cap from
+        // the window the endpoint stated: half of it, never below pi's own default, and with
+        // room left for the prompt. No window probed, no number invented: pi keeps its default.
+        let half = (w / 2).max(16_384).min(w.saturating_sub(4_096).max(1));
+        entry["maxTokens"] = serde_json::json!(half);
     }
     let path = agent_dir.join("models.json");
     // Merge, and overwrite only the section this app owns. Skipping the whole file when it
@@ -199,6 +207,17 @@ mod tests {
         let entry = &doc["providers"]["cwoffee"]["models"][0];
         assert_eq!(entry["contextWindow"].as_u64(), Some(262144), "the probed window goes in");
         assert_eq!(entry["input"].as_array().map(|a| a.len()), Some(2), "text and image, or pi drops pictures");
+        assert_eq!(entry["maxTokens"].as_u64(), Some(131_072), "half the window, or pi cuts the reply at 16384");
+        // A small window keeps pi's default rather than inventing a smaller cut.
+        let small = root.join("small");
+        write_dev_provider(&small, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(8192)).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&small.join("models.json")).unwrap()).unwrap();
+        assert_eq!(doc["providers"]["cwoffee"]["models"][0]["maxTokens"].as_u64(), Some(4_096), "never above the window minus the prompt");
+        // And no window means no claim: pi's own default stays in charge.
+        let blind = root.join("blind");
+        write_dev_provider(&blind, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", None).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&blind.join("models.json")).unwrap()).unwrap();
+        assert!(doc["providers"]["cwoffee"]["models"][0].get("maxTokens").is_none(), "no probed window, no invented cap");
         // Same baseUrl: refreshed in place, so a window learned later actually lands.
         write_dev_provider(&root, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(131072)).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();

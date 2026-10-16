@@ -95,7 +95,14 @@ impl Default for AgentConfig {
 /// without reading 40 tool cards. The number is the old hardcoded cap plus one -
 /// exactly where the previous build would have stopped, and why the turn keeps
 /// going is worth one line at that moment.
-const SOFT_ITERATION_NOTE: usize = 15;
+pub const SOFT_ITERATION_NOTE: usize = 15;
+
+/// The sentence a long uncapped turn owes the user. Public because the pi core runs the
+/// same loop through a different engine, and "this run is long and nothing is bounding
+/// it" cannot be a claim one core makes and the other keeps silent about.
+pub fn uncapped_note(iters: usize) -> String {
+    format!("{iters} tool calls so far and no cap set; set max_tool_iters in config.toml to bound a turn")
+}
 
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -434,9 +441,7 @@ impl Agent {
                 // turn is out of road.
                 let _ = out.send(EngineEvent::Note {
             session: Some(session_id),
-                    message: format!(
-                        "{iters} tool calls so far and no cap set; set max_tool_iters in config.toml to bound a turn"
-                    ),
+                    message: uncapped_note(iters),
                 });
             }
             iters += 1;

@@ -387,3 +387,93 @@ fn a_turn_parked_on_a_human_reports_the_generation_rate_not_the_wall_clock() {
     );
     assert!(!stats.is_empty(), "a streamed turn should have produced live stats");
 }
+
+/// A finished tool carries three claims, and a bridge that drops any of them leaves the
+/// transcript disagreeing with itself: the live card is an empty box while the same
+/// session reloaded from the store shows the tool's text; and "what did this run make?"
+/// is answered by a column nothing wrote.
+#[test]
+fn a_finished_tool_carries_its_own_words_and_what_it_made() {
+    use cwoffee_engine::event::EngineEvent;
+    let env = serde_json::json!({
+        "ok": true,
+        "tool": "sheet_query",
+        "engine": "rust",
+        "output": "Region\tNorth\nWest\t26\n# header: sheet row 3",
+        "changes": [{ "path": "report.xlsx", "added": 2, "removed": 1, "created": true }],
+        "files": [{ "path": "/tmp/x/report.xlsx", "name": "report.xlsx", "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "bytes": 7049 }]
+    });
+    let text = env.to_string();
+    let mut tr = Translator::default();
+    let now = Instant::now();
+    tr.on_record(&serde_json::json!({ "type": "agent_start" }), now);
+    let rows = tr.on_record(
+        &serde_json::json!({
+            "type": "message_end",
+            "message": { "role": "toolResult", "toolCallId": "call-1", "content": [{ "type": "text", "text": text }] }
+        }),
+        now,
+    );
+    let tool_row = rows.rows.iter().find(|m| matches!(m.role, cwoffee_engine::provider::Role::Tool)).expect("a tool row was stored");
+    assert_eq!(tool_row.content, text, "the row keeps the engine's own envelope, not a summary of it");
+    assert_eq!(tool_row.changes.len(), 1, "the card's +N -M comes from the row, so the row has to carry the changes");
+
+    let done = tr.on_record(
+        &serde_json::json!({
+            "type": "tool_execution_end", "toolCallId": "call-1", "isError": false,
+            "result": { "content": [{ "type": "text", "text": text }] }
+        }),
+        now,
+    );
+    let kinds: Vec<String> = done.events.iter().map(|e| serde_json::to_value(e).unwrap()["kind"].as_str().unwrap().to_string()).collect();
+    let out_at = kinds.iter().position(|k| k == "toolExecOutput").expect("the tool's own output reaches the card");
+    let end_at = kinds.iter().position(|k| k == "toolExecEnd").expect("the tool ends");
+    assert!(out_at < end_at, "the output has to arrive before the card closes: {kinds:?}");
+    for e in &done.events {
+        if let EngineEvent::ToolExecOutput { id, chunk, .. } = e {
+            assert_eq!(id, "call-1");
+            assert!(chunk.contains("West\t26") && chunk.contains("# header: sheet row 3"), "the card shows what the tool said, not what the bridge guessed: {chunk}");
+        }
+    }
+    assert!(done.events.iter().any(|e| matches!(e, EngineEvent::TurnFiles { files, .. } if files.len() == 1)), "a tool that wrote a file says so");
+    assert_eq!(done.files_by_call.len(), 1, "the file is stamped on the row that made it");
+    assert_eq!(done.files_by_call[0].0, "call-1", "stamped on the row for THIS call");
+    assert_eq!(done.files_by_call[0].1[0].name, "report.xlsx");
+}
+
+/// A long uncapped turn has to say so — once, and in the engine's own sentence. The pi
+/// core runs the loop, so the bridge is the only place that can make the claim, and a
+/// claim one core makes while the other stays silent is not a guardrail.
+#[test]
+fn a_long_uncapped_run_says_it_is_uncapped_on_either_core() {
+    use cwoffee_engine::event::EngineEvent;
+    let now = Instant::now();
+    let env = serde_json::json!({ "ok": true, "output": "done" }).to_string();
+    let notes = |cap: usize| {
+        let mut tr = Translator::with_iter_cap(cap);
+        tr.on_record(&serde_json::json!({ "type": "agent_start" }), now);
+        let mut got = Vec::new();
+        for i in 0..25 {
+            let out = tr.on_record(
+                &serde_json::json!({
+                    "type": "tool_execution_end", "toolCallId": format!("c{i}"), "isError": false,
+                    "result": { "content": [{ "type": "text", "text": env }] }
+                }),
+                now,
+            );
+            for e in out.events {
+                if let EngineEvent::Note { message, .. } = e {
+                    got.push(message);
+                }
+            }
+        }
+        got
+    };
+    let uncapped = notes(0);
+    assert_eq!(uncapped.len(), 1, "the note is said once per run, not once per call: {uncapped:?}");
+    let first = uncapped[0].clone();
+    assert!(first.contains("no cap set") && first.contains("max_tool_iters"), "{first}");
+    // A cap somebody actually set is a different fact: the turn is bounded, and saying
+    // it is uncapped would be a lie about the run.
+    assert!(notes(15).is_empty(), "a bounded run must not claim it is unbounded");
+}

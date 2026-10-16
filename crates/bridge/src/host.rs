@@ -74,6 +74,10 @@ pub struct PiHostConfig {
     /// The config file the shells started from, so a mode switch is written down and
     /// survives a restart instead of being a fact about one window.
     pub cfg_path: Option<std::path::PathBuf>,
+    /// `max_tool_iters` from the config: 0 means no cap, which is the default and the
+    /// reason a long turn has to say so out loud. pi owns the loop on this core, so the
+    /// bridge counts the calls and says the engine's sentence.
+    pub max_tool_iters: usize,
 }
 
 /// The handle the gateway and the desktop window hold, deliberately shaped like
@@ -152,6 +156,7 @@ impl PiHost {
         let map = SessionMap::open(cfg.session_map.clone());
         let web_last = Arc::new(Mutex::new(None::<Instant>));
         let boot_workdir = cfg.launch.workdir.clone();
+        let iter_cap = cfg.max_tool_iters;
         let engine = Engine {
             boot_workdir,
             cfg,
@@ -162,7 +167,7 @@ impl PiHost {
             ui_tx,
             rec_tx,
             child: None,
-            tr: Translator::default(),
+            tr: Translator::with_iter_cap(iter_cap),
             map,
             cmd_tx: cmd_tx.clone(),
             deferred: Vec::new(),
@@ -250,6 +255,20 @@ impl HostOps for PiHost {
     /// they are not is silent — a move that did not happen says why, in the same
     /// two places the Rust core puts it (`state().workspace_refusal` and an
     /// `Error` event), and a move that happened reports the canonical path.
+    async fn compact(&self, instructions: Option<String>) -> Result<String, String> {
+        let mut cmd = serde_json::json!({ "type": "compact" });
+        if let Some(i) = instructions.filter(|t| !t.trim().is_empty()) {
+            cmd["customInstructions"] = serde_json::Value::String(i);
+        }
+        let v = self.rpc(cmd, Duration::from_secs(300)).await?;
+        let before = v.get("tokensBefore").and_then(|x| x.as_u64());
+        let after = v.get("estimatedTokensAfter").and_then(|x| x.as_u64());
+        Ok(match (before, after) {
+            (Some(b), Some(a)) => format!("compacted: {b} tokens before, about {a} after"),
+            _ => "compacted; pi reported no token counts".to_string(),
+        })
+    }
+
     fn set_persona(&self, persona: cwoffee_engine::host::Persona) -> Result<String, String> {
         // The switch is applied by the model task, which owns the process. What this
         // returns is what will happen; `session_state().persona` is what did.
@@ -496,6 +515,42 @@ impl Engine {
                                 "provider": self.cfg.launch.provider,
                                 "contextWindow": self.cfg.model_window,
                             }] })));
+                        } else if cmd.get("type").and_then(|t| t.as_str()) == Some("compact") {
+                            // Nothing running means no thread to fold: pi's session file
+                            // belongs to a process that is not up, and asking a model that
+                            // is not running to summarize a conversation it never held is a
+                            // question that cannot be answered.
+                            if self.state.lock().unwrap().busy {
+                                // Folding the conversation while the model is answering would
+                                // rewrite the history under a run that is reading it.
+                                let _ = reply.send(Err(
+                                    "a turn is running; compaction happens between turns".into(),
+                                ));
+                            } else if self.child.is_none() {
+                                let _ = reply.send(Err(
+                                    "nothing to compact yet: this conversation has no running model process. Send a message first.".into(),
+                                ));
+                            } else {
+                            // Compaction is a model call: it writes a summary of the older
+                            // turns. A 30-second budget would fail it on a long session and
+                            // report a timeout as though compaction itself were broken.
+                            let out = self.request(cmd, Duration::from_secs(300)).await;
+                            if let Ok(v) = &out {
+                                // pi reports the numbers, so the note quotes them. The counter
+                                // is not touched here: pi also emits compaction_start, and
+                                // counting in both places would double it.
+                                let before = v.get("tokensBefore").and_then(|x| x.as_u64()).unwrap_or(0);
+                                let after = v.get("estimatedTokensAfter").and_then(|x| x.as_u64()).unwrap_or(0);
+                                let session = self.state.lock().unwrap().session_id;
+                                let _ = self.ev.send(EngineEvent::Note {
+                                    session: Some(session),
+                                    message: format!(
+                                        "compacted: {before} tokens of conversation before, about {after} after. The older turns are replaced by a summary; what the model still reads verbatim starts at the kept entry."
+                                    ),
+                                });
+                            }
+                            let _ = reply.send(out);
+                            }
                         } else {
                             let out = self.request(cmd, Duration::from_secs(30)).await;
                             let _ = reply.send(out);
@@ -1122,10 +1177,26 @@ impl Engine {
     fn apply(&mut self, out: Output) {
         let row = self.row();
         for m in &out.rows {
-            if let Err(e) = self.cfg.store.append_message(row, m) {
-                // The transcript is the user's record of what happened; failing to
-                // write it is worth saying out loud, not logging quietly.
-                self.err(format!("could not store that message: {e}"));
+            match self.cfg.store.append_message(row, m) {
+                Ok(mid) => {
+                    // A tool that wrote files leaves them on the row that wrote them:
+                    // the chips under an answer, and the answer to "what did this run
+                    // make?", are read from there. The row goes in first because pi
+                    // echoes the row before it reports the result - the same ordering the
+                    // Rust core has, stamping with this same store verb.
+                    if let Some(tcid) = m.tool_call_id.as_deref() {
+                        if let Some((_, files)) = out.files_by_call.iter().find(|(c, _)| c == tcid) {
+                            if let Err(e) = self.cfg.store.set_message_files(mid, files) {
+                                self.err(format!("could not record what that tool made: {e}"));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // The transcript is the user's record of what happened; failing to
+                    // write it is worth saying out loud, not logging quietly.
+                    self.err(format!("could not store that message: {e}"));
+                }
             }
         }
         for ev in out.events {

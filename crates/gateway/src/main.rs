@@ -354,6 +354,7 @@ async fn main() -> anyhow::Result<()> {
             // file, so the next start continues the kind of conversation they chose
             // instead of resetting to the coworker.
             cfg_path: Some(config_path.clone()),
+            max_tool_iters: appcfg.max_tool_iters(),
         })
         .await?;
         // Not a claim about tools or extensions: those are chosen per process by the

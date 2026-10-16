@@ -814,11 +814,13 @@ const AUDITED: &[&str] = &[
     "switch_session",
     "clear_session",
     "rename_session",
+    "set_session_persona",
     "delete_session",
     "set_model",
     "set_mode",
     "set_reasoning",
     "set_persona",
+    "compact",
     "set_workspace",
     "add_workspace",
     "remove_workspace",
@@ -1307,6 +1309,26 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             need_drive(role)?;
             h.store
                 .rename_session(arg_i64(&args, "id")?, &arg_str(&args, "title")?)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(true))
+        }
+        "compact" => {
+            need_drive(role)?;
+            let instructions = args
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let note = h.host.compact(instructions).await?;
+            Ok(json!({ "note": note }))
+        }
+        "set_session_persona" => {
+            need_drive(role)?;
+            let p = arg_str(&args, "persona")?;
+            if p != "chat" && p != "cowork" {
+                return Err(format!("unknown persona {p:?}: cowork or chat"));
+            }
+            h.store
+                .set_session_persona(arg_i64(&args, "id")?, &p)
                 .map_err(|e| e.to_string())?;
             Ok(json!(true))
         }

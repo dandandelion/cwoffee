@@ -56,6 +56,11 @@ pub struct Output {
     pub settled: bool,
     pub ui: Vec<UiRequest>,
     pub note: Option<String>,
+    /// Files a tool produced, keyed by the tool-call id of the row that made them.
+    /// The row is written before the tool result is known — pi echoes the row, then
+    /// reports the result — so the stamps are applied after the append, which is what
+    /// the Rust core does with the same store verb.
+    pub files_by_call: Vec<(String, Vec<cwoffee_engine::tools::OutputFile>)>,
     /// True when this record began a compaction, so the host can count them.
     pub compaction_start: bool,
     /// Context size as of the last assistant message, in tokens: input + cached,
@@ -138,6 +143,14 @@ pub struct Translator {
     /// size for a picture. pi echoes the bytes back but knows nothing about
     /// "probe.png"; taking only the echo would lose what the transcript shows.
     sent_att: Vec<Attachment>,
+    /// Tool calls in the run that is currently open. pi runs the loop, so this is the
+    /// only place a long-uncapped-turn note can come from on this core.
+    calls_this_run: usize,
+    /// A hard stop from the config (`max_tool_iters`). 0 means none, which is the
+    /// default, and is exactly why the note exists.
+    pub iter_cap: usize,
+    /// The note is said once per run, not once per call.
+    soft_note_sent: bool,
 }
 
 impl Translator {
@@ -199,7 +212,14 @@ impl Translator {
                     out.events.push(EngineEvent::ToolExecOutput { id, stream: ExecStream::Stdout, chunk });
                 }
             }
-            "tool_execution_end" => out.events.extend(tool_end(self.turn_id, rec)),
+            "tool_execution_end" => {
+                let (ev, (call, files)) = tool_end(self.turn_id, rec);
+                out.events.extend(ev);
+                if !files.is_empty() {
+                    out.files_by_call.push((call, files));
+                }
+                self.count_call(&mut out);
+            }
             "agent_end" => {}
             "agent_settled" => self.settle(rec, now, &mut out),
             "extension_error" => {
@@ -259,6 +279,8 @@ impl Translator {
     }
 
     fn start_run(&mut self, out: &mut Output, now: Instant) {
+        self.calls_this_run = 0;
+        self.soft_note_sent = false;
         if self.run.is_some() {
             // A steer or follow-up can restart the agent inside one run; the turn
             // is already open and stays open.
@@ -271,6 +293,32 @@ impl Translator {
             model: self.model.clone(),
             session_id: self.session,
         });
+    }
+
+    /// A long uncapped turn has to say so, once. The number and the sentence come from
+    /// the engine, because both cores run the same loop and a claim about the run cannot
+    /// be made by one and withheld by the other.
+    /// A translator that knows the run's bound: `max_tool_iters` from the config, 0 for
+    /// none. The count is the bridge's; the sentence and the number at which it is said
+    /// are the engine's, so a turn reads the same whichever core ran it.
+    pub fn with_iter_cap(cap: usize) -> Self {
+        let mut t = Self::default();
+        t.iter_cap = cap;
+        t
+    }
+
+    fn count_call(&mut self, out: &mut Output) {
+        self.calls_this_run += 1;
+        if self.iter_cap == 0
+            && self.calls_this_run == cwoffee_engine::agent::SOFT_ITERATION_NOTE
+            && !self.soft_note_sent
+        {
+            self.soft_note_sent = true;
+            out.events.push(EngineEvent::Note {
+                message: cwoffee_engine::agent::uncapped_note(self.calls_this_run),
+                session: None,
+            });
+        }
     }
 
     fn on_message_end(&mut self, rec: &Value, out: &mut Output) {
@@ -400,10 +448,21 @@ impl Translator {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 if !text.is_empty() {
+                    // The row keeps the envelope the Rust tools emit, byte for byte, so a
+                    // reopened transcript shows the same card as the live one. `changes`
+                    // ride along: the store persists them as the card's `+N -M`, and a
+                    // row without them is a file edit the user cannot see the size of.
+                    let changes = envelope(&text)
+                        .and_then(|v| {
+                            v.get("changes")
+                                .and_then(|c| serde_json::from_value::<Vec<cwoffee_engine::tools::changes::FileChange>>(c.clone()).ok())
+                        })
+                        .unwrap_or_default();
                     let m = Message {
                         role: Role::Tool,
                         content: text,
                         tool_call_id: id,
+                        changes,
                         ..Default::default()
                     };
                     out.rows.push(m);
@@ -541,14 +600,25 @@ impl Translator {
 /// ours (`{"ok":true,"tool":"read_file","engine":"rust",...}`), which is how the
 /// `+N -M` badges and the attachment chips survive the core swap: pi reports that
 /// a tool returned, cwoffee reports *what it changed*.
-fn tool_end(turn_id: u64, rec: &Value) -> Vec<EngineEvent> {
+/// Turn one pi `tool_execution_end` into what cwoffee says about a tool finishing.
+///
+/// Three things travel, and each one is a user-visible claim:
+///   * the tool's own output text, as a `toolExecOutput` chunk, so the card shows what
+///     the tool said. It arrives when the call finished rather than during it — pi gives
+///     us the result once, at the end — and the bridge adds nothing to it. Without this
+///     the live card is an empty box, while the same session reloaded from the store
+///     shows the text: the transcript would disagree with itself.
+///   * the file changes, for the card's `+N -M`.
+///   * the files the tool produced in the workspace, which the host stamps onto the row.
+fn tool_end(turn_id: u64, rec: &Value) -> (Vec<EngineEvent>, (String, Vec<cwoffee_engine::tools::OutputFile>)) {
+    let _ = &turn_id;
     let mut ev = Vec::new();
     let id = rec.get("toolCallId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let is_err = rec.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut changes: Vec<FileChange> = Vec::new();
     let mut files: Vec<cwoffee_engine::tools::OutputFile> = Vec::new();
     if let Some(txt) = result_text(rec) {
-        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+        if let Some(v) = envelope(&txt) {
             if let Some(c) = v.get("changes").and_then(|c| serde_json::from_value::<Vec<FileChange>>(c.clone()).ok()) {
                 changes = c;
             }
@@ -557,11 +627,37 @@ fn tool_end(turn_id: u64, rec: &Value) -> Vec<EngineEvent> {
             }
         }
     }
-    ev.push(EngineEvent::ToolExecEnd { id, ok: !is_err, exit_code: None, changes });
-    if !files.is_empty() {
-        ev.push(EngineEvent::TurnFiles { turn_id, files });
+    // The tool's own words, in its own shape. `output` is what the Rust host streams;
+    // `error` is what it says when the tool refused. Anything else in the envelope is
+    // metadata the card derives for itself.
+    if let Some(txt) = result_text(rec) {
+        let shown = envelope(&txt)
+            .and_then(|v| {
+                v.get("output")
+                    .and_then(|o| o.as_str())
+                    .map(str::to_string)
+                    .or_else(|| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            })
+            .unwrap_or_else(|| txt.clone());
+        if !shown.trim().is_empty() {
+            ev.push(EngineEvent::ToolExecOutput {
+                id: id.clone(),
+                stream: cwoffee_engine::event::ExecStream::Stdout,
+                chunk: shown,
+            });
+        }
     }
-    ev
+    ev.push(EngineEvent::ToolExecEnd { id: id.clone(), ok: !is_err, exit_code: None, changes });
+    if !files.is_empty() {
+        ev.push(EngineEvent::TurnFiles { turn_id, files: files.clone() });
+    }
+    (ev, (id, files))
+}
+
+/// Our tools answer with a JSON envelope; pi hands it over as text. Parse it once,
+/// tolerate anything that is not ours (a pi-side "tool not found", a shell's own text).
+fn envelope(text: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(text).ok()
 }
 
 fn result_text(rec: &Value) -> Option<String> {

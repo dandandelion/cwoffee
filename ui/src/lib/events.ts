@@ -174,6 +174,9 @@ export interface Session {
   created_at: number
   updated_at: number
   message_count: number
+  /** Which mode made this conversation: "cowork" or "chat". Absent means the store is
+      older than the column, which means cowork. */
+  persona?: string
 }
 
 export interface WorkspaceRow {

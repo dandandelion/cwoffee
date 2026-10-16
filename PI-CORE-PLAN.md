@@ -633,6 +633,49 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     no idle clock anywhere; hence the ledger (`<agent_dir>/pi-children.txt`) that the next bridge
     reads and adopts.
 
+58. **Half the window is the budget, not 80%.** Two ceilings were cutting people off. pi's provider
+    composer defaults a model's max output tokens to `16384` unless the entry declares
+    `maxTokens` (`definition.maxTokens ?? 16384`), and cwoffee's `auto_budget` gave the prompt 80%
+    of the window, leaving a fifth for the answer. A chat asked for an SVG of a pelican on a
+    bicycle and the markup was cut off mid-drawing with no error anywhere — a ceiling that
+    truncates an answer is not a ceiling, it is a truncation. Now `auto_budget` is **half** the
+    probed window, and the generated model entry declares `maxTokens = clamp(window/2)` — never
+    below pi's default, never above the window minus the prompt, and **no probed window means no
+    cap claimed**. The harness had to change too: it asserted `budget ≥ 75% of window` to catch a
+    32 000 fallback sitting under a 262 144 window, which is a different failure than the one it
+    was written to catch; it now asserts a derived share (0.25 ≤ share ≤ 1, and not the fallback
+    constant) instead of one core's constant.
+59. **A tool card that is empty on one core and full on the other is one transcript telling two
+    stories.** cwoffee renders a *live* card from `toolExecOutput` chunks and a *reloaded* card
+    from the stored row's content. pi reports a tool's result once, at the end, and the bridge
+    streamed nothing — so the live card was an empty box (the sheet cells, the query grid, the
+    "which row named the columns" line all invisible) while the same session reopened from the
+    store showed the text. The bridge now emits the tool's own output as one chunk before
+    `toolExecEnd`, in the shape the Rust host uses, and nothing else: the words are the tool's.
+    The same fix carries `changes` onto the row (the card's `+N -M` is a store column,
+    `tool_meta_json`) and stamps `files` with the store's own `set_message_files`, which is what
+    the file chips and "what did this run make?" read.
+60. **`[data-x]` matches `[data-x="none"]`.** The check "chat mode offers no approvals control"
+    matched its own *no-approvals-here* marker and failed a run that was correct. Name the control
+    you mean: `[data-approvals]:not([data-approvals="none"])`.
+61. **Recording a fact on a row is half the feature.** The chat list is built from the same
+    in-memory session rows as the folder list, so after writing `persona` the UI has to re-read
+    the list — otherwise the chat you just started is missing from the list made for it.
+62. **Compaction is a model call, not a flag.** pi's `{"type":"compact"}` answers with
+    `tokensBefore` / `estimatedTokensAfter` / `firstKeptEntryId`, so the note quotes pi's numbers
+    instead of an estimate invented in the UI. The verb refuses while a turn is running (folding
+    history under a run that is reading it) and refuses when no model process is up (there is no
+    thread to fold), and it gets a 300-second budget because a 30-second one would report a
+    timeout as though compaction were broken. The compaction counter is *not* bumped in the verb:
+    pi also emits `compaction_start`, and counting in both places counts twice.
+63. **A conversation's mode is a fact about the conversation, not about the window.**
+    `sessions.persona` (schema v11, default `'cowork'` by the schema so every caller need not
+    remember it) says which mode made a row. Chat mode swaps the sidebar's folder tree for a flat
+    chat list built from that column, newest first, and a `persona='chat'` row never appears in a
+    folder group: filing a chat under a workspace makes the sidebar claim something about it that
+    is not true. The composer says so where the folder line used to be, and offers no approvals
+    control where nothing can need approving.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -853,6 +896,40 @@ behaviour, and exactly why the gate prints the mode it ran in.
   window around the filename, which matched the model's own prose and failed a run in which every
   read of the file had succeeded; it now reads the path out of the refusal's own shape
   (`refused: <path>: <reason>`) and compares the basename.
+
+### Session 8 — three product asks, and the parity list gets started
+
+The user asked for three things and then said to start immediately on the failure list plus
+compaction. All three landed, and five of the fifteen failures went with the first pass at parity.
+
+- **Budget.** `auto_budget` is half the probed window (was 80%), and the pi model entry declares
+  `maxTokens` derived from the window (gotcha 58). Measured on the pi core against the mock:
+  `budget=131072 window=262144`. This was the pelican-SVG truncation.
+- **Chat is a mode with its own list.** `sessions.persona` (v11) + `set_session_persona` on both
+  shells; the sidebar in chat mode is a flat chat list, not a folder tree; the composer's folder
+  line says "Chat has no folder, and no tools to use one with" and the approvals control is gone
+  (gotcha 63). The page harness has a block for it, and that block found two of its own bugs
+  (gotchas 60, 61) before it found a real one — it now re-reads the list it is checking.
+- **Compaction.** `HostOps::compact` (async, default refuses in words so a core with no manual
+  lever does not grow a dead button), the bridge's verb, the RPC verb `compact`, the Tauri command,
+  and a `compact` control on the context row of the metrics panel. Refuses mid-turn and with no
+  process up; quotes pi's token counts (gotcha 62).
+- **Parity fixes (5 of the 15/17):** the tool's own output now reaches the live card as
+  `toolExecOutput` (sheet cells, query grid, the header-row note); `changes` ride on the tool row
+  so `+N -M` survives a reload; produced files are stamped with `set_message_files` (the espresso
+  chip and the six-file flood); the uncapped-turn note is said by the bridge too, at the engine's
+  own count and in the engine's own sentence (`agent::SOFT_ITERATION_NOTE`, `agent::uncapped_note`)
+  so a claim about a long run is made by both cores or neither; and the attachment case passes on
+  both cores. Two new bridge tests (`a_finished_tool_carries_its_own_words_and_what_it_made`,
+  `a_long_uncapped_run_says_it_is_uncapped_on_either_core`) and one store test
+  (`a_row_remembers_which_mode_made_it`, which also migrates a pre-v11 store).
+
+Still open from the list, in the order they are worth attacking: `ask_user` cards (`cwtool` runs
+tools with `ToolCtx.ask = None`, so the scripted question never reaches the App), the mid-stream
+endpoint-drop surfacing nothing (`pi`'s provider error never becomes a cwoffee `Error`), a
+braceless tool call running without the engine saying so (`ToolCallParseError` is a Rust-core
+concept; pi parses its own arguments), `useSession(N): the host is on M` (an addressing race under
+the harness's rapid switching), and the resumed-history note not reaching the screen.
 
 - **Owed after this batch:** `/compact` and MCP are still not surfaced in the UI; `ask_user` still
   has `ToolCtx.ask = None`, so the tool says nobody can answer instead of raising a card; `exec`

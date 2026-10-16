@@ -355,10 +355,16 @@
     return s.message_count === 0 && /^new session$/i.test(s.title)
   }
 
+  // A chat has no folder and no tools, so filing it under a workspace would make the
+  // sidebar say something about it that is not true. Chats get their own list, newest
+  // first, which is the order the store already returns them in.
+  const isChat = (s: Session) => s.persona === 'chat'
+  const chatSessions = $derived(sessions.filter(isChat))
   const wsGroups = $derived.by((): WsGroup[] => {
     const byPath = new Map<string, Session[]>()
     for (const s of sessions) {
       if (isBareDraft(s)) continue
+      if (isChat(s)) continue
       const k = wsBucket(s.workspace)
       const arr = byPath.get(k) ?? []
       arr.push(s)
@@ -2231,6 +2237,20 @@
           title: 'new session',
           workspace: draftWorkspace || null,
         })
+        // A chat is not a conversation that happens to have no tools; it belongs to a
+        // different list. The store defaults a row to cowork because that is true of most
+        // rows, and the host creates rows in places that know nothing about personas — so
+        // the one client that does know, the person who pressed the button while the tab
+        // said Chat, says so here, before the first message lands.
+        if (personaNow === 'chat') {
+          await invoke('set_session_persona', { id, persona: 'chat' }).catch((e) =>
+            pageLog(`set_session_persona: ${e}`),
+          )
+          // The sidebar lists chats out of the same rows it lists conversations from, so
+          // recording the mode on the row is only half of it: the list on screen has to be
+          // re-read, or the chat you just started is missing from the list that is for it.
+          sessions = await invoke<Session[]>('list_sessions').catch(() => sessions)
+        }
         viewId = id
         draftWorkspace = ''
       } catch (e) {
@@ -2326,6 +2346,24 @@
       runningSessions = new Set()
     } else if (h.busy && h.session_id && !runningSessions.has(h.session_id)) {
       runningSessions = new Set(runningSessions).add(h.session_id)
+    }
+  }
+
+  // pi's compaction is the real thing: it asks the model to summarize the older turns and
+  // keeps the recent ones verbatim. The note that follows quotes pi's own counts, so the
+  // panel does not have to invent a number for what was saved.
+  let compacting = $state(false)
+  async function compactNow() {
+    if (compacting) return
+    compacting = true
+    try {
+      const note = await invoke<string>('compact', { instructions: null })
+      pageLog(`compact: ${note}`)
+      await refreshState()
+    } catch (e) {
+      pageLog(`compact: ${e}`)
+    } finally {
+      compacting = false
     }
   }
 
@@ -3475,6 +3513,73 @@
           }
           await invoke('set_mode', { mode: mode0 }).catch(() => {})
           await invoke('delete_session', { id: modeSess }).catch(() => {})
+        }
+      }
+
+      // Chat is a different list, not a narrower folder tree. A chat owns no folder, so
+      // filing one under a workspace makes the sidebar claim something about it that is
+      // not true - and the only way to reach it would be to guess which bucket the boot
+      // directory landed in.
+      {
+        const chatSess = await invoke<number>('new_session', { title: 'selftest chat list' })
+        // Same tabs the mode block drives: the tab is the only way in, so the check goes
+        // through it rather than poking the state behind the app's back.
+        const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('.modesel'))
+        const chatTab = tabs.find((b) => b.textContent?.trim() === 'Chat')
+        const workTab = tabs.find((b) => b.textContent?.trim() === 'Cowork')
+        const personaOf = async () => (await invoke<HostState>('session_state')).persona
+        if (!chatTab || !workTab) {
+          fail('the Cowork/Chat tabs are missing, so the chat list cannot be reached')
+          await invoke('delete_session', { id: chatSess }).catch(() => {})
+        } else
+        try {
+          await invoke('set_session_persona', { id: chatSess, persona: 'chat' })
+          const rows = await invoke<Session[]>('list_sessions')
+          sessions = rows
+          const mine = rows.find((r) => r.id === chatSess)
+          if (!mine) fail('the store has no row for the chat it just created')
+          else if (mine.persona !== 'chat')
+            fail(`the row did not remember being a chat (persona=${JSON.stringify(mine.persona)})`)
+          chatTab.click()
+          await new Promise((r) => setTimeout(r, 400))
+          if ((await personaOf()) !== 'chat') {
+            pageLog('selftest note: this core refused chat mode, so the chat list was not drawn')
+          } else {
+            const side = document.querySelector('.sidebar') ?? document.body
+            const txt = side.textContent ?? ''
+            if (!txt.includes('Chats')) fail('chat mode draws no Chats list - the sidebar is still a folder tree')
+            if (txt.includes('Workspaces')) fail('chat mode still draws the workspace tree beside the chats')
+            const titles = [...side.querySelectorAll('.sess-title')].map((e) => e.textContent)
+            if (!titles.includes('selftest chat list'))
+              fail(`the chat list does not contain the chat it made: ${JSON.stringify(titles.slice(0, 8))}`)
+            const main = document.querySelector('main') ?? document.body
+            if (!(main.textContent ?? '').includes('Chat has no folder'))
+              fail('the composer still offers a folder line where a chat owns none')
+            if (
+              !document.querySelector('[data-approvals="none"]') ||
+              document.querySelector('[data-approvals]:not([data-approvals="none"])')
+            )
+              fail('the approvals control is still offered in chat mode, where nothing can need approving')
+            // Back to cowork: the chat must not reappear in a folder. It has one listed
+            // nowhere, and a row that shows up in both lists is two lies.
+            workTab.click()
+            await new Promise((r) => setTimeout(r, 400))
+            if ((await personaOf()) !== 'cowork') {
+              fail(`Cowork did not restore the host (it reports ${await personaOf()})`)
+            } else {
+              const side2 = document.querySelector('.sidebar') ?? document.body
+              const t2 = [...side2.querySelectorAll('.sess-title')].map((e) => e.textContent)
+              if (t2.includes('selftest chat list'))
+                fail('a chat showed up in the workspace list once the tab said Cowork')
+              if (!document.querySelector('[data-approvals]'))
+                fail('the approvals control did not come back with Cowork')
+              pageLog(`chat list ok (${titles.length} chat row(s) drawn, no folder tree, no approvals control)`)
+            }
+          }
+        } catch (e) {
+          fail(`chat list check: ${e}`)
+        } finally {
+          await invoke('delete_session', { id: chatSess }).catch(() => {})
         }
       }
 
@@ -5632,7 +5737,12 @@
         // deleting its oldest 57 messages.
         {
           const h = await invoke<HostState>('session_state')
-          if (h.model_window && h.context_budget < h.model_window * 0.75)
+          // Half the stated window, deliberately: the other half is the reply. What this
+          // check is for is a budget that was never derived from the window at all — the
+          // 32 000 fallback sitting under a 262 144 window, trimming history nobody asked
+          // to trim. Assert the derivation, not one core's constant.
+          const share = h.model_window ? h.context_budget / h.model_window : 0
+          if (h.model_window && (share < 0.25 || share > 1 || h.context_budget === 32_000))
             fail(
               `the engine budgets ${h.context_budget} tokens of a ${h.model_window} token window: ` +
                 'that is a fallback, not a derivation, and it trims history nobody asked to trim',
@@ -8087,6 +8197,55 @@
            grew the sidebar, which grew the row, which pushed the composer and
            the telemetry bar off-screen. -->
       <div class="sesslist min-h-0 flex-1 overflow-y-auto">
+        {#snippet sessRow(s: Session)}
+                <div
+                  class="sessrow {viewId === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''} {picked.has('s' + s.id) ? 'picked' : ''}"
+                >
+                  {#if editingId === s.id}
+                    <input
+                      class="pill px-2 py-1 text-[12.5px] w-full"
+                      bind:value={editTitle}
+                      onkeydown={(e) => {
+                        if (e.key === 'Enter') commitRename()
+                        else if (e.key === 'Escape') editingId = null
+                      }}
+                      onblur={() => commitRename()}
+                    />
+                  {:else}
+                    <!-- One line per session, no message count: the row is a target,
+                         not a report. Rename/delete live in a menu so the row stays
+                         quiet, and the dot is always laid out (invisible until unread)
+                         so titles do not shift when one arrives. -->
+                    <button
+                      class="sessbtn"
+                      aria-pressed={picking ? picked.has('s' + s.id) : undefined}
+                      onclick={(e) => rowClick(e, 's' + s.id, () => openSession(s.id))}
+                    >
+                      {#if picking}
+                        <span class="pickbox" aria-hidden="true">
+                          {#if picked.has('s' + s.id)}
+                            <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.4 5.2L4.2 7L7.6 3.2" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
+                          {/if}
+                        </span>
+                      {/if}
+                      <span
+                        class="sess-dot"
+                        class:busy={runningSessions.has(s.id)}
+                        aria-hidden="true"
+                        title={runningSessions.has(s.id) ? 'answering' : ''}></span>
+                      <span class="sess-title">{s.title}</span>
+                    </button>
+                    <button
+                      class="iconbtn more"
+                      data-menu
+                      aria-label="More actions"
+                      onclick={(e) => openMenu('row', e.currentTarget as HTMLElement, s.id)}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="2.6" cy="6" r="1.05" fill="currentColor"/><circle cx="6" cy="6" r="1.05" fill="currentColor"/><circle cx="9.4" cy="6" r="1.05" fill="currentColor"/></svg>
+                    </button>
+                  {/if}
+                </div>
+        {/snippet}
       {#if hits.length}
         <div class="mt-2 px-1 text-[11px] uppercase tracking-wide text-ink-3">Search</div>
         {#each hits as h}
@@ -8101,6 +8260,19 @@
              list of sessions hides it. A group with no sessions still shows: a
              folder you added and have not written in yet is information, not
              clutter. -->
+        {#if personaNow === 'chat'}
+        <!-- Chat owns no folder, so the folder tree is not a narrower view of the same
+             thing here - it is the wrong thing. Chats get a flat list, newest first. -->
+        <div class="sesshead mt-2">
+          <span>Chats{chatSessions.length ? ` (${chatSessions.length})` : ''}</span>
+        </div>
+        {#each chatSessions as s (s.id)}
+          {@render sessRow(s)}
+        {/each}
+        {#if !chatSessions.length}
+          <div class="pickhint">No chats yet. This one has no folder and no tools — write to it like a person, not a workspace.</div>
+        {/if}
+        {:else}
         <div class="sesshead mt-2">
           <span>Workspaces</span>
           <span class="sesshead-r">
@@ -8213,57 +8385,12 @@
             </div>
             {#if open}
               {#each g.list as s (s.id)}
-                <div
-                  class="sessrow {viewId === s.id ? 'active' : ''} {unread.has(s.id) ? 'unread' : ''} {picked.has('s' + s.id) ? 'picked' : ''}"
-                >
-                  {#if editingId === s.id}
-                    <input
-                      class="pill px-2 py-1 text-[12.5px] w-full"
-                      bind:value={editTitle}
-                      onkeydown={(e) => {
-                        if (e.key === 'Enter') commitRename()
-                        else if (e.key === 'Escape') editingId = null
-                      }}
-                      onblur={() => commitRename()}
-                    />
-                  {:else}
-                    <!-- One line per session, no message count: the row is a target,
-                         not a report. Rename/delete live in a menu so the row stays
-                         quiet, and the dot is always laid out (invisible until unread)
-                         so titles do not shift when one arrives. -->
-                    <button
-                      class="sessbtn"
-                      aria-pressed={picking ? picked.has('s' + s.id) : undefined}
-                      onclick={(e) => rowClick(e, 's' + s.id, () => openSession(s.id))}
-                    >
-                      {#if picking}
-                        <span class="pickbox" aria-hidden="true">
-                          {#if picked.has('s' + s.id)}
-                            <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.4 5.2L4.2 7L7.6 3.2" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
-                          {/if}
-                        </span>
-                      {/if}
-                      <span
-                        class="sess-dot"
-                        class:busy={runningSessions.has(s.id)}
-                        aria-hidden="true"
-                        title={runningSessions.has(s.id) ? 'answering' : ''}></span>
-                      <span class="sess-title">{s.title}</span>
-                    </button>
-                    <button
-                      class="iconbtn more"
-                      data-menu
-                      aria-label="More actions"
-                      onclick={(e) => openMenu('row', e.currentTarget as HTMLElement, s.id)}
-                    >
-                      <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="2.6" cy="6" r="1.05" fill="currentColor"/><circle cx="6" cy="6" r="1.05" fill="currentColor"/><circle cx="9.4" cy="6" r="1.05" fill="currentColor"/></svg>
-                    </button>
-                  {/if}
-                </div>
+                {@render sessRow(s)}
               {/each}
-              {/if}
+            {/if}
           </div>
         {/each}
+        {/if}
       {/if}
       </div>
       {#if picking && picked.size}
@@ -8369,7 +8496,7 @@
           </div>
           <h1 class="empty-hi">{greeting.hi}</h1>
           <p class="empty-sub">{greeting.sub}</p>
-          {#if draftWsLabel}
+          {#if draftWsLabel && personaNow !== 'chat'}
             <!-- Saying which folder an unwritten session belongs to is the
                  difference between "a session in reports/" and a guess. Click it
                  to drop the preselection and go back to the default. -->
@@ -8542,11 +8669,17 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3.5h6v3H9z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 5h-1A2.5 2.5 0 0 0 5 7.5v11A2.5 2.5 0 0 0 7.5 21h9a2.5 2.5 0 0 0 2.5-2.5v-11A2.5 2.5 0 0 0 16.5 5h-1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M8.5 13.5h7M8.5 17h4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
               </button>
 
-              <button class="cbtn chip" data-menu onclick={(e) => openMenu('mode', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'mode'}>
+              {#if personaNow !== 'chat'}
+              <button class="cbtn chip" data-menu data-approvals onclick={(e) => openMenu('mode', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'mode'}>
                 <svg width="13" height="13" viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.2" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M5.4 7h3.2M7 5.4v3.2" stroke="currentColor" stroke-width="1.1"/></svg>
                 <span>{MODE_LABEL[mode]}</span>
                 <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
               </button>
+              {:else}
+              <!-- Nothing to approve where no tool can run. The tab says which mode this
+                   is; a control that could only ever be ignored would be decoration. -->
+              <span class="cbtn chip" data-approvals="none" title="Chat mode has no tools, so nothing needs approving">Chat</span>
+              {/if}
 
               <div class="ml-auto flex items-center gap-1">
                 <button class="cbtn chip" data-menu onclick={(e) => openMenu('model', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'model'}>
@@ -8584,7 +8717,14 @@
 
           </div>
 
-          {#if wsEditing && !wsLocked}
+          {#if personaNow === 'chat'}
+            <!-- Not hidden, because the space where the folder used to be would otherwise
+                 read as a bug. It says what is true instead. -->
+            <div class="wsrow ws-none">
+              <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+              <span>Chat has no folder, and no tools to use one with</span>
+            </div>
+          {:else if wsEditing && !wsLocked}
             <div class="wsrow ws-edit">
               <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
               <input
@@ -8791,6 +8931,16 @@
               >
             {/if}
           </span>
+          <button
+            class="mbtn"
+            disabled={compacting || (hostState?.busy ?? false)}
+            title={hostState?.busy
+              ? 'A turn is running; compaction happens between turns'
+              : 'Ask the model to summarize the older turns. Recent turns stay word for word; the note reports the token counts pi measured, not an estimate from the UI.'}
+            onclick={() => void compactNow()}
+          >
+            {compacting ? 'compacting…' : 'compact'}
+          </button>
         </div>
         <div class="mbar-row">
           <span class="mlbl">prefix cache</span>
