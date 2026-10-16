@@ -477,3 +477,80 @@ fn a_long_uncapped_run_says_it_is_uncapped_on_either_core() {
     // it is uncapped would be a lie about the run.
     assert!(notes(15).is_empty(), "a bounded run must not claim it is unbounded");
 }
+
+// An endpoint that stops talking in the middle of an answer leaves a half-sentence in the
+// transcript and nothing else to show for it. pi retries on its own — up to three times,
+// waiting 2s, 4s, 8s — and each attempt ends with an errored assistant message, so a naive
+// translation stacks four error cards over one answer while a careful one says nothing at
+// all. Both failures hide the same fact from the user: the answer is not finished.
+#[test]
+fn an_endpoint_that_stops_mid_answer_says_the_answer_was_cut_short() {
+    let recs = fixture("pi-events-mid-stream-abort.jsonl");
+    let mut tr = Translator::default();
+    let mut clock = Clock::new();
+    let mut errs: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut answer_rows = 0usize;
+    for rec in &recs {
+        let out = tr.on_record(rec, clock.tick());
+        for ev in out.events {
+            if let EngineEvent::Error { message, .. } = ev {
+                errs.push(message);
+            }
+        }
+        if let Some(n) = out.note {
+            notes.push(n);
+        }
+        answer_rows += out
+            .rows
+            .iter()
+            .filter(|m| m.role == Role::Assistant && !m.content.is_empty())
+            .count();
+    }
+    assert!(answer_rows > 0, "the half-answer must still be stored");
+    let cut = errs
+        .iter()
+        .filter(|m| m.contains("closed the connection in the middle of the answer"))
+        .count();
+    assert_eq!(cut, 1, "one dead answer, one error card: {errs:?}");
+    let said = errs.iter().find(|m| m.contains("closed the connection")).unwrap();
+    assert!(said.contains("terminated"), "pi's own words must survive: {said}");
+    assert!(said.contains("3 attempts"), "and how hard pi tried: {said}");
+    assert!(
+        notes.iter().any(|n| n.contains("pi is sending the prompt again")),
+        "the retries are 14 seconds of waiting the user would otherwise experience as a freeze: {notes:?}"
+    );
+}
+
+// A quantised model truncates the middle of a tool call's JSON. pi's parser closes what
+// the wire left open and runs the call; the rust core does the same repair but says so,
+// because a call someone else finished is not the call the model wrote. The bridge cannot
+// see pi's decision — it only sees a parsed object arrive — so it compares the fragments
+// off the wire with what got run.
+#[test]
+fn a_tool_call_something_else_put_back_together_says_so() {
+    let recs = fixture("pi-events-malformed-tool-json.jsonl");
+    let mut tr = Translator::default();
+    let mut clock = Clock::new();
+    let mut errs: Vec<String> = Vec::new();
+    let mut began: Vec<String> = Vec::new();
+    let mut ran: Vec<String> = Vec::new();
+    for rec in &recs {
+        let out = tr.on_record(rec, clock.tick());
+        for ev in out.events {
+            match ev {
+                EngineEvent::Error { message, .. } => errs.push(message),
+                EngineEvent::ToolCallBegin { id, .. } => began.push(id),
+                EngineEvent::ToolExecStart { id } => ran.push(id),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(began, vec!["mock-broken-1".to_string()], "the call is shown");
+    assert_eq!(ran, vec!["mock-broken-1".to_string()], "and it is run");
+    let said = errs
+        .iter()
+        .find(|m| m.contains("repaired malformed arguments for exec"))
+        .unwrap_or_else(|| panic!("the repair went unmentioned; errors were: {errs:?}"));
+    assert!(said.contains("did not parse as JSON"), "and what was wrong: {said}");
+}

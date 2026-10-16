@@ -321,6 +321,19 @@ pub fn check_workspace(raw: &str) -> Result<std::path::PathBuf, String> {
 /// workspace" - the default a session sits in before a folder is chosen, and the
 /// place older sessions were left in. Letting it also be a workspace would split
 /// those same sessions across two sidebar groups and make the grouping a guess.
+/// The per-session folder lock, in words, in one place. A conversation's folder is the
+/// one its user chose (or the folder the sidebar row was made from); moving the tools
+/// somewhere else while a session already has one turns the sidebar's grouping into
+/// decoration and makes `write_file` land somewhere nobody named. Both cores have to be
+/// able to say it, because the client's check is for the *rule*, not for one core's
+/// phrasing — a rule one core states and the other silently violates is two rules.
+pub fn folder_lock(current: &str) -> String {
+    format!(
+        "this session works in {current}; a session keeps its folder, so start a new \
+         session to work somewhere else"
+    )
+}
+
 pub fn is_temp_root(raw: &str) -> bool {
     let p = std::path::Path::new(raw.trim());
     let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -851,9 +864,7 @@ impl SessionHost {
                                         &ev_tx,
                                         &state_bg,
                                         &path,
-                                        &format!(
-                                            "this session works in {current}; a session keeps its folder, so start a new session to work somewhere else"
-                                        ),
+                                        &folder_lock(&current),
                                     );
                                     continue;
                                 }

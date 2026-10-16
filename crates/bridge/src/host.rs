@@ -78,6 +78,12 @@ pub struct PiHostConfig {
     /// reason a long turn has to say so out loud. pi owns the loop on this core, so the
     /// bridge counts the calls and says the engine's sentence.
     pub max_tool_iters: usize,
+    /// How long a manual compaction may take before cwoffee stops waiting and says so,
+    /// in words, including that nothing was thrown away. A fold of a ~200k-token
+    /// conversation is a model call over the whole of it: many minutes on a local
+    /// endpoint. A tight ceiling does not make it faster; it makes a compaction that
+    /// works look broken, and the user pays for the summary twice.
+    pub compact_timeout: Duration,
 }
 
 /// The handle the gateway and the desktop window hold, deliberately shaped like
@@ -97,6 +103,12 @@ pub struct PiHost {
     ap_rx: Option<ApprovalIn>,
     q_rx: Option<QuestionIn>,
     pub pi_version: String,
+    /// How long this side waits on a compaction. The model task runs the same wait from
+    /// the config (`compact_timeout`) and is the one that knows the number, writes the
+    /// reassuring note, and keeps the token counts out of the message; so this side waits
+    /// a little *longer* on purpose. If it gave up first, the caller would get a bare
+    /// timeout with no counts and no statement that the history is intact.
+    compact_wait: Duration,
 }
 
 /// The managed instance, when the config asks Cwoffee to run one. Built from the same
@@ -119,6 +131,9 @@ impl PiHost {
     /// user may not use in this session.
     pub async fn spawn(cfg: PiHostConfig) -> Result<PiHost, PiError> {
         let pi_version = pi_version(&cfg.launch.bin).await?;
+        // Read before `cfg` moves into the model task: this side of the channel needs the
+        // compaction ceiling too, and needs to wait longer than the task does.
+        let compact_wait = cfg.compact_timeout + Duration::from_secs(15);
         // A bridge that died badly leaves its pi behind, and a pi has no reason to notice:
         // it goes on serving a client that is gone and keeps its context loaded while it
         // does. Two such orphans from killed runs measured 205 MB between them, with no
@@ -168,8 +183,8 @@ impl PiHost {
             rec_tx,
             child: None,
             tr: Translator::with_iter_cap(iter_cap),
-            row_of_call: HashMap::new(),
-            staged_files: HashMap::new(),
+            turn_files: Vec::new(),
+            last_assistant_row: None,
             map,
             cmd_tx: cmd_tx.clone(),
             deferred: Vec::new(),
@@ -196,6 +211,7 @@ impl PiHost {
             ap_rx: Some(ap_rx),
             q_rx: Some(q_rx),
             pi_version,
+            compact_wait,
         })
     }
 
@@ -262,7 +278,7 @@ impl HostOps for PiHost {
         if let Some(i) = instructions.filter(|t| !t.trim().is_empty()) {
             cmd["customInstructions"] = serde_json::Value::String(i);
         }
-        let v = self.rpc(cmd, Duration::from_secs(300)).await?;
+        let v = self.rpc(cmd, self.compact_wait).await?;
         let before = v.get("tokensBefore").and_then(|x| x.as_u64());
         let after = v.get("estimatedTokensAfter").and_then(|x| x.as_u64());
         Ok(match (before, after) {
@@ -459,8 +475,14 @@ struct Engine {
     /// Tool-call id -> the store row that holds that call's result, and files whose row
     /// has not landed yet. pi splits the two across records; the pairing is what makes the
     /// file chips appear on the right row on this core.
-    row_of_call: HashMap<String, i64>,
-    staged_files: HashMap<String, Vec<cwoffee_engine::tools::OutputFile>>,
+    /// What the tools made during this run, and the row to attach it to. Collected across
+    /// the run and stamped on the **answer that closed the turn**, because that is where
+    /// the Rust core puts it ("a reload shows the same attachments the live turn showed")
+    /// and where the transcript's file strip knows to render. pi reports files per tool
+    /// call, and the row carrying them is a tool row — a shape the UI has no rendering
+    /// for, so a faithful per-call stamp produced a turn with six files and no strip.
+    turn_files: Vec<cwoffee_engine::tools::OutputFile>,
+    last_assistant_row: Option<i64>,
     map: SessionMap,
     cmd_tx: mpsc::UnboundedSender<HostCmd>,
     /// Conversation-retargeting verbs that arrived during a turn. The Rust core queues
@@ -538,10 +560,13 @@ impl Engine {
                                     "nothing to compact yet: this conversation has no running model process. Send a message first.".into(),
                                 ));
                             } else {
-                            // Compaction is a model call: it writes a summary of the older
-                            // turns. A 30-second budget would fail it on a long session and
-                            // report a timeout as though compaction itself were broken.
-                            let out = self.request(cmd, Duration::from_secs(300)).await;
+                            // Compaction is a model call over the whole conversation, and a
+                            // ~200k-token fold runs for many minutes on a local endpoint. The
+                            // ceiling is a config knob for that reason: a tight one does not
+                            // make compaction quicker, it only reports a timeout over a fold
+                            // that was still going.
+                            let secs = self.cfg.compact_timeout.as_secs();
+                            let out = self.request(cmd, self.cfg.compact_timeout).await;
                             if let Ok(v) = &out {
                                 // pi reports the numbers, so the note quotes them. The counter
                                 // is not touched here: pi also emits compaction_start, and
@@ -555,6 +580,14 @@ impl Engine {
                                         "compacted: {before} tokens of conversation before, about {after} after. The older turns are replaced by a summary; what the model still reads verbatim starts at the kept entry."
                                     ),
                                 });
+                            }
+                            if let Err(e) = &out {
+                                // Whatever the reason, the person needs to know their history
+                                // is still there: compaction is the operation people fear, and
+                                // a bare error line reads as "and now it is gone".
+                                self.note(format!(
+                                    "compaction did not finish in {secs}s ({e}). Nothing was                                      thrown away: the conversation is still whole as far as                                      cwoffee can tell, and pi may still be summarizing it. The                                      context meter after the next turn is the fact to look at                                      — raise `compact_timeout_secs` if this conversation is                                      simply big."
+                                ));
                             }
                             let _ = reply.send(out);
                             }
@@ -849,11 +882,11 @@ impl Engine {
                     ));
                     return;
                 }
-                if let Some(child) = self.child.take() {
-                    child.reap(Duration::from_secs(3)).await;
-                }
-                // Same probe again, from the other side of the mailbox: a direct
+                // Same probe first, from the other side of the mailbox: a direct
                 // `HostCmd` push must not be able to skip what the public verb checks.
+                // Before the process is reaped, not after: a refusal that costs the model
+                // its process and its warm prefix cache is not a free refusal, and a move
+                // that was turned away should have changed nothing at all.
                 let checked = match cwoffee_engine::host::check_workspace(&path) {
                     Ok(p) => p,
                     Err(reason) => {
@@ -861,6 +894,38 @@ impl Engine {
                         return;
                     }
                 };
+                // A chat owns no folder, so there is nothing here to move; accepting one
+                // would group a conversation that has no tools to use it.
+                if self.cfg.persona == cwoffee_engine::host::Persona::Chat {
+                    self.refuse(format!(
+                        "not moving the tools to {path}: chat mode has no folder and no tools to \
+                         use one with. Switch to cowork to work in a folder."
+                    ));
+                    return;
+                }
+                // The folder lock the rust core states, on this core too: a conversation
+                // that already has a folder keeps it. Left unsaid here, the same client
+                // check passes on one core and fails on the other, which is what "the
+                // guardrail is in the engine" was supposed to prevent.
+                let session_id = self.state.lock().unwrap().session_id;
+                if session_id != 0 {
+                    let current = match self.cfg.store.session(session_id) {
+                        Ok(Some(s)) => s.workspace.trim().to_string(),
+                        _ => String::new(),
+                    };
+                    if !current.is_empty() && !cwoffee_engine::host::is_temp_root(&current) {
+                        let same = std::fs::canonicalize(&current)
+                            .map(|c| c == checked)
+                            .unwrap_or_else(|_| std::path::PathBuf::from(&current) == checked);
+                        if !same {
+                            self.refuse(cwoffee_engine::host::folder_lock(&current));
+                            return;
+                        }
+                    }
+                }
+                if let Some(child) = self.child.take() {
+                    child.reap(Duration::from_secs(3)).await;
+                }
                 let path = checked.display().to_string();
                 self.cfg.launch.workdir = checked.clone();
                 {
@@ -1183,31 +1248,19 @@ impl Engine {
 
     fn apply(&mut self, mut out: Output) {
         let row = self.row();
+        if out
+            .events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::TurnStart { .. }))
+        {
+            self.turn_files.clear();
+            self.last_assistant_row = None;
+        }
         for m in &out.rows {
             match self.cfg.store.append_message(row, m) {
                 Ok(mid) => {
-                    // A tool that wrote files leaves them on the row that wrote them:
-                    // the chips under an answer, and the answer to "what did this run
-                    // make?", are read from there. The row goes in first because pi
-                    // echoes the row before it reports the result - the same ordering the
-                    // Rust core has, stamping with this same store verb.
-                    if let Some(tcid) = m.tool_call_id.as_deref() {
-                        // pi echoes the tool's row and reports the result in two records, so
-                        // the row and its files arrive in different batches — in either
-                        // order. Pair them by the call id and stamp whichever shows up last.
-                        let stamp = out
-                            .files_by_call
-                            .iter()
-                            .find(|(c, _)| c == tcid)
-                            .map(|(_, f)| f.clone())
-                            .or_else(|| self.staged_files.remove(tcid));
-                        if let Some(files) = stamp {
-                            if let Err(e) = self.cfg.store.set_message_files(mid, &files) {
-                                self.err(format!("could not record what that tool made: {e}"));
-                            }
-                        } else {
-                            self.row_of_call.insert(tcid.to_string(), mid);
-                        }
+                    if matches!(m.role, cwoffee_engine::provider::Role::Assistant) {
+                        self.last_assistant_row = Some(mid);
                     }
                 }
                 Err(e) => {
@@ -1217,17 +1270,23 @@ impl Engine {
                 }
             }
         }
-        // Files whose row has not been written yet wait for it (see above).
-        for (call, files) in out.files_by_call.drain(..) {
-            match self.row_of_call.remove(&call) {
+        for (_, files) in out.files_by_call.drain(..) {
+            self.turn_files.extend(files);
+        }
+        // Stamp at the end of the run, on the answer, once. `take()` so a second settle
+        // in the same process cannot re-attach the same files to a later answer.
+        if out.settled && !self.turn_files.is_empty() {
+            let files = std::mem::take(&mut self.turn_files);
+            match self.last_assistant_row.take() {
                 Some(mid) => {
                     if let Err(e) = self.cfg.store.set_message_files(mid, &files) {
-                        self.err(format!("could not record what that tool made: {e}"));
+                        self.err(format!("could not record what that run made: {e}"));
                     }
                 }
-                None => {
-                    self.staged_files.insert(call, files);
-                }
+                None => self.err(format!(
+                    "that run made {} file(s) but stored no answer to attach them to — they are on                      disk, not in the transcript",
+                    files.len()
+                )),
             }
         }
         for ev in out.events {

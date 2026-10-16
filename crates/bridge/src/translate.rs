@@ -134,7 +134,21 @@ pub struct Translator {
     pub model: String,
     turn_id: u64,
     run: Option<Run>,
+    /// An assistant message that ended with `stopReason: "error"`, held rather than
+    /// shown. pi retries a failed call on its own — up to three attempts, waiting
+    /// 2s/4s/8s — and the capture shows four errored messages for one dead endpoint, so
+    /// reporting each one would stack four error cards over one half-answer. It is
+    /// flushed when the run closes, or replaced by pi's own `auto_retry_end`, which knows
+    /// how many attempts it took.
+    pending_error: Option<String>,
+    retry_attempts: u64,
     /// toolCallId -> the argument JSON streamed so far, for the parse-error report.
+    /// Also how we catch a *silent* repair: pi's parser closes truncated JSON without
+    /// saying so, and a repaired call looks identical to a clean one on screen.
+    /// Accumulated from pi's own `toolcall_delta` fragments — which carry no id, only a
+    /// `contentIndex`, so the id comes from the `toolcall_start` that opened the block and
+    /// the fragments land in the call that is currently streaming.
+    stream_cur: Option<String>,
     args_stream: HashMap<String, String>,
     /// Record types we do not know, counted. A pi bump that adds records shows up
     /// here rather than quietly dropping features on the floor.
@@ -228,7 +242,44 @@ impl Translator {
                     .unwrap_or_else(|| "an extension reported an error".into());
                 out.events.push(EngineEvent::Error { message: format!("extension: {m}"), fatal: false });
             }
-            "auto_retry_start" => out.note = Some("the provider failed; retrying".into()),
+            "auto_retry_start" => {
+                // pi is doing this behind the prompt: the answer stopped, and the whole
+                // thing is being sent again after a wait the user would otherwise
+                // experience as the app sitting there. Say what is happening and how long
+                // the wait is, and hold the error itself back until the retries are done.
+                let attempt = rec.get("attempt").and_then(|v| v.as_u64()).unwrap_or(1);
+                let max = rec.get("maxAttempts").and_then(|v| v.as_u64()).unwrap_or(attempt);
+                let delay = rec.get("delayMs").and_then(|v| v.as_u64()).unwrap_or(0);
+                let err = rec
+                    .get("errorMessage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("the provider failed");
+                self.pending_error = None;
+                self.retry_attempts = attempt;
+                out.note = Some(format!(
+                    "{}; pi is sending the prompt again (attempt {} of {}, waiting {}s)",
+                    stream_death(err),
+                    attempt + 1,
+                    max,
+                    (delay as f64 / 1000.0).max(0.1).round()
+                ));
+            }
+            "auto_retry_end" => {
+                let ok = rec.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                let attempts = rec.get("attempt").and_then(|v| v.as_u64()).unwrap_or(self.retry_attempts);
+                if ok {
+                    out.note = Some(format!("the retry worked after {attempts} attempt(s)"));
+                    self.pending_error = None;
+                } else {
+                    // Keep pi's final error, and how many tries it cost, so the card that
+                    // follows can say both.
+                    let last = rec
+                        .get("finalError")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("the provider failed");
+                    self.pending_error = Some(format!("{last} (after {attempts} attempts)"));
+                }
+            }
             "compaction_start" => {
                 out.compaction_start = true;
                 out.note = Some("compacting the conversation to stay inside the window".into());
@@ -281,6 +332,8 @@ impl Translator {
     fn start_run(&mut self, out: &mut Output, now: Instant) {
         self.calls_this_run = 0;
         self.soft_note_sent = false;
+        self.pending_error = None;
+        self.retry_attempts = 0;
         if self.run.is_some() {
             // A steer or follow-up can restart the agent inside one run; the turn
             // is already open and stays open.
@@ -425,6 +478,19 @@ impl Translator {
                     }
                     if let Some(stop) = msg.get("stopReason").and_then(|v| v.as_str()) {
                         r.finish = finish_reason(stop);
+                        if stop == "error" {
+                            // The half-answer is real and stays on screen; what must not
+                            // happen is the silence. pi reports the cause in errorMessage —
+                            // `terminated` for an endpoint that closed the socket mid-stream
+                            // — and the sentence about it is ours, in terms of what the
+                            // user can see: an answer that stopped before it was done.
+                            self.pending_error = Some(
+                                msg.get("errorMessage")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("the model call failed")
+                                    .to_string(),
+                            );
+                        }
                     }
                     // Stored now, so a later crash cannot store it twice.
                     r.open_text.clear();
@@ -519,16 +585,46 @@ impl Translator {
             "toolcall_start" => {
                 let id = ame.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let name = ame.get("toolName").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                self.stream_cur = Some(id.clone());
                 self.args_stream.entry(id.clone()).or_default();
                 out.events.push(EngineEvent::ToolCallBegin { id, name });
             }
             "toolcall_delta" => {
                 let d = ame.get("delta").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                if let Some(cur) = self.stream_cur.clone() {
+                    self.args_stream.entry(cur).or_default().push_str(&d);
+                }
                 out.events.push(EngineEvent::ToolCallArgs(d));
             }
             "toolcall_end" => {
                 let tc = ame.get("toolCall").cloned().unwrap_or_default();
                 let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("a tool").to_string();
+                // Was the call repaired on the way in? pi's parser accepts truncated JSON
+                // and hands over a finished object without a word; cwoffee repairs the same
+                // way but says so, because a call someone else completed for the model is
+                // not the call the model wrote. Compare the fragments off the wire with
+                // what pi ended up running.
+                let streamed = self.args_stream.remove(&id).unwrap_or_default();
+                if self.stream_cur.as_deref() == Some(id.as_str()) {
+                    self.stream_cur = None;
+                }
+                let handed = matches!(
+                    tc.get("arguments"),
+                    Some(Value::Object(_)) | Some(Value::Null) | None
+                );
+                if handed && !streamed.trim().is_empty() && serde_json::from_str::<Value>(streamed.trim()).is_err() {
+                    out.events.push(EngineEvent::Error {
+                        message: cwoffee_engine::agent::repaired_args_note(
+                            &name,
+                            &format!(
+                                "the arguments as streamed did not parse as JSON ({} bytes); pi's parser                                  closed them and ran the call anyway — read the card before trusting what                                  it ran",
+                                streamed.trim().chars().count()
+                            ),
+                        ),
+                        fatal: false,
+                    });
+                }
                 match tc.get("arguments") {
                     Some(Value::Object(_)) | Some(Value::Null) | None => {
                         let args = tc.get("arguments").cloned().unwrap_or_else(|| Value::Object(Default::default()));
@@ -563,6 +659,15 @@ impl Translator {
         };
         if rec.get("aborted").and_then(|v| v.as_bool()) == Some(true) {
             out.events.push(EngineEvent::Error { message: "turn cancelled".into(), fatal: false });
+        }
+        // A run that ended with the model call in error must say so inside the same turn:
+        // the transcript holds half an answer either way, and without this the user's only
+        // clue is that the sentence stops. `finish` already says Error; this says why.
+        if let Some(err) = self.pending_error.take() {
+            out.events.push(EngineEvent::Error {
+                message: stream_death(&err),
+                fatal: false,
+            });
         }
         let streamed_ms = r
             .first_delta
@@ -770,6 +875,31 @@ fn add_usage(r: &mut Run, u: &Value) -> Option<()> {
 fn used_tokens(u: &Value) -> Option<usize> {
     let g = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     Some((g("input") + g("cacheRead") + g("cacheWrite")) as usize)
+}
+
+/// Put pi's provider error into words a person can act on. The distinction that matters
+/// is between an endpoint that stopped talking in the middle of an answer — where the
+/// transcript on screen is genuinely incomplete and retrying may help — and a call that
+/// was refused before it produced anything, where "the stream dropped" would be a wrong
+/// story. pi's own text is kept in the sentence either way.
+fn stream_death(raw: &str) -> String {
+    let low = raw.to_ascii_lowercase();
+    const TRANSPORT: &[&str] = &[
+        "terminated",
+        "econn",
+        "socket hang up",
+        "other side closed",
+        "fetch failed",
+        "network",
+        "etimedout",
+        "eof",
+        "aborted",
+    ];
+    if TRANSPORT.iter().any(|k| low.contains(k)) {
+        format!("the endpoint closed the connection in the middle of the answer: {raw}")
+    } else {
+        format!("the model call failed: {raw}")
+    }
 }
 
 fn finish_reason(stop: &str) -> FinishReason {

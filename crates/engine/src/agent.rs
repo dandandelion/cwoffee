@@ -104,6 +104,16 @@ pub fn uncapped_note(iters: usize) -> String {
     format!("{iters} tool calls so far and no cap set; set max_tool_iters in config.toml to bound a turn")
 }
 
+/// The sentence for "the arguments that came off the wire were not valid JSON, and
+/// something put them back together". Said out loud because a repaired call looks on
+/// screen exactly like a call the model wrote cleanly, and it is not: the model's intent
+/// was completed by an editor. Both cores have to be able to say it — the rust core does
+/// the repairing, the pi core watches another parser do it — so the client's check is for
+/// the sentence, not for who did the edit.
+pub fn repaired_args_note(name: &str, notes: &str) -> String {
+    format!("repaired malformed arguments for {name}: {notes}")
+}
+
 pub struct Agent {
     provider: Arc<dyn Provider>,
     registry: Registry,
@@ -795,11 +805,7 @@ impl Agent {
             Ok(o) => {
                 if o.repaired {
                     let _ = out.send(EngineEvent::Error {
-                        message: format!(
-                            "repaired malformed arguments for {}: {}",
-                            call.name,
-                            o.notes.join("; ")
-                        ),
+                        message: repaired_args_note(&call.name, &o.notes.join("; ")),
                         fatal: false,
                     });
                 }

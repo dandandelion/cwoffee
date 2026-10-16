@@ -355,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
             // instead of resetting to the coworker.
             cfg_path: Some(config_path.clone()),
             max_tool_iters: appcfg.max_tool_iters(),
+            compact_timeout: appcfg.compact_timeout(),
         })
         .await?;
         // Not a claim about tools or extensions: those are chosen per process by the

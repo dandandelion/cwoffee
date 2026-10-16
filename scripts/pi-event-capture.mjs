@@ -32,7 +32,10 @@ const PROMPTS = {
   "read-file-approval": "Use read_file to read the file /etc/hostname",
   "count-fifteen": "Count from 1 to 15.",
 };
-const PROMPT = PROMPTS[SCENARIO] ?? PROMPTS["count-fifteen"];
+// PROMPT can be overridden: the scripted endpoint chooses a scenario by matching the
+// prompt text, so capturing what pi does with a mid-stream abort needs the prompt that
+// scenario is written for, not only the two the spike happened to need.
+const PROMPT = process.env.PROMPT ?? PROMPTS[SCENARIO] ?? PROMPTS["count-fifteen"];
 const OUT = process.env.OUT ?? path.join(root, "crates", "bridge", "tests", "fixtures", `pi-events-${SCENARIO}.jsonl`);
 
 function piNodeModules() {
@@ -48,7 +51,13 @@ function piNodeModules() {
 
 mkdirSync(AGENT_DIR, { recursive: true });
 mkdirSync(WORKDIR, { recursive: true });
-writeFileSync(path.join(AGENT_DIR, "models.json"), readFileSync(path.join(here, "..", "spike", "models.json"), "utf8"));
+// MODELS_JSON lets a capture point at a different scripted endpoint than the spike's:
+// two captures on one port would otherwise race, and a capture that shares a port with a
+// running harness reads the harness's traffic as if it were its own.
+writeFileSync(
+  path.join(AGENT_DIR, "models.json"),
+  readFileSync(process.env.MODELS_JSON ?? path.join(here, "..", "spike", "models.json"), "utf8"),
+);
 const extDst = path.join(AGENT_DIR, "extensions", "cwoffee-tools.ts");
 mkdirSync(path.dirname(extDst), { recursive: true });
 copyFileSync(path.join(here, "..", "spike", "pi-extension-cwoffee-tools.ts"), extDst);

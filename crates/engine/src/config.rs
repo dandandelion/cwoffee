@@ -106,6 +106,14 @@ pub struct Config {
     /// inside three minutes, which is what session 1306 found. Range 15..=3600.
     #[serde(default)]
     pub question_timeout_secs: Option<u64>,
+    /// How long a **manual compaction** may take before cwoffee stops waiting and says
+    /// so. Absent means 1800 seconds. This is not a formality: folding a conversation
+    /// around 200k tokens is a model call that summarizes all of it, and on a local
+    /// endpoint that runs the clock at reading speed it takes many minutes. A short
+    /// timeout does not make compaction faster; it makes a working compaction look
+    /// broken, and the user pays for the summary twice.
+    #[serde(default)]
+    pub compact_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -293,6 +301,8 @@ fn table_hint(err: &toml::de::Error) -> String {
         "mode",
         "persona",
         "approval_timeout_secs",
+        "compact_timeout_secs",
+        "question_timeout_secs",
         "theme",
         "provider",
         "context",
@@ -584,6 +594,13 @@ impl Config {
 
     pub fn question_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.question_timeout_secs.unwrap_or(180))
+    }
+
+    /// The budget for one manual compaction. Deliberately generous, and deliberately a
+    /// knob: a ~200k-token fold was measured taking well past five minutes on this box,
+    /// and the only thing a tight ceiling accomplishes is a false report of failure.
+    pub fn compact_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.compact_timeout_secs.unwrap_or(1800))
     }
 
     /// Validate the question timeout. A tiny value makes `ask_user` useless (the card

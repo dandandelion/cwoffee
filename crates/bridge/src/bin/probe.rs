@@ -147,6 +147,7 @@ async fn run() -> anyhow::Result<()> {
         persona: cwoffee_engine::host::Persona::Cowork,
         cfg_path: None,
         max_tool_iters: 0,
+        compact_timeout: std::time::Duration::from_secs(1800),
     })
     .await?;
     println!("pi {} at {}", host.pi_version, pi_bin.display());

@@ -805,6 +805,7 @@ async fn pi_host(
         // app booted from, so the mode is a property of the install, not of one window.
         cfg_path: cfg.cfg_path.clone(),
         max_tool_iters: appcfg.max_tool_iters(),
+        compact_timeout: appcfg.compact_timeout(),
     })
     .await
     .map_err(|e| format!("{e}"))?;
