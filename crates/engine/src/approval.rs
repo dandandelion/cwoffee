@@ -521,6 +521,8 @@ mod tests {
             // command to a substring matcher. Only letters *inside* a word are
             // treated as a different word - that is the line between a false
             // block and a hole.
+            // The wide spacing here is the test: the fence has to survive the model
+            // padding a keyword out, so do not "tidy" it.
             "sudo    umount /mnt",
             "; crontab -e",
             "(service nginx restart)",

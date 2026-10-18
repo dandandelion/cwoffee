@@ -649,7 +649,7 @@ mod cfg_tests {
         assert!(one > 0 && one < 1600, "sheet_query alone is {one} bytes");
         assert!(
             total < 11_000,
-            "the whole tool block is {total} bytes: two spreadsheet tools now, and              a description longer than this is a per-turn tax on every session"
+            "the whole tool block is {total} bytes: two spreadsheet tools now, and a description longer than this is a per-turn tax on every session"
         );
     }
 

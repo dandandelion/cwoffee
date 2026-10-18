@@ -22,6 +22,16 @@ const workspace = get('--workspace', process.env.HOME + '/cwoffee-workspace')
 const file = get('--file', 'README.md')
 const turnTimeoutMs = Number(get('--turn-timeout', '180000'))
 const abs = `${workspace.replace(/\/$/, '')}/${file}`
+
+// The gate needs a file the tool can be asked to read. Seed one rather than reaching
+// into somebody's real folder for a file that may not be there: a gate that dies on a
+// missing README (an ENOENT stack, no verdict) reads as an app failure when it is a
+// missing scratch directory. Same for the folder itself.
+fs.mkdirSync(workspace, { recursive: true })
+if (!fs.existsSync(abs)) {
+  fs.writeFileSync(abs, 'Cwoffee workspace-gate fixture.\nThis file exists so read_file has something to read.\n')
+  console.log(`  note: wrote ${abs} — the gate's own fixture, nothing of yours`)
+}
 // What the tool must bring back. Compare on whole *lines*, because the engine's
 // read_file numbers them ("1\t# BESPOT — working checkpoint") and paginates long files:
 // a raw 40-character window of the file straddles a line number and fails for the wrong
@@ -89,7 +99,15 @@ for (const w of want) {
   if (!transcript.includes(w)) fail.push(`the transcript does not contain the line "${w.slice(0, 60)}…" from ${abs}`)
 }
 if (!/showing \d+/.test(transcript)) fail.push('no line-count report in the read: the tool answered without describing what it showed')
-if (!/"ok"\s*:\s*true/.test(transcript)) fail.push('no successful tool read in the transcript')
+// Success, in the shape the transcript actually holds. A successful read stores the
+// engine's own model-facing text — `N\tline…` plus a "showing N of M lines" note, both
+// asserted above; a failed one starts `ERROR (exit …)`. An earlier version looked for
+// `"ok": true`, which is a property of the JSON envelope: a wire shape on one core, not
+// a stored fact. Once the tool's own words became the model-facing text that check was
+// asserting nothing about the read, and it failed a run where the read had plainly
+// worked (gotchas 55, 71, 77).
+const errLine = transcript.match(/ERROR \(exit[^\n]{0,140}/)
+if (errLine) fail.push(`the stored tool read is an error, not a read: ${errLine[0]}`)
 // A refusal *of this file* is the bug under test. Refusals of other paths (the model
 // probing somewhere else) are information, not failure — the confinement is working.
 const refusals = (transcript.match(/refused/gi) ?? []).length

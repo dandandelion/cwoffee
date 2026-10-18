@@ -798,6 +798,36 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     correctly refused to download 460 MB. The failure read as "the model did not name it".
     When a real-thing phase fails, read which paths the caller handed it before believing
     the thing itself.
+76. **What the model reads and what the card reads are two different claims, and the tool
+    extension was making one claim do both jobs.** The pi tool extension used to hand the
+    model `JSON.stringify(envelope)`. So the model read a spreadsheet grid as one escaped
+    line — `Region\nUnits\nWest\t26` — which costs more prompt tokens, reads worse to a
+    small model, and broke the mock endpoint's `require` strings, which look for a real tab.
+    pi already has the right seam: `AgentToolResult.content` is model-facing, `details` is
+    "kept out of the prompt, for logs and UI". Model gets the engine's own `render_result`
+    bytes (exported, because *what a model reads for a tool result is engine policy* — two
+    cores wording it differently is two behaviours); the envelope travels in `details`, where
+    the bridge reads `files` and the `+N -M`.
+77. **Keep both vintages when the shape of a tool result moves.** Fixtures captured before
+    the change put the envelope in the model-facing text; a bridge that only understands the
+    new shape loses the file chips and the diff badge *silently*. `envelope_of()` prefers
+    `details` and falls back to parsing the text, and both are tested.
+78. **Your own message has to be in the store before the host asks anything of a model.**
+    The rust core records a send as a fact, then asks; the pi bridge let pi's echo create
+    the row, so while the bridge was opening a pi thread for a conversation the message you
+    had just sent was not on screen — the oldest "my message disappeared" complaint, reborn
+    as a 4-second window. Now `on_send` appends the user row (attachments included) before
+    `ensure_child`, tells the translator to skip pi's echo row, and the echo still does its
+    reconciliation work — the suppression is one message, not one session, and a store
+    failure falls back to the echo rather than losing the message.
+79. **A note only one core says is a hole, not a style difference.** The rust core explains
+    what a resumed conversation costs ("resumed session N: … message(s), ~N tokens …"); the
+    pi core said nothing, so the same click on the same row was described differently
+    depending on what was behind it, and the harness noticed. The bridge now says it once per
+    session per process, claiming the stored transcript's size always, a token figure only
+    once a turn has reported one, and never a cache state — which stays the endpoint's
+    business.
+
 
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
@@ -815,8 +845,27 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
    (pi is cache-aware — it has a cache-warmer and disables cache writes for summarisation —
    but "byte-identical prefix" was *our* invariant and is now pi's behaviour, not ours.)
 5. **Does a coworker want pi's compaction summary tone?** It is written for coding sessions.
-6. **`ask_user` multi-question cards** — sequential `select`/`input` dialogs (free, matches
-   our `pending_q` deque) vs a custom tool + our own card protocol (Back/Next, one card).
+6. **`ask_user` on the pi core** — **designed, not built**; this is why the harness still says
+   "the scripted ask_user set produced no card". `cwtool` runs tools with `ToolCtx.ask = None`,
+   so a tool's question has no road back to a card and goes unanswered. The road, in the order
+   the pieces actually exist:
+   * the **extension** asks, because it is the only party that can: pi runs the tool inside the
+     extension, so the bridge first learns of the call at `tool_execution_start`, which is too
+     late to ask first. `ctx.ui.confirm/select/input` already round-trips to the bridge
+     (approvals use it) and RPC-mode extension UI works with a timeout that auto-resolves —
+     the same fail-closed posture as approvals.
+   * the **bridge** turns that request into cwoffee's own question card (`QuestionRequested`)
+     and answers the extension when the client responds or the clock runs out, so there is
+     still one card with one owner.
+   * the **answers reach `cwtool` as a flag, never in the args**: `cwtool run ask_user
+     --host-answers <json>`, building a `ToolCtx.ask` that returns them. Args are
+     model-authored, so answers arriving there would let the model answer its own question —
+     which is the entire point of the tool.
+   * the **engine keeps the wording**: `ask_user` formats its own result ("nobody answered",
+     the answer list) so both cores say the same thing to the model.
+   Open sub-question: one card holding every question (today's card, Back/Next) versus
+   sequential `select`/`input` dialogs. One card is the product behaviour; sequential dialogs
+   are twenty lines. Decide with the card in front of you, not the tool.
 7. **Do we keep `crates/tui` as a bridge-driven debug client?** (It becomes ~300 lines if the
    frames are already right; useful in the field, but it no longer shows 7 MB.)
 
@@ -948,6 +997,37 @@ behaviour, and exactly why the gate prints the mode it ran in.
 ---
 
 ## PROGRESS JOURNAL (newest on top)
+### Session 11 — the model reads a tool's words again, and a send is stored before it is asked
+
+Ran the page harness on the pi core: **6 red** (4 carried over, plus a message that vanished
+from the transcript and a geometry skip because a second app window was covering the run).
+Three fixes, each of which was a claim the app was making wrongly rather than a missing
+feature:
+
+- **The tool extension was handing the model a JSON envelope.** pi's `content` is what the
+  model reads; `details` is what the UI and the log read. The extension put
+  `JSON.stringify(envelope)` in `content`, so a spreadsheet grid arrived as one escaped line
+  (`West\t26` became `West\t26` with literal backslashes) — more prompt bytes, a worse
+  table for a 230M-parameter reader, and the mock endpoint's `require` strings stopped
+  matching, which is why the sheet-query and titled-header turns "stopped before their last
+  step". Now `cwtool` carries the engine's own `render_result` text (made public — wording a
+  tool result is engine policy, not the bridge's) and the extension puts *those bytes* in
+  `content` and the envelope in `details`. The bridge reads metadata from `details` first
+  and still parses the older shape, so the captured fixtures keep their authority (gotchas
+  76-77). Three new bridge tests, one per vintage plus the dedupe.
+- **A send is a fact the user made, so it is stored before anything is asked.** The rust
+  core appends the user row, then calls the provider; the bridge let pi's echo create it, so
+  while the bridge was opening a pi thread the message you had just sent was missing from
+  the transcript. `on_send` stores the row (with attachments) before `ensure_child` and
+  suppresses pi's echo row only — reconciliation and its note still run (gotcha 78).
+- **The resumed-history note existed on one core only.** Same click, different story.
+  Bridge says it once per session per process, with the numbers it can actually see
+  (gotcha 79).
+- Docs also caught up with a stale claim in the README: it still described the context
+  budget as `window * 0.72 - 2048` after the budget became half the window (131,072 of
+  262,144 measured). A formula in a doc that the code no longer implements is a false claim
+  with better grammar than a bug.
+
 ### Session 10 — titles: a 230M model on this machine names the conversation ✅
 
 The ask was small and specific: stop titling conversations with their first line, use

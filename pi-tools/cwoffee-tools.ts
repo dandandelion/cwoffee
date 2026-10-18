@@ -69,12 +69,12 @@ export default function (pi: ExtensionAPI) {
 				// `notes.md` are different decisions and the card has to say which.
 				const chk = cwtool("check", name, params) as any;
 				if (!chk?.ok) {
-					return { content: [{ type: "text", text: `blocked: ${chk?.error ?? "the tool could not be assessed"}` }], isError: true };
+					return { content: [{ type: "text", text: `blocked: ${chk?.error ?? "the tool could not be assessed"}` }], details: chk, isError: true };
 				}
 				if (chk.needs_approval) {
 					const yes = await ctx.ui.confirm(`Allow ${name}?`, chk.summary, { timeout: APPROVAL_TIMEOUT_MS });
 					if (!yes) {
-						return { content: [{ type: "text", text: "blocked: user denied approval" }], isError: true };
+						return { content: [{ type: "text", text: "blocked: user denied approval" }], details: chk, isError: true };
 					}
 				}
 				// The escapes the user just saw are the permits for THIS call only. The engine
@@ -84,8 +84,13 @@ export default function (pi: ExtensionAPI) {
 				for (const p of chk.escapes ?? []) permits.push("--permit", p);
 
 				const res = cwtool("run", name, params, permits) as any;
-				const text = JSON.stringify(res);
-				return { content: [{ type: "text", text }], isError: res?.ok !== true };
+				// What the model reads is the tool's own words (`render_result` in the
+				// engine), not the envelope: a spreadsheet grid handed over as escaped JSON
+				// costs more prompt tokens and reads worse. The envelope still travels, in
+				// pi's `details`, which is kept out of the prompt and given to the UI and the
+				// log — that is where the bridge reads `files` and the `+N -M` from.
+				const text = typeof res?.rendered === "string" && res.rendered.length > 0 ? res.rendered : JSON.stringify(res);
+				return { content: [{ type: "text", text }], details: res, isError: res?.ok !== true };
 			},
 		});
 	}

@@ -1163,7 +1163,7 @@ mod tests {
         assert_eq!(
             r.escapes,
             vec!["/tmp/secrets/notes.txt".to_string()],
-            "the prompt must name the resolved path (.. collapsed), not the string              the model typed: {} vs {}",
+            "the prompt must name the resolved path (.. collapsed), not the string the model typed: {} vs {}",
             d.display(),
             r.escapes[0]
         );

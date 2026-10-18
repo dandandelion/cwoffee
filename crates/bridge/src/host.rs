@@ -594,7 +594,7 @@ impl Engine {
                                 // is still there: compaction is the operation people fear, and
                                 // a bare error line reads as "and now it is gone".
                                 self.note(format!(
-                                    "compaction did not finish in {secs}s ({e}). Nothing was                                      thrown away: the conversation is still whole as far as                                      cwoffee can tell, and pi may still be summarizing it. The                                      context meter after the next turn is the fact to look at                                      — raise `compact_timeout_secs` if this conversation is                                      simply big."
+                                    "compaction did not finish in {secs}s ({e}). Nothing was thrown away: the conversation is still whole as far as cwoffee can tell, and pi may still be summarizing it. The context meter after the next turn is the fact to look at — raise `compact_timeout_secs` if this conversation is simply big."
                                 ));
                             }
                             let _ = reply.send(out);
@@ -1306,7 +1306,7 @@ impl Engine {
                     }
                 }
                 None => self.err(format!(
-                    "that run made {} file(s) but stored no answer to attach them to — they are on                      disk, not in the transcript",
+                    "that run made {} file(s) but stored no answer to attach them to — they are on disk, not in the transcript",
                     files.len()
                 )),
             }

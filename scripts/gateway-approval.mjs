@@ -1,3 +1,4 @@
+import { mkdirSync } from 'node:fs'
 // The approval round trip through the gateway, with a real tool behind it.
 //
 // `gateway-smoke.mjs` never answers an approval card — it has no such check — so the
@@ -20,6 +21,10 @@ const answer = get('--answer', 'allow') // allow | deny | allowSession
 // does not know about is a different conversation from the one in the sidebar.
 const workspace = get('--workspace', '/tmp/cw-smoke-ws')
 const turnTimeoutMs = Number(get('--turn-timeout', '30000'))
+// The gateway refuses a workspace that is not a directory, in words — which is right,
+// and unhelpful in a gate whose only sin is that a scratch folder was cleaned up. Create
+// it, and say which folder the run used.
+mkdirSync(workspace, { recursive: true })
 const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 const t = (ms) => new Promise((r) => setTimeout(r, ms))
 let id = 0
@@ -111,8 +116,15 @@ const transcript = JSON.stringify(rows)
 if (answer === 'allow') {
   if (seen.execEnd < 1) fail.push(`answered allow, but no tool-result event arrived (kinds: ${JSON.stringify(seen.kinds)})`)
   if (/blocked|denied approval|user denied/i.test(transcript)) fail.push('answered allow, yet something reports the *human* denied')
-  if (!/"ok":true/.test(transcript) && !/outside the workspace root/i.test(transcript)) {
-    fail.push('answered allow, and the tool neither read the file nor said which root it is confined to')
+  // Asserted in the tool's own words, not in an envelope's shape: the model-facing text
+  // (and therefore the stored row) is what the engine hands over — `output` when the call
+  // worked, `ERROR (exit …): <reason>` when it did not. A previous version of this check
+  // looked for `"ok":true`, which only ever matched a JSON-encoded tool result, i.e. it
+  // was testing the wire shape of one core rather than the product claim (gotcha 55/71).
+  const confined = /which is outside the workspace \S*/i.test(transcript)
+  const readIt = /hostname|localhost|[a-z0-9-]+\.local/i.test(transcript)
+  if (!confined && !readIt) {
+    fail.push(`answered allow, and the tool neither read the file nor said which workspace it is confined to: ${transcript.slice(0, 320)}`)
   }
 }
 if (answer === 'deny') {

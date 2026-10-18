@@ -234,7 +234,11 @@ verdict=""
 while [ $SECONDS -lt $deadline ]; do
   if grep -q "SELFTEST ok" "$log" 2>/dev/null; then verdict=ok; break; fi
   if grep -q "SELFTEST FAILED" "$log" 2>/dev/null; then verdict=fail; break; fi
-  kill -0 "$APP_PID" 2>/dev/null || { verdict=crash; break; }
+  # "Is there a process slot" is not "is it running". A window the user closed leaves a
+  # reaped-or-zombie pid that `kill -0` happily answers for, and the run then sits out the
+  # whole 900 s before saying what happened in the first three seconds. Read the state.
+  st=$(awk '{print $3}' "/proc/$APP_PID/stat" 2>/dev/null)
+  [ -n "$st" ] && [ "$st" != Z ] || { verdict=crash; break; }
   sleep 1
 done
 [ -n "$verdict" ] || verdict=timeout
@@ -264,7 +268,9 @@ case $verdict in
     exit 0 ;;
   crash)
     printf '\033[31mthe app exited before printing a verdict; last lines:\033[0m\n' >&2
-    tail -25 "$log" >&2; exit 1 ;;
+    tail -25 "$log" >&2
+    printf '\033[31mthe harness drives a real window: if that window was closed, minimised or\ncovered during the run, the run is not a failure of the app, it is a run that\nnever happened. Re-run with the window left alone.\033[0m\n' >&2
+    exit 1 ;;
   timeout)
     printf '\033[31mno verdict in 900s; last lines:\033[0m\n' >&2
     tail -25 "$log" >&2; exit 1 ;;

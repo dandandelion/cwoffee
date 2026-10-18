@@ -175,7 +175,7 @@ impl TitleGenCfg {
         }
         if !self.python.is_file() {
             return Err(format!(
-                "no python for the title helper at {} — create the venv, or point titlegen_python at one with                  torch and transformers",
+                "no python for the title helper at {} — create the venv, or point titlegen_python at one with torch and transformers",
                 self.python.display()
             ));
         }
@@ -422,7 +422,7 @@ pub fn maybe_name(
         let _ = ev.send(EngineEvent::Note {
             session: Some(session_id),
             message: format!(
-                "titlegen is on but cannot run: {what}. The conversation keeps its automatic title;                  the peak cost of the helper is about {} MB of memory for a few seconds per new                  conversation, which is why it is opt-in.",
+                "titlegen is on but cannot run: {what}. The conversation keeps its automatic title; the peak cost of the helper is about {} MB of memory for a few seconds per new conversation, which is why it is opt-in.",
                 st.peak_rss_mb
             ),
         });

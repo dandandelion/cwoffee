@@ -618,7 +618,7 @@ impl Translator {
                         message: cwoffee_engine::agent::repaired_args_note(
                             &name,
                             &format!(
-                                "the arguments as streamed did not parse as JSON ({} bytes); pi's parser                                  closed them and ran the call anyway — read the card before trusting what                                  it ran",
+                                "the arguments as streamed did not parse as JSON ({} bytes); pi's parser closed them and ran the call anyway — read the card before trusting what it ran",
                                 streamed.trim().chars().count()
                             ),
                         ),

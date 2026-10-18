@@ -87,7 +87,7 @@ pub fn confine_permitted(workspace: &Path, raw: &str, permits: &[PathBuf]) -> Re
                 Ok(p)
             } else {
                 Err(format!(
-                    "{raw:?} resolves to {}, which is outside the workspace {}.                      Use a path relative to the workspace root.",
+                    "{raw:?} resolves to {}, which is outside the workspace {}. Use a path relative to the workspace root.",
                     p.display(),
                     lexical_resolve(workspace, ".").display()
                 ))

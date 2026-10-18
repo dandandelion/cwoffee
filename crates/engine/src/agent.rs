@@ -477,7 +477,7 @@ impl Agent {
                 // instruction pushed through history would render a user bubble the
                 // user never typed.
                 req.messages.push(Message::user(
-                    "Your previous message was cut off at the output limit. Continue it from              exactly where it stopped, in the same language, without repeating anything              you already wrote.",
+                    "Your previous message was cut off at the output limit. Continue it from exactly where it stopped, in the same language, without repeating anything you already wrote.",
                 ));
             }
 
@@ -505,7 +505,7 @@ impl Agent {
                     };
                     let _ = out.send(EngineEvent::Error {
                         message: format!(
-                            "no answer: the model used all {} completion tokens on thinking and stopped at the output limit.                              Lower the thinking level, or raise {cap}.",
+                            "no answer: the model used all {} completion tokens on thinking and stopped at the output limit. Lower the thinking level, or raise {cap}.",
                             collected.telemetry.completion_tokens
                         ),
                         fatal: false,
@@ -545,7 +545,7 @@ impl Agent {
                     let _ = out.send(EngineEvent::Note {
             session: Some(session_id),
                         message: format!(
-                            "the answer is still cut short at the output limit ({} tokens).                              Raise max_output_tokens in config.toml, or the server's -np.",
+                            "the answer is still cut short at the output limit ({} tokens). Raise max_output_tokens in config.toml, or the server's -np.",
                             collected.telemetry.completion_tokens
                         ),
                     });
@@ -605,7 +605,7 @@ impl Agent {
         req.max_tokens = self.cfg.max_tokens;
         self.cfg.sampling.apply(&mut req);
         req.messages.push(Message::user(
-            "You have used up your tool budget. Do not request any more tools.              In the user's own language, say in a few sentences what you actually              did, what you produced or changed (by name), and what is still              unfinished or unverified. Plain prose, no tool calls.",
+            "You have used up your tool budget. Do not request any more tools. In the user's own language, say in a few sentences what you actually did, what you produced or changed (by name), and what is still unfinished or unverified. Plain prose, no tool calls.",
         ));
 
         match self.stream_once(&req, out, session_id).await {
@@ -876,7 +876,7 @@ impl Agent {
                     || reason == "pipe into shell";
                 let text = if denied_by_policy {
                     format!(
-                        "BLOCKED BY THE DENYLIST ({reason}). No user refused this call: the shape                          of it is blocked in every mode. Do not retry it as written. If the                          pattern matched inside an unrelated word, rephrase the command; if it                          was writing a file, use write_file/edit_file instead."
+                        "BLOCKED BY THE DENYLIST ({reason}). No user refused this call: the shape of it is blocked in every mode. Do not retry it as written. If the pattern matched inside an unrelated word, rephrase the command; if it was writing a file, use write_file/edit_file instead."
                     )
                 } else {
                     format!("DENIED BY USER ({reason}). Do not retry this call.")

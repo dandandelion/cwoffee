@@ -1515,7 +1515,7 @@ fn read_xlsx(
         } else if cell_addrs {
             let cols: Vec<usize> = (c1..=c2).collect();
             out.push_str(&format!(
-                "# sheet {:?} rows {}-{} cols {}-{} - one line per row, only the cells that have                  a value, as CELL=value\n",
+                "# sheet {:?} rows {}-{} cols {}-{} - one line per row, only the cells that have a value, as CELL=value\n",
                 sm.name,
                 r1 + 1,
                 r2 + 1,

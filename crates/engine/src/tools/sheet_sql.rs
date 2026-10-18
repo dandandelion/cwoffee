@@ -717,7 +717,7 @@ impl Shape {
                 let skipped = loaded.rows.keys().copied().filter(|r| *r < h).count();
                 if skipped > 0 {
                     note.push_str(&format!(
-                        "# note: rows 1-{skipped} sit above the header (titles, names, dates) so they are not rows of t.                          If they are data, pass header_row=1; if you only want part of the sheet, pass range.\n"
+                        "# note: rows 1-{skipped} sit above the header (titles, names, dates) so they are not rows of t. If they are data, pass header_row=1; if you only want part of the sheet, pass range.\n"
                     ));
                 }
                 note
