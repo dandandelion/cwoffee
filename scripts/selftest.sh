@@ -76,8 +76,20 @@ else
   # it read at start-up. Testing against that stale copy silently hides every change
   # made since - which is how one run reported that a scenario existed while the
   # server answering it had never seen it.
-  if curl -fsS "http://127.0.0.1:${MOCK_PORT}/mock/state" >/dev/null 2>&1; then
-    die "port ${MOCK_PORT} is already answering as a mock-llm. It holds an old copy of scenarios.json; kill it (pkill -f 'mock-llm.mjs --port ${MOCK_PORT}') or set MOCK_PORT=…"
+  # Answer "is this server current?", not "is something listening here?". An earlier
+  # version refused any listener, which told the operator to kill a mock that had just
+  # been started with the current file - and told them to pattern-kill it, which is the
+  # kind of instruction that once ended an unrelated process with the same name.
+  state=$(curl -fsS "http://127.0.0.1:${MOCK_PORT}/mock/state" 2>/dev/null || true)
+  if [ -n "$state" ]; then
+    want=$(node -e 'const c=require("node:crypto"),f=require("node:fs");process.stdout.write(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex").slice(0,12))' tests/scenarios/scenarios.json)
+    got=$(node -e 'const s=JSON.parse(process.argv[1]||"{}");process.stdout.write(String(s.fingerprint ?? ""))' "$state")
+    if [ -n "$got" ] && [ "$got" = "$want" ]; then
+      note "port ${MOCK_PORT} answers as a mock-llm with the CURRENT scenarios.json (fingerprint $got) - reusing it"
+    else
+      pid=$(ss -ltnp "sport = :${MOCK_PORT}" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+      die "port ${MOCK_PORT} answers as a mock-llm with a stale or unknown scenario set (it says ${got:-no fingerprint}, the file says $want). End that one server by its pid (${pid:-not found from ss}) — do not pattern-kill by name, something else may answer to it — or set MOCK_PORT=…"
+    fi
   fi
   note "starting mock endpoint on 127.0.0.1:${MOCK_PORT} (speed x${SPEED})"
   node scripts/mock-llm.mjs --port "$MOCK_PORT" --speed "$SPEED" >>"$log" 2>&1 &
@@ -118,6 +130,18 @@ note "config dir : ${XDG_CONFIG_HOME:-$HOME/.config}"
 note "data dir   : ${XDG_DATA_HOME:-$HOME/.local/share}"
 note "workspace  : ${CWOFFEE_WORKSPACE:-default}"
 note "gateway    : 127.0.0.1:${GW_PORT} (not 8099: the running app keeps its gateway)"
+# The board's meaning depends entirely on this line. A run with no CWOFFEE_CORE exercises the
+# rust engine, and its results say nothing at all about pi parity — which is how a missing
+# pi-core feature stayed green for two sessions (gotchas 85, 86). Say the core, and say out
+# loud when the pi core has no toolhost: without cwtool the model is told "tool not found"
+# for every call, and half the board turns into a core-shape accident.
+note "core       : ${CWOFFEE_CORE:-rust} (from the environment; check /proc/<app>/environ if unsure)"
+if [ "${CWOFFEE_CORE:-rust}" = pi ] && [ -z "${CWOFFEE_CWTOOL:-}" ]; then
+  note "core       : pi WITHOUT CWOFFEE_CWTOOL — the extension will register no Rust tools;"
+  note "             every tool call becomes 'tool not found' and tool-heavy checks test nothing"
+elif [ "${CWOFFEE_CORE:-rust}" = pi ]; then
+  note "toolhost   : ${CWOFFEE_CWTOOL}"
+fi
 note "log        : $log"
 
 cleanup() {

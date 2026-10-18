@@ -40,6 +40,7 @@
  *   POST /mock/reset          -> clear instrumentation
  */
 
+import crypto from 'node:crypto'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -71,7 +72,14 @@ if (HOST !== '127.0.0.1' && HOST !== 'localhost') {
 
 // ---- scenario script -------------------------------------------------------
 
-const script = JSON.parse(fs.readFileSync(SCENARIOS, 'utf8'))
+const scenariosRaw = fs.readFileSync(SCENARIOS, 'utf8')
+const script = JSON.parse(scenariosRaw)
+// A fingerprint of the scenario file this process read at start-up. A gate that starts
+// a mock and a gate that reuses one cannot otherwise tell whether the server answering
+// on the port saw the scenarios.json that is on disk right now — and testing against a
+// stale copy silently hides every scenario added since.
+const FP = crypto.createHash('sha256').update(scenariosRaw).digest('hex').slice(0, 12)
+const SCENARIO_COUNT = Object.keys(script.scenarios ?? script).length
 const defaults = script.defaults ?? {}
 const MODEL = script.model ?? 'cwoffee-mock'
 
@@ -348,7 +356,9 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'GET' && url.pathname === '/mock/state') {
     res.writeHead(200, { 'content-type': 'application/json' })
-    return res.end(JSON.stringify({ model: MODEL, speed: SPEED, ...stats }))
+    return res.end(
+      JSON.stringify({ model: MODEL, speed: SPEED, scenarios: SCENARIO_COUNT, fingerprint: FP, ...stats }),
+    )
   }
   if (req.method === 'POST' && url.pathname === '/mock/reset') {
     stats.requests = 0

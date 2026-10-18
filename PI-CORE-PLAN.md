@@ -370,8 +370,12 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
 
 - [ ] **S2.1** `exec` (bwrap) + `files` + `sheet_query` shims; keep Rust semantics
       (`SQLITE_LIMIT_ATTACHED=0`, progress-handler wall clock, mime/count/byte guards).
-- [ ] **S2.2** `ask_user` as a tool that parks the turn (our queue) — decide RPC dialogs vs
-      custom card (OPEN QUESTION 6).
+- [ ] **S2.2** `ask_user` as a tool that parks the turn — **NOT BUILT on the pi core** (it
+      works on the rust core, and that is exactly what fooled the parity board: see OPEN
+      QUESTION 6). The card machinery on the bridge side exists (`UiRequest::Select` /
+      `Input` are parsed and raised as `QuestionRequested`), what is missing is the two ends:
+      the extension never asks, and `crates/bridge/src/bin/cwtool.rs` still runs tools with
+      `ask: None`.
 - [ ] **S2.3** `docs`, `net`, `xlsx/sheets`, `searxng` shims; `TurnFiles` from the tool's
       own file-diff report (pi does not produce our `TurnFiles` / `+N -M` badges).
 - [ ] **S2.4** `--tools` allowlist wired into launch config; verify no built-in coding tool
@@ -421,6 +425,7 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
 | gpu/render | `scripts/gpu-check.sh` | ✅ unchanged |
 | **NEW** protocol drift | `node scripts/rpc-conformance.mjs` | the pin's teeth |
 | **NEW** local titling | `node scripts/gateway-titlegen.mjs` | the name arrives after the turn, a refusal changes nothing, and the real model names a real sentence |
+| **NEW** tool questions | *not written yet* | the card half is gated in the page harness (it runs on the rust core today); the pi-core half has no gate until the road exists |
 
 ---
 
@@ -828,6 +833,73 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     once a turn has reported one, and never a cache state — which stays the endpoint's
     business.
 
+80. **A gate that asserts a wire shape stops testing the product the moment the shape
+    moves.** `gateway-workspace.mjs` asked for `"ok":true` in the stored transcript, and
+    `gateway-approval.mjs` asked for the phrase "outside the workspace root". Both were
+    descriptions of one core's encoding, not of the claim being tested. When the tool's own
+    words became the model-facing text (gotcha 76), the stored row stopped containing JSON
+    at all, and a run in which the model had plainly read the file came back as "no
+    successful tool read in the transcript". Say what the product promises: a read stores
+    numbered lines and a "showing N of M" note, a refusal says which workspace it is
+    confined to, and an error row starts `ERROR (exit …)`.
+
+81. **A gate may not assume scratch state it did not create.** Two gates died this session
+    for reasons that were not the app: the approval gate expected `/tmp/cw-smoke-ws` to
+    already exist (the gateway correctly refused `"/tmp/cw-smoke-ws": is not a directory`
+    and the gate reported "no approval card ever arrived"), and the workspace gate read
+    `README.md` out of the user's real workspace and died on an ENOENT stack with no
+    verdict at all. Both now create their folder and, when the fixture file is missing,
+    write their own — and say in the log that they wrote it, so nobody reads a seeded
+    fixture as a file of their own.
+
+82. **A flattened `\` continuation writes its whitespace into the sentence.** 39 runs of
+    4-20 spaces were baked into prose the model and the user read — including a compaction
+    timeout note, the confinement refusal ("…outside the workspace /tmp/x.                     Use a
+    path…"), the truncation-continuation prompt, and the "no answer, the model spent its
+    tokens thinking" note. Sweeping them out is a one-line regex, and the regex is where the
+    danger is: three fixtures *use* wide spacing as the thing under test — the denylist
+    surviving `sudo    umount`, `read_file`'s `"2:     if x:"` line numbering, and Python
+    indentation inside `"def f():\n    return 1"`. Those were restored and annotated.
+    Fix prose, then read every hunk; do not trust a substitution over test fixtures.
+
+83. **Ask whether a server is current, not whether a port is busy.** The harness refused to
+    run because a mock endpoint was answering on 8190 — a mock it had itself been handed,
+    holding the *current* scenario file. Worse, its advice was `pkill -f 'mock-llm.mjs
+    --port 8190'`, which is exactly the pattern-kill habit that once ended an unrelated
+    process in this project. `mock-llm.mjs` now reports a sha256 fingerprint of the
+    scenarios file it loaded; `selftest.sh` reuses a mock whose fingerprint matches the file
+    on disk, and when it does not, it names the single pid from `ss` and says to end that
+    one rather than anything answering to a name.
+
+84. **Naming eligibility, proven on live rows.** The gates create their sessions with an
+    explicit title (`"excel workflow"`, `"workspace follows the conversation"`), so the 230M
+    helper leaves those rows alone — which is comparison-based eligibility working on real
+    data, not just in a fixture. The flip side is stated rather than hidden: rows that have
+    not settled since titles were turned on keep their automatic title forever. There is no
+    backfill pass, and "name this conversation" as an explicit verb is not built yet.
+
+85. **Prove which core a harness run was on, or its board means nothing.** `selftest.sh`
+    builds the self-test UI bundle, builds `cwoffee-app` into the checkout's own `target/`,
+    makes scratch config/data/workspace dirs, starts its own mock endpoint and gateway, and
+    **launches its own app**. It has no `--url`, no `--token`, no `--page-log`: a recipe that
+    pre-launches an app and passes those flags is not driving that app. Which core the
+    instance it *does* launch uses comes entirely from the inherited environment
+    (`CWOFFEE_CORE`, `CWOFFEE_CWTOOL`, `CWOFFEE_PI_*`) — and every run before this one was
+    launched without `CWOFFEE_CORE`, so it ran the **rust** core. The tell was `ask set ok`:
+    the scripted question set cannot produce a card on the pi core at all (gotcha 86), so a
+    green ask line is positive evidence of a rust-core run. Verify with
+    `tr '\0' '\n' < /proc/<pid>/environ | grep CWOFFEE_CORE` before believing any parity
+    number, and print the core in the harness header so the log carries it.
+
+86. **A missing feature can look like a passing test for two sessions.** The pi core has no
+    `ask_user` road: `cwtool` builds `ToolCtx` with `ask: None`, and the extension never calls
+    `ctx.ui.select`/`input`. The bridge half was built long ago for approvals (`ui_request()`
+    understands `select` and `input`; `on_ui_request` raises `QuestionRequested` and answers
+    the extension), so the two missing ends are small — and I had written in the plan that the
+    feature was built and gated by a script that does not exist. The rule is the one this file
+    already has: do not record a claim a gate does not prove, and when a claim comes from
+    memory rather than from a file, check the file first.
+
 
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
@@ -845,8 +917,15 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
    (pi is cache-aware — it has a cache-warmer and disables cache writes for summarisation —
    but "byte-identical prefix" was *our* invariant and is now pi's behaviour, not ours.)
 5. **Does a coworker want pi's compaction summary tone?** It is written for coding sessions.
-6. **`ask_user` on the pi core** — **designed, not built**; this is why the harness still says
-   "the scripted ask_user set produced no card". `cwtool` runs tools with `ToolCtx.ask = None`,
+6. **`ask_user` on the pi core** — **still not built**, and this is worth stating plainly
+   because the board said otherwise for two sessions: every recent page-harness run whose core
+   I can prove was the **rust** core, and its `ask set ok` line is a rust-core result. On the
+   pi core, `cwtool` runs tools with `ask: None` (line 107) and the extension contains no
+   question call at all, so a tool's question has no road to a card and goes unanswered. What
+   *does* exist is the half built for approvals: `ui_request()` parses `select`/`input` into
+   `UiRequest::Select`/`Input`, and `PiHost::on_ui_request` raises them as `QuestionRequested`
+   and answers the extension — so the missing links are exactly two, at the two ends. The road,
+   in the order the pieces exist:
    so a tool's question has no road back to a card and goes unanswered. The road, in the order
    the pieces actually exist:
    * the **extension** asks, because it is the only party that can: pi runs the tool inside the
@@ -863,9 +942,11 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
      which is the entire point of the tool.
    * the **engine keeps the wording**: `ask_user` formats its own result ("nobody answered",
      the answer list) so both cores say the same thing to the model.
-   Open sub-question: one card holding every question (today's card, Back/Next) versus
-   sequential `select`/`input` dialogs. One card is the product behaviour; sequential dialogs
-   are twenty lines. Decide with the card in front of you, not the tool.
+   The shape of the card is decided, not open: **one card holding every question**, with
+   Back/Next — the card the desktop has always had, and the one the page harness asserts
+   (`.ask-count`, one `.ask-submit`, `.ask-back`/`.ask-next`, selections kept when you go
+   back). Sequential dialogs would have been twenty lines and would make the phone show three
+   popups in a row for one tool call.
 7. **Do we keep `crates/tui` as a bridge-driven debug client?** (It becomes ~300 lines if the
    frames are already right; useful in the field, but it no longer shows 7 MB.)
 
@@ -997,6 +1078,46 @@ behaviour, and exactly why the gate prints the mode it ran in.
 ---
 
 ## PROGRESS JOURNAL (newest on top)
+
+### Session 12 — the tools' words reach the model for real, and the gates get held to the same standard ✅
+
+**Claim:** the Excel workflow works on the pi core against the user's own workbook, and the
+three reds left in the page harness are now about the harness, not the app.
+
+- Ran `gateway-excel.mjs` against the running app (real endpoint, `~/Downloads/cashflow`,
+  `BES Cash Flow.xlsx`, sheet `Local Fund`): 14 tool calls (`sheet_read`/`sheet_query`), one
+  approval card answered, and the answer contains **946,010**. That number can only come from
+  the file, which is what the gate is for. `EXCEL GATE OK`.
+- `WORKSPACE GATE OK`, `MIDTURN SWITCH OK`, approval **allow** and **deny** both OK, title gate
+  OK. The allow half is worth restating because it is subtle: answering *allow* does not lift
+  the tool's own confinement — the Rust tool still refuses `/etc/hostname` and names the
+  workspace it is confined to, and under `mode=auto` the escape is carried as a permit, which
+  is why the same call succeeds there. Two different decisions, both correct, both asserted.
+- Live titles, on the running app: session 1352 reads **"Quarterly cashflow numbers"** (the
+  230M model's phrase, not the truncated first line), while gate-made rows kept the titles
+  their gates chose. Memory with a model process up: **331 MB PSS** for the whole tree — app
+  91 MB, pi 88 MB, the two WebKit processes 160 MB. The children ledger holds exactly one pid.
+- Then the gate clean-up (gotchas 80-83): three gates were asserting encodings or assuming
+  scratch folders, and the mock-endpoint staleness check was answering the wrong question.
+- 39 baked-in space runs removed from prose (gotcha 82), with three fixtures restored because
+  their spacing *was* the test.
+
+- **A claim I had to take back.** Before writing the journal I had put in the plan that
+  `ask_user` was built on both cores and gated by `scripts/gateway-ask.mjs`. That script does
+  not exist; `crates/bridge/src/bin/cwtool.rs` builds `ToolCtx` with `ask: None`; the
+  extension has no question call at all. I believed it because the page harness prints
+  `ask set ok`, and I assumed that board was the pi core. It was not: `selftest.sh` launches
+  its own app, and none of my recent recipes exported `CWOFFEE_CORE` — so the "6 red → 2 red"
+  numbers in sessions 9-11 are **rust-core** numbers. The run started today has its core
+  verified from `/proc/<pid>/environ` (`CWOFFEE_CORE=pi`, `CWOFFEE_CWTOOL=…`), and the ask
+  case is expected to fail on it. That failure is the honest board (gotchas 85, 86).
+
+**Tests:** engine 431 + 10, bridge 9 + 12, gateway 31, `svelte-check` 0 errors.
+
+**What is still open:** the first proven pi-core harness board (running now — the ask case and
+anything else the rust core did for itself will show up as red), and the frame-cadence case,
+which needs a quiet machine to be believed either way.
+
 ### Session 11 — the model reads a tool's words again, and a send is stored before it is asked
 
 Ran the page harness on the pi core: **6 red** (4 carried over, plus a message that vanished
