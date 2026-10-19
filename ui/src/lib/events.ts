@@ -151,6 +151,14 @@ export interface HostState {
    * 53k of a 262k window was being trimmed because the budget was a constant.
    */
   context_budget: number
+  /**
+   * How the ceiling got its value. A number means a person pinned it (config or the
+   * settings screen); `null`/absent means the app derives it as half of the window the
+   * endpoint states. The difference is visible because a derived ceiling follows a model
+   * change and a pinned one does not — a panel that cannot tell them apart has to watch
+   * its own number move for reasons it cannot explain.
+   */
+  budget_pin?: number | null
   /** What the endpoint stated as the window, or null when it never said. */
   model_window: number | null
   /** How long an `ask_user` card stays open. Names itself in the timeout text. */

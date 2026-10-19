@@ -827,6 +827,7 @@ const AUDITED: &[&str] = &[
     "respond_approval",
     "respond_question",
     "set_search_backend",
+    "set_context_budget",
 ];
 
 /// Empty a pending map and report how many waiters were released.
@@ -1181,6 +1182,25 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 )
                 .await?;
             serde_json::to_value(v).map_err(|e| e.to_string())
+        }
+        "set_context_budget" => {
+            need_drive(role)?;
+            // Audited and drive-only: this writes the host's config file and moves the
+            // ceiling the conversation is measured and folded against.
+            //
+            // `target` is read as an *optional* number on purpose. `{"target": 60000}`
+            // pins it; `{"target": null}` — or no key at all — means "derive it from the
+            // window the endpoint states", which is a different setting from any number
+            // that could be typed in.
+            let target = args
+                .get("target")
+                .and_then(|v| v.as_i64())
+                .map(|n| n.max(0) as usize);
+            let said = h.host.set_context_budget(&h.config_path, target).await?;
+            // One shape for both shells: the sentence, not an envelope around it. The
+            // desktop command returns the same string, and a settings panel that has to
+            // know two wire shapes is a panel that shows `undefined` on one of them.
+            serde_json::to_value(said).map_err(|e| e.to_string())
         }
         "search_probe" => {
             need_drive(role)?;
@@ -2309,6 +2329,102 @@ mod tests {
     /// itself". Over the wire the refusal arrives as an error *event* (the rpc itself
     /// was well formed), so the client must render it; what this asserts is that
     /// nothing ran.
+    /// The context ceiling is a setting, not a fact about one window: a phone can pin
+    /// it, a watcher can see it, and "back to derived" has to be expressible at all.
+    #[tokio::test]
+    async fn a_context_ceiling_can_be_pinned_freed_and_refused_over_the_wire() {
+        let h = test_handle();
+        let _ = std::fs::remove_file(&h.config_path);
+        let before = run_cmd("session_state", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("state");
+        let start = before["context_budget"].as_u64().expect("a budget to show");
+        assert!(start > 0, "{before}");
+
+        // A watcher sees the number but cannot move it, and the refusal writes nothing.
+        let err = run_cmd(
+            "set_context_budget",
+            serde_json::json!({ "target": 60000 }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watcher must not be able to move the ceiling");
+        assert!(err.contains("watch"), "unhelpful: {err}");
+        assert!(!h.config_path.exists(), "a refused change writes no config either");
+
+        let out = run_cmd(
+            "set_context_budget",
+            serde_json::json!({ "target": 60000 }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("a driver can pin the ceiling");
+        assert!(out.as_str().unwrap().contains("pinned at 60000"), "{out}");
+        let text = std::fs::read_to_string(&h.config_path).expect("the pin was written");
+        assert!(text.contains("target_tokens = 60000"), "{text}");
+
+        // The running host follows the file, not the other way round.
+        let mut moved = false;
+        for _ in 0..40 {
+            let st = run_cmd("session_state", serde_json::json!({}), Role::Watch, &h)
+                .await
+                .expect("state");
+            if st["context_budget"].as_u64() == Some(60_000) {
+                moved = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(moved, "the meter never moved to the pinned ceiling");
+
+        // A ceiling under the floor is refused in words, not clamped: silently
+        // rounding somebody's number is a setting that did not do what was typed.
+        let bad = run_cmd(
+            "set_context_budget",
+            serde_json::json!({ "target": 900 }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("900 tokens cannot hold a prompt and its tools");
+        assert!(bad.contains("floor"), "unhelpful: {bad}");
+        let text = std::fs::read_to_string(&h.config_path).expect("still there");
+        assert!(
+            text.contains("target_tokens = 60000"),
+            "the refusal must not have edited the file: {text}"
+        );
+
+        // And back to derived, which is not a number: the line comes out of the file.
+        let free = run_cmd(
+            "set_context_budget",
+            serde_json::json!({ "target": null }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("the setting can be freed");
+        assert!(free.as_str().unwrap().contains("freed"), "{free}");
+        let text = std::fs::read_to_string(&h.config_path).expect("still there");
+        assert!(
+            !text.contains("target_tokens"),
+            "freeing the ceiling has to remove the line, or the next start re-pins it:\n{text}"
+        );
+        let mut back = false;
+        for _ in 0..40 {
+            let st = run_cmd("session_state", serde_json::json!({}), Role::Watch, &h)
+                .await
+                .expect("state");
+            if st["context_budget"].as_u64() == Some(start) {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(back, "the meter did not go back to the derived ceiling");
+    }
+
     /// The search panel on a phone drives the same file the desktop panel writes.
     /// What must hold: a watch token can read it, cannot change it, and a change
     /// that is accepted lands in the config file this process was given (a temp

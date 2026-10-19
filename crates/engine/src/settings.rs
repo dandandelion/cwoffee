@@ -1,4 +1,5 @@
-//! The search provider, as a thing the app can show and change.
+//! The settings the app can change: the search provider, and the ceiling a
+//! conversation is measured and folded against.
 //!
 //! This lives in the engine rather than in the desktop shell because there are two
 //! shells with the same panel: the window and the browser page on the phone. A
@@ -20,11 +21,66 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::host::SessionHost;
+use crate::host::{self, HostCmd, SessionHost};
 use crate::tools::searxng::{self, AutoSearXNG};
 use crate::tools::web::SearchBackend;
 
 /// What the search panel shows, and what it can change.
+/// Pin or free the ceiling a conversation is measured against.
+///
+/// Same two rules as the provider above: the file is written first and the running
+/// host follows what the file now says, and the sentence returned is what the panel
+/// shows, built from the read-back value rather than from the click.
+///
+/// `None` means "derive it": half of the window the endpoint states, which is what a
+/// person who has never opened a config file gets. The difference between "unset" and
+/// "set to some number" has to survive a restart, so freeing the setting deletes the
+/// line rather than writing a sentinel into it.
+pub async fn set_context_budget(
+    host: &SessionHost,
+    cfg_path: &Path,
+    target: Option<usize>,
+) -> Result<String, String> {
+    // The window the endpoint stated for the model that is loaded now. It is only used
+    // to refuse an impossible ceiling, and an endpoint that has not answered yet is not
+    // a licence to write any number: the floor still applies.
+    let window = SessionHost::state(host).model_window;
+    if let Some(n) = target {
+        host::check_budget(n, window)?;
+    }
+    let changed = match target {
+        Some(n) => Config::set_context_keys(cfg_path, &[("target_tokens", &n.to_string())])?,
+        None => Config::unset_context_keys(cfg_path, &["target_tokens"])?,
+    };
+    for c in &changed {
+        eprintln!("[cwoffee] context config: {c} ({})", cfg_path.display());
+    }
+    // Read the file back before applying it: "saved" and "applied" have to mean the
+    // same number, or a restart moves the ceiling under somebody who did not touch it.
+    let back = load_cfg(cfg_path).context.target_tokens;
+    if back != target {
+        return Err(format!(
+            "{} now says {:?}, which is not what was asked for ({:?}): nothing was applied",
+            cfg_path.display(),
+            back,
+            target
+        ));
+    }
+    SessionHost::send(host, HostCmd::SetContextBudget { target: back });
+    Ok(match back {
+        Some(n) => format!(
+            "context ceiling pinned at {n} tokens ({}); saved to {}",
+            host::budget_share(n, window),
+            cfg_path.display()
+        ),
+        None => format!(
+            "context ceiling freed: it will be derived as half of whatever window the endpoint states \
+             for this model; saved to {}",
+            cfg_path.display()
+        ),
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchView {
     /// `duckduckgo` | `searxng` | `auto` — the same vocabulary as the config file.

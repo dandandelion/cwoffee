@@ -206,6 +206,32 @@ conversations short on purpose; a pin is a decision, and the engine honours it a
 The old default was a hardcoded 8000 regardless of model, which compacted a 43k conversation
 on a 262k model and reported "context full". That is why the number now comes from the server.
 
+**You can change it without editing a file.** The telemetry panel (footer → *Session
+telemetry*, and the same body under Settings) has a **ceiling** row: it shows the number in
+force and says whether that is *pinned by you* or *derived: half of 262,144*. A box pins a
+new one, and **derive it** takes the pin off again — which is not a number, so freeing the
+setting deletes the line from `config.toml` instead of writing a sentinel into it. The file
+is written before the setting is applied, so a ceiling chosen on a phone is the ceiling the
+desktop shows after a restart. Both cores refuse the same two nonsense values in the same
+words: under 4096 tokens, and anything at or above the window the endpoint stated (a ceiling
+the endpoint would undercut first is a gauge that can never fill).
+
+On the pi core the model is told where the line is too. pi folds when its running count passes
+`window − compaction.reserveTokens`, and its default reserve (16 384) was chosen for coding
+sessions; cwoffee's meter filled against its own ceiling. Now cwoffee writes
+`reserveTokens = window − ceiling` for *this model* into its own agent dir, merging with
+whatever `settings.json` already holds and refusing to touch one it cannot parse. The boot
+line states it:
+
+```
+[cwoffee/pi] pi will fold above 131072 of 262144 tokens (… compaction.modelOverrides["cwoffee/qwen3…"].reserveTokens = 131072)
+```
+
+Before that, the meter and the fold were two different numbers, and which one you believed
+depended on which panel you opened. A model process that is already running keeps the
+threshold it started with — pi reads its settings when the process starts — and the note says
+so rather than implying the change is live inside a running process.
+
 ### What a conversation is called
 
 A conversation starts out named after its own first line, cut at 48 characters. That is

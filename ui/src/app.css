@@ -2646,6 +2646,18 @@ body {
   padding: 1px 6px;
   cursor: pointer;
 }
+/* The token count a person may type. It lives in a metrics row, so it is sized like the
+   row rather than like a form field: the only control that can carry a token count is a
+   number box, because the safe range belongs to the endpoint, not to a slider. */
+.mbar-row .mnum {
+  width: 8ch;
+  font-size: 10.5px;
+  padding: 1px 5px;
+  background: transparent;
+  color: var(--ink-2);
+}
+.mnum::-webkit-outer-spin-button,
+.mnum::-webkit-inner-spin-button { opacity: 1; }
 .mbtn[disabled] { opacity: 0.45; cursor: default; }
 .mbtn:hover:not([disabled]) { border-color: var(--ink-3); color: var(--ink); }
 

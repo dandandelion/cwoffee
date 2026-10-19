@@ -116,6 +116,103 @@ pub fn context_budget(pinned: Option<usize>, window: Option<usize>) -> usize {
         .unwrap_or(cwoffee_engine::host::FALLBACK_BUDGET)
 }
 
+/// Tell pi where the ceiling is, so its own folding and cwoffee's meter are one number
+/// stated twice.
+///
+/// pi folds when `contextTokens > contextWindow - compaction.reserveTokens` (its default
+/// reserve is 16 384, chosen for coding sessions). cwoffee's meter fills against a
+/// budget. Writing `reserveTokens = window - budget` makes the fold happen where the app
+/// says the conversation is full, instead of pi folding on a default nobody chose while
+/// the meter still shows a third of the window free.
+///
+/// It goes in as a **per-model override** (`compaction.modelOverrides["provider/model"]`),
+/// not globally: a reserve computed from one model's window must not follow a different
+/// model around. Everything else in the file is left exactly as it was — the agent dir is
+/// cwoffee's own, but a person may have put settings there, and a settings panel that
+/// rewrites the file wholesale is a panel that deletes somebody's configuration.
+///
+/// `None` is returned when the window is not known. Then pi keeps its defaults, and the
+/// caller says so rather than claiming a threshold it never wrote.
+pub fn mount_settings(
+    agent_dir: &Path,
+    provider: &str,
+    model: &str,
+    budget: usize,
+    window: usize,
+) -> anyhow::Result<Option<String>> {
+    if window == 0 || budget >= window {
+        return Err(anyhow::anyhow!(
+            "a ceiling of {budget} tokens leaves nothing of a {window}-token window for the answer"
+        ));
+    }
+    std::fs::create_dir_all(agent_dir)?;
+    let path = agent_dir.join("settings.json");
+    let mut doc: serde_json::Value = match std::fs::read(&path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| {
+                anyhow::anyhow!(
+                    "{} does not parse ({e}); refusing to overwrite a settings file we did not write",
+                    path.display()
+                )
+            })?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    if !doc.is_object() {
+        return Err(anyhow::anyhow!(
+            "{} is not a JSON object; refusing to overwrite it",
+            path.display()
+        ));
+    }
+    let reserve = window - budget;
+    let key = format!("{provider}/{model}");
+    let comp = doc
+        .as_object_mut()
+        .expect("checked above")
+        .entry("compaction")
+        .or_insert_with(|| serde_json::json!({}));
+    if !comp.is_object() {
+        return Err(anyhow::anyhow!(
+            "{} already has a `compaction` key that is not an object; refusing to guess what it meant",
+            path.display()
+        ));
+    }
+    let over = comp
+        .as_object_mut()
+        .expect("checked above")
+        .entry("modelOverrides")
+        .or_insert_with(|| serde_json::json!({}));
+    if !over.is_object() {
+        return Err(anyhow::anyhow!(
+            "{} already has a `compaction.modelOverrides` key that is not an object; refusing to guess",
+            path.display()
+        ));
+    }
+    let entry = over
+        .as_object_mut()
+        .expect("checked above")
+        .entry(key.clone())
+        .or_insert_with(|| serde_json::json!({}));
+    if !entry.is_object() {
+        return Err(anyhow::anyhow!(
+            "{} already has an override for {key} that is not an object; refusing to guess",
+            path.display()
+        ));
+    }
+    entry["reserveTokens"] = serde_json::json!(reserve);
+    let text = serde_json::to_string_pretty(&doc)?;
+    // Write-then-rename, as with the config file: a settings file truncated by a crash
+    // half-way through is a file pi cannot open on the next start.
+    let tmp = agent_dir.join("settings.json.tmp");
+    std::fs::write(&tmp, format!("{text}\n"))?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(Some(format!(
+        "pi will fold above {budget} of {window} tokens ({} compaction.modelOverrides[\"{key}\"].reserveTokens = {reserve})",
+        path.display()
+    )))
+}
+
 /// Ask the endpoint what window this model has, through the same probe the Rust core
 /// uses. `None` means the endpoint never said, which the UI reports rather than guesses.
 pub async fn probe_window(provider: &dyn cwoffee_engine::provider::Provider, model: &str) -> Option<u64> {
@@ -263,5 +360,61 @@ mod tests {
         assert!(find_bin(Path::new("sh")).is_some());
         assert!(find_bin(Path::new("definitely-not-a-binary-xyz")).is_none());
         assert_eq!(find_bin(Path::new("/bin/sh")).unwrap(), PathBuf::from("/bin/sh"));
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("cw-mount-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn pi_is_told_where_to_fold_without_losing_anybody_elses_settings() {
+        let dir = scratch("settings");
+        // Somebody else's file: a switch, and a compaction setting that is not ours.
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"showCacheMissNotices\": true, \"compaction\": {\"enabled\": true, \"keepRecentTokens\": 30000}}\n",
+        )
+        .unwrap();
+        let sentence = mount_settings(&dir, "cwoffee", "m1", 131_072, 262_144)
+            .unwrap()
+            .expect("a window was given, so a threshold can be written");
+        assert!(sentence.contains("fold above 131072 of 262144 tokens"), "{sentence}");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(doc["showCacheMissNotices"], serde_json::json!(true), "unrelated keys survive");
+        assert_eq!(doc["compaction"]["enabled"], serde_json::json!(true));
+        assert_eq!(doc["compaction"]["keepRecentTokens"], serde_json::json!(30_000));
+        assert_eq!(
+            doc["compaction"]["modelOverrides"]["cwoffee/m1"]["reserveTokens"],
+            serde_json::json!(131_072),
+            "reserve = window - budget: the fold lands where cwoffee's meter says the room is gone"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_settings_file_we_cannot_read_is_left_alone() {
+        let dir = scratch("unparseable");
+        let text = "{ this is not json, and it is somebody's file\n";
+        std::fs::write(dir.join("settings.json"), text).unwrap();
+        let e = mount_settings(&dir, "cwoffee", "m1", 8_000, 100_000).unwrap_err().to_string();
+        assert!(e.contains("refusing to overwrite"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.json")).unwrap(),
+            text,
+            "a refusal changes nothing, including the bytes on disk"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_ceiling_that_leaves_nothing_for_the_answer_is_not_written() {
+        let dir = scratch("no-room");
+        let e = mount_settings(&dir, "cwoffee", "m1", 100_000, 100_000).unwrap_err().to_string();
+        assert!(e.contains("leaves nothing"), "{e}");
+        assert!(!dir.join("settings.json").exists(), "no file, no claim");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

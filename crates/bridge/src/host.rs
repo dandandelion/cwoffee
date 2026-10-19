@@ -64,6 +64,10 @@ pub struct PiHostConfig {
     /// file, so nothing the model knew is lost.
     pub idle_reap: Duration,
     pub context_budget: usize,
+    /// The ceiling as the person left it in `config.toml`: `Some(n)` pins it, `None`
+    /// means "derive it from whatever window this model has". Kept apart from the
+    /// resolved number because the intent has to outlive the model it was resolved for.
+    pub budget_pin: Option<usize>,
     pub model_window: Option<usize>,
     /// cwoffee row id <-> pi session file. See `sessions.rs`.
     pub session_map: PathBuf,
@@ -162,6 +166,7 @@ impl PiHost {
             context_tokens: 0,
             compactions: 0,
             context_budget: cfg.context_budget,
+            budget_pin: cfg.budget_pin,
             model_window: cfg.model_window,
             approval_timeout_secs: cfg.approval_timeout.as_secs(),
             question_timeout_secs: cfg.question_timeout.as_secs(),
@@ -421,6 +426,65 @@ impl HostOps for PiHost {
     /// Rust core runs, through the same tool a session will use. Under a pi core this is
     /// also how the managed container can be started from the panel; the bridge's tick
     /// then owns its idle clock like any other search.
+    /// Pin or free the context ceiling.
+    ///
+    /// Three things have to agree, in that order: the config file (so a restart keeps
+    /// it), this host's meter (so the number moves now), and pi's own fold threshold
+    /// (so the fold happens where the app says the conversation is full, not at a
+    /// default chosen for coding sessions). The file is written here because the answer
+    /// has to be built from what the file now says; the meter and pi follow inside the
+    /// task that owns the model process, which is also the only place that knows whether
+    /// one is up — and its note reports that, instead of this side guessing.
+    async fn set_context_budget(
+        &self,
+        cfg_path: &std::path::Path,
+        target: Option<usize>,
+    ) -> Result<String, String> {
+        // Validate first: a refusal must leave the file, the meter and the running
+        // process exactly as they were.
+        let window = self.state().model_window;
+        if let Some(n) = target {
+            cwoffee_engine::host::check_budget(n, window)?;
+        }
+        let changed = match target {
+            Some(n) => cwoffee_engine::config::Config::set_context_keys(
+                cfg_path,
+                &[("target_tokens", &n.to_string())],
+            ),
+            None => cwoffee_engine::config::Config::unset_context_keys(cfg_path, &["target_tokens"]),
+        }
+        .map_err(|e| format!("could not save the ceiling: {e}"))?;
+        for c in &changed {
+            println!("[cwoffee/pi] context config: {c} ({})", cfg_path.display());
+        }
+        // Read the file back: what this run applies has to be what the next start reads,
+        // or "saved" describes a different app than the one on screen.
+        let back = cwoffee_engine::config::Config::load(Some(cfg_path))
+            .map(|(c, _)| c.context.target_tokens)
+            .unwrap_or(None);
+        if back != target {
+            return Err(format!(
+                "{} now says {:?}, which is not what was asked for ({:?}): nothing was applied",
+                cfg_path.display(),
+                back,
+                target
+            ));
+        }
+        self.push(HostCmd::SetContextBudget { target: back });
+        Ok(match back {
+            Some(n) => format!(
+                "context ceiling pinned at {n} tokens ({}); saved to {}",
+                cwoffee_engine::host::budget_share(n, window),
+                cfg_path.display()
+            ),
+            None => format!(
+                "context ceiling freed: it will be derived as half of whatever window the endpoint \
+                 states for this model; saved to {}",
+                cfg_path.display()
+            ),
+        })
+    }
+
     async fn search_probe(&self, query: Option<String>) -> Result<SearchProbe, String> {
         let (cfg, _) = Config::load(None).map_err(|e| format!("config could not be read: {e}"))?;
         let backend = cfg.search_backend();
@@ -767,6 +831,68 @@ impl Engine {
         self.state.lock().unwrap().session_id
     }
 
+    /// The ceiling for whatever window this host now believes the model has.
+    ///
+    /// The Rust core re-derives the budget when a model with a different window is
+    /// loaded; this side has to do the same or one screen ends up with a meter sized for
+    /// a model that is not running. The pin is the person's number and survives; only the
+    /// derived half follows the window.
+    /// The live half of a ceiling change: the meter, and pi's own folding threshold.
+    ///
+    /// pi reads `settings.json` when a process starts, so a process that is already
+    /// running keeps the threshold it started with. Saying that is the honest form of
+    /// "applied"; the alternative is a number on screen that the running model has no
+    /// idea about.
+    fn set_budget(&mut self, target: Option<usize>) {
+        self.cfg.budget_pin = target;
+        let (window, model) = {
+            let mut st = self.state.lock().unwrap();
+            st.budget_pin = target;
+            st.context_budget = crate::mount::context_budget(target, st.model_window);
+            (st.model_window, st.model.clone())
+        };
+        let budget = self.state.lock().unwrap().context_budget;
+        let pin_word = match target {
+            Some(n) => format!(
+                "pinned by you at {n}, {}",
+                cwoffee_engine::host::budget_share(n, window)
+            ),
+            None => "derived: half of whatever window the endpoint states".to_string(),
+        };
+        match window {
+            Some(w) => match crate::mount::mount_settings(
+                &self.cfg.launch.agent_dir,
+                &self.cfg.launch.provider,
+                &model,
+                budget,
+                w,
+            ) {
+                Ok(Some(sentence)) => {
+                    self.note(format!(
+                        "context ceiling is now {budget} tokens ({pin_word}). {sentence}"
+                    ));
+                }
+                Ok(None) => self.note(format!(
+                    "context ceiling is now {budget} tokens ({pin_word}); pi keeps its own folding \
+                     default, because no window is known for this model to compute a threshold from"
+                )),
+                Err(e) => self.err(format!(
+                    "context ceiling is now {budget} tokens ({pin_word}) and the config was written, \
+                     but pi's own threshold could not be set: {e}"
+                )),
+            },
+            None => self.note(format!(
+                "context ceiling is now {budget} tokens ({pin_word}); pi keeps its own folding default, \
+                 because no window is known for this model to compute a threshold from"
+            )),
+        }
+    }
+
+    fn recompute_budget(&self, st: &mut HostState) {
+        st.budget_pin = self.cfg.budget_pin;
+        st.context_budget = crate::mount::context_budget(self.cfg.budget_pin, st.model_window);
+    }
+
     fn note(&self, message: impl Into<String>) {
         let session = self.state.lock().unwrap().session_id;
         let _ = self.ev.send(EngineEvent::Note { message: message.into(), session: Some(session) });
@@ -923,7 +1049,10 @@ impl Engine {
                 st.model = id.to_string();
             }
             if let Some(w) = m.get("contextWindow").and_then(|v| v.as_u64()) {
-                st.model_window = Some(w as usize);
+                if st.model_window != Some(w as usize) {
+                    st.model_window = Some(w as usize);
+                    self.recompute_budget(&mut st);
+                }
             }
         }
         let row = st.session_id;
@@ -961,6 +1090,7 @@ impl Engine {
         }
         match cmd {
             HostCmd::SetPersona { persona } => self.set_persona(persona).await,
+            HostCmd::SetContextBudget { target } => self.set_budget(target),
             HostCmd::Send { text, attachments, session } => self.on_send(text, attachments, session).await,
             HostCmd::Cancel => {
                 if let Err(e) = self.request(json!({ "type": "abort" }), Duration::from_secs(10)).await {
@@ -998,6 +1128,10 @@ impl Engine {
                             if let Some(w) = data.get("contextWindow").and_then(|v| v.as_u64()) {
                                 st.model_window = Some(w as usize);
                             }
+                            // Different model, different window: a budget carried over
+                            // from the previous model is how a fold warning shows up in a
+                            // conversation that is nowhere near full.
+                            self.recompute_budget(&mut st);
                         }
                         self.cfg.launch.model = model.clone();
                         if persist {

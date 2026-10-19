@@ -270,6 +270,33 @@ async fn main() -> anyhow::Result<()> {
             appcfg.provider.base_url,
             models.display()
         );
+        // pi folds on its own schedule (`compaction.reserveTokens`, 16 384 by default,
+        // chosen for coding sessions) while cwoffee's meter fills against a budget.
+        // Writing the reserve makes them one number: the fold happens where the app says
+        // the room is gone. No window probed means nothing to compute, and the boot line
+        // says so rather than claiming a threshold that was never written.
+        match window {
+            Some(w) => {
+                let budget =
+                    cwoffee_bridge::mount::context_budget(cfg.context_budget, Some(w as usize));
+                match cwoffee_bridge::mount::mount_settings(
+                    &agent_dir,
+                    PI_PROVIDER,
+                    &configured_model,
+                    budget,
+                    w as usize,
+                ) {
+                    Ok(Some(sentence)) => println!("[cwoffee/pi] {sentence}"),
+                    Ok(None) => println!("[cwoffee/pi] compaction: pi keeps its own defaults"),
+                    Err(e) => println!("[cwoffee/pi] compaction: pi was NOT told where to fold: {e}"),
+                }
+            }
+            None => println!(
+                "[cwoffee/pi] compaction: the endpoint stated no window, so pi keeps its own \
+                 folding default and the meter falls back to {}",
+                cwoffee_bridge::mount::context_budget(cfg.context_budget, None)
+            ),
+        }
         let exts = cwoffee_bridge::mount::mount_extensions(
             &agent_dir,
             &pi_bin,
@@ -347,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
             // Same fallback the Rust core uses: a context meter that reads
             // differently per core is drift, not a difference in the model.
             context_budget: cwoffee_bridge::mount::context_budget(cfg.context_budget, window.map(|w| w as usize)),
+            budget_pin: cfg.context_budget,
             model_window: window.map(|w| w as usize),
             session_map: agent_dir.join("cwoffee-pi-sessions.json"),
             persona,

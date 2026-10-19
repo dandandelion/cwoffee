@@ -2386,6 +2386,41 @@
   // pi's compaction is the real thing: it asks the model to summarize the older turns and
   // keeps the recent ones verbatim. The note that follows quotes pi's own counts, so the
   // panel does not have to invent a number for what was saved.
+  // The context ceiling, as a setting rather than a fact about one window. `budgetDraft`
+  // is what is typed, not what is in force: the row shows the live number and says whether
+  // it is pinned, so an empty box plus a placeholder is the honest "not typed anything yet".
+  let budgetDraft = $state<number | ''>('')
+  let budgetBusy = $state(false)
+  let budgetMsg = $state('')
+
+  async function setBudget(target: number | null) {
+    if (budgetBusy) return
+    budgetBusy = true
+    budgetMsg = ''
+    try {
+      const said = await invoke<string>('set_context_budget', { target })
+      budgetMsg = said
+      say(said)
+      // The host moves the meter itself; re-reading it is how the panel shows the
+      // number that is actually in force rather than the one it hoped for.
+      hostState = await invoke<HostState>('session_state')
+      budgetDraft = ''
+    } catch (e) {
+      budgetMsg = String(e)
+    } finally {
+      budgetBusy = false
+    }
+  }
+
+  function pinBudget() {
+    const n = typeof budgetDraft === 'number' ? Math.trunc(budgetDraft) : NaN
+    if (!Number.isFinite(n) || n <= 0) {
+      budgetMsg = 'type a token count first: the ceiling is a number of tokens, not a feeling'
+      return
+    }
+    void setBudget(n)
+  }
+
   let compacting = $state(false)
   async function compactNow() {
     if (compacting) return
@@ -5866,6 +5901,112 @@
           }
         }
 
+        // (a12b) the context ceiling is a setting, and the setting is what the meter says
+        //
+        // The ceiling used to be arithmetic nobody could reach: half the window, on whoever
+        // computed it. Now it can be pinned, refused, and freed — and the config file, the
+        // live meter and (on the pi core) the line the model is told to fold at have to agree.
+        // This drives the control the way a person drives it, from the panel: a check that
+        // called the verb directly would measure the backend and leave the page's own state
+        // behind, which is what the first version of this check did — it pinned the host and
+        // then failed because the row still showed the old number. Reading the host's state
+        // is still how the numbers are asserted; the click is how they are produced.
+        {
+          const h0 = await invoke<HostState>('session_state')
+          const win = h0.model_window ?? 0
+          if (!win) {
+            pageLog(
+              'ceiling check skipped: this endpoint stated no window, so a derived ceiling is not knowable',
+            )
+          } else {
+            const btnM = document.querySelector('button[aria-label="Session telemetry"]') as HTMLElement | null
+            btnM?.click()
+            await new Promise((r) => setTimeout(r, 250))
+            const crowEl = () =>
+              [...document.querySelectorAll('.mbar-row')].find((r) =>
+                (r.textContent ?? '').includes('ceiling'),
+              ) as HTMLElement | undefined
+            const crow = crowEl()
+            const ctext = () => (crowEl()?.textContent ?? '').replace(/\s+/g, ' ').trim()
+            const box = crow?.querySelector('input.mnum') as HTMLInputElement | undefined
+            const btnNamed = (name: string) =>
+              [...(crow?.querySelectorAll('button') ?? [])].find((b) =>
+                (b.textContent ?? '').includes(name),
+              ) as HTMLButtonElement | undefined
+            const pinBtn = btnNamed('pin it')
+            const deriveBtn = btnNamed('derive it')
+            const sayRow = () =>
+              [...document.querySelectorAll('.set-note')].map((n) => n.textContent ?? '').join(' | ')
+
+            if (!crow) fail('the telemetry panel shows no ceiling row')
+            else if (!box || !pinBtn || !deriveBtn) fail('the ceiling row has no number box and pin/derive buttons')
+            else if (!ctext().includes(h0.budget_pin ? 'pinned by you' : 'derived'))
+              fail(`the ceiling row does not say how its number was arrived at: "${ctext()}"`)
+            else {
+              const pinTo = Math.max(4096, Math.floor(win / 3 / 1024) * 1024)
+              box.value = String(pinTo)
+              box.dispatchEvent(new Event('input', { bubbles: true }))
+              pinBtn.click()
+              let h1 = await invoke<HostState>('session_state')
+              for (let i = 0; i < 40 && h1.context_budget !== pinTo; i++) {
+                await new Promise((r) => setTimeout(r, 100))
+                h1 = await invoke<HostState>('session_state')
+              }
+              if (h1.context_budget !== pinTo)
+                fail(`pinning the ceiling to ${pinTo} from the panel never moved the meter (${h1.context_budget})`)
+              else if (h1.budget_pin !== pinTo)
+                fail(`the host does not say the ceiling is pinned (budget_pin=${h1.budget_pin}); the panel cannot tell a pin from a derivation`)
+              else if (!ctext().includes('pinned by you'))
+                fail(`the row still does not say the ceiling is pinned: "${ctext()}"`)
+              else {
+                // A ceiling that cannot mean anything is refused in words, and the refusal
+                // changes nothing: not the file, not the meter, not the row.
+                box.value = '900'
+                box.dispatchEvent(new Event('input', { bubbles: true }))
+                pinBtn.click()
+                await new Promise((r) => setTimeout(r, 400))
+                const note = sayRow()
+                if (!/floor/i.test(note))
+                  fail(`a 900-token ceiling was not refused in words on screen: "${note || '(no message shown)'}"`)
+                const h2 = await invoke<HostState>('session_state')
+                if (h2.context_budget !== pinTo)
+                  fail(`the refused ceiling moved the meter anyway: ${h2.context_budget}`)
+                else if (!ctext().includes('pinned by you'))
+                  fail(`a refused change altered what the row claims: "${ctext()}"`)
+                else {
+                  // And back to derived, which is not a number: the line comes out of the
+                  // file, so the next start does not re-pin itself.
+                  if (!deriveBtn || deriveBtn.disabled) fail('the ceiling row has no live "derive it" control')
+                  else {
+                    deriveBtn.click()
+                    let h3 = await invoke<HostState>('session_state')
+                    for (let i = 0; i < 40 && h3.budget_pin; i++) {
+                      await new Promise((r) => setTimeout(r, 100))
+                      h3 = await invoke<HostState>('session_state')
+                    }
+                    const wantBack = Math.max(4096, Math.floor(win / 2))
+                    if (h3.budget_pin) fail(`"derive it" left a pin in place: ${h3.budget_pin}`)
+                    else if (h3.context_budget !== wantBack)
+                      fail(
+                        `after freeing the pin the meter reads ${h3.context_budget}, not half the stated window (${wantBack})`,
+                      )
+                    else {
+                      await new Promise((r) => setTimeout(r, 250))
+                      if (!ctext().includes('derived'))
+                        fail(`the row still claims a pin after deriving: "${ctext()}"`)
+                      pageLog(
+                        `ceiling ok (pinned ${pinTo} from the panel and the meter followed, 900 refused as ` +
+                          `"${note.slice(0, 44)}…", derive-it back to ${h3.context_budget} = half of ${win})`,
+                      )
+                    }
+                  }
+                }
+              }
+            }
+            window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+          }
+        }
+
         // (a13) a turn that wrote a dozen files shows one line, not a dozen chips
         //
         // Implementing a feature in a real repository touches dozens of files, and
@@ -9068,6 +9209,50 @@
             {compacting ? 'compacting…' : 'compact'}
           </button>
         </div>
+        <div class="mbar-row">
+          <span class="mlbl">ceiling</span>
+          <span
+            class="mval mono"
+            title="The number this conversation is measured and folded against. Half the window is the default because the other half is the answer: a ceiling that leaves no room for the reply truncates it mid-sentence. On the pi core the model is told to fold at the same line, so the meter and the fold are one number stated twice."
+          >
+            {fmtTokens(hostState?.context_budget ?? 0)}
+            <small class="ctxtrim">
+              {hostState?.budget_pin
+                ? `pinned by you at ${fmtTokens(hostState.budget_pin)}`
+                : ctxLimit
+                  ? `derived: half of ${fmtTokens(ctxLimit)}`
+                  : 'derived: no window stated yet'}
+            </small>
+          </span>
+          <input
+            class="mbtn mnum mono"
+            type="number"
+            min="4096"
+            step="1024"
+            bind:value={budgetDraft}
+            placeholder={String(hostState?.context_budget ?? 0)}
+            title="Tokens. Below 4096 the app refuses: a prompt that small cannot hold the system prompt, the tool definitions and a tool result. Above the window the endpoint stated it also refuses, because the server would cut the prompt before this meter ever filled."
+          />
+          <button
+            class="mbtn"
+            disabled={budgetBusy}
+            title="Pin this ceiling. It is written to the config file before it is applied, so it survives a restart and a phone can read what the desktop chose."
+            onclick={pinBudget}
+          >
+            pin it
+          </button>
+          <button
+            class="mbtn"
+            disabled={budgetBusy || !hostState?.budget_pin}
+            title="Let go of the pin: the ceiling goes back to half of whatever window this model's endpoint states. This is not a number, so it is stored by removing the line — writing some sentinel instead would leave the next start pinned."
+            onclick={() => void setBudget(null)}
+          >
+            derive it
+          </button>
+        </div>
+        {#if budgetMsg}
+          <div class="set-note">{budgetMsg}</div>
+        {/if}
         <div class="mbar-row">
           <span class="mlbl">prefix cache</span>
           <span class="mbar" title="how much of the prompt the server already had">

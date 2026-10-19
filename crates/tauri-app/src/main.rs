@@ -637,6 +637,7 @@ fn main() {
             commands::search_settings,
             commands::set_search_backend,
             commands::search_probe,
+            commands::set_context_budget,
             commands::open_file,
             commands::new_session,
             commands::list_workspaces,
@@ -740,6 +741,33 @@ async fn pi_host(
         )
         .map_err(|e| format!("cannot write {}: {e}", models.display()))?;
         println!("[cwoffee/pi] provider cwoffee -> {} (written to {})", appcfg.provider.base_url, path.display());
+        // pi folds on its own schedule (`compaction.reserveTokens`, 16 384 by default,
+        // chosen for coding sessions) while cwoffee's meter fills against a budget.
+        // Writing the reserve makes them one number: the fold happens where the app says
+        // the room is gone. No window probed means nothing to compute, and the boot line
+        // says so rather than claiming a threshold that was never written.
+        match window {
+            Some(w) => {
+                let budget =
+                    cwoffee_bridge::mount::context_budget(cfg.context_budget, Some(w as usize));
+                match cwoffee_bridge::mount::mount_settings(
+                    &agent_dir,
+                    PI_PROVIDER,
+                    model,
+                    budget,
+                    w as usize,
+                ) {
+                    Ok(Some(sentence)) => println!("[cwoffee/pi] {sentence}"),
+                    Ok(None) => println!("[cwoffee/pi] compaction: pi keeps its own defaults"),
+                    Err(e) => println!("[cwoffee/pi] compaction: pi was NOT told where to fold: {e}"),
+                }
+            }
+            None => println!(
+                "[cwoffee/pi] compaction: the endpoint stated no window, so pi keeps its own \
+                 folding default and the meter falls back to {}",
+                cwoffee_bridge::mount::context_budget(cfg.context_budget, None)
+            ),
+        }
     }
 
     let srcs: Vec<PathBuf> = std::env::var("CWOFFEE_PI_EXT")
@@ -800,6 +828,7 @@ async fn pi_host(
                 .unwrap_or(600),
         ),
         context_budget: cwoffee_bridge::mount::context_budget(cfg.context_budget, window.map(|w| w as usize)),
+        budget_pin: cfg.context_budget,
         model_window: window.map(|w| w as usize),
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
         persona,

@@ -529,6 +529,19 @@ pub async fn set_search_backend(
         .await
 }
 
+/// Pin or free the ceiling a conversation is measured and folded against.
+///
+/// `None` means "derive it from the window this model has", which is why the argument
+/// is optional rather than a sentinel like `0`: a magic number on the wire is how a
+/// setting comes back looking like a value somebody chose.
+#[tauri::command]
+pub async fn set_context_budget(
+    state: tauri::State<'_, AppState>,
+    target: Option<usize>,
+) -> Result<String, String> {
+    state.host.set_context_budget(&state.config_path, target).await
+}
+
 #[tauri::command]
 pub async fn search_probe(
     state: tauri::State<'_, AppState>,

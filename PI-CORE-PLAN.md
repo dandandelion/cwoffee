@@ -18,13 +18,16 @@
 
 - **Phase:** 1 done on both paths, and the product surface is now **on** the pi core: eleven
   Rust tools mounted from the registry, approval cards, workspace-following, mid-turn switching,
-  search panel, attachments, metrics with a probed window, **Chat mode**, and a settings screen
-  with categories. `cwoffee-gateway --core pi` and `CWOFFEE_CORE=pi` on the desktop; `master`
-  still defaults to the Rust core, which stays the fallback and the A/B half.
-- **Last updated:** 2026-10-16T07:10Z (assistant, session 10) — conversations are now
-  named by a **230M model running on this machine** (`LiquidAI/LFM2.5-230M`, CPU only),
-  after the first turn, out of process, opt-in; live on the pi core ("hey, I want to go
-  over the quarterly cashflow numbers…" → **"Quarterly cashflow numbers"**).
+  search panel, attachments, metrics with a probed window, **Chat mode**, **ask_user** cards,
+  a **context ceiling you can pin or free**, and a settings screen with categories.
+  `cwoffee-gateway --core pi` and `CWOFFEE_CORE=pi` on the desktop; `master` still defaults to
+  the Rust core, which stays the fallback and the A/B half.
+- **Last updated:** 2026-10-19T16:20Z (assistant, session 19) — the context ceiling is **one
+  number** now: the config file holds the pin (or the line is removed to derive it), both cores
+  measure and refuse against it, and pi is told to fold at `window − ceiling` for this model,
+  so the meter and the model's fold finally name the same line. Page harness green on the pi
+  core (`verdict: ok`) with a new case that drives the control itself. Gates: engine 436 + 10,
+  bridge 15 + 16, gateway 32, `svelte-check` 0.
 - **Verdict:** feasible, and cheaper than it looks — because the UI and the tools both
   survive untouched. Measured, not assumed. Three real costs: **+~90 MB PSS**, **two
   languages in the runtime**, and **pi gives you no sandbox** (that stays ours to own).
@@ -248,6 +251,78 @@ Gated by `scripts/gateway-titlegen.mjs`: a scripted helper proves the app honour
 changes *nothing* on a refusal; the real model then names a real sentence
 ("…quarterly cashflow numbers, they look short to me" → "Check your quarterly cashflow
 numbers"), and `titlegen.py --check` answers availability without loading weights.
+
+### D13 — a tool's question crosses the pi boundary in the engine's own words, and the
+answer comes back as a host flag, never as model text (locked 2026-10-19)
+
+The old core ran `ask_user` in-process, so the question travelled as an `EngineEvent` and
+the answer came back over an mpsc channel. On pi the tool runs inside an extension, and a
+tool cannot hold a card open from inside a short-lived `cwtool` call.
+
+Locked shape:
+
+* **Ask before running.** `Tool::host_questions(&args)` (default `None`) lets a remote host
+  ask the questions the tool *would* have asked. `ask_user` implements it. The extension
+  asks `spec.host_ask`, which `cwtool specs` sets from the same registry — nothing in
+  TypeScript decides which tool asks a person or what its options look like.
+* **The answers are an argument to the run, not part of the tool's input.**
+  `cwtool run ask_user --host-answers '[…]'`. A model that can put its own answers in
+  `args` can answer its own question, which is the whole thing `ask_user` exists to prevent.
+  The engine rejects any `ask_user` call whose arguments contain `answer`/`answers`/`answer_id`
+  for the same reason; a test asserts it.
+* **A payload rides in the dialog title.** `CWOFFEEQ {…}` carries the engine's `Question`
+  through pi's title-and-labels primitives, and the bridge rebuilds it: the trade-off line
+  under each option, the recommended option, "pick more than one", and "question 1 of 2".
+  Unparsable payload → the bridge **refuses to flatten silently**: it says so and shows the
+  flattened version, because silently dropping the model's trade-offs is worse than a loud
+  degraded card.
+* **Set ids are this process's to give.** The engine numbers the first set of every call at
+  1, and even pi's tool-call id repeats when a scripted endpoint replays the same scenario.
+  So the bridge keys a card on the caller's key *while that card is open*: once every
+  question the set promised has arrived and then been answered or expired, the key is
+  released and the next call gets a card of its own. `mark_set_closed` implements "closed",
+  and an answered question and an expired one are the same event to it.
+* **Both cores emit `QuestionAnswered`.** It used to be a bridge event only, so on the old
+  core an answered card stayed live in a second window — a control still wired to a question
+  the user had already settled. `AskUserTool` emits it where the answer is actually taken.
+
+### D14 — one ceiling, written down, and the model is told where it is (locked 2026-10-19)
+
+The context ceiling had been arithmetic nobody could reach: half the endpoint's window,
+computed by whichever core got there first, and the pi core never told pi anything — so pi
+folded at its own default (`compaction.reserveTokens = 16 384`, chosen for coding sessions)
+while cwoffee's meter filled against a different line. Two numbers on one conversation, and
+whichever one you saw depended on which panel you opened.
+
+Locked:
+
+* **One formula, one place.** `mount::context_budget(pin, window)` — the pin from config if
+  there is one, else `auto_budget(window)` (half, floored at 4096), else the shared fallback.
+  Both cores draw one meter from it.
+* **The ceiling is a setting, and the file is the authority.** `set_context_budget` writes
+  `[context] target_tokens` (or removes it — see gotcha 102), reads the file back, and only
+  then applies what the file says. A ceiling that lives in RAM is a setting that resets on
+  restart, and a phone's choice has to be the desktop's choice.
+* **A refusal changes nothing.** Below 4096, or not below the window the endpoint stated, the
+  verb refuses in words and leaves the file, the meter and the running process alone.
+  `check_budget` is shared, so both cores refuse the same nonsense for the same reason.
+* **pi is told where the line is.** `mount::mount_settings` writes
+  `compaction.modelOverrides["<provider>/<model>"].reserveTokens = window − budget`, so pi's
+  fold (`contextTokens > window − reserveTokens`) lands where cwoffee's meter says the room is
+  gone. Per-model, never global: a reserve computed from one window must not follow a different
+  model around. Merged into whatever `settings.json` already holds, and if that file does not
+  parse, the write is refused — cwoffee does not overwrite a settings file it did not write.
+* **The change is announced as a fact about the process.** pi reads its settings at exec, so a
+  model process that is already running keeps the threshold it started with; the note says
+  that, rather than claiming the new ceiling is live. No window probed means no threshold
+  written, and the boot line says so instead of inventing one.
+* **`unset` is a state, not a number** (gotcha 102), and the pin is carried in
+  `HostState.budget_pin` so the panel can say which kind of number it is showing (gotcha 104).
+
+Open, and deliberately not answered here: whether a coworker wants pi's *summary tone* for the
+fold (open question 4). This decision fixes where the fold happens, not what it writes.
+
+---
 
 ---
 
@@ -1038,6 +1113,32 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     Symptom to remember: the first failure line names the 400 and says
     `mock-llm has no scenario for this prompt` — read that line before the four below it.
 
+102. **An unset setting is not a number, and TOML has no `null` to write.** `context.target_tokens`
+    has two states: a pinned ceiling, and "derive it as half of whatever window this model's
+    endpoint states". The second is not expressible as any value, and `target_tokens = null`
+    is not TOML — the parser would reject the file and the *next* start would fail to boot
+    hours later. So freeing a setting deletes the line (`unset_keys_in`, with the same
+    parse-back-then-rename care as setting one), and a commented example in the shipped file
+    is left alone and reported: it is documentation, not a setting. Symptom of getting this
+    wrong: a control that says "back to derived" while the file still pins the old number, so
+    the restart quietly re-applies it.
+103. **A check that calls the verb behind a control measures the backend, not the app.** The
+    first version of the ceiling check pinned the ceiling with `invoke('set_context_budget')`
+    and then asserted that the panel's row said *pinned by you* — and it did not, because the
+    page's mirror of host state only refreshes on actions the page itself took. The failure
+    read like a rendering bug ("the row does not say the ceiling is pinned") when the row was
+    telling the truth about a number the page had never been told. The rewritten check types
+    the number into the box and presses *pin it* / *derive it*, so the state, the file and the
+    row all move for the reason a user would move them; the host's state is still what the
+    numbers are asserted against. Two clocks, one story: drive the control, read the host.
+104. **A number on screen has to carry how it was arrived at.** `context_budget` alone cannot
+    tell a pinned ceiling from a derived one, and the difference is observable: a derived
+    ceiling follows a model switch, a pinned one does not. Without `HostState.budget_pin` the
+    panel would watch its own number move with no way to say why — and the settings control
+    could not know whether "derive it" is a verb or a no-op. Same for the bridge: the pin
+    lives on the task that owns the model process, so re-derivation after a model change works
+    from the person's intent, not from the previous model's resolved answer.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -1671,41 +1772,74 @@ was the light-theme icon; and go on with the harness plus the parity list.
   still runs the Rust core. Next session: S1.1 the bridge, with the S1.2 exit criterion
   (a live turn in the existing UI, zero UI edits).
 
-### D13 — a tool's question crosses the pi boundary in the engine's own words, and the
-answer comes back as a host flag, never as model text (locked 2026-10-19)
-
-The old core ran `ask_user` in-process, so the question travelled as an `EngineEvent` and
-the answer came back over an mpsc channel. On pi the tool runs inside an extension, and a
-tool cannot hold a card open from inside a short-lived `cwtool` call.
-
-Locked shape:
-
-* **Ask before running.** `Tool::host_questions(&args)` (default `None`) lets a remote host
-  ask the questions the tool *would* have asked. `ask_user` implements it. The extension
-  asks `spec.host_ask`, which `cwtool specs` sets from the same registry — nothing in
-  TypeScript decides which tool asks a person or what its options look like.
-* **The answers are an argument to the run, not part of the tool's input.**
-  `cwtool run ask_user --host-answers '[…]'`. A model that can put its own answers in
-  `args` can answer its own question, which is the whole thing `ask_user` exists to prevent.
-  The engine rejects any `ask_user` call whose arguments contain `answer`/`answers`/`answer_id`
-  for the same reason; a test asserts it.
-* **A payload rides in the dialog title.** `CWOFFEEQ {…}` carries the engine's `Question`
-  through pi's title-and-labels primitives, and the bridge rebuilds it: the trade-off line
-  under each option, the recommended option, "pick more than one", and "question 1 of 2".
-  Unparsable payload → the bridge **refuses to flatten silently**: it says so and shows the
-  flattened version, because silently dropping the model's trade-offs is worse than a loud
-  degraded card.
-* **Set ids are this process's to give.** The engine numbers the first set of every call at
-  1, and even pi's tool-call id repeats when a scripted endpoint replays the same scenario.
-  So the bridge keys a card on the caller's key *while that card is open*: once every
-  question the set promised has arrived and then been answered or expired, the key is
-  released and the next call gets a card of its own. `mark_set_closed` implements "closed",
-  and an answered question and an expired one are the same event to it.
-* **Both cores emit `QuestionAnswered`.** It used to be a bridge event only, so on the old
-  core an answered card stayed live in a second window — a control still wired to a question
-  the user had already settled. `AskUserTool` emits it where the answer is actually taken.
-
 ---
+
+## Journal — session 19 (one ceiling, and the model is told where it is)
+
+A conversation had two context ceilings, and neither was reachable. cwoffee's meter filled and
+promised to trim at 131 072 (half of the endpoint's stated 262 144, re-derived per model),
+while the pi core never told pi any of that: pi folded on its own default —
+`contextTokens > window − compaction.reserveTokens` with `reserveTokens = 16 384`, i.e. at
+245 760 tokens. The app was reporting a line the model was never asked to stop at, and the
+reserve it would have used was chosen for coding sessions, not for a coworker whose other half
+is the answer's room. That is decision **D14**.
+
+What exists now:
+
+* **One formula, one place**: `mount::context_budget(pin, window)`; the Rust core and the
+  bridge both take the pin from config, else `auto_budget`, else the shared fallback.
+* **A setting with a file behind it**: `set_context_budget` writes `[context] target_tokens`,
+  reads the file back, applies what the file says, and only then answers. Freeing the pin
+  removes the line (gotcha 102). Both surfaces — desktop command and audited drive-only RPC —
+  return the same plain sentence, so a settings panel does not need two wire shapes.
+* **Refusals in words, and they change nothing**: below 4096, or not below the window the
+  endpoint states. `check_budget` is shared, so the phone and the desktop refuse the same
+  nonsense for the same reason. An endpoint that states no window still gets the floor.
+* **pi is told where the line is**: `mount::mount_settings` writes
+  `compaction.modelOverrides["<provider>/<model>"].reserveTokens = window − ceiling`, per
+  model, merged into whatever `settings.json` holds, refused outright if that file does not
+  parse. At boot the log now says so:
+
+  ```
+  [cwoffee/pi] pi will fold above 131072 of 262144 tokens (/home/dandandelion/.local/share/cwoffee/pi-agent/settings.json compaction.modelOverrides["cwoffee/qwen3.8-flash-next-iq3_s"].reserveTokens = 131072)
+  ```
+
+  or, when nothing was probed, that pi keeps its own folding default rather than inventing a
+  number. A model process already running keeps the threshold it started with — pi reads its
+  settings at exec — and the note says which of the two happened.
+* **`HostState.budget_pin`** so the row can say *pinned by you at 60 000* or *derived: half of
+  262 144*, and so re-derivation after a model switch works from the person's intent rather
+  than the previous model's resolved number.
+
+Verified, on this box, in that order:
+
+```
+engine 436 + 10 (mock endpoint), bridge 15 + 16, gateway 32, svelte-check 0
+board (pi core): verdict ok — 12 turns, 61 tool calls, 0 errors
+[cwoffee/page] ceiling ok (pinned 87040 from the panel and the meter followed, 900 refused as
+  "900 tokens is below the floor of 4096: a pro…", derive-it back to 131072 = half of 262144)
+```
+
+and against the running app over the wire, with the file read back between every step:
+
+```
+state A : budget=131072 pin=null window=262144
+refuse 900: refused: 900 tokens is below the floor of 4096: … Leave the ceiling unset to derive it
+state B : budget=131072 pin=null                     (a refusal changed nothing)
+pin 60000 : "…pinned at 60000 tokens (23% of the endpoint's 262144 tokens - that folds early on
+             purpose); saved to ~/.config/cwoffee/config.toml"
+state C : budget=60000  pin=60000                    and pi's settings moved to reserveTokens=202144
+derive  : "…freed: it will be derived as half of whatever window the endpoint states…"
+state D : budget=131072 pin=null                     no target_tokens line left in the file
+```
+
+The first version of the harness case failed honestly, and the failure was about the harness
+(gotcha 103): it pinned through the RPC and then blamed the row for not knowing. The app was
+left as found — no pin in the user's config, the meter derived — because a test that changes a
+person's settings owes them a restore.
+
+Not answered here: whether the *fold itself* should read like a coworker's note (open question
+4). D14 fixes where pi folds, not what it writes when it does.
 
 ## Journal — session 18 (ask_user on the pi core, and a harness that died without a verdict)
 

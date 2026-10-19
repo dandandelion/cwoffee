@@ -433,6 +433,79 @@ impl Config {
         Self::set_keys_in(text, Some("search"), kvs)
     }
 
+    /// Edit `[context]` keys in a config file's text. Same rules as
+    /// `set_search_keys_in`: every other line, comments included, stays as it was.
+    pub fn set_context_keys_in(text: &str, kvs: &[(&str, &str)]) -> (String, Vec<String>) {
+        Self::set_keys_in(text, Some("context"), kvs)
+    }
+
+    /// Remove keys from one region of a config file's text.
+    ///
+    /// "Not set" is a state no number can express. For `context.target_tokens` it means
+    /// *derive the ceiling from what the endpoint states about its window*, and the only
+    /// way back to it is to delete the line — writing some sentinel number would pin a
+    /// value while claiming to free the setting. A commented-out key is left alone and
+    /// reported: an example shipped in the config file is documentation, not a setting,
+    /// and deleting documentation because somebody pressed "derive from the model" would
+    /// be a quiet loss of somebody's own notes.
+    pub fn unset_keys_in(text: &str, table: Option<&str>, keys: &[&str]) -> (String, Vec<String>) {
+        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+        let mut changed = Vec::new();
+        let is_header = |l: &str| match table {
+            Some(name) => l.trim() == format!("[{name}]"),
+            None => l.trim().starts_with('[') && l.trim().ends_with(']'),
+        };
+        let h = match table {
+            Some(_) => lines.iter().position(|l| is_header(l)),
+            None => Some(0),
+        };
+        let Some(h) = h else { return (text.to_string(), changed) };
+        // The region runs to the next table header, so a same-named key in another
+        // section cannot be removed by accident. At the top level the region ends at the
+        // first header, and line 0 is a key row, not a header.
+        let end = (h + 1..lines.len())
+            .find(|i| {
+                let t = lines[*i].trim();
+                t.starts_with('[') && t.ends_with(']')
+            })
+            .unwrap_or(lines.len());
+        let body = if table.is_some() { h + 1 } else { 0 };
+        for k in keys {
+            let at = (body..end).find(|i| {
+                let t = lines[*i].trim();
+                t.starts_with(&format!("{k} ")) || t.starts_with(&format!("{k}="))
+            });
+            match at {
+                Some(i) => {
+                    let old = lines[i].trim().to_string();
+                    lines.remove(i);
+                    changed.push(format!("removed {old}"));
+                }
+                None => {
+                    let commented = (body..end).find(|i| {
+                        let t = lines[*i].trim().trim_start_matches('#').trim();
+                        t.starts_with(&format!("{k} ")) || t.starts_with(&format!("{k}="))
+                    });
+                    match commented {
+                        Some(i) => changed.push(format!(
+                            "{} was already commented out: {}",
+                            k,
+                            lines[i].trim()
+                        )),
+                        // Nothing to remove. The caller says "back to derived", and a
+                        // file that never pinned the value was already there.
+                        None => changed.push(format!("{k} was not set")),
+                    }
+                }
+            }
+        }
+        let mut out = lines.join("\n");
+        if text.ends_with('\n') || !out.ends_with('\n') {
+            out.push('\n');
+        }
+        (out, changed)
+    }
+
     /// Edit keys in one region of a TOML file.
     ///
     /// `table` is a section name without brackets; `None` is the **top level**,
@@ -539,6 +612,53 @@ impl Config {
     /// that resets on restart is a provider that was never really enabled.
     pub fn set_search_keys(path: &std::path::Path, kvs: &[(&str, &str)]) -> Result<Vec<String>, String> {
         Self::set_keys(path, Some("search"), kvs)
+    }
+
+    /// Write `[context]` keys to `path`.
+    pub fn set_context_keys(
+        path: &std::path::Path,
+        kvs: &[(&str, &str)],
+    ) -> Result<Vec<String>, String> {
+        Self::set_keys(path, Some("context"), kvs)
+    }
+
+    /// Remove keys from one table of `path`, with the same care as `set_keys`: the
+    /// edited text is parsed back before the file is replaced, and the replacement is a
+    /// rename. A settings control that can free a setting has to be as careful as one
+    /// that sets it — the failure mode of a bad removal is a config the next boot
+    /// cannot open.
+    pub fn unset_keys(
+        path: &std::path::Path,
+        table: Option<&str>,
+        keys: &[&str],
+    ) -> Result<Vec<String>, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        let (out, changed) = Self::unset_keys_in(&text, table, keys);
+        if let Err(e) = toml::from_str::<Config>(&out) {
+            return Err(format!("the edited file would not parse, so nothing was written: {e}"));
+        }
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, out.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+        Ok(changed)
+    }
+
+    /// Remove keys from `[context]` in `path`.
+    pub fn unset_context_keys(path: &std::path::Path, keys: &[&str]) -> Result<Vec<String>, String> {
+        Self::unset_keys(path, Some("context"), keys)
     }
 
     /// Write **top-level** keys to `path`.
@@ -878,6 +998,67 @@ fn env(k: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_context_ceiling_can_be_pinned_and_then_freed_again() {
+        // The shipped shape: a commented example, and the live keys around it.
+        let text = "# target_tokens = 12000  <- uncomment to pin a ceiling\n\n[context]\nmax_tool_output = 24576\ntarget_tokens = 40000\n\n[search]\nbackend = \"searxng\"\n";
+        let (out, ch) = Config::set_context_keys_in(text, &[("target_tokens", "60000")]);
+        assert!(
+            ch.iter().any(|c| c.contains("target_tokens: target_tokens = 40000 -> target_tokens = 60000")),
+            "{ch:?}"
+        );
+        let back: Config = toml::from_str(&out).expect("the edited file parses");
+        assert_eq!(back.context.target_tokens, Some(60_000), "the pin is the setting");
+        assert_eq!(back.search.backend, "searxng", "the other sections are untouched");
+
+        // And the way back to "derive it" is to remove the line, because no number
+        // means "from the endpoint".
+        let (out2, ch2) = Config::unset_keys_in(&out, Some("context"), &["target_tokens"]);
+        let free: Config = toml::from_str(&out2).expect("the edited file parses");
+        assert_eq!(free.context.target_tokens, None, "unset means derive it again");
+        assert!(ch2.iter().any(|c| c.contains("removed target_tokens = 60000")), "{ch2:?}");
+        assert!(
+            out2.contains("max_tool_output = 24576") && out2.contains("backend = \"searxng\""),
+            "removing one key must not take the section or its neighbours with it:\n{out2}"
+        );
+        assert!(
+            out2.contains("# target_tokens = 12000"),
+            "the commented example is documentation, not a setting: it stays"
+        );
+    }
+
+    #[test]
+    fn unsetting_a_key_that_is_somewhere_else_or_nowhere_says_so() {
+        let text = "[context]\nmax_tool_output = 1\n\n[other]\ntarget_tokens = 7\n";
+        let (out, ch) = Config::unset_keys_in(text, Some("context"), &["target_tokens"]);
+        assert_eq!(ch, vec!["target_tokens was not set".to_string()], "{ch:?}");
+        assert_eq!(out, text, "nothing to remove means nothing changes");
+        assert!(
+            out.contains("[other]\ntarget_tokens = 7"),
+            "a same-named key in another table is not ours to touch:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_removed_key_survives_the_round_trip_on_disk() {
+        let dir = std::env::temp_dir().join(format!("cw-unset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "mode = \"ask\"\n\n[context]\ntarget_tokens = 40000\nmax_tool_output = 2\n",
+        )
+        .unwrap();
+        let ch = Config::unset_context_keys(&path, &["target_tokens"]).expect("removal ok");
+        assert!(ch.iter().any(|c| c.contains("removed")), "{ch:?}");
+        let (c, _) = Config::load(Some(&path)).expect("the file still opens");
+        assert_eq!(c.context.target_tokens, None);
+        assert_eq!(c.mode.as_deref(), Some("ask"), "the rest of the file is intact");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+
     use super::*;
 
     #[test]

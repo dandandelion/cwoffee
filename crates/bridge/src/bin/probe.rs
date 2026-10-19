@@ -142,6 +142,7 @@ async fn run() -> anyhow::Result<()> {
         question_timeout: Duration::from_secs(30),
         idle_reap: Duration::from_secs(idle_reap),
         context_budget: 8_000,
+        budget_pin: Some(8_000),
         model_window: None,
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
         persona: cwoffee_engine::host::Persona::Cowork,

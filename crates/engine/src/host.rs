@@ -177,6 +177,50 @@ pub fn auto_budget(window: usize) -> usize {
     ((window as f64 * 0.50) as usize).max(4_096)
 }
 
+/// Refuse a pinned context ceiling that cannot mean anything.
+///
+/// The ceiling is the number the context meter fills against and the number the prompt
+/// is folded at, so a nonsense pin is not a harmless preference: too small and the app
+/// folds a conversation that had plenty of room, too large and the meter can never
+/// reach full, which makes the meter a decoration while the endpoint silently truncates
+/// the prompt from the front. Both cores refuse in these words.
+pub fn check_budget(target: usize, window: Option<usize>) -> Result<(), String> {
+    if target < 4_096 {
+        return Err(format!(
+            "{target} tokens is below the floor of 4096: a prompt that small cannot hold the system \
+             prompt, the tool definitions and a tool result, and still leave room for an answer. Leave \
+             the ceiling unset to derive it from the endpoint instead."
+        ));
+    }
+    if let Some(w) = window {
+        if target >= w {
+            return Err(format!(
+                "{target} tokens is not below this endpoint's stated window ({w}): the server would cut \
+                 the prompt from the front before cwoffee ever said the context was full. A ceiling has \
+                 to be smaller than the window it is measured against."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How the pin sits against the window, in the words the app shows back: a ceiling far
+/// below the window is legitimate (someone who wants short, cheap turns) but should be
+/// said out loud rather than left as an unexplained number on the meter.
+pub fn budget_share(target: usize, window: Option<usize>) -> String {
+    match window {
+        Some(w) if w > 0 => {
+            let pct = (target as f64 / w as f64) * 100.0;
+            if pct < 25.0 {
+                format!("{pct:.0}% of the endpoint's {w} tokens - that folds early on purpose")
+            } else {
+                format!("{pct:.0}% of the endpoint's {w} tokens")
+            }
+        }
+        _ => "the endpoint has not stated a window, so nothing but this number is known".to_string(),
+    }
+}
+
 /// Read the loaded model's advertised window and set the compaction budget.
 ///
 /// `announce` is false on a re-read: a boot-shaped line printed once per turn
@@ -444,6 +488,11 @@ pub enum HostCmd {
     },
     SetMode { mode: ApprovalMode },
     SetReasoning { reasoning: Reasoning },
+    /// Pin the context ceiling, or `None` to derive it from what the endpoint states
+    /// about the model's window. The value here is already read back from the config
+    /// file: the file is the authority, so a phone and the desktop cannot end up with
+    /// two different answers to "where does this conversation fold".
+    SetContextBudget { target: Option<usize> },
     /// Change the model id for subsequent turns. Does not rewrite history.
     ///
     /// `persist` is false when the host chose the id itself (an empty config
@@ -485,7 +534,14 @@ pub struct HostState {
     /// The compaction budget in force, and the window it came from. Without these
     /// a compaction message is a claim with nothing to check it against.
     #[serde(default)]
+    /// The ceiling the meter fills against.
     pub context_budget: usize,
+    /// How that ceiling got its value: `Some(n)` is a number a person pinned in the
+    /// config or from the settings screen, `None` means it is derived from the window
+    /// this model has. The panel has to show which, because a derived ceiling follows a
+    /// model change and a pinned one does not — and a screen that cannot tell them apart
+    /// cannot explain why the number moved on its own.
+    pub budget_pin: Option<usize>,
     #[serde(default)]
     pub model_window: Option<usize>,
     /// Seconds before an unanswered approval fails closed. The UI shows this as a
@@ -584,6 +640,7 @@ impl SessionHost {
             workspace_refusal: None,
             refusal_seq: 0,
             context_budget: cfg.context_budget.unwrap_or(FALLBACK_BUDGET),
+            budget_pin: cfg.context_budget,
             model_window: None,
         }));
         // What the prompt costs, owned here and written by the agent. `state()`
@@ -807,9 +864,45 @@ impl SessionHost {
                 true,
             ).await;
 
+            // The ceiling in force for this process. It starts as whatever the config
+            // file said, and a settings change replaces it here rather than waiting for
+            // a restart: the file is written first, and this is the read-back value, so
+            // the meter, the fold and the next start all agree on one number.
+            let mut budget_pin = cfg.context_budget;
+
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     HostCmd::Shutdown => break,
+
+                    HostCmd::SetContextBudget { target } => {
+                        budget_pin = target;
+                        state_bg.lock().unwrap().budget_pin = target;
+                        // Announced, because a ceiling that moves without saying so is
+                        // indistinguishable from the meter being wrong.
+                        apply_context_budget(
+                            &mut agent,
+                            &budget_provider,
+                            budget_pin,
+                            &state_bg,
+                            &cfg.sampling,
+                            &gauge_bg,
+                            true,
+                        )
+                        .await;
+                        let st = state_bg.lock().unwrap();
+                        let sess = st.session_id;
+                        let _ = ev_tx.send(EngineEvent::Note {
+                            session: Some(sess),
+                            message: format!(
+                                "context ceiling is now {} tokens ({}); the meter and the fold both read against it",
+                                st.context_budget,
+                                match target {
+                                    Some(t) => format!("pinned by you at {t}, {}", budget_share(t, st.model_window)),
+                                    None => "derived: half of whatever the endpoint states".to_string(),
+                                }
+                            ),
+                        });
+                    }
 
                     HostCmd::SetPersona { persona } => {
                         // Half-applied would be worse than refused: this core's prompt,
@@ -930,7 +1023,7 @@ impl SessionHost {
                             apply_context_budget(
                                 &mut agent,
                                 &budget_provider,
-                                cfg.context_budget,
+                                budget_pin,
                                 &state_bg,
                                 &cfg.sampling,
                                 &gauge_bg,
@@ -1100,13 +1193,13 @@ impl SessionHost {
                         // asked at boot, asking again here costs two GETs and is
                         // the difference between a 209k budget and a 32k one - and
                         // the smaller number is the one that deletes history.
-                        if cfg.context_budget.is_none()
+                        if budget_pin.is_none()
                             && agent.prompt_mut().context_window.is_none()
                         {
                             apply_context_budget(
                                 &mut agent,
                                 &budget_provider,
-                                cfg.context_budget,
+                                budget_pin,
                                 &state_bg,
                                 &cfg.sampling,
                                 &gauge_bg,
@@ -1452,6 +1545,20 @@ pub trait HostOps: Send + Sync {
     /// One real search, so "is search working?" gets answered by the host instead of
     /// by asking the model to demonstrate it.
     async fn search_probe(&self, query: Option<String>) -> Result<SearchProbe, String>;
+
+    /// Pin or free the context ceiling. Both cores write the same config file and then
+    /// apply what they just read back, so the meter, the fold and the next start all
+    /// agree; a ceiling that only lives in RAM is a setting that resets on restart.
+    ///
+    /// The answer is the sentence the app shows: what the ceiling is now, what it is a
+    /// share of, and which part takes effect when.
+    async fn set_context_budget(
+        &self,
+        _cfg_path: &Path,
+        _target: Option<usize>,
+    ) -> Result<String, String> {
+        Err("this core cannot change its context ceiling".to_string())
+    }
 }
 
 #[async_trait]
@@ -1489,6 +1596,14 @@ impl HostOps for SessionHost {
         searxng_url: &str,
     ) -> Result<SearchView, String> {
         crate::settings::set_search_backend(self, cfg_path, backend, searxng_url).await
+    }
+
+    async fn set_context_budget(
+        &self,
+        cfg_path: &Path,
+        target: Option<usize>,
+    ) -> Result<String, String> {
+        crate::settings::set_context_budget(self, cfg_path, target).await
     }
     async fn search_probe(&self, query: Option<String>) -> Result<SearchProbe, String> {
         crate::settings::search_probe(self, query).await
@@ -2002,6 +2117,31 @@ mod tests {
         assert_eq!(auto_budget(8_192), 4_096, "half, floored - not a percentage minus a constant");
         assert_eq!(auto_budget(4_096), 4_096, "a tiny window cannot go below the floor");
         assert_eq!(auto_budget(0), 4_096);
+    }
+
+    #[test]
+    fn a_ceiling_that_cannot_mean_anything_is_refused_in_words() {
+        // Too small to hold a conversation: the fold would fire before the tools did.
+        let e = check_budget(900, Some(262_144)).unwrap_err();
+        assert!(
+            e.contains("below the floor of 4096") && e.contains("Leave the ceiling unset"),
+            "{e}"
+        );
+        // Not below the window: the endpoint would truncate first and the meter could
+        // never fill, which is a gauge drawn for decoration.
+        let e = check_budget(262_144, Some(262_144)).unwrap_err();
+        assert!(
+            e.contains("not below this endpoint's stated window") && e.contains("262144"),
+            "{e}"
+        );
+        // An endpoint that has not stated a window is not a licence to write any number.
+        assert!(check_budget(900, None).is_err(), "the floor does not depend on the window");
+        assert!(check_budget(8_000, Some(262_144)).is_ok());
+        // An early fold is legitimate, and says so rather than leaving the number
+        // unexplained next to a meter that fills up far too soon.
+        assert!(budget_share(8_000, Some(262_144)).contains("folds early on purpose"));
+        assert!(budget_share(131_072, Some(262_144)).contains("50%"));
+        assert!(budget_share(131_072, None).contains("has not stated a window"));
     }
 
     #[tokio::test]
