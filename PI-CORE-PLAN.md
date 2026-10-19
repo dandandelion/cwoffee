@@ -500,6 +500,7 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
 | gpu/render | `scripts/gpu-check.sh` | ✅ unchanged |
 | **NEW** protocol drift | `node scripts/rpc-conformance.mjs` | the pin's teeth |
 | **NEW** local titling | `node scripts/gateway-titlegen.mjs` | the name arrives after the turn, a refusal changes nothing, and the real model names a real sentence |
+| **NEW** prompt shape | `node scripts/gateway-prompt-shape.mjs --core pi` / `--core rust` | reads the bytes the model is actually given: no tools declared in a chat, no coding-harness preamble in a chat, tools declared when cowork says they are mounted |
 | **NEW** tool questions | `node scripts/gateway-ask.mjs --core pi` and `--core rust` | one call, its questions as one set (id/index/total, options with trade-offs, the recommendation), the picks back in the tool's own words, and the scripted endpoint only answers once they reach the prompt |
 
 ---
@@ -1138,6 +1139,16 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     could not know whether "derive it" is a verb or a no-op. Same for the bridge: the pin
     lives on the task that owns the model process, so re-derivation after a model change works
     from the person's intent, not from the previous model's resolved answer.
+105. **A measurement endpoint can invent a finding about the app.** The first prompt-shape
+    probe answered with a plain `chat.completion` JSON body, and pi re-sent the same request
+    four times at 2 s, 4 s, 8 s — exponential backoff, identical bodies. That reads exactly
+    like "the app quadruples its prefill", and it was the probe: pi streams, and a streaming
+    client handed a non-stream body treats the endpoint as dead. Answer the way the working
+    endpoint answers (SSE chunks, a usage chunk, `[DONE]`), and report the *gaps* in the
+    output so a retry loop can never again be mistaken for product behaviour. Related facts
+    the same gate turned up: both cores `GET /props` to learn the context window, and a turn's
+    `busy` flag lags its start by a beat, so a driver that polls too early moves on while the
+    request is still in flight and reaps the model mid-request.
 
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
@@ -1773,6 +1784,49 @@ was the light-theme icon; and go on with the harness plus the parity list.
   (a live turn in the existing UI, zero UI edits).
 
 ---
+
+---
+
+## Journal — session 20 (reading the bytes the model is actually given)
+
+The question asked was whether Chat mode leaks pi's own system prompt. Answering it needed a
+gate that records the request body an endpoint actually receives, because every prompt-size
+claim in this repo had been arithmetic about what each side *composes*, not what leaves the
+process. So: `scripts/gateway-prompt-shape.mjs` — it starts an endpoint that logs the body and
+answers as a stream, points a scratch gateway at it, runs one cowork turn and one chat turn,
+and prints the system text, its sections and the byte cost of every tool declaration. On the
+old core it measures cowork and reports the chat refusal, which is what that core promises.
+
+Measured on this box (one request per turn, `cwoffee-mock` at a stated 262 144 window):
+
+| mode | system text | tool declarations | payload | ≈ tokens |
+|---|---|---|---|---|
+| pi core, cowork | 3,183 B | 11 tools, 11,284 B | 14,467 B | 3,617 |
+| rust core, cowork | 909 B (`cwoffee-v1`) | 11 tools, 11,284 B | 12,193 B | 3,048 |
+| pi core, chat | 79 B | none | 79 B | 20 |
+
+So **chat is clean**: `--system-prompt` replaces pi's default (its help says "default: coding
+assistant prompt", and `--append-system-prompt` is the additive form), the tools section is
+empty because `--no-tools` covers extension tools as well, and what reaches the endpoint is
+one line. Two honest footnotes:
+
+* pi still appends its own `<cwd>` block to a chat prompt, naming the workspace folder — 41
+  bytes, but it is a folder claim in a mode that deliberately has no file tools.
+* **cowork on the pi core runs on pi's coding-harness preamble**, not cwoffee's. 1,478 B of it
+  is pi telling the model to read pi's own docs and examples — files that are not in the
+  user's workspace — and the preamble opens by defining the job as "an expert coding assistant
+  operating inside pi". The old core sends 909 B of cwoffee's own words. Same tools, different
+  idea of what the assistant is, and nobody had noticed because nobody had read the bytes.
+
+Tool declaration costs (worth knowing before deciding what to expose): `ask_user` 2,107 B,
+`exec` 1,904 B, `sheet_query` 1,630 B, `sheet_read` 1,571 B, `edit_file` 804 B,
+`write_xlsx` 758 B, `download_file` 755 B, `write_file` 577 B, `read_file` 535 B,
+`web_fetch` 339 B, `web_search` 304 B — the four spreadsheet/machinery tools are nearly half
+the declaration bytes, which is what the `explore-tools` work is about.
+
+Gotcha 105 belongs to this session: the probe, not the app, produced "the model was asked four
+times" until the endpoint streamed. The gate now prints request gaps and per-request shape so a
+retry loop cannot masquerade as product behaviour again.
 
 ## Journal — session 19 (one ceiling, and the model is told where it is)
 

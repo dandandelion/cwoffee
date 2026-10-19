@@ -232,6 +232,44 @@ depended on which panel you opened. A model process that is already running keep
 threshold it started with — pi reads its settings when the process starts — and the note says
 so rather than implying the change is live inside a running process.
 
+### What the model is actually told
+
+Prompt-size claims used to be arithmetic about what each layer composes.
+`scripts/gateway-prompt-shape.mjs` reads the request body an endpoint actually receives
+instead: it starts an endpoint that logs the body and answers as a stream, points a scratch
+gateway at it, runs one cowork turn and one chat turn, and prints the system text, its
+sections and the byte cost of every tool declaration. Measured on this box:
+
+| mode | system text | tool declarations | payload | ≈ tokens |
+|---|---|---|---|---|
+| pi core, cowork | 3,183 B | 11 tools, 11,284 B | 14,467 B | 3,617 |
+| old core, cowork | 909 B (`cwoffee-v1`) | 11 tools, 11,284 B | 12,193 B | 3,048 |
+| pi core, chat | 79 B | none | 79 B | 20 |
+
+Two things that table says, both of which were invisible before anyone read the bytes:
+
+* **Chat mode really is empty.** `--system-prompt` replaces pi's default prompt (the additive
+  form is `--append-system-prompt`), and `--no-tools` covers extension tools as well as pi's
+  own four, so the tools section is absent and the whole instruction is one line. pi does
+  still append its own `<cwd>` block naming the workspace folder — 41 bytes, but a folder claim
+  in a mode that has no file tools on purpose.
+* **Cowork on the pi core speaks with pi's voice, not cwoffee's.** The preamble defines the job
+  as "an expert coding assistant operating inside pi", and 1,478 bytes of the prompt is pi
+  telling the model to read pi's own docs and examples — files that are not in the user's
+  workspace. The old core sends 909 bytes of cwoffee's own words for the same conversation.
+
+The declaration bytes are uneven enough to matter on a small local model: `ask_user` 2,107 B,
+`exec` 1,904 B, `sheet_query` 1,630 B, `sheet_read` 1,571 B, `edit_file` 804 B, `write_xlsx`
+758 B, `download_file` 755 B, `write_file` 577 B, `read_file` 535 B, `web_fetch` 339 B,
+`web_search` 304 B. The gate is a gate, not a report: it fails if a chat declares tools, or if a
+chat carries a coding harness's preamble, or if cowork declares nothing while claiming the tools
+are mounted.
+
+It also prints the *timing* between requests, because the first version of that endpoint
+answered with a non-streaming body and pi re-sent the same request four times at 2 s, 4 s and
+8 s. A "the app quadruples prefill" finding that was really a probe bug is exactly what the
+timing column is there to make impossible.
+
 ### What a conversation is called
 
 A conversation starts out named after its own first line, cut at 48 characters. That is
