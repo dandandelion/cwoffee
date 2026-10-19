@@ -370,12 +370,12 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
 
 - [ ] **S2.1** `exec` (bwrap) + `files` + `sheet_query` shims; keep Rust semantics
       (`SQLITE_LIMIT_ATTACHED=0`, progress-handler wall clock, mime/count/byte guards).
-- [ ] **S2.2** `ask_user` as a tool that parks the turn — **NOT BUILT on the pi core** (it
-      works on the rust core, and that is exactly what fooled the parity board: see OPEN
-      QUESTION 6). The card machinery on the bridge side exists (`UiRequest::Select` /
-      `Input` are parsed and raised as `QuestionRequested`), what is missing is the two ends:
-      the extension never asks, and `crates/bridge/src/bin/cwtool.rs` still runs tools with
-      `ask: None`.
+- [x] **S2.2** `ask_user` as a tool that parks the turn — **BUILT ON BOTH CORES**, gated by
+      `scripts/gateway-ask.mjs` on each. On the pi core the tool runs in a separate process, so
+      the questions are read out of the engine (`cwtool questions`, the tool's own parse), asked
+      in the host's UI through pi's dialog primitives, and handed back with `--host-answers` —
+      a flag, never `args`, because `args` is what the model wrote. One call, its questions as
+      one set, and the picks land in the engine's own restatement (gotchas 89-92).
 - [ ] **S2.3** `docs`, `net`, `xlsx/sheets`, `searxng` shims; `TurnFiles` from the tool's
       own file-diff report (pi does not produce our `TurnFiles` / `+N -M` badges).
 - [ ] **S2.4** `--tools` allowlist wired into launch config; verify no built-in coding tool
@@ -425,7 +425,7 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
 | gpu/render | `scripts/gpu-check.sh` | ✅ unchanged |
 | **NEW** protocol drift | `node scripts/rpc-conformance.mjs` | the pin's teeth |
 | **NEW** local titling | `node scripts/gateway-titlegen.mjs` | the name arrives after the turn, a refusal changes nothing, and the real model names a real sentence |
-| **NEW** tool questions | *not written yet* | the card half is gated in the page harness (it runs on the rust core today); the pi-core half has no gate until the road exists |
+| **NEW** tool questions | `node scripts/gateway-ask.mjs --core pi` and `--core rust` | one call, its questions as one set (id/index/total, options with trade-offs, the recommendation), the picks back in the tool's own words, and the scripted endpoint only answers once they reach the prompt |
 
 ---
 
@@ -900,6 +900,121 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     already has: do not record a claim a gate does not prove, and when a claim comes from
     memory rather than from a file, check the file first.
 
+87. **A test script must run the binaries this tree builds.** Two page-harness checks — the
+    sheet-query grid and the header-row note — stayed red through a whole session. On an
+    isolated endpoint the same scenario passed in one run, because the needles the scripted
+    endpoint demands (`West` + tab + `26`, `# columns: rownum | region | units | price`) are searched
+    for in the *prompt bytes*, and the harness had been running a `cwtool` lying around in
+    `target/release` from before the tool host started exporting the engine's rendered
+    sentence. With JSON in the prompt instead of the grid, the tab between the region and the
+    total arrives as a backslash and a `t`, the needle never matches, and the endpoint refuses
+    to play its final step —
+    which surfaces as "the grid reached the card but not the answer", a sentence about the UI
+    that was really about a stale binary. `selftest.sh` now builds `-p cwoffee-bridge --bin
+    cwtool` on the same line as the app and points the run at its own copy unless the caller
+    named one on purpose.
+
+88. **Isolate the endpoint you are testing, or you are testing somebody else's run.** A
+    scratch gateway that does not set its own `XDG_DATA_HOME` writes its provider entry into
+    the shared `~/.local/share/cwoffee/pi/models.json`, whose `baseUrl` belongs to the running
+    desktop app. `write_dev_provider` then refuses to overwrite an entry it does not own —
+    correct, that is another install's configuration — and the run *continues against the other
+    endpoint*, which answers plausibly. Two scratch runs this session drove the live app's mock
+    on port 8193 without ever touching the mock they started. A scratch harness needs
+    `XDG_CONFIG_HOME` *and* `XDG_DATA_HOME`; `selftest.sh` has always had both, my throwaway
+    reproduction scripts did not.
+
+89. **pi's dialog primitives are narrower than cwoffee's question card.** `ctx.ui.select`
+    carries a title and a list of bare labels; `ctx.ui.input` carries a title and a
+    placeholder. Nothing in that shape can hold an option's one-line trade-off, which option
+    the model recommended, whether several may be picked, or that this is question 2 of 3 —
+    and those are exactly the parts that make `ask_user` worth calling. So the engine's own
+    `Question` rides in the title after the `CWOFFEEQ ` marker, and the bridge re-numbers it:
+    the question ids a client answers back are this process's, and the set id the UI groups by
+    is this process's too, because `cwtool` numbers a fresh set in every process and two
+    conversations' cards would otherwise merge into one. When a payload will not parse the
+    bridge says so out loud — a silently flattened card is a feature that rotted, and the next
+    person would read it as a feature that was never there.
+
+90. **A person's answers do not travel in model-authored arguments.** `ask_user`'s point is
+    that the model cannot answer its own question. `args` is the model's text, so answers come
+    back to the tool host as a separate flag, `--host-answers`, matched to the questions by
+    position. The extension asks from `cwtool questions` — the tool's own parse, the same one
+    the call will do — so nothing in TypeScript decides what to ask, and a null entry (nobody
+    answered) is carried by dropping the reply sender, which is how the engine already says
+    "nobody answered" instead of being handed an empty sentence.
+
+91. **An answer the gateway cannot see is an answer nobody gave.** `respond_question` reads
+    `text` and `options` off the args themselves — `{ id, text, options }`, flat. A client that
+    nests them (`answer: { text, options }`) gets a successful RPC and an empty answer, and the
+    tool then reports — correctly — that the questions were cancelled. That is the second time
+    this session a *correct* product refusal was really a bug in my own test client, and both
+    times the fix was to read the handler before doubting the feature (gotcha 80 is the same
+    lesson from the other side: assert the product's words, and know the protocol's shape).
+
+92. **A question that was answered should say so, on both cores.** `EngineEvent::
+    QuestionAnswered` has been in the enum the whole time and nothing in the Rust core emitted
+    it — only the pi bridge did. So on the rust core, a card answered in one window stayed
+    interactive in every other window until each of them was clicked. Now `ask_user` emits it
+    itself where the tool runs in-process, and the bridge emits it where the tool runs in
+    another process: exactly one announcement per question either way, because two windows
+    closing a card twice is the same bug wearing a different coat as one never closing.
+
+
+93. **A hoisted helper can read a neighbour `let` before it exists, and the page dies without a
+    verdict.** `frame()` sat below `blind('at the start')`; `blind` recovers a drifted view
+    through `ensureTranscriptMounted → reopen → frame(0)`, and `frame` increments `framePaints`.
+    Function declarations are callable before the `let` next to them runs, so the *recovery*
+    path — the one that only fires when something already went wrong — raised
+    `Cannot access 'Re' before initialization`, the harness stopped measuring, and the board sat
+    out its watchdog. Two fixes: declare the shared helpers above their earliest caller, and give
+    a page-side throw its own verdict (`verdict=throw`, quoting the `UNCAUGHT:` line) so a dead
+    harness is reported as the harness's own failure rather than as a mystery silence.
+
+94. **Do not edit a script a running board is executing.** bash reads a script as it goes, so
+    adding a few lines to `scripts/selftest.sh` under a live run produced `line 274: r: command
+    not found` and `syntax error near unexpected token 'done'` in the middle of an otherwise
+    healthy board. That second red has nothing to do with the app. Check that no board is
+    running before touching the runner — and prefer editing the harness source, which is
+    compiled before the run starts.
+
+95. **A caller's key is not an identity.** The bridge groups a question set by the key the
+    extension sends, and every plausible key turned out to be reusable: the engine numbers the
+    first set of every call at 1 (`cwtool` is a fresh process per call), and pi's tool-call id is
+    whatever the endpoint put in the tool call — a replayed scenario hands out `mock-ask-1` twice.
+    Ask the same conversation the same thing twice and the second call's questions landed on the
+    first call's card. A key now maps to a card **while that card is open**: `QSet` counts what the
+    set promised, what has arrived and what has closed, and a fully closed set leaves the map.
+
+96. **A `require` string in a scenario is the endpoint judging the tool, and its refusals have to
+    be visible.** `ask-two-questions` step 1 refuses to answer until the prompt carries the
+    engine's restatement of the user's picks. When that failed, the only symptom was a missing
+    string three layers away. `mock-llm` now logs `SERVE <scenario> step n/m` and `REQUIRE …
+    missing`, so "which step did the endpoint answer, and what needle did it reject" is one line
+    in the log instead of a guess.
+
+97. **Parity on an event means both cores emit it, not that both declare it.**
+    `QuestionAnswered` sat unused in the engine enum for the whole port; the pi bridge emitted it,
+    the Rust core never did, so answered cards stayed live in every other window on the old core.
+    Grepping *who sends* an event is a cheaper parity check than grepping who can.
+
+98. **`--bin` is a target filter over *every* selected package, and cargo will not tell you.**
+    `cargo build --release -p cwoffee-app -p cwoffee-bridge --bin cwtool` builds the bridge's
+    `cwtool` and **no binary of `cwoffee-app`** — the app has no bin by that name. Cargo compiles
+    the app's dependencies, prints `Finished`, exits 0, and with `-vv` never mentions the package
+    at all. The executable on disk is then whatever older build last wrote it: a whole board ran
+    an app from three hours earlier and reported reds about code that no longer exists. Never let
+    a board trust an exit code: compare the artifact against the sources (`find crates ui/dist
+    -type f -newer target/release/cwoffee-app`), force one relink when it loses, and refuse to run
+    when it loses twice.
+
+99. **A board must say which tree its artifacts came from, and refuse to share a target dir with a
+    tree that packages the same names.** Upstream cwoffee and this clone both define `cwoffee-app`
+    and `cwoffee-gateway`; cargo keeps freshness per workspace, so one shared target dir can hold a
+    binary linked from the other tree's sources while this tree's build says it is done.
+    `scripts/selftest.sh` now dies if `CARGO_TARGET_DIR` points outside the checkout, and prints
+    the artifact timestamps and the target dir it used. This is a guard, not the cause of 98 — the
+    same skip reproduced in the clone's own `./target`.
 
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
@@ -917,17 +1032,15 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
    (pi is cache-aware — it has a cache-warmer and disables cache writes for summarisation —
    but "byte-identical prefix" was *our* invariant and is now pi's behaviour, not ours.)
 5. **Does a coworker want pi's compaction summary tone?** It is written for coding sessions.
-6. **`ask_user` on the pi core** — **still not built**, and this is worth stating plainly
-   because the board said otherwise for two sessions: every recent page-harness run whose core
-   I can prove was the **rust** core, and its `ask set ok` line is a rust-core result. On the
-   pi core, `cwtool` runs tools with `ask: None` (line 107) and the extension contains no
-   question call at all, so a tool's question has no road to a card and goes unanswered. What
-   *does* exist is the half built for approvals: `ui_request()` parses `select`/`input` into
-   `UiRequest::Select`/`Input`, and `PiHost::on_ui_request` raises them as `QuestionRequested`
-   and answers the extension — so the missing links are exactly two, at the two ends. The road,
-   in the order the pieces exist:
-   so a tool's question has no road back to a card and goes unanswered. The road, in the order
-   the pieces actually exist:
+6. ~~**`ask_user` on the pi core**~~ **ANSWERED and BUILT on both cores**, and the road is the
+   one written below, in the order the pieces exist. It stayed "not built" here for a session on
+   purpose: the board that said otherwise was the rust core (gotchas 85, 86), and the honest
+   board was red. What was added at the two ends: `Tool::host_questions` in the registry (so
+   nothing in TypeScript decides what to ask), `cwtool questions` / `--host-answers`, the
+   extension's `askOne` over pi's `select`/`input`, and the bridge re-numbering the engine's
+   `Question` — which arrives in the dialog title, because pi's primitives cannot carry option
+   details, a recommendation, multi, or "2 of 3" (gotchas 89-92).
+   The shape of the card was decided rather than left open: **one card holding every question**.
    * the **extension** asks, because it is the only party that can: pi runs the tool inside the
      extension, so the bridge first learns of the call at `tool_execution_start`, which is too
      late to ask first. `ctx.ui.confirm/select/input` already round-trips to the bridge
@@ -942,11 +1055,12 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
      which is the entire point of the tool.
    * the **engine keeps the wording**: `ask_user` formats its own result ("nobody answered",
      the answer list) so both cores say the same thing to the model.
-   The shape of the card is decided, not open: **one card holding every question**, with
-   Back/Next — the card the desktop has always had, and the one the page harness asserts
-   (`.ask-count`, one `.ask-submit`, `.ask-back`/`.ask-next`, selections kept when you go
-   back). Sequential dialogs would have been twenty lines and would make the phone show three
-   popups in a row for one tool call.
+   The card the page harness asserts is the card both cores send: `.ask-count`, one
+   `.ask-submit`, `.ask-back`/`.ask-next`, selections kept when you go back. Sequential dialogs
+   would have been twenty lines and would make the phone show three popups in a row for one tool
+   call. What is left here is not the road but the traffic: `multi` answers travel through pi's
+   one-label `select` as a joined string and are split back into picks — good enough for the
+   engine's "few words" labels, and worth revisiting if an option label ever grows a pipe.
 7. **Do we keep `crates/tui` as a bridge-driven debug client?** (It becomes ~300 lines if the
    frames are already right; useful in the field, but it no longer shows 7 MB.)
 
@@ -1534,3 +1648,183 @@ was the light-theme icon; and go on with the harness plus the parity list.
 - **Not done / not started:** everything in Phase 1+. `crates/engine` untouched; `master`
   still runs the Rust core. Next session: S1.1 the bridge, with the S1.2 exit criterion
   (a live turn in the existing UI, zero UI edits).
+
+### D13 — a tool's question crosses the pi boundary in the engine's own words, and the
+answer comes back as a host flag, never as model text (locked 2026-10-19)
+
+The old core ran `ask_user` in-process, so the question travelled as an `EngineEvent` and
+the answer came back over an mpsc channel. On pi the tool runs inside an extension, and a
+tool cannot hold a card open from inside a short-lived `cwtool` call.
+
+Locked shape:
+
+* **Ask before running.** `Tool::host_questions(&args)` (default `None`) lets a remote host
+  ask the questions the tool *would* have asked. `ask_user` implements it. The extension
+  asks `spec.host_ask`, which `cwtool specs` sets from the same registry — nothing in
+  TypeScript decides which tool asks a person or what its options look like.
+* **The answers are an argument to the run, not part of the tool's input.**
+  `cwtool run ask_user --host-answers '[…]'`. A model that can put its own answers in
+  `args` can answer its own question, which is the whole thing `ask_user` exists to prevent.
+  The engine rejects any `ask_user` call whose arguments contain `answer`/`answers`/`answer_id`
+  for the same reason; a test asserts it.
+* **A payload rides in the dialog title.** `CWOFFEEQ {…}` carries the engine's `Question`
+  through pi's title-and-labels primitives, and the bridge rebuilds it: the trade-off line
+  under each option, the recommended option, "pick more than one", and "question 1 of 2".
+  Unparsable payload → the bridge **refuses to flatten silently**: it says so and shows the
+  flattened version, because silently dropping the model's trade-offs is worse than a loud
+  degraded card.
+* **Set ids are this process's to give.** The engine numbers the first set of every call at
+  1, and even pi's tool-call id repeats when a scripted endpoint replays the same scenario.
+  So the bridge keys a card on the caller's key *while that card is open*: once every
+  question the set promised has arrived and then been answered or expired, the key is
+  released and the next call gets a card of its own. `mark_set_closed` implements "closed",
+  and an answered question and an expired one are the same event to it.
+* **Both cores emit `QuestionAnswered`.** It used to be a bridge event only, so on the old
+  core an answered card stayed live in a second window — a control still wired to a question
+  the user had already settled. `AskUserTool` emits it where the answer is actually taken.
+
+---
+
+## Journal — session 18 (ask_user on the pi core, and a harness that died without a verdict)
+
+Two things were proven this session: that `ask_user` — the one cwoffee feature most assumed
+to be Rust-core-only — works on pi, and that a red board can be red about the board.
+
+ask_user. The machinery was in place (`questions_for`, `--host-answers`, the `CWOFFEEQ`
+payload, `questions` in the gateway, cards in the UI) and every layer looked right in
+isolation. The gate still failed, and the interesting part was where it failed:
+
+* the *endpoint* was refusing the step — `ask-two-questions` step 1 `require`s the engine's
+  own restatement of the user's picks, and it was being answered with step 0's filler. The
+  mock had no logging for "which step am I serving, and why did I refuse", so the failure
+  appeared at the far end of the chain as a missing string. `SERVE` / `REQUIRE` lines now
+  print the step and the missing needle.
+* **the gateway takes `respond_question { id, text, options }` flat**, and the gate sent
+  `{ id, answer: { … } }`. The handler answered "unknown question id" — and a card that
+  refuses an answer leaves the tool waiting until the engine's own timeout says nobody
+  answered. Same wire shape as `respond_approval`, and nothing said so until it was wrong.
+* **the set key has to be the bridge's business.** Asking the same conversation twice — the
+  obvious thing a person does — put the second call's two questions on the first call's
+  card, because both calls' sets were numbered 1 by their own `cwtool` process and pi's
+  tool-call id was identical across the two turns of a replayed scenario. The card is now
+  keyed on "is this set still open", not on the caller's number.
+
+Then the harness. It crashed inside two seconds of the first turn with
+`ReferenceError: Cannot access 'Re' before initialization`, printed no verdict, and the board
+would have sat out the full 900 s watchdog. The cause was mine from an earlier session: the
+rAF-floor helpers sit after `blind('at the start')`, and `blind` recovers a drifted view by
+calling `ensureTranscriptMounted → reopen → frame(0)`. A hoisted function is callable before
+the `let` next to it is initialised, and reading one is not a warning, it is a dead run. The
+declarations moved above their earliest caller.
+
+Two harness lessons came out of that:
+
+* A page-side throw is now its own verdict (`verdict=throw`) that quotes the `UNCAUGHT:`
+  line, instead of a timeout. A harness that dies says so; the red belongs to the harness and
+  the board should say which.
+* **Do not edit a script while it runs.** bash reads a script as it goes: editing
+  `scripts/selftest.sh` under a running board produced `line 274: r: command not found` and
+  `syntax error near unexpected token 'done'` in the *middle* of a healthy run. That red was
+  a second, unrelated, self-inflicted failure. Check for a running board before editing the
+  runner.
+
+Gates added or changed: `scripts/gateway-ask.mjs` now drives **two** ask_user calls in one
+conversation and asserts they stay two cards with different set ids, that every question
+carries a marker, and that answers come back for every question; both `--core pi` and
+`--core rust` pass, and the pi run shows `questionRequested:4, questionAnswered:4` with the
+endpoint's `require` satisfied by the tool's own words.
+
+### It went green: the page harness passes on the pi core
+
+With the artifacts proven current and the two harness bugs (the frame TDZ, and the ask check
+looking for a tool card the renderer deliberately does not draw) fixed, the board ran
+end-to-end on `--core pi` and printed a verdict for the first time:
+
+```
+[selftest.sh] artifacts  : app 10-19 13:33:45, target dir /home/dandandelion/AI/Harness/pi-cwoffee/target (built from this tree)
+[cwoffee/page] scripted ask set ok (one tool call, 2 questions, one card; settled "answered 2 of 2";
+               the stored transcript carries both restated picks)
+[cwoffee/page] clipboard paste ok (97 bytes of image/png read off the desktop selection,
+               named clipboard-133453.png, previewed in the composer)
+[cwoffee/page] scripted bullets ok (4 of 4 were structure while streaming, counts 0->1->2->3->4)
+[cwoffee/page] frame cadence ok
+[cwoffee/page] SELFTEST ok: sessions 0->0, fts-safe query -> 0 hits, models=1 picked=cwoffee-mock
+[selftest.sh] verdict: ok
+```
+
+Two of the fixes were about the harness measuring the machine rather than the app:
+
+* **`wl-copy` does not exit.** It forks a resident process that owns the selection, so
+  capturing its stdout and waiting held a pipe open forever: the paste check's request to
+  re-stage the fixture never returned, the harness printed no verdict, and the board died on
+  its 900 s watchdog. The verb now sends stdout to null and stderr to a file, and the page
+  races the request against 4 s so a helper that never returns costs one honest skip.
+* **A window that is not being composited has no mid-stream.** In one run every sample of the
+  live-bullet check saw zero `<li>` while the turn streamed, and the turn's own `frames=0`
+  said why: the incremental renderer writes nothing between paints. The check now skips that
+  half — with the reason and the frame count in the log — when the window delivered no paints,
+  and still fails when it did.
+
+Live desktop after the rebuild (own artifacts, product bundle, `harness-in-js=0`):
+
+```
+session_state: persona=cowork budget=131072 window=262144 tokens=0 compactions=0
+tools_view: 11 -> exec, read_file, write_file, write_xlsx, web_fetch, web_search,
+             download_file, edit_file, ask_user, sheet_read, sheet_query
+titlegen: enabled=true model=LiquidAI/LFM2.5-230M script_found=true python_found=true weights=true
+compact -> refused: nothing to compact yet: this conversation has no running model process.
+tree PSS with no model process up: 259.1 MB (app 89.4, WebKitNetwork 28.7, WebKitWeb 141.0)
+```
+
+The long run of spaces in the read-outside-the-workspace refusal — still open at the start of
+this session — turned out to be another stale-`cwtool` artifact: the current tool host answers
+"…which is outside the workspace /tmp/cw-smoke-ws. Use a path relative to the workspace
+root." with one space, and the gate that saw the word salad was mounting an old binary.
+
+Tests: engine 432+10, bridge 11+16, gateway 31, svelte-check 0, page harness green on pi core.
+
+### And then the board itself was lying: `--bin` filters targets away from every package
+
+The h18 board's ask_user red — a page that received `questionRequested` events still carrying
+the raw `CWOFFEEQ {…}` payload — was not the bridge failing to parse. The app it launched was
+**built at 01:56**, hours before the question work existed: `strings` finds no `CWOFFEEQ` in
+`target/release/cwoffee-app`, while the `cwtool` next to it is from 09:34.
+
+The cause was a build line I wrote this morning:
+
+```
+cargo build --release -p cwoffee-app -p cwoffee-bridge --bin cwtool
+```
+
+**A target filter applies to every selected package.** `--bin cwtool` selects "the bin named
+cwtool" across the whole selection, and `cwoffee-app` has no such bin — so cargo builds the
+bridge's tool host and **no binary of the app at all**, compiles the app's *dependencies* on
+the way, prints `Finished`, exits 0, and says nothing about what it left unlinked. The
+artifact on disk keeps whatever vintage last wrote it. `-vv` makes it plain: the log never
+mentions `cwoffee-app` — no `Fresh`, no `Dirty`.
+
+Two things were guessed wrong on the way and are worth keeping as warnings:
+
+* The first theory was artifact collision: the upstream checkout defines packages with the
+  same names, and I had been building the clone into *its* target dir. Plausible, and the new
+  board refuses that setup anyway (it is a real trap) — but the same skip reproduced in this
+  checkout's own `./target`, so the collision was not the cause.
+* An mtime-only `touch` of a dependency also leaves the app alone, which is correct behaviour
+  and made the bug look like cargo being lazy rather than cargo being told.
+
+Fixes, in `scripts/selftest.sh`:
+
+* The build line names the packages with **no target filter** (`-p cwoffee-app -p
+  cwoffee-gateway -p cwoffee-bridge`), so every one of their binaries is a build target.
+* **The proof is the artifact, not the exit code.** After building, any source newer than
+  `target/release/cwoffee-app` means the build did not produce what the board would run: say
+  which file, force one relink, re-check, and *die* if it is still behind. The same check runs
+  for `cwtool` on the pi core, since the tools, their guardrails and their answer wording all
+  live in that binary.
+* The header now prints the artifact timestamps and the target dir the build used.
+
+Consequence for the pi-core triage: the ask_user red and the cascading
+"pi refused prompt: Agent is already processing" that followed it both came from grading code
+this tree no longer has, and the h18 run's other numbers (`grown transcript` cadence included)
+describe the 01:56 app. Nothing about the current tree's page-harness state is known until the
+next board runs with the proof passing.

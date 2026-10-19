@@ -780,6 +780,15 @@ pub fn gpu_report() -> gpu::GpuReport {
     gpu::report()
 }
 
+/// Only the page harness asks for this: it puts the board's own clipboard fixture back on the
+/// selection at the moment the paste check needs it. Refuses unless the board named the file
+/// in `CWOFFEE_SELFTEST_CLIP_IMG`, so a running app cannot be talked into replacing what the
+/// user copied.
+#[tauri::command]
+pub fn selftest_stage_clipboard() -> Result<serde_json::Value, String> {
+    crate::clipboard::stage_fixture()
+}
+
 /// A paste of an image that lives only in the system clipboard.
 ///
 /// The page cannot read it: WebKitGTK gives the paste event no file and no image

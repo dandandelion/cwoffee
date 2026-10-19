@@ -137,10 +137,9 @@ note "gateway    : 127.0.0.1:${GW_PORT} (not 8099: the running app keeps its gat
 # for every call, and half the board turns into a core-shape accident.
 note "core       : ${CWOFFEE_CORE:-rust} (from the environment; check /proc/<app>/environ if unsure)"
 if [ "${CWOFFEE_CORE:-rust}" = pi ] && [ -z "${CWOFFEE_CWTOOL:-}" ]; then
-  note "core       : pi WITHOUT CWOFFEE_CWTOOL — the extension will register no Rust tools;"
-  note "             every tool call becomes 'tool not found' and tool-heavy checks test nothing"
+  note "toolhost   : not set — this run will build and use its own target/release/cwtool"
 elif [ "${CWOFFEE_CORE:-rust}" = pi ]; then
-  note "toolhost   : ${CWOFFEE_CWTOOL}"
+  note "toolhost   : ${CWOFFEE_CWTOOL} (from the environment; this run does NOT rebuild it)"
 fi
 note "log        : $log"
 
@@ -206,14 +205,75 @@ if [ "$CLIP_TOOL" = 1 ] && [ -f "$CLIP_MARKER" ]; then
 fi
 
 # ---- build ------------------------------------------------------------------
+# Which tree the artifacts come from decides what the board is actually testing, so it is
+# settled before the build rather than guessed afterwards. The upstream checkout defines
+# packages with the *same names* (`cwoffee-app`, `cwoffee-gateway`), and cargo keeps
+# freshness per workspace: share one target dir between the two and a `cargo build` here can
+# report "Finished" while the executable in that dir was linked from the other tree. That is
+# not a slow build; it is a board that grades code it never compiled.
+tgt=${CARGO_TARGET_DIR:-$PWD/target}
+case "$tgt" in
+  "$PWD"/target|"$PWD"/target/*) ;;
+  *) die "refusing to build into $tgt: that target dir belongs to another tree, and both trees package cwoffee-app/cwoffee-gateway under the same names. Unset CARGO_TARGET_DIR (this checkout builds into ./target) or point it at a directory of this checkout's own." ;;
+esac
+
+# The proof, after the build: an artifact older than the sources it is supposed to contain.
+# Which sources count is stated per artifact, because guessing is wrong in both directions:
+# comparing `cwtool` to `ui/dist` or to the Tauri app's sources invents failures, and
+# ignoring a package that really does feed an artifact hides a stale one. These are the
+# packages each binary is linked from, plus the UI bundle the app embeds at build time.
+app_inputs() { printf '%s\n' crates/tauri-app crates/gateway crates/bridge crates/engine Cargo.toml Cargo.lock ui/dist; }
+tool_inputs() { printf '%s\n' crates/bridge crates/engine Cargo.toml Cargo.lock; }
+newer_than() {
+  local a=$1 f
+  while IFS= read -r f; do
+    local hit
+    hit=$(find "$f" -type f -newer "$a" 2>/dev/null | head -1)
+    [ -n "$hit" ] && { printf '%s' "$hit"; return 0; }
+  done
+  return 1
+}
+
 if [ "$NO_BUILD" = 0 ]; then
   note "building the self-test UI bundle (the release binary embeds it)"
   ( cd ui && VITE_SELFTEST=1 npx vite build ) >>"$log" 2>&1 || die "ui build failed (see $log)"
   note "building cwoffee-app (release, guarded); this is the slow part"
-  CARGO_BUILD_JOBS=1 ./scripts/cargo-guard.sh --max-mb 3000 cargo build --release -p cwoffee-app -j 1 >>"$log" 2>&1 \
+  # cwtool travels with the app: the pi core's tools, guardrails and answer wording all
+  # come out of that binary, so a board that runs whatever cwtool was lying around in
+  # target/release is testing an unknown vintage. One build line, one vintage.
+  # No `--bin cwtool` here. A target filter applies to **every** selected package, so
+  # `-p cwoffee-app -p cwoffee-bridge --bin cwtool` builds the bridge's cwtool and *no
+  # binary of the app at all* — cargo does not warn, prints "Finished", and the board runs
+  # whatever cwoffee-app was left in the target dir by an older build. That is how a board
+  # graded a three-hour-old bridge while the tree had moved on. Build the packages, all of
+  # their targets, and let the proof below check the artifacts.
+  CARGO_BUILD_JOBS=1 ./scripts/cargo-guard.sh --max-mb 3000 cargo build --release -p cwoffee-app -p cwoffee-gateway -p cwoffee-bridge -j 1 >>"$log" 2>&1 \
     || die "cargo build failed (see $log)"
+  # "Finished" is not evidence. Cargo has been seen to recompile the engine and the bridge
+  # and leave `cwoffee-app` alone, so the app keeps an embedded bridge from hours ago and the
+  # board reports red for behaviour this tree no longer has. Compare the artifact against the
+  # sources, force it once if it lost, and refuse to run if it loses twice.
+  stale=$(newer_than target/release/cwoffee-app $(app_inputs))
+  if [ -n "$stale" ]; then
+    note "target/release/cwoffee-app is older than $stale — the build said finished without relinking the app; forcing one relink"
+    touch crates/tauri-app/src/main.rs
+    CARGO_BUILD_JOBS=1 ./scripts/cargo-guard.sh --max-mb 3000 cargo build --release -p cwoffee-app -p cwoffee-gateway -p cwoffee-bridge -j 1 >>"$log" 2>&1 \
+      || die "cargo rebuild failed (see $log)"
+    stale=$(newer_than target/release/cwoffee-app $(app_inputs))
+    [ -z "$stale" ] || die "target/release/cwoffee-app is STILL older than $stale: this board would be running an artifact it did not build. Any red it prints belongs to that older code, not to this tree."
+  fi
 fi
 [ -x target/release/cwoffee-app ] || die "no target/release/cwoffee-app"
+if [ "${CWOFFEE_CORE:-rust}" = pi ] && [ -z "${CWOFFEE_CWTOOL:-}" ]; then
+  [ -x target/release/cwtool ] || die "the pi core needs a tool host and target/release/cwtool is missing (see $log)"
+  # Same proof for the tool host: the tools, their guardrails and the wording of a tool's
+  # answer all live in that binary, so a stale cwtool grades stale tool behaviour.
+  stale=$(newer_than target/release/cwtool $(tool_inputs))
+  [ -z "$stale" ] || die "target/release/cwtool is older than $stale: rebuild it (cargo build --release -p cwoffee-bridge --bin cwtool) before trusting a tool-shaped red"
+  export CWOFFEE_CWTOOL="$PWD/target/release/cwtool"
+fi
+
+note "artifacts  : app $(date -r target/release/cwoffee-app '+%m-%d %H:%M:%S'), target dir $tgt (built from this tree)"
 
 # No pkill here: this run owns its own config, data dir, workspace and gateway
 # port, so it coexists with an app the user already has open.
@@ -240,6 +300,12 @@ if [ "$CLIP_TOOL" = 1 ]; then
     { printf '%s\n' "$CLIP_BACKUP_IMG"; sha256sum tests/fixtures/clipboard.png | cut -d' ' -f1; } \
       > "$CLIP_MARKER" 2>/dev/null || true
     CLIP_ARMED=1
+    # Tell the app where the fixture lives so the paste check can ask for it to be put back
+    # on the selection at the moment it is needed. The selection belongs to the desktop, not
+    # to this run: a person copying something, or an earlier check copying an answer, replaces
+    # the image with text, and the check then reports "nothing sendable" about a fixture that
+    # stopped existing mid-run.
+    CLIP_FIXTURE=/tmp/cwoffee-selftest-fixture.png
     note "clipboard  : a $(wc -c < tests/fixtures/clipboard.png)-byte PNG is on the selection; the old content goes back after"
   else
     note "clipboard  : wl-copy refused the fixture; the paste check will report the failure"
@@ -249,7 +315,7 @@ fi
 # commands.rs::selftest_armed - the release binary embeds whatever ui/dist holds,
 # so a production start right after this script unarms the same bundle and must
 # not drive the user's endpoint, config or session store.
-CWOFFEE_SELFTEST=1 ./target/release/cwoffee-app >>"$log" 2>&1 &
+CWOFFEE_SELFTEST=1 CWOFFEE_SELFTEST_CLIP_IMG="${CLIP_FIXTURE:-}" ./target/release/cwoffee-app >>"$log" 2>&1 &
 APP_PID=$!
 
 # ---- wait for a verdict -----------------------------------------------------
@@ -258,6 +324,10 @@ verdict=""
 while [ $SECONDS -lt $deadline ]; do
   if grep -q "SELFTEST ok" "$log" 2>/dev/null; then verdict=ok; break; fi
   if grep -q "SELFTEST FAILED" "$log" 2>/dev/null; then verdict=fail; break; fi
+  # A page-side exception inside the harness kills the run mid-chain: no verdict is
+  # printed, and the only signal would otherwise be a 900 s watchdog expiring with the
+  # crash three seconds in. Say which line threw, because that is the whole diagnosis.
+  if grep -q "UNCAUGHT:" "$log" 2>/dev/null; then verdict=throw; break; fi
   # "Is there a process slot" is not "is it running". A window the user closed leaves a
   # reaped-or-zombie pid that `kill -0` happily answers for, and the run then sits out the
   # whole 900 s before saying what happened in the first three seconds. Read the state.
@@ -298,6 +368,14 @@ case $verdict in
   timeout)
     printf '\033[31mno verdict in 900s; last lines:\033[0m\n' >&2
     tail -25 "$log" >&2; exit 1 ;;
+  throw)
+    # Not "a check failed": the harness itself died, so nothing after the throw was ever
+    # measured and the board says nothing about the app. Quote the throw, and say plainly
+    # that the red is the harness's own.
+    printf '\033[31mthe page harness threw an uncaught error; nothing after it ran:\033[0m\n' >&2
+    grep -E "UNCAUGHT:" "$log" | tail -5 >&2
+    tail -12 "$log" >&2
+    exit 1 ;;
   *)
     grep -E "SELFTEST FAIL|selftest note" "$log" | tail -30 >&2
     exit 1 ;;

@@ -652,6 +652,7 @@ fn main() {
             commands::selftest_armed,
             commands::gpu_report,
             commands::clipboard_image,
+            commands::selftest_stage_clipboard,
             commands::render_report,
             commands::boot_log
         ]);

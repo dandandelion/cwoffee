@@ -17,7 +17,23 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-target=${CARGO_TARGET_DIR:-$here/../cwoffee/target}
+# Which tree the artifact came from is a fact about what runs, so say it. The neighbour
+# checkout also defines packages named `cwoffee-app` / `cwoffee-gateway`, and cargo keeps
+# its freshness bookkeeping per workspace: a shared target dir can hold a binary built
+# entirely from the *other* tree's sources while this one's `cargo build` says "Finished".
+# Look here first, and shout when we have to look there.
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  target=$CARGO_TARGET_DIR
+elif [[ -x "$here/target/release/cwoffee-app" ]]; then
+  target="$here/target"
+elif [[ -x "$here/../cwoffee/target/release/cwoffee-app" ]]; then
+  target="$here/../cwoffee/target"
+  echo "[run-pi-app] nothing built in this checkout's ./target — running the artifact from $target," >&2
+  echo "[run-pi-app] which was linked from ANOTHER checkout's sources. Build here, or expect this" >&2
+  echo "[run-pi-app] run to test code that is not in this working tree." >&2
+else
+  target="$here/target"
+fi
 
 BIN=${CWOFFEE_BIN:-$target/release/cwoffee-app}
 # Prefer the release tool host; fall back to a debug one rather than launching an app

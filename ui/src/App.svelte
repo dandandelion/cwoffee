@@ -1266,6 +1266,11 @@
   }
   let rafId = 0
   let lastFrameTs = 0
+  // Paints delivered during the turn that just ended — the number the `turn end frames=` line
+  // prints. A check that samples the DOM mid-stream is measuring the window manager when this
+  // is 0: with no paints the incremental renderer writes nothing until the settle, so "the
+  // bullets appeared all at once" says something about compositing, not about the app.
+  let lastTurnFrames = 0
 
   function watchFrames(ts: number) {
     if (lastFrameTs) {
@@ -1639,6 +1644,7 @@
           tick = undefined
         }
         stopFrames()
+        lastTurnFrames = frames
         pageLog(
           `turn end chars=${transcript?.streamedChars ?? 0} frames=${frames} ` +
             `dropped=${dropped} worst=${worstFrame.toFixed(0)}ms`,
@@ -2954,25 +2960,6 @@
       return true
     }
     let blindSkips = 0
-    const blind = async (where: string) => {
-      let b = offScreen()
-      if (!b) return false
-      // One recovery attempt first. A view that drifted onto a draft is a harness
-      // problem that can be fixed on the spot; a locked screen cannot be.
-      await ensureTranscriptMounted()
-      b = offScreen()
-      if (!b) {
-        pageLog(`selftest note: the view had drifted for ${where}; reopened a session`)
-        return false
-      }
-      blindSkips++
-      pageLog(`selftest note: skipped ${where}; ${b}`)
-      return true
-    }
-    if (await blind('at the start')) {
-      pageLog('SELFTEST ABORTED: nothing was measured')
-      return
-    }
     // rAF is not a clock. An occluded, minimized or workspace-switched window stops
     // compositing, and a wait built only on requestAnimationFrame then never settles:
     // the run prints no verdict and no failure, and the harness's only signal is a
@@ -3021,6 +3008,25 @@
           setTimeout(() => res(false), settleMs)
         }, 400 + settleMs)
       })
+    }
+    const blind = async (where: string) => {
+      let b = offScreen()
+      if (!b) return false
+      // One recovery attempt first. A view that drifted onto a draft is a harness
+      // problem that can be fixed on the spot; a locked screen cannot be.
+      await ensureTranscriptMounted()
+      b = offScreen()
+      if (!b) {
+        pageLog(`selftest note: the view had drifted for ${where}; reopened a session`)
+        return false
+      }
+      blindSkips++
+      pageLog(`selftest note: skipped ${where}; ${b}`)
+      return true
+    }
+    if (await blind('at the start')) {
+      pageLog('SELFTEST ABORTED: nothing was measured')
+      return
     }
       // Sessions created lazily by a check's `newSession(); send()` pair are not
       // the `selftest` session this harness deletes by id, and auto-titling renames
@@ -5147,6 +5153,15 @@
           if (!done) fail('the scripted bullet turn never finished')
           else if (!body) fail('the scripted bullet turn left no answer block')
           else if (lis.length !== 4) fail(`the bullet list ended with ${lis.length} items, expected 4`)
+          else if (maxRunning < 3 && lastTurnFrames === 0)
+            // Honest skip, and the reason: nothing painted during the turn, so there was no
+            // moment between the stream and the settle in which to look at the DOM. The final
+            // structure above is still asserted; only the mid-stream half is unobservable here.
+            pageLog(
+              `selftest note: skipped the mid-stream half of the bullet check; this window delivered ` +
+              `0 paints during the turn (${liCounts.length} samples all saw ${maxRunning} li, and the list is ` +
+              `whole at settle), so live structure cannot be observed in a window that is not being composited`,
+            )
           else if (maxRunning < 3)
             fail(
               `only ${maxRunning} of 4 bullets were real <li> elements while the stream was still running ` +
@@ -6022,6 +6037,33 @@
           } else if (noClip) {
             pageLog('clipboard paste SKIPPED: this machine has no wl-clipboard, so nothing was placed on the selection')
           } else {
+            // The selection belongs to the desktop, not to this run. A person copying
+            // something mid-run, or an earlier check that copies an answer, replaces the
+            // fixture image with text, and then this check reports "nothing sendable" about a
+            // fixture that stopped existing. Ask the app to put the board's own file back on
+            // the selection at the moment it is needed; the verb refuses unless the board
+            // named that file in CWOFFEE_SELFTEST_CLIP_IMG, so a product build cannot be
+            // talked into overwriting what the user copied.
+            // Bounded on purpose. This reaches outside the page into the desktop, and an
+            // external tool that never answers must cost one honest skip, not the whole board:
+            // a `wl-copy` that forks a resident clipboard owner once held this request open
+            // for the remaining 15 minutes of a run and the harness printed no verdict.
+            const staged = await Promise.race([
+              invoke<{ mime: string; bytes: number }>('selftest_stage_clipboard')
+                .then((v) => ({ v, why: '' }))
+                .catch((e) => ({ v: null as null | { mime: string; bytes: number }, why: String(e) })),
+              new Promise<{ v: null; why: string }>((res) =>
+                setTimeout(() => res({ v: null, why: 'the app never answered the staging request (4s) — the helper it calls did not return' }), 4000),
+              ),
+            ])
+            if (!staged.v) {
+              // A skip with a reason, and no substitute: firing a synthetic paste event with a
+              // made-up file would exercise our handler and not the desktop path, which is the
+              // whole thing this check exists for.
+              pageLog(`clipboard paste SKIPPED: ${staged.why || 'the app refused to stage a fixture'}`)
+            } else {
+              const stagedInfo = staged.v
+              pageLog(`clipboard fixture re-staged for this check: ${stagedInfo.mime}, ${stagedInfo.bytes} bytes`)
             const had = pending.length
             btn.click()
             const grew = await waitFor('the clipboard image to attach', () => pending.length > had, 9000)
@@ -6056,6 +6098,7 @@
                     `named ${pend.name}, previewed in the composer)`,
                 )
               dropAttachment(pending.length - 1)
+            }
             }
           }
         }
@@ -6205,11 +6248,35 @@
             else if (pairs.length !== 2) fail(`the settled set shows ${pairs.length} question/answer pairs, expected 2`)
             else if (!answers.every((a) => a.length > 0)) fail(`a settled answer is blank: ${JSON.stringify(answers)}`)
             else if (!/answered 2 of 2/.test(receipt)) fail(`the settled card reads "${receipt}"`)
-            else
-              pageLog(
-                `scripted ask set ok (one tool call, two questions, one card; settled "${receipt}": ` +
-                  `${questions.map((q, i) => `${q} -> ${answers[i]}`).join(' | ').slice(0, 160)})`,
-              )
+            else {
+              // The card closing is half the feature. The other half is the picks arriving
+              // where the model reads them. There is deliberately no tool card for `ask_user`:
+              // the renderer turns one question into one card, and a second card next to it
+              // saying "ask_user running" reads as a bug. So the proof is read from the store,
+              // where the tool row carries the engine's own restatement — "User chose: 1:
+              // Engineers" — and that is the text the endpoint has to see in the prompt before
+              // it will serve the scripted step.
+              // `session_messages` answers with a page, not a list — `{ messages, has_older }`
+              // — and paging is capped, so ask for a page wide enough to hold the run.
+              const page = await invoke<{ messages?: { content?: unknown }[] }>('session_messages', {
+                id: viewId,
+                limit: 200,
+              }).catch(() => ({ messages: [] }))
+              const rows = page.messages ?? []
+              const all = rows.map((r) => (typeof r.content === 'string' ? r.content : JSON.stringify(r.content ?? ''))).join('\n')
+              const picks = ['User chose: 1: Engineers', 'User chose: 2: Two pages']
+              const missing = picks.filter((t) => !all.includes(t))
+              const shown = pairs.map((_, i) => `${questions[i]} -> ${answers[i]}`)
+              if (missing.length)
+                fail(`the picks never reached the stored transcript; missing ${JSON.stringify(missing)} from ${rows.length} row(s), ${all.length} chars`)
+              else if (!answers.some((a) => a.includes('Engineers')) || !answers.some((a) => a.includes('Two pages')))
+                fail(`the settled card does not show the picks the user made: ${JSON.stringify(shown)}`)
+              else
+                pageLog(
+                  `scripted ask set ok (one tool call, ${questions.length} questions, one card; settled "${receipt}"; `
+                  + `the stored transcript carries both restated picks: ${JSON.stringify(picks)})`,
+                )
+            }
           }
         }
 

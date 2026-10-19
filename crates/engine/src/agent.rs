@@ -1020,7 +1020,12 @@ struct Collected {
 
 /// What the model sees for a tool result. Shaped for a small model: lead with
 /// the status, keep it short, and never let an empty result be ambiguous.
-fn render_result(r: &ToolResult) -> String {
+/// What the model is handed for a tool result. Public because the pi core must hand over
+/// *these* bytes and not its own idea: two cores describing the same tool result in two
+/// different ways is two behaviours, and the scenario fixtures in tests/scenarios key their
+/// `require` lists off this text, so a core that re-renders it silently fails them for the
+/// wrong reason.
+pub fn render_result(r: &ToolResult) -> String {
     if let Some(e) = &r.error {
         return format!("ERROR (exit {:?}): {e}\n{}", r.exit_code.unwrap_or(-1), r.output);
     }

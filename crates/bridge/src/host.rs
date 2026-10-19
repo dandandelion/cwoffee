@@ -185,6 +185,8 @@ impl PiHost {
             tr: Translator::with_iter_cap(iter_cap),
             turn_files: Vec::new(),
             last_assistant_row: None,
+            resume_announced: std::collections::HashSet::new(),
+            q_sets: HashMap::new(),
             titlegen: cwoffee_engine::titlegen::TitleGen::new(
                 cwoffee_engine::config::Config::load(None)
                     .map(|(c, _)| c.titlegen_cfg())
@@ -449,13 +451,101 @@ impl HostOps for PiHost {
 /// What the bridge knows about an outstanding dialog, in both id spaces.
 enum Wait {
     Approval { pi_id: String, tool: String, deadline: Instant },
-    Question { pi_id: String, kind: QKind, deadline: Instant, answered: bool },
+    Question {
+        pi_id: String,
+        kind: QKind,
+        deadline: Instant,
+        answered: bool,
+        /// The set this question belongs to, in this process's numbering. An answered or
+        /// expired question releases its set, which is what lets a later call reuse the
+        /// caller's key without reusing this card.
+        set_id: Option<u64>,
+    },
+}
+
+/// What an unanswered card was, so the expiry can be said in the right words and the right
+/// set slot can be released.
+enum Expired {
+    Approval(String),
+    Question,
 }
 
 enum QKind {
     /// pi's `select` takes plain strings and returns the one chosen.
     Select { options: Vec<String> },
     Input,
+}
+
+/// A cwoffee tool that asks a person (today: `ask_user`) cannot hold the question open
+/// inside its own process — the tool host is a short-lived `cwtool` run — so it asks
+/// through pi's dialog primitives and the answers travel back as an argument. pi's
+/// primitives carry a title and a list of labels, and nothing else: no trade-off lines,
+/// no recommended option, no "pick more than one", no "this is question 2 of 3". So the
+/// engine's own `Question` rides in the title after this marker, and the card the user
+/// answers is the card the engine designed rather than a flattened summary of it. If the
+/// payload ever fails to parse, the arms below fall back to treating the title as the
+/// question, which is what any other extension's dialog would do.
+pub const CANON_Q: &str = "CWOFFEEQ ";
+
+/// Recover the engine's question from a dialog title, and re-number it for this process.
+///
+/// The ids a client answers back are the ids this process announced on the card, and the
+/// set ids the UI groups by have to be unique *here*: the ids in the payload came from a
+/// `cwtool` process that has already exited, and the next ask_user in the next
+/// conversation hands out the same numbers. So the payload's call key (`k`) maps to a set
+/// id of this process's own, and one key keeps one id while the card is open — which is
+/// what makes "question 2 of 3" true rather than approximate.
+/// One question set as this process numbers it: the id the UI groups by, how many
+/// questions the set promised, and how many have arrived / been closed.
+#[derive(Debug, Clone)]
+struct QSet {
+    id: u64,
+    total: usize,
+    seen: usize,
+    closed: usize,
+}
+
+/// Answer to give back for a set whose questions have all arrived but whose card should no
+/// longer accept members. A set that is complete and closed is dropped from the map, which
+/// is what lets a later call reuse the caller's key and still get its own card.
+/// Close one slot of a set. An answered question and an expired one are the same thing to
+/// the card: that question is finished. Once every question the set promised is closed, the
+/// set leaves the map — which is what lets a later call arrive with the same caller key and
+/// build its own card instead of appending questions to one that has already settled.
+fn mark_set_closed(sets: &mut HashMap<String, QSet>, set_id: u64) {
+    for e in sets.values_mut() {
+        if e.id == set_id {
+            e.closed += 1;
+        }
+    }
+    sets.retain(|_, e| e.closed < e.total);
+}
+
+fn canon_question(title: &str, next_id: &mut u64, sets: &mut HashMap<String, QSet>) -> Option<Question> {
+    let rest = title.strip_prefix(CANON_Q)?;
+    let envelope: Value = serde_json::from_str(rest).ok()?;
+    let mut q: Question = serde_json::from_value(envelope.get("q")?.clone()).ok()?;
+    q.id = *next_id;
+    *next_id += 1;
+    if let Some(set) = q.set.as_mut() {
+        let key = envelope.get("k").and_then(|k| k.as_str()).unwrap_or("").to_string();
+        let want_total = set.total;
+        let reusable = sets
+            .get(&key)
+            .filter(|e| e.seen < e.total && e.closed < e.total)
+            .map(|e| e.id);
+        let id = reusable.unwrap_or_else(|| {
+            let fresh = *next_id;
+            *next_id += 1;
+            sets.insert(key.clone(), QSet { id: fresh, total: want_total.max(1), seen: 0, closed: 0 });
+            fresh
+        });
+        if let Some(e) = sets.get_mut(&key) {
+            e.seen += 1;
+        }
+        set.id = id;
+    }
+    Some(q)
 }
 
 enum UiAnswer {
@@ -488,6 +578,10 @@ struct Engine {
     /// for, so a faithful per-call stamp produced a turn with six files and no strip.
     turn_files: Vec<cwoffee_engine::tools::OutputFile>,
     last_assistant_row: Option<i64>,
+    /// Conversations this process has already explained on reopening. The rust core says
+    /// it once per session per process; saying it on every switch would train the user to
+    /// ignore a note that is only worth reading when the history is reopened.
+    resume_announced: std::collections::HashSet<i64>,
     /// The same local title helper the rust core offers, from the same config, so the
     /// sidebar names conversations the same way whichever core is behind it.
     titlegen: cwoffee_engine::titlegen::TitleGen,
@@ -514,6 +608,15 @@ struct Engine {
     /// Approvals granted with `AllowSession`: the same tool is not asked again.
     auto_allow: HashSet<String>,
     waits: HashMap<u64, Wait>,
+    /// Call key from a cwoffee question payload -> the set this process built for it.
+    ///
+    /// The engine numbers a fresh set in every `cwtool` process, so its set id says
+    /// "first set of this call" and nothing else; even the call id is not reliable, because
+    /// a scripted endpoint hands the same tool-call id to the same scenario every time it
+    /// runs. So a key maps to a card **while that card is still open**: once every question
+    /// the set promised has arrived, and then answered or expired, the key is released and
+    /// the next call that reuses it gets a card of its own.
+    q_sets: HashMap<String, QSet>,
     next_id: u64,
     last_activity: Instant,
 }
@@ -875,7 +978,7 @@ impl Engine {
                         if persist {
                             self.note(
                                 "the model change applies to this run; writing the default model to the config \
-                                 file is not wired on the pi core yet (PI-CORE-PLAN Phase 4)",
+                                 file is not wired on this core yet",
                             );
                         }
                     }
@@ -1120,10 +1223,30 @@ impl Engine {
                         }
                         self.note(format!(
                             "conversation {id} has no pi thread of its own yet, so the model starts this one from \
-                             scratch; the stored transcript is unchanged (PI-CORE-PLAN Phase 4)"
+                             scratch; the stored transcript is unchanged"
                         ));
                     }
                 }
+            }
+        }
+        // What reopening this conversation cost — the same sentence the rust core says, so
+        // the same click is described the same way behind either core. The size always comes
+        // from the stored transcript; a token figure only exists once a turn in this process
+        // has reported one, and a cache claim never appears at all, because that stays the
+        // endpoint's business.
+        if !self.resume_announced.contains(&id) {
+            let n = self.cfg.store.messages(id).map(|v| v.len()).unwrap_or(0);
+            if n > 0 && self.resume_announced.insert(id) {
+                let (est, budget) = {
+                    let st = self.state.lock().unwrap();
+                    (st.context_tokens, st.context_budget)
+                };
+                self.note(cwoffee_engine::host::resumed_note(
+                    id,
+                    n,
+                    (est > 0).then_some(est),
+                    budget,
+                ));
             }
         }
         true
@@ -1198,6 +1321,22 @@ impl Engine {
         } else {
             row
         };
+
+        // A send is a fact before it is asked of a model. The rust core stores the user's
+        // message before the provider call; here pi used to echo it back, and the row was
+        // created from that echo — which left a window, while the bridge opened a pi thread
+        // for this conversation, in which the sentence the user had just typed was on no
+        // screen and in no store. It read as the message vanishing.
+        let mut user_row = cwoffee_engine::provider::Message::user(text.clone());
+        user_row.attachments = attachments.clone();
+        if let Err(e) = self.cfg.store.append_message(row, &user_row) {
+            // Storing first is the whole point: a message the store refused to keep is a
+            // message that was never sent, and saying so now beats letting pi answer a
+            // sentence that will not survive the next reload.
+            self.err(format!("could not store your message: {e}"));
+            return;
+        }
+        self.tr.store_user_early(&attachments);
 
         if let Err(e) = self.ensure_child().await {
             self.err(format!("cannot start the model process: {e}"));
@@ -1424,17 +1563,37 @@ impl Engine {
                     self.err("the model offered a choice with no options; it was cancelled rather than answered blindly");
                     return;
                 }
-                let id = self.next_id;
-                self.next_id += 1;
-                let q = Question {
-                    id,
-                    question: title,
-                    options: options.iter().map(|o| QuestionOption { label: o.clone(), detail: None }).collect(),
-                    recommended: None,
-                    allow_custom: false,
-                    multi: false,
-                    set: None,
+                let q = match self.canon_question(&title) {
+                    Some(q) => q,
+                    None => {
+                        if title.starts_with(CANON_Q) {
+                            // A card we could not read is a card the user answers in the
+                            // dark: no trade-offs, no recommendation, no "2 of 3". Say so —
+                            // this is the difference between a feature that rotted and one
+                            // that was never there.
+                            self.err(format!(
+                                "a cwoffee question arrived with the engine's payload in its title and the payload did                                  not parse, so the card shows a flattened question instead: {}",
+                                &title[CANON_Q.len()..(CANON_Q.len() + 120).min(title.len())]
+                            ));
+                        }
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        Question {
+                            id,
+                            question: title.clone(),
+                            options: options.iter().map(|o| QuestionOption { label: o.clone(), detail: None }).collect(),
+                            recommended: None,
+                            allow_custom: false,
+                            multi: false,
+                            set: None,
+                        }
+                    }
                 };
+                let id = q.id;
+                // The labels the reply maps picks back onto. The card may have been built
+                // from the engine's payload (labels plus one-line trade-offs) rather than
+                // from pi's bare list, so take them from the question we are asking.
+                let labels: Vec<String> = q.options.iter().map(|o| o.label.clone()).collect();
                 let (tx, rx) = oneshot::channel();
                 // Same rule as the approval above: the shell renders it. A second send
                 // would show the question twice and answer it once.
@@ -1449,9 +1608,10 @@ impl Engine {
                     id,
                     Wait::Question {
                         pi_id: pi_id.clone(),
-                        kind: QKind::Select { options },
+                        kind: QKind::Select { options: labels },
                         deadline: Instant::now() + Duration::from_secs(secs),
                         answered: false,
+                        set_id: q.set.as_ref().map(|st| st.id),
                     },
                 );
                 let ui_tx = self.ui_tx.clone();
@@ -1464,17 +1624,29 @@ impl Engine {
                 });
             }
             UiRequest::Input { pi_id, title, placeholder, timeout_ms } => {
-                let id = self.next_id;
-                self.next_id += 1;
-                let q = Question {
-                    id,
-                    question: if placeholder.is_empty() { title.clone() } else { format!("{title} — {placeholder}") },
-                    options: Vec::new(),
-                    recommended: None,
-                    allow_custom: true,
-                    multi: false,
-                    set: None,
+                let q = match self.canon_question(&title) {
+                    Some(q) => q,
+                    None => {
+                        if title.starts_with(CANON_Q) {
+                            self.err(format!(
+                                "a cwoffee question arrived with the engine's payload in its title and the payload did                                  not parse, so the card shows a flattened question instead: {}",
+                                &title[CANON_Q.len()..(CANON_Q.len() + 120).min(title.len())]
+                            ));
+                        }
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        Question {
+                            id,
+                            question: if placeholder.is_empty() { title.clone() } else { format!("{title} — {placeholder}") },
+                            options: Vec::new(),
+                            recommended: None,
+                            allow_custom: true,
+                            multi: false,
+                            set: None,
+                        }
+                    }
                 };
+                let id = q.id;
                 let (tx, rx) = oneshot::channel();
                 // Same rule as the approval above: the shell renders it. A second send
                 // would show the question twice and answer it once.
@@ -1487,7 +1659,13 @@ impl Engine {
                 let secs = timeout_ms.max(1000) / 1000;
                 self.waits.insert(
                     id,
-                    Wait::Question { pi_id: pi_id.clone(), kind: QKind::Input, deadline: Instant::now() + Duration::from_secs(secs), answered: false },
+                    Wait::Question {
+                        pi_id: pi_id.clone(),
+                        kind: QKind::Input,
+                        deadline: Instant::now() + Duration::from_secs(secs),
+                        answered: false,
+                        set_id: q.set.as_ref().map(|st| st.id),
+                    },
                 );
                 let ui_tx = self.ui_tx.clone();
                 tokio::spawn(async move {
@@ -1506,6 +1684,11 @@ impl Engine {
                 self.note(format!("this interface cannot show a {method} dialog, so it was cancelled"));
             }
         }
+    }
+
+    /// Recover the engine's question from a dialog title. See the free `canon_question`.
+    fn canon_question(&mut self, title: &str) -> Option<Question> {
+        canon_question(title, &mut self.next_id, &mut self.q_sets)
     }
 
     fn reply(&self, pi_id: &str, body: Value) {
@@ -1560,25 +1743,42 @@ impl Engine {
             }
             UiAnswer::Question { id, answer } => {
                 let wait = match self.waits.get_mut(&id) {
-                    Some(Wait::Question { pi_id, kind, answered, .. }) => {
+                    Some(Wait::Question { pi_id, kind, answered, set_id, .. }) => {
                         *answered = true;
                         Some((pi_id.clone(), match kind {
                             QKind::Select { options } => Some(options.clone()),
                             QKind::Input => None,
-                        }))
+                        }, *set_id))
                     }
                     _ => None,
                 };
-                let Some((pi_id, options)) = wait else {
-                    self.note("a choice was answered after its card had closed; that answer was ignored");
-                    return;
+                let (pi_id, options, set_id) = match wait {
+                    Some(t) => t,
+                    None => {
+                        self.note("a choice was answered after its card had closed; that answer was ignored");
+                        return;
+                    }
                 };
+                if let Some(st) = set_id {
+                    mark_set_closed(&mut self.q_sets, st);
+                }
+
                 let body = match (&answer, options) {
                     (Some(a), Some(labels)) => {
-                        // The UI answers with either a picked index or typed text.
-                        let value = match a.options.first() {
-                            Some(i) => labels.get(*i).cloned().unwrap_or_else(|| a.text.clone()),
-                            None => a.text.clone(),
+                        // The UI answers with either picked indexes or typed text. pi's
+                        // `select` hands the extension one label, which is a narrower answer
+                        // than a cwoffee multi-select card can produce — so several picks
+                        // travel as one string with this separator, and the extension splits
+                        // it back into option indexes. Engine option labels are "few words"
+                        // and never contain the separator; if one somehow does, the extension
+                        // falls back to reporting the whole answer as free text rather than
+                        // inventing a pick.
+                        let picks: Vec<String> =
+                            a.options.iter().filter_map(|i| labels.get(*i).cloned()).collect();
+                        let value = if picks.is_empty() {
+                            a.text.clone()
+                        } else {
+                            picks.join(" | ")
                         };
                         json!({ "value": value })
                     }
@@ -1632,22 +1832,33 @@ impl Engine {
         // what the bridge owes the UI is that a card cannot sit there offering a
         // choice nothing will ever take.
         let now = Instant::now();
-        let mut expired = Vec::new();
+        // (id, what expired, and the set slot to release if it was a question)
+        let mut expired: Vec<(u64, Expired, Option<u64>)> = Vec::new();
         for (id, w) in self.waits.iter() {
             match w {
-                Wait::Approval { deadline, tool, .. } if now >= *deadline => expired.push((*id, Some(tool.clone()))),
-                Wait::Question { deadline, answered, .. } if now >= *deadline && !*answered => expired.push((*id, None)),
+                Wait::Approval { deadline, tool, .. } if now >= *deadline => {
+                    expired.push((*id, Expired::Approval(tool.clone()), None))
+                }
+                Wait::Question { deadline, answered, set_id, .. } if now >= *deadline && !*answered => {
+                    expired.push((*id, Expired::Question, *set_id))
+                }
                 _ => {}
             }
         }
-        for (id, tool) in expired {
+        for (id, what, set_id) in expired {
             self.waits.remove(&id);
             // The engine's own timeout fired: the run is generating again, or it
             // is over. Either way the wait is not the model's remaining time.
             self.tr.dialog_resolved(now);
-            match tool {
-                Some(tool) => self.note(format!("{tool} was not answered in time; the tool did not run")),
-                None => {
+            match what {
+                Expired::Approval(tool) => self.note(format!("{tool} was not answered in time; the tool did not run")),
+                Expired::Question => {
+                    // A question nobody answered closes its set slot for the same reason an
+                    // answered one does: the card is finished, and the next call that shares
+                    // the caller's key must get a card of its own.
+                    if let Some(st) = set_id {
+                        mark_set_closed(&mut self.q_sets, st);
+                    }
                     let _ = self.ev.send(EngineEvent::QuestionExpired { id });
                 }
             }
@@ -1771,5 +1982,72 @@ mod tests {
         assert_eq!(pi_level(&Reasoning::Off), "off");
         assert_eq!(pi_level(&Reasoning::Medium), "medium");
         assert_eq!(pi_level(&Reasoning::High), "high");
+    }
+
+    /// A cwoffee question set reaches the host through pi's dialog primitives, which carry
+    /// a title and bare labels. Everything the engine designed — the one-line trade-offs,
+    /// the recommended option, multi, "question 2 of 3" — has to come back out of the
+    /// payload, and the set has to hold one id inside this process even though `cwtool`
+    /// numbers every call from one.
+    #[test]
+    fn a_questions_own_card_survives_pis_narrower_dialog() {
+        let payload = json!({ "k": "set-1", "q": {
+            "id": 2,
+            "question": "Which file?",
+            "options": [{ "label": "January", "detail": "the closed books" }, { "label": "February" }],
+            "recommended": 0,
+            "allow_custom": false,
+            "multi": true,
+            "set": { "id": 1, "index": 0, "total": 2 }
+        } });
+        let mut next = 7u64;
+        let mut sets: HashMap<String, QSet> = HashMap::new();
+        let q = canon_question(&format!("{CANON_Q}{payload}"), &mut next, &mut sets).expect("the payload is the card");
+        assert_eq!(q.question, "Which file?");
+        assert_eq!(q.options[0].detail.as_deref(), Some("the closed books"));
+        assert_eq!(q.recommended, Some(0));
+        assert!(q.multi, "multi is the model's call, and the card has to honour it");
+        assert!(!q.allow_custom);
+        assert_eq!(q.id, 7, "a client answers the id this process announced on the card");
+        let first_set = q.set.as_ref().expect("a set for more than one question").id;
+        assert_ne!(first_set, 1, "the payload's set id came from a process that has already exited");
+
+        let second_payload = json!({ "k": "set-1", "q": {
+            "id": 3, "question": "Totals or rows?", "options": [{ "label": "Totals" }],
+            "allow_custom": true, "multi": false, "set": { "id": 1, "index": 1, "total": 2 }
+        } });
+        let second = canon_question(&format!("{CANON_Q}{second_payload}"), &mut next, &mut sets).expect("the second question of the set");
+        assert_eq!(second.set.as_ref().unwrap().id, first_set, "one card holding two questions");
+        assert_eq!(second.set.as_ref().unwrap().index, 1);
+
+        // The caller's key is not unique — a scripted endpoint hands the same tool-call id to
+        // the same scenario every time it runs, and `cwtool` numbers the first set of every
+        // call at 1. A complete set is therefore closed to new members, and a later call that
+        // reuses the key builds its own card.
+        let again = canon_question(&format!("{CANON_Q}{}", json!({ "k": "set-1", "q": {
+            "id": 2, "question": "Same key, later call", "options": [{ "label": "x" }], "multi": false, "allow_custom": true,
+            "set": { "id": 1, "index": 0, "total": 2 } } })), &mut next, &mut sets).expect("the same key, later call");
+        assert_ne!(again.set.as_ref().unwrap().id, first_set, "a settled card must not collect questions from a later call");
+        mark_set_closed(&mut sets, first_set);
+        mark_set_closed(&mut sets, first_set);
+        assert!(!sets.values().any(|e| e.id == first_set), "a fully closed set leaves the map");
+        let third = canon_question(&format!("{CANON_Q}{}", json!({ "k": "set-1", "q": {
+            "id": 2, "question": "After the card closed", "options": [{ "label": "x" }], "multi": false, "allow_custom": true,
+            "set": { "id": 1, "index": 0, "total": 1 } } })), &mut next, &mut sets).expect("a fresh card after closing");
+        assert_ne!(third.set.as_ref().unwrap().id, first_set);
+
+        let other = canon_question(&format!("{CANON_Q}{}", json!({ "k": "set-1-next-conversation", "q": {
+            "id": 2, "question": "Unrelated", "options": [{ "label": "x" }], "multi": false, "allow_custom": true,
+            "set": { "id": 1, "index": 0, "total": 2 } } })), &mut next, &mut sets).expect("another conversation's call");
+        assert_ne!(other.set.as_ref().unwrap().id, first_set, "two conversations must not merge into one card");
+    }
+
+    #[test]
+    fn a_plain_dialog_title_is_still_just_a_question() {
+        let mut next = 3u64;
+        let mut sets: HashMap<String, QSet> = HashMap::new();
+        assert!(canon_question("Which format?", &mut next, &mut sets).is_none(), "an ordinary extension dialog keeps its ordinary shape");
+        assert!(canon_question("CWOFFEEQ not json", &mut next, &mut sets).is_none());
+        assert_eq!(next, 3, "a payload we could not read changes nothing: the arm builds the plain card");
     }
 }

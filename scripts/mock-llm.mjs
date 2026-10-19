@@ -441,6 +441,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   const stepNo = stepsSince(messages, found.at)
+  // Which step this request plays, and what the step counter saw. The count is assistant
+  // messages after the matched user message, so a core that appends one extra assistant
+  // message per round shifts every later step of the script while still looking healthy:
+  // the run finishes, the tools ran, and the last answer is simply not the scripted one.
+  // Without this line that is undebuggable from outside the process.
+  const asst = messages.filter((m) => m.role === 'assistant').length
+  const tools = messages.filter((m) => m.role === 'tool').length
+  log(`SERVE ${scenario.name} step ${stepNo}/${(scenario.steps ?? []).length - 1} (messages ${messages.length}, assistant ${asst}, tool ${tools})`)
   const step = (scenario.steps ?? [])[stepNo]
   if (!step) {
     const why =
@@ -461,6 +469,7 @@ const server = http.createServer(async (req, res) => {
       .filter((m) => m.role === 'tool')
       .map((m) => String(m.content ?? ''))
       .join('\n---\n')
+    log(`REQUIRE ${scenario.name} step ${stepNo}: ${needs.length} needle(s) against ${toolText.length} chars of tool output`)
     const missing = needs.filter((needle) => !toolText.includes(needle))
     if (missing.length) {
       const why =

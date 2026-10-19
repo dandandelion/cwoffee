@@ -273,7 +273,7 @@
   },
   {
    "name": "ask-two-questions",
-   "_why": "multi-question ask_user through the engine event path, not through a synthetic card",
+   "_why": "multi-question ask_user through the engine event path, not through a synthetic card. The scripted answer is only allowed once the tool result in the prompt carries the two choices in the engine's own restatement: the point of the tool is that a person answered, and a card that closed without delivering the answers proves nothing.",
    "match": "Ask me two questions before writing the report",
    "steps": [
     {
@@ -292,7 +292,12 @@
      "content": "Written, with those two settled.",
      "finish": "stop",
      "chunk_chars": 6,
-     "delay_ms": 12
+     "delay_ms": 12,
+     "require": [
+      "User chose: 1: Engineers",
+      "User chose: 2: Two pages"
+     ],
+     "_why": "the page harness picks Engineers (1) for the first question and Two pages (2) for the second; the require strings are those two picks in the engine's words"
     }
    ]
   },

@@ -406,9 +406,19 @@ async fn a_scripted_question_set_arrives_as_one_group_and_answers_as_one() {
     let t = h
         .turn("Ask me two questions before writing the report, then write it.", &mut |q| {
             picks += 1;
+            // Answer one question with its first option and the other with its second. A loop
+            // that always answered index 0 would satisfy a test that only ever looks at the
+            // first option, and the scenario this turn is scripted from (`ask-two-questions`)
+            // only lets its last step through when the prompt carries the two picks the client
+            // actually made — so the picks have to be distinguishable here.
+            let i = if picks == 1 {
+                0
+            } else {
+                1.min(q.options.len().saturating_sub(1))
+            };
             Answer {
-                text: q.options.first().map(|o| o.label.clone()).unwrap_or_else(|| "yes".into()),
-                options: vec![0],
+                text: q.options.get(i).map(|o| o.label.clone()).unwrap_or_else(|| "yes".into()),
+                options: vec![i],
             }
         })
         .await;
@@ -430,6 +440,13 @@ async fn a_scripted_question_set_arrives_as_one_group_and_answers_as_one() {
     assert_eq!((a.index, a.total), (0, 2), "first question is indexed {a:?}");
     assert_eq!((b.index, b.total), (1, 2), "second question is indexed {b:?}");
     assert_eq!(picks, 2, "the loop answered {} questions", picks);
+    // The engine restates the picks in the tool's own output, and that output is what the
+    // endpoint reads: this is the byte the scripted step is gated on.
+    assert!(
+        t.tool_out.contains("User chose: 1: Engineers") && t.tool_out.contains("User chose: 2: Two pages"),
+        "the two picks never reached the tool's own words: {:?}",
+        t.tool_out
+    );
     assert!(
         t.answer.contains("Written"),
         "the answer after the questions: {:?}",

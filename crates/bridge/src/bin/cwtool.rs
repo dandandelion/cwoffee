@@ -115,15 +115,25 @@ fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
 async fn main() -> std::process::ExitCode {
     let mut it = std::env::args().skip(1);
     let Some(sub) = it.next() else {
-        eprintln!("usage: cwtool specs | check <tool> | run <tool> [--permit p]... < args.json");
+        eprintln!(
+            "usage: cwtool specs | questions <tool> | check <tool> | run <tool> [--permit p]...              [--host-answers json] < args.json"
+        );
         return std::process::ExitCode::from(2);
     };
     let tool = it.next().unwrap_or_default();
     let mut permits: Vec<PathBuf> = Vec::new();
+    // Answers a *person* gave, in the order the tool asks its questions. They arrive as a
+    // flag rather than inside `args` on purpose: the model authors `args`, and answers
+    // authored by the model would defeat the point of a tool whose whole job is to ask.
+    let mut host_answers: Option<String> = None;
     while let Some(a) = it.next() {
         if a == "--permit" {
             if let Some(p) = it.next() {
                 permits.push(PathBuf::from(p));
+            }
+        } else if a == "--host-answers" {
+            if let Some(j) = it.next() {
+                host_answers = Some(j);
             }
         }
     }
@@ -136,17 +146,57 @@ async fn main() -> std::process::ExitCode {
             let list: Vec<Value> = reg
                 .defs()
                 .into_iter()
-                .map(|d| json!({ "name": d.name, "description": d.description, "parameters": d.parameters }))
+                .map(|d| {
+                    // Which tools want a human to answer, so the extension around them can
+                    // ask without deciding anything. It reads this flag and then asks
+                    // `cwtool questions` for the list; it never guesses from the tool name.
+                    let host_ask = reg
+                        .get(&d.name)
+                        .map(|t| t.host_questions(&json!({})).is_some())
+                        .unwrap_or(false);
+                    json!({
+                        "name": d.name,
+                        "description": d.description,
+                        "parameters": d.parameters,
+                        "host_ask": host_ask,
+                    })
+                })
                 .collect();
             out(json!({ "ok": true, "count": list.len(), "tools": list }));
             std::process::ExitCode::SUCCESS
         }
-        "check" => {
+        "questions" => {
             if tool.is_empty() {
-                return die("check needs a tool name".into());
+                die("questions needs a tool name".into());
             }
             let Some(t) = reg.get(&tool) else {
-                return die(format!("no such cwoffee tool: {tool}"));
+                die(format!("no such cwoffee tool: {tool}"));
+            };
+            let args = args_from_stdin();
+            // The questions this call would ask, from the tool's own parse. A host that
+            // runs the tool in a separate process cannot hold a question open inside it,
+            // so it has to ask from this list and hand the answers back with --host-answers.
+            // Same parse, same ids: the card the user sees and the answers the tool scores
+            // are one set, not two things that happen to look alike.
+            match t.host_questions(&args) {
+                None => out(json!({ "ok": false, "tool": tool, "error": format!("{tool} does not ask the user anything") })),
+                Some(Err(e)) => out(json!({ "ok": false, "tool": tool, "error": e })),
+                Some(Ok(qs)) => {
+                    let list: Vec<Value> = qs
+                        .iter()
+                        .map(|q| serde_json::to_value(q).unwrap_or_else(|_| json!({ "error": "a question would not serialize" })))
+                        .collect();
+                    out(json!({ "ok": true, "tool": tool, "count": list.len(), "questions": list }));
+                }
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        "check" => {
+            if tool.is_empty() {
+                die("check needs a tool name".into());
+            }
+            let Some(t) = reg.get(&tool) else {
+                die(format!("no such cwoffee tool: {tool}"));
             };
             let args = args_from_stdin();
             let ctx = ctx(permits);
@@ -172,13 +222,41 @@ async fn main() -> std::process::ExitCode {
         }
         "run" => {
             if tool.is_empty() {
-                return die("run needs a tool name".into());
+                die("run needs a tool name".into());
             }
             let Some(t) = reg.get(&tool) else {
-                return die(format!("no such cwoffee tool: {tool}"));
+                die(format!("no such cwoffee tool: {tool}"));
             };
             let args = args_from_stdin();
-            let ctx = ctx(permits);
+            let mut ctx = ctx(permits);
+            if let Some(raw) = host_answers.as_deref() {
+                let answers: Vec<Option<cwoffee_engine::tools::ask::Answer>> = match serde_json::from_str(raw) {
+                    Ok(a) => a,
+                    Err(e) => die(format!(
+                        "--host-answers must be a JSON array with one entry per question, in the order                          `cwtool questions` listed them: {e}"
+                    )),
+                };
+                let (qtx, mut qrx) = mpsc::unbounded_channel::<cwoffee_engine::tools::ask::QuestionRx>();
+                tokio::spawn(async move {
+                    // Match by position, not id: the extension asked in the order this tool
+                    // builds its questions, and each `cwtool` run numbers a fresh set, so an
+                    // id compared across two processes would be noise. A null slot means the
+                    // person left that one unanswered — dropping the reply sender is how the
+                    // engine already says so, which is why the model is told nobody answered
+                    // instead of being handed an empty sentence.
+                    let mut i = 0usize;
+                    while let Some((_asked, reply)) = qrx.recv().await {
+                        match answers.get(i).cloned().flatten() {
+                            Some(a) => {
+                                let _ = reply.send(a);
+                            }
+                            None => drop(reply),
+                        }
+                        i += 1;
+                    }
+                });
+                ctx.ask = Some(qtx);
+            }
             // Stream chunks out on stderr rather than dropping them: `exec` produces
             // output while it runs, and a runner that swallows it makes a long command
             // look like a hang.
@@ -200,6 +278,16 @@ async fn main() -> std::process::ExitCode {
                 .unwrap_or_else(|e| json!({ "ok": false, "error": format!("could not serialize the tool result: {e}") }));
             if let Some(o) = v.as_object_mut() {
                 o.insert("tool".to_string(), json!(tool));
+                // The sentence the model should read, rendered by the engine itself. The
+                // envelope carries the structured result (files, changes, telemetry) and
+                // rides in pi's `details`, which never enters the prompt; this field is
+                // what the extension puts in `content`. Keeping the rendering here rather
+                // than in ~40 lines of TypeScript is what keeps the two cores saying the
+                // same thing to the endpoint.
+                o.insert(
+                    "rendered".to_string(),
+                    json!(cwoffee_engine::agent::render_result(&res)),
+                );
             }
             out(v);
             if res.ok {

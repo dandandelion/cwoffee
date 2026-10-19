@@ -107,6 +107,48 @@ impl AskUserTool {
         self.timeout = d;
         self
     }
+
+    /// The questions this call would ask, in the order they should be asked.
+    ///
+    /// A host that cannot hold the question open *inside* the tool needs them first.
+    /// pi runs the tool inside an extension, so by the time the bridge sees the call it
+    /// is too late to ask; cwoffee's answers therefore arrive as an argument to the tool
+    /// host rather than as a live channel. Both halves call this, so the card the user
+    /// sees and the answers the tool scores are one set, and the ids that
+    /// `QuestionExpired` is reported by come from a single allocation.
+    pub fn questions_for(&self, args: &Value) -> Result<Vec<Question>, String> {
+        let specs = parse_specs(args)?;
+        Ok(self.build_questions(&specs))
+    }
+
+    /// Id allocation for one call: a set id first — so "question 2 of 3" can be said
+    /// without waiting to see whether more questions are coming — then one id per
+    /// question. A single question carries `set: None`, which is the wire shape every
+    /// existing client already renders.
+    fn build_questions(&self, specs: &[Spec]) -> Vec<Question> {
+        let total = specs.len();
+        // One set id for the whole call, so a shell can group the cards and say
+        // "question 2 of 3". A single question keeps `set: None`, which is exactly the
+        // wire shape every existing client already renders.
+        let set_id = if total > 1 {
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| Question {
+                id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                question: spec.question.clone(),
+                options: spec.options.clone(),
+                recommended: spec.recommended,
+                allow_custom: spec.allow_custom,
+                multi: spec.multi,
+                set: (total > 1).then(|| QuestionSet { id: set_id, index: i, total }),
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -177,6 +219,12 @@ impl Tool for AskUserTool {
         Risk::Harmless
     }
 
+    /// The one tool whose result is a person, so it is the one tool a remote host has
+    /// to ask on its behalf.
+    fn host_questions(&self, args: &Value) -> Option<Result<Vec<Question>, String>> {
+        Some(self.questions_for(args))
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {
         let specs = match parse_specs(&args) {
             Ok(s) => s,
@@ -192,35 +240,24 @@ impl Tool for AskUserTool {
             );
         };
 
-        // One set id for the whole call, so a shell can group the cards and say
-        // "question 2 of 3". A single question keeps `set: None`, which is exactly
-        // the wire shape every existing client already renders.
+        // The questions come from one helper, so the card `cwtool questions` shows a
+        // remote host and the card this call would have shown are the same set.
         let total = specs.len();
-        let set_id = if total > 1 {
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        } else {
-            0
-        };
+        let qs = self.build_questions(&specs);
         let mut waiting: Vec<(u64, Spec, oneshot::Receiver<Answer>)> = Vec::with_capacity(total);
-        for (i, spec) in specs.into_iter().enumerate() {
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        for (i, q) in qs.into_iter().enumerate() {
+            // Keep the id the question was sent with: an expired question is reported to
+            // every window by that id, and a card that closed under a different number
+            // than the one the expiry names is a card that never closes.
+            let id = q.id;
             let (reply_tx, reply_rx) = oneshot::channel::<Answer>();
-            let q = Question {
-                id,
-                question: spec.question.clone(),
-                options: spec.options.clone(),
-                recommended: spec.recommended,
-                allow_custom: spec.allow_custom,
-                multi: spec.multi,
-                set: (total > 1).then(|| QuestionSet { id: set_id, index: i, total }),
-            };
             if tx.send((q, reply_tx)).is_err() {
                 return ToolResult::err(
                     "ask_user: nobody is connected to answer. Decide yourself, state the \
                      assumption you made, and continue.",
                 );
             }
-            waiting.push((id, spec, reply_rx));
+            waiting.push((id, specs[i].clone(), reply_rx));
         }
 
         // A set is answered as one card, so the wait is one budget rather than N
@@ -234,7 +271,7 @@ impl Tool for AskUserTool {
         let deadline = tokio::time::Instant::now() + budget;
         let mut got: Vec<Option<Answer>> = Vec::with_capacity(total);
         let mut timed_out = false;
-        for (_, _, rx) in waiting.iter_mut() {
+        for (id, _, rx) in waiting.iter_mut() {
             if timed_out {
                 // The person walked away from the card, not from one field of it, so
                 // the rest of the set stops waiting too.
@@ -243,7 +280,20 @@ impl Tool for AskUserTool {
             }
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(left, rx).await {
-                Ok(Ok(a)) => got.push(Some(a)),
+                Ok(Ok(a)) => {
+                    got.push(Some(a));
+                    // An answer belongs to one window, but the card sits in all of them.
+                    // Say so, and every other copy closes instead of offering a choice
+                    // nothing will take any more. The expiry below is the same announcement
+                    // for the case where nobody answered; a question that is answered and a
+                    // question that is ignored must both be visible from outside the window
+                    // that acted. The pi core's bridge emits this for its questions because
+                    // there the tool runs in another process; here the tool emits it, so
+                    // exactly one announcement per question either way.
+                    if let Some(tx) = ctx.events.as_ref() {
+                        let _ = tx.send(crate::event::EngineEvent::QuestionAnswered { id: *id });
+                    }
+                }
                 // The reply sender is gone: the turn was stopped, or the pending
                 // question was cleared.
                 Ok(Err(_)) => got.push(None),
@@ -676,15 +726,27 @@ mod tests {
             events: Some(etx),
             permits: Vec::new(),
         };
+        let (idx, iqx) = oneshot::channel::<u64>();
         tokio::spawn(async move {
-            let (_q, reply) = rx.recv().await.unwrap();
+            let (q, reply) = rx.recv().await.unwrap();
+            let _ = idx.send(q.id);
             reply.send(Answer { text: "PDF".into(), options: vec![0] }).unwrap();
         });
         let r = tool()
             .run(json!({"question": "Which format?", "options": [{"label": "PDF"}]}), &ctx, &sink())
             .await;
         assert!(r.ok, "{}", r.output);
-        assert!(erx.try_recv().is_err(), "an answer is not an expiry");
+        let asked = iqx.await.unwrap();
+        // An answer is not an expiry — but it is an announcement. Every other window showing
+        // this question has to learn the card was settled, which is why the core that runs the
+        // tool in-process emits it too: a card that stays live after being answered is a
+        // control wired to a question somebody already settled.
+        let ev = erx.recv().await.expect("an answered question announces the answer");
+        match ev {
+            crate::event::EngineEvent::QuestionAnswered { id } => assert_eq!(id, asked),
+            other => panic!("an answer announced {other:?}, not QuestionAnswered"),
+        }
+        assert!(erx.try_recv().is_err(), "one answer announces once, and nothing expires");
     }
 
     /// The answer has to name the question it answers. A quantized local model
@@ -1136,14 +1198,14 @@ mod tests {
             events: Some(etx),
             permits: Vec::new(),
         };
-        let (idx, iqx) = oneshot::channel::<u64>();
+        let (idx, iqx) = oneshot::channel::<(u64, u64)>();
         let h = tokio::spawn(async move {
-            let (_q1, r1) = rx.recv().await.unwrap();
+            let (q1, r1) = rx.recv().await.unwrap();
             let (q2, r2) = rx.recv().await.unwrap();
             r1.send(Answer { text: "MD".into(), options: vec![0] }).unwrap();
             // The second stays unanswered: the watcher holds its sender past the
             // budget, which is the situation the timeout has to survive.
-            let _ = idx.send(q2.id);
+            let _ = idx.send((q1.id, q2.id));
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             drop(r2);
         });
@@ -1157,16 +1219,24 @@ mod tests {
                 &sink(),
             )
             .await;
-        let lost = iqx.await.unwrap();
+        let (answered, lost) = iqx.await.unwrap();
         h.abort();
         assert!(r.ok, "{:?}", r.error);
         assert!(r.text().contains("did not answer this one in time"), "{}", r.text());
+        // Two questions, two announcements, each the kind that fits what happened to it:
+        // the answered one closes as an answer and the other as an expiry. A client that
+        // sees only the expiry would render the settled question as if nobody had replied.
+        let first = erx.recv().await.expect("the answered question must announce its answer");
+        match first {
+            crate::event::EngineEvent::QuestionAnswered { id } => assert_eq!(id, answered),
+            other => panic!("the answered question announced {other:?}, not QuestionAnswered"),
+        }
         let ev = erx.recv().await.expect("the unanswered question must be closed");
         match ev {
             crate::event::EngineEvent::QuestionExpired { id } => assert_eq!(id, lost),
             other => panic!("expected QuestionExpired, got {other:?}"),
         }
-        assert!(erx.try_recv().is_err(), "only the unanswered question gets an expiry");
+        assert!(erx.try_recv().is_err(), "one announcement per question, and only the unanswered one expires");
     }
 
     /// A single question keeps the wire shape existing clients render: no `set`, no
@@ -1250,5 +1320,44 @@ mod tests {
             .await;
         h.await.unwrap();
         assert!(r.ok, "{:?}", r.error);
+    }
+
+    /// A remote tool host has to know what to ask **before** it runs the call, because
+    /// it cannot hold the question open inside a process that is about to exit. It gets
+    /// the questions from the tool's own parse, so the card the user sees is the card
+    /// this call would have shown — and asking twice must produce the same set, since
+    /// the extension asks from one call and the answers come back against the other.
+    #[test]
+    fn a_remote_host_can_ask_the_questions_the_tool_would_have_asked() {
+        let args = json!({
+            "questions": [
+                { "question": "Which file?", "options": [{ "label": "January" }, { "label": "February" }], "recommended": 0 },
+                { "question": "Totals or rows?", "options": [{ "label": "Totals" }], "multi": true, "allow_custom": false }
+            ]
+        });
+        let qs = tool().questions_for(&args).expect("the set form parses");
+        assert_eq!(qs.len(), 2);
+        let s0 = qs[0].set.as_ref().expect("a set for more than one");
+        let s1 = qs[1].set.as_ref().expect("the second question belongs to the same set");
+        assert_eq!((s0.index, s0.total), (0, 2));
+        assert_eq!((s1.index, s1.total), (1, 2));
+        assert_eq!(s0.id, s1.id, "one set id for the whole call, or the card splits");
+        assert_eq!(qs[1].options.len(), 1);
+        assert!(qs[1].multi, "multi is the model's call, not the host's guess");
+        assert!(!qs[1].allow_custom);
+        assert_eq!(qs[0].recommended, Some(0));
+        // Same call, same shape: the extension asks from one `cwtool questions` run and
+        // the answers arrive against a second parse in `cwtool run`.
+        let again = tool().questions_for(&args).expect("parsing is repeatable");
+        assert_eq!(again.len(), 2);
+        assert_eq!(again[0].question, qs[0].question);
+        assert_eq!(again[0].set.as_ref().unwrap().total, 2);
+        // One question is not a set: that is the wire shape every existing client renders.
+        let one = tool().questions_for(&json!({ "question": "Which format?", "options": [{ "label": "PDF" }] })).expect("single form");
+        assert_eq!(one.len(), 1);
+        assert!(one[0].set.is_none(), "a single question must not grow a set");
+        // And a malformed call says so in the tool's own words rather than asking nothing.
+        let bad = tool().questions_for(&json!({ "questions": [{ "question": "only one", "options": [{ "label": "x" }] }] }));
+        assert!(bad.is_err(), "the set form needs 2-4 entries; ask_user says so itself");
     }
 }

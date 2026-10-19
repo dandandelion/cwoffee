@@ -334,6 +334,24 @@ pub fn folder_lock(current: &str) -> String {
     )
 }
 
+/// What reopening a conversation cost, in one sentence both cores say.
+///
+/// It lives here rather than in each core because a note only one core prints is a parity
+/// hole the user feels as flakiness: the same click on the same row explained differently
+/// depending on what is behind it. The token figure is optional on purpose — a bridge that
+/// has not run a turn yet has no figure to quote, and inventing one to complete a sentence
+/// is worse than a sentence that says where the number comes from.
+pub fn resumed_note(id: i64, n: usize, est: Option<usize>, budget: usize) -> String {
+    let measure = match est {
+        Some(t) => format!(", ~{t} tokens of a {budget} token budget"),
+        None => ", counted from the stored transcript".to_string(),
+    };
+    format!(
+        "resumed session {id}: {n} message(s){measure}. Whether the endpoint still holds this \
+                 session's prefix cache is its own business; the first reply settles it in numbers."
+    )
+}
+
 pub fn is_temp_root(raw: &str) -> bool {
     let p = std::path::Path::new(raw.trim());
     let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -760,12 +778,7 @@ impl SessionHost {
                                 let budget = s.context_budget;
                                 let _ = ev_tx.send(EngineEvent::Note {
                                     session: Some(id),
-                                    message: format!(
-                                        "resumed session {id}: {n} message(s), ~{est} tokens of a \
-                                         {budget} token budget. Whether the endpoint still holds this \
-                                         session's prefix cache is its own business; the first reply \
-                                         settles it in numbers.",
-                                    ),
+                                    message: resumed_note(id, n as usize, Some(est), budget),
                                 });
                             }
                             true

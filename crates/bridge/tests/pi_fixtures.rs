@@ -554,3 +554,149 @@ fn a_tool_call_something_else_put_back_together_says_so() {
         .unwrap_or_else(|| panic!("the repair went unmentioned; errors were: {errs:?}"));
     assert!(said.contains("did not parse as JSON"), "and what was wrong: {said}");
 }
+
+// What the model reads and what the card reads are two different claims. pi's
+// `AgentToolResult.content` goes into the prompt; `details` is kept out of it and given
+// to the UI and the log. So the Rust tool host renders the model-facing sentence with
+// the engine's own `render_result` and puts the structured envelope in `details` — and
+// the bridge must read the envelope from *there*, or the `+N -M` badge and the produced
+// files quietly disappear from a live card while still appearing after a reload.
+#[test]
+fn a_tools_own_words_go_to_the_model_and_its_metadata_goes_to_the_card() {
+    let grid = "region\tunits\nWest\t26\nNorth\t12\n# 4 result row(s)\n";
+    let envelope = serde_json::json!({
+        "ok": true,
+        "tool": "sheet_query",
+        "output": grid,
+        "changes": [{ "path": "q.csv", "added": 4, "removed": 0, "created": true }],
+        "files": [{ "path": "q.csv", "name": "q.csv", "mime": "text/csv", "bytes": 41 }]
+    });
+    let recs = vec![
+        serde_json::json!({ "type": "agent_start" }),
+        serde_json::json!({
+            "type": "tool_execution_end",
+            "toolCallId": "mock-q-1",
+            "toolName": "sheet_query",
+            "isError": false,
+            "result": {
+                // The model-facing text is the engine's sentence, not the envelope.
+                "content": [{ "type": "text", "text": grid }],
+                "details": envelope
+            }
+        }),
+    ];
+    let mut tr = Translator::default();
+    let mut clock = Clock::new();
+    tr.on_record(&recs[0], clock.tick());
+    let out = tr.on_record(&recs[1], clock.tick());
+
+    let shown: Vec<String> = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ToolExecOutput { chunk, .. } => Some(chunk.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        shown.iter().any(|c| c.contains("West\t26") && !c.contains("\"ok\":true")),
+        "the card should carry the grid, not a JSON envelope: {shown:?}"
+    );
+    let changes = out
+        .events
+        .iter()
+        .find_map(|e| match e {
+            EngineEvent::ToolExecEnd { changes, .. } => Some(changes.clone()),
+            _ => None,
+        })
+        .expect("a tool execution end");
+    assert_eq!(changes.len(), 1, "the changes in `details` never reached the card");
+    assert_eq!(changes[0].path, "q.csv");
+    assert_eq!(changes[0].added, 4);
+}
+
+// The other vintage: fixtures recorded before that change put the JSON envelope *in* the
+// model-facing text. Dropping support would mean a card that loses its grid and its
+// numbers after a reload, because the transcript and the live stream would then disagree.
+#[test]
+fn a_stream_that_put_the_envelope_in_the_text_is_still_understood() {
+    let envelope = serde_json::json!({
+        "ok": true,
+        "tool": "sheet_query",
+        "output": "region\tunits\nWest\t26\n# 4 result row(s)\n",
+        "changes": [{ "path": "q.csv", "added": 4, "removed": 0, "created": true }]
+    });
+    let recs = vec![
+        serde_json::json!({ "type": "agent_start" }),
+        serde_json::json!({
+            "type": "tool_execution_end",
+            "toolCallId": "mock-q-2",
+            "toolName": "sheet_query",
+            "isError": false,
+            "result": { "content": [{ "type": "text", "text": envelope.to_string() }] }
+        }),
+    ];
+    let mut tr = Translator::default();
+    let mut clock = Clock::new();
+    tr.on_record(&recs[0], clock.tick());
+    let out = tr.on_record(&recs[1], clock.tick());
+    assert!(
+        out.events.iter().any(|e| matches!(e, EngineEvent::ToolExecOutput { chunk, .. } if chunk.contains("West\t26"))),
+        "the envelope in the text should still unwrap to its output"
+    );
+    assert!(
+        out.events.iter().any(|e| matches!(e, EngineEvent::ToolExecEnd { changes, .. } if changes.len() == 1)),
+        "the `+N -M` counts in that envelope should still reach the card"
+    );
+}
+
+// A send is a fact before it is asked of a model. The host stores the user's message
+// first, so pi's echo of it must not create a second row — and the echo is still what
+// proves whether a picture reached the endpoint.
+#[test]
+fn a_user_row_the_host_already_stored_is_not_stored_twice() {
+    let mut tr = Translator::default();
+    let mut clock = Clock::new();
+    tr.store_user_early(&[]);
+    let echo = serde_json::json!({
+        "type": "message_end",
+        "message": { "role": "user", "content": [{ "type": "text", "text": "what is 6 times 7?" }] }
+    });
+    let out = tr.on_record(&echo, clock.tick());
+    assert!(
+        !out.rows.iter().any(|m| m.role == Role::User),
+        "the host stored this message already; a second row would show it twice"
+    );
+    // The suppression is for the one send it was armed for. A later message in the same
+    // process (a second turn, or a message the host did not pre-store) must still land.
+    let out2 = tr.on_record(&echo, clock.tick());
+    assert!(
+        out2.rows.iter().any(|m| m.role == Role::User),
+        "the echo suppression outlived its own send"
+    );
+}
+
+#[test]
+fn an_early_stored_send_still_reconciles_what_came_back() {
+    let att = cwoffee_engine::provider::Attachment {
+        mime: "image/png".to_string(),
+        data_b64: "AA==".to_string(),
+        name: Some("probe.png".to_string()),
+    };
+    let mut tr = Translator::default();
+    let mut clock = Clock::new();
+    tr.store_user_early(std::slice::from_ref(&att));
+    // pi echoes the prompt with no image block: the picture did not travel. The row is
+    // suppressed, but the shortfall has to be said out loud.
+    let echo = serde_json::json!({
+        "type": "message_end",
+        "message": { "role": "user", "content": [{ "type": "text", "text": "look at this" }] }
+    });
+    let out = tr.on_record(&echo, clock.tick());
+    assert!(!out.rows.iter().any(|m| m.role == Role::User), "the row was already stored");
+    assert!(
+        out.events.iter().any(|e| matches!(e, EngineEvent::Note { message, .. } if message.contains("echoed 0 of 1"))),
+        "a picture that never reached the endpoint must be reported: {:?}",
+        out.events
+    );
+}

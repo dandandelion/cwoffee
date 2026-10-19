@@ -351,6 +351,20 @@ pub trait Tool: Send + Sync {
 
     /// `args` has already been through `repair::parse_or_repair`.
     async fn run(&self, args: Value, ctx: &ToolCtx, sink: &ExecSink) -> ToolResult;
+
+    /// The questions this call wants a human to answer, in the order the host should
+    /// ask them. `None` for every tool that does not ask.
+    ///
+    /// This exists for a host that cannot hold a question open *inside* the tool. On the
+    /// pi core the tool runs in a separate process (`cwtool`) spawned by an extension,
+    /// so the questions have to be read out before the call and the answers handed back
+    /// as an argument. Listing them here — in the registry, from the same parse the tool
+    /// itself uses — is what keeps the ~40 lines of TypeScript around it free of policy:
+    /// it asks whatever the engine says to ask, and never decides for itself that some
+    /// tool ought to ask.
+    fn host_questions(&self, _args: &Value) -> Option<Result<Vec<ask::Question>, String>> {
+        None
+    }
 }
 
 /// Exec knobs that come from config. Kept separate from ExecTool so the registry

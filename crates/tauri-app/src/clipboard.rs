@@ -371,6 +371,90 @@ fn sniff(b: &[u8], fallback: String) -> String {
     }
 }
 
+/// Put the page harness's own fixture back on the selection.
+///
+/// The selection is desktop-wide and a board runs for a quarter of an hour: a person copying
+/// an email, or one of the board's own checks copying an answer, replaces the fixture image
+/// with text, and the paste check then reports "nothing sendable" about a fixture that
+/// stopped existing mid-run. The board names its file in `CWOFFEE_SELFTEST_CLIP_IMG`; with
+/// that variable unset this does nothing, so a running app cannot be talked into overwriting
+/// what the user copied. It refuses an image the model cannot be shown, for the same reason
+/// `finish` refuses it on the way in.
+pub fn stage_fixture() -> Result<serde_json::Value, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let path = match std::env::var("CWOFFEE_SELFTEST_CLIP_IMG") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Err("this run staged no clipboard fixture: CWOFFEE_SELFTEST_CLIP_IMG is unset".to_string()),
+    };
+    let meta = std::fs::metadata(&path).map_err(|e| format!("the fixture {path} cannot be read: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("CWOFFEE_SELFTEST_CLIP_IMG={path} is not a file"));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("could not read {path}: {e}"))?;
+    let mime = sniff(&bytes, image_ext(&path).unwrap_or_else(|| "application/octet-stream".into()));
+    if !matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
+        return Err(format!(
+            "the fixture {path} is {mime}, which the model cannot be shown; the board should stage a PNG"
+        ));
+    }
+    // wl-copy first, because this desktop runs Wayland; xclip for an X11 session.
+    //
+    // Neither tool's process is the one that ends up owning the selection: both fork a
+    // resident child that holds the offer until something replaces it. `read_image` can pipe
+    // and wait because its tools (`wl-paste`, `xclip -o`) exit; these do not. Capturing their
+    // stdout would keep the pipe open through that resident child and `wait` would never
+    // return — which is how a self-test verb hung a whole page harness. So stdout goes to
+    // null, and stderr to a file: a diagnosis that does not hold a pipe open.
+    let err_log = std::env::temp_dir().join("cwoffee-selftest-clipboard.err");
+    let attempts: [(&str, Vec<&str>); 2] = [
+        ("wl-copy", vec!["--type", mime.as_str()]),
+        ("xclip", vec!["-selection", "clipboard", "-t", mime.as_str(), "-mode", "i"]),
+    ];
+    let mut failures = Vec::new();
+    for (bin, args) in attempts {
+        let stderr_file = std::fs::File::create(&err_log).ok();
+        let spawned = Command::new(bin)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(match stderr_file {
+                Some(f) => Stdio::from(f),
+                None => Stdio::null(),
+            })
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) => {
+                failures.push(format!("{bin}: {e}"));
+                continue;
+            }
+        };
+        if let Some(mut si) = child.stdin.take() {
+            if let Err(e) = si.write_all(&bytes) {
+                failures.push(format!("{bin}: could not hand over the bytes: {e}"));
+                continue;
+            }
+        }
+        match child.wait() {
+            Ok(st) if st.success() => {
+                return Ok(serde_json::json!({
+                    "path": path,
+                    "mime": mime,
+                    "bytes": bytes.len(),
+                    "via": bin,
+                }));
+            }
+            Ok(st) => failures.push(format!(
+                "{bin}: exit {st}; see {}",
+                err_log.display()
+            )),
+            Err(e) => failures.push(format!("{bin}: {e}")),
+        }
+    }
+    Err(format!("nothing could take the fixture: {}", failures.join("; ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

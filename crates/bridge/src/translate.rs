@@ -157,6 +157,11 @@ pub struct Translator {
     /// size for a picture. pi echoes the bytes back but knows nothing about
     /// "probe.png"; taking only the echo would lose what the transcript shows.
     sent_att: Vec<Attachment>,
+    /// Set when the host has already stored the user's own message for this turn. pi
+    /// echoes that message back as a transcript record, and storing it a second time
+    /// would put the same sentence in the conversation twice — so the echo reconciles the
+    /// attachments and is then dropped, once.
+    skip_user_row: bool,
     /// Tool calls in the run that is currently open. pi runs the loop, so this is the
     /// only place a long-uncapped-turn note can come from on this core.
     calls_this_run: usize,
@@ -177,6 +182,15 @@ impl Translator {
     /// would claim somebody else's picture.
     pub fn expect_attachments(&mut self, atts: Vec<Attachment>) {
         self.sent_att = atts;
+    }
+
+    /// The host wrote the user's message into the store before opening the model process,
+    /// so pi's echo of it is expected and must not become a second row. The attachment
+    /// bookkeeping still runs on that echo: what was sent and what came back are the only
+    /// evidence that a picture reached the endpoint.
+    pub fn store_user_early(&mut self, atts: &[Attachment]) {
+        self.skip_user_row = true;
+        self.sent_att = atts.to_vec();
     }
 
     pub fn clear_attachments(&mut self) {
@@ -439,7 +453,16 @@ impl Translator {
                         });
                     }
                 }
-                out.rows.push(m);
+                if self.skip_user_row {
+                    // Sent-and-echoed accounting still happens here; only the row is
+                    // suppressed, because the host already stored it. Doing this the other
+                    // way round — waiting for pi's echo to create the row — is what made a
+                    // message look like it had vanished while the bridge opened a pi thread.
+                    self.skip_user_row = false;
+                    let _ = &m;
+                } else {
+                    out.rows.push(m);
+                }
             }
             "assistant" => {
                 let mut calls = Vec::new();
@@ -518,7 +541,7 @@ impl Translator {
                     // reopened transcript shows the same card as the live one. `changes`
                     // ride along: the store persists them as the card's `+N -M`, and a
                     // row without them is a file edit the user cannot see the size of.
-                    let changes = envelope(&text)
+                    let changes = envelope_in(msg, &text)
                         .and_then(|v| {
                             v.get("changes")
                                 .and_then(|c| serde_json::from_value::<Vec<cwoffee_engine::tools::changes::FileChange>>(c.clone()).ok())
@@ -723,7 +746,7 @@ fn tool_end(turn_id: u64, rec: &Value) -> (Vec<EngineEvent>, (String, Vec<cwoffe
     let mut changes: Vec<FileChange> = Vec::new();
     let mut files: Vec<cwoffee_engine::tools::OutputFile> = Vec::new();
     if let Some(txt) = result_text(rec) {
-        if let Some(v) = envelope(&txt) {
+        if let Some(v) = envelope_in(rec, &txt) {
             if let Some(c) = v.get("changes").and_then(|c| serde_json::from_value::<Vec<FileChange>>(c.clone()).ok()) {
                 changes = c;
             }
@@ -736,7 +759,7 @@ fn tool_end(turn_id: u64, rec: &Value) -> (Vec<EngineEvent>, (String, Vec<cwoffe
     // `error` is what it says when the tool refused. Anything else in the envelope is
     // metadata the card derives for itself.
     if let Some(txt) = result_text(rec) {
-        let shown = envelope(&txt)
+        let shown = envelope_in(rec, &txt)
             .and_then(|v| {
                 v.get("output")
                     .and_then(|o| o.as_str())
@@ -763,6 +786,34 @@ fn tool_end(turn_id: u64, rec: &Value) -> (Vec<EngineEvent>, (String, Vec<cwoffe
 /// tolerate anything that is not ours (a pi-side "tool not found", a shell's own text).
 fn envelope(text: &str) -> Option<Value> {
     serde_json::from_str::<Value>(text).ok()
+}
+
+/// The envelope behind a tool result, in whichever vintage produced it.
+///
+/// Two shapes have to keep working. The current one puts the engine's own sentence in the
+/// model-facing text and the structured envelope in pi's `details` (which never enters the
+/// prompt). The older one — and every fixture recorded before that change — put the JSON
+/// envelope *in* the text. Read only one and a reopened transcript quietly loses its
+/// `+N -M` badge and its produced files, which is a failure the user notices as a card that
+/// changed shape after a reload.
+fn envelope_in(rec: &Value, text: &str) -> Option<Value> {
+    for path in [&["details"][..], &["result", "details"][..]] {
+        let mut cur = rec;
+        let mut found = true;
+        for key in path {
+            match cur.get(key) {
+                Some(v) => cur = v,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found && cur.is_object() {
+            return Some(cur.clone());
+        }
+    }
+    envelope(text)
 }
 
 fn result_text(rec: &Value) -> Option<String> {
