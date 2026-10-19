@@ -131,5 +131,11 @@ if (fail.length) {
   process.exit(1)
 }
 console.log('WORKSPACE GATE OK')
+// A gate that litters the user's sidebar costs them work after the fact: every live run
+// leaves a conversation titled after the gate. On success, delete it with the same verb the
+// row menu uses. On failure, leave it — the conversation is the evidence for the red.
+rpc('delete_session', { id: sid })
+await t(700)
+
 ws.close()
 process.exit(0)

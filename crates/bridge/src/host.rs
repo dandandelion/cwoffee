@@ -200,7 +200,7 @@ impl PiHost {
             auto_checked: None,
             auto_seen: None,
             web_last: Arc::clone(&web_last),
-            auto_allow: HashSet::new(),
+            auto_allow: HashMap::new(),
             waits: HashMap::new(),
             next_id: 1,
             last_activity: Instant::now(),
@@ -449,8 +449,28 @@ impl HostOps for PiHost {
 }
 
 /// What the bridge knows about an outstanding dialog, in both id spaces.
+/// Whether a standing grant covers this call. Two conditions, both taken from the Rust
+/// core's gate (engine `ApprovalGate::check`), because a permit means the same thing on
+/// either core or the app has two security models:
+///
+/// * the grant belongs to **this conversation** — "for the rest of this session" means the
+///   conversation you clicked in, not every conversation this model process serves; and
+/// * the call **leaves nothing behind** — a grant is about the tool in your own folder, and
+///   remembering an out-of-workspace yes for the rest of the session would turn one yes
+///   into unlimited access outside the workspace.
+fn permit_covers(auto: &HashMap<i64, HashSet<String>>, row: i64, tool: &str, escapes: &[String]) -> bool {
+    escapes.is_empty() && auto.get(&row).map_or(false, |s| s.contains(tool))
+}
+
 enum Wait {
-    Approval { pi_id: String, tool: String, deadline: Instant },
+    /// `row` is the conversation whose turn raised the card. A standing permit
+    /// belongs to that conversation and to no other.
+    Approval {
+        pi_id: String,
+        tool: String,
+        deadline: Instant,
+        row: i64,
+    },
     Question {
         pi_id: String,
         kind: QKind,
@@ -606,7 +626,12 @@ struct Engine {
     /// bridge cannot see inside the tool host's clock, so it keeps its own.
     web_last: Arc<Mutex<Option<Instant>>>,
     /// Approvals granted with `AllowSession`: the same tool is not asked again.
-    auto_allow: HashSet<String>,
+    /// "allow for the rest of this session", by conversation. Keyed by the session row —
+    /// `sessions.id` is AUTOINCREMENT, so an id never comes back to haunt a later
+    /// conversation. A host-wide set would mean that clicking "allow for this session"
+    /// while talking about one folder also silenced the card in every other conversation
+    /// this process serves, which is not what the button says.
+    auto_allow: HashMap<i64, HashSet<String>>,
     waits: HashMap<u64, Wait>,
     /// Call key from a cwoffee question payload -> the set this process built for it.
     ///
@@ -1498,10 +1523,19 @@ impl Engine {
                 let escapes = outside_paths(&message, &workdir);
                 let risk = if escapes.is_empty() { Risk::Workspace } else { Risk::Sensitive };
                 let mode = self.state.lock().unwrap().mode.clone();
-                if matches!(mode, ApprovalMode::Auto) || self.auto_allow.contains(&tool) {
+                let row = self.row();
+                let permit = permit_covers(&self.auto_allow, row, &tool, &escapes);
+                if matches!(mode, ApprovalMode::Auto) || permit {
                     self.tr.dialog_resolved(now);
                     self.reply(&pi_id, json!({ "confirmed": true }));
-                    self.note(format!("{tool} was allowed without asking (approval mode {:?})", mode));
+                    // Two different reasons, and the person is entitled to know which one
+                    // let this through: a mode they set, or a grant they gave in this
+                    // conversation earlier.
+                    self.note(if permit {
+                        format!("{tool} was allowed without asking: this conversation granted it earlier")
+                    } else {
+                        format!("{tool} was allowed without asking (approval mode {:?})", mode)
+                    });
                     return;
                 }
                 let id = self.next_id;
@@ -1545,7 +1579,12 @@ impl Engine {
                 let secs = timeout_ms.max(1000) / 1000;
                 self.waits.insert(
                     id,
-                    Wait::Approval { pi_id: pi_id.clone(), tool, deadline: Instant::now() + Duration::from_secs(secs) },
+                    Wait::Approval {
+                        pi_id: pi_id.clone(),
+                        tool,
+                        deadline: Instant::now() + Duration::from_secs(secs),
+                        row,
+                    },
                 );
                 let ui_tx = self.ui_tx.clone();
                 tokio::spawn(async move {
@@ -1705,7 +1744,7 @@ impl Engine {
         match ans {
             UiAnswer::Approval { id, answer } => {
                 let wait = match self.waits.remove(&id) {
-                    Some(Wait::Approval { pi_id, tool, .. }) => Some((pi_id, tool)),
+                    Some(Wait::Approval { pi_id, tool, row, .. }) => Some((pi_id, tool, row)),
                     other => {
                         if other.is_some() {
                             self.err("an approval answer arrived for something that was not an approval card");
@@ -1713,7 +1752,7 @@ impl Engine {
                         None
                     }
                 };
-                let Some((pi_id, tool)) = wait else {
+                let Some((pi_id, tool, row)) = wait else {
                     // The card already closed: pi denied on its own timeout, or
                     // the turn was cancelled. Silently writing a response would
                     // imply the human's answer reached the tool.
@@ -1727,9 +1766,9 @@ impl Engine {
                     }
                     Some(ApprovalAnswer::AllowSession) => {
                         self.tr.dialog_resolved(now);
-                        self.auto_allow.insert(tool.clone());
+                        self.auto_allow.entry(row).or_default().insert(tool.clone());
                         self.reply(&pi_id, json!({ "confirmed": true }));
-                        self.note(format!("{tool} is now allowed for the rest of this session"));
+                        self.note(format!("{tool} is now allowed for the rest of this session (conversation {row})"));
                     }
                     Some(ApprovalAnswer::Deny) => {
                         self.tr.dialog_resolved(now);
@@ -1952,6 +1991,30 @@ fn pi_level(r: &Reasoning) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_permit_given_in_one_conversation_does_not_silence_the_card_in_another() {
+        // The user clicked "allow for this session" while working in conversation 7.
+        let mut auto: HashMap<i64, HashSet<String>> = HashMap::new();
+        auto.entry(7).or_default().insert("read_file".to_string());
+        let inside: Vec<String> = vec![];
+        assert!(
+            permit_covers(&auto, 7, "read_file", &inside),
+            "the grant applies where it was given"
+        );
+        assert!(
+            !permit_covers(&auto, 8, "read_file", &inside),
+            "conversation 8 granted nothing, so its card must still appear"
+        );
+        assert!(!permit_covers(&auto, 7, "exec", &inside), "a grant for one tool is not a grant for the next");
+        // And a grant never covers a path that leaves the folder — the rule the Rust core
+        // states outright, and the reason an out-of-workspace read is asked about every
+        // time rather than once.
+        assert!(
+            !permit_covers(&auto, 7, "read_file", &["/etc/hostname".to_string()]),
+            "one yes inside the workspace is not a yes for reading outside it"
+        );
+    }
 
     #[test]
     fn an_approval_card_names_the_tool_our_extensions_ask_for() {

@@ -1016,6 +1016,28 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     the artifact timestamps and the target dir it used. This is a guard, not the cause of 98 — the
     same skip reproduced in the clone's own `./target`.
 
+100. **A "for the rest of this session" grant belongs to the conversation, and it never
+    covers a path that leaves the folder.** The bridge kept `auto_allow: HashSet<String>` on
+    the *host*: one "allow for this session" click in one conversation silenced `read_file`
+    in every conversation that model process served, including out-of-workspace reads. The
+    engine's gate has keyed the grant per session and required `risk.escapes.is_empty()` from
+    the start — "a session grant is about the *tool*, so it never covers an escape… one yes
+    would otherwise be unlimited access outside the workspace" — and the bridge had neither
+    half. Two questions a permit must answer: *whose* session, and *does this call leave the
+    folder*. Keying by row id is safe because `sessions.id` is `AUTOINCREMENT` (a deleted
+    conversation's id never comes back to authorise a later one). This surfaced as a chat-gate
+    red — "the same prompt opened no card after switching back" — caused by an `allowSession`
+    answer in an unrelated conversation forty minutes earlier, so the lesson also is that a
+    security hole is most often noticed by a gate that never meant to test it.
+101. **A gate whose prompt has no scenario is a gate that quietly stopped being run.** The
+    workspace gate's prompt was never in `tests/scenarios/scenarios.json`; because the fixture
+    endpoint refuses an unknown prompt instead of inventing a plausible one, the turn died with
+    a 400 and the gate then failed on its content assertions ("no tool events", "the transcript
+    does not contain…"). Scripted as `workspace-read`, whose second step requires the gate's
+    two fixture lines and the engine's own "showing N of M lines" note before it may answer.
+    Symptom to remember: the first failure line names the 400 and says
+    `mock-llm has no scenario for this prompt` — read that line before the four below it.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -1828,3 +1850,33 @@ Consequence for the pi-core triage: the ask_user red and the cascading
 this tree no longer has, and the h18 run's other numbers (`grown transcript` cadence included)
 describe the 01:56 app. Nothing about the current tree's page-harness state is known until the
 next board runs with the proof passing.
+
+### Security parity found by a chat gate: a permit that covered the whole host
+
+The chat gate's cowork phase reported `cards=0 toolsRan=1` — a tool ran with no card — and
+the reason was not the persona switch. The bridge's standing grants were keyed on the model
+process, so the `allowSession` answer from the approval gate's third variant, in a different
+conversation, had silenced `read_file` for every conversation that host served. The engine's
+`ApprovalGate` had both rules the whole time (per-session, and never for an escaping path);
+the bridge had neither.
+
+Now `permit_covers(auto, row, tool, escapes)` states both, and the bridge test asserts all
+three failures: a grant in another conversation, a grant for a different tool, and a grant
+used for `/etc/hostname`. The note the user sees also split, because "allowed without asking
+(approval mode Ask)" blamed the mode for a decision the user had made: it now says *this
+conversation granted it earlier* when a permit is what let the call through.
+
+Two more things went green on the way: `gateway-workspace.mjs` was red because its prompt had
+no scenario (fixed by scripting `workspace-read` with require strings on the final step), and
+the whole gate family now runs against this checkout's own artifacts from a scratch gateway:
+
+```
+GATEWAY APPROVAL OK (allow) / (deny) / (allowSession)
+WORKSPACE GATE OK
+no leak: A kept its turn, B stayed empty — MIDTURN SWITCH OK
+ATTACH GATE OK (bytes reached the model, and the transcript says what they were called)
+```
+
+`gateway-excel` and `gateway-search` remain to re-run against the scratch gateway, and the
+chat gate gets one more pass now that the permit is scoped — the failure it reported was real,
+so its red is the fix's evidence rather than something to explain away.

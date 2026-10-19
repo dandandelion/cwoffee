@@ -331,7 +331,7 @@
      "delay_ms": 25
     },
     {
-     "content": "Right \u2014 that belongs in write_file, not in a shell.",
+     "content": "Right — that belongs in write_file, not in a shell.",
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 12
@@ -1404,6 +1404,37 @@
      "require": [
       "created"
      ]
+    }
+   ]
+  },
+  {
+   "name": "workspace-read",
+   "_why": "the workspace gate asks for a relative path inside the conversation's own folder; the gate is about the bytes arriving, so the last step waits until the tool's output is in the prompt",
+   "match": "read_file tool to read the file",
+   "steps": [
+    {
+     "reasoning": "A file in this folder, named by the user. Read it instead of guessing.",
+     "tool_calls": [
+      {
+       "id": "mock-ws-read-1",
+       "name": "read_file",
+       "arguments": "{\"path\":\"README.md\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "require": [
+      "Cwoffee workspace-gate fixture.",
+      "This file exists so read_file has something to read.",
+      "showing"
+     ],
+     "_why": "the gate's two fixture lines plus the engine's own line-count note: answering this step before they are in the prompt would let the gate pass on an apology instead of a read",
+     "content": "Both lines are in it. It reads as a two-line fixture.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 12
     }
    ]
   }
