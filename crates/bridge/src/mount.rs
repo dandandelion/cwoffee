@@ -157,7 +157,15 @@ pub fn mount_settings(
             })?
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e.into()),
+        // Named, and with the promise that nothing changed: a bare `Permission denied` is
+        // technically true and useless, because the reader cannot tell which of pi's files
+        // cwoffee walked away from, or whether it left a half-written one.
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "cannot read {}: {e} — nothing was written",
+                path.display()
+            ))
+        }
     };
     if !doc.is_object() {
         return Err(anyhow::anyhow!(
@@ -247,10 +255,20 @@ pub fn mount_provider_rows(
         cwoffee_engine::config::model_rows_in(cfg_path);
     std::fs::create_dir_all(agent_dir)?;
     let path = agent_dir.join("models.json");
+    // "Could not read it" and "there is nothing there" are different answers, and the old
+    // arm treated both as the second: a `models.json` that existed but could not be read
+    // (permissions, a hung mount point) was parsed as `{}` and then written back whole,
+    // which would have erased the endpoint registrations cwoffee does not own. Absence is
+    // the only state that starts from an empty document; anything else is a refusal.
     let mut doc: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(t) => serde_json::from_str(&t)?,
-        Err(std::io::Error { .. }) => serde_json::json!({}),
-        Err(e) => return Err(anyhow::anyhow!("{} is not JSON: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "cannot read {}: {e} — nothing was written",
+                path.display()
+            ))
+        }
     };
     if !doc.is_object() {
         return Err(anyhow::anyhow!("{} is not a JSON object", path.display()));
@@ -358,9 +376,25 @@ pub fn write_dev_provider(
     // `input`, and pi then dropped image attachments before the request, quietly. And
     // clobbering a `models.json` that belongs to somebody else's pi setup (same provider
     // name, different baseUrl) would edit a config we do not own.
+    // The same three answers, kept separate: absent (start fresh), unreadable (refuse),
+    // unparseable (refuse). The old pair of catch-alls turned either into "start fresh",
+    // and this function then *writes* the document — so a `models.json` that merely could
+    // not be read for a moment would be replaced with cwoffee's entry alone, taking every
+    // other provider in the file with it.
     let mut doc: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({})),
-        Err(_) => serde_json::json!({}),
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "{} does not parse ({e}); refusing to overwrite a models file we did not write",
+                path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "cannot read {}: {e} — nothing was written",
+                path.display()
+            ))
+        }
     };
     let ours = doc
         .get("providers")
@@ -497,6 +531,54 @@ mod tests {
         assert!(find_bin(Path::new("sh")).is_some());
         assert!(find_bin(Path::new("definitely-not-a-binary-xyz")).is_none());
         assert_eq!(find_bin(Path::new("/bin/sh")).unwrap(), PathBuf::from("/bin/sh"));
+    }
+
+    /// "Cannot read it" is not "there is nothing there". The arm that conflated them read a
+    /// `models.json` blocked by permissions as `{}` and then wrote that back — erasing the
+    /// endpoint registrations in a file cwoffee does not own. The refusal names the file and
+    /// leaves the bytes alone.
+    #[test]
+    fn a_file_that_cannot_be_read_is_not_treated_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("unreadable");
+        let agent = dir.join("pi-agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[providers.theirs]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:8090/v1\"\nmodels = [\"theirs/x\"]\n",
+        )
+        .unwrap();
+
+        for name in ["models.json", "settings.json"] {
+            let path = agent.join(name);
+            let mine = format!("{{\"kept\": \"for {name}\"}}");
+            // A previous failed run can leave a 0o000 file of the same name behind, and
+            // writing to that is the very error this test is about — clear it first so the
+            // failure under test is the one being provoked.
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, &mine).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_to_string(&path).is_ok() {
+                // Running as root: permission bits do not bind, so this case would assert
+                // nothing. Say so rather than report a pass that proved it.
+                eprintln!("[cwoffee/test] skipping {name}: running as root, 0o000 does not bind");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                continue;
+            }
+            let e = match name {
+                "models.json" => mount_provider_rows(&agent, &cfg).unwrap_err().to_string(),
+                _ => mount_settings(&agent, "p", "m", 1000, 4000).unwrap_err().to_string(),
+            };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(e.contains(name), "{e}");
+            assert!(e.contains("nothing was written"), "{e}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                mine,
+                "{name} was written over after a failed read"
+            );
+        }
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {

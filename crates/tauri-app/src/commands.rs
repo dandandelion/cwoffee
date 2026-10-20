@@ -526,6 +526,23 @@ pub fn sessions_in(state: tauri::State<'_, AppState>, path: String) -> Result<Ve
     state.store.sessions_in(&path).map_err(|e| e.to_string())
 }
 
+/// The display settings, with their labels and defaults, from the Rust list that owns
+/// them. They live in the conversation database, so a phone and this window agree; a
+/// browser's `localStorage` would be a fourth opinion nobody asked for.
+#[tauri::command]
+pub fn ui_prefs(state: tauri::State<'_, AppState>) -> Result<Vec<cwoffee_engine::prefs::UiPrefView>, String> {
+    cwoffee_engine::prefs::view(state.store.as_ref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_ui_pref(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    value: String,
+) -> Result<String, String> {
+    cwoffee_engine::prefs::set(state.store.as_ref(), &key, &value)
+}
+
 #[tauri::command]
 pub fn search_messages(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<SearchHit>, String> {
     state.store.search(&query, 25).map_err(|e| e.to_string())

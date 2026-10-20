@@ -1287,6 +1287,47 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     still printed, as context, because they are the thing that made the old assertion look
     meaningful.
 
+125. **A decision the reader has to make once belongs in settings, not on every card.** The run
+    accordion shipped with a `show outputs` button per run. Within a week of use that is four
+    clicks per conversation asking the same question each time — "do I want to read what the
+    steps did?" — and the answer does not change mid-conversation. The control is gone; the
+    question is answered once in Settings › Transcript, and every run follows it, live and
+    stored. An affordance repeated per item is a setting wearing a button.
+
+126. **A display preference belongs in the app's store, not the browser's.** `ui_prefs`
+    (schema v12) sits in the same SQLite file as the conversations. `localStorage` looked
+    easier and is wrong: it is per-origin, and the desktop, a browser on another port and a
+    phone are three origins, so the same person would get three answers and the settings
+    screen would be a per-device guess. Unset stays distinguishable from the default
+    (`is_default`), exactly as with the context ceiling: an unset pref follows a default that
+    moves later, a written one does not.
+
+127. **A settings table needs a vocabulary.** `prefs::UI_PREFS` is the only place that knows
+    which keys exist, what their values mean and what each one defaults to; the screen renders
+    from that list rather than carrying its own, so a pref the app does not act on cannot
+    appear as a control, and an unknown key or an out-of-vocabulary value is refused with the
+    list named. Writing one is drive-only: the store is shared, so a viewer pressing a switch
+    would otherwise change what the desktop draws. The list holds one entry today, and the test
+    that fails when it grows is the reminder that a new pref has to be wired in the UI as well.
+
+128. **The stored transcript had been separating the runs all along; the live one looked fine.**
+    History painted *every* assistant row as an answer — including the rows a tool call leaves
+    with no text at all — each with its own `Copy | Share as markdown | Branch` footer under
+    nothing. Those bare strips between run accordions are what the user read as "they separated
+    again as soon as the turn ended". The live path never did it because it only opens an
+    answer block when text arrives. Two rules now hold in both paths: an assistant row with no
+    text paints nothing, and the footer line belongs to a turn, not to each message. A page case
+    asserts both, on rows shaped exactly like the engine's.
+
+129. **"Cannot read it" is not "there is nothing there."** `mount_provider_rows` and
+    `write_dev_provider` both collapsed absent / unreadable / unparseable into "start from
+    `{}`" and then wrote the file — so a `models.json` momentarily blocked by permissions would
+    have been replaced by cwoffee's entry alone, deleting the other endpoints' registrations in
+    a file cwoffee does not own. The three answers are separate now; a refusal names the path and
+    says nothing was written, and a test sets `0o000`, checks the error text, and re-reads the
+    bytes — while admitting out loud that under root the mode does not bind, so the case is
+    skipped rather than quietly passed.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -1924,6 +1965,87 @@ was the light-theme icon; and go on with the harness plus the parity list.
 
 ---
 
+## Journal — session 23 (a turn's grouping has to survive the turn ending)
+
+Two reports from actually using the accordion, one of which was not about the accordion.
+
+**"It looks fine while it generates, then they separate again."** The runs stayed grouped;
+what appeared between them was the transcript's own bookkeeping. The history renderer painted
+*every* stored assistant row as an answer — including the rows a tool call leaves with no text
+at all — and gave each one a `Copy | Share as markdown | Branch` footer. A `CWOFFEE` label, an
+empty body and a footer under nothing, wedged between two accordions, reads exactly like the
+runs splitting. The live path had never done it, because it only opens an answer block when text
+arrives; the settled view is the one people trust, so the bug was invisible until a turn ended.
+The user's guess that the buttons were involved was right about the symptom and wrong about the
+cause, which is worth remembering: the affordance was the only visible part of an empty block.
+
+Two rules now hold in both paths: **an assistant row with no text paints nothing**, and **the
+footer belongs to a turn, not to each message** — placed where a live turn puts it, after
+everything that turn produced. A page case asserts this on rows shaped exactly like the
+engine's (two turns, each with a silent tool-call row, a tool answer, and a spoken sentence):
+
+```
+settled grouping ok (2 spoken rows → 2 blocks, 2 silent rows painted nothing, 2 runs still
+  holding their steps, 2 footer lines placed under their turns)
+```
+
+**"The show-output buttons on the big blocks are not needed — make it a persistent setting."**
+The per-run button is gone. **Settings › Transcript** has one switch, *"Show what each step
+did"*, and the screen renders its list from `prefs::UI_PREFS` in Rust rather than carrying its
+own copy — so a pref the app does not act on cannot appear as a control, and an unknown key or
+value is refused with the real list named (`prefs::the_vocabulary_is_short_and_every_pref_names_its_default`,
+and a second test that fails when the list grows, because the UI has to be wired too).
+
+It is stored in `ui_prefs` (schema v12), in the same SQLite file as the conversations, not in
+`localStorage`: localStorage is per-origin, and the desktop, a browser on another port and a
+phone are three origins — a preference only one of them remembers is a coincidence, not a
+setting. `is_default` keeps *unset* distinguishable from *the default*, exactly as with the
+context ceiling: unset follows a default that moves later. Writing one is drive-only.
+
+The first version of the setting was a lie, and the page case said so:
+`verbose blocks did not reveal the thought that was already over`. It set `show-out` on runs
+that were still collapsed, changing a class nothing read — a run whose body is `display: none`
+cannot show its contents. Revealing the working means opening the accordion, so the two classes
+travel together, in `mkRun`, in `setVerbose`, and in the settle path (a verbose transcript stops
+folding the run when the answer lands, live *and* stored, or the same conversation would look
+different depending on whether you were watching it):
+
+```
+display setting ok (the control writes the store, the runs follow both ways, the wording is the host's)
+run accordion ok (two runs split by the answer, "Thought, then worked on your computer", entries fold to lines, output still in the page)
+```
+
+Two gates caught unrelated damage on the way:
+
+- The new gateway test demanded that a **watch-only** connection could not write the display
+  pref. It could: the verb had no role check. The store is shared, so a viewer pressing that
+  switch changes what the desktop draws — `need_drive` now, and audited.
+- `mount_provider_rows` and `write_dev_provider` both treated "cannot read `models.json`" as
+  "there is no `models.json`", parsed `{}`, and then **wrote the file** — so a file briefly
+  blocked by permissions would have come back holding only cwoffee's provider, with every other
+  registration in it gone. Absent, unreadable and unparseable are three answers now; the refusal
+  names the path and says nothing was written. The test sets `0o000`, reads the bytes back, and
+  prints that it is skipping rather than pretending, when running as root makes the mode bind
+  to nothing (gotchas 126-129).
+
+Board #39 after all of it: `verdict: ok`, with the cadence case finally measuring the turn that
+streamed rather than the whole mounted transcript (gotcha 124):
+
+```
+[cwoffee/page] big transcript cadence: 173 blocks / 162 messages / 636548 characters mounted; 93 frames
+  over 1545ms while a turn streamed, median 16.0ms, p95 26.0ms; the stream itself added 13021 characters
+  in the answer with 3 rendered tables; idle baseline 54 frames (stream/idle x0.94)
+```
+
+Rust at the same moment: engine 472 lib + 10 endpoint, bridge 17 + 16, gateway 34, `svelte-check`
+0 errors / 0 warnings. The desktop relaunched on those artifacts; the user's store reports
+`user_version: 12` with `ui_prefs` empty, which is the honest state: nothing set, defaults in
+force.
+
+Still open, said plainly: live compaction on one genuinely large conversation; the Models screen
+still has no page-harness case; lean tool exposure is still not real (pi's `defaultTools` has to
+be written at mount, so `--mode lean` still declares all thirteen tools).
+
 ## Journal — session 22 (the model's leftovers get an address, and the working surface folds)
 
 **Claim:** two asks the user raised from using the app — workspaces full of the model's own
@@ -1958,7 +2080,8 @@ The run accordion:
 - Consecutive thinking and tool calls now share one collapsible accordion whose header is a live
   claim — `Thinking`, `Working on your computer`, `Thought, then worked on your computer` — and
   the only thing that divides two accordions is the model's own message text. Inside, an entry is
-  a line: one control per run (`show outputs`) reveals the contents of the whole run at once,
+  a line: one control per run (`show outputs`, since replaced by a setting — see gotcha 125) reveals
+  the contents of the whole run at once,
   instead of a triangle per thought and per call.
 - Live and stored share `mkRun()`; the run that is *currently running* still shows its own output,
   because a header sitting still for forty seconds on a local model reads as a hang.

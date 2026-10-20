@@ -3301,3 +3301,39 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   opacity: 0.78;
   font-style: italic;
 }
+
+/* The display settings. The segments reuse `.modesel` (the same control the Chat/Cowork
+   tabs use) so one affordance means one thing; `.prefseg` only fixes the width, because a
+   two-value group should not stretch across the screen. */
+.prefrow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+.prefrow:last-of-type {
+  border-bottom: none;
+}
+.preftxt {
+  min-width: 0;
+}
+.preflbl {
+  font-size: 13.5px;
+  color: var(--ink);
+}
+.prefhint {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: color-mix(in srgb, var(--ink) 62%, transparent);
+}
+.prefnote {
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--accent);
+}
+.prefseg {
+  flex: 0 0 auto;
+}

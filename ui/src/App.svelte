@@ -123,7 +123,8 @@
   // Custom popovers instead of <select>: native dropdowns render with the
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
-  type MenuKind = 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'search' | 'tools' | 'naming'
+  type MenuKind =
+    'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'search' | 'tools' | 'naming' | 'display'
 
   /** Mirror of the desktop's GatewayStatus. Not reachable over the gateway
       itself: the payload carries the token inside ready-to-open URLs. */
@@ -172,6 +173,50 @@
      The sections below are the popups' own bodies - one copy of each control, rendered
      into either surface - so a setting cannot mean two different things depending on
      where you reached it from. */
+  // The display settings the host knows about, read from Rust (`prefs::UI_PREFS`) rather
+  // than typed here: the list is the vocabulary, so a setting the app does not act on
+  // cannot appear as a control, and a phone gets the same list the desktop does.
+  interface UiPref {
+    key: string
+    label: string
+    hint: string
+    value: string
+    default: string
+    is_default: boolean
+    values: string[]
+  }
+  let uiPrefs = $state<UiPref[]>([])
+  let prefBusy = $state(false)
+
+  async function loadPrefs() {
+    try {
+      uiPrefs = await invoke<UiPref[]>('ui_prefs')
+      applyPrefs()
+    } catch (e) {
+      pageLog(`prefs: ${e}`)
+    }
+  }
+
+  function applyPrefs() {
+    transcript?.setVerbose(uiPrefs.find((p) => p.key === 'verbose_blocks')?.value === 'on')
+  }
+
+  async function setPref(key: string, value: string) {
+    prefBusy = true
+    try {
+      const said = await invoke<string>('set_ui_pref', { key, value })
+      toast = { text: said, bad: false }
+      // Read the list back instead of painting what we sent: the store's answer is what
+      // the screen should show, and a refused write would otherwise leave a number there
+      // that was never stored.
+      await loadPrefs()
+    } catch (e) {
+      toast = { text: `${e}`, bad: true }
+      await loadPrefs()
+    }
+    prefBusy = false
+  }
+
   const SET_TABS: { kind: MenuKind; label: string; hint: string; group: string }[] = [
     { kind: 'model', label: 'Model', hint: 'what answers here', group: 'Answering' },
     { kind: 'think', label: 'Thinking', hint: 'how hard it deliberates', group: 'Answering' },
@@ -183,6 +228,7 @@
     { kind: 'naming', label: 'Titles', hint: 'what a conversation is called', group: 'This app' },
     { kind: 'metrics', label: 'This session', hint: 'context, cache, cost', group: 'This app' },
     { kind: 'keys', label: 'Shortcuts', hint: 'keys the app answers', group: 'This app' },
+    { kind: 'display', label: 'Transcript', hint: 'how much of the working shows', group: 'This app' },
   ]
   // The tool list is read from the engine, never typed here: the description a tool
   // carries is the same text the model is handed, so a UI-side copy is a second copy of
@@ -234,6 +280,9 @@
 
   function openSettings(tab: MenuKind = 'model') {
     closeMenu()
+    // The screen reads its own list fresh, so another client's change is reflected here
+    // the next time the screen is opened.
+    void loadPrefs()
     void loadSettingsFor(tab)
     settings = { tab }
     // Focus follows the surface: a screen nothing can tab into is a screen nothing can use.
@@ -5063,15 +5112,16 @@
             const trun = rblk.closest('.blk-run') as HTMLElement | null
             if (!trun) fail('a thinking block in a live turn sits outside the run accordion')
             else {
-              const out = trun.querySelector('.run-out') as HTMLElement
-              out.click()
+              // The reveal is a display setting, not a button per run: see
+              // `setVerbose` and the Transcript section of Settings.
+              transcript?.setVerbose(true)
               await new Promise((r) => setTimeout(r, 200))
               if (getComputedStyle(body).display === 'none')
-                fail('`show outputs` did not reveal the thought that was already over')
-              out.click()
+                fail('verbose blocks did not reveal the thought that was already over')
+              transcript?.setVerbose(false)
               await new Promise((r) => setTimeout(r, 200))
               if (getComputedStyle(body).display !== 'none')
-                fail('`hide outputs` did not fold the thought back to its duration line')
+                fail('verbose blocks off did not fold the thought back to its duration line')
             }
           }
         }
@@ -7117,8 +7167,146 @@
             pageLog(
               `run accordion ok (two runs split by the answer, "${l1}", entries fold to lines, output still in the page)`,
             )
+
           }
           transcript?.clear()
+        }
+
+        // A settled turn keeps the grouping the live turn had. The live shape was right and
+        // the reopened one was not: every stored assistant row was painted as an answer,
+        // including the rows a tool call leaves with no text at all, each with its own
+        // `Copy | Share as markdown | Branch` line under nothing. Those bare strips between
+        // the run accordions read as the runs separating again the moment a turn ended - and
+        // the reopened transcript is the look people compare their memory against.
+        {
+          pageLog('case: a settled transcript keeps the run grouping')
+          const base = {
+            session_id: 1,
+            reasoning: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            attachments: [],
+            tool_call_id: null,
+            tool_calls_json: '',
+          }
+          // Two turns, each: a silent assistant row carrying a tool call, the tool's answer,
+          // then the sentence the model said. `content: ''` is what the engine stores for a
+          // message that spent itself entirely on a call.
+          const rows: StoredMessage[] = [
+            { ...base, id: 1, role: 'user', content: 'first ask', created_at: 1 },
+            {
+              ...base,
+              id: 2,
+              role: 'assistant',
+              content: '',
+              tool_calls_json: '[{"id":"c1","name":"read_file","arguments":"{}"}]',
+              created_at: 2,
+            },
+            { ...base, id: 3, role: 'tool', content: 'the file said seven', tool_call_id: 'c1', created_at: 3 },
+            { ...base, id: 4, role: 'assistant', content: 'Let me keep going.', created_at: 4 },
+            { ...base, id: 5, role: 'user', content: 'second ask', created_at: 5 },
+            {
+              ...base,
+              id: 6,
+              role: 'assistant',
+              content: '',
+              tool_calls_json: '[{"id":"c2","name":"web_search","arguments":"{}"}]',
+              created_at: 6,
+            },
+            { ...base, id: 7, role: 'tool', content: 'three results', tool_call_id: 'c2', created_at: 7 },
+            { ...base, id: 8, role: 'assistant', content: 'Done.', created_at: 8 },
+          ]
+          transcript?.loadHistory(rows)
+          await new Promise((r) => setTimeout(r, 300))
+          const answers = [...document.querySelectorAll('.blk-answer')] as HTMLElement[]
+          const quiet = answers.filter(
+            (a) => (a.querySelector('.blk-body')?.textContent ?? '').trim() === '',
+          )
+          const runs = [...document.querySelectorAll('.blk-run')] as HTMLElement[]
+          const acts = document.querySelectorAll('.turn-acts').length
+          if (quiet.length)
+            fail(
+              `${quiet.length} answer block(s) on screen say nothing at all: an assistant row with no text still paints a ` +
+                `label and a `+
+                `footer, and that strip between two run accordions is exactly what reads as the run splitting open again`,
+            )
+          else if (answers.length !== 2)
+            fail(`${answers.length} answer block(s) for 2 spoken message(s): the transcript invented or dropped an answer`)
+          else if (answers.some((a) => a.closest('.blk-run')))
+            fail('an answer block sits inside a run accordion, so it divides nothing')
+          else if (runs.length !== 2)
+            fail(`${runs.length} run accordion(s) for 2 tool groups: the grouping did not survive the reload`)
+          else if (runs.some((r) => !r.querySelector('.run-body > *'))) fail('a stored run accordion holds nothing')
+          else if (runs.some((r) => (r.querySelector('.run-label')?.textContent ?? '') === ''))
+            fail('a stored run header is blank, which reads as an empty accordion')
+          else if (acts !== 2)
+            fail(
+              `${acts} copy/share line(s) for 2 turn(s): one under every message is the wall this replaced, and none is a ` +
+                `lost affordance - the live turn offers them`,
+            )
+          else
+            pageLog(
+              `settled grouping ok (2 spoken rows → 2 blocks, 2 silent rows painted nothing, 2 runs still holding their ` +
+                `steps, 2 footer lines placed under their turns)`,
+            )
+        }
+
+        // The display setting is driven through the control and checked against the store,
+        // because it is the app's setting rather than this tab's: a check that called the
+        // verb behind the switch would measure the backend and miss the screen.
+        {
+          pageLog('case: the Transcript section of Settings drives the runs')
+          openSettings('display')
+          await new Promise((r) => setTimeout(r, 300))
+          const row = document.querySelector('[data-pref="verbose_blocks"]') as HTMLElement | null
+          if (!row) fail('Settings > Transcript has no verbose_blocks row: the screen is not rendering the host\'s list')
+          else {
+            // The words on the control come from Rust, so the client cannot advertise a
+            // setting the host does not implement.
+            const lbl = row.querySelector('.preflbl')?.textContent ?? ''
+            if (!/step/i.test(lbl)) fail(`the pref row's label did not come from the host: "${lbl}"`)
+            const segOn = row.querySelector('[data-pref-value="on"]') as HTMLButtonElement | null
+            const segOff = row.querySelector('[data-pref-value="off"]') as HTMLButtonElement | null
+            if (!segOn || !segOff || segOn.disabled)
+              fail('the pref row has no live on/off segments')
+            else {
+              segOn.click()
+              await new Promise((r) => setTimeout(r, 500))
+              toast = null
+              await frame(40)
+              const host = await invoke<any[]>('ui_prefs')
+              const vb = (host ?? []).find((v) => v.key === 'verbose_blocks')
+              if (!vb || vb.value !== 'on')
+                fail(`the control said on, the store says ${JSON.stringify(vb?.value)}: the switch and the app disagree`)
+              else {
+                const runs = [...document.querySelectorAll('.blk-run')] as HTMLElement[]
+                const folded = runs.filter((r) => !r.classList.contains('show-out'))
+                const detailVisible = [...document.querySelectorAll('.tool-detail')].some(
+                  (d) => getComputedStyle(d).display !== 'none',
+                )
+                if (runs.length && folded.length)
+                  fail(`${folded.length} of ${runs.length} run(s) ignored the setting and stayed folded`)
+                else if (!detailVisible)
+                  fail('the setting is on and every run claims to show its steps, but no tool output is actually visible')
+                else {
+                  segOff.click()
+                  await new Promise((r) => setTimeout(r, 500))
+                  toast = null
+                  await frame(40)
+                  const back = (await invoke<any[]>('ui_prefs'))?.find((v) => v.key === 'verbose_blocks')
+                  const still = [...document.querySelectorAll('.blk-run')].filter((r) =>
+                    r.classList.contains('show-out'),
+                  )
+                  if (back?.value !== 'off') fail(`turning it back off did not reach the store: ${JSON.stringify(back?.value)}`)
+                  else if (still.length) fail(`${still.length} run(s) stayed open after the setting went back to off`)
+                  else pageLog('display setting ok (the control writes the store, the runs follow both ways, the wording is the host\'s)')
+                }
+              }
+            }
+            closeSettings()
+            await new Promise((r) => setTimeout(r, 200))
+          }
         }
 
         // (c) arguments a quantised model mangled: repaired, run, and admitted
@@ -7290,17 +7478,16 @@
           if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display !== 'none')
             fail('opening a run also spilled its entries\' contents')
           // The one control that does reveal them.
-          const out = histRun.querySelector('.run-out') as HTMLElement
-          out.click()
+          transcript?.setVerbose(true)
           await new Promise((r) => setTimeout(r, 200))
           if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display === 'none')
-            fail('`show outputs` did not reveal what the run produced')
+            fail('verbose blocks did not reveal what the run produced')
           if (getComputedStyle(cards[1].querySelector('.tool-detail') as Element).display === 'none')
-            fail('`show outputs` revealed only one entry: the question is about the run')
-          out.click()
+            fail('verbose blocks revealed only one entry: the setting is about the whole run')
+          transcript?.setVerbose(false)
           await new Promise((r) => setTimeout(r, 200))
           if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display !== 'none')
-            fail('`hide outputs` did not fold the entries back to lines')
+            fail('verbose blocks off did not fold the entries back to lines')
         }
 
         // Settled thinking is a header line: "Thought for 4s" and no sneak peek.
@@ -8357,14 +8544,14 @@
         } else {
           // A settled thinking body is collapsed by design, and a collapsed element
           // measures 0 - so open it before measuring it. Inside a run the way to
-          // open it is the run: the entry is a line, and `show outputs` is the reveal.
+          // open it is the run: the entry is a line, and the display setting is the reveal.
           const head = think.querySelector('.blk-head') as HTMLElement
           const body = think.querySelector('.blk-body') as HTMLElement
           const trun = think.closest('.blk-run') as HTMLElement | null
           if (trun) {
             ;(trun.querySelector('.blk-head') as HTMLElement).click()
             await new Promise((r) => setTimeout(r, 120))
-            ;(trun.querySelector('.run-out') as HTMLElement).click()
+            transcript?.setVerbose(true)
           } else {
             head.click()
           }
@@ -8909,6 +9096,10 @@
   onMount(async () => {
     if (rootEl) {
       transcript = new Transcript(rootEl)
+      // The display settings are the app's, so they arrive from the store before the
+      // first transcript is painted: a conversation that rendered one way and then
+      // re-rendered when a pref landed is a visible jump over something you were reading.
+      void loadPrefs()
       invoke<string[]>('migration_notes')
         .then((notes) => {
           for (const n of notes) transcript?.showNote(n)
@@ -10305,6 +10496,7 @@
             {/if}
             <button
               class="set-tab {settings.tab === t.kind ? 'on' : ''}"
+              data-set-tab={t.kind}
               onclick={() => pickSettingsTab(t.kind)}
               aria-current={settings.tab === t.kind ? 'true' : undefined}
             >
@@ -10314,7 +10506,39 @@
           {/each}
         </nav>
         <div class="set-body">
-          {#if settings.tab === 'tools'}
+          {#if settings.tab === 'display'}
+            <div class="mcur">
+              What the transcript shows while a turn works. These live in the app's own store, not in
+              the browser's: the desktop, a browser on another port and a phone read one answer.
+            </div>
+            {#each uiPrefs as p (p.key)}
+              <div class="prefrow" data-pref={p.key}>
+                <div class="preftxt">
+                  <div class="preflbl">{p.label}</div>
+                  <div class="prefhint">{p.hint}</div>
+                  {#if !p.is_default}
+                    <div class="prefnote">set by you: {p.value} (the default is {p.default})</div>
+                  {/if}
+                </div>
+                <div class="modesel prefseg" role="group" aria-label={p.label}>
+                  {#each p.values as v (v)}
+                    <button
+                      class="modesel-btn {p.value === v ? 'on' : ''}"
+                      data-pref-value={v}
+                      aria-pressed={p.value === v ? 'true' : 'false'}
+                      disabled={prefBusy}
+                      onclick={() => void setPref(p.key, v)}>{v}</button
+                    >
+                  {/each}
+                </div>
+              </div>
+            {/each}
+            <div class="setdiv"></div>
+            <div class="prefhint">
+              This list comes from the host. A setting the app does not act on never appears here, and
+              nothing here changes what the model is told - it is only about what you see.
+            </div>
+          {:else if settings.tab === 'tools'}
             <div class="toolsec">
               <p class="set-note">
                 Every tool below is defined once, in the Rust engine, and the model is handed

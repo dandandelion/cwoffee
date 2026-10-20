@@ -206,6 +206,9 @@ export class Transcript {
    * answer you came for was below all of them.
    */
   private runGroup: HTMLElement | null = null
+  /** Whether the entries inside a run carry their contents. The app's setting, not this
+      screen's: see `setVerbose`. */
+  private verbose = false
   private tools = new Map<string, ToolRefs>()
   private pending: string[] = []
   private raf = 0
@@ -514,33 +517,57 @@ export class Transcript {
   private mkRun(): HTMLElement {
     const wrap = this.el('blk blk-run')
     const head = this.el('blk-head')
-    head.append(this.el('run-label'), this.el('run-count'), this.btn('run-out', 'show outputs'))
+    head.append(this.el('run-label'), this.el('run-count'))
     const body = this.el('blk-body run-body')
     wrap.append(head, body)
     head.addEventListener('click', () => {
       const open = wrap.classList.toggle('open')
       head.classList.toggle('open', open)
     })
-    // One control for the whole run, rather than one per card: the question a
-    // reader asks is "what came out of all this", not "what came out of this one
-    // line", and nine small triangles is a wall of affordances.
-    const toggle = head.querySelector('.run-out') as HTMLElement
-    toggle.addEventListener('click', (e) => {
-      e.stopPropagation()
-      const on = wrap.classList.toggle('show-out')
-      toggle.textContent = on ? 'hide outputs' : 'show outputs'
-      toggle.classList.toggle('on', on)
-    })
+    // Whether the run's entries carry their contents is a setting, not a control here:
+    // a `show outputs` button per accordion was a switch each run offered you, when the
+    // question ("do I want to read what the steps did?") is answered once, for the whole
+    // conversation, and belongs in the app's display settings where a phone and the
+    // desktop get the same answer.
+    // The two classes travel together on purpose: a run whose body is collapsed cannot show
+    // its contents, so "show the working" has to open the accordion as well. Keeping them
+    // apart is what made the setting look like it did nothing.
+    if (this.verbose) {
+      wrap.classList.add('show-out', 'open')
+      head.classList.add('open')
+    }
     wrap.dataset.think = '0'
     wrap.dataset.tool = '0'
     return wrap
+  }
+
+  /**
+   * Whether the entries inside a run show what they did.
+   *
+   * The value is the app's, stored in the conversation database (`ui_prefs`), so the
+   * desktop, a browser on another port and a phone all read the same answer. Runs already
+   * on screen follow immediately: a toggle that only takes effect on the next turn looks
+   * broken on the conversation you are looking at.
+   */
+  setVerbose(on: boolean) {
+    if (this.verbose === on) return
+    this.verbose = on
+    for (const r of Array.from(this.root.querySelectorAll('.blk-run')) as HTMLElement[]) {
+      // Both halves at once: the setting says "show me the working", which means opening the
+      // accordion as well as revealing what is inside it.
+      r.classList.toggle('show-out', on)
+      r.classList.toggle('open', on)
+      r.querySelector('.blk-head')?.classList.toggle('open', on)
+    }
+    // Revealing a run's contents changes the height under the reader, so the view gets
+    // the same nudge a fold gets, rather than leaving them somewhere in the middle.
+    this.follow()
   }
 
   /** Paint one run's header from what it contains. Static so history can call it. */
   static paintRun(wrap: HTMLElement) {
     const label = wrap.querySelector('.run-label')
     const count = wrap.querySelector('.run-count')
-    const toggle = wrap.querySelector('.run-out')
     if (!label || !count) return
     const tools = Number(wrap.dataset.tool ?? 0)
     const thinks = Number(wrap.dataset.think ?? 0)
@@ -559,7 +586,9 @@ export class Transcript {
     label.textContent = text
     const steps = tools + thinks
     count.textContent = steps > 1 ? `${steps} steps` : ''
-    if (toggle) (toggle as HTMLElement).style.display = tools > 0 ? '' : 'none'
+    // Nothing else to paint here. An earlier version hid the reveal control on a
+    // thinking-only run, which left two kinds of run with different affordances - the
+    // display setting applies to every run, so the header only has to say what ran.
   }
 
   private ensureRunGroup(): HTMLElement {
@@ -618,7 +647,10 @@ export class Transcript {
         wrap.dataset.thinkMs = String(Math.round(performance.now() - opened))
       }
     }
-    if (settle) {
+    if (settle && !this.verbose) {
+      // A reader who asked to see the working does not get it folded away at the moment the
+      // answer lands. That fold is the disappearance that made a finished turn look like a
+      // stack of separate cards.
       wrap.classList.remove('open')
       ;(wrap.querySelector('.blk-head') as HTMLElement)?.classList.remove('open')
     }
@@ -2472,6 +2504,22 @@ export class Transcript {
     let lastCard: { out: HTMLElement; stat: HTMLElement; detail: HTMLElement; card: HTMLElement } | undefined
 
     let lastWrap: HTMLElement | undefined
+    // The last thing this page's turns actually said. One actions row per turn, the
+    // same affordance a live turn puts under its final answer - emitted per assistant
+    // row, it stamped `Copy | Share as markdown | Branch` under every intermediate
+    // message and the transcript read as a stack of separate turns.
+    let lastAnswer: { body: HTMLElement; text: string } | null = null
+    const flushAnswerActs = () => {
+      if (!lastAnswer) return
+      const acts = this.turnActionsRow(lastAnswer.text, this.sessionId)
+      acts.classList.add('from-history')
+      // Appended at the end of what this turn has produced so far, which is where a
+      // live turn puts them: under the turn, after any run that followed its last
+      // sentence. Inserting them under the answer itself would slide them above a run
+      // that came after it and read as belonging to the next turn.
+      frag.appendChild(acts)
+      lastAnswer = null
+    }
     const blk = (kind: string, label: string) => {
       endRun()
       const wrap = this.el(`blk blk-${kind}`)
@@ -2486,6 +2534,10 @@ export class Transcript {
     // grouped differently, a conversation would look tidier while it ran than
     // after you left and came back, and the second look is the one people trust.
     let run: HTMLElement | null = null
+    // The display setting, captured so the nested end-run can honour it: a stored transcript
+    // has to open its runs exactly like the live one, or the same conversation looks different
+    // depending on whether you are watching it or coming back to it.
+    const verboseRuns = this.verbose
     const runBody = () => {
       if (!run) {
         run = this.mkRun()
@@ -2497,8 +2549,10 @@ export class Transcript {
     function endRun() {
       if (!run) return
       run.classList.remove('running')
-      run.classList.remove('open')
-      run.querySelector('.blk-head')?.classList.remove('open')
+      if (!verboseRuns) {
+        run.classList.remove('open')
+        run.querySelector('.blk-head')?.classList.remove('open')
+      }
       // The header carries the run's summary, so `Thought for 4.2s` needs the
       // thinking duration the row stored, not an estimate made now.
       if (!run.dataset.thinkMs) {
@@ -2512,6 +2566,9 @@ export class Transcript {
 
     for (const m of msgs) {
       if (m.role === 'user') {
+        // A user row is where one turn stops and the next starts, so it is where the
+        // previous turn's actions row gets placed.
+        flushAnswerActs()
         const body = blk('user', 'you')
         body.textContent = m.content
         this.appendAttachmentTags(body, m.attachments ?? [])
@@ -2528,17 +2585,23 @@ export class Transcript {
           rb.appendChild(wrap)
           run!.dataset.think = String(Number(run!.dataset.think ?? 0) + 1)
         }
-        const body = blk('answer', 'cwoffee')
-        body.innerHTML = renderMarkdown(m.content)
-        // The source, kept on the element: right-click "Copy" and any future
-        // export from the DOM should hand back what the model wrote, not the
-        // rendering of it.
-        body.dataset.md = m.content
-        // Same affordance as a live turn. In history the copy is that one message
-        // and the share is the whole conversation, which is what the buttons say.
-        const acts = this.turnActionsRow(m.content, this.sessionId)
-        acts.classList.add('from-history')
-        frag.appendChild(acts)
+        // An assistant row with no text in it is a turn's bookkeeping: the row that
+        // exists because the model spent its step on a tool call. Painting it as an
+        // answer produced a `CWOFFEE` label, an empty body, and a `Copy | Share as
+        // markdown | Branch` line under nothing - and that bare strip between two run
+        // accordions is what made a settled turn look *un*grouped, right after the live
+        // turn had looked grouped. A turn's actions belong to what it said, so nothing
+        // said, nothing offered.
+        const saidSomething = (m.content ?? '').trim().length > 0
+        if (saidSomething) {
+          const body = blk('answer', 'cwoffee')
+          body.innerHTML = renderMarkdown(m.content)
+          // The source, kept on the element: right-click "Copy" and any future
+          // export from the DOM should hand back what the model wrote, not the
+          // rendering of it.
+          body.dataset.md = m.content
+          lastAnswer = { body, text: m.content }
+        }
         if (m.files?.length) {
           // Into the fragment, directly under the answer that produced them. This
           // used to call ensureTurn() and append to the live turn, which landed the
@@ -2620,6 +2683,7 @@ export class Transcript {
     // The page may end in the middle of a run. Its header still has to say what
     // the run was: an unpainted header reads as an empty accordion.
     endRun()
+    flushAnswerActs()
     return frag
   }
 }

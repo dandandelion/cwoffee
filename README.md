@@ -139,15 +139,27 @@ message text: a run is everything it did between two things it said.
 
 The header is a live claim, not a label — `Thinking` while it reasons, `Working on your computer`
 once tools start, and once the answer lands, `Thought, then worked on your computer · 6 steps`.
-Open it and the entries are lines: the call, what it touched, whether it worked. One control —
-`show outputs` — reveals what the whole run produced, instead of nine triangles to aim at. While a
-call is still running its output peeks out on its own, because a header sitting motionless for
-forty seconds on a local model reads as a hang.
+Open it and the entries are lines: the call, what it touched, whether it worked. Whether those
+lines carry their contents is a setting, not a button on every accordion — **Settings ›
+Transcript**, "Show what each step did" — because the question is answered once per person, not
+once per run. While a call is still running its output peeks out on its own regardless, because a
+header sitting motionless for forty seconds on a local model reads as a hang.
+
+That setting lives in the app's own store (the same SQLite file as the conversations), not in the
+browser's storage, so the desktop, a browser on another port and a phone read the same answer. The
+screen renders its list from the app: a setting the app does not act on cannot appear there, an
+unknown key or value is refused with the real list named, and a view-only connection cannot change
+it — the store is shared, so pressing that switch changes what somebody else's screen draws.
 
 Folding is CSS, not deletion: the arguments, output and diffs of a finished call are still in the
-page, so a search finds them and the app's own harness can still assert what a tool said. The
-stored transcript groups itself the same way — a conversation you left and came back to looks the
-way you remember it working.
+page, so a search finds them and the app's own harness can still assert what a tool said.
+
+The stored transcript groups itself the same way a live turn does, and two rules keep that honest.
+An assistant row with no text in it — the row a tool call leaves behind — paints nothing at all.
+It used to paint a `CWOFFEE` label, an empty body and a `Copy | Share as markdown | Branch` line
+under nothing, and that bare strip between two accordions is what made a finished turn look
+ungrouped the instant it settled. And the footer line belongs to a turn, once, under what the turn
+last said; it used to appear under every message.
 
 ## Run it
 

@@ -638,6 +638,8 @@ fn main() {
             commands::session_state,
             commands::list_sessions,
             commands::sessions_in,
+            commands::ui_prefs,
+            commands::set_ui_pref,
             commands::provider_status,
             commands::provider_test,
             commands::provider_probe,

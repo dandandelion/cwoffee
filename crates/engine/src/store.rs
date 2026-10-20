@@ -52,7 +52,11 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Current schema version. Bump with a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 11;
+// v12: `ui_prefs` — the display settings a client sets for itself. It lives in this
+// database and not in a browser's localStorage because localStorage is per-origin: a gateway
+// on another port is another store, and the desktop, the browser and the phone are three
+// origins between them. A preference only one of the three remembers is not a setting.
+const SCHEMA_VERSION: i64 = 12;
 
 /// A workspace the user has registered (or that holds sessions).
 /// How many conversations one folder can be asked for at a time. See
@@ -209,6 +213,55 @@ impl Store {
     pub fn remove_workspace(&self, path: &str) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute("DELETE FROM workspaces WHERE path = ?1", params![path])?)
+    }
+
+    /// One display preference, as stored. `None` means nobody set it, which is not the
+    /// same thing as its default: the default belongs to `crate::prefs`, not to this table.
+    pub fn ui_pref(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let c = self.conn.lock().unwrap();
+        c.query_row(
+            "SELECT value FROM ui_prefs WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// What every client has set, as written. Only `crate::prefs` knows what a value means.
+    pub fn ui_prefs_all(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c
+            .prepare("SELECT key, value FROM ui_prefs ORDER BY key")
+            ?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            ?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?)
+        }
+        Ok(out)
+    }
+
+    pub fn set_ui_pref(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO ui_prefs (key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+            params![key, value, now_ts()],
+        )
+        ?;
+        Ok(())
+    }
+
+    /// Back to unset, which is not the same as writing the default: an unset preference
+    /// follows a future change of default, and a written one does not.
+    pub fn clear_ui_pref(&self, key: &str) -> Result<(), StoreError> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM ui_prefs WHERE key = ?1", params![key])
+            ?;
+        Ok(())
     }
 
     /// Name a workspace for the sidebar. Empty means "show the folder name",
@@ -1100,6 +1153,15 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
             "persona TEXT NOT NULL DEFAULT 'cowork'",
         )?;
     }
+    if from < 12 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ui_prefs (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );",
+        )?;
+    }
     if from < 10 {
         // v10: workspaces became things you can add, not just side effects of the
         // last path you typed. The sidebar groups sessions by workspace and lets
@@ -1186,6 +1248,13 @@ pub trait StoreOps: Send + Sync {
     /// store creates rows in several places (boot, resume, import) that know nothing about
     /// personas; the default is the honest one, and the client that *does* know says so.
     fn set_session_persona(&self, id: i64, persona: &str) -> Result<(), StoreError>;
+    /// Display preferences a client set for itself. The keys are not free-form — see
+    /// `crate::prefs` — because a table every client can invent keys in is a drawer, not
+    /// a settings store.
+    fn ui_pref(&self, key: &str) -> Result<Option<String>, StoreError>;
+    fn ui_prefs_all(&self) -> Result<Vec<(String, String)>, StoreError>;
+    fn set_ui_pref(&self, key: &str, value: &str) -> Result<(), StoreError>;
+    fn clear_ui_pref(&self, key: &str) -> Result<(), StoreError>;
     /// Attach the files a tool produced to the row that produced them. Not a nicety:
     /// the file chips under an answer, and "what did this run make?", are read from
     /// this column. Both cores learn the files only after the row is written, so both
@@ -1211,6 +1280,18 @@ impl StoreOps for Store {
     }
     fn set_session_persona(&self, id: i64, persona: &str) -> Result<(), StoreError> {
         Store::set_session_persona(self, id, persona)
+    }
+    fn ui_pref(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Store::ui_pref(self, key)
+    }
+    fn ui_prefs_all(&self) -> Result<Vec<(String, String)>, StoreError> {
+        Store::ui_prefs_all(self)
+    }
+    fn set_ui_pref(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        Store::set_ui_pref(self, key, value)
+    }
+    fn clear_ui_pref(&self, key: &str) -> Result<(), StoreError> {
+        Store::clear_ui_pref(self, key)
     }
     fn set_message_files(&self, message_id: i64, files: &[crate::tools::OutputFile]) -> Result<(), StoreError> {
         Store::set_message_files(self, message_id, files)

@@ -12,6 +12,7 @@ pub mod approval;
 pub mod config;
 pub mod event;
 pub mod provider;
+pub mod prefs;
 pub mod prompt;
 pub mod sse;
 pub mod legacy;

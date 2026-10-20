@@ -828,6 +828,10 @@ const AUDITED: &[&str] = &[
     "respond_question",
     "set_search_backend",
     "set_context_budget",
+    // A display pref is the client choosing what *the app's* transcript shows, and the
+    // store is shared by every client of this app, so a watch-only connection cannot
+    // change what the desktop draws. Audited for the same reason.
+    "set_ui_pref",
     // The model screen writes endpoints and per-model facts. Audited because they change what
     // the app believes about an endpoint, and therefore what it sends to it.
     "provider_add",
@@ -1030,6 +1034,11 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             serde_json::to_value(h.store.sessions_in(&raw).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())
         }
+        // The display prefs, with their labels and defaults, from the Rust list that owns
+        // them: a settings screen with its own copy of the vocabulary drifts, and a client
+        // on a phone gets a control the host does not honour.
+        "ui_prefs" => serde_json::to_value(cwoffee_engine::prefs::view(h.store.as_ref()).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string()),
         "search_messages" => serde_json::to_value(
             h.store
                 .search(&arg_str(&args, "query")?, 25)
@@ -1244,6 +1253,19 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 )
                 .await?;
             serde_json::to_value(v).map_err(|e| e.to_string())
+        }
+        "set_ui_pref" => {
+            // Drive-only: the pref lives in the app's own store, so writing it changes what
+            // every client of this app draws, not just the one asking.
+            need_drive(role)?;
+            let key = arg_str(&args, "key")?;
+            let value = arg_str(&args, "value")?;
+            let said = cwoffee_engine::prefs::set(h.store.as_ref(), &key, &value)?;
+            // The value is returned, not broadcast. The change is a display preference,
+            // which is not an event about a conversation, and inventing a frame for it would
+            // be a second protocol; the other clients of this app re-read the list the next
+            // time they read their state, which is within a turn of here.
+            serde_json::to_value(said).map_err(|e| e.to_string())
         }
         "set_context_budget" => {
             need_drive(role)?;
@@ -2402,6 +2424,98 @@ mod tests {
     /// folder while invisible rows remain (chats and empty drafts are filed under the folder's
     /// path but not shown inside it) watches the row reappear and reads that as a Delete button
     /// that does not work.
+    /// Display settings are the app's, not the browser's. The gateway is the only place a
+    /// phone, another port's browser and the desktop agree, so a pref written here is one
+    /// setting; a pref written in `localStorage` is three coincidences.
+    #[tokio::test]
+    async fn a_display_setting_is_kept_by_the_app_and_refused_in_words() {
+        let h = test_handle();
+        let prefs = run_cmd("ui_prefs", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("a watcher may read what the transcript shows");
+        let list = prefs.as_array().expect("a list");
+        assert!(!list.is_empty(), "{prefs}");
+        let vb = list
+            .iter()
+            .find(|v| v["key"] == "verbose_blocks")
+            .expect("the transcript pref is in the host's list, not the client's copy");
+        assert_eq!(vb["value"], "off", "{vb}");
+        assert_eq!(vb["is_default"], true, "unset must stay distinguishable");
+        // The label and hint come from Rust, so a client cannot invent a promise the host
+        // does not keep.
+        assert!(vb["label"].as_str().unwrap().contains("step"), "{vb}");
+
+        let refused = run_cmd(
+            "set_ui_pref",
+            serde_json::json!({ "key": "verbose_blocks", "value": "on" }),
+            Role::Watch,
+            &h,
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "a watch-only connection changed what the desktop draws: {refused:?}"
+        );
+
+        let said = run_cmd(
+            "set_ui_pref",
+            serde_json::json!({ "key": "verbose_blocks", "value": "on" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("a driver may set a display pref");
+        assert!(
+            said.as_str().unwrap().contains("Show what each step did"),
+            "{said}"
+        );
+
+        let after = run_cmd("ui_prefs", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .unwrap();
+        let vb2 = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["key"] == "verbose_blocks")
+            .unwrap();
+        assert_eq!(vb2["value"], "on", "{after}");
+        assert_eq!(vb2["is_default"], false, "a written pref is not the default");
+
+        // A key nobody declared, and a value outside the pref's own vocabulary: both
+        // refused, and the store still answers with what it actually holds.
+        for args in [
+            serde_json::json!({ "key": "theme_loud", "value": "on" }),
+            serde_json::json!({ "key": "verbose_blocks", "value": "yes please" }),
+        ] {
+            let e = run_cmd("set_ui_pref", args.clone(), Role::Drive, &h)
+                .await
+                .expect_err(&format!("{args} should be refused"));
+            assert!(
+                e.contains("not a setting") || e.contains("not a value"),
+                "{args} -> {e}"
+            );
+        }
+        assert_eq!(
+            h.store.ui_prefs_all().unwrap().len(),
+            1,
+            "a refused write left a row behind"
+        );
+        let again = run_cmd("ui_prefs", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .unwrap();
+        assert_eq!(
+            again
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["key"] == "verbose_blocks")
+                .unwrap()["value"],
+            "on",
+            "{again}"
+        );
+    }
+
     #[tokio::test]
     async fn a_folder_delete_asks_the_store_what_is_inside() {
         let h = test_handle();
