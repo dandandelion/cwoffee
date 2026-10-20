@@ -90,12 +90,26 @@ async function askOne(ctx: any, q: any, callId: string): Promise<unknown> {
 	return { text: String(typed), options: [] };
 }
 
-function cwtool(sub: string, tool: string, args: unknown, permits: string[] = [], extra: string[] = []): unknown {
+// Which conversation this pi session belongs to, in cwoffee's own terms. The bridge keeps
+// the map from row to pi session file; the tool host reads it. Passing pi's own session file
+// rather than a row number means the answer comes from a fact pi knows instead of a label the
+// extension guessed — and when the map has no entry yet, `recall` says which claim it cannot
+// make instead of inventing one.
+function piSessionFile(ctx: any): string {
+	try {
+		return ctx?.sessionManager?.getSessionFile?.() ?? "";
+	} catch {
+		return "";
+	}
+}
+
+function cwtool(sub: string, tool: string, args: unknown, permits: string[] = [], extra: string[] = [], sessionFile = ""): unknown {
 	if (!CWTOOL) throw new Error("CWOFFEE_CWTOOL is not set — the cwoffee tool host cannot start");
 	const raw = execFileSync(CWTOOL, [sub, tool, ...permits, ...extra], {
 		input: JSON.stringify(args ?? {}),
 		encoding: "utf8",
 		maxBuffer: 64 * 1024 * 1024,
+		env: { ...process.env, CWOFFEE_PI_SESSION_FILE: sessionFile },
 	});
 	try {
 		return JSON.parse(raw);
@@ -104,21 +118,85 @@ function cwtool(sub: string, tool: string, args: unknown, permits: string[] = []
 	}
 }
 
-function specs(): any[] {
+function specs(): any {
 	const res = cwtool("specs", "", {}) as any;
 	if (!res?.ok) throw new Error(`cwtool specs failed: ${res?.error ?? "no specs"}`);
-	return res.tools ?? [];
+	return res;
 }
 
+/**
+ * How much of the tool set the model is *shown*.
+ *
+ * The bridge says `lean` or `full`, and the registry (through `cwtool specs`) says which
+ * tools are always declared. Neither is decided here: this file is plumbing, and a list of
+ * "the important tools" written in TypeScript would be a second policy answering the same
+ * question differently from the engine.
+ *
+ * Narrowing matters because tool declarations are prompt bytes measured in the request body
+ * (~12 KB for the whole set), and on a small local model with a small window that is a fifth
+ * of the room spent describing capabilities the turn will not use. `explore` is how the rest
+ * comes back: the model describes the job, the registry searches itself, and the tools it
+ * names are made callable here.
+ */
+const TOOL_MODE = (process.env.CWOFFEE_TOOL_MODE ?? "full").trim().toLowerCase();
+
+/** The set this process declared last, kept so activation is a union and not a guess. */
+let declared: string[] = [];
+
+/** Declare exactly these tools. Returns a sentence when it could not, for the caller to put
+ *  in front of the model rather than in a log nobody reads. */
+function declareExactly(pi: any, names: string[]): string | null {
+	if (typeof pi.setActiveTools !== "function") {
+		return "this pi build cannot change the declared tool set, so the full set stays declared";
+	}
+	const missing = names.filter((n) => !registered.has(n));
+	declared = [...names];
+	pi.setActiveTools(declared);
+	if (missing.length) return `the registry named tools that are not mounted here: ${missing.join(", ")}`;
+	return null;
+}
+
+/** Add tools to what is already declared. Used by `explore`: a discovered tool that the host
+ *  does not actually make callable is a promise the model was lied to about. */
+function declareMore(pi: any, names: string[]): string | null {
+	if (typeof pi.setActiveTools !== "function") {
+		return "this pi build cannot change the declared tool set, so the tools `explore` found are not callable";
+	}
+	const have = new Set<string>(declared.length ? declared : registered);
+	for (const n of names) if (registered.has(n)) have.add(n);
+	declared = [...have];
+	pi.setActiveTools(declared);
+	const skipped = names.filter((n) => !registered.has(n));
+	if (skipped.length) return `not mounted in this process, so not made callable: ${skipped.join(", ")}`;
+	return null;
+}
+
+const registered = new Set<string>();
+
 export default function (pi: ExtensionAPI) {
+	let spec: any = {};
 	let tools: any[] = [];
 	try {
-		tools = specs();
+		spec = specs();
+		tools = spec.tools ?? [];
 	} catch (e) {
 		// Loud on stderr rather than silent: an extension that registers nothing and says
 		// nothing is how a session ends up with a model that has no tools and no idea why.
 		console.error(`[cwoffee-tools] no tools: ${(e as Error).message}`);
 		return;
+	}
+
+	for (const spec of tools) registered.add(spec.name as string);
+
+	if (TOOL_MODE === "lean") {
+		const lean: string[] = Array.isArray(spec.lean) ? spec.lean : [];
+		if (!lean.length) {
+			console.error("[cwoffee-tools] lean mode asked for but the registry gave no always-declared set; the full set stays declared");
+		} else {
+			const problem = declareExactly(pi, lean);
+			if (problem) console.error(`[cwoffee-tools] lean mode did not apply: ${problem}`);
+			else console.error(`[cwoffee-tools] lean mode: declaring ${lean.join(", ")} of ${registered.size} tools; the rest are behind \`explore\``);
+		}
 	}
 
 	for (const spec of tools) {
@@ -166,12 +244,46 @@ export default function (pi: ExtensionAPI) {
 					}
 					const asked = (qs.questions ?? []) as any[];
 					const answers = await Promise.all(asked.map((q) => askOne(ctx, q, String(callId))));
-					const res = cwtool("run", name, params, permits, ["--host-answers", JSON.stringify(answers)]) as any;
+					const res = cwtool(
+						"run",
+						name,
+						params,
+						permits,
+						["--host-answers", JSON.stringify(answers)],
+						piSessionFile(ctx),
+					) as any;
 					const askedText = typeof res?.rendered === "string" && res.rendered.length > 0 ? res.rendered : JSON.stringify(res);
 					return { content: [{ type: "text", text: askedText }], details: res, isError: res?.ok !== true };
 				}
 
-				const res = cwtool("run", name, params, permits) as any;
+				const res = cwtool("run", name, params, permits, [], piSessionFile(ctx)) as any;
+				// A discovery result is a capability claim about the rest of this session, so
+				// the host that can make it true has to say whether it did. The names come from
+				// the registry (`activates` on the tool result); this file only carries them to
+				// pi and reports back what happened.
+				const found: string[] = Array.isArray(res?.activates)
+					? res.activates.filter((x: unknown) => typeof x === "string")
+					: [];
+				if (found.length) {
+					const problem = declareMore(pi, found);
+					const note = problem
+						? `\n\n[host] ${problem}`
+						: `\n\n[host] made callable from your next call: ${found.join(", ")}`;
+				if (res) {
+					// The engine's own words first; this line is the host signing for the part
+					// of the promise it owns. The envelope carries `rendered` (the sentence the
+					// model reads) and `output` (the same text before rendering), and a host note
+					// has to ride on the part that actually reaches the prompt - which is not the
+					// field named `content`, a shape this envelope does not have.
+					const base =
+						typeof res.rendered === "string"
+							? res.rendered
+							: typeof res.output === "string"
+								? res.output
+								: "";
+					res.rendered = `${base}${note}`;
+				}
+				}
 				// What the model reads is the tool's own words (`render_result` in the
 				// engine), not the envelope: a spreadsheet grid handed over as escaped JSON
 				// costs more prompt tokens and reads worse. The envelope still travels, in

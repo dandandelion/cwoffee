@@ -145,6 +145,8 @@ async fn run() -> anyhow::Result<()> {
         budget_pin: Some(8_000),
         model_window: None,
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
+        db_path: None,
+        lean_tools: false,
         persona: cwoffee_engine::host::Persona::Cowork,
         cfg_path: None,
         max_tool_iters: 0,

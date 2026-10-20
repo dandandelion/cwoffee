@@ -60,6 +60,46 @@ Gates that must stay green (each asserts a user-visible fact, not one core's dia
 chat, card back in cowork), plus the in-app harness (`scripts/selftest.sh`) which now covers
 attachments, the mode toggle and the Tools list.
 
+### Deleting a folder
+
+A folder row in the sidebar is a *registration*, not the folder's contents — and the sidebar
+rebuilds its folder list from any path that still holds a conversation. So the folder menu offers
+two different things:
+
+* **Delete folder and its N conversations** — two presses. The count comes from the store, not
+  from what the sidebar shows, because a folder group hides chat conversations and empty drafts
+  that are filed under that folder's path. Conversations answering right now are left alone and
+  called out, and the folder row is dropped only once the store says nothing is inside.
+* **Take it off the sidebar** — forgets the registered row. Conversations stay, and the row comes
+  back because they are still in the folder. This is stated on the menu item.
+
+Bulk picking works the same way: picking a folder row means the folder *and* every conversation
+filed in it, chats and drafts included.
+
+### Endpoints and models (Settings › Model)
+
+One model answers at a time. Below that, the screen lists every endpoint the app knows:
+
+* **Test connection** asks the endpoint whether it is there, writing nothing.
+* **Probe models** asks what each model can do — the window it states, whether it accepts tool
+  calls, whether it takes images, which thinking levels it names back. On a box that is also
+  running a model this takes a minute per model; the screen says so while it works.
+* **Add this endpoint and N model(s)** registers the endpoint together with the models the probe
+  found. A probe is what names the models, so adding an endpoint with nothing probed is refused
+  rather than creating an empty row.
+
+Each provider expands into its models; each model expands into fields: max context, output cap,
+temperature, top_p, top_k, min_p, seed, thinking levels. Capability is shown as observed, with
+"unknown" as its own state — never-asked is not the same claim as refused. An empty field means
+"ask the endpoint", and saving it that way *deletes* the key: there is no number that means
+unset. Everything lands in `config.toml` under `[providers."<name>"]` and `[models."<id>"]`,
+written in place so comments and hand-written sections survive.
+
+What a model's stored window does: it outranks the endpoint's claim, and the context meter, the
+derived ceiling and pi's own fold threshold are all rebuilt from it. A model process already
+running keeps the window it started with — the next one reads what you saved.
+
+
 ## Run it
 
 ```bash

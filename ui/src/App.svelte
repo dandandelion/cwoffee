@@ -255,6 +255,295 @@
     if (!want) return
     if (SET_TABS.some((t) => t.kind === want)) openSettings(want as MenuKind)
   })
+  // ----------------------------------------------------------------------------------
+  // Providers and models (Settings > Model)
+  //
+  // The shape this screen is built around: one answering model, a list of endpoints, and
+  // every endpoint expandable into the models on it. Three things the old popup could not
+  // do and this one has to: keep more than one endpoint, tell you what an endpoint can
+  // actually do before you commit to it, and let a model's window and sampling be set here
+  // rather than in a config file you have to find by hand.
+  // ----------------------------------------------------------------------------------
+  type CapRow = {
+    id: string
+    provider?: string
+    context_window?: number | null
+    max_tokens?: number | null
+    temperature?: number | null
+    top_p?: number | null
+    top_k?: number | null
+    min_p?: number | null
+    seed?: number | null
+    efforts?: string[]
+    supports_tools?: boolean | null
+    supports_vision?: boolean | null
+    source?: string
+    configured?: boolean
+    current?: boolean
+  }
+  type ProvRow = {
+    name: string
+    kind: string
+    base_url: string
+    has_key: boolean
+    models: string[]
+    current?: boolean
+  }
+  let provRows = $state<ProvRow[]>([])
+  let capRows = $state<CapRow[]>([])
+  let openProv = $state<Set<string>>(new Set())
+  let openModel = $state<Set<string>>(new Set())
+  let pvName = $state('')
+  let pvUrl = $state('')
+  let pvKey = $state('')
+  let pvKind = $state('openai')
+  let pvMsg = $state('')
+  let pvBad = $state(false)
+  let pvBusy = $state(false)
+  let probing = $state(false)
+  let probed = $state<CapRow[]>([])
+  let mDraft = $state<Record<string, Record<string, string>>>({})
+
+  /** Whether the endpoint text carries a `/v1` tail. Said out loud rather than silently
+   *  normalised: on some servers `/v1` belongs in the base URL and on others the client adds
+   *  it, and guessing wrong is a "connection refused" with no explanation. */
+  const urlSaysV1 = $derived(/\/v\d*\/?$/.test(pvUrl.trim()))
+
+  function draftFor(id: string): Record<string, string> {
+    let d = mDraft[id]
+    if (!d) {
+      const c = capRows.find((x) => x.id === id)
+      const num = (v?: number | null) => (v === null || v === undefined ? '' : String(v))
+      d = {
+        context_window: num(c?.context_window),
+        max_tokens: num(c?.max_tokens),
+        temperature: num(c?.temperature),
+        top_p: num(c?.top_p),
+        top_k: num(c?.top_k),
+        min_p: num(c?.min_p),
+        seed: num(c?.seed),
+        efforts: (c?.efforts ?? []).join(','),
+      }
+      mDraft[id] = d
+    }
+    return d
+  }
+
+  async function loadProviders() {
+    try {
+      const st = await invoke<{ chosen?: string; providers?: ProvRow[]; models?: CapRow[] }>(
+        'provider_status',
+      )
+      provRows = st.providers ?? []
+      capRows = st.models ?? []
+      // Prefill the add form with what is answering now: most people opening this screen are
+      // describing the box they already use, and an empty form makes them retype a URL.
+      if (!pvUrl && !pvName) {
+        const cur = provRows.find((x) => x.current)
+        if (cur) {
+          pvName = cur.name
+          pvUrl = cur.base_url
+          pvKind = cur.kind
+        }
+      }
+      // The endpoint answering now is worth having open: those are the models in use, and the
+      // ones a person is most likely here to look at.
+      for (const x of provRows) if (x.current) openModel = new Set([...openModel])
+      for (const x of provRows) if (x.current) openProv = new Set([...openProv, x.name])
+    } catch (e) {
+      pvMsg = cleanErr(e)
+      pvBad = true
+    }
+  }
+
+  async function probeProvider() {
+    if (probing) return
+    probing = true
+    probed = []
+    pvMsg = 'probing — this asks the endpoint what each model can do, one small request per model'
+    pvBad = false
+    try {
+      const out = await invoke<CapRow[]>('provider_probe', {
+        base_url: pvUrl.trim(),
+        api_key: pvKey,
+        kind: pvKind,
+        name: pvName.trim() || undefined,
+      })
+      probed = out ?? []
+      pvMsg = probed.length
+        ? `${probed.length} model(s) answered. Add the endpoint and they come with it.`
+        : 'the endpoint answered but named no models'
+      pvBad = probed.length === 0
+    } catch (e) {
+      pvMsg = cleanErr(e)
+      pvBad = true
+    } finally {
+      probing = false
+    }
+  }
+
+  async function testProvider() {
+    if (pvBusy) return
+    pvBusy = true
+    pvMsg = 'asking the endpoint whether it is there…'
+    pvBad = false
+    try {
+      const out = await invoke<string>('provider_test', {
+        base_url: pvUrl.trim(),
+        api_key: pvKey,
+        kind: pvKind,
+      })
+      pvMsg = String(out)
+      pvBad = false
+    } catch (e) {
+      pvMsg = cleanErr(e)
+      pvBad = true
+    } finally {
+      pvBusy = false
+    }
+  }
+
+  async function addProvider() {
+    if (pvBusy) return
+    if (!probed.length) {
+      pvMsg = 'probe the endpoint first: adding an endpoint means naming the models on it, and a probe is what names them'
+      pvBad = true
+      return
+    }
+    pvBusy = true
+    try {
+      const out = await invoke<string>('provider_add', {
+        base_url: pvUrl.trim(),
+        api_key: pvKey,
+        kind: pvKind,
+        name: pvName.trim() || undefined,
+        caps: probed,
+      })
+      pvMsg = String(out)
+      pvBad = false
+      probed = []
+      await loadProviders()
+      const nm = pvName.trim()
+      if (nm) openProv = new Set([...openProv, nm])
+    } catch (e) {
+      pvMsg = cleanErr(e)
+      pvBad = true
+    } finally {
+      pvBusy = false
+    }
+  }
+
+  async function removeProvider(name: string) {
+    try {
+      const out = await invoke<string>('provider_remove', { name })
+      pvMsg = String(out)
+      pvBad = false
+      await loadProviders()
+      await refreshState()
+    } catch (e) {
+      pvMsg = cleanErr(e)
+      pvBad = true
+    }
+  }
+
+  function toggleProv(name: string) {
+    const n = new Set(openProv)
+    if (n.has(name)) n.delete(name)
+    else n.add(name)
+    openProv = n
+  }
+
+  function toggleModel(id: string) {
+    const n = new Set(openModel)
+    if (n.has(id)) n.delete(id)
+    else n.add(id)
+    openModel = n
+    draftFor(id)
+  }
+
+  function parseField(v: string): number | null | 'bad' {
+    const t = v.trim()
+    if (!t) return null
+    if (!/^-?\d+(\.\d+)?$/.test(t)) return 'bad'
+    const n = Number(t)
+    return Number.isFinite(n) ? n : 'bad'
+  }
+
+  /** Save one model's fields. Empty means "ask the endpoint", which the engine carries out by
+   *  deleting the key — there is no number that means "unset", and the screen says so because
+   *  people expect a blank field to have a value of its own. */
+  async function saveModel(id: string) {
+    const d = draftFor(id)
+    const body: Record<string, unknown> = { id }
+    for (const k of ['context_window', 'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'seed']) {
+      const v = parseField(d[k] ?? '')
+      if (v === 'bad') {
+        pvMsg = `${id}: "${d[k]}" is not a number for ${k.replace('_', ' ')}`
+        pvBad = true
+        return
+      }
+      if (v !== null) body[k] = v
+    }
+    body.efforts = (d.efforts ?? '')
+      .split(',')
+      .map((x) => x.trim())
+      .filter(Boolean)
+    try {
+      const out = await invoke<string>('model_set', body)
+      pvMsg = String(out)
+      pvBad = false
+      await loadProviders()
+      await refreshState()
+    } catch (e) {
+      pvMsg = cleanErr(e)
+      pvBad = true
+    }
+  }
+
+  async function forgetModel(id: string) {
+    try {
+      const out = await invoke<string>('model_forget', { id })
+      pvMsg = String(out)
+      pvBad = false
+      delete mDraft[id]
+      await loadProviders()
+    } catch (e) {
+      pvMsg = cleanErr(e)
+      pvBad = true
+    }
+  }
+
+  async function useModel(id: string) {
+    try {
+      await invoke('set_model', { model: id })
+      await loadModels()
+      await loadProviders()
+      await refreshState()
+      say(`answering with ${id}`)
+    } catch (e) {
+      pvMsg = cleanErr(e)
+      pvBad = true
+    }
+  }
+
+  /** The capability chips. Each one is an observation or an explicit "unknown": a model that
+   *  was never probed must not be shown as text-only, and a model that refused tool calls must
+   *  not be shown as unknown. */
+  function capLabel(m: CapRow): string[] {
+    const out: string[] = []
+    out.push(m.context_window ? `${m.context_window} context` : 'context unknown')
+    if (m.supports_tools === true) out.push('tool calling')
+    else if (m.supports_tools === false) out.push('no tool calling')
+    else out.push('tool calling unknown')
+    if (m.supports_vision === true) out.push('takes images')
+    else if (m.supports_vision === false) out.push('text only')
+    else out.push('images unknown')
+    const eff = m.efforts ?? []
+    out.push(eff.length ? `thinking: ${eff.join('/')}` : 'thinking unknown')
+    if (m.source && !out.some((x) => x.startsWith('probed'))) out.push(m.source)
+    return out
+  }
+
   function pickSettingsTab(tab: MenuKind) {
     if (!settings || settings.tab === tab) return
     void loadSettingsFor(tab)
@@ -265,6 +554,7 @@
   /// running before someone cares about search.
   function loadSettingsFor(tab: MenuKind) {
     if (tab === 'model' && (modelErr || !models.length)) void loadModels()
+    if (tab === 'model') void loadProviders()
     if (tab === 'naming' && !titleInfo) void loadTitles()
     if (tab === 'search' && !webSearch) void loadWebSearch()
     if (tab === 'tools' && !toolViews.length) void loadTools()
@@ -526,12 +816,65 @@
     for (const k of picked) {
       if (k[0] === 's') ids.add(Number(k.slice(1)))
       else {
-        const g = wsGroups.find((x) => x.path === k.slice(1))
-        for (const s of g?.list ?? []) ids.add(s.id)
+        // By folder path over **every** loaded row, not over the group's visible list: a
+        // folder group hides chat rows and empty drafts, and a pick that follows the visible
+        // list deletes a folder's coworker conversations while its chats stay behind. The
+        // folder then comes straight back — the sidebar builds its folder list from the paths
+        // that hold sessions — and what the user sees is a Delete button that does not work.
+        const want = k.slice(1)
+        for (const s of sessions) if (wsBucket(s.workspace) === want) ids.add(s.id)
       }
     }
     return [...ids]
   })
+
+  /**
+   * What a folder actually contains, per the store.
+   *
+   * Two lists look like the answer and are not: `list_sessions` is a window of the newest 50,
+   * and the sidebar's folder group deliberately hides chats and drafts. So a folder action
+   * asks the store. If the store will not answer, this says so in the log and the caller
+   * falls back to what it can see — a partial delete announced is a thousand times better
+   * than a partial delete presented as success.
+   */
+  async function folderRows(path: string): Promise<Session[]> {
+    try {
+      return await invoke<Session[]>('sessions_in', { path })
+    } catch (e) {
+      pageLog(`sessions_in(${path}) failed: ${cleanErr(e)} — falling back to the loaded list`)
+      return sessions.filter((x) => wsBucket(x.workspace) === path)
+    }
+  }
+
+  /** Delete rows by the same verb the row menu uses, one row at a time. */
+  async function deleteRows(ids: number[]): Promise<{ gone: number; failed: number }> {
+    let gone = 0
+    let failed = 0
+    for (const id of ids) {
+      await invoke('delete_session', { id })
+        .then(() => (gone += 1))
+        .catch((e) => {
+          failed++
+          pageLog(`delete_session ${id} failed: ${e}`)
+        })
+    }
+    return { gone, failed }
+  }
+
+  /**
+   * Forget a folder row, but only once nothing is inside it.
+   *
+   * `remove_workspace` deletes the registered path and nothing else, and the sidebar rebuilds
+   * folder rows from any path that still holds sessions. Calling it while rows remain is not
+   * a delete and not a removal: it is a no-op that looks like a failure. So the row stays, and
+   * the sentence says why.
+   */
+  async function forgetFolder(path: string): Promise<{ removed: boolean; left: number }> {
+    const left = (await folderRows(path)).length
+    if (left > 0) return { removed: false, left }
+    await invoke('remove_workspace', { path }).catch((e) => pageLog(`remove_workspace ${path}: ${e}`))
+    return { removed: true, left: 0 }
+  }
 
   const pickedRunning = $derived(pickedSessions.filter((id) => runningSessions.has(id)))
 
@@ -589,11 +932,31 @@
    *  the first press is the count the second press deletes. */
   async function deletePicked() {
     if (!picked.size) return
-    const doomed = pickedSessions.filter((id) => !runningSessions.has(id))
-    const busy = pickedSessions.length - doomed.length
+    // Ask the store what each picked folder holds before naming a number. The confirm step is
+    // a promise about what the second press does, and the visible basket is a lower bound:
+    // `list_sessions` returns the newest 50, and a folder group hides its chat rows.
+    const byFolder = new Map<string, Session[]>()
+    for (const p of pickedFolders) byFolder.set(p, await folderRows(p))
+    const personaById = new Map<number, string>()
+    const ids = new Set<number>(pickedSessions)
+    for (const rows of byFolder.values())
+      for (const r of rows) {
+        ids.add(r.id)
+        personaById.set(r.id, r.persona ?? 'cowork')
+      }
+    for (const x of sessions) if (!personaById.has(x.id)) personaById.set(x.id, x.persona ?? 'cowork')
+    const all = [...ids]
+    const doomed = all.filter((id) => !runningSessions.has(id))
+    const skipped = all.filter((id) => runningSessions.has(id))
+    const chats = all.filter((id) => personaById.get(id) === 'chat').length
+    const busy = skipped.length
     if (!bulkArm) {
       bulkArm = Date.now()
       const bits = [`${doomed.length} conversation${doomed.length === 1 ? '' : 's'}`]
+      // Chats are named because they are the rows the folder does not show: a count that
+      // silently includes conversations the person cannot see next to the folder reads as the
+      // app deleting more than it was asked to.
+      if (chats) bits.push(`${chats} of them chat${chats === 1 ? '' : 's'}`)
       if (pickedFolders.length)
         bits.push(`${pickedFolders.length} folder${pickedFolders.length === 1 ? '' : 's'}`)
       if (busy) bits.push(`${busy} ${busy === 1 ? 'is' : 'are'} answering and will be skipped`)
@@ -604,30 +967,35 @@
       return
     }
     const wasOpen = viewId !== null && doomed.includes(viewId)
-    let failed = 0
-    for (const id of doomed) {
-      // The same verb the row menu uses. A bulk action must not grow its own private
-      // idea of what deleting means.
-      await invoke('delete_session', { id }).catch((e) => {
-        failed++
-        pageLog(`delete_session ${id} failed: ${e}`)
-      })
-    }
-    const folders = pickedFolders.length
-    for (const p of pickedFolders) {
-      await invoke('remove_workspace', { path: p }).catch((e) =>
-        pageLog(`remove_workspace ${p}: ${e}`),
-      )
+    const res = await deleteRows(doomed)
+    const failed = res.failed
+    let removedFolders = 0
+    const keptFolders: { path: string; left: number }[] = []
+    for (const f of pickedFolders) {
+      const r = await forgetFolder(f)
+      if (r.removed) removedFolders++
+      else keptFolders.push({ path: f, left: r.left })
+      wsInside[f] = r.left
     }
     await loadSessions()
+    await loadWorkspaces()
     await refreshState()
     if (wasOpen) {
       const rest = sessions.find((s) => s.id !== viewId)
       if (rest) openSession(rest.id)
       else newSession()
     }
-    if (failed) say(`${doomed.length - failed} deleted, ${failed} refused — see the log`, true)
-    else say(`deleted ${doomed.length} conversation(s), removed ${folders} folder(s)`)
+    const bits = [`deleted ${res.gone} conversation(s)`]
+    if (removedFolders) bits.push(`removed ${removedFolders} folder(s)`)
+    if (skipped.length) bits.push(`${skipped.length} still answering and left alone`)
+    if (failed) bits.push(`${failed} refused (log)`)
+    say(bits.join(', '), failed > 0 || keptFolders.length > 0)
+    if (keptFolders.length) {
+      say(
+        `${keptFolders.length} folder(s) stay: still holding ${keptFolders.reduce((a, k) => a + k.left, 0)} conversation(s) — a folder row is only dropped once nothing is inside it`,
+        true,
+      )
+    }
     clearPick()
   }
 
@@ -635,6 +1003,15 @@
     try {
       workspaces = await invoke<WorkspaceRow[]>('list_workspaces')
       pruneWsCollapsed()
+      // Only the folders someone has already opened a menu on. A destructive label carries a
+      // count, and a count that outlives the delete it described is a lie waiting for a click.
+      for (const f of Object.keys(wsInside)) {
+        if (!workspaces.some((w) => w.path === f)) {
+          delete wsInside[f]
+          continue
+        }
+        wsInside[f] = (await folderRows(f)).length
+      }
       // Said once, in the log, because "it should have remembered" is not checkable
       // otherwise, and an empty count here is the difference between a lost preference
       // and one that was never set.
@@ -730,6 +1107,67 @@
     }
   }
 
+  /** How many conversations each folder holds, filled in when a folder menu opens.
+   *  `-1` means "not asked yet", which the markup renders as a plain `Delete folder`. */
+  let wsInside = $state<Record<string, number>>({})
+  let wsDeleteArm = $state<string | null>(null)
+
+  /** Ask the store how many conversations one folder holds, for the label of its delete item. */
+  async function armOne(path: string) {
+    wsInside[path] = (await folderRows(path)).length
+  }
+
+  /**
+   * Two presses, and the second one only arms for this folder. A folder delete is a pile of
+   * conversations going with it, and the label has to say the count on both presses.
+   */
+  async function deleteFolderAndRows(path: string) {
+    menu = null
+    const rows = await folderRows(path)
+    if (!rows.length) {
+      await removeFolder(path)
+      say(`${basenameOf(path)}: no conversations inside, row dropped`)
+      return
+    }
+    const running = rows.filter((r) => runningSessions.has(r.id))
+    const doomed = rows.filter((r) => !runningSessions.has(r.id))
+    const chats = rows.filter((r) => (r.persona ?? 'cowork') === 'chat').length
+    if (wsDeleteArm !== path) {
+      wsDeleteArm = path
+      const bits = [`${doomed.length} conversation${doomed.length === 1 ? '' : 's'}`]
+      if (chats) bits.push(`${chats} of them chat${chats === 1 ? '' : 's'}`)
+      if (running.length) bits.push(`${running.length} answering ${running.length === 1 ? 'is' : 'are'} kept`)
+      say(
+        `delete ${basenameOf(path)} and ${bits.join(', ')} — press "Delete folder" again to confirm`,
+        true,
+      )
+      setTimeout(() => {
+        if (wsDeleteArm === path) wsDeleteArm = null
+      }, 8100)
+      return
+    }
+    wsDeleteArm = null
+    // Rows for the message, ids for the verb: the same `delete_session` the row menu and the
+    // basket use, because a second private idea of what deleting means is a second behaviour.
+    const res = await deleteRows(doomed.map((r) => r.id))
+    await loadSessions()
+    const left = await forgetFolder(path)
+    wsInside[path] = left.left
+    await loadWorkspaces()
+    await refreshState()
+    if (!left.removed) {
+      say(
+        `${basenameOf(path)} stays: ${left.left} conversation(s) still filed here (${running.length} answering)`,
+        true,
+      )
+    } else {
+      say(
+        `${basenameOf(path)} deleted (${res.gone} conversation(s)${res.failed ? `, ${res.failed} refused — see the log` : ''})`,
+        res.failed > 0,
+      )
+    }
+  }
+
   async function removeFolder(path: string) {
     menu = null
     wsAddErr = ''
@@ -765,6 +1203,10 @@
     sessionId?: number,
     wsPath?: string,
   ) {
+    // The folder menu's destructive label carries a count, so opening the menu is the moment
+    // to ask the store how many conversations live here. Until the answer lands the label says
+    // the plain thing ("Delete folder") rather than a number nobody checked.
+    if (wsPath) void armOne(wsPath)
     if (menu && menu.kind === kind && menu.sessionId === sessionId && menu.wsPath === wsPath) {
       menu = null
       return
@@ -3481,6 +3923,51 @@
         await invoke('delete_session', { id: attSess }).catch(() => {})
       }
 
+      // Memory, in the app's own board. Two claims live here: the card reads "Recalled"
+      // rather than a generic "Done", and the *other* conversation is what comes back, with
+      // the asking one named and excluded. The second one is the interesting failure — on the
+      // pi core the tool host runs three processes away from the store, so if the database
+      // path or the session map never arrives the tool answers "this host cannot say which
+      // conversation is asking". That is an honest sentence, and it is still a broken feature,
+      // which is why the check fails on it instead of accepting it.
+      {
+        const memA = await invoke<number>('new_session', { title: 'board memory alpha' })
+        const memB = await invoke<number>('new_session', { title: 'board memory beta' })
+        let mBefore = await turnCount()
+        await invoke('start_turn', {
+          text: 'SEED THE MEMORY: remember the word mangosteen for later.',
+          session: memA,
+        }).catch((e) => pageLog(`selftest note: the seed turn failed: ${e}`))
+        const seeded = await waitTurnDone(mBefore, 60000)
+        mBefore = await turnCount()
+        await invoke('start_turn', {
+          text:
+            'RECALL GATE: look up what I have said about mangosteen in another conversation, then say RECALL DONE.',
+          session: memB,
+        }).catch((e) => pageLog(`selftest note: the recall turn failed: ${e}`))
+        const askedBack = await waitTurnDone(mBefore, 60000)
+        await useSession(memB)
+        await new Promise((r) => setTimeout(r, 400))
+        const memCard = [...document.querySelectorAll('.blk-tool[data-tool="recall"]')].pop()
+        const memHead = memCard?.querySelector('.tool-name')?.textContent ?? ''
+        const memOut = memCard?.querySelector('.tool-out')?.textContent ?? ''
+        if (!seeded || !askedBack) fail('one of the two memory turns never finished')
+        else if (!memCard) fail('no tool card for recall: the model never reached the memory tool')
+        else if (!memHead.includes('Recalled'))
+          fail(`the recall card does not read "Recalled": ${JSON.stringify(memHead.slice(0, 40))}`)
+        else if (!memOut.includes('board memory alpha'))
+          fail(`the recall card does not name the other conversation: ${JSON.stringify(memOut.slice(0, 140))}`)
+        else if (memOut.includes('cannot say which conversation is asking'))
+          fail('the tool host could not tell which conversation was asking: the store path or the session map never reached it')
+        else if (memOut.includes('board memory beta'))
+          fail('the recall card quoted the asking conversation back to itself')
+        else
+          pageLog(
+            `recall ok (card reads ${JSON.stringify(memHead)}, names the other conversation, excludes this one)`,
+          )
+        for (const id of [memA, memB]) await invoke('delete_session', { id }).catch(() => {})
+      }
+
       // The settings screen must show the tool list the engine owns, not a list typed
       // into the UI. Asserting a known id arrives proves the verb round-tripped; the
       // group headers are asserted because a screen whose sections are unreadable is a
@@ -4319,6 +4806,134 @@
         // Tidy up whatever a failed branch left behind, so the scratch store stays clean
         // and the next run's row count means the same thing.
         for (const id of await gone([pa, pb])) await invoke('delete_session', { id }).catch(() => {})
+      }
+
+      // --- deleting a folder has to take the rows the folder *hides* with it -----------
+      // The complaint on record: a workspace that looked empty could not be deleted, and
+      // stayed in the sidebar "until all sessions get deleted". It looked empty because a
+      // folder group shows neither chat conversations nor empty drafts, both of which are
+      // filed under that folder's path in the store. Removing the registered path while any
+      // of them remained was a no-op: the sidebar builds its folder list from the paths that
+      // hold conversations, so the row came straight back. This case creates exactly that
+      // shape - one visible conversation, one chat, one empty draft - picks the FOLDER row
+      // only, and demands the store be empty of the folder afterwards.
+      {
+        const home = hostState?.workspace ?? ''
+        // The folder under test is the *parent* of the app's own workspace: it exists, it is
+        // not the system temp folder (which the app refuses as a workspace, because that is
+        // where no-workspace sessions live), and it holds nothing of anybody else's. The app
+        // itself never files conversations there, so the rows this case creates are the only
+        // contents, and "empty now" is a claim the assertions can actually make.
+        const dir = home ? home.replace(/\/+$/, '').split('/').slice(0, -1).join('/') : ''
+        const label = (t: string) =>
+          [...document.querySelectorAll('.wsbtn')].find(
+            (b) => (b.querySelector('.ws-name') as HTMLElement | null)?.getAttribute('title') === t,
+          ) as HTMLElement | undefined
+        const ctrlClick = (el: HTMLElement) =>
+          el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }))
+        const made: number[] = []
+        if (!dir || dir === '/' || dir === '/tmp') {
+          fail(`no usable scratch folder (derived "${dir}" from workspace "${home}")`)
+        }
+        try {
+          await invoke('add_workspace', { path: dir }).catch(() => {})
+          const visible = await invoke<number>('new_session', { title: 'selftest folder visible', workspace: dir })
+          made.push(visible)
+          const chat = await invoke<number>('new_session', { title: 'selftest folder chat', workspace: dir })
+          made.push(chat)
+          await invoke('set_session_persona', { id: chat, persona: 'chat' })
+          const draft = await invoke<number>('new_session', { title: 'selftest folder draft', workspace: dir })
+          made.push(draft)
+          // A conversation in the app's own folder, to prove the action is scoped to the one
+          // picked. Named explicitly, because `new_session` without a workspace files the row
+          // under wherever the host happens to be — and by now the host has been moved to the
+          // scratch folder by the rows above, so an unnamed one would land inside the folder
+          // being deleted and the scoping check would prove nothing.
+          const elsewhere = await invoke<number>('new_session', {
+            title: 'selftest folder elsewhere',
+            workspace: home || undefined,
+          })
+          made.push(elsewhere)
+          await loadSessions()
+          await loadWorkspaces()
+          await new Promise((r) => setTimeout(r, 300))
+
+          const inside = await invoke<Session[]>('sessions_in', { path: dir })
+          if (inside.length !== 3) {
+            const what = inside.map((x) => `#${x.id} "${x.title}" ${x.persona ?? 'cowork'}`).join(' | ')
+            fail(`sessions_in(${dir}) returned ${inside.length} row(s), wanted 3 (visible + chat + draft): ${what}`)
+          }
+          const row = label(dir)
+          if (!row) fail(`no folder row for ${dir} to delete`)
+          else {
+            const shown = Number((row.querySelector('.ws-n')?.textContent ?? '').trim() || 0)
+            ctrlClick(row)
+            await new Promise((r) => setTimeout(r, 250))
+            const bar = document.querySelector('.bulkbar')
+            if (!bar) fail('picking a folder row drew no bulk bar')
+            else {
+              const txt = (bar.textContent ?? '').replace(/\s+/g, ' ').trim()
+              // The basket counts what the store says is inside, not what the group shows.
+              // `shown` is the number printed next to the folder, and it is smaller - that
+              // difference is the bug the user reported, so the case asserts both.
+              if (!/\b3 conversation/.test(txt))
+                fail(`the basket counts from the visible list, not the folder's contents: "${txt}" (folder label showed ${shown})`)
+              const delBtn = () =>
+                [...(bar.querySelectorAll('button') as NodeListOf<HTMLElement>)].find((x) =>
+                  /^(Delete|Confirm)$/.test((x.textContent ?? '').trim()),
+                )
+              const first = delBtn()
+              if (!first) fail('the bulk bar has no Delete button')
+              else {
+                first.click()
+                await new Promise((r) => setTimeout(r, 250))
+                const armed = (document.querySelector('.toast')?.textContent ?? '').replace(/\s+/g, ' ')
+                if (!/chat/.test(armed))
+                  fail(`the confirm line hides the chat rows it is about to delete: "${armed.trim()}"`)
+                const second = delBtn()
+                if (!second || (second.textContent ?? '').trim() !== 'Confirm') {
+                  fail(`first press did not arm the confirm (button says "${second?.textContent?.trim()}")`)
+                } else {
+                  second.click()
+                  await new Promise((r) => setTimeout(r, 1200))
+                  const still = await invoke<Session[]>('sessions_in', { path: dir })
+                if (still.length)
+                  fail(`${still.length} conversation(s) still filed under ${dir} after deleting the folder row`)
+                const wss = await invoke<WorkspaceRow[]>('list_workspaces')
+                if (wss.some((w) => w.path === dir))
+                  fail(`${dir} is still registered after its last conversation was deleted`)
+                if (label(dir)) fail(`${dir} still has a folder row in the sidebar`)
+                const rest = await invoke<Session[]>('sessions_in', { path: home })
+                if (!rest.some((x) => x.id === elsewhere))
+                  fail(`the folder delete took a conversation filed under ${home} as well`)
+                pageLog(
+                  `folder delete ok (${shown} shown under the folder, ${inside.length} really inside, all gone, other folders untouched)`,
+                )
+                }
+              }
+            }
+          }
+        } catch (e) {
+          fail(`folder delete case threw: ${cleanErr(e)}`)
+        } finally {
+          for (const id of made) {
+            const live = await invoke<Session[]>('list_sessions')
+            if (live.some((x) => x.id === id)) await invoke('delete_session', { id }).catch(() => {})
+          }
+          // A new_session with a workspace moves the host's folder. Put it back where the
+          // rest of the board expects it, or every later case runs in /tmp.
+          if (home && (await invoke<HostState>('session_state')).workspace !== home)
+            await invoke('set_workspace_checked', { path: home }).catch(() => {})
+          await loadSessions()
+          await loadWorkspaces()
+          // Leave no toast standing and no frame pending. This case speaks through the same
+          // notice line every other case reads, and a bubble left up has been shown to swallow
+          // the next case's click — which then reads as a regression in a feature two features
+          // away.
+          toast = null
+          await new Promise((r) => setTimeout(r, 250))
+          await frame(40)
+        }
       }
 
       // --- the message you just sent must survive the session being created --
@@ -9143,16 +9758,35 @@
             <span class="pop-sub">Changes the name in the list, never the folder</span>
           </button>
           {#if gatewayRole() !== 'watch'}
+            {@const inside = wsInside[wp] ?? -1}
             <button
               class="pop-item danger"
               role="menuitem"
+              onclick={() => void deleteFolderAndRows(wp)}
+            >
+              <span class="pop-lbl">
+                {wsDeleteArm === wp
+                  ? 'Delete the folder again — it is armed'
+                  : inside > 0
+                    ? `Delete folder and its ${inside} conversation${inside === 1 ? '' : 's'}`
+                    : 'Delete folder'}
+              </span>
+              <span class="pop-sub">
+                {inside > 0
+                  ? 'Every conversation filed here goes with it, chats and empty drafts included. Anything mid-turn is left alone and the folder stays.'
+                  : 'Nothing is filed here, so this only drops the row'}
+              </span>
+            </button>
+            <button
+              class="pop-item"
+              role="menuitem"
               onclick={() => void removeFolder(wp)}
             >
-              <span class="pop-lbl">Remove from sidebar</span>
+              <span class="pop-lbl">Take it off the sidebar</span>
               <span class="pop-sub">
-                {sessions.filter((x) => x.workspace === wp).length
-                  ? 'Sessions that live here stay, so the folder comes back'
-                  : 'The folder has no sessions in it'}
+                {inside > 0
+                  ? 'Forgets the row only. The conversations stay, and the folder comes back because they are still in it.'
+                  : 'The folder has no conversations in it'}
               </span>
             </button>
           {/if}
@@ -9586,6 +10220,252 @@
                 core, and a control that did nothing would be worse than no control.
               </p>
             </div>
+          {:else if settings.tab === 'model'}
+            <div class="toolsec">
+              <div class="mcur">
+                <span class="set-lbl">Answering with</span>
+                <code class="toolname">{hostState?.model || 'nothing picked yet'}</code>
+                <button class="set-btn" onclick={() => openSettings('think')}>thinking</button>
+              </div>
+              <p class="set-note">
+                One endpoint answers at a time. Adding another does not replace this one;
+                picking a model that lives on another endpoint moves the answer over, and the
+                conversation keeps its folder.
+              </p>
+              {#if pvMsg}<p class="set-note {pvBad ? 'set-err' : ''}">{pvMsg}</p>{/if}
+
+              <div class="pvadd">
+                <div class="pvgrid">
+                  <label class="pvf">
+                    <span>name</span>
+                    <input class="pill" bind:value={pvName} placeholder="the box on the LAN" />
+                  </label>
+                  <label class="pvf">
+                    <span>dialect</span>
+                    <select class="pill" bind:value={pvKind}>
+                      <option value="openai">openai</option>
+                      <option value="anthropic">anthropic</option>
+                      <option value="llama.cpp">llama.cpp</option>
+                    </select>
+                    <span class="set-note">left on the default when the URL already says what it is</span>
+                  </label>
+                  <label class="pvf wide">
+                    <span>API endpoint</span>
+                    <input class="pill" bind:value={pvUrl} placeholder="http://192.168.0.122:8080/v1" />
+                    <span class="set-note">
+                      {#if urlSaysV1}
+                        the <code>/v1</code> stays in the box on purpose: a llama.cpp or
+                        llama.cpp-style server answers at <code>/v1/chat/completions</code>, and
+                        the app would otherwise be one path short
+                      {:else}
+                        no <code>/v1</code> at the end — fine as a base URL; the app adds the
+                        path the dialect uses. If the endpoint expects <code>/v1</code> and you
+                        leave it out, Test connection will say so
+                      {/if}
+                    </span>
+                  </label>
+                  <label class="pvf">
+                    <span>API key</span>
+                    <input class="pill" type="password" bind:value={pvKey} />
+                    <span class="set-note">
+                      {#if pvKey}
+                        a key typed here is written to the config file, not shown back
+                      {:else if provRows.some((x) => x.current && x.has_key)}
+                        the endpoint answering now has a key stored; leave this empty to keep it
+                        untouched
+                      {:else}
+                        only if the endpoint asks for one — a local server usually does not
+                      {/if}
+                    </span>
+                  </label>
+                </div>
+                <div class="pvacts">
+                  <button class="set-btn" disabled={pvBusy || !pvUrl.trim()} onclick={() => void testProvider()}>
+                    {pvBusy ? 'asking the endpoint…' : 'Test connection'}
+                  </button>
+                  <button class="set-btn" disabled={probing || !pvUrl.trim()} onclick={() => void probeProvider()}>
+                    {probing ? 'probing…' : 'Probe models'}
+                  </button>
+                  <button class="set-btn primary" disabled={pvBusy || probed.length === 0} onclick={() => void addProvider()}>
+                    Add {pvName.trim() || 'this endpoint'} and {probed.length} model{probed.length === 1 ? '' : 's'}
+                  </button>
+                  <button
+                    class="set-btn"
+                    disabled={!probed.length && !pvMsg}
+                    onclick={() => {
+                      probed = []
+                      pvMsg = ''
+                    }}
+                  >
+                    clear
+                  </button>
+                </div>
+                {#if probing}
+                  <p class="set-note">
+                    Probing asks the endpoint what each model can do: the window it states,
+                    whether it accepts tool calls, whether it takes images, which thinking
+                    levels it names back. On a machine that is also running one of these models,
+                    give it a minute — this is a model call per model.
+                  </p>
+                {/if}
+                {#if probed.length}
+                  <div class="probelist">
+                    {#each probed as m (m.id)}
+                      <div class="prow">
+                        <code class="toolname">{m.id}</code>
+                        <span class="capset">
+                          {#each capLabel(m) as c (c)}<span class="cap">{c}</span>{/each}
+                        </span>
+                      </div>
+                    {/each}
+                  </div>
+                  <p class="set-note">
+                    Press Add and the endpoint plus every model above becomes a row you can open
+                    and edit. The window each one states is what the context ceiling and the
+                    model's own fold are built from, so adding a provider with a probe is what
+                    keeps the meter honest instead of guessed.
+                  </p>
+                {/if}
+                {#if !pvUrl.trim() && provRows.length}
+                  <p class="set-note">
+                    The fields start out as whatever the endpoint answering now uses — change
+                    the URL and you are describing a new endpoint, not editing that one.
+                  </p>
+                {/if}
+              </div>
+
+              <hr class="setdiv" />
+
+              <div class="prow-head">
+                <span class="set-lbl">Endpoints ({provRows.length})</span>
+                <button
+                  class="set-btn"
+                  onclick={() => {
+                    openProv = openProv.size === provRows.length ? new Set() : new Set(provRows.map((x) => x.name))
+                  }}
+                  disabled={!provRows.length}
+                >
+                  {provRows.length && openProv.size === provRows.length ? 'collapse all' : 'expand all'}
+                </button>
+              </div>
+              {#if !provRows.length}
+                <p class="set-note">
+                  No endpoint rows yet. The one answering now comes from
+                  <code>config.toml</code>; probe it above and Add puts it on the list without
+                  replacing anything.
+                </p>
+              {:else}
+                {#each provRows as p (p.name)}
+                  <div class="prov {openProv.has(p.name) ? 'open' : ''}">
+                    <button class="provhead" aria-expanded={openProv.has(p.name)} onclick={() => toggleProv(p.name)}>
+                      <span class="chev">{openProv.has(p.name) ? '▾' : '▸'}</span>
+                      <span class="provname">{p.name}</span>
+                      {#if p.current}<span class="cap now">answering now</span>{/if}
+                      <code class="provurl">{p.base_url}</code>
+                      <span class="provn">{p.models.length} model{p.models.length === 1 ? '' : 's'}</span>
+                    </button>
+                    {#if openProv.has(p.name)}
+                      <div class="provbody">
+                        <div class="pvline"><span>dialect</span><code>{p.kind}</code></div>
+                        <div class="pvline">
+                          <span>API key</span>
+                          <span>{p.has_key ? 'stored in the config file — never shown back here' : 'none: this endpoint takes none'}</span>
+                        </div>
+                        {#each p.models as id (id)}
+                          {@const m = capRows.find((x) => x.id === id)}
+                          {@const d = draftFor(id)}
+                          <div class="mrow2 {openModel.has(id) ? 'open' : ''}">
+                            <div class="mrow2top">
+                              <button class="mrow2name" aria-expanded={openModel.has(id)} onclick={() => toggleModel(id)}>
+                                <span class="chev">{openModel.has(id) ? '▾' : '▸'}</span>
+                                <code class="toolname">{id}</code>
+                              </button>
+                              <span class="capset">
+                                {#each capLabel(m ?? { id }) as c (c)}<span class="cap">{c}</span>{/each}
+                              </span>
+                              {#if m?.current}
+                                <span class="cap now">in use</span>
+                              {:else}
+                                <button class="set-btn" onclick={() => void useModel(id)}>use this</button>
+                              {/if}
+                            </div>
+                            {#if openModel.has(id)}
+                              <div class="mfields">
+                                <label class="pvf">
+                                  <span>max context (tokens)</span>
+                                  <input class="pill" inputmode="numeric" bind:value={d.context_window} placeholder="ask the endpoint" />
+                                </label>
+                                <label class="pvf">
+                                  <span>output cap</span>
+                                  <input class="pill" inputmode="numeric" bind:value={d.max_tokens} placeholder="the endpoint's own" />
+                                </label>
+                                <label class="pvf"><span>temperature</span><input class="pill" bind:value={d.temperature} placeholder="server default" /></label>
+                                <label class="pvf"><span>top_p</span><input class="pill" bind:value={d.top_p} placeholder="server default" /></label>
+                                <label class="pvf"><span>top_k</span><input class="pill" inputmode="numeric" bind:value={d.top_k} placeholder="server default" /></label>
+                                <label class="pvf"><span>min_p</span><input class="pill" bind:value={d.min_p} placeholder="server default" /></label>
+                                <label class="pvf"><span>seed</span><input class="pill" inputmode="numeric" bind:value={d.seed} placeholder="no seed" /></label>
+                                <label class="pvf wide">
+                                  <span>thinking levels</span>
+                                  <input class="pill" bind:value={d.efforts} placeholder="off,low,medium,high" />
+                                  <span class="set-note">
+                                    comma-separated, in the order the endpoint takes them —
+                                    {#if m?.efforts?.length}
+                                      this one answered: {m.efforts.join(', ')}
+                                    {:else}
+                                      unknown until a probe asks this endpoint what it accepts
+                                    {/if}
+                                  </span>
+                                </label>
+                                <p class="set-note">
+                                  {#if m?.source}
+                                    what is stored came from: {m.source}
+                                  {:else}
+                                    nothing is stored for this model yet — the window comes from
+                                    the endpoint every time the app starts
+                                  {/if}
+                                  · an empty field means "ask the endpoint", and saving it that
+                                  way deletes the key rather than writing a number for it
+                                </p>
+                                <div class="pvacts">
+                                  <button class="set-btn primary" onclick={() => void saveModel(id)}>Save</button>
+                                  <button
+                                    class="set-btn"
+                                    onclick={() => {
+                                      delete mDraft[id]
+                                      void loadProviders()
+                                    }}
+                                  >
+                                    revert
+                                  </button>
+                                  <button class="set-btn danger" onclick={() => void forgetModel(id)}>
+                                    forget this model's settings
+                                  </button>
+                                </div>
+                              </div>
+                            {/if}
+                          </div>
+                        {:else}
+                          <p class="set-note">
+                            No models are filed under this endpoint row. Probe the endpoint and
+                            Add it, and the models come with it.
+                          </p>
+                        {/each}
+                        <div class="pvacts">
+                          <button class="set-btn danger" onclick={() => void removeProvider(p.name)}>
+                            Remove the {p.name} endpoint row
+                          </button>
+                        </div>
+                        <p class="set-note">
+                          Removing the endpoint row leaves the model rows alone on purpose: the
+                          window and sampling someone stored are decisions, not debris.
+                        </p>
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              {/if}
+            </div>
+
           {:else if settings.tab === 'naming'}
             <div class="toolsec">
               <p class="set-note">

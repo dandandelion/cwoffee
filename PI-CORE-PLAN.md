@@ -1150,6 +1150,66 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     `busy` flag lags its start by a beat, so a driver that polls too early moves on while the
     request is still in flight and reaps the model mid-request.
 
+106. **A config table the writer produces and the reader does not declare is a config file that
+    stops booting.** This has happened to `config.toml` before, and it nearly happened again: the
+    model screen writes `[providers."<id>"]` and `[models."<id>"]`, and `Config` is parsed with
+    `deny_unknown_fields`, so the next start after "Add provider" would have refused to load.
+    The parser now declares both maps. The rule generalises: any settings verb that writes a new
+    table must land in the reader in the same change, and a test must load the file the verb
+    wrote (`a_provider_added_from_a_probe_comes_back_with_its_models_attached` does exactly that).
+
+107. **A TOML key with a dot in it is a path unless it is quoted.** `[providers.glm-5.1]` is not
+    one endpoint named `glm-5.1`; it is `providers → glm-5 → 1`. Provider and model ids carry
+    dots and slashes, so the writer quotes them (`[providers."glm-5.1"]`) and the row list stays
+    one row per id. A reader that silently merges paths makes phantom endpoints appear.
+
+108. **`toml::to_string` on a bare string returns nothing.** It serialises a *document*, and a
+    document cannot be a lone string. The first version of the endpoint writer therefore wrote
+    `base_url = ` — valid-looking, fatal on parse. Quoting is done by hand (`fn q`) and the tests
+    assert the file still parses afterwards.
+
+109. **A helper first called with one key can hide a bug that only several keys show.**
+    `Config::unset_keys_in` computed its section's end once, then removed rows and searched the
+    stale range for the next key — an index-out-of-bounds panic when the section was last in the
+    file. The context ceiling cleared one key at a time, so it never bit. Saving a model row with
+    eight optional fields, several of them "back to unset", was the first multi-key caller.
+    Recompute the region after every removal.
+
+110. **Deleting a folder is not unregistering it, and the sidebar's own lists cannot tell you
+    what is inside.** `remove_workspace` deletes one row from `workspaces`; `list_workspaces`
+    then rebuilds folder rows from any path that still holds a conversation — so a folder with
+    anything left in it reappears the instant it is removed, which is what the user reported as
+    "it only goes away once all the sessions are deleted". Two more traps: a folder *group* in
+    the sidebar hides chat rows and empty drafts (both are filed under the folder's path in the
+    store), and `list_sessions` is bounded at the newest 50. A destructive folder action must ask
+    the store — the new `Store::sessions_in(path)` / `sessions_in` verb — and only drop the
+    registered row once the store reports nothing inside. "Nothing inside" is re-checked after the
+    deletes, not assumed.
+
+111. **A page case that leaves a toast standing steals the next case's click.** The context
+    ceiling case started failing with "after freeing the pin the meter reads 87040" — the panel
+    click had hit the notice bubble left up by the folder case two minutes earlier. A case that
+    speaks through the notice line has to clear it (`toast = null`) and let a frame settle before
+    it finishes.
+
+112. **A fixture path the app deliberately refuses is not a fixture.** The folder case first used
+    `/tmp`; the app answered "is the system temp folder, which is where sessions with no workspace
+    live; pick a real project folder" — a correct refusal, and the case was wrong. Scratch folders
+    have to be real folders that hold nothing of anyone else's: the parent of the app's own
+    workspace fits, and the case restores the workspace afterwards because `new_session` with a
+    folder moves the host's tools.
+
+113. **A probe that answers "no models" for an endpoint that did not answer is a lie.**
+    `probe_models` returns an error and the sentence names the URL; `probe_endpoint` (Test
+    connection) returns a sentence either way, because a settings row has one line. An empty list
+    is reserved for "the endpoint answered and named nothing".
+
+114. **Capability chips have three states, and two of them are not "no".** `supports_tools:
+    None` means never asked; `Some(false)` means asked and refused. The model screen renders
+    "tool calling unknown" and "no tool calling" as different chips. Collapsing them would let a
+    model the app never probed be displayed as one that cannot take tools — and the model choice
+    is made off that chip.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -1786,6 +1846,68 @@ was the light-theme icon; and go on with the harness plus the parity list.
 ---
 
 ---
+
+## Journal — session 21 (a folder that deletes, and endpoints you can add)
+
+Two complaints answered in one pass.
+
+**"I can't delete a workspace that still has sessions in it — the sidebar keeps it until every
+session is gone."** The claim in the menu was already honest ("Sessions that live here stay, so
+the folder comes back") and useless: it described a no-op and offered no way to mean what the
+user meant. What was actually wrong, in three layers:
+
+* `remove_workspace` deletes one `workspaces` row and nothing else — by design, and the design
+  is fine; the *action* was missing.
+* `list_workspaces` unions registered paths with paths that hold conversations, so anything left
+  inside resurrects the row. Deleting looked broken from the outside.
+* The two lists the UI could count were both wrong: a folder group hides chat rows and empty
+  drafts (chat rows still carry the folder's path), and `list_sessions` returns the newest 50.
+
+Fix: a store verb that answers the question a destructive action actually asks —
+`Store::sessions_in(path)` (chats and drafts included, bounded at 500 so a pathological folder
+cannot flood a client), exposed as `sessions_in` on both shells, with a gateway test that shows
+the resurrect: `remove_workspace` while rows remain leaves all three rows behind. The folder menu
+now offers two different actions with honest labels — "Delete folder and its 3 conversations"
+(two presses, count from the store, chat rows named on the confirm line, anything mid-answer
+skipped and called out) and "Take it off the sidebar" (forgets the row, says the folder will come
+back). The bulk-picking path expands a picked folder the same way, and a folder row is dropped
+only when a re-query says nothing is inside. The page case asserts both the visible count and the
+real one — `folder delete ok (1 shown under the folder, 3 really inside, all gone, other folders
+untouched)` — because that difference *is* the bug.
+
+**"Make the settings nice again: providers with endpoint + key + test + probe, models expandable
+under providers, per-model context/sampling/thinking, capabilities displayed."** Built as one
+screen (Settings › Model) rather than a popup that grows:
+
+* One answering model at the top, then an add-an-endpoint block: name, dialect, endpoint (the
+  `/v1` question is answered out loud rather than normalised away), optional key (never shown
+  back), **Test connection**, **Probe models**, and **Add this endpoint and N model(s)** — the
+  whole-endpoint add the user leaned toward, because a probe is what names the models and an
+  endpoint added without a probe is refused in words.
+* A divider, then the endpoint list: each provider expands into its models; each model expands
+  into fields (window, output cap, temperature, top_p, top_k, min_p, seed, thinking levels) with
+  the probe's own numbers shown as where the value came from, capability chips with three states
+  (seen / refused / never asked — gotcha 114), "use this", Save, revert, forget.
+* Storage: `[providers."<name>"]` and `[models."<id>"]` sections in the same hand-editable
+  `config.toml`, written with the same line surgery as the rest of settings — comments and
+  hand-written sections survive (gotchas 106-108 are all from this work). Dotted ids are quoted;
+  cleared fields are deleted rather than zeroed.
+* Applying, not just displaying: `chosen_window(stored, advertised)` is what both cores use for
+  `HostState.model_window`, so a window typed into the model screen outranks the endpoint's claim
+  and the meter, the derived ceiling and pi's `reserveTokens` fold all move together. A model
+  process already running keeps what it started with, and the sentence says that instead of
+  implying otherwise.
+* Verbs: `provider_status` (watch-readable, file-based, answers while the box is offline),
+  `provider_test`, `provider_probe`, `provider_add`, `provider_remove`, `model_set`,
+  `model_forget` — the last four audited and drive-only; each mutating verb answers in one plain
+  sentence.
+
+Verified so far: engine 461 lib + 10 endpoint, bridge 15 + 16, gateway 33 (the new folder test
+included), `svelte-check` 0/0, board #33 in flight for the page side. **Not yet verified: the
+Models screen driven from the page harness.** The verbs have Rust coverage; the screen's gestures
+(probe → add → expand → save a window → watch the meter) do not have a case yet, and that is the
+first thing to add next session — a settings screen with no page case is a screen someone will
+break quietly.
 
 ## Journal — session 20 (reading the bytes the model is actually given)
 

@@ -221,6 +221,16 @@ pub fn budget_share(target: usize, window: Option<usize>) -> String {
     }
 }
 
+/// Which window this app believes for one model: what the person stored wins over what the
+/// endpoint claims.
+///
+/// The meter, the derived ceiling and pi's fold threshold all come from this one answer, so a
+/// stored override cannot drift from the number on screen. Storing a window is the fix for the
+/// common case where the server's real context is set by a launch flag the client never sees.
+pub fn chosen_window(stored: Option<usize>, from_endpoint: Option<usize>) -> Option<usize> {
+    stored.or(from_endpoint)
+}
+
 /// Read the loaded model's advertised window and set the compaction budget.
 ///
 /// `announce` is false on a re-read: a boot-shaped line printed once per turn
@@ -241,7 +251,9 @@ async fn apply_context_budget(
         .unwrap_or_default()
         .into_iter()
         .find(|m| m.id == model);
-    let window = info.as_ref().and_then(|m| m.context_tokens).map(|t| t as usize);
+    let advertised = info.as_ref().and_then(|m| m.context_tokens).map(|t| t as usize);
+    let stored = crate::config::window_override_in(&crate::config::Config::default_path(), &model);
+    let window = chosen_window(stored, advertised);
 
     let budget = pinned.unwrap_or_else(|| window.map(auto_budget).unwrap_or(FALLBACK_BUDGET));
     let compactions = {
@@ -264,7 +276,11 @@ async fn apply_context_budget(
     if announce {
         eprintln!(
             "[cwoffee] context budget {budget} tokens (model window {}, budget {})",
-            window.map(|w| w.to_string()).unwrap_or_else(|| "unknown".into()),
+            match (window, stored) {
+                (Some(w), Some(_)) => format!("{w}, set by you rather than the endpoint's {a}", a = advertised.unwrap_or(w)),
+                (Some(w), None) => w.to_string(),
+                (None, _) => "unknown".into(),
+            },
             if pinned.is_some() { "pinned in config" } else { "derived" }
         );
         // Sampling is a claim about behaviour, so the boot line states both halves:
@@ -443,7 +459,14 @@ impl Persona {
     /// The whole prompt Chat mode gets. Short on purpose: everything longer is a
     /// claim about what the assistant can do, and in this mode it can do nothing
     /// but answer.
-    pub const CHAT_PROMPT: &'static str = "You are cwoffee, a helpful assistant";
+    /// The whole instruction for a chat, and it has to stand on its own: on the pi core this
+    /// *replaces* the runtime's default prompt, and nothing else cwoffee says reaches the
+    /// model. The second sentence is not decoration — pi appends its own `<cwd>` block
+    /// naming the workspace folder even to a chat with no file tools, so the prompt is where
+    /// the capability claim gets corrected.
+    pub const CHAT_PROMPT: &'static str = "You are cwoffee, a helpful assistant. This mode is \
+        conversation only: you have no tools and no folder to work in, so never offer to open, \
+        run or change anything — say what you think instead.";
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -678,6 +701,22 @@ impl SessionHost {
             ask: Some(ask_tx),
             question_timeout: Some(cfg.question_timeout),
             events: None,
+            // The store this host already owns, handed to the one tool that reads memory
+            // instead of files. Which conversation is asking is *not* set here: a host outlives
+            // its conversations, so `session` is filled per turn by the agent loop.
+            store: Some(Arc::clone(&store)),
+            session: None,
+            // The two settings `explore` needs in order to describe the tool set honestly.
+            // They come from config because config is where the mounting is decided — the same
+            // file the caller read when it built `registry` — and a card that names the wrong
+            // search provider, or promises a sandbox that is switched off, is a claim about
+            // this machine that is simply false.
+            search_backend: crate::config::Config::load(None)
+                .map(|(c, _)| c.search_backend())
+                .unwrap_or(crate::tools::web::SearchBackend::DuckDuckGo),
+            exec_cfg: crate::config::Config::load(None)
+                .map(|(c, _)| c.exec_cfg())
+                .unwrap_or_default(),
             permits: Vec::new(),
         };
         let mut agent = Agent::new(
@@ -1559,6 +1598,59 @@ pub trait HostOps: Send + Sync {
     ) -> Result<String, String> {
         Err("this core cannot change its context ceiling".to_string())
     }
+
+    // ---- providers and models, as the settings screen sees them ----------------------
+
+    /// Every endpoint the app knows, the models filed under each, and which one is answering.
+    ///
+    /// File-based on purpose: this must answer without touching the network, because a settings
+    /// screen that goes blank when the box is offline tells you nothing about why.
+    fn provider_status(&self) -> crate::config::ProviderStatus {
+        let path = crate::config::Config::default_path();
+        let (cfg, _) = crate::config::Config::load(None).unwrap_or_default();
+        crate::config::provider_status_with(&path, &cfg)
+    }
+
+    /// Ask one endpoint whether it is there, registering nothing. The answer is a sentence,
+    /// because that is what a settings row has room for.
+    async fn provider_test(&self, req: &crate::config::ProviderReq) -> String {
+        crate::config::probe_endpoint(req).await
+    }
+
+    /// Ask one endpoint what its models can do: window, tool calling, images, thinking levels.
+    /// An unreachable endpoint is refused in words; returning an empty list would read as "this
+    /// endpoint has nothing on it", which is a different claim entirely.
+    async fn provider_probe(
+        &self,
+        req: &crate::config::ProviderReq,
+    ) -> Result<Vec<crate::config::ModelSpec>, String> {
+        crate::config::probe_models(req).await
+    }
+
+    /// Register an endpoint and the models on it in one action. The per-model rows written
+    /// alongside are what make the window, the context ceiling and pi's fold agree from then on.
+    fn provider_add(
+        &self,
+        req: &crate::config::ProviderReq,
+        caps: &[crate::config::ModelSpec],
+    ) -> String {
+        crate::config::add_provider_with(&crate::config::Config::default_path(), req, caps)
+    }
+
+    fn provider_remove(&self, name: &str) -> String {
+        crate::config::remove_provider_with(&crate::config::Config::default_path(), name)
+    }
+
+    /// One model's window, sampling and thinking levels, written to the file that is the source
+    /// of truth. A model process already running keeps what it started with; the next one picks
+    /// this up. The sentence says that, because the meter moving is not the model re-reading.
+    fn model_set(&self, id: &str, row: &crate::config::ModelRow) -> String {
+        crate::config::set_model_with(&crate::config::Config::default_path(), id, row)
+    }
+
+    fn model_forget(&self, id: &str) -> String {
+        crate::config::forget_model_with(&crate::config::Config::default_path(), id)
+    }
 }
 
 #[async_trait]
@@ -1787,6 +1879,21 @@ pub fn check_attachments(atts: &[crate::provider::Attachment], limits: Attachmen
 
 #[cfg(test)]
 mod tests {
+    /// The window the person typed beats the window the endpoint claims, and only when there
+    /// is one. A default that quietly preferred the endpoint would make the setting in the
+    /// model screen decorative.
+    #[test]
+    fn a_stored_window_beats_the_endpoint_and_says_so() {
+        assert_eq!(chosen_window(Some(32_768), Some(131_072)), Some(32_768));
+        assert_eq!(chosen_window(None, Some(131_072)), Some(131_072));
+        assert_eq!(chosen_window(Some(32_768), None), Some(32_768));
+        assert_eq!(chosen_window(None, None), None, "nothing known is still nothing known");
+        // The budget formula then sees the smaller window, which is the point: the fold
+    // happens where the server will actually run out.
+        assert!(auto_budget(32_768) < auto_budget(131_072));
+    }
+
+
     use super::*;
     use crate::event::FinishReason;
     use crate::provider::{Delta, ProviderError};
@@ -2117,6 +2224,20 @@ mod tests {
         assert_eq!(auto_budget(8_192), 4_096, "half, floored - not a percentage minus a constant");
         assert_eq!(auto_budget(4_096), 4_096, "a tiny window cannot go below the floor");
         assert_eq!(auto_budget(0), 4_096);
+    }
+
+    #[test]
+    fn the_chat_prompt_says_what_the_mode_cannot_do() {
+        // On the pi core this string is the *whole* instruction: `--system-prompt` replaces
+        // the runtime's default prompt, and with `--no-tools` nothing else reaches the model.
+        // pi does append its own <cwd> block naming the workspace folder, so a chat prompt
+        // that stays silent about its own limits leaves the model reading one claim from the
+        // prompt and the opposite one from the block underneath it.
+        let p = Persona::CHAT_PROMPT;
+        assert!(p.contains("no tools"), "chat must say it has no tools: {p}");
+        assert!(p.contains("no folder"), "chat must say it has no folder to work in: {p}");
+        assert!(p.contains("never offer"), "chat must not leave the model offering to act: {p}");
+        assert!(p.len() < 400, "the whole chat instruction stays small: {} B", p.len());
     }
 
     #[test]

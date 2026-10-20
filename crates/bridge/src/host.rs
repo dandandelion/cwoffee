@@ -71,6 +71,18 @@ pub struct PiHostConfig {
     pub model_window: Option<usize>,
     /// cwoffee row id <-> pi session file. See `sessions.rs`.
     pub session_map: PathBuf,
+    /// The SQLite file this host opened, handed to the model process so the one tool that
+    /// reads conversation history (`recall`) can read it too. `None` when the bridge does not
+    /// know — and then `recall` refuses in words instead of answering "you never mentioned
+    /// that", which is the difference between a wrong answer and an honest one.
+    pub db_path: Option<PathBuf>,
+    /// How much of the tool set the model is *shown*. `false` (the default, and today's
+    /// behaviour) declares every mounted tool. `true` declares only the two the registry says
+    /// must always be there (`Registry::lean_tool_names`) and leaves the rest one `explore`
+    /// call away. It is a switch, not a conclusion: on a 262k-token endpoint the full menu is
+    /// affordable, and a small local model with a small window pays a fifth of its room for a
+    /// menu it will not use. The registry owns which tools those two are.
+    pub lean_tools: bool,
     /// Cowork or chat at boot. In Chat the process itself is different: no extension
     /// mounted, `--no-tools`, pi's prompt replaced by one line, and the conversation's
     /// folder left where it is.
@@ -954,6 +966,7 @@ impl Engine {
             c.reap(Duration::from_secs(2)).await;
         }
         let mut launch = self.cfg.launch.clone();
+        let lean = self.cfg.lean_tools;
         if self.state.lock().unwrap().persona == cwoffee_engine::host::Persona::Chat {
             // A chat has no tools and no folder. The extension is not mounted at all,
             // so its tool declarations never reach the prompt; `--no-tools` covers
@@ -966,6 +979,16 @@ impl Engine {
             launch.system_prompt =
                 Some(cwoffee_engine::host::Persona::CHAT_PROMPT.to_string());
             launch.workdir = self.boot_workdir.clone();
+        } else {
+            // Cowork: the coworker's own words. Left to itself the pi core sends pi's
+            // coding-harness preamble — measured at 3,183 B of instructions about reading
+            // files, running commands and reading pi's own docs, none of which describe
+            // cwoffee's job and all of which describe tools cwoffee has switched off. The
+            // same `cwoffee-v1` text the Rust core sends is used here, plus the discovery
+            // note when the declared tool set is deliberately incomplete: a model that is
+            // shown a subset and never told it is a subset concludes the app cannot do the
+            // thing, and then it stops trying.
+            launch.system_prompt = Some(cwoffee_engine::prompt::cowork_prompt_text(lean));
         }
         launch.session_file = self.map.get(self.row()).map(str::to_string).map(PathBuf::from);
         // Name the root for the tools instead of trusting an inherited cwd. A shim that
@@ -980,6 +1003,20 @@ impl Engine {
         // of the child: changing the mode mid-session is not seen by an already-spawned
         // pi — noted in the plan.)
         launch.extra_env.push(("CWOFFEE_MODE".to_string(), self.state.lock().unwrap().mode.as_str().to_string()));
+        // The conversation store, named rather than assumed. `recall` reads the user's own
+        // history out of this file; a tool host that was never told where it lives says so
+        // instead of reporting that nothing was ever said.
+        launch.extra_env.push((
+            "CWOFFEE_TOOL_MODE".to_string(),
+            if lean { "lean".to_string() } else { "full".to_string() },
+        ));
+        if let Some(db) = &self.cfg.db_path {
+            launch.extra_env.push(("CWOFFEE_DB".to_string(), db.display().to_string()));
+        }
+        launch.extra_env.push((
+            "CWOFFEE_PI_SESSION_MAP".to_string(),
+            self.cfg.session_map.display().to_string(),
+        ));
         let (child, mut rx) = PiChild::spawn(&launch).await.map_err(|e| self.explain_now(&e))?;
         let pid = child.pid;
         // Name the process we started, in a file the next bridge to start reads.
@@ -1040,6 +1077,18 @@ impl Engine {
         e.to_string()
     }
 
+    /// The window to believe for one model: a `[models."<id>"] context_window` the person set
+    /// in the model screen outranks the endpoint's claim. Without this, the number typed in the
+    /// screen would be decoration while the meter kept believing the server.
+    fn believed_window(&self, model: &str, from_endpoint: usize) -> usize {
+        let stored = self
+            .cfg
+            .cfg_path
+            .as_ref()
+            .and_then(|p| cwoffee_engine::config::window_override_in(p, model));
+        cwoffee_engine::host::chosen_window(stored, Some(from_endpoint)).unwrap_or(from_endpoint)
+    }
+
     /// Read what pi says about itself: the model it picked, its window, and the
     /// session file that identifies this conversation on disk.
     fn absorb_state(&mut self, data: &Value) {
@@ -1049,8 +1098,11 @@ impl Engine {
                 st.model = id.to_string();
             }
             if let Some(w) = m.get("contextWindow").and_then(|v| v.as_u64()) {
-                if st.model_window != Some(w as usize) {
-                    st.model_window = Some(w as usize);
+                // What the person stored for this model beats what pi claims, and the meter,
+                // the derived ceiling and pi's own fold threshold are all rebuilt from that.
+                let believed = self.believed_window(&st.model.clone(), w as usize);
+                if st.model_window != Some(believed) {
+                    st.model_window = Some(believed);
                     self.recompute_budget(&mut st);
                 }
             }
@@ -1126,7 +1178,8 @@ impl Engine {
                                 .unwrap_or(&model)
                                 .to_string();
                             if let Some(w) = data.get("contextWindow").and_then(|v| v.as_u64()) {
-                                st.model_window = Some(w as usize);
+                                st.model_window =
+                                    Some(self.believed_window(&st.model.clone(), w as usize));
                             }
                             // Different model, different window: a budget carried over
                             // from the previous model is how a fold warning shows up in a

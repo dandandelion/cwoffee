@@ -3101,6 +3101,61 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 .toolname { font-family: var(--font-mono); font-size: 12px; color: var(--color-ink); }
 .tooldesc { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--color-ink-2); }
 
+/* The model screen: endpoints that expand into models that expand into fields. The
+   nesting is deliberate — an endpoint list is only useful once you can see what is on
+   each one, and a model row is only useful once you can see what the app believes about
+   it. Capability chips say what was *observed*; "unknown" is a chip of its own, because
+   "never asked" and "refused" are different answers. */
+.mcur { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.setdiv { border: 0; border-top: 1px solid var(--color-hairline); margin: 16px 0 10px; }
+.pvadd { display: flex; flex-direction: column; gap: 9px; }
+.pvgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 12px; }
+.pvf { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; color: var(--color-ink-3); }
+.pvf.wide { grid-column: 1 / -1; }
+.pvf input, .pvf select { font-size: 12.5px; }
+.pvacts { display: flex; gap: 7px; flex-wrap: wrap; }
+.set-btn {
+  font: inherit; font-size: 12px;
+  padding: 5px 10px; border-radius: 7px;
+  border: 1px solid var(--color-hairline-2);
+  background: var(--color-paper-2); color: var(--color-ink-2);
+  cursor: pointer;
+}
+.set-btn:hover:not(:disabled) { border-color: var(--color-ink-3); color: var(--color-ink); }
+.set-btn:disabled { opacity: 0.45; cursor: default; }
+.set-btn.primary { background: var(--color-tint); border-color: var(--color-hairline-2); color: var(--color-ink); font-weight: 550; }
+.set-btn.danger { color: var(--color-danger); }
+.prow-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.probelist, .provbody { display: flex; flex-direction: column; gap: 7px; }
+.probelist { padding: 3px 0; }
+.prow { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.capset { display: inline-flex; gap: 5px; flex-wrap: wrap; }
+.cap {
+  font-size: 10.5px; padding: 2px 6px; border-radius: 999px;
+  border: 1px solid var(--color-hairline); background: var(--color-paper-2);
+  color: var(--color-ink-3);
+}
+.cap.now { color: var(--color-ink); border-color: var(--color-hairline-2); font-weight: 600; }
+.prov { border-radius: 9px; background: var(--color-paper-2); }
+.provhead {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 10px; border: 0; background: transparent; cursor: pointer;
+  font: inherit; color: var(--color-ink); text-align: left;
+}
+.provname { font-weight: 600; font-size: 12.5px; }
+.provurl { font-family: var(--font-mono); font-size: 11px; color: var(--color-ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.provn { margin-left: auto; font-size: 11px; color: var(--color-ink-3); white-space: nowrap; }
+.chev { font-size: 10px; color: var(--color-ink-3); width: 9px; }
+.provbody { padding: 0 10px 10px; }
+.pvline { display: flex; gap: 8px; font-size: 11.5px; color: var(--color-ink-3); }
+.pvline code { font-family: var(--font-mono); color: var(--color-ink-2); }
+.mrow2 { border-top: 1px solid var(--color-hairline); padding: 6px 0 0; }
+.mrow2top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mrow2name { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; cursor: pointer; font: inherit; color: inherit; padding: 0; }
+.mfields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 12px; padding: 8px 0 4px; }
+.mfields .set-note { grid-column: 1 / -1; }
+.mfields .pvacts { grid-column: 1 / -1; }
+
 /* Phones and narrow windows: the rail becomes a strip along the top. A settings
    screen you have to zoom sideways to navigate is not a settings screen. */
 @media (max-width: 720px) {

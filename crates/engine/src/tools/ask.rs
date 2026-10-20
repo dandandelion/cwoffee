@@ -646,6 +646,10 @@ mod tests {
             ask: Some(tx),
             events: Some(etx),
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let (idx, iqx) = oneshot::channel::<u64>();
         // Deliberately not awaited: the watcher holds the reply sender open past
@@ -687,6 +691,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         tokio::spawn(async move {
             let (_q, _reply) = rx.recv().await.unwrap();
@@ -725,6 +733,10 @@ mod tests {
             ask: Some(tx),
             events: Some(etx),
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let (idx, iqx) = oneshot::channel::<u64>();
         tokio::spawn(async move {
@@ -762,6 +774,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let h = tokio::spawn(async move {
             let (q, reply) = rx.recv().await.unwrap();
@@ -803,6 +819,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let h = tokio::spawn(async move {
             let (q, reply) = rx.recv().await.unwrap();
@@ -843,6 +863,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let h = tokio::spawn(async move {
             let (_q, reply) = rx.recv().await.unwrap();
@@ -905,6 +929,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let t = tool();
         let h = tokio::spawn(async move {
@@ -948,6 +976,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let h = tokio::spawn(async move {
             let (_, reply) = rx.recv().await.unwrap();
@@ -990,6 +1022,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let r = tool()
             .run(json!({"question": "Which?", "options": [{"label": "a"}]}), &ctx, &sink())
@@ -1010,6 +1046,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let r = tool()
             .run(json!({"question": "Which?", "options": [{"label": "a"}]}), &ctx, &sink())
@@ -1029,6 +1069,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let t = AskUserTool::default().with_timeout(std::time::Duration::from_secs(60));
         let h = tokio::spawn(async move {
@@ -1083,6 +1127,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let h = tokio::spawn(async move {
             let (q1, r1) = rx.recv().await.unwrap();
@@ -1128,6 +1176,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let h = tokio::spawn(async move {
             let (_, r1) = rx.recv().await.unwrap();
@@ -1167,6 +1219,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let r = tool()
             .run(
@@ -1197,6 +1253,10 @@ mod tests {
             ask: Some(tx),
             events: Some(etx),
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let (idx, iqx) = oneshot::channel::<(u64, u64)>();
         let h = tokio::spawn(async move {
@@ -1252,6 +1312,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let h = tokio::spawn(async move {
             let (q, reply) = rx.recv().await.unwrap();
@@ -1305,6 +1369,10 @@ mod tests {
             ask: Some(tx),
             events: None,
             permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
         };
         let h = tokio::spawn(async move {
             let (q, reply) = rx.recv().await.unwrap();

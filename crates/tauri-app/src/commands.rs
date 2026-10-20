@@ -411,6 +411,121 @@ pub fn list_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<Session>, 
     state.store.list_sessions(50).map_err(|e| e.to_string())
 }
 
+// ---- the model screen ------------------------------------------------------------------
+
+/// Every endpoint, the models under each, and what is answering. File-based: this answers even
+/// when the inference box is down, which is when someone opens this screen.
+#[tauri::command]
+pub fn provider_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    serde_json::to_value(state.host.provider_status()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn provider_test(
+    state: tauri::State<'_, AppState>,
+    base_url: String,
+    api_key: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+) -> Result<String, String> {
+    let req = cwoffee_engine::config::ProviderReq {
+        name: name.unwrap_or_default(),
+        base_url,
+        api_key: api_key.unwrap_or_default(),
+        kind: kind.unwrap_or_default(),
+    };
+    Ok(state.host.provider_test(&req).await)
+}
+
+#[tauri::command]
+pub async fn provider_probe(
+    state: tauri::State<'_, AppState>,
+    base_url: String,
+    api_key: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let req = cwoffee_engine::config::ProviderReq {
+        name: name.unwrap_or_default(),
+        base_url,
+        api_key: api_key.unwrap_or_default(),
+        kind: kind.unwrap_or_default(),
+    };
+    let rows = state.host.provider_probe(&req).await.map_err(|e| e.to_string())?;
+    serde_json::to_value(rows).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn provider_add(
+    state: tauri::State<'_, AppState>,
+    base_url: String,
+    api_key: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+    caps: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let req = cwoffee_engine::config::ProviderReq {
+        name: name.unwrap_or_default(),
+        base_url,
+        api_key: api_key.unwrap_or_default(),
+        kind: kind.unwrap_or_default(),
+    };
+    let caps: Vec<cwoffee_engine::config::ModelSpec> = caps
+        .map(|v| serde_json::from_value(v).map_err(|e| format!("probed models: {e}")))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(state.host.provider_add(&req, &caps))
+}
+
+#[tauri::command]
+pub fn provider_remove(state: tauri::State<'_, AppState>, name: String) -> Result<String, String> {
+    Ok(state.host.provider_remove(&name))
+}
+
+#[tauri::command]
+pub fn model_set(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    context_window: Option<usize>,
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    min_p: Option<f32>,
+    seed: Option<u64>,
+    efforts: Option<Vec<String>>,
+    supports_tools: Option<bool>,
+    supports_vision: Option<bool>,
+    source: Option<String>,
+) -> Result<String, String> {
+    let row = cwoffee_engine::config::ModelRow {
+        context_window,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        seed,
+        efforts: efforts.unwrap_or_default(),
+        supports_tools,
+        supports_vision,
+        source: source.unwrap_or_default(),
+    };
+    Ok(state.host.model_set(&id, &row))
+}
+
+#[tauri::command]
+pub fn model_forget(state: tauri::State<'_, AppState>, id: String) -> Result<String, String> {
+    Ok(state.host.model_forget(&id))
+}
+
+/// Every conversation filed under one folder — the list a folder delete has to act on.
+/// See `Store::sessions_in` for why the sidebar's own lists cannot answer this.
+#[tauri::command]
+pub fn sessions_in(state: tauri::State<'_, AppState>, path: String) -> Result<Vec<Session>, String> {
+    state.store.sessions_in(&path).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn search_messages(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<SearchHit>, String> {
     state.store.search(&query, 25).map_err(|e| e.to_string())

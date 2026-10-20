@@ -55,6 +55,11 @@ impl From<rusqlite::Error> for StoreError {
 const SCHEMA_VERSION: i64 = 11;
 
 /// A workspace the user has registered (or that holds sessions).
+/// How many conversations one folder can be asked for at a time. See
+/// `Store::sessions_in` for why the cap exists and what a caller owes the user when it is
+/// reached.
+pub const SESSIONS_IN_CAP: i64 = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceEntry {
     pub path: String,
@@ -126,8 +131,35 @@ pub struct SearchHit {
     pub rank: f64,
 }
 
+/// One remembered passage, with the conversation it came from attached to it.
+///
+/// The sidebar's `search` answers a different question: there a hit is a row somebody can
+/// click. A model asking what it has already discussed needs the conversation *named*,
+/// because "this is from the conversation about the Q3 numbers" is the only basis it has for
+/// deciding to ask for the whole thing — and a passage with no owner is a quote from nowhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecallHit {
+    pub session_id: i64,
+    pub title: String,
+    pub persona: String,
+    pub message_id: i64,
+    pub role: String,
+    pub created_at: i64,
+    /// FTS5 snippet with the match marked.
+    pub snippet: String,
+    pub rank: f64,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ToolCtx` derives Debug and now holds an `Arc<Store>`. A live connection has no
+        // useful Debug — printing one would imply the caller can see SQL state it cannot.
+        f.debug_struct("Store").finish_non_exhaustive()
+    }
 }
 
 impl Store {
@@ -286,6 +318,44 @@ impl Store {
              LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |r| {
+            Ok(Session {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                workspace: r.get(2)?,
+                model: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+                message_count: r.get(6)?,
+                persona: r.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every conversation filed under one folder — **including** chat rows and empty
+    /// drafts, which the sidebar files elsewhere or not at all.
+    ///
+    /// A destructive folder action cannot trust either list the sidebar shows: `list_sessions`
+    /// is a window (the newest 50), and the folder group hides chats and drafts. Meanwhile
+    /// `list_workspaces` unions registered paths with paths that still hold sessions, so a
+    /// folder with anything left inside it resurrects itself the moment it is removed. The
+    /// user sees that as "I deleted the folder and it came back", and the only honest fix is
+    /// to ask the store what is actually in the folder before deciding what deleting it means.
+    ///
+    /// Bounded at 500 so a pathological folder cannot flood a client; the caller compares the
+    /// count with `SESSIONS_IN_CAP` and says so rather than deleting a silent subset.
+    pub fn sessions_in(&self, workspace: &str) -> Result<Vec<Session>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                    s.persona
+             FROM sessions s
+             WHERE s.workspace = ?1
+             ORDER BY s.updated_at DESC, s.id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![workspace, SESSIONS_IN_CAP], |r| {
             Ok(Session {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -676,6 +746,54 @@ impl Store {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    /// Search what the **other** conversations said.
+    ///
+    /// `except` is the conversation that is asking. Its own text is already in front of the
+    /// model, so returning it costs prompt bytes to say nothing new — and a model that keeps
+    /// finding its own last message tends to conclude it has remembered something useful.
+    /// The join to `sessions` is the point of this query rather than `search`: a passage
+    /// without a conversation attached is a quote from nowhere.
+    pub fn recall(
+        &self,
+        query: &str,
+        limit: i64,
+        except: Option<i64>,
+    ) -> Result<Vec<RecallHit>, StoreError> {
+        let q = fts_escape(query);
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT f.session_id, s.title, s.persona, f.message_id, f.role, m.created_at,
+                    snippet(messages_fts, 0, '[', ']', '…', 18),
+                    bm25(messages_fts)
+             FROM messages_fts f
+             JOIN messages m ON m.id = f.message_id
+             JOIN sessions s ON s.id = f.session_id
+             WHERE messages_fts MATCH ?1
+               AND (?2 IS NULL OR f.session_id <> ?2)
+             ORDER BY bm25(messages_fts)
+             LIMIT ?3",
+        ) {
+            Ok(st) => st,
+            Err(e) => return Err(StoreError::FtsUnavailable(e.to_string())),
+        };
+        let rows = stmt.query_map(params![q, except, limit], |r| {
+            Ok(RecallHit {
+                session_id: r.get(0)?,
+                title: r.get(1)?,
+                persona: r.get(2)?,
+                message_id: r.get(3)?,
+                role: r.get(4)?,
+                created_at: r.get(5)?,
+                snippet: r.get(6)?,
+                rank: r.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -1047,6 +1165,10 @@ pub trait StoreOps: Send + Sync {
     fn create_session(&self, title: &str, workspace: &str, model: &str) -> Result<i64, StoreError>;
     fn delete_session(&self, id: i64) -> Result<(), StoreError>;
     fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError>;
+
+    /// Every conversation in one folder, chats and empty drafts included. See the inherent
+    /// method on `Store` for what this is for.
+    fn sessions_in(&self, workspace: &str) -> Result<Vec<Session>, StoreError>;
     fn append_message(&self, session_id: i64, m: &Message) -> Result<i64, StoreError>;
     fn messages_page(&self, session_id: i64, before_id: Option<i64>, limit: usize)
         -> Result<MessagesPage, StoreError>;
@@ -1096,6 +1218,10 @@ impl StoreOps for Store {
     fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError> {
         Store::list_sessions(self, limit)
     }
+
+    fn sessions_in(&self, workspace: &str) -> Result<Vec<Session>, StoreError> {
+        Store::sessions_in(self, workspace)
+    }
     fn append_message(&self, session_id: i64, m: &Message) -> Result<i64, StoreError> {
         Store::append_message(self, session_id, m)
     }
@@ -1129,6 +1255,37 @@ impl StoreOps for Store {
 
 #[cfg(test)]
 mod tests {
+    /// The failure this query exists for: a folder that looks empty in the sidebar is not
+    /// empty in the store, and deleting the folder then reads as a UI that will not let you
+    /// remove it. Chat rows carry the folder path (they were started in it) while the sidebar
+    /// files them in their own list; an empty draft carries it too.
+    #[test]
+    fn a_folder_holds_what_the_sidebar_does_not_show_under_it() {
+        let s = store();
+        let cowork = s.create_session("Read the quarterly numbers", "/tmp/folder-a", "m").unwrap();
+        let chat = s.create_session("Chat in the same folder", "/tmp/folder-a", "m").unwrap();
+        s.set_session_persona(chat, "chat").unwrap();
+        let draft = s.create_session("new session", "/tmp/folder-a", "m").unwrap();
+        s.create_session("Somewhere else", "/tmp/folder-b", "m").unwrap();
+        s.append_message(cowork, &Message::user("mangosteen")).unwrap();
+
+        // What the folder row claims: all three.
+        let listed = s.list_workspaces().unwrap();
+        let a = listed.iter().find(|w| w.path == "/tmp/folder-a").expect("folder listed");
+        assert_eq!(a.sessions, 3, "the folder count must include chats and drafts");
+
+        // What is actually inside, which is what a delete must act on.
+        let mut ids: Vec<i64> = s.sessions_in("/tmp/folder-a").unwrap().into_iter().map(|x| x.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![cowork, chat, draft], "sessions_in missed rows the folder holds");
+
+        // A row is not filed in two folders at once.
+        assert_eq!(s.sessions_in("/tmp/folder-b").unwrap().len(), 1);
+        // An unknown folder is an empty answer, not an error: the caller has to be able to
+        // ask "is anything left inside?" after a delete without bracing for a failure.
+        assert!(s.sessions_in("/tmp/no-such-folder").unwrap().is_empty());
+    }
+
     use super::*;
     use crate::provider::{Message, Role, ToolCall};
 
@@ -1463,6 +1620,32 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(!hits[0].snippet.is_empty());
         assert!(hits[0].snippet.contains("[fox]"), "got {:?}", hits[0].snippet);
+    }
+
+    /// Recall answers a different question from the sidebar's search: a passage has to come
+    /// back with its conversation attached, and the conversation that is *asking* has to be
+    /// left out — its text is already in front of the model, so returning it costs prompt
+    /// bytes to say nothing new.
+    #[test]
+    fn recall_names_the_conversation_and_leaves_the_asking_one_out() {
+        let s = store();
+        let a = sid(&s);
+        let b = s.create_session("trip plan", "/tmp/ws2", "m").unwrap();
+        s.set_session_persona(b, "chat").unwrap();
+        s.append_message(a, &Message::user("the quarterly cashflow total is 946010")).unwrap();
+        s.append_message(b, &Message::assistant("we leave before the quarterly meeting")).unwrap();
+
+        let hits = s.recall("quarterly", 8, Some(a)).unwrap();
+        assert_eq!(hits.len(), 1, "the asking conversation must not come back: {hits:?}");
+        assert_eq!(hits[0].session_id, b);
+        assert_eq!(hits[0].title, "trip plan", "a passage with no conversation attached is a quote from nowhere");
+        assert_eq!(hits[0].persona, "chat");
+        assert!(hits[0].snippet.contains("[quarterly]"), "{:?}", hits[0].snippet);
+
+        // Nothing to exclude: both conversations answer.
+        assert_eq!(s.recall("quarterly", 8, None).unwrap().len(), 2);
+        // Hostile input behaves the same way it does for the sidebar search.
+        assert!(s.recall("NOT AND OR \"x", 5, None).is_ok());
     }
 
     /// FTS5 has query syntax. Raw user input must not be able to break it.

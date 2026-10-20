@@ -671,9 +671,10 @@ pub struct SearchResult {
 /// repeated searching; DuckDuckGo's HTML endpoint is the keyless fallback that
 /// starts returning bot challenges after a handful of queries. `Auto` means
 /// "Cwoffee runs its own SearXNG, and says so if it cannot".
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub enum SearchBackend {
     SearXNG { base: String },
+    #[default]
     DuckDuckGo,
     Auto(crate::tools::searxng::AutoSearXNG),
 }

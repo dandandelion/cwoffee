@@ -33,6 +33,7 @@ const arg = (n, d) => {
   return i >= 0 ? argv[i + 1] : d
 }
 const CORE = arg('core', 'pi')
+const MODE = arg('mode', 'full')
 const PORT = Number(arg('port', 8316))
 const EPORT = Number(arg('ep', 8317))
 const DIR = path.resolve(arg('db', '/tmp/cwoffee-prompt-shape'))
@@ -120,7 +121,7 @@ const gwArgs = [
   '--pi-tools', '-read,-bash,-edit,-write',
   '--pi-agent-dir', path.join(DIR, 'agent'), '--pi-session-dir', path.join(DIR, 'sess'),
 ]
-console.log(`prompt shape on the ${CORE} core (endpoint :${EPORT}, gateway :${PORT})`)
+console.log(`prompt shape on the ${CORE} core, tool exposure ${MODE} (endpoint :${EPORT}, gateway :${PORT})`)
 console.log(`  artifacts from ${TGT}`)
 const gwChild = spawn(path.join(TGT, 'release', 'cwoffee-gateway'), gwArgs, {
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -133,6 +134,7 @@ const gwChild = spawn(path.join(TGT, 'release', 'cwoffee-gateway'), gwArgs, {
     CWOFFEE_MODEL: 'cwoffee-mock',
     CWOFFEE_MODE: 'ask',
     CWOFFEE_CWTOOL: process.env.CWOFFEE_CWTOOL ?? path.join(TGT, 'release', 'cwtool'),
+    CWOFFEE_PI_TOOL_MODE: MODE,
   },
 })
 kids.push(gwChild)
@@ -272,12 +274,29 @@ if (chat.requests > 0 && chat.tools.length !== 0)
   fails.push(`chat: ${chat.tools.length} tool(s) declared in a chat: ${chat.tools.map((x) => x.name).join(', ')}`)
 if (chat.requests > 0 && /expert coding assistant operating inside pi/i.test(chat.sys))
   fails.push('chat: the system prompt still carries pi harness preamble')
-if (/expert coding assistant operating inside pi/i.test(cowork.sys)) {
-  console.log(
-    '\n  note: cowork mode sends pi harness preamble — the coding harness prompt, with its own\n' +
-      '        tool list, docs pointers and cwd rules. cwoffee does not own the coworker prompt\n' +
-      '        on this core, so what the model is told about its job comes from pi.',
-  )
+// The coworker's own words, on either core. This used to be a note that reported pi's
+// coding-harness preamble arriving and let it pass: a coworker that changed core also changed
+// what it was told about its own job, and the pi text describes reading files, running
+// commands and reading pi's docs — capabilities cwoffee switches off. Asserting the absence
+// of that text and the presence of cwoffee's is what keeps two cores describing one
+// assistant.
+if (/expert coding assistant operating inside pi/i.test(cowork.sys))
+  fails.push("cowork: the system prompt is pi's coding-harness preamble, not cwoffee's coworker prompt")
+if (cowork.requests > 0 && !/You are Cwoffee/i.test(cowork.sys))
+  fails.push(`cowork: the model is not told it is cwoffee: ${JSON.stringify(cowork.sys.slice(0, 90))}`)
+if (MODE === 'lean') {
+  const names = cowork.tools.map((x) => x.name)
+  if (names.length > 3)
+    fails.push(`lean mode declared ${names.length} tools: ${names.join(', ')} — the short menu is the feature`)
+  if (!names.includes('explore'))
+    fails.push('lean mode did not declare `explore`, the only way back to the rest of the tool set')
+  if (cowork.toolBytes > 2_000)
+    fails.push(`lean mode still costs ${cowork.toolBytes} B of tool declarations (${names.join(', ')}) — that is not a saving`)
+  else console.log(`\n  lean mode: ${names.length} declaration(s), ${cowork.toolBytes} B (full mode measured ~12.3 KB)`)
+  if (cowork.requests > 0 && !/explore/i.test(cowork.sys))
+    fails.push('lean mode hides most of the tool set but never tells the model the list it sees is a subset')
+} else if (cowork.requests > 0 && cowork.tools.length < 8) {
+  fails.push(`full mode declared only ${cowork.tools.length} tools — the switch is leaking the wrong way`)
 }
 if (cowork.tools.length && !/cwoffee|workspace|folder/i.test(cowork.sys))
   console.log('\n  note: the cowork system text never mentions the workspace or cwoffee by name')

@@ -84,6 +84,13 @@ fn flag(args: &[String], long: &str, short: Option<&str>) -> Option<String> {
     None
 }
 
+/// The app's own conversation history, in one place. The bridge hands this path to the
+/// model process so the `recall` tool can read the same file; two literals for one file is
+/// how a tool ends up reading a database nobody writes to.
+fn sessions_db_path() -> std::path::PathBuf {
+    data_dir().join("sessions.db")
+}
+
 fn data_dir() -> PathBuf {
     PathBuf::from(env_or("XDG_DATA_HOME", &format!("{}/.local/share", std::env::var("HOME").unwrap_or_default())))
         .join("cwoffee")
@@ -173,7 +180,7 @@ fn main() {
         println!("[cwoffee] {note}");
     }
 
-    let db_path = data_dir().join("sessions.db");
+    let db_path = sessions_db_path();
     let mode = appcfg.mode();
 
     if let Err(e) = std::fs::create_dir_all(db_path.parent().unwrap_or_else(|| std::path::Path::new("."))) {
@@ -630,6 +637,14 @@ fn main() {
             commands::set_model,
             commands::session_state,
             commands::list_sessions,
+            commands::sessions_in,
+            commands::provider_status,
+            commands::provider_test,
+            commands::provider_probe,
+            commands::provider_add,
+            commands::provider_remove,
+            commands::model_set,
+            commands::model_forget,
             commands::search_messages,
             commands::session_messages,
             commands::share_markdown,
@@ -740,7 +755,22 @@ async fn pi_host(
             window,
         )
         .map_err(|e| format!("cannot write {}: {e}", models.display()))?;
-        println!("[cwoffee/pi] provider cwoffee -> {} (written to {})", appcfg.provider.base_url, path.display());
+        println!("[cwoffee/pi] provider cwoffee -> {} (written to {})", appcfg.provider.base_url, path.display());        // Endpoints registered on the model screen have to be reachable by name, or "use this
+        // model" is a button the core cannot honour.
+        let cfg_path = cwoffee_engine::config::Config::default_path();
+        match cwoffee_bridge::mount::mount_provider_rows(&agent_dir, &cfg_path) {
+            Ok(list) if !list.is_empty() => println!(
+                "[cwoffee/pi] also mounted {} endpoint(s) from {}: {}",
+                list.len(),
+                cfg_path.display(),
+                list.join(", ")
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "[cwoffee/pi] could not mount the registered endpoints from {}: {e} — models on them will not be pickable",
+                cfg_path.display()
+            ),
+        }
         // pi folds on its own schedule (`compaction.reserveTokens`, 16 384 by default,
         // chosen for coding sessions) while cwoffee's meter fills against a budget.
         // Writing the reserve makes them one number: the fold happens where the app says
@@ -831,6 +861,15 @@ async fn pi_host(
         budget_pin: cfg.context_budget,
         model_window: window.map(|w| w as usize),
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
+        db_path: Some(sessions_db_path()),
+        lean_tools: {
+            let (c, _) = cwoffee_engine::config::Config::load(None).unwrap_or_default();
+            c.lean_tools()
+                || matches!(
+                    std::env::var("CWOFFEE_PI_TOOL_MODE").ok().as_deref(),
+                    Some("lean")
+                )
+        },
         persona,
         // The tab the user clicks writes `persona` back to the same config file the
         // app booted from, so the mode is a property of the install, not of one window.

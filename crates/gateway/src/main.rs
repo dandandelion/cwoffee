@@ -269,7 +269,22 @@ async fn main() -> anyhow::Result<()> {
             "[cwoffee/pi] provider {PI_PROVIDER} -> {} (written to {})",
             appcfg.provider.base_url,
             models.display()
-        );
+        );        // Same on the browser/phone shell: an endpoint the model screen registered has to be
+        // in pi's file, or picking one of its models fails on the far side of the wire.
+        let cfg_path = cwoffee_engine::config::Config::default_path();
+        match cwoffee_bridge::mount::mount_provider_rows(&agent_dir, &cfg_path) {
+            Ok(list) if !list.is_empty() => println!(
+                "[cwoffee/pi] also mounted {} endpoint(s) from {}: {}",
+                list.len(),
+                cfg_path.display(),
+                list.join(", ")
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "[cwoffee/pi] could not mount the registered endpoints from {}: {e} — models on them will not be pickable",
+                cfg_path.display()
+            ),
+        }
         // pi folds on its own schedule (`compaction.reserveTokens`, 16 384 by default,
         // chosen for coding sessions) while cwoffee's meter fills against a budget.
         // Writing the reserve makes them one number: the fold happens where the app says
@@ -377,6 +392,15 @@ async fn main() -> anyhow::Result<()> {
             budget_pin: cfg.context_budget,
             model_window: window.map(|w| w as usize),
             session_map: agent_dir.join("cwoffee-pi-sessions.json"),
+        db_path: Some(db.clone()),
+        lean_tools: {
+            let (c, _) = cwoffee_engine::config::Config::load(None).unwrap_or_default();
+            c.lean_tools()
+                || matches!(
+                    std::env::var("CWOFFEE_PI_TOOL_MODE").ok().as_deref(),
+                    Some("lean")
+                )
+        },
             persona,
             // A mode the user picks in the window is written back to the same config
             // file, so the next start continues the kind of conversation they chose

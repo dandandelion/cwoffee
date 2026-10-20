@@ -7,9 +7,11 @@
 
 pub mod ask;
 pub mod changes;
+pub mod discover;
 pub mod docs;
 pub mod exec;
 pub mod files;
+pub mod memory;
 pub mod path;
 pub mod repair;
 pub mod sheet_sql;
@@ -112,6 +114,13 @@ pub struct ToolResult {
     /// just wrote is the most expensive possible thing to put back in a prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<changes::FileChange>,
+    /// Tools this call made available to the model, named by the registry that owns them.
+    /// Only `explore` fills this, and it never reaches the model as text: the extension reads
+    /// it to widen the declared tool set, and the transcript card can show what the call
+    /// unlocked. A capability claim belongs to the tool that granted it, not to whatever
+    /// process happens to be hosting the model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activates: Vec<String>,
 }
 
 /// A file the agent produced, described for the UI rather than the model.
@@ -257,6 +266,7 @@ impl ToolResult {
             error: None,
             files: Vec::new(),
             changes: Vec::new(),
+            activates: Vec::new(),
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
@@ -269,6 +279,7 @@ impl ToolResult {
             error: Some(m),
             files: Vec::new(),
             changes: Vec::new(),
+            activates: Vec::new(),
         }
     }
 
@@ -311,6 +322,20 @@ pub struct ToolCtx {
     /// which is what examples and tests get. The knob exists because a question the
     /// user has to ask someone else cannot be answered in three minutes.
     pub question_timeout: Option<std::time::Duration>,
+    /// The app's own conversation history, for the one tool that reads memory rather than
+    /// the filesystem. `None` where the host has no store to offer — a probe, an example, a
+    /// tool host that was never told where the database is — and then the tool says *that*,
+    /// rather than reporting that it searched and found nothing.
+    pub store: Option<Arc<crate::store::Store>>,
+    /// Which conversation is asking, so a search of the others can leave its own text out.
+    /// `None` when the runner cannot say; the tool then says which claim it cannot make.
+    pub session: Option<i64>,
+    /// How this host built the tool set: the search provider and the exec policy. Only
+    /// `explore` reads these, and it reads them because a tool card that describes a
+    /// different provider than the one the user mounted is a claim about the app that is
+    /// simply wrong — the descriptions of `web_search` and `exec` are built from these.
+    pub search_backend: web::SearchBackend,
+    pub exec_cfg: ExecCfg,
     /// Paths outside the workspace the **user approved for this one call**.
     /// Rebuilt per call by the agent loop; never inherited by the next call, and
     /// never widened by a session-level "allow for session" answer.
@@ -325,6 +350,12 @@ impl Default for ToolCtx {
             ask: None,
             events: None,
             question_timeout: None,
+            store: None,
+            // The same default `with_v1_tools` builds with, so an example or a test that
+            // never picks a provider sees the same card text as that registry.
+            search_backend: web::SearchBackend::DuckDuckGo,
+            exec_cfg: ExecCfg::default(),
+            session: None,
             permits: Vec::new(),
         }
     }
@@ -462,7 +493,43 @@ impl Registry {
         // schema is prompt bytes, so a new tool has to arrive as a suffix. The
         // tool_order test failing is the proof this is an addition, not a reshuffle.
         r.register(Box::new(sheet_sql::SheetQueryTool));
+        // Appended, same discipline. `recall` reads the app's own history rather than the
+        // filesystem, which is a new kind of reach: the risk level it picks is Harmless on
+        // purpose (the user's own conversations, on their own disk, already listed in the
+        // sidebar), and an approval card there only trains click-through.
+        r.register(Box::new(memory::RecallTool::new()));
+        // Appended last, and the two exist together: `recall` is how the coworker reads its
+        // own past, `explore` is how it reaches the rest of this registry once the prompt
+        // stops declaring all of it. Both are cheap enough to declare in every mode - see
+        // `lean_tool_names`, where the price of always being declared is asserted.
+        r.register(Box::new(discover::ExploreTool));
         r
+    }
+
+    /// The tools declared in **every** mode, lean included.
+    ///
+    /// Lean mode answers a measured fact: the declarations above cost ~12 KB of every prompt
+    /// (`scripts/gateway-prompt-shape.mjs` reads the bytes that actually leave the process),
+    /// which on a small local model with a small window is a fifth of the room spent
+    /// describing capabilities the turn will not use. So the coworker starts with two: one to
+    /// read its own past, one to ask for anything else. Everything else - including
+    /// `ask_user`, the single most expensive declaration here - is one `explore` call away.
+    ///
+    /// A Rust decision, not an extension decision: the registry is the thing that knows what
+    /// the tools are, and a list written in TypeScript would be a second policy answering the
+    /// same question differently.
+    pub fn lean_tool_names() -> Vec<String> {
+        vec!["explore".to_string(), "recall".to_string()]
+    }
+
+    /// The tools that exist but are not declared until something asks for them.
+    pub fn discoverable_tool_names(&self) -> Vec<String> {
+        let lean = Self::lean_tool_names();
+        self.defs()
+            .into_iter()
+            .map(|d| d.name)
+            .filter(|n| !lean.contains(n))
+            .collect()
     }
 
     pub fn register(&mut self, t: Box<dyn Tool>) {
@@ -629,6 +696,8 @@ mod cfg_tests {
                 "ask_user",
                 "sheet_read",
                 "sheet_query",
+                "recall",
+                "explore",
             ]
         );
     }
@@ -661,9 +730,35 @@ mod cfg_tests {
                 .join(" ")
         );
         assert!(one > 0 && one < 1600, "sheet_query alone is {one} bytes");
+        // The tools declared in *every* mode are the one thing lean mode cannot avoid, and the
+        // lean design rests on them being small: if `explore` grows, the short menu stops being
+        // short; if `recall` grows, the saving moves into the tool whose job is to make saving
+        // possible. So the floor of the tax is asserted, not assumed.
+        let lean = Registry::lean_tool_names();
+        let lean_total: usize = each.iter().filter(|(n, _)| lean.contains(n)).map(|(_, b)| *b).sum();
+        for n in &lean {
+            let b = each.iter().find(|(m, _)| m == n).map(|(_, b)| *b).unwrap_or(0);
+            assert!(b > 0 && b < 900, "`{n}` is declared in every mode, so it must stay cheap: {b} B");
+        }
         assert!(
-            total < 11_000,
-            "the whole tool block is {total} bytes: two spreadsheet tools now, and a description longer than this is a per-turn tax on every session"
+            lean_total < 1_700,
+            "the always-declared set costs {lean_total} B ({lean:?}) - a short menu costing a fifth of the long one is not a short menu"
+        );
+        eprintln!(
+            "[cwoffee/test] declared in every mode: {lean_total} B for {} tools; the other {} cost {} B and sit behind `explore`",
+            lean.len(),
+            each.len() - lean.len(),
+            total - lean_total
+        );
+        // 12,600, not 11,800: `explore` arrived as a suffix and costs ~700 of these bytes on
+        // top of `recall`'s 540. The number is a tax rate, not a fact — if a later tool pushes
+        // past it, the honest move is to say what it costs (as this message does) rather than
+        // grow the ceiling silently. The lean total printed below is what discovery pays back:
+        // declaring two of these tools instead of twelve.
+        assert!(
+            total < 12_600,
+            "the whole tool block is {total} bytes across {} tools: a description longer than this is a per-turn tax on every session",
+            each.len()
         );
     }
 

@@ -828,6 +828,12 @@ const AUDITED: &[&str] = &[
     "respond_question",
     "set_search_backend",
     "set_context_budget",
+    // The model screen writes endpoints and per-model facts. Audited because they change what
+    // the app believes about an endpoint, and therefore what it sends to it.
+    "provider_add",
+    "provider_remove",
+    "model_set",
+    "model_forget",
 ];
 
 /// Empty a pending map and report how many waiters were released.
@@ -966,6 +972,62 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         "session_state" => serde_json::to_value(h.host.state()).map_err(|e| e.to_string()),
         "list_sessions" => {
             serde_json::to_value(h.store.list_sessions(50).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())
+        }
+        // The model screen's picture: every endpoint, the models filed under each, what is
+        // known about them, and which one is answering. Read-only, and file-based, so a phone
+        // can read it while the inference box is down — which is exactly when someone looks.
+        "provider_status" => serde_json::to_value(h.host.provider_status()).map_err(|e| e.to_string()),
+        "provider_test" => {
+            need_drive(role)?;
+            let req: cwoffee_engine::config::ProviderReq =
+                serde_json::from_value(args.clone()).map_err(|e| format!("endpoint: {e}"))?;
+            Ok(json!(h.host.provider_test(&req).await))
+        }
+        "provider_probe" => {
+            need_drive(role)?;
+            let req: cwoffee_engine::config::ProviderReq =
+                serde_json::from_value(args.clone()).map_err(|e| format!("endpoint: {e}"))?;
+            let rows = h.host.provider_probe(&req).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(rows).map_err(|e| e.to_string())
+        }
+        "provider_add" => {
+            need_drive(role)?;
+            let req: cwoffee_engine::config::ProviderReq =
+                serde_json::from_value(args.clone()).map_err(|e| format!("endpoint: {e}"))?;
+            let caps: Vec<cwoffee_engine::config::ModelSpec> = args
+                .get("caps")
+                .cloned()
+                .map(|v| serde_json::from_value(v).map_err(|e| format!("probed models: {e}")))
+                .transpose()?
+                .unwrap_or_default();
+            Ok(json!(h.host.provider_add(&req, &caps)))
+        }
+        "provider_remove" => {
+            need_drive(role)?;
+            let name = arg_str(&args, "name")?;
+            Ok(json!(h.host.provider_remove(&name)))
+        }
+        // One model's window / sampling / thinking levels. A plain sentence again: what moved,
+        // and which part a running model process will not notice.
+        "model_set" => {
+            need_drive(role)?;
+            let spec: cwoffee_engine::config::ModelSpec =
+                serde_json::from_value(args.clone()).map_err(|e| format!("model row: {e}"))?;
+            Ok(json!(h.host.model_set(&spec.id, &spec.row)))
+        }
+        "model_forget" => {
+            need_drive(role)?;
+            let id = arg_str(&args, "id")?;
+            Ok(json!(h.host.model_forget(&id)))
+        }
+        // Every conversation inside one folder, chat rows and empty drafts included. The
+        // sidebar hides those from a folder group and `list_sessions` is a window of 50, so
+        // "what is actually in this folder" is a question only the store can answer — and a
+        // delete that asks the sidebar instead leaves rows behind and the folder reappears.
+        "sessions_in" => {
+            let raw = arg_str(&args, "path")?;
+            serde_json::to_value(h.store.sessions_in(&raw).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())
         }
         "search_messages" => serde_json::to_value(
@@ -2331,6 +2393,123 @@ mod tests {
     /// nothing ran.
     /// The context ceiling is a setting, not a fact about one window: a phone can pin
     /// it, a watcher can see it, and "back to derived" has to be expressible at all.
+    /// A folder delete over the wire, which is what a phone does, and the reason the gateway
+    /// needs a verb that answers "what is inside this folder" rather than leaving the client
+    /// to count the rows it was shown.
+    ///
+    /// `remove_workspace` forgets a registered path and nothing else. The sidebar builds its
+    /// folder list from any path that still holds a conversation, so a client that deletes a
+    /// folder while invisible rows remain (chats and empty drafts are filed under the folder's
+    /// path but not shown inside it) watches the row reappear and reads that as a Delete button
+    /// that does not work.
+    #[tokio::test]
+    async fn a_folder_delete_asks_the_store_what_is_inside() {
+        let h = test_handle();
+        let dir = "/tmp/cwoffee-gw-folder-test";
+        let other = "/tmp/cwoffee-gw-folder-other";
+        let a = h.store.create_session("visible one", dir, "m").unwrap();
+        let c = h.store.create_session("a chat", dir, "m").unwrap();
+        h.store.set_session_persona(c, "chat").unwrap();
+        let d = h.store.create_session("", dir, "m").unwrap(); // an empty draft
+        h.store.create_session("in another folder", other, "m").unwrap();
+
+        let out = run_cmd(
+            "sessions_in",
+            serde_json::json!({ "path": dir }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect("a watcher may read what a folder holds");
+        let rows = out.as_array().expect("a list");
+        assert_eq!(
+            rows.len(),
+            3,
+            "the folder holds a chat and a draft the group does not show: {out}"
+        );
+        // The persona travels with the row, so the client can name the hidden rows on the
+        // confirm line ("2 of them chats") instead of offering a bare number for things the
+        // person has never seen.
+        let chats = rows
+            .iter()
+            .filter(|v| v["persona"].as_str() == Some("chat"))
+            .count();
+        assert_eq!(chats, 1, "{out}");
+
+        // Forgetting the registered row is not a delete, and the test says so by showing that
+        // the contents are untouched — this is exactly the state that resurrects the row.
+        run_cmd(
+            "remove_workspace",
+            serde_json::json!({ "path": dir }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap();
+        let back = run_cmd(
+            "sessions_in",
+            serde_json::json!({ "path": dir }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            back.as_array().unwrap().len(),
+            3,
+            "forgetting a folder row deleted nothing, which is why it came back"
+        );
+
+        for id in [a, c, d] {
+            run_cmd(
+                "delete_session",
+                serde_json::json!({ "id": id }),
+                Role::Drive,
+                &h,
+            )
+            .await
+            .unwrap();
+        }
+        let empty = run_cmd(
+            "sessions_in",
+            serde_json::json!({ "path": dir }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .unwrap();
+        assert!(empty.as_array().unwrap().is_empty(), "{empty}");
+        run_cmd(
+            "remove_workspace",
+            serde_json::json!({ "path": dir }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap();
+        let listed = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .unwrap();
+        assert!(
+            !listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["path"].as_str() == Some(dir)),
+            "the folder is still listed: {listed}"
+        );
+        // The point of scoping the action to one folder: a neighbour keeps its rows.
+        let neighbour = run_cmd(
+            "sessions_in",
+            serde_json::json!({ "path": other }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .unwrap();
+        assert_eq!(neighbour.as_array().unwrap().len(), 1, "{neighbour}");
+    }
+
     #[tokio::test]
     async fn a_context_ceiling_can_be_pinned_freed_and_refused_over_the_wire() {
         let h = test_handle();

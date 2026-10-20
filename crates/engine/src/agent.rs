@@ -375,6 +375,10 @@ impl Agent {
         out: &EngineSink,
         session_id: i64,
     ) -> TurnTelemetry {
+        // The tools are told which conversation this is, for the same reason the event
+        // stream is: `recall` has to leave the asking conversation out of a search of the
+        // others, and a tool cannot guess it from what the client happens to be looking at.
+        self.ctx.session = Some(session_id);
         self.turn_id += 1;
         let turn = self.turn_id;
         self.cancel.store(false, Ordering::Relaxed);
@@ -949,6 +953,7 @@ impl Agent {
                 truncated: false,
                 files: Vec::new(),
                 changes: Vec::new(),
+                activates: Vec::new(),
                 error: Some(if e.is_panic() {
                     format!(
                         "tool '{}' panicked and was isolated; the session continues",
@@ -2118,7 +2123,7 @@ mod tests {
     fn render_result_never_returns_empty_to_the_model() {
         assert_eq!(render_result(&ToolResult::ok("")), "(succeeded, no output)");
         assert!(render_result(&ToolResult::err("boom")).contains("ERROR"));
-        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new(), changes: Vec::new() };
+        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new(), changes: Vec::new(), activates: Vec::new() };
         assert!(render_result(&r).contains("(no output)"));
     }
 

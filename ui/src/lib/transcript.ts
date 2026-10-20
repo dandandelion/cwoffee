@@ -2473,6 +2473,15 @@ const TOOL_HEAD: Record<string, { run: string; done: string; bad: string }> = {
   web_fetch: { run: 'Opening a page', done: 'Opened a page', bad: 'Could not open that page' },
   web_search: { run: 'Searching the web', done: 'Searched the web', bad: 'The search did not parse' },
   exec: { run: 'Running a command', done: 'Ran a command', bad: 'The command did not parse' },
+  // The app's own history, read out loud. "Recalling memory" while it works, "Recalled"
+  // when it has said what it found — and the failure wording names the reason, because a
+  // tool host that was never given the store answers differently from a search that came
+  // up empty, and the transcript should not flatten those two into one grey row.
+  recall: { run: 'Recalling memory', done: 'Recalled', bad: 'Could not reach the conversation store' },
+  // The model asking what else this app can do. Worth its own words because in lean mode it
+  // is the door to every capability the transcript has not shown yet, and the row is where a
+  // person sees that a tool appeared partway through a turn.
+  explore: { run: 'Looking through the tool set', done: 'Found the tools', bad: 'Could not read the tool set' },
   ask_user: { run: 'Asked you something', done: 'Asked you something', bad: 'Asked you something' },
 }
 

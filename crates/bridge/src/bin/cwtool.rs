@@ -26,10 +26,12 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cwoffee_engine::approval::ApprovalMode;
 use cwoffee_engine::config::Config;
 use cwoffee_engine::tools::web::SearchBackend;
+use cwoffee_engine::store::Store;
 use cwoffee_engine::tools::{ExecCfg, ExecChunk, Registry, Risk, ToolCtx};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -96,7 +98,77 @@ fn mode() -> ApprovalMode {
     }
 }
 
+/// The app's conversation store, when the host said where it lives.
+///
+/// `recall` reads the user's own history, and that history is a SQLite file the *host*
+/// opened. A tool host that was never handed the path has to say so: the alternative is a
+/// tool that reports "nothing matched" when the truth is "nobody was able to look", and a
+/// model that believes the first one stops looking.
+///
+/// The file must already exist. `Store::open` creates one, so a typo in an env var would
+/// otherwise produce an empty database beside the user's real history and a confident
+/// answer of "you have never discussed that".
+fn store_handle() -> Option<Arc<Store>> {
+    let raw = std::env::var("CWOFFEE_DB").unwrap_or_default();
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        eprintln!(
+            "[cwtool] CWOFFEE_DB is not set: the conversation store is unreachable, so `recall` refuses rather than reporting nothing found"
+        );
+        return None;
+    }
+    if !std::path::Path::new(&raw).is_file() {
+        eprintln!("[cwtool] CWOFFEE_DB points at {} which is not a database file: `recall` refuses", raw);
+        return None;
+    }
+    match Store::open(&raw) {
+        Ok(st) => Some(Arc::new(st)),
+        Err(e) => {
+            eprintln!("[cwtool] the conversation store at {raw} could not be opened ({e}): `recall` refuses");
+            None
+        }
+    }
+}
+
+/// Which conversation is asking, resolved from pi's own session file through the bridge's
+/// session map. "Unknowable" is a legitimate answer — one pi process serves several
+/// conversations, and the map may not know this one yet — so the tool says which claim it
+/// cannot make rather than guessing at one.
+fn asking_session() -> Option<i64> {
+    let file = std::env::var("CWOFFEE_PI_SESSION_FILE").unwrap_or_default();
+    let map = std::env::var("CWOFFEE_PI_SESSION_MAP").unwrap_or_default();
+    if file.trim().is_empty() || map.trim().is_empty() {
+        return None;
+    }
+    let me = std::fs::canonicalize(file.trim()).ok()?;
+    let text = std::fs::read_to_string(map.trim()).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let rows = v.get("by_row").and_then(Value::as_object)?;
+    for (row, path) in rows {
+        let Some(p) = path.as_str() else { continue };
+        if std::fs::canonicalize(p).ok().as_deref() == Some(me.as_path()) {
+            if let Ok(id) = row.trim().parse::<i64>() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// The search provider and exec policy, read the way the host reads them. `explore` builds
+/// its tool cards from these, so a card has to describe the tool the user actually mounted
+/// (a SearXNG search described as DuckDuckGo is a wrong claim in a tool result).
+fn cfg_for_tools() -> ExecCfg {
+    let (c, _) = cwoffee_engine::config::Config::load(None).unwrap_or_default();
+    c.exec_cfg()
+}
+
 fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
+    let store = store_handle();
+    let search_backend = {
+        let (c, _) = cwoffee_engine::config::Config::load(None).unwrap_or_default();
+        c.search_backend()
+    };
     ToolCtx {
         workspace: workspace(),
         // The Rust core's host uses 24 KiB (`SessionHost`'s ToolCtx). Match it exactly:
@@ -107,6 +179,10 @@ fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
         ask: None,
         events: None,
         question_timeout: None,
+        store,
+        session: asking_session(),
+        search_backend,
+        exec_cfg: cfg_for_tools(),
         permits,
     }
 }

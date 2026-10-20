@@ -62,6 +62,35 @@ pub struct PromptBuilder {
 /// attributed to a specific change rather than appearing as mysterious slowness.
 pub const SYSTEM_VERSION: &str = "cwoffee-v1";
 
+/// What the model is told about the tool set when it is *not* given the whole set.
+///
+/// The wording has to close the loop the short menu opens: a model that is not shown a tool
+/// will conclude the app cannot do the thing, unless the prompt says, in the same breath,
+/// that the list it sees is a subset and that there is a way to the rest. The last sentence
+/// matters most: a discovery tool the model never reaches for is a wasted declaration.
+pub const TOOL_DISCOVERY_NOTE: &str = "Tool set:
+- Only some tools are listed to you. Absence from the list does not mean the app cannot do something.
+- When a job needs a capability you were not given, call `explore` with the job in a few words; it searches the app's whole tool set, names the closest tools, and makes them callable from your next call.
+- If a job is ambiguous in a way the person could settle in one sentence, `explore` can find the tool for asking them. Do not guess at a tool name you were not given.";
+
+/// The coworker prompt, as one string, for any core.
+///
+/// Both cores used to describe the job differently: the Rust core sent `cwoffee-v1`, the pi
+/// core sent pi's own coding-harness preamble (measured by `scripts/gateway-prompt-shape.mjs`
+/// - 3.2 KB of instructions about reading files, running commands and reading pi's docs). A
+/// coworker that changes core also changes what it is told about its own job, which is how a
+/// model ends up offering to run shell commands in a mode that has no shell tool.
+pub fn cowork_prompt_text(lean_tools: bool) -> String {
+    let mut p = system_prompt();
+    if lean_tools {
+        p.push_str("
+
+");
+        p.push_str(TOOL_DISCOVERY_NOTE);
+    }
+    p
+}
+
 /// What the prompt costs, as the thing that builds it measured it.
 ///
 /// Shared (behind a mutex) between the agent and the host so a client reading
@@ -567,6 +596,29 @@ pub struct TurnRecord {
 
 #[cfg(test)]
 mod tests {
+    /// The discovery note has to say three things, or the short menu becomes a lie about
+    /// what the app can do: the list is a subset, there is a way to the rest, and the way is
+    /// named. Asserting the words is asserting the claims, and asserting the *absence* of the
+    /// note in full mode is what keeps a mode that declares everything from telling the model
+    /// that it must go looking.
+    #[test]
+    fn the_short_menu_comes_with_the_way_back_to_the_long_one() {
+        let lean = cowork_prompt_text(true);
+        let full = cowork_prompt_text(false);
+        assert!(lean.contains("explore"), "the note must name the tool");
+        assert!(lean.contains("does not mean"), "the note must say absence is not inability");
+        assert!(lean.contains("from your next call"), "the note must say when the tools arrive");
+        assert!(!full.contains("explore"), "a full tool set gets no instruction to go looking");
+        assert!(full.len() < lean.len());
+        // The note is a per-turn tax on every lean session, so its own size is what is
+        // bounded - not the whole prompt, which is already bounded by its own test.
+        let added = lean.len() - full.len();
+        assert!(
+            added < 620,
+            "the discovery note costs {added} B on top of the coworker prompt: {TOOL_DISCOVERY_NOTE}"
+        );
+    }
+
     use super::*;
 
     fn built() -> PromptBuilder {

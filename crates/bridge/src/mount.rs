@@ -223,6 +223,103 @@ pub async fn probe_window(provider: &dyn cwoffee_engine::provider::Provider, mod
         .and_then(|m| m.context_tokens)
 }
 
+/// Mount every endpoint the model screen registered, so a model picked on the screen is a
+/// model pi can actually reach.
+///
+/// Without this, `set_model("box/qwen3-4b")` on the pi core names a model pi has never heard
+/// of: the screen would offer a choice the core cannot honour, and the failure would surface as
+/// a provider error far from the click that caused it. The chosen endpoint's own entry is
+/// written by `write_dev_provider`; this covers the rest, and only the rest.
+///
+/// A removed endpoint row leaves its pi entry behind. That is deliberate bookkeeping-shyness:
+/// cwoffee's model list comes from cwoffee's config, so a leftover entry is unreachable from
+/// the app, and deleting files behind a row the user already deleted is the sort of surprise
+/// that costs somebody their hand-written provider.
+pub fn mount_provider_rows(
+    agent_dir: &Path,
+    cfg_path: &Path,
+) -> anyhow::Result<Vec<String>> {
+    let rows = cwoffee_engine::config::provider_rows_in(cfg_path);
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known: Vec<(String, cwoffee_engine::config::ModelRow)> =
+        cwoffee_engine::config::model_rows_in(cfg_path);
+    std::fs::create_dir_all(agent_dir)?;
+    let path = agent_dir.join("models.json");
+    let mut doc: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str(&t)?,
+        Err(std::io::Error { .. }) => serde_json::json!({}),
+        Err(e) => return Err(anyhow::anyhow!("{} is not JSON: {e}", path.display())),
+    };
+    if !doc.is_object() {
+        return Err(anyhow::anyhow!("{} is not a JSON object", path.display()));
+    }
+    let providers = doc
+        .as_object_mut()
+        .expect("object")
+        .entry("providers")
+        .or_insert_with(|| serde_json::json!({}));
+    let mut mounted = Vec::new();
+    for (name, row) in &rows {
+        let api = match row.kind.as_str() {
+            "anthropic" => "anthropic-messages",
+            _ => "openai-completions",
+        };
+        let mut models = Vec::new();
+        for id in &row.models {
+            // cwoffee ids are `provider/model`; pi's entry id is the bare model under its
+            // provider, so the two spellings have to agree at the seam.
+            let bare = id.split_once('/').map(|(_, m)| m).unwrap_or(id.as_str());
+            if bare.is_empty() {
+                continue;
+            }
+            let facts = known.iter().find(|(mid, _)| mid == id).map(|(_, r)| r.clone());
+            let mut entry = serde_json::json!({ "id": bare });
+            let vision = facts.as_ref().and_then(|f| f.supports_vision);
+            entry["input"] = serde_json::json!(match vision {
+                Some(false) => vec!["text"],
+                // Unknown or yes: cwoffee accepts image attachments, and pi drops a picture
+                // quietly if the entry says text-only. A model that truly cannot see images
+                // answers the request with an error the user can read, which is better than a
+                // picture that disappears.
+                _ => vec!["text", "image"],
+            });
+            if let Some(w) = facts.as_ref().and_then(|f| f.context_window) {
+                entry["contextWindow"] = serde_json::json!(w);
+                let cap = (w / 2).max(1);
+                entry["maxTokens"] = serde_json::json!(cap);
+            }
+            models.push(entry);
+        }
+        if models.is_empty() {
+            continue;
+        }
+        let mut entry = serde_json::json!({
+            "baseUrl": row.base_url,
+            "api": api,
+            "apiKey": if row.api_key.trim().is_empty() { "__cwoffee_no_key".to_string() } else { row.api_key.clone() },
+            "models": models,
+        });
+        if row.api_key.trim().is_empty() {
+            // pi reads `apiKey` as a literal or an env reference. An empty string makes it send
+            // an empty Authorization header, which some servers reject; leaving the field out
+            // means "no key", which is what a local server expects.
+            entry.as_object_mut().unwrap().remove("apiKey");
+        }
+        providers
+            .as_object_mut()
+            .expect("object")
+            .insert(name.clone(), entry);
+        mounted.push(format!("{name} ({} model(s))", models.len()));
+    }
+    let body = serde_json::to_string_pretty(&doc)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(mounted)
+}
+
 pub fn write_dev_provider(
     agent_dir: &Path,
     provider: &str,
@@ -327,6 +424,46 @@ mod tests {
         write_dev_provider(&other, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(9)).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&other.join("models.json")).unwrap()).unwrap();
         assert_eq!(doc["providers"]["cwoffee"]["baseUrl"].as_str(), Some("http://127.0.0.1:8090/v1"), "ours was replaced, not theirs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The model screen registers endpoints; pi has to be able to reach them or "use this
+    /// model" is a button that cannot work.
+    #[test]
+    fn every_registered_endpoint_becomes_a_provider_pi_can_reach() {
+        let root = std::env::temp_dir().join(format!("cw-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = root.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[provider]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"here/m1\"\n\n[providers.\"box\"]\nkind = \"llama.cpp\"\nbase_url = \"http://192.168.0.122:8080/v1\"\napi_key = \"\"\nmodels = [\"box/qwen3-4b\", \"box/vision-7b\"]\n\n[models.\"box/qwen3-4b\"]\ncontext_window = 131072\nsupports_vision = false\nsource = \"probed\"\n\n[models.\"box/vision-7b\"]\ncontext_window = 8192\nsupports_vision = true\n",
+        )
+        .unwrap();
+        // The chosen endpoint first, the way boot does it.
+        write_dev_provider(&root, "here", "http://127.0.0.1:9/v1", "m1", "k", "openai-completions", Some(262144)).unwrap();
+        let mounted = mount_provider_rows(&root, &cfg).unwrap();
+        assert_eq!(mounted, vec!["box (2 model(s))".to_string()], "{mounted:?}");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("models.json")).unwrap()).unwrap();
+        // Both endpoints are in the file, and the chosen one is still there on its own baseUrl.
+        assert_eq!(doc["providers"]["here"]["baseUrl"].as_str(), Some("http://127.0.0.1:9/v1"));
+        let boxp = &doc["providers"]["box"];
+        assert_eq!(boxp["baseUrl"].as_str(), Some("http://192.168.0.122:8080/v1"));
+        assert_eq!(boxp["api"].as_str(), Some("openai-completions"), "a llama.cpp server speaks the openai wire");
+        assert!(boxp.get("apiKey").is_none(), "an endpoint with no key must not get an empty one");
+        let small = &boxp["models"][0];
+        assert_eq!(small["id"].as_str(), Some("qwen3-4b"), "pi's id is bare under its provider");
+        assert_eq!(small["contextWindow"].as_u64(), Some(131_072), "the stored window is what pi is told");
+        assert_eq!(small["input"].as_array().map(|a| a.len()), Some(1), "a probed text-only model is not shown taking images");
+        let eyes = &boxp["models"][1];
+        assert_eq!(eyes["input"].as_array().map(|a| a.len()), Some(2));
+        // Rerunning boot is idempotent: the same row mounts once, not twice.
+        let again = mount_provider_rows(&root, &cfg).unwrap();
+        assert_eq!(again, mounted);
+        let doc2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("models.json")).unwrap()).unwrap();
+        assert_eq!(doc2["providers"]["box"]["models"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1437,6 +1437,94 @@
      "delay_ms": 12
     }
    ]
+  },
+  {
+   "name": "recall-seed",
+   "_why": "a conversation worth remembering: the recall gate needs something true to find, so a distinctive word goes into one conversation first",
+   "match": "SEED THE MEMORY",
+   "steps": [
+    {
+     "content": "Noted. mangosteen, understood.",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 5
+    }
+   ]
+  },
+  {
+   "name": "recall-other",
+   "_why": "memory across conversations: the model asks what was said elsewhere and the answer has to come out of the app's own store. The require strings only pass if the other conversation's title and word arrive in the tool's own output — a model that simply guesses at a memory cannot satisfy them",
+   "match": "RECALL GATE",
+   "steps": [
+    {
+     "reasoning": "Something from another conversation. There is a tool for that.",
+     "tool_calls": [
+      {
+       "id": "mock-recall-1",
+       "name": "recall",
+       "arguments": "{\"query\":\"mangosteen\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "_why": "the tool's own words, not the model's paraphrase: the other conversation's title and the seeded word have to be in the result the engine put in the prompt",
+     "_note": "only strings both gates can produce: the search phrase, the engine's own count line, and the exclusion claim. Conversation titles differ between gates and are asserted by each gate against its own store, not here.",
+     "require": [
+      "mangosteen",
+      "passage(s) matching",
+      "itself is left out"
+     ],
+     "content": "RECALL DONE",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 10
+    }
+   ]
+  },
+  {
+   "name": "explore-then-use",
+   "_why": "the short menu has to be survivable: the model asks for a capability it was not given, the registry answers, the host makes the tool callable, and then the model uses it. The require strings are the three claims in that chain — the discovery answer, the host signing for the activation, and text only the discovered tool itself could produce.",
+   "match": "EXPLORE GATE",
+   "steps": [
+    {
+     "reasoning": "The tool set I was given does not include reading a file. There is a tool for finding the right tool.",
+     "tool_calls": [
+      {
+       "id": "mock-explore-1",
+       "name": "explore",
+       "arguments": "{\"need\":\"read the README file in this folder\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "reasoning": "read_file is available now. Use it.",
+     "tool_calls": [
+      {
+       "id": "mock-read-9",
+       "name": "read_file",
+       "arguments": "{\"path\":\"README.md\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "_why": "the fixture text proves the discovered tool really ran; the host line proves the activation was reported to the model rather than only performed",
+     "require": [
+      "tool(s) fit",
+      "made callable from your next call",
+      "Nothing here is precious"
+     ],
+     "content": "EXPLORE DONE",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 10
+    }
+   ]
   }
  ]
 }
