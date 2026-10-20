@@ -254,11 +254,14 @@ impl Tool for DownloadTool {
     }
 
     fn description(&self) -> &str {
-        "Download a URL and save it verbatim into the workspace. Use this instead \
-         of web_fetch when the goal is to obtain a file (docs dump, PDF, archive, \
-         CSV, JSON blob) rather than to read a page: web_fetch strips markup and \
-         truncates, this preserves bytes. Read the result back with read_file. \
-         Returns the saved path, byte count and content type."
+        "Download a URL and save it verbatim. Use this instead of web_fetch when \
+         the goal is to obtain a file (docs dump, PDF, archive, CSV, JSON blob) \
+         rather than to read a page: web_fetch strips markup, this preserves bytes. \
+         The file lands under `.cws/` unless you pass \"place\": \"keep\" — that is \
+         the workspace's scratch folder, and reference material you fetched for \
+         yourself should not litter the person's folder or their git status. Use \
+         \"keep\" for the file they asked you to get. Read it back with read_file; \
+         the result gives the saved path, byte count and content type."
     }
 
     fn schema(&self) -> Value {
@@ -273,6 +276,11 @@ impl Tool for DownloadTool {
                 "overwrite": {
                     "type": "boolean",
                     "description": "Replace the destination if it already exists. Default false."
+                },
+                "place": {
+                    "type": "string",
+                    "enum": ["scratch", "keep"],
+                    "description": "\"scratch\" (default) saves under `.cws/` in the workspace; \"keep\" saves where `path` says, in the person's view. Only choose \"keep\" for a file they asked for."
                 }
             },
             "required": ["url"]
@@ -287,16 +295,33 @@ impl Tool for DownloadTool {
     /// exists* is not, and neither is writing outside the workspace. Same split
     /// as write_file: creating is the job, replacing needs a yes.
     fn risk_for(&self, args: &Value, ctx: &ToolCtx) -> CallRisk {
-        let raw = args
+        let requested = args
             .get("path")
             .and_then(|v| v.as_str())
             .map(|p| p.to_string())
             .unwrap_or_default();
-        if raw.is_empty() {
-            // No path given means "the URL's file name, inside the workspace",
-            // which confine will resolve; be conservative and treat it as a write.
-            return CallRisk::at(Risk::Workspace);
-        }
+        let requested = if requested.is_empty() {
+            // No `path` does not mean no destination. The tool is going to use the URL's
+            // file name, so the verdict can name it, and naming it is what makes the
+            // verdict honest: the old conservative answer ("a write, somewhere") opened a
+            // card whose summary read `-> ???`, which asks a person to approve a file they
+            // cannot see the name of.
+            match args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .and_then(|u| url::Url::parse(u).ok())
+                .map(|u| default_filename(&u))
+            {
+                Some(name) => name,
+                None => return CallRisk::at(Risk::Workspace),
+            }
+        } else {
+            requested
+        };
+        // The same resolver the write uses, so the card describes the file that is
+        // actually written: a permission prompt about one path and a write to another is
+        // not a permission prompt.
+        let raw = super::scratch::destination_for(&requested, super::scratch::Place::of(args));
         let resolved = super::path::lexical_resolve(&ctx.workspace, &raw);
         if resolved != super::path::lexical_resolve(&ctx.workspace, ".")
             && !resolved.starts_with(super::path::lexical_resolve(&ctx.workspace, "."))
@@ -326,6 +351,13 @@ impl Tool for DownloadTool {
             Some(p) => p.to_string(),
             None => default_filename(&url),
         };
+        let place = super::scratch::Place::of(&args);
+        let requested = super::scratch::destination_for(&requested, place);
+        if place == super::scratch::Place::Scratch {
+            if let Err(e) = super::scratch::ensure_scratch(&ctx.workspace) {
+                return ToolResult::err(e);
+            }
+        }
         let dest = match super::path::confine_permitted(&ctx.workspace, &requested, &ctx.permits) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
@@ -416,13 +448,22 @@ impl Tool for DownloadTool {
             // A download is a deliverable whatever it is named: the name came from
             // a URL or the model's choice, so extension-guessing is the weaker fact
             // here and the act of fetching is the stronger one.
-            kind: super::FileKind::Artifact,
+            // The placement, not the extension: a reference PDF the model fetched for
+            // itself is not a deliverable the person asked for, and the transcript should
+            // not put it in the same strip as the file they asked to be built.
+            kind: if place == super::scratch::Place::Scratch {
+                super::FileKind::Scratch
+            } else {
+                super::FileKind::Artifact
+            },
         };
+        let note = super::scratch::place_note(place, &rel);
         ToolResult::ok(format!(
-            "saved {} to {} ({})",
+            "saved {} to {} ({})\n{}",
             human_bytes(written),
             rel,
-            file.mime
+            file.mime,
+            note
         ))
         .with_file(file)
     }
@@ -1056,6 +1097,89 @@ mod tests {
     use super::*;
     use crate::tools::ToolCtx;
     use tokio::sync::mpsc;
+
+    /// The verdict has to describe the file the tool will actually write. If risk_for
+    /// resolved the destination separately from run(), the card would approve one path and
+    /// the tool would create another — and with `.cws` in play that is no longer
+    /// hypothetical, because the destination now depends on an argument.
+    #[test]
+    fn a_reference_download_is_a_write_inside_the_scratch_folder_and_says_so() {
+        let ws = std::env::temp_dir().join(format!("cw-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let ctx = ToolCtx {
+            workspace: ws.clone(),
+            ..ToolCtx::default()
+        };
+        let t = DownloadTool::default();
+        // A fetch of a file that is not there yet is the job, not the risk — in the
+        // scratch folder or anywhere else in the workspace. This used to read `Workspace`
+        // because no `path` was given; the verdict now names the destination the tool will
+        // use, which is what makes the calmer answer defensible.
+        let r = t.risk_for(&serde_json::json!({ "url": "http://x/a.pdf" }), &ctx);
+        assert_eq!(r.level, super::super::Risk::Harmless, "{r:?}");
+        assert!(r.escapes.is_empty(), "no escape: the file goes inside the workspace");
+        // A path the person was shown stays the path they were shown: an absolute
+        // destination is refused as an escape even though scratch placement exists.
+        let r2 = t.risk_for(
+            &serde_json::json!({ "url": "http://x/a.pdf", "path": "/etc/passwd" }),
+            &ctx,
+        );
+        assert_eq!(r2.level, super::super::Risk::Sensitive, "{r2:?}");
+        assert!(
+            r2.escapes.iter().any(|e| e.ends_with("/etc/passwd")),
+            "the card names the real destination: {:?}",
+            r2.escapes
+        );
+        // "keep" is the one that puts a file in the person's view, so an existing
+        // destination under it is still a replace, still a workspace write.
+        std::fs::write(ws.join("notes.md"), "theirs").unwrap();
+        let r3 = t.risk_for(
+            &serde_json::json!({ "url": "http://x/a", "path": "notes.md", "place": "keep" }),
+            &ctx,
+        );
+        assert_eq!(r3.level, super::super::Risk::Workspace, "{r3:?}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A download with no `path` still has a destination, and the verdict has to name it.
+    /// The old answer was a conservative `Workspace` — which opened a card reading
+    /// `download http://x/a.pdf -> ???`, asking for permission over a name nobody could see.
+    #[test]
+    fn a_download_with_no_path_is_still_a_verdict_somebody_can_read() {
+        let ws = std::env::temp_dir().join(format!("cw-dl3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let ctx = ToolCtx {
+            workspace: ws.clone(),
+            ..ToolCtx::default()
+        };
+        let t = DownloadTool::default();
+        let r = t.risk_for(&serde_json::json!({ "url": "http://example.com/a.pdf" }), &ctx);
+        assert!(
+            r.level == super::super::Risk::Harmless && r.escapes.is_empty(),
+            "a new file under .cws asks nothing, and says nothing is being escaped: {r:?}"
+        );
+        // A url nobody can name a file from keeps the conservative answer: the destination
+        // is genuinely unknown, so "this is a write" is the most that can be said.
+        let r2 = t.risk_for(&serde_json::json!({ "url": "not a url" }), &ctx);
+        assert_eq!(r2.level, super::super::Risk::Workspace, "{r2:?}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// The placement note is model-facing text: it has to say where the file went and
+    /// what to do if the person actually wanted it. "saved to .cws/x" alone leaves the
+    /// model guessing whether it just hid the deliverable.
+    #[test]
+    fn the_placement_is_explained_in_the_words_the_model_reads() {
+        use crate::tools::scratch::{place_note, Place};
+        let s = place_note(Place::Scratch, ".cws/a.pdf");
+        assert!(s.contains(".cws/"), "{s}");
+        assert!(s.contains("place"), "the model needs the way back: {s}");
+        let k = place_note(Place::Keep, "a.pdf");
+        assert!(k.contains("workspace proper"), "{k}");
+        assert!(k.contains(".cws"), "the keep note still names the alternative: {k}");
+    }
 
     fn sink() -> ExecSink {
         mpsc::unbounded_channel().0

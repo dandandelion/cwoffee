@@ -100,6 +100,55 @@ derived ceiling and pi's own fold threshold are all rebuilt from it. A model pro
 running keeps the window it started with — the next one reads what you saved.
 
 
+### Where the model's own files go
+
+Every folder cwoffee has ever worked in ends up with the model's leftovers in it: a fetched PDF,
+a scratch `helper.py`, three CSVs it parsed on the way to an answer, filed among your own files
+and showing up in `git status` like your work.
+
+A file the model wants **for itself** now goes under `<workspace>/.cws/` — a normal, hidden
+subdirectory of the workspace, with its own `.gitignore` saying `*` so none of it ever appears as
+untracked work. A file you asked for lands where you asked for it. `download_file` defaults to the
+scratch folder, and the model has to say `"place": "keep"` to put something in your view; the tool
+answers in words either way, so you can see which decision was made:
+
+```
+saved 45 B to .cws/reference.pdf (application/pdf)
+.cws/reference.pdf is under .cws/ — cwoffee's scratch folder, for files the model fetched for its
+own use. If the person asked you for this file, move it into the workspace proper or fetch it
+again with "place": "keep".
+```
+
+Reference files are kept out of the deliverable strip in the transcript and folded into one line —
+`2 reference files` — which expands to chips you can still open. Hidden is not gone: reading them
+back with `read_file` works by name, `ls -a` finds the folder, and nothing about the confinement
+rules changes (`.cws` is inside the workspace, so a call reaching outside it is refused the same
+way as any other escape).
+
+The `.py` half of the clutter is the model's choice of path, so it is a rule in the prompt rather
+than a wall in a tool: scaffolding you did not ask for — a script to run, a scratch dump — belongs
+under `.cws/`. Nothing deletes `.cws` automatically yet; it is a folder you can empty whenever you
+like.
+
+### The working surface, folded
+
+A turn that made nine tool calls used to print nine one-line cards, each with its own triangle,
+and the answer you came for sat below all of them. Consecutive thinking and tool calls now share
+**one accordion per run**, and the only thing that divides two accordions is the model's own
+message text: a run is everything it did between two things it said.
+
+The header is a live claim, not a label — `Thinking` while it reasons, `Working on your computer`
+once tools start, and once the answer lands, `Thought, then worked on your computer · 6 steps`.
+Open it and the entries are lines: the call, what it touched, whether it worked. One control —
+`show outputs` — reveals what the whole run produced, instead of nine triangles to aim at. While a
+call is still running its output peeks out on its own, because a header sitting motionless for
+forty seconds on a local model reads as a hang.
+
+Folding is CSS, not deletion: the arguments, output and diffs of a finished call are still in the
+page, so a search finds them and the app's own harness can still assert what a tool said. The
+stored transcript groups itself the same way — a conversation you left and came back to looks the
+way you remember it working.
+
 ## Run it
 
 ```bash
@@ -851,6 +900,15 @@ but not usable:
 
 Every tool call is classified per call, not per tool, because the same tool is not
 equally dangerous twice:
+
+What does **not** ask: fetching a file that is not there yet. A download that replaces nothing is
+the tool doing its job, and the verdict says so by naming the destination it resolved — the URL's
+file name, under `.cws/` unless `place: "keep"` was passed. The old verdict answered "a write,
+somewhere" and produced a card reading `download http://example.com/a.pdf -> ???`, which asked a
+person to approve a file whose name was withheld from them. A download that *would* replace an
+existing file still asks, and a path that reaches outside the workspace still asks, whatever
+`place` says.
+
 
 | class | example | `ask` mode |
 |---|---|---|

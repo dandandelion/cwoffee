@@ -269,8 +269,14 @@ async fn apply_context_budget(
         g.compactions = compactions;
         g.tokens = agent.prompt_mut().estimate_tokens("");
     }
+    // The ceiling, where it came from, and the window it was derived against are one
+    // claim, so they are written in one lock. A reader that caught this between the
+    // writes saw `budget_pin: None` next to the *old pinned* number — which is neither
+    // the setting nor the derivation, and the page harness caught it reporting exactly
+    // that. A state a client can read half-updated is a state that lies.
     let mut s = state.lock().unwrap();
     s.context_budget = budget;
+    s.budget_pin = pinned;
     s.model_window = window;
     drop(s);
     if announce {
@@ -915,7 +921,9 @@ impl SessionHost {
 
                     HostCmd::SetContextBudget { target } => {
                         budget_pin = target;
-                        state_bg.lock().unwrap().budget_pin = target;
+                        // `apply_context_budget` writes the pin, the budget and the window
+                        // together; writing the pin here first is what let a client read a
+                        // freed pin next to the number it had just stopped meaning.
                         // Announced, because a ceiling that moves without saying so is
                         // indistinguishable from the meter being wrong.
                         apply_context_budget(

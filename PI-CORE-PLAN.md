@@ -1210,6 +1210,83 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     model the app never probed be displayed as one that cannot take tools — and the model choice
     is made off that chip.
 
+115. **A destination has to be resolved once, by one function, for both the verdict and the
+    write.** `.cws` placement makes this load-bearing in a new way: `download_file`'s risk verdict
+    and its write both compute where the file lands. If they did it separately, an approval card
+    could describe `notes.md` while the tool wrote `.cws/notes.md` — a permission prompt for a
+    path nobody was shown. `scratch::destination_for(raw, place)` is the only resolver, `risk_for`
+    calls it and `run` calls it, and the test asserts the escaping absolute path is still reported
+    as the escape (prefixing an absolute path with `.cws/` would rewrite a request the person was
+    shown, which is exactly what a card exists to prevent).
+
+116. **What kind a file is has a placement half.** `kind_for` used to read the extension. A PDF is
+    a deliverable — unless it is at `.cws/reference.pdf`, where it is the model's reference
+    material and belongs in a different shape in the transcript. Placement outranks extension, and
+    that also catches the scaffolding case the user complained about: `write_file` of
+    `.cws/fetch.py` gets the same treatment as a fetched copy, without that tool having to know
+    the rule.
+
+117. **Folding is a CSS fact, not a deletion — and the app's own harness depends on it.** The run
+    accordion hides entry contents with `display:none`; the arguments, output and diffs stay in the
+    document, so `folder delete`, `recall` and the stored-transcript cases still read them. The
+    case that made this explicit asserts the output text is still in the page after the run folds:
+    `output still in the page`. If a later change swaps CSS for not-rendering, those cases go red
+    for the right reason.
+
+118. **Closing a run and folding a run are two acts, and a page case found the difference.** The
+    first version ended a run when the model said something but left it open, so a turn that
+    narrated twice stacked two open accordions above the answer — and the next case, clicking the
+    header to *open* an already-open run, closed it and measured a zero-width thinking block
+    (`expanded thinking block has no width: 0`). The chain diagnostic in that case printed
+    `blk-run.show-out < blk-body.run-body[display:none]`, which is the whole bug in two classes.
+    A run now ends and folds at the same moment.
+
+119. **Live and stored transcripts need the same builder, and a page boundary has to close the
+    last group.** `mkRun()` is shared by both paths on purpose. The history half had its own bug:
+    a stored page that ends mid-run never called `endRun()`, so the run's header was never painted
+    — an empty label where "Worked on your computer · 4 steps" belongs. An accordion with no
+    header reads as an empty accordion.
+
+120. **Folding content underneath a reader changes the height under them.** `follow()` after
+    collapsing a settled run, or the view ends up 204px short of the bottom at exactly the moment
+    the turn finishes — the frame-cadence case reported it as `the view finished 204px short of the
+    bottom`, which looks like a scroll bug and is a layout bug wearing one.
+
+121. **Creating a file is the job; replacing one is the risk — and the placement is what the
+    verdict follows.** A download of a file that does not exist yet is `harmless` whether it lands
+    in `.cws/` or in the workspace proper, so the reference-download case asks nothing. The
+    scratch gate counts approval cards and fails if any opened, because a card for a new file is
+    the noise this feature exists to remove — and if a future change ties risk to the folder name
+    rather than to the destination, that count is what notices.
+
+122. **A state a client can read half-updated is a state that lies.** `HostState` carries the
+    ceiling (`context_budget`) and how it was arrived at (`budget_pin`) as a pair, and the page
+    case for "derive it" caught a read where the pin was gone and the number was still the pinned
+    one — 87040 with `budget_pin: None`, which is neither the setting nor the derivation. The
+    `SetContextBudget` handler wrote the pin in one lock and let `apply_context_budget` write the
+    budget in a later one. Both fields (plus `model_window`) are now written in the same lock, and
+    the case polls the *pair* rather than one half of it. The bridge already wrote them together;
+    the Rust core had the window.
+
+123. **A conservative verdict that cannot name the destination is a card nobody can read.**
+    `download_file` with no `path` used to answer `Risk::Workspace` — "a write, somewhere" — which
+    opened a card summarising `download http://x/a.pdf -> ???`. The destination was knowable all
+    along (the URL's file name, now under `.cws/`), so the verdict computes it and the calm answer
+    ("a new file, in the workspace, nothing replaced") follows from the same resolver the write
+    uses. The gate counts approval cards and fails if any opens, because a prompt for a file that
+    replaces nothing is the noise this feature exists to remove. Unparseable URL keeps the
+    conservative answer: when the destination genuinely cannot be named, "this is a write" is the
+    most that can be claimed.
+
+124. **A fixture whose numbers move under you needs its premise moved onto the thing being
+    measured.** The big-transcript cadence case asserted that the mounted block count grows while
+    a big answer streams. It went flat (13,076 characters, 3 tables, `+0 blocks`) because the
+    older pages around the live turn are being pulled and repainted in the same window — and a
+    repaint of 168 stored rows can shed exactly as many wrappers as the new turn adds. The premise
+    now measures the turn that streamed: its answer's characters and tables. The mounted counts are
+    still printed, as context, because they are the thing that made the old assertion look
+    meaningful.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -1846,6 +1923,97 @@ was the light-theme icon; and go on with the harness plus the parity list.
 ---
 
 ---
+
+## Journal — session 22 (the model's leftovers get an address, and the working surface folds)
+
+**Claim:** two asks the user raised from using the app — workspaces full of the model's own
+temporary files, and a transcript that buries the answer under a wall of one-line cards — both
+landed, with a filesystem check behind the first and a page case behind the second.
+
+`.cws`, the scratch folder:
+
+- `crates/engine/src/tools/scratch.rs` owns the rule: the default for `download_file` is
+  `place: "scratch"`, which lands under `<workspace>/.cws/`; `place: "keep"` lands where the
+  model says, for the file the person actually asked for. One resolver, shared by the risk verdict
+  and the write (gotcha 115). `.cws/.gitignore` says `*`, so the model's leftovers never show up
+  as the person's untracked work.
+- The tool says what it did, in the model-facing text: `saved 45 B to .cws/reference.pdf
+  (application/pdf)` plus a sentence naming the folder, the reason, and the way back
+  (`"place": "keep"`). A placement the model is not told is a placement it cannot explain.
+- `kind_for` treats anything under `.cws` as `Scratch`, and the transcript puts reference files in
+  their own folded line (`2 reference files`) rather than the deliverable strip (gotcha 116).
+- The shared system prompt — the one both cores send — gained one line: a file you want for
+  yourself goes under `.cws/`; the folder proper is for the file they asked for. That is the half
+  that answers the `.py` clutter, which no tool enforces because the model chose those paths.
+- Tool-block cost of the rule, measured: `download_file` went 671 B → 1,189 B and the whole block
+  is 12,969 B for 13 tools. It is paid in full mode; in lean mode `download_file` sits behind
+  `explore` and costs nothing. The always-declared pair (`explore`, `recall`) costs 1,462 B.
+- Gate: `scripts/gateway-scratch.mjs` drives both calls from the scripted endpoint and checks the
+  **filesystem** — reference copy under `.cws/` with the served bytes, no twin at the root; the
+  requested file at the root, none under `.cws/`; the self-ignoring `.gitignore`; zero approval
+  cards; and the placement present in the tool's own rows.
+
+The run accordion:
+
+- Consecutive thinking and tool calls now share one collapsible accordion whose header is a live
+  claim — `Thinking`, `Working on your computer`, `Thought, then worked on your computer` — and
+  the only thing that divides two accordions is the model's own message text. Inside, an entry is
+  a line: one control per run (`show outputs`) reveals the contents of the whole run at once,
+  instead of a triangle per thought and per call.
+- Live and stored share `mkRun()`; the run that is *currently running* still shows its own output,
+  because a header sitting still for forty seconds on a local model reads as a hang.
+- Page case: `run accordion ok (two runs split by the answer, "Thought, then worked on your
+  computer", entries fold to lines, output still in the page)`. Four older cases that assumed a
+  per-entry expander were rewritten to the new affordance rather than deleted — the old behaviour
+  is what this replaced, and the rewritten cases assert both halves: the entry does not open on
+  its own, and the run's control does.
+
+The board after it (`verdict: ok`), with the new case and the rewritten ones:
+
+```
+[cwoffee/page] run accordion ok (two runs split by the answer, "Thought, then worked on your
+  computer", entries fold to lines, output still in the page)
+[cwoffee/page] ceiling ok (pinned 87040 from the panel and the meter followed, 900 refused as
+  "900 tokens is below the floor of 4096: a pro…", derive-it back to 131072 = half of 262144)
+[cwoffee/page] folder delete ok (2 shown under the folder, 3 really inside, all gone, other
+  folders untouched)
+[cwoffee/page] big transcript cadence: 329 blocks / 162 messages / 643429 characters mounted;
+  87 frames over 1616ms while a turn streamed, median 17.0ms, p95 37.0ms; idle x1.00
+```
+
+Still open after this session, said plainly:
+
+- **Lean tool exposure is still not real.** `scripts/gateway-prompt-shape.mjs --mode lean` says so:
+  `lean mode declared 13 tools … 12808 B — that is not a saving`. The registry owns the
+  always-declared set and the prompt says the list is a subset; what is missing is pi's
+  `defaultTools` written at mount, which is the only thing pi honours across a runtime rebuild.
+- The Model screen still has no page-harness case (the verbs have Rust coverage, the gestures
+  don't).
+
+What the scratch gate found, and what it let go:
+
+```
+SCRATCH GATE OK (pi: reference copy under .cws/, requested file in the folder proper, .cws ignores
+  itself in git; no card for a download that replaces nothing, and the placement stated in the
+  tool's own words)
+SCRATCH GATE OK (rust: … identical output, byte for byte)
+```
+
+Identical output on both cores is the point of running it twice: the placement, the wording and
+the verdict all live in the Rust registry, so the pi core's copy is not a translation.
+
+It went red before it went green, on the approval half: one card opened for the reference download.
+The cause was a conservative branch in `risk_for` — with no `path` argument it answered
+"this is a write, somewhere", and the card it produced read `download http://x/a.pdf -> ???`. The
+destination was knowable, the verdict now computes it through the same resolver the write uses, and
+the gate's card count is what would notice if a later change tied the verdict to the folder name
+instead of the destination (gotchas 122-123).
+- Live compaction on one genuinely large conversation remains unproven.
+
+Two facts about the user's own machine, noticed while checking the boot lines and deliberately not
+"fixed": `config.toml` carries `target_tokens = 196608`, so the ceiling is pinned rather than
+derived (the panel says "pinned by you"; one press of *derive it* frees it), and the same section
+has `max_tool_output = 8000` while both cores cap a tool's output at 24 KB.
 
 ## Journal — session 21 (a folder that deletes, and endpoints you can add)
 

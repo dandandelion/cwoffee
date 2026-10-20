@@ -3170,3 +3170,134 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   .set-hint { display: none; }
   .set-group { display: none; }
 }
+
+/* ---- the run accordion --------------------------------------------------
+   Consecutive thinking and tool calls share one accordion, and what divides one
+   run from the next is the model's own message text. Inside a run an entry is a
+   line: the run's header says what it is doing, and one control reveals what
+   came out of the entries.
+
+   Hiding is a CSS fact, not a deletion. The arguments and output stay in the
+   document, so a text search of the page and the app's own harness still reach
+   them; what went away is the wall of one-line cards, not the record.
+   -------------------------------------------------------------------------- */
+.blk-run {
+  display: block;
+  margin: 12px 0 14px;
+  padding-left: 12px;
+  border-left: 2px solid var(--color-shell);
+}
+.blk-run > .blk-head {
+  position: static;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: var(--color-shell-deep);
+  font-weight: 600;
+}
+.blk-run > .blk-head::after {
+  content: '\25B8';
+  color: var(--color-shell);
+  font-size: 11px;
+}
+.blk-run > .blk-head.open::after {
+  content: '\25BE';
+}
+.run-count {
+  font-weight: 450;
+  font-size: 12px;
+  color: var(--color-shell);
+}
+.run-out {
+  margin-left: auto;
+  border: 1px solid var(--color-shell);
+  background: none;
+  color: var(--color-shell-deep);
+  border-radius: 999px;
+  padding: 1px 9px;
+  font-size: 11px;
+  line-height: 1.6;
+  cursor: pointer;
+}
+.run-out.on {
+  background: var(--color-shell);
+}
+.run-out:hover {
+  border-color: var(--color-shell-deep);
+}
+.run-body {
+  display: none;
+  padding-top: 2px;
+}
+.blk-run.open .run-body {
+  display: block;
+}
+.run-body > .blk {
+  margin: 4px 0;
+}
+.run-body > .blk > .blk-head {
+  font-weight: 500;
+}
+/* A finished thought inside a run is its duration line. The text underneath is
+   the run's to reveal, not each block's to negotiate. */
+.run-body .blk-reasoning .blk-body {
+  display: none;
+}
+/* The thought that is happening right now shows itself: a header sitting still
+   for forty seconds on a local model reads as a hang, and it is the one moment
+   where the moving text is the point. */
+.run-body .blk-reasoning .blk-body.streaming {
+  display: block;
+  max-height: 8.4em;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
+}
+.blk-run.show-out .run-body .blk-reasoning .blk-body {
+  display: block;
+  max-height: 320px;
+  overflow: auto;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.blk-run.show-out .run-body .blk-tool:not(.is-open) .tool-detail {
+  display: block;
+  max-height: 320px;
+  overflow: auto;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+/* The card you are watching needs no `show outputs`: an open command with no
+   body looks stuck. That behaviour is the existing `.live` rule above. */
+.blk-run .blk-tool {
+  cursor: default;
+}
+
+/* ---- reference files: what the model kept for itself --------------------- */
+.refgroup {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.refhead {
+  border: 1px dashed var(--color-shell);
+  background: none;
+  color: var(--color-shell-deep);
+  border-radius: 8px;
+  padding: 2px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.refhead.open {
+  border-style: solid;
+}
+.reflist {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.filechip.ref {
+  opacity: 0.78;
+  font-style: italic;
+}

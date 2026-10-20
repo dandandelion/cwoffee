@@ -60,7 +60,7 @@ pub struct PromptBuilder {
 
 /// Bump when the system prompt text changes, so cache-miss regressions can be
 /// attributed to a specific change rather than appearing as mysterious slowness.
-pub const SYSTEM_VERSION: &str = "cwoffee-v1";
+pub const SYSTEM_VERSION: &str = "cwoffee-v2";
 
 /// What the model is told about the tool set when it is *not* given the whole set.
 ///
@@ -233,6 +233,7 @@ Tool use:
 - Call tools by name with JSON arguments exactly matching the schema.
 - Emit exactly one JSON object per tool call.
 - If you cannot do something, say so plainly rather than inventing an answer.
+- A file you want for yourself — a reference download, a fetched dataset, a script to run, a scratch dump — belongs under `.cws/` in the workspace, not among the person's files. Write into the folder proper only for the file they asked you for.
 
 {environment}"#
     )

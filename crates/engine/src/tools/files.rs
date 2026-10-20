@@ -297,7 +297,9 @@ impl Tool for WriteFileTool {
 
     fn description(&self) -> &str {
         "Write a text file inside the workspace. mode \"overwrite\" (default) replaces \
-         the file, \"append\" adds to the end. Parent directories are created."
+         the file, \"append\" adds to the end. Parent directories are created. \
+         Scaffolding the person did not ask for — a script to run, a scratch dump — goes \
+         under `.cws/`."
     }
 
     fn schema(&self) -> Value {

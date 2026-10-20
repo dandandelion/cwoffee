@@ -5053,17 +5053,26 @@
             if (head.getBoundingClientRect().height > 22)
               fail(`thinking head is not a single line: ${head.getBoundingClientRect().height}px`)
 
-            // Whole collapsed block is the click target, not just the label.
+            // Inside a run the entry is a line: clicking it reveals nothing, and the
+            // run's one control reveals the whole run. Both halves are asserted
+            // because the old behaviour - a triangle per thought - is what this replaced.
             body.click()
             await new Promise((r) => setTimeout(r, 120))
-            if (!body.classList.contains('expanded')) fail('clicking the thinking body did not expand it')
-            // Once open, only the label collapses it.
-            body.click()
-            await new Promise((r) => setTimeout(r, 120))
-            if (!body.classList.contains('expanded')) fail('clicking the body while expanded collapsed it')
-            head.click()
-            await new Promise((r) => setTimeout(r, 120))
-            if (body.classList.contains('expanded')) fail('clicking the label did not collapse it')
+            if (getComputedStyle(body).display !== 'none')
+              fail('clicking a thinking entry inside a run still expanded it on its own')
+            const trun = rblk.closest('.blk-run') as HTMLElement | null
+            if (!trun) fail('a thinking block in a live turn sits outside the run accordion')
+            else {
+              const out = trun.querySelector('.run-out') as HTMLElement
+              out.click()
+              await new Promise((r) => setTimeout(r, 200))
+              if (getComputedStyle(body).display === 'none')
+                fail('`show outputs` did not reveal the thought that was already over')
+              out.click()
+              await new Promise((r) => setTimeout(r, 200))
+              if (getComputedStyle(body).display !== 'none')
+                fail('`hide outputs` did not fold the thought back to its duration line')
+            }
           }
         }
       }
@@ -6390,8 +6399,19 @@
               // grown transcript is the plain cadence check with extra steps.
               const charsAfter = (document.querySelector('.transcript')?.textContent ?? '').length
               const blocksAfter = document.querySelectorAll('.transcript .blk').length
+              const byClass = (want: string) => document.querySelectorAll(`.transcript ${want}`).length
               const tables = document.querySelectorAll('.transcript table').length
               const grew = charsAfter - charsBefore
+              // The premise is about the turn that just streamed, so it is measured on
+              // that turn. A count over the whole mounted transcript can be flat while a
+              // big answer streams, because the older pages around it are being pulled and
+              // repainted at the same time - and a premise that fails for a reason off in
+              // the fixture is a check that will be argued about instead of believed.
+              const turnEls = [...document.querySelectorAll('.transcript .turn')] as HTMLElement[]
+              const lastTurn = turnEls[turnEls.length - 1]
+              const liveAnswer = lastTurn?.querySelector('.blk-answer .blk-body')
+              const liveChars = (liveAnswer?.textContent ?? '').length
+              const liveTables = liveAnswer?.querySelectorAll('table').length ?? 0
               if (cadDone && viewMsgCount < mountedMsgs)
                 fail(
                   `a turn started in ${sessH}, which was already on screen, and the view fell from ` +
@@ -6399,11 +6419,14 @@
                     `triggers handed back the default page instead of the window the reader had loaded. ` +
                     `This is "Load history disappears" - the rows arrive, and then a repaint elsewhere undoes them.`,
                 )
-              if (cadDone && (grew < 4000 || tables < 2 || blocksAfter <= blocksBefore))
+              if (cadDone && (grew < 4000 || liveChars < 4000 || liveTables < 2))
                 fail(
-                  `the big-transcript turn added ${grew} characters, ${blocksAfter - blocksBefore} blocks ` +
-                    `and ${tables} rendered table(s): a real answer streams thousands of deltas of headings, ` +
-                    `lists and tables, and the cadence check has to be measured against that`,
+                  `the big-transcript turn added ${grew} characters to the transcript and ${liveChars} of them, ` +
+                    `with ${liveTables} rendered table(s), in the answer that just streamed (mounted transcript: ` +
+                    `${tables} table(s), ${byClass('.blk-answer')} answers, ${byClass('.blk-run')} runs, ` +
+                    `${byClass('.blk-tool')} tool entries, ${blocksAfter - blocksBefore} net blocks): a real answer ` +
+                    `streams thousands of deltas of headings, lists and tables, and the cadence check has to be ` +
+                    `measured against that`,
                 )
               await invoke('set_reasoning', { level: 'medium' })
               const idleBig = await idleFrameSample(900)
@@ -6594,16 +6617,26 @@
                   if (!deriveBtn || deriveBtn.disabled) fail('the ceiling row has no live "derive it" control')
                   else {
                     deriveBtn.click()
+                    const wantBack = Math.max(4096, Math.floor(win / 2))
+                    // Both halves of the claim have to change, and they change together:
+                    // the pin going away and the number being re-derived are one decision.
+                    // Polling for the pair (bounded) is honest; polling for one field and
+                    // asserting the other is how this case once reported a mismatch the
+                    // host had never published.
                     let h3 = await invoke<HostState>('session_state')
-                    for (let i = 0; i < 40 && h3.budget_pin; i++) {
+                    let waitedMs = 0
+                    for (let i = 0; i < 40; i++) {
+                      if (h3.budget_pin === null || h3.budget_pin === undefined) {
+                        if (h3.context_budget === wantBack) break
+                      }
                       await new Promise((r) => setTimeout(r, 100))
+                      waitedMs += 100
                       h3 = await invoke<HostState>('session_state')
                     }
-                    const wantBack = Math.max(4096, Math.floor(win / 2))
                     if (h3.budget_pin) fail(`"derive it" left a pin in place: ${h3.budget_pin}`)
                     else if (h3.context_budget !== wantBack)
                       fail(
-                        `after freeing the pin the meter reads ${h3.context_budget}, not half the stated window (${wantBack})`,
+                        `after freeing the pin the meter still reads ${h3.context_budget} after ${waitedMs}ms, not half the stated window (${wantBack})`,
                       )
                     else {
                       await new Promise((r) => setTimeout(r, 250))
@@ -7036,6 +7069,58 @@
           }
         }
 
+        // (c2) the working surface: one accordion per run, divided by what was said
+        //
+        // Driven through transcript.apply(), which is the same entry point the live
+        // event stream uses. The claim under test is the renderer's grouping rule, so
+        // the events are the app's own shapes rather than a re-creation of them.
+        {
+          transcript?.clear()
+          transcript?.apply({ kind: 'turnStart', d: { turn_id: 31, model: 'selftest', session_id: 0 } })
+          transcript?.addUser('Find the number, then tell me.')
+          transcript?.apply({ kind: 'reasoning', d: 'the file should hold it' })
+          transcript?.apply({ kind: 'toolCallBegin', d: { id: 'a1', name: 'read_file' } })
+          transcript?.apply({ kind: 'toolCallReady', d: { id: 'a1', args: { path: 'note.md' } } })
+          transcript?.apply({ kind: 'toolExecOutput', d: { id: 'a1', stream: 'stdout', chunk: 'the number is 7' } })
+          transcript?.apply({ kind: 'toolExecEnd', d: { id: 'a1', ok: true, exit_code: 0, changes: [] } })
+          transcript?.apply({ kind: 'text', d: 'It is in note.md.' })
+          transcript?.apply({ kind: 'reasoning', d: 'now check the sheet' })
+          transcript?.apply({ kind: 'toolCallBegin', d: { id: 'a2', name: 'sheet_read' } })
+          transcript?.apply({ kind: 'toolExecEnd', d: { id: 'a2', ok: true, exit_code: 0, changes: [] } })
+          transcript?.apply({ kind: 'text', d: 'Seven, in both.' })
+          transcript?.apply({ kind: 'turnEnd', d: { turn_id: 31, finish: 'stop' } })
+          await new Promise((r) => setTimeout(r, 220))
+          const runs = [...document.querySelectorAll('.turn > .blk-run')] as HTMLElement[]
+          const texts = [...document.querySelectorAll('.turn > .blk-answer')] as HTMLElement[]
+          const said = texts.map((t) => t.textContent ?? '')
+          const first = runs[0]?.querySelectorAll('.blk-tool').length ?? 0
+          const second = runs[1]?.querySelectorAll('.blk-tool').length ?? 0
+          if (runs.length !== 2)
+            fail(`expected two run accordions divided by the model's own text, saw ${runs.length}`)
+          else if (said.length !== 2 || !said[0].includes('note.md') || !said[1].includes('Seven'))
+            fail(`the message text did not land between the runs: ${JSON.stringify(said).slice(0, 120)}`)
+          else if (first !== 1 || second !== 1)
+            fail(`the runs hold the wrong entries: ${first} then ${second}`)
+          else {
+            const l1 = runs[0].querySelector('.run-label')?.textContent ?? ''
+            const l2 = runs[1].querySelector('.run-label')?.textContent ?? ''
+            if (!/^Thought, then worked/.test(l1))
+              fail(`a run that thought and worked is labelled ${JSON.stringify(l1)}`)
+            if (runs[0].classList.contains('open') || runs[1].classList.contains('open'))
+              fail('a finished run is still open once the answer landed')
+            const t1 = runs[0].querySelector('.blk-tool') as HTMLElement
+            if (getComputedStyle(t1.querySelector('.tool-detail') as Element).display !== 'none')
+              fail('an entry inside a closed run is still spilling its body')
+            // Nothing was lost by folding: the words are still there to find.
+            if (!(t1.querySelector('.tool-out')?.textContent ?? '').includes('the number is 7'))
+              fail('folding the run threw the tool output away instead of hiding it')
+            pageLog(
+              `run accordion ok (two runs split by the answer, "${l1}", entries fold to lines, output still in the page)`,
+            )
+          }
+          transcript?.clear()
+        }
+
         // (c) arguments a quantised model mangled: repaired, run, and admitted
         {
           const errs: string[] = []
@@ -7182,15 +7267,41 @@
           if (getComputedStyle(det).display !== 'none')
             fail(`a collapsed card still shows a body: ${nm}`)
         }
-        // ...and one click opens it.
-        ;(cards[0].querySelector('.blk-head') as HTMLElement).click()
-        await new Promise((r) => setTimeout(r, 200))
-        if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display === 'none')
-          fail('clicking a card header did not open it')
-        ;(cards[0].querySelector('.blk-head') as HTMLElement).click()
-        await new Promise((r) => setTimeout(r, 200))
-        if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display !== 'none')
-          fail('clicking the header again did not collapse it')
+        // ...and the run around them is the thing you open. A stored card is an
+        // entry, not a control: nine triangles is what the accordion replaced.
+        const histRun = cards[0].closest('.blk-run') as HTMLElement | null
+        if (!histRun) fail('a stored tool card sits outside a run accordion')
+        else {
+          if (histRun.classList.contains('running'))
+            fail('a stored run is still marked as running')
+          const rlabel = histRun.querySelector('.run-label')?.textContent ?? ''
+          if (!/^(Worked|Thought|Thought, then worked)/.test(rlabel))
+            fail(`a stored run's header does not read as a finished run: ${JSON.stringify(rlabel)}`)
+          const rcount = histRun.querySelector('.run-count')?.textContent ?? ''
+          if (!/^\d+ steps$/.test(rcount))
+            fail(`a stored run does not count its steps: ${JSON.stringify(rcount)}`)
+          if (getComputedStyle(histRun.querySelector('.run-body') as Element).display !== 'none')
+            fail('a settled run is left open, which is the wall of cards this replaced')
+          // Opening the run shows the entries as lines; it does not show their bodies.
+          ;(histRun.querySelector('.blk-head') as HTMLElement).click()
+          await new Promise((r) => setTimeout(r, 200))
+          if (getComputedStyle(histRun.querySelector('.run-body') as Element).display === 'none')
+            fail('clicking the run header did not open the accordion')
+          if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display !== 'none')
+            fail('opening a run also spilled its entries\' contents')
+          // The one control that does reveal them.
+          const out = histRun.querySelector('.run-out') as HTMLElement
+          out.click()
+          await new Promise((r) => setTimeout(r, 200))
+          if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display === 'none')
+            fail('`show outputs` did not reveal what the run produced')
+          if (getComputedStyle(cards[1].querySelector('.tool-detail') as Element).display === 'none')
+            fail('`show outputs` revealed only one entry: the question is about the run')
+          out.click()
+          await new Promise((r) => setTimeout(r, 200))
+          if (getComputedStyle(cards[0].querySelector('.tool-detail') as Element).display !== 'none')
+            fail('`hide outputs` did not fold the entries back to lines')
+        }
 
         // Settled thinking is a header line: "Thought for 4s" and no sneak peek.
         const rbody = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
@@ -8245,10 +8356,18 @@
           fail(`the view moved under this check mid-measurement: ${offScreen()}`)
         } else {
           // A settled thinking body is collapsed by design, and a collapsed element
-          // measures 0 - so open it before measuring it.
+          // measures 0 - so open it before measuring it. Inside a run the way to
+          // open it is the run: the entry is a line, and `show outputs` is the reveal.
           const head = think.querySelector('.blk-head') as HTMLElement
           const body = think.querySelector('.blk-body') as HTMLElement
-          head.click()
+          const trun = think.closest('.blk-run') as HTMLElement | null
+          if (trun) {
+            ;(trun.querySelector('.blk-head') as HTMLElement).click()
+            await new Promise((r) => setTimeout(r, 120))
+            ;(trun.querySelector('.run-out') as HTMLElement).click()
+          } else {
+            head.click()
+          }
           await new Promise((r) => setTimeout(r, 300))
           const hr = head.getBoundingClientRect()
           const br = body.getBoundingClientRect()

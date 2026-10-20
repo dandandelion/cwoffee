@@ -17,6 +17,7 @@ pub mod repair;
 pub mod sheet_sql;
 pub mod net;
 pub mod sheets;
+pub mod scratch;
 pub mod searxng;
 pub mod web;
 pub mod xlsx;
@@ -156,6 +157,12 @@ pub enum FileKind {
     Artifact,
     /// A file the model wrote or edited as part of working in a tree.
     Edit,
+    /// A file the model wanted for itself: a reference download, a fetched dataset,
+    /// a scratch dump. It lives under the workspace's `.cws/` folder so it stays out of
+    /// the person's way, and the transcript keeps it out of the deliverable strip for
+    /// the same reason. Opening it is still one click; it is just not presented as
+    /// something the person asked for.
+    Scratch,
     /// A row stored before the distinction existed. Rendered as it always was:
     /// guessing a category for data that never carried one would be inventing
     /// a fact about a turn we no longer have.
@@ -178,6 +185,18 @@ const ARTIFACT_EXTS: &[&str] = &[
 /// tell them apart either. What the tool *can* say, and does, is that a
 /// downloaded file is a deliverable whatever its name.
 pub fn kind_for(path: &std::path::Path) -> FileKind {
+    // Placement outranks extension. Anything that lives under `.cws` is the model's
+    // own working material — a fetched PDF, a scratch script, a dump it parsed — and
+    // presenting it as a deliverable would put the model's leftovers in the same strip
+    // as the file the person asked for. This is the path fact behind the placement
+    // decision the tools make, so a scaffolding file written by `write_file` gets the
+    // same treatment as one placed by `download_file`.
+    if path
+        .components()
+        .any(|c| c.as_os_str() == crate::tools::scratch::SCRATCH_DIR)
+    {
+        return FileKind::Scratch;
+    }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -750,13 +769,16 @@ mod cfg_tests {
             each.len() - lean.len(),
             total - lean_total
         );
-        // 12,600, not 11,800: `explore` arrived as a suffix and costs ~700 of these bytes on
-        // top of `recall`'s 540. The number is a tax rate, not a fact — if a later tool pushes
-        // past it, the honest move is to say what it costs (as this message does) rather than
-        // grow the ceiling silently. The lean total printed below is what discovery pays back:
-        // declaring two of these tools instead of twelve.
+        // 13,200, up from 12,600 because `download_file` now carries the `.cws` placement
+        // rule: its declaration went 671 B -> ~1,150 B, which is the whole increase. That is
+        // a deliberate purchase — it is what stops a workspace filling with the model's
+        // leftovers — and it is paid in full mode only: in lean mode `download_file` sits
+        // behind `explore` and costs nothing until the model asks for it. If a later tool
+        // pushes past this, the honest move is to say what it costs (as the message below
+        // does) rather than grow the ceiling silently. The lean total printed below is what
+        // discovery pays back: declaring two of these tools instead of thirteen.
         assert!(
-            total < 12_600,
+            total < 13_200,
             "the whole tool block is {total} bytes across {} tools: a description longer than this is a per-turn tax on every session",
             each.len()
         );
@@ -786,6 +808,10 @@ mod cfg_tests {
         }
         // A file with no extension is not something you open from a chat.
         assert_eq!(kind_for(Path::new("Makefile")), FileKind::Edit);
+        // The scratch folder outranks the extension: a PDF the model fetched for
+        // itself is reference material, not a deliverable, whatever it is named.
+        assert_eq!(kind_for(Path::new(".cws/fetch.py")), FileKind::Scratch);
+        assert_eq!(kind_for(Path::new(".cws/tables/x.pdf")), FileKind::Scratch);
         // Case does not change what a file is.
         assert_eq!(kind_for(Path::new("a/b/report.PDF")), FileKind::Artifact);
         // from_path carries the label, so every tool that describes a file on

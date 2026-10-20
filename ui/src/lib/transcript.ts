@@ -196,6 +196,16 @@ export class Transcript {
   private turn: HTMLElement | null = null
   private textBuf: HTMLElement | null = null
   private textKind: BlockKind | null = null
+  /**
+   * The run accordion the next thinking entry or tool call belongs to.
+   *
+   * Consecutive thinking and tool calls share one accordion. What ends it is the
+   * model's own message text: a run is "everything it did between two things it
+   * said". That is the division the reader actually experiences - a turn that made
+   * nine tool calls used to print nine cards, each its own expander, and the
+   * answer you came for was below all of them.
+   */
+  private runGroup: HTMLElement | null = null
   private tools = new Map<string, ToolRefs>()
   private pending: string[] = []
   private raf = 0
@@ -367,6 +377,10 @@ export class Transcript {
       // so selecting text inside a long block does not hide it.
       const rblk = t?.closest?.('.blk-reasoning')
       if (rblk) {
+        // Inside a run accordion the entry is a line, not a control. Its contents
+        // are the run's `show outputs`, which reveals the whole run at once: nine
+        // nine small expanders is what the accordion replaced.
+        if (rblk.closest('.blk-run') && !rblk.closest('.show-out')) return
         const body = rblk.querySelector('.blk-body') as HTMLElement | null
         const head = rblk.querySelector('.blk-head') as HTMLElement | null
         if (!body) return
@@ -390,6 +404,7 @@ export class Transcript {
     this.stopFollow()
     this.root.textContent = ''
     this.turn = null
+    this.runGroup = null
     this.textBuf = null
     this.tools.clear()
     this.answerEls = []
@@ -464,9 +479,153 @@ export class Transcript {
     const head = this.el('blk-head', label)
     const body = this.el('blk-body')
     wrap.append(head, body)
-    this.turn!.appendChild(wrap)
+    // Thinking joins the run accordion; anything the model *said* ends it. A note
+    // or a warning ends it too: those are the app interrupting, and folding an
+    // approval notice into "working on your computer" would hide a fact the user
+    // has to see without clicking.
+    if (kind === 'reasoning') {
+      this.runBodyOf(this.ensureRunGroup()).appendChild(wrap)
+    } else {
+      // The work is over: the model is talking. The run folds to its header at the
+      // same moment it ends, so a turn that said three things does not leave three
+      // open accordions stacked above the answer.
+      this.closeRunGroup(true)
+      this.turn!.appendChild(wrap)
+    }
     this.scrollIfNeeded()
     return body
+  }
+
+  /**
+   * Open the run accordion, or reuse the one already open in this turn.
+   *
+   * The header is a live claim: it says what this run is doing, and it changes
+   * when the run changes from thinking to working. A static "Working on your
+   * computer" over a model that has been reasoning for forty seconds would be a
+   * label wearing a fact it does not have.
+   */
+  /**
+   * The accordion's shell, built the same way live and stored.
+   *
+   * Shared on purpose: two builders is how the live turn and the reopened
+   * conversation ended up with different affordances, and the reopened one is the
+   * one a user compares against their memory of the run.
+   */
+  private mkRun(): HTMLElement {
+    const wrap = this.el('blk blk-run')
+    const head = this.el('blk-head')
+    head.append(this.el('run-label'), this.el('run-count'), this.btn('run-out', 'show outputs'))
+    const body = this.el('blk-body run-body')
+    wrap.append(head, body)
+    head.addEventListener('click', () => {
+      const open = wrap.classList.toggle('open')
+      head.classList.toggle('open', open)
+    })
+    // One control for the whole run, rather than one per card: the question a
+    // reader asks is "what came out of all this", not "what came out of this one
+    // line", and nine small triangles is a wall of affordances.
+    const toggle = head.querySelector('.run-out') as HTMLElement
+    toggle.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const on = wrap.classList.toggle('show-out')
+      toggle.textContent = on ? 'hide outputs' : 'show outputs'
+      toggle.classList.toggle('on', on)
+    })
+    wrap.dataset.think = '0'
+    wrap.dataset.tool = '0'
+    return wrap
+  }
+
+  /** Paint one run's header from what it contains. Static so history can call it. */
+  static paintRun(wrap: HTMLElement) {
+    const label = wrap.querySelector('.run-label')
+    const count = wrap.querySelector('.run-count')
+    const toggle = wrap.querySelector('.run-out')
+    if (!label || !count) return
+    const tools = Number(wrap.dataset.tool ?? 0)
+    const thinks = Number(wrap.dataset.think ?? 0)
+    const running = wrap.classList.contains('running')
+    let text: string
+    if (running) {
+      text = tools > 0 ? 'Working on your computer' : thinks > 0 ? 'Thinking' : 'Working'
+    } else if (tools > 0 && thinks > 0) {
+      text = 'Thought, then worked on your computer'
+    } else if (tools > 0) {
+      text = 'Worked on your computer'
+    } else {
+      const ms = Number(wrap.dataset.thinkMs ?? 0)
+      text = ms ? `Thought for ${fmtThink(ms)}` : 'Thought'
+    }
+    label.textContent = text
+    const steps = tools + thinks
+    count.textContent = steps > 1 ? `${steps} steps` : ''
+    if (toggle) (toggle as HTMLElement).style.display = tools > 0 ? '' : 'none'
+  }
+
+  private ensureRunGroup(): HTMLElement {
+    this.ensureTurn()
+    if (this.runGroup && this.runGroup.parentElement === this.turn) return this.runGroup
+    const wrap = this.mkRun()
+    wrap.dataset.opened = String(Math.round(performance.now()))
+    wrap.classList.add('running', 'open')
+    ;(wrap.querySelector('.blk-head') as HTMLElement).classList.add('open')
+    this.turn!.appendChild(wrap)
+    this.runGroup = wrap
+    wrap.dataset.think = '0'
+    wrap.dataset.tool = '0'
+    wrap.dataset.opened = String(Math.round(performance.now()))
+    wrap.classList.add('running', 'open')
+    ;(wrap.querySelector('.blk-head') as HTMLElement).classList.add('open')
+    this.paintRunHead(wrap)
+    return wrap
+  }
+
+  private runBodyOf(wrap: HTMLElement): HTMLElement {
+    return wrap.querySelector('.run-body') as HTMLElement
+  }
+
+  /** Count an entry into the run and update the header, which is what the count is for. */
+  private bumpRun(wrap: HTMLElement, which: 'think' | 'tool') {
+    wrap.dataset[which] = String(Number(wrap.dataset[which] ?? 0) + 1)
+    this.paintRunHead(wrap)
+  }
+
+  /** The accordion's header, from what the accordion actually contains. */
+  private paintRunHead(wrap: HTMLElement) {
+    if (wrap.classList.contains('running') && !wrap.dataset.thinkMs) {
+      const thinks = Number(wrap.dataset.think ?? 0)
+      const opened = Number(wrap.dataset.opened ?? 0)
+      // Remember the duration while it is knowable. A header painted later has no
+      // way to recover how long the model actually spent thinking.
+      if (thinks > 0 && opened) wrap.dataset.thinkMs = String(Math.round(performance.now() - opened))
+    }
+    Transcript.paintRun(wrap)
+  }
+
+  /**
+   * End the run accordion. `settle` collapses it: while a run is happening it is
+   * open because you are watching it, and once the turn is over it folds to its
+   * header because the transcript you scan is a list of what happened, not of how.
+   */
+  private closeRunGroup(settle = false) {
+    const wrap = this.runGroup
+    this.runGroup = null
+    if (!wrap) return
+    wrap.classList.remove('running')
+    if (!wrap.dataset.thinkMs) {
+      const opened = Number(wrap.dataset.opened ?? 0)
+      if (opened && Number(wrap.dataset.think ?? 0) > 0) {
+        wrap.dataset.thinkMs = String(Math.round(performance.now() - opened))
+      }
+    }
+    if (settle) {
+      wrap.classList.remove('open')
+      ;(wrap.querySelector('.blk-head') as HTMLElement)?.classList.remove('open')
+    }
+    this.paintRunHead(wrap)
+    // Folding a run takes height away underneath the reader, which is the one
+    // moment a follower ends up short of the bottom without noticing.
+    if (settle) this.follow()
   }
 
   /**
@@ -1130,6 +1289,8 @@ export class Transcript {
         this.textBuf.classList.add('clamp', 'streaming')
         this.textBuf.dataset.thinkStart = String(performance.now())
         this.reasoningEls.push(this.textBuf)
+        const run = this.runGroup
+        if (run) this.bumpRun(run, 'think')
       }
       if (kind === 'answer') {
         this.answerEls.push(this.textBuf)
@@ -1168,6 +1329,7 @@ export class Transcript {
         // "clean up those downloads" turn ended up wearing the files it deleted.
         this.turnFiles = []
         this.fileStrip = null
+        this.runGroup = null
         this.collected = { answer: '', reasoning: '' }
         this.answerEls = []
         const head = this.el('turn-head', `turn ${ev.d.turn_id} · ${ev.d.model}`)
@@ -1224,6 +1386,9 @@ export class Transcript {
         this.setLive(null)
         this.textBuf = null
         this.textKind = null
+        // The working surface folds once the answer has landed: what you scan a
+        // finished turn for is what happened, and the header carries that.
+        this.closeRunGroup(true)
         // Actions after the answer, not before the files: the answer is what you
         // read, the files are what it produced, and copying is a thing you do to
         // a finished turn rather than one still arriving.
@@ -1542,6 +1707,9 @@ export class Transcript {
     // up, answers correctly when driven by a test that reaches it by id - and is
     // never on screen. A rewrite of this method lost exactly these three lines,
     // and the self-test caught it as "question card did not render".
+    // Never inside the accordion: a question that needs an answer cannot hide
+    // behind a header, and a run whose card you cannot see looks like a hang.
+    this.closeRunGroup(true)
     this.turn!.appendChild(card)
     this.questionCards.set(q.id, card)
     this.scrollIfNeeded()
@@ -1816,6 +1984,7 @@ export class Transcript {
       submit()
     })
 
+    this.closeRunGroup()
     this.turn!.appendChild(card)
     for (const p of panes) this.questionCards.set(p.q.id, card)
     show(0)
@@ -1864,6 +2033,7 @@ export class Transcript {
     }
     this.fileStrip?.remove()
     this.fileStrip = this.fileRow(this.turnFiles)
+    this.closeRunGroup(true)
     this.turn!.appendChild(this.fileStrip)
     this.scrollIfNeeded()
   }
@@ -1877,14 +2047,41 @@ export class Transcript {
     // used to bury the one artifact in the turn. Below the threshold, chips are
     // the right shape for changes too - two edited files are worth seeing.
     const deliverables = files.filter((f) => f.kind === 'artifact')
-    const changes = files.filter((f) => f.kind !== 'artifact')
+    // A file the model fetched for itself landed under .cws/ on purpose, so the
+    // transcript does not present it as something the person asked for. It is
+    // still one click away — hidden is not the same as gone, and a file the model
+    // read should be checkable by the person who was told about it.
+    const scratch = files.filter((f) => (f as { kind?: string }).kind === 'scratch')
+    const changes = files.filter((f) => f.kind !== 'artifact' && (f as { kind?: string }).kind !== 'scratch')
     for (const f of deliverables) row.append(this.fileChip(f))
+    if (scratch.length) row.append(this.scratchGroup(scratch))
     if (changes.length <= ROLL_FILES_AT) {
       for (const f of changes) row.append(this.fileChip(f))
     } else if (changes.length) {
       row.append(this.changeRoll(changes))
     }
     return row
+  }
+
+  /** The reference files of a turn, folded into one line: `2 reference files`. */
+  private scratchGroup(files: OutputFile[]): HTMLElement {
+    const wrap = this.el('refgroup')
+    const head = this.btn('refhead', `${files.length} reference file${files.length === 1 ? '' : 's'}`)
+    head.title = 'Files the model fetched for its own use. They live under .cws/ in the workspace, which is git-ignored.'
+    const list = this.el('reflist')
+    for (const f of files) {
+      const chip = this.fileChip(f)
+      chip.classList.add('ref')
+      chip.title = `${f.path} — reference copy under .cws/`
+      list.append(chip)
+    }
+    list.hidden = true
+    head.addEventListener('click', () => {
+      list.hidden = !list.hidden
+      head.classList.toggle('open', !list.hidden)
+    })
+    wrap.append(head, list)
+    return wrap
   }
 
   private fileChip(f: OutputFile): HTMLElement {
@@ -2048,6 +2245,9 @@ export class Transcript {
     // Collapsed: the whole card is the target. Expanded: only the label, so
     // selecting output text does not hide it.
     card.addEventListener('click', (e) => {
+      // Inside a run accordion the entry does not expand on its own; the run's
+      // `show outputs` reveals every entry's contents at once.
+      if (card.closest('.blk-run') && !card.closest('.show-out')) return
       const isHead = (e.target as HTMLElement)?.closest?.('.blk-head')
       if (detail.classList.contains('expanded')) {
         if (!isHead) return
@@ -2076,7 +2276,13 @@ export class Transcript {
     const { card, head, args, out, detail, subject, stat } = this.buildToolCard(name)
     const status = head.querySelector('.tool-status') as HTMLElement
     this.setLive(card)
-    this.turn!.appendChild(card)
+    // The call joins the run accordion. It is open while it runs because the
+    // output streaming past is the feedback that the app is alive; it folds back
+    // to one line when the call finishes.
+    card.classList.add('live')
+    const run = this.ensureRunGroup()
+    this.bumpRun(run, 'tool')
+    this.runBodyOf(run).appendChild(card)
     this.tools.set(id, {
       card,
       args,
@@ -2197,6 +2403,7 @@ export class Transcript {
       : `failed${exit === null ? '' : ` · exit ${exit}`}`
     t.status.className = `tool-status ${ok ? 'ok' : 'bad'}`
     t.card.classList.add(ok ? 'tool-ok' : 'tool-bad')
+    t.card.classList.remove('live')
     // A finished card collapses to its header: the transcript a user scans is a
     // list of what happened, not of how it happened.
     if (!t.detail.classList.contains('expanded')) t.detail.scrollTop = 0
@@ -2266,6 +2473,7 @@ export class Transcript {
 
     let lastWrap: HTMLElement | undefined
     const blk = (kind: string, label: string) => {
+      endRun()
       const wrap = this.el(`blk blk-${kind}`)
       const head = this.el('blk-head', label)
       const body = this.el('blk-body')
@@ -2273,6 +2481,33 @@ export class Transcript {
       frag.appendChild(wrap)
       lastWrap = wrap
       return body
+    }
+    // Stored turns are grouped the same way live turns are. If the two were
+    // grouped differently, a conversation would look tidier while it ran than
+    // after you left and came back, and the second look is the one people trust.
+    let run: HTMLElement | null = null
+    const runBody = () => {
+      if (!run) {
+        run = this.mkRun()
+        frag.appendChild(run)
+        lastWrap = run
+      }
+      return run!.querySelector('.run-body') as HTMLElement
+    }
+    function endRun() {
+      if (!run) return
+      run.classList.remove('running')
+      run.classList.remove('open')
+      run.querySelector('.blk-head')?.classList.remove('open')
+      // The header carries the run's summary, so `Thought for 4.2s` needs the
+      // thinking duration the row stored, not an estimate made now.
+      if (!run.dataset.thinkMs) {
+        const first = run.querySelector('.blk-reasoning') as HTMLElement | null
+        const ms = Number(first?.dataset.thinkMs ?? 0)
+        if (ms) run.dataset.thinkMs = String(ms)
+      }
+      Transcript.paintRun(run)
+      run = null
     }
 
     for (const m of msgs) {
@@ -2282,9 +2517,16 @@ export class Transcript {
         this.appendAttachmentTags(body, m.attachments ?? [])
       } else if (m.role === 'assistant') {
         if (m.reasoning) {
-          const r = blk('reasoning', m.reasoning_ms ? fmtThink(m.reasoning_ms) : 'thinking')
-          r.classList.add('clamp', 'settled')
-          r.textContent = m.reasoning
+          const wrap = this.el('blk blk-reasoning')
+          const head = this.el('blk-head', m.reasoning_ms ? fmtThink(m.reasoning_ms) : 'thinking')
+          const body = this.el('blk-body')
+          wrap.append(head, body)
+          body.classList.add('clamp', 'settled')
+          body.textContent = m.reasoning
+          if (m.reasoning_ms) wrap.dataset.thinkMs = String(m.reasoning_ms)
+          const rb = runBody()
+          rb.appendChild(wrap)
+          run!.dataset.think = String(Number(run!.dataset.think ?? 0) + 1)
         }
         const body = blk('answer', 'cwoffee')
         body.innerHTML = renderMarkdown(m.content)
@@ -2340,7 +2582,9 @@ export class Transcript {
           const label = head.querySelector('.tool-name')
           if (label) label.textContent = toolHeadline(call.name, 'done')
           ;(head.querySelector('.tool-status') as HTMLElement).textContent = '' 
-          frag.appendChild(card)
+          const rb = runBody()
+          rb.appendChild(card)
+          run!.dataset.tool = String(Number(run!.dataset.tool ?? 0) + 1)
           args.textContent = call.arguments
           const subj = subjectFor(call.name, call.arguments)
           if (subj) {
@@ -2373,6 +2617,9 @@ export class Transcript {
         }
       }
     }
+    // The page may end in the middle of a run. Its header still has to say what
+    // the run was: an unpainted header reads as an empty accordion.
+    endRun()
     return frag
   }
 }

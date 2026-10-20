@@ -331,7 +331,7 @@
      "delay_ms": 25
     },
     {
-     "content": "Right — that belongs in write_file, not in a shell.",
+     "content": "Right \u2014 that belongs in write_file, not in a shell.",
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 12
@@ -1453,7 +1453,7 @@
   },
   {
    "name": "recall-other",
-   "_why": "memory across conversations: the model asks what was said elsewhere and the answer has to come out of the app's own store. The require strings only pass if the other conversation's title and word arrive in the tool's own output — a model that simply guesses at a memory cannot satisfy them",
+   "_why": "memory across conversations: the model asks what was said elsewhere and the answer has to come out of the app's own store. The require strings only pass if the other conversation's title and word arrive in the tool's own output \u2014 a model that simply guesses at a memory cannot satisfy them",
    "match": "RECALL GATE",
    "steps": [
     {
@@ -1485,7 +1485,7 @@
   },
   {
    "name": "explore-then-use",
-   "_why": "the short menu has to be survivable: the model asks for a capability it was not given, the registry answers, the host makes the tool callable, and then the model uses it. The require strings are the three claims in that chain — the discovery answer, the host signing for the activation, and text only the discovered tool itself could produce.",
+   "_why": "the short menu has to be survivable: the model asks for a capability it was not given, the registry answers, the host makes the tool callable, and then the model uses it. The require strings are the three claims in that chain \u2014 the discovery answer, the host signing for the activation, and text only the discovered tool itself could produce.",
    "match": "EXPLORE GATE",
    "steps": [
     {
@@ -1520,6 +1520,49 @@
       "Nothing here is precious"
      ],
      "content": "EXPLORE DONE",
+     "finish": "stop",
+     "chunk_chars": 8,
+     "delay_ms": 10
+    }
+   ]
+  },
+  {
+   "name": "scratch-place",
+   "_why": "where a download lands is a decision, and the model has to be told it was made: the first call is the reference copy the model wanted for itself and must land under .cws/, the second is the file the person asked for and must land in the workspace proper. The require strings are the engine's own placement sentences, so a tool that saved somewhere else cannot satisfy them.",
+   "match": "SCRATCH GATE",
+   "steps": [
+    {
+     "reasoning": "Fetch the reference copy. I did not need it in front of the person.",
+     "tool_calls": [
+      {
+       "id": "mock-dl-1",
+       "name": "download_file",
+       "arguments": "{\"url\":\"http://127.0.0.1:8341/reference.pdf\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "reasoning": "Now the file they actually asked for. That one goes where they can see it.",
+     "tool_calls": [
+      {
+       "id": "mock-dl-2",
+       "name": "download_file",
+       "arguments": "{\"url\":\"http://127.0.0.1:8341/report.csv\",\"place\":\"keep\",\"path\":\"report.csv\"}"
+      }
+     ],
+     "finish": "tool_calls",
+     "delay_ms": 20
+    },
+    {
+     "_why": "the tool placed both files and said where each went; the model can only repeat what it was told",
+     "require": [
+      "under .cws/",
+      "scratch folder",
+      "workspace proper"
+     ],
+     "content": "SCRATCH DONE",
      "finish": "stop",
      "chunk_chars": 8,
      "delay_ms": 10

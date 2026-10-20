@@ -36,7 +36,7 @@ pub fn discovery_words(name: &str) -> &'static [&'static str] {
         ],
         "write_file" => &[
             "save", "create", "overwrite", "file", "text", "new document", "export", "write",
-            "replace file",
+            "replace file", "scratch file", "temp script", "scaffolding",
         ],
         "edit_file" => &[
             "patch", "change", "modify", "find and replace", "update", "fix", "rename", "edit",
@@ -62,7 +62,7 @@ pub fn discovery_words(name: &str) -> &'static [&'static str] {
             "open", "url", "page", "read website", "http", "fetch", "html", "article",
         ],
         "download_file" => &[
-            "download", "get file", "http", "url", "save file", "attachment", "link", "fetch a file",
+            "download", "get file", "http", "url", "save file", "attachment", "link", "fetch a file", "reference copy", "scratch file", "temp file", "dataset",
         ],
         "recall" => &[
             "memory", "remember", "earlier", "another conversation", "history", "previously said",
