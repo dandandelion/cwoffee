@@ -1,5 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
+  // `tick` is already a name in this component (the status-polling interval), so Svelte's
+  // own tick is aliased rather than shadowed: an await that resolves to a number is a bug
+  // the compiler only caught because the names happened to collide.
+  import { tick as renderTick } from 'svelte'
   import { invoke, Channel, transportKind, gatewayRole, onReconnect, onResync } from './lib/transport'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import type {
@@ -20,6 +24,12 @@
   import { Transcript, linkProbe, subjectFor, riskHeadline } from './lib/transcript'
   import { installContextMenu } from './lib/ctxmenu'
   import { pageLog } from './lib/pagelog'
+  import Section from './lib/settings/Section.svelte'
+  import Field from './lib/settings/Field.svelte'
+  import Select from './lib/settings/Select.svelte'
+  import Segmented from './lib/settings/Segmented.svelte'
+  import Switch from './lib/settings/Switch.svelte'
+  import Choices from './lib/settings/Choices.svelte'
 
   // ---- state --------------------------------------------------------------
   let rootEl: HTMLDivElement | undefined = $state()
@@ -217,19 +227,94 @@
     prefBusy = false
   }
 
-  const SET_TABS: { kind: MenuKind; label: string; hint: string; group: string }[] = [
-    { kind: 'model', label: 'Model', hint: 'what answers here', group: 'Answering' },
-    { kind: 'think', label: 'Thinking', hint: 'how hard it deliberates', group: 'Answering' },
-    { kind: 'tools', label: 'Tools', hint: 'what the coworker can do', group: 'Working' },
-    { kind: 'mode', label: 'Approvals', hint: 'what may run without asking', group: 'Working' },
-    { kind: 'ws', label: 'Folders', hint: 'where the tools may work', group: 'Working' },
-    { kind: 'search', label: 'Search', hint: 'how web_search reaches out', group: 'Reaching out' },
-    { kind: 'gateway', label: 'Devices', hint: 'browsers and phones joining', group: 'This app' },
-    { kind: 'naming', label: 'Titles', hint: 'what a conversation is called', group: 'This app' },
-    { kind: 'metrics', label: 'This session', hint: 'context, cache, cost', group: 'This app' },
-    { kind: 'keys', label: 'Shortcuts', hint: 'keys the app answers', group: 'This app' },
-    { kind: 'display', label: 'Transcript', hint: 'how much of the working shows', group: 'This app' },
+  /* Settings categories. Five names in the rail, because the rail's job is to be
+     scanned, not read: what a section is for belongs at the top of the section,
+     next to the controls it describes, not in a caption under a nav label.
+
+     `title`/`desc` are what the page header shows; `label` is what the rail shows.
+     Appearance and shortcuts share a page because both are facts about this window
+     rather than about the model or the conversation, and neither carries enough to
+     stand beside the other four. */
+  type SetPage = 'models' | 'workspace' | 'devices' | 'conversation' | 'appearance'
+  const SET_PAGES: { kind: SetPage; label: string; title: string; desc: string; icon: string }[] = [
+    {
+      kind: 'models',
+      label: 'Models',
+      title: 'Models',
+      desc: 'Which model answers, which endpoint it comes from, how much it may think, and how much of the conversation it is allowed to carry.',
+      icon: 'M4.5 6a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 11.5 6v4a1.5 1.5 0 0 1-1.5 1.5h-4A1.5 1.5 0 0 1 4.5 10zM6.5 2.5v2M9.5 2.5v2M6.5 11.5v2M9.5 11.5v2M2.5 6.5h2M2.5 9.5h2M11.5 6.5h2M11.5 9.5h2',
+    },
+    {
+      kind: 'workspace',
+      label: 'Workspace',
+      title: 'Workspace',
+      desc: 'What the coworker can do here, what it may do without asking, which folders its files may go in, and how it reaches the web.',
+      icon: 'M2.5 5.6A1.6 1.6 0 0 1 4.1 4h2.5l1.2 1.7h5.6A1.6 1.6 0 0 1 13.5 7.3v4.1A1.6 1.6 0 0 1 11.9 13H4.1a1.6 1.6 0 0 1-1.6-1.6z',
+    },
+    {
+      kind: 'devices',
+      label: 'Devices',
+      title: 'Devices',
+      desc: 'Other windows, phones and machines attached to this app over the network, and what they are allowed to control.',
+      icon: 'M2.5 4a1.5 1.5 0 0 1 1.5-1.5h7A1.5 1.5 0 0 1 12.5 4v4.5A1.5 1.5 0 0 1 11 10H4a1.5 1.5 0 0 1-1.5-1.5zM5.5 13h4M11.6 8.5h3.4a1 1 0 0 1 1 1v3.5a1 1 0 0 1-1 1h-3.4a1 1 0 0 1-1-1V9.5a1 1 0 0 1 1-1z',
+    },
+    {
+      kind: 'conversation',
+      label: 'Conversation',
+      title: 'Conversation',
+      desc: 'What a conversation is called, and what the one on screen is using: the context it carries, what the server already had, and how fast the answers came.',
+      icon: 'M3 4.5h10a1 1 0 0 1 1 1v4.6a1 1 0 0 1-1 1H7.4l-2.6 2v-2H3a1 1 0 0 1-1-1V5.5a1 1 0 0 1 1-1z',
+    },
+    {
+      kind: 'appearance',
+      label: 'Appearance',
+      title: 'Appearance & shortcuts',
+      desc: 'How much of the working the transcript shows, the palette of this window, and the keys it answers.',
+      icon: 'M2.5 5h11M2.5 8h11M2.5 11h6M11 5a1.5 1.5 0 1 0 0-.01M7 8a1.5 1.5 0 1 0 0-.01M12 11a1.5 1.5 0 1 0 0-.01',
+    },
   ]
+
+  /**
+   * Where a name lives. A hash, a jump from another part of the app, and the app's
+   * own page cases all name the thing they want - "search", "this session",
+   * "thinking" - and each has to land on the page that now holds it, with that
+   * section scrolled into view.
+   *
+   * The older names stay valid on purpose: a `#tools` link written down last month
+   * still opens Workspace. A link that quietly stops landing is a feature that
+   * broke without anyone announcing it.
+   */
+  const SECTION_HOME: Record<string, [SetPage, string]> = {
+    models: ['models', 'answering'],
+    model: ['models', 'endpoints'],
+    endpoints: ['models', 'endpoints'],
+    configured: ['models', 'endpoints-list'],
+    think: ['models', 'reasoning'],
+    reasoning: ['models', 'reasoning'],
+    ceiling: ['models', 'ceiling'],
+    context: ['models', 'ceiling'],
+    workspace: ['workspace', 'tools'],
+    tools: ['workspace', 'tools'],
+    mode: ['workspace', 'approvals'],
+    approvals: ['workspace', 'approvals'],
+    ws: ['workspace', 'folders'],
+    folders: ['workspace', 'folders'],
+    search: ['workspace', 'search'],
+    web: ['workspace', 'search'],
+    devices: ['devices', 'gateway'],
+    gateway: ['devices', 'gateway'],
+    conversation: ['conversation', 'session'],
+    naming: ['conversation', 'titles'],
+    titles: ['conversation', 'titles'],
+    metrics: ['conversation', 'session'],
+    session: ['conversation', 'session'],
+    appearance: ['appearance', 'transcript'],
+    display: ['appearance', 'transcript'],
+    transcript: ['appearance', 'transcript'],
+    theme: ['appearance', 'theme'],
+    keys: ['appearance', 'shortcuts'],
+    shortcuts: ['appearance', 'shortcuts'],
+  }
   // The tool list is read from the engine, never typed here: the description a tool
   // carries is the same text the model is handed, so a UI-side copy is a second copy of
   // prompt bytes that will drift.
@@ -275,34 +360,84 @@
     const first = d.split(/(?<=[.!?])\s/)[0] ?? d
     return first.length > 180 ? `${first.slice(0, 177)}...` : first
   }
-  let settings = $state<{ tab: MenuKind } | null>(null)
+  let settings = $state<{ page: SetPage; flash: string } | null>(null)
   let settingsEl = $state<HTMLElement | null>(null)
+  let setBodyEl = $state<HTMLElement | null>(null)
 
-  function openSettings(tab: MenuKind = 'model') {
+  const setPage = $derived(SET_PAGES.find((p) => p.kind === settings?.page) ?? SET_PAGES[0])
+  const pageTitle = $derived(setPage.title)
+  const pageDesc = $derived(setPage.desc)
+
+  /** `what` is a name from SECTION_HOME - a category, a section, or one of the older
+      names a link or another part of the app already uses - not an index. */
+  function openSettings(what: string = 'models') {
+    const home = SECTION_HOME[what]
+    if (!home && !SET_PAGES.some((p) => p.kind === what)) {
+      // An unknown name still opens the screen rather than doing nothing, but the log
+      // says which name nothing answers: a dead link should be a visible bug, not a
+      // panel that appears to ignore a click.
+      pageLog(`settings: nothing answers "${what}"; opening ${SET_PAGES[0].kind}`)
+    }
+    const [page, section] = home ?? [what as SetPage, '']
     closeMenu()
-    // The screen reads its own list fresh, so another client's change is reflected here
-    // the next time the screen is opened.
-    void loadPrefs()
-    void loadSettingsFor(tab)
-    settings = { tab }
+    // The screen reads its own lists fresh, so another client's change is reflected
+    // here the next time it is opened.
+    void loadSettingsFor(page)
+    settings = { page, flash: section }
     // Focus follows the surface: a screen nothing can tab into is a screen nothing can use.
-    queueMicrotask(() => settingsEl?.focus())
+    queueMicrotask(() => {
+      settingsEl?.focus()
+      void anchorSection(section)
+    })
   }
+
+  function gotoSettings(page: SetPage) {
+    if (settings?.page === page) return
+    openSettings(page)
+  }
+
+  /** Scroll the named section into the settings column and say, for a moment, that
+      this is the one the link asked for. If nothing answers the name, the log says
+      so: a deep link that lands somewhere plausible is worse than one that admits it
+      missed. */
+  async function anchorSection(section: string) {
+    if (!section) return
+    await renderTick()
+    const el = setBodyEl?.querySelector<HTMLElement>(`[data-set-section="${section}"]`)
+    if (!el) {
+      pageLog(`settings: no section "${section}" on the ${settings?.page ?? 'closed'} page`)
+      return
+    }
+    el.scrollIntoView({ block: 'start' })
+    el.classList.add('flash')
+    setTimeout(() => el.classList.remove('flash'), 1600)
+  }
+
   function closeSettings() {
     settings = null
   }
 
   /* Settings is a place now, so a link can point at it: a phone opening
-     http://host:8122/?token=…#settings should land on the section it asked for rather
-     than on a transcript it did not ask for. Applied once, at boot, and the hash is
-     left alone afterwards so reloading does not fight a hand that navigated away. */
+     http://host:8122/?token=…#settings:search should land on the section it asked
+     for rather than on a transcript it did not ask for. Applied once, at boot, and
+     the hash is left alone afterwards so reloading does not fight a hand that
+     navigated away. `#settings`, `#settings:search` and a bare `#search` all work:
+     people write these forms differently and none of them is wrong. */
   let deepLinked = false
   $effect(() => {
     if (deepLinked) return
     deepLinked = true
-    const want = location.hash.replace(/^#/, '')
+    const want = decodeURIComponent(location.hash.replace(/^#/, ''))
     if (!want) return
-    if (SET_TABS.some((t) => t.kind === want)) openSettings(want as MenuKind)
+    const asked =
+      want.startsWith('settings:') || want.startsWith('settings.')
+        ? want.slice('settings.'.length)
+        : want
+    if (!asked || asked === 'settings') {
+      openSettings()
+      return
+    }
+    openSettings(asked)
   })
   // ----------------------------------------------------------------------------------
   // Providers and models (Settings > Model)
@@ -397,7 +532,6 @@
       }
       // The endpoint answering now is worth having open: those are the models in use, and the
       // ones a person is most likely here to look at.
-      for (const x of provRows) if (x.current) openModel = new Set([...openModel])
       for (const x of provRows) if (x.current) openProv = new Set([...openProv, x.name])
     } catch (e) {
       pvMsg = cleanErr(e)
@@ -580,7 +714,9 @@
    *  not be shown as unknown. */
   function capLabel(m: CapRow): string[] {
     const out: string[] = []
-    out.push(m.context_window ? `${m.context_window} context` : 'context unknown')
+    // Short in the row, exact where it is edited: a chip for 262144 tokens pushes the
+    // model's own name out of the row, and the field below shows the number in full.
+    out.push(m.context_window ? `${fmtTokens(m.context_window)} context` : 'context unknown')
     if (m.supports_tools === true) out.push('tool calling')
     else if (m.supports_tools === false) out.push('no tool calling')
     else out.push('tool calling unknown')
@@ -593,36 +729,44 @@
     return out
   }
 
-  function pickSettingsTab(tab: MenuKind) {
-    if (!settings || settings.tab === tab) return
-    void loadSettingsFor(tab)
-    settings = { tab }
-  }
-  /// The same lazy reads the popups do, so a section never shows a state older than the
-  /// last time anyone asked. A container status probe (podman ps) has no business
-  /// running before someone cares about search.
-  function loadSettingsFor(tab: MenuKind) {
-    if (tab === 'model' && (modelErr || !models.length)) void loadModels()
-    if (tab === 'model') void loadProviders()
-    if (tab === 'naming' && !titleInfo) void loadTitles()
-    if (tab === 'search' && !webSearch) void loadWebSearch()
-    if (tab === 'tools' && !toolViews.length) void loadTools()
-  }
-  /// The bodies were written against a `Menu` because that is what carries the anchor
-  /// geometry they never read. In the screen the geometry is meaningless, so it is
-  /// zeroed rather than faked, and the folder the Folders section describes is the one
-  /// the engine is actually working in.
-  function menuFor(tab: MenuKind): Menu {
-    return {
-      kind: tab,
-      sessionId: undefined,
-      wsPath: hostState?.workspace,
-      left: 0,
-      right: 0,
-      top: 0,
-      bottom: 0,
-      barTop: 0,
+  /// The reads each page needs, and nothing else. The same lazy rule the popups
+  /// follow: a section never shows a state older than the last time anyone asked,
+  /// and a container status probe (podman ps) has no business running before
+  /// somebody opens Search.
+  function loadSettingsFor(page: SetPage) {
+    void loadPrefs()
+    if (page === 'models') {
+      if (modelErr || !models.length) void loadModels()
+      void loadProviders()
     }
+    if (page === 'workspace') {
+      if (!toolViews.length) void loadTools()
+      void loadWorkspaces()
+      if (!webSearch) void loadWebSearch()
+    }
+    if (page === 'devices') void loadGateway()
+    if (page === 'conversation') {
+      if (!titleInfo) void loadTitles()
+      void refreshState()
+    }
+  }
+
+  /** Which folder rows are open on the Workspace page. Opening one is the moment to
+      ask the store how many conversations live under that path - the visible sidebar
+      list is not the folder's contents (it hides chat conversations and empty drafts),
+      so the count comes from the store, and the delete label is only able to name a
+      number after it has been fetched. */
+  let wsOpen = $state<Set<string>>(new Set())
+  async function toggleWsRow(path: string) {
+    const next = new Set(wsOpen)
+    if (next.has(path)) {
+      next.delete(path)
+      wsOpen = next
+      return
+    }
+    next.add(path)
+    wsOpen = next
+    await armOne(path)
   }
   // Genuinely unread: a session whose stored message count grew since it was last
   // opened, and which is not the session currently on screen.
@@ -646,11 +790,6 @@
     session: 'Auto for session',
     auto: 'Full auto',
   }
-  const MODE_HINT: Record<'ask' | 'session' | 'auto', string> = {
-    ask: 'prompt for every mutating call',
-    session: 'first allow per tool is remembered',
-    auto: 'no prompts; denylist still applies',
-  }
   const THINK_LABEL: Record<ReasoningLevel, string> = {
     off: 'Off',
     low: 'Low',
@@ -658,6 +797,83 @@
     high: 'High',
     xhigh: 'Extra high',
   }
+
+  /* The option tables the settings controls draw. They live next to the state they
+     change, not inside the markup: a choice and the sentence that explains what
+     choosing it does belong together, and the same table answers the popup and the
+     settings page. */
+  const MODE_CHOICES = [
+    {
+      value: 'ask',
+      label: 'Ask before anything changes',
+      sub: 'Every call that writes, runs, or reaches outside the folder waits for an answer.',
+    },
+    {
+      value: 'session',
+      label: 'Ask once per tool in this conversation',
+      sub: 'The first allow for a tool covers its later calls here, and nowhere else.',
+    },
+    {
+      value: 'auto',
+      label: 'Run without asking',
+      sub: 'The denylist, the folder boundary and anything outside the folder are still enforced.',
+    },
+  ]
+  const THINK_CHOICES = THINKS.map((t) => ({ value: t as string, label: THINK_LABEL[t] }))
+  const SCOPE_CHOICES = [
+    { value: 'loopback', label: 'This machine', title: '127.0.0.1: nothing else can reach the port' },
+    { value: 'lan', label: 'Any device', title: '0.0.0.0: anything on the network can reach it, so the token is the only gate' },
+  ]
+  const PROVIDER_KINDS = [
+    { value: 'openai', label: 'OpenAI-compatible' },
+    { value: 'anthropic', label: 'Anthropic' },
+    { value: 'llama.cpp', label: 'llama.cpp server' },
+  ]
+
+  const currentCapRow = $derived(
+    capRows.find((x) => x.id === model || x.id.endsWith(`/${model}`)) ?? null,
+  )
+  const currentModelLine = $derived.by(() => {
+    const p = provRows.find((x) => x.current)
+    const bits: string[] = []
+    if (p) bits.push(`${p.base_url} \u00b7 ${p.kind}`)
+    bits.push(
+      personaNow === 'chat'
+        ? 'this conversation is in chat mode: no tools are mounted'
+        : 'this conversation carries the tool set',
+    )
+    return bits.join('  \u00b7  ')
+  })
+  const urlHintLine = $derived(
+    urlSaysV1
+      ? 'The /v1 stays in the field on purpose: a llama.cpp-style server answers at /v1/chat/completions, and without it the app is one path short.'
+      : 'No /v1 at the end. That is fine as a base URL: the app appends the path the chosen dialect uses. If this endpoint expects /v1 and it is left out, Test connection says so.',
+  )
+  /** What the endpoint said about the model the settings page is describing. "detected"
+   *  is kept distinct from "stated": one is inferred from the served chat template. */
+  function modelHint(m: ModelInfo): string {
+    const b: string[] = []
+    if (m.context_tokens) b.push(`${fmtTokens(m.context_tokens)} context`)
+    const v = visionOf(m)
+    if (v !== null) b.push(v ? 'takes images' : 'text only')
+    if (m.tools !== null) b.push(m.tools ? 'tool calling' : 'no tool calling')
+    if (m.slots) b.push(`${m.slots} slot${m.slots === 1 ? '' : 's'}`)
+    if (m.tools_inferred) b.push('capabilities detected, not stated')
+    else if (!m.advertised) b.push('capabilities not reported')
+    return b.join('  \u00b7  ') || 'no capabilities reported'
+  }
+  const MODEL_CHOICES = $derived(
+    models.map((m) => ({ value: m.id, label: m.id, hint: modelHint(m) })),
+  )
+  const thinkingNote = $derived.by(() => {
+    const eff = currentCapRow?.efforts ?? []
+    const on = THINK_LABEL[thinking]
+    if (!eff.length)
+      return `Set to ${on}. No discovery has asked this endpoint which levels it accepts, so the request goes out and the server answers at whatever depth it has. Discover the model to see the levels it names back.`
+    if (!eff.includes(thinking))
+      return `Set to ${on}. This endpoint named ${eff.join(', ')} and did not name this one, so the answer may come at the nearest level it implements.`
+    return `Set to ${on}. This endpoint named ${eff.join(', ')}. The level travels with each turn, so the next request carries it; a model process that is already running keeps the level it started with.`
+  })
   function titleOf(id: number) {
     return sessions.find((x) => x.id === id)?.title ?? 'session'
   }
@@ -1570,6 +1786,12 @@
     { id: 'searxng', label: 'SearXNG, already running', sub: 'point at an instance you run' },
   ]
 
+  /** The backends the engine names, in the shape the radio rows draw: the engine's own
+   *  label and the sentence it says about each one. */
+  const SEARCH_CHOICES = $derived(
+    SEARCH_PROVIDERS.map((p) => ({ value: p.id, label: p.label, sub: p.sub })),
+  )
+
   const webSearchText = $derived(
     !webSearch
       ? 'unknown'
@@ -1606,7 +1828,9 @@
     try {
       webSearch = await invoke<SearchView>('set_search_backend', {
         backend: id,
-        searxngUrl: webSearchUrl,
+        // snake_case, like every other verb on this wire: the gateway reads these names
+        // off the frame, and the desktop command now asks for them by the same spelling.
+        searxng_url: webSearchUrl,
       })
       say(`search: ${webSearch.describing}`)
     } catch (e) {
@@ -4017,25 +4241,209 @@
         for (const id of [memA, memB]) await invoke('delete_session', { id }).catch(() => {})
       }
 
-      // The settings screen must show the tool list the engine owns, not a list typed
-      // into the UI. Asserting a known id arrives proves the verb round-tripped; the
-      // group headers are asserted because a screen whose sections are unreadable is a
-      // screen people don't open.
+      // The settings screen has to answer two questions at once: is every setting
+      // still reachable now that the rail names five categories instead of eleven
+      // sections, and does the whole screen share one set of measurements.
+      //
+      // The first is checked by walking the old names — the names links and this
+      // board already use — and insisting each one lands on a page that really holds
+      // the section it claims. A rail that hides a section and a rail that dropped it
+      // look identical from a screenshot, so the only honest check is to go looking
+      // for every one of them. The second is measured, not admired: the heights of
+      // the fields, the select trigger against the text inputs, and the colours the
+      // open dropdown paints itself with.
       {
         openSettings('tools')
         await new Promise((r) => setTimeout(r, 900))
-        const tabsN = document.querySelectorAll('.set-rail .set-tab').length
-        const groupsN = document.querySelectorAll('.set-rail .set-group').length
+
+        // 1. The rail: category names, no captions.
+        const nav = [...document.querySelectorAll('.set-rail [data-set-tab]')] as HTMLElement[]
+        const railText = nav.map((b) => (b.textContent ?? '').trim().replace(/\s+/g, ' '))
+        if (nav.length !== SET_PAGES.length)
+          fail(`the settings rail shows ${nav.length} of ${SET_PAGES.length} categories`)
+        else if (document.querySelector('.set-rail .set-hint'))
+          fail('the settings rail still carries descriptive subtitles')
+        else if (nav.some((t) => (t.textContent ?? '').split(/\s+/).length > 3))
+          fail(`a rail entry is a sentence rather than a name: ${JSON.stringify(railText)}`)
+        else if (!nav.every((t) => t.querySelector('svg')))
+          fail('a rail entry has no icon: five identical words are harder to scan than five marks')
+        else pageLog(`settings rail ok (${railText.join(', ')})`)
+
+        // 2. Nothing orphaned: every name that used to be a page must still land.
+        const missing: string[] = []
+        const landed: string[] = []
+        for (const name of Object.keys(SECTION_HOME)) {
+          const [wantPage, wantSection] = SECTION_HOME[name]
+          openSettings(name)
+          await new Promise((r) => setTimeout(r, 90))
+          const body = document.querySelector('.set-body')
+          const page = body?.getAttribute('data-set-page')
+          const sect = body?.querySelector(`[data-set-section="${wantSection}"]`)
+          if (page !== wantPage) missing.push(`${name} -> page ${page} (wanted ${wantPage})`)
+          else if (!sect) missing.push(`${name} -> no [data-set-section="${wantSection}"] on ${page}`)
+          else landed.push(`${name}:${page}/${wantSection}`)
+        }
+        if (missing.length) fail(`settings destinations lost: ${missing.join('; ')}`)
+
+        // 3. Every page has a heading and a description, and every section has a
+        //    heading: the copy moved out of the rail, so it has to be somewhere.
+        const pageGaps: string[] = []
+        for (const p of SET_PAGES) {
+          openSettings(p.kind)
+          await new Promise((r) => setTimeout(r, 140))
+          const body = document.querySelector('.set-body')
+          const t = (body?.querySelector('.spage-title')?.textContent ?? '').trim()
+          const d = (body?.querySelector('.spage-desc')?.textContent ?? '').trim()
+          const sects = [...(body?.querySelectorAll('[data-set-section]') ?? [])]
+          const noHead = sects.filter(
+            (el) => !(el.querySelector('.ssect-h')?.textContent ?? '').trim(),
+          ).length
+          const noDesc = sects.filter(
+            (el) => !(el.querySelector('.ssect-d')?.textContent ?? '').trim(),
+          ).length
+          if (t !== p.title) pageGaps.push(`${p.kind}: title "${t}"`)
+          else if (d.length < 40) pageGaps.push(`${p.kind}: description is ${d.length} characters`)
+          else if (sects.length < 1) pageGaps.push(`${p.kind}: no sections`)
+          else if (noHead || noDesc)
+            pageGaps.push(`${p.kind}: ${noHead} section(s) without a heading, ${noDesc} without a description`)
+        }
+        if (pageGaps.length) fail(`settings page headers: ${pageGaps.join('; ')}`)
+        else
+          pageLog(
+            `settings pages ok (${SET_PAGES.length} titled pages, ${landed.length} names still land, every section headed and described)`,
+          )
+
+        // 4. One design system, measured. The complaint this refactor answers is
+        //    that the fields were three sizes and the dropdown was painted white by
+        //    the toolkit, so the assertions are about size and colour, not taste.
+        openSettings('models')
+        await new Promise((r) => setTimeout(r, 600))
+        const inputs = [...document.querySelectorAll('.set-body .sinp')] as HTMLElement[]
+        const sels = [...document.querySelectorAll('.set-body .ssel-btn')] as HTMLElement[]
+        const btns = [...document.querySelectorAll('.set-body .set-btn')] as HTMLElement[]
+        const hs = (els: HTMLElement[]) => [...new Set(els.map((e) => Math.round(e.getBoundingClientRect().height)))]
+        if (inputs.length < 4) fail(`the Models page has ${inputs.length} text fields; the endpoint form should have more`)
+        else if (sels.length < 1) fail('the Models page has no themed select: the native <select> is still here')
+        else if (hs(inputs).length > 1) fail(`text fields come in ${hs(inputs).length} heights: ${hs(inputs).join('/')}`)
+        else if (inputs[0].getBoundingClientRect().height < 29)
+          fail(`a settings text field is ${inputs[0].getBoundingClientRect().height}px tall; that is not a desktop control`)
+        else if (Math.abs(sels[0].getBoundingClientRect().height - inputs[0].getBoundingClientRect().height) > 1)
+          fail(
+            `the select is ${sels[0].getBoundingClientRect().height}px against a ${inputs[0].getBoundingClientRect().height}px field: two controls, one row, two sizes`,
+          )
+        else if (hs(btns).length > 1) fail(`buttons come in ${hs(btns).length} heights: ${hs(btns).join('/')}`)
+        else {
+          // The open dropdown has to be the app's colour, not the toolkit's.
+          sels[0].click()
+          await new Promise((r) => setTimeout(r, 120))
+          const pop = document.querySelector('.ssel-pop') as HTMLElement | null
+          const opts = [...document.querySelectorAll('.ssel-opt')] as HTMLElement[]
+          if (!pop) fail('pressing the select opened no panel: the themed dropdown is not wired up')
+          else if (!opts.length) fail('the select panel is empty')
+          else {
+            const cs = getComputedStyle(pop)
+            const screen = getComputedStyle(document.querySelector('.settings') as Element).backgroundColor
+            const ink = getComputedStyle(opts[0]).color
+            // Snapshot the colours. `cs` is live: read after the panel has gone, it
+            // reports nothing, and a verdict line that quotes "nothing" while the
+            // judgement used the real values is a claim nobody can check afterwards.
+            const panelBg = cs.backgroundColor
+            const panelShadow = cs.boxShadow
+            // Colour arithmetic, in the theme the app happens to be in. The complaint
+            // this refactor answers was a bright white toolkit menu on a dark screen,
+            // and the answer is not "assert the panel is dark" - a light theme is
+            // allowed to have a light menu. The claim is that the panel separates
+            // from the surface behind it and that its text is readable on it, which
+            // is a number either theme can be held to.
+            // A colour this code cannot read is a colour it cannot judge, so the
+            // parse refuses rather than producing NaN: a comparison against NaN is
+            // false, and a check built on false silently becomes a check that
+            // nothing can fail.
+            const rgb = (what: string, c: string): number[] => {
+              const n = (c ?? '').match(/[\d.]+/g)?.map(Number) ?? []
+              if (n.length < 3)
+                throw new Error(`the page reports no ${what} colour (got ${JSON.stringify(c)})`)
+              return n
+            }
+            const lum = (what: string, c: string) => {
+              const [r, g, b] = rgb(what, c)
+              const f = (v: number) => {
+                const x = v / 255
+                return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4
+              }
+              return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+            }
+            const ratio = (a: string, what: string, b: string) => {
+              const la = lum('the option text', a)
+              const lb = lum(what, b)
+              return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+            }
+            const dist = (a: string, b: string, what: string) => {
+              const x = rgb(what, a)
+              const y = rgb('the surface behind it', b)
+              return Math.max(Math.abs(x[0] - y[0]), Math.abs(x[1] - y[1]), Math.abs(x[2] - y[2]))
+            }
+            const body = document.querySelector('.set-body') as HTMLElement | null
+            const pr = pop.getBoundingClientRect()
+            const br = body?.getBoundingClientRect()
+            const bad: string[] = []
+            let lift = NaN
+            let contrast = NaN
+            try {
+              lift = dist(cs.backgroundColor, screen, 'panel')
+              contrast = ratio(ink, 'panel', panelBg)
+            } catch (e) {
+              // Reading the failure out is the point: a colour the page will not
+              // name is a claim this check cannot make, and it must not be allowed
+              // to pass by producing NaN.
+              bad.push(
+                `${e instanceof Error ? e.message : e}; panel=${JSON.stringify(panelBg)} screen=${JSON.stringify(screen)} text=${JSON.stringify(ink)}`,
+              )
+            }
+            if (Number.isFinite(lift) && lift < 6)
+              bad.push(`panel ${panelBg} on screen ${screen}: no lift, the menu is the page`)
+            if (Number.isFinite(contrast) && contrast < 4.5)
+              bad.push(`option text ${ink} on ${panelBg} is ${contrast.toFixed(2)}:1`)
+            if (panelShadow === 'none') bad.push('the floating panel casts no shadow')
+            // The panel is placed inside the scrolling column on purpose (a fixed
+            // descendant of a transformed dialog is clipped by it), so the honest
+            // check is that it fits the column rather than overflowing it.
+            if (br && (pr.top < br.top - 1 || pr.bottom > br.bottom + 1 || pr.left < br.left - 1 || pr.right > br.right + 1))
+              bad.push(
+                `panel ${pr.top.toFixed(0)}..${pr.bottom.toFixed(0)} escapes the settings column ${br.top.toFixed(0)}..${br.bottom.toFixed(0)}`,
+              )
+            if (bad.length) fail(`the themed dropdown fails: ${bad.join('; ')}`)
+            else {
+              sels[0].click()
+              await new Promise((r) => setTimeout(r, 80))
+              // Focus has to be visible without a mouse: a keyboard user has to see
+              // where they are in a form, and a 1px hairline is not that.
+              const navBtn = document.querySelector('.set-rail [data-set-tab]') as HTMLElement
+              navBtn.focus()
+              const ring = getComputedStyle(navBtn).boxShadow
+              if (!ring || ring === 'none')
+                fail('the focused settings category has no focus ring: the keyboard user cannot see where they are')
+              else
+                pageLog(
+                  `settings design system ok (fields ${hs(inputs).join('/')}px, select ${Math.round(sels[0].getBoundingClientRect().height)}px, buttons ${hs(btns).join('/')}px across ${btns.length}; panel ${JSON.stringify(panelBg)} lifts ${lift.toFixed(0)} off ${JSON.stringify(screen)}, option text ${contrast.toFixed(1)}:1, inside the column; focus ring painted)`,
+                )
+            }
+          }
+        }
+
+        // 5. The tool list still comes from the engine, not from this file.
+        openSettings('tools')
+        await new Promise((r) => setTimeout(r, 700))
         const rows = Array.from(document.querySelectorAll('.toolrow .toolname')).map((e) => e.textContent?.trim())
-        if (tabsN < SET_TABS.length) fail(`settings rail shows ${tabsN} of ${SET_TABS.length} sections`)
-        if (groupsN < 2) fail(`settings rail has ${groupsN} group label(s) — the sections are unlabelled`)
         if (!rows.length) fail('the Tools section lists nothing (tools_view returned no rows)')
         else if (!rows.includes('read_file') || !rows.includes('sheet_query'))
           fail(`the Tools section is not the engine's list: ${JSON.stringify(rows)}`)
-        else pageLog(`settings tools section ok (${rows.length} tools from the registry, ${groupsN} groups)`)
-        // The Titles screen holds the same rule as every status panel here: it says what is
-        // on this machine, including "not installed", and it quotes the cost next to the
-        // switch that turns it on. A screen that only says "on" is an advertisement.
+        else pageLog(`settings tools section ok (${rows.length} tools from the registry)`)
+
+        // The Titles section holds the same rule as every status panel here: it says
+        // what is on this machine, including "not installed", and it quotes the cost
+        // next to the switch that turns it on. A screen that only says "on" is an
+        // advertisement.
         {
           openSettings('naming')
           await new Promise((r) => setTimeout(r, 1200))
@@ -4049,6 +4457,261 @@
         }
         closeSettings()
       }
+
+      // The endpoint screen, driven the way a person drives it. The verbs behind it have
+      // their own Rust tests; what was never proven is that the page round trip works:
+      // discovery fills the chips, Add writes a row the list then shows, a window typed into
+      // a field outranks what the endpoint claims all the way into the host's stored picture,
+      // emptying the field gives that answer back, and what a probe found survives a save that
+      // never mentioned it. It ends by removing the row it created, so the board leaves its
+      // scratch config as it found it.
+      //
+      // One straight-line function with early exits rather than a chain of `else` blocks: the
+      // steps each need a wait of their own, and the staircase version buried the premises.
+      const modelsRoundTrip = async () => {
+        openSettings('model')
+        await new Promise((r) => setTimeout(r, 500))
+        const nameBox = document.querySelector('#cw-pv-name') as HTMLInputElement | null
+        const urlBox = document.querySelector('#cw-pv-url') as HTMLInputElement | null
+        if (!nameBox || !urlBox) {
+          fail('the Models page has no endpoint name/base URL fields: the form is not where the page says it is')
+          return
+        }
+        if (!models.length) {
+          fail('the Models page lists no models, so the endpoint round trip could not be driven at all')
+          return
+        }
+        const ep = models[0].server
+        if (!ep) {
+          // Say so instead of passing: the case needs the endpoint's own address, and the only
+          // honest source for it is what the host reported about its models. On a core that
+          // cannot name one, the bridge is the thing to fix — not the premise to weaken.
+          pageLog('models page round trip SKIPPED: the host named no server for its models (not passed)')
+          return
+        }
+        const type = (el: HTMLInputElement, v: string) => {
+          el.value = v
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+        }
+        const act = (txt: string, where: ParentNode = document) =>
+          [...where.querySelectorAll('.set-btn')].find((b) => (b.textContent ?? '').includes(txt)) as
+            | HTMLButtonElement
+            | undefined
+        // Half of this case asks the *host*, which is a round trip, so the wait loop is here:
+        // bounded, and it answers whether the thing happened instead of pretending.
+        const until = async (fn: () => Promise<boolean> | boolean, ms: number) => {
+          const t0 = Date.now()
+          for (;;) {
+            if (await fn()) return true
+            if (Date.now() - t0 > ms) return false
+            await new Promise((r) => setTimeout(r, 150))
+          }
+        }
+        const before = await invoke<{ providers: { name: string }[] }>('provider_status')
+        const rowsBefore = Array.isArray(before?.providers) ? before.providers.length : -1
+
+        const addFirst = act('Add endpoint')
+        if (!addFirst) {
+          fail('no Add endpoint button on the Models page')
+          return
+        }
+        if (!addFirst.disabled) {
+          fail('Add endpoint is live before any discovery: a guess could become configuration, which is what the guard is for')
+          return
+        }
+        type(nameBox, 'selftest probe box')
+        type(urlBox, ep)
+        // A dispatched `input` updates the state now and the DOM on the next flush: read a
+        // control's `disabled` in between and a reachable control reports itself unreachable.
+        await renderTick()
+        const disc = act('Discover models')
+        if (!disc || disc.disabled) {
+          fail(
+            `Discover models is not reachable once a URL is typed ` +
+              `(urlBox.value=${JSON.stringify(urlBox.value)} found=${!!disc} disabled=${disc?.disabled} ` +
+              `pvUrl=${JSON.stringify(pvUrl)} probing=${probing} busy=${pvBusy})`,
+          )
+          return
+        }
+        disc.click()
+        if (!(await until(() => !!document.querySelector('[data-probed] .srow-t'), 12000))) {
+          const msg = document.querySelector('[data-pv-msg]')?.textContent ?? 'no message'
+          fail(`discovery named nothing for ${ep}: ${msg.slice(0, 140)}`)
+          return
+        }
+        const found = (document.querySelector('[data-probed] .srow-t')?.textContent ?? '').trim()
+        const chipNames = [...(document.querySelectorAll('[data-probed] .cap') ?? [])].map((c) => c.textContent?.trim())
+        // What discovery claimed about tool calls, read before the add clears the list. Kept to
+        // compare after Save: the screen has no field for capabilities, so it has no authority
+        // to clear them.
+        const toolsYes = probed.filter((c) => c.supports_tools === true).map((c) => c.id)
+        if (!chipNames.length) {
+          fail(`discovery listed "${found}" with no capability chips: the empty/known/unknown distinction is lost`)
+          return
+        }
+        const test = act('Test connection')
+        if (!test) {
+          fail('no Test connection button on the Models page')
+          return
+        }
+        test.click()
+        // The placeholder message is on screen the moment the click lands, so waiting for "a
+        // message" proves nothing — that is how this case once judged a test that had not
+        // finished. Wait for the state the button itself reads, then read the sentence.
+        if (!(await until(() => !pvBusy, 10000))) {
+          fail(`the connection test never finished for ${ep}`)
+          return
+        }
+        const said = (document.querySelector('[data-pv-msg]')?.textContent ?? '').trim()
+        if (said.length < 12 || said.startsWith('asking the endpoint')) {
+          fail(`the connection test answered with "${said}": that is not a sentence about an endpoint`)
+          return
+        }
+        const add = act('Add endpoint')
+        if (!add || add.disabled) {
+          fail(`Add endpoint still disabled after discovery found ${found}`)
+          return
+        }
+        add.click()
+        if (!(await until(() => !!document.querySelector('[data-set-section="endpoints-list"] .sitem-name'), 6000))) {
+          fail('Add endpoint reported success but the page lists no endpoint row')
+          return
+        }
+        const after = await invoke<{ providers: { name: string; models: string[]; base_url: string }[] }>('provider_status')
+        const row = (after.providers ?? []).find((x) => x.name === 'selftest probe box')
+        if (!row) {
+          fail(
+            `the host was not told about the endpoint the page added (rows: ${(after.providers ?? [])
+              .map((x) => x.name)
+              .join(', ')})`,
+          )
+          return
+        }
+        if (!row.base_url.includes(ep.replace(/^https?:\/\//, ''))) {
+          fail(`the stored row points at ${row.base_url}, not ${ep}`)
+          return
+        }
+        if (!row.models.length) {
+          fail('the stored endpoint row came back with no models')
+          return
+        }
+        const mid = row.models[0]
+        const prov = [
+          ...document.querySelectorAll('[data-set-section="endpoints-list"] .sitem-h'),
+        ].find((b) => (b.textContent ?? '').includes('selftest probe box')) as HTMLButtonElement | undefined
+        if (!prov) {
+          fail('the new endpoint row has no disclosure control')
+          return
+        }
+        // Adding an endpoint opens its row on purpose, so the click is only for the case where
+        // it came back shut: clicking an open row would close the thing the case needs.
+        if (prov.getAttribute('aria-expanded') !== 'true') {
+          prov.click()
+          await new Promise((r) => setTimeout(r, 250))
+        }
+        // Scope to this provider's own block: the list can hold other endpoints, and reaching
+        // for the first model row in the section would grade somebody else's model.
+        const block = prov.closest('.sitem') as HTMLElement | null
+        // The provider row has a `.sitem-top` of its own; the model rows live inside its body,
+        // so the model header is looked for there and not at the top of the block.
+        const mHdr = block?.querySelector('.sitem-b .sitem-top .sitem-h') as HTMLButtonElement | null
+        if (!mHdr) {
+          fail('the endpoint row expanded but lists no model row')
+          return
+        }
+        mHdr.click()
+        await new Promise((r) => setTimeout(r, 250))
+        const winBox = block?.querySelector('input[id^="cw-mw-"]') as HTMLInputElement | null
+        if (!winBox) {
+          fail('a model row opened with no Max context field')
+          return
+        }
+        // `context_window` on the host's view is what the file holds, not what the endpoint
+        // claims: a missing field really does mean nothing is stored.
+        const storedWindow = async () => {
+          const st = await invoke<{ models?: { id: string; context_window?: number | null }[] }>('provider_status')
+          return (st.models ?? []).find((m) => m.id === mid)?.context_window ?? null
+        }
+        type(winBox, '40000')
+        await renderTick()
+        const save = act('Save', block ?? document)
+        if (!save) {
+          fail('the model row has no Save button')
+          return
+        }
+        if (save.disabled) {
+          fail('Save is disabled with a number typed in the context field')
+          return
+        }
+        save.click()
+        if (!(await until(async () => (await storedWindow()) === 40000, 4000))) {
+          fail(`the stored window came back as ${await storedWindow()}, not 40000`)
+          return
+        }
+        const chipsIn = () => [...(block?.querySelectorAll('.cap') ?? [])].map((c) => c.textContent ?? '')
+        const wantChip = `${fmtTokens(40000)} context`
+        if (!(await until(() => chipsIn().some((c) => c.includes(wantChip)), 2000))) {
+          fail(`the model row does not show the stored window it just saved (chips: ${chipsIn().join(', ')})`)
+          return
+        }
+        if (toolsYes.includes(mid)) {
+          const kept = (
+            await invoke<{ models?: { id: string; supports_tools?: boolean | null }[] }>('provider_status')
+          ).models?.find((m) => m.id === mid)
+          if (kept?.supports_tools !== true) {
+            fail(
+              `the save dropped what discovery had found for ${mid}: supports_tools=${String(
+                kept?.supports_tools,
+              )}, and discovery had said true`,
+            )
+            return
+          }
+        }
+        // An empty field means "ask the endpoint", so saving it empty has to remove the value
+        // rather than file a placeholder — and the page has to stop claiming the number.
+        type(winBox, '')
+        await renderTick()
+        const clear = act('Save', block ?? document)
+        if (!clear) {
+          fail('the model row lost its Save button')
+          return
+        }
+        clear.click()
+        if (!(await until(async () => (await storedWindow()) === null, 4000))) {
+          fail(`clearing the field left a stored value behind: ${await storedWindow()}`)
+          return
+        }
+        if (!(await until(() => !chipsIn().some((c) => c.includes(wantChip)), 2000))) {
+          fail(`the host no longer stores a window for ${mid} but the row still shows "${wantChip}"`)
+          return
+        }
+        // Leave the scratch config as the run found it.
+        const rm = [...(block?.querySelectorAll('.set-btn.danger') ?? [])].find((b) =>
+          (b.textContent ?? '').includes('Remove endpoint row'),
+        ) as HTMLButtonElement | undefined
+        if (!rm) {
+          fail('the endpoint row offers no way to remove it')
+          return
+        }
+        rm.click()
+        if (
+          !(await until(async () => {
+            const st2 = await invoke<{ providers: { name: string }[] }>('provider_status')
+            return !(st2.providers ?? []).some((x) => x.name === 'selftest probe box')
+          }, 5000))
+        ) {
+          fail('the board could not remove the endpoint row it created')
+          return
+        }
+        const now = await invoke<{ providers: unknown[] }>('provider_status')
+        pageLog(
+          `models page ok (discovered ${found}, tested, added a row the host kept, stored 40000 then ` +
+            `freed it, what the probe found survived a save that never mentioned it, removed the row: ` +
+            `${rowsBefore} -> ${(now.providers ?? []).length})`,
+        )
+      }
+      await modelsRoundTrip()
+      closeSettings()
 
       // Cowork <-> chat, driven through the tab the user actually clicks. The scripted
       // endpoint answers the same prompt with a tool call on both halves: in chat nothing
@@ -4615,11 +5278,14 @@
           btn.click()
           // The panel reads its state on first open, including a container probe
           // (podman ps), so give the round trip room.
-          if (!(await waitFor('the search panel to fill in', () => document.querySelectorAll('.pop .pop-item').length > 3, 4000))) {
+          if (!(await waitFor('the search panel to fill in', () => document.querySelectorAll('.pop [role="radio"]').length >= 3, 4000))) {
             fail('the search panel opened but never listed its providers')
           } else {
-            const items = [...document.querySelectorAll('.pop .pop-item')] as HTMLElement[]
-            const labels = items.map((i) => (i.querySelector('.pop-lbl')?.textContent ?? '').trim())
+            // The panel body is the same block the Workspace page renders under its
+            // own heading, so the checks below name the row kinds, not one surface's
+            // class names.
+            const items = [...document.querySelectorAll('.pop [role="radio"]')] as HTMLElement[]
+            const labels = items.map((i) => (i.querySelector('.schoice-l')?.textContent ?? '').trim())
             const want = ['DuckDuckGo', 'SearXNG, run by Cwoffee', 'SearXNG, already running']
             const missing = want.filter((w) => !labels.includes(w))
             if (missing.length)
@@ -4627,8 +5293,8 @@
             const marked = items.filter((i) => i.getAttribute('aria-checked') === 'true')
             if (marked.length !== 1)
               fail(`exactly one provider must be marked as in use, saw ${marked.length}: ${labels.join(' | ')}`)
-            const inUse = items.find((i) => i.textContent?.includes('In use now'))
-            const said = (inUse?.querySelector('.pop-sub')?.textContent ?? '').trim()
+            const inUse = document.querySelector('.pop [data-web-current]') as HTMLElement | null
+            const said = (inUse?.querySelector('.srow-h')?.textContent ?? '').trim()
             if (!inUse || said.length < 6)
               fail(
                 `the panel does not say what search is actually doing (got ${said || 'nothing'}): a card that prints the config value cannot tell "auto" with a container from "auto" with no runtime`,
@@ -4682,23 +5348,25 @@
                 Math.min(x.bottom, y.bottom) - Math.max(x.top, y.top) > 4
               )
             }
-            const rows = [...panel.querySelectorAll('.pop-item')] as HTMLElement[]
+            const rows = [...panel.querySelectorAll('.srow, .schoice')] as HTMLElement[]
             for (let i = 0; i + 1 < rows.length; i++)
               if (overlaps(rows[i], rows[i + 1]))
                 fail(`provider rows overlap: "${rows[i].textContent?.trim().slice(0, 20)}" / "${rows[i + 1].textContent?.trim().slice(0, 20)}"`)
 
             const synth = document.createElement('div')
-            synth.className = 'pop-item static status'
-            const l1 = document.createElement('span')
-            l1.className = 'pop-lbl'
+            synth.className = 'srow'
+            const wrap = document.createElement('div')
+            const l1 = document.createElement('div')
+            l1.className = 'srow-t'
             l1.textContent = 'Its own container'
-            const l2 = document.createElement('span')
-            l2.className = 'pop-sub'
+            const l2 = document.createElement('div')
+            l2.className = 'srow-h'
             l2.textContent = 'podman · 8899 · idle in 120s · standing up'
-            const l3 = document.createElement('span')
-            l3.className = 'pop-sub mono s2'
+            const l3 = document.createElement('div')
+            l3.className = 'srow-h mono'
             l3.textContent = 'port 8899 · idle 120s · config /home/user/.config/cwoffee/searxng'
-            synth.append(l1, l2, l3)
+            wrap.append(l1, l2, l3)
+            synth.append(wrap)
             panel.appendChild(synth)
             await frame(60)
             const lineBad: string[] = []
@@ -4721,9 +5389,9 @@
             if (lineBad.length)
               fail(
                 `the managed-container status block stacks wrong: ${lineBad.join('; ')} ` +
-                  `(every .pop-sub sits on grid row 2 unless the item says otherwise)`,
+                  `(the two helper lines of a settings row must stack, not share a line)`,
               )
-            const real = panel.querySelector('.pop-item.status')
+            const real = panel.querySelector('[data-web-auto]')
             pageLog(
               `search panel geometry ok (${rows.length} rows, ${pr.width.toFixed(0)}x${pr.height.toFixed(0)} inside ` +
                 `${innerWidth}x${innerHeight}, status block stacks, live status ${real ? 'shown' : 'not applicable on this backend'})`,
@@ -4971,8 +5639,15 @@
           }
           // A new_session with a workspace moves the host's folder. Put it back where the
           // rest of the board expects it, or every later case runs in /tmp.
-          if (home && (await invoke<HostState>('session_state')).workspace !== home)
-            await invoke('set_workspace_checked', { path: home }).catch(() => {})
+          // The verb is `set_workspace` on both hosts. This used to call
+          // `set_workspace_checked` — a name no host implements — behind a `.catch(() => {})`,
+          // so the board left its scratch folder as the host's workspace and nothing said so.
+          if (home && (await invoke<HostState>('session_state')).workspace !== home) {
+            await invoke('set_workspace', { path: home })
+            const back = (await invoke<HostState>('session_state')).workspace
+            if (back !== home)
+              pageLog(`folders: the board could not move the host back to ${home}; it is at ${back}`)
+          }
           await loadSessions()
           await loadWorkspaces()
           // Leave no toast standing and no frame pending. This case speaks through the same
@@ -6610,24 +7285,27 @@
             const btnM = document.querySelector('button[aria-label="Session telemetry"]') as HTMLElement | null
             btnM?.click()
             await new Promise((r) => setTimeout(r, 250))
+            // The ceiling row is the settings control, drawn once and rendered here
+            // too: the popup and the Models page are the same markup, so this case can
+            // drive either one and mean the same thing.
             const crowEl = () =>
-              [...document.querySelectorAll('.mbar-row')].find((r) =>
+              [...document.querySelectorAll('[data-set-ceiling]')].find((r) =>
                 (r.textContent ?? '').includes('ceiling'),
               ) as HTMLElement | undefined
             const crow = crowEl()
             const ctext = () => (crowEl()?.textContent ?? '').replace(/\s+/g, ' ').trim()
-            const box = crow?.querySelector('input.mnum') as HTMLInputElement | undefined
+            const box = crow?.querySelector('[data-ceiling-input]') as HTMLInputElement | undefined
             const btnNamed = (name: string) =>
               [...(crow?.querySelectorAll('button') ?? [])].find((b) =>
                 (b.textContent ?? '').includes(name),
               ) as HTMLButtonElement | undefined
-            const pinBtn = btnNamed('pin it')
-            const deriveBtn = btnNamed('derive it')
+            const pinBtn = btnNamed('Pin')
+            const deriveBtn = btnNamed('Derive')
             const sayRow = () =>
               [...document.querySelectorAll('.set-note')].map((n) => n.textContent ?? '').join(' | ')
 
             if (!crow) fail('the telemetry panel shows no ceiling row')
-            else if (!box || !pinBtn || !deriveBtn) fail('the ceiling row has no number box and pin/derive buttons')
+            else if (!box || !pinBtn || !deriveBtn) fail('the ceiling row has no token field and no Pin / Derive buttons')
             else if (!ctext().includes(h0.budget_pin ? 'pinned by you' : 'derived'))
               fail(`the ceiling row does not say how its number was arrived at: "${ctext()}"`)
             else {
@@ -6664,7 +7342,7 @@
                 else {
                   // And back to derived, which is not a number: the line comes out of the
                   // file, so the next start does not re-pin itself.
-                  if (!deriveBtn || deriveBtn.disabled) fail('the ceiling row has no live "derive it" control')
+                  if (!deriveBtn || deriveBtn.disabled) fail('the ceiling row has no live Derive control')
                   else {
                     deriveBtn.click()
                     const wantBack = Math.max(4096, Math.floor(win / 2))
@@ -6683,7 +7361,7 @@
                       waitedMs += 100
                       h3 = await invoke<HostState>('session_state')
                     }
-                    if (h3.budget_pin) fail(`"derive it" left a pin in place: ${h3.budget_pin}`)
+                    if (h3.budget_pin) fail(`pressing Derive left a pin in place: ${h3.budget_pin}`)
                     else if (h3.context_budget !== wantBack)
                       fail(
                         `after freeing the pin the meter still reads ${h3.context_budget} after ${waitedMs}ms, not half the stated window (${wantBack})`,
@@ -7264,10 +7942,10 @@
           else {
             // The words on the control come from Rust, so the client cannot advertise a
             // setting the host does not implement.
-            const lbl = row.querySelector('.preflbl')?.textContent ?? ''
+            const lbl = row.querySelector('[data-pref-label]')?.textContent ?? ''
             if (!/step/i.test(lbl)) fail(`the pref row's label did not come from the host: "${lbl}"`)
-            const segOn = row.querySelector('[data-pref-value="on"]') as HTMLButtonElement | null
-            const segOff = row.querySelector('[data-pref-value="off"]') as HTMLButtonElement | null
+            const segOn = row.querySelector('[data-seg-value="on"]') as HTMLButtonElement | null
+            const segOff = row.querySelector('[data-seg-value="off"]') as HTMLButtonElement | null
             if (!segOn || !segOff || segOn.disabled)
               fail('the pref row has no live on/off segments')
             else {
@@ -9963,22 +10641,400 @@
     </main>
   </div>
 
+  <!-- ================================================================
+       Settings bodies, written once and rendered twice.
+
+       Every block below is drawn both in the popup that answers a passing
+       question (the telemetry bar, the composer controls) and in the settings
+       screen under its own heading. That sharing is the point: a control that
+       exists in two copies is two chances to mean different things, and the
+       app has already been bitten by exactly that once - the ceiling was set
+       from a panel in one place and shown from a different number in another.
+       ================================================================ -->
+  {#snippet approvalsBody()}
+    <Choices
+      aria="Approval mode"
+      value={mode}
+      options={MODE_CHOICES}
+      onpick={(v) => void pickMode(v as 'ask' | 'session' | 'auto')}
+    />
+    <p class="set-note">
+      A yes covers this conversation only, and never a folder it does not already
+      cover: a path outside the workspace is refused in every mode, including
+      <span class="mono">run without asking</span>. The sandbox is the app's, not
+      the model's, so no answer here widens what a command can reach.
+    </p>
+  {/snippet}
+
+  {#snippet reasoningBody()}
+    <Segmented
+      aria="Thinking effort"
+      value={thinking}
+      options={THINK_CHOICES}
+      onpick={(v) => void pickThinking(v as ReasoningLevel)}
+    />
+    <p class="set-note">{thinkingNote}</p>
+  {/snippet}
+
+  {#snippet ceilingRow()}
+    <div class="srow" data-set-ceiling>
+      <div>
+        <div class="srow-t">
+          Context ceiling
+          <b class="mono nowrap">{fmtTokens(hostState?.context_budget ?? 0)} tokens</b>
+        </div>
+        <div class="srow-h" data-budget-provenance>
+          {#if hostState?.budget_pin}
+            pinned by you at {fmtTokens(hostState.budget_pin)}: it survives a restart, and every
+            client of this app reads the same number
+          {:else if ctxLimit}
+            derived: half of the {fmtTokens(ctxLimit)} token window this endpoint states -
+            the other half is left for the answer
+          {:else}
+            derived: this endpoint has stated no window yet, so the app keeps a standing
+            default until one is known
+          {/if}
+        </div>
+      </div>
+      <div class="srow-c">
+        <input
+          class="sinp num narrow mono"
+          type="number"
+          min="4096"
+          step="1024"
+          data-ceiling-input
+          bind:value={budgetDraft}
+          placeholder={String(hostState?.context_budget ?? 0)}
+          aria-label="Context ceiling in tokens"
+          title="Tokens. Below 4096 the app refuses: a prompt that small cannot hold the system prompt, the tool definitions and a tool result, and still leave room for an answer. Above the window the endpoint states it also refuses, because the server would cut the prompt before the meter ever filled."
+        />
+        <button
+          class="set-btn primary"
+          disabled={budgetBusy}
+          title="Write this ceiling to the config file, then apply what the file says."
+          onclick={pinBudget}
+        >
+          Pin
+        </button>
+        <button
+          class="set-btn plain"
+          disabled={budgetBusy || !hostState?.budget_pin}
+          title="Let go of the pin. The ceiling goes back to half of whatever window this model's endpoint states, so it is stored by removing the line rather than by writing a number for it."
+          onclick={() => void setBudget(null)}
+        >
+          Derive
+        </button>
+        <button
+          class="set-btn"
+          disabled={compacting || (hostState?.busy ?? false)}
+          title={hostState?.busy
+            ? 'A turn is running; compaction happens between turns'
+            : 'Ask the model to summarize the older turns. Recent turns stay word for word; the note reports the token counts the core measured, not an estimate from this window.'}
+          onclick={() => void compactNow()}
+        >
+          {compacting ? 'Compacting…' : 'Compact now'}
+        </button>
+      </div>
+    </div>
+    {#if budgetMsg}
+      <div class="set-note" data-budget-note>{budgetMsg}</div>
+    {/if}
+  {/snippet}
+
+  {#snippet sessionReadouts(showCeiling: boolean)}
+    <div class="mbar-row">
+      <span class="mlbl">context</span>
+      <span
+        class="mbar"
+        title="prompt tokens against the ceiling the endpoint states; the tick marks the engine's own prompt budget, the line history is trimmed past"
+      >
+        <i style="width:{Math.min(100, ctxPct)}%"></i>
+        {#if ctxLimit && hostState?.context_budget}
+          <u
+            style="left:{Math.min(100, (hostState.context_budget / ctxLimit) * 100)}%"
+            title="{hostState.context_budget.toLocaleString()} tokens: the engine's prompt budget"
+          ></u>
+        {/if}
+      </span>
+      <span
+        class="mval mono"
+        title="{(hostState?.context_tokens ?? 0).toLocaleString()} tokens used against a {ctxLimit ? ctxLimit.toLocaleString() : 'unknown'} token window the endpoint itself stated. The percentage is the number worth watching; the exact counts live here rather than on screen."
+      >
+        {#if ctxLimit}
+          {ctxPct}%
+        {:else}
+          no window reported
+        {/if}
+        {#if hostState?.context_budget}
+          <small class="ctxtrim" title="history is trimmed past this, not past the model's window"
+            >trims at {fmtTokens(hostState.context_budget)}</small
+          >
+        {/if}
+      </span>
+    </div>
+    {#if showCeiling}
+      {@render ceilingRow()}
+    {/if}
+    <div class="mbar-row">
+      <span class="mlbl">prefix cache</span>
+      <span class="mbar" title="how much of the prompt the server already had">
+        <i class="ok" style="width:{Math.min(100, cacheHit)}%"></i>
+      </span>
+      <span class="mval mono">{cacheLabel}</span>
+    </div>
+    <div class="mgrid">
+      <div class="mcell">
+        <b>{liveEstimate ? '\u2248 ' : ''}{fmt.rate(curDecode)}</b>
+        <span>decode/s now{liveEstimate ? ' · estimated' : ''}</span>
+      </div>
+      <div class="mcell"><b>{fmt.rate(avgDecode)}</b><span>decode/s session avg</span></div>
+      <div class="mcell"><b>{fmt.rate(curPrefill)}</b><span>prefill/s effective</span></div>
+      <div class="mcell"><b>{fmt.rate(avgPrefill)}</b><span>prefill/s raw avg</span></div>
+      <div class="mcell">
+        <b>{ttft || '\u2014'}<small>ms</small></b><span>first token</span>
+      </div>
+      <div class="mcell">
+        <b>{turnMs ? (turnMs / 1000).toFixed(1) : '\u2014'}<small>s</small></b><span>this turn</span>
+      </div>
+      <div class="mcell"><b>{fmt.pct(specPct)}</b><span>speculative accept</span></div>
+      <div class="mcell"><b>{lastUsage?.completion ?? 0}</b><span>tokens out</span></div>
+      <div class="mcell">
+        <b>{lastUsage?.prompt ?? promptTokens ?? 0}</b><span>tokens in (prompt)</span>
+      </div>
+      <div class="mcell">
+        <b>{hostState?.compactions ?? 0}</b>
+        <span title="history was dropped; the next prefill will be slow">compactions</span>
+      </div>
+    </div>
+    <div class="mfoot">
+      <span class="mfoot-lbl">render</span>
+      <span class="mfoot-v mono">
+        {frames} frames · {dropped} dropped · worst {worstFrame.toFixed(0)}ms
+      </span>
+    </div>
+    {#if transportKind === 'tauri'}
+      <div class="mfoot">
+        <span class="mfoot-lbl">host</span>
+        <span class="mfoot-v mono">
+          ipc {ipc.ok ? 'ok' : ipc.msg} ·
+          {gpu
+            ? gpuOk
+              ? `iGPU ${gpuNodes.join(',')}`
+              : `GPU LEAK ${gpuNodes.join(',')}`
+            : 'gpu not reported'}
+        </span>
+      </div>
+    {/if}
+    <p class="set-note">
+      Rates marked ≈ are estimated from characters: the server reports token counts only when a
+      turn ends. Context is measured against the window the endpoint states, which is a
+      measurement, not a reservation.
+    </p>
+  {/snippet}
+
+  {#snippet devicesBody()}
+    {#if transportKind !== 'tauri'}
+      <div class="smsg">
+        This window is served by the gateway running on the host machine, so it is already
+        attached. Turn remote access on or off from the desktop app on that machine.
+      </div>
+      <p class="set-note">
+        Plain http, no tls: anyone who can reach that address and read the link can drive this
+        agent, workspace and tools included.
+      </p>
+    {:else}
+      <div class="srow">
+        <div>
+          <div class="srow-t">Remote access</div>
+          <div class="srow-h">
+            {#if gwBusy}
+              changing…
+            {:else if gw?.running}
+              running on <span class="mono">{gw.host}:{gw.port}</span>
+            {:else if gwErr}
+              not running: {gwErr}
+            {:else if gw?.note && gw.note !== 'off'}
+              not running: {gw.note}
+            {:else}
+              off: no other device can reach this app
+            {/if}
+          </div>
+        </div>
+        <div class="srow-c">
+          <Switch
+            on={!!gw?.running}
+            disabled={gwBusy}
+            aria="Turn remote access on or off"
+            onpick={(next) => void setGateway(next)}
+          />
+        </div>
+      </div>
+      <div class="srow">
+        <div>
+          <div class="srow-t">Which machines may connect</div>
+          <div class="srow-h">
+            {#if gw?.running}
+              bound now to <span class="mono">{gw.host}</span>
+            {:else}
+              used at the next start:
+              {gwScope === 'lan' ? 'every interface (0.0.0.0)' : 'this machine only (127.0.0.1)'}
+            {/if}
+          </div>
+        </div>
+        <div class="srow-c">
+          <Segmented
+            aria="Which machines may connect"
+            value={gw?.running ? (gw.host === '127.0.0.1' ? 'loopback' : 'lan') : gwScope}
+            options={SCOPE_CHOICES}
+            onpick={(v) => void setScope(v as 'loopback' | 'lan')}
+          />
+        </div>
+      </div>
+      {#if gw?.running}
+        <div class="srow">
+          <div>
+            <div class="srow-t">Attached now</div>
+            <div class="srow-h mono">{attachedLine(gw)} · token from {gw.token_source ?? 'none'}</div>
+          </div>
+        </div>
+        <div class="slist">
+          {#each gw?.urls ?? [] as u (u)}
+            <div class="srow" data-gw-url={u}>
+              <div class="mono" style="font-size:11.5px; word-break:break-all">{u}</div>
+              <div class="srow-c">
+                <button class="set-btn plain" onclick={() => void copyUrl(u)}>
+                  {copiedUrl && copiedUrl === 'copied' ? 'Copied' : 'Copy link'}
+                </button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+      {#if gwErr}
+        <div class="smsg bad" data-gw-error>{gwErr}</div>
+      {/if}
+      <p class="set-note">
+        The link is the credential. A drive token can send turns, move the workspace and run
+        sandboxed commands, so anyone who reads it can drive this agent. Nothing here is a
+        second factor: keep the scope at this machine unless a device has to reach it.
+      </p>
+    {/if}
+  {/snippet}
+
+  {#snippet webBody()}
+    {#if !webSearch}
+      <div class="smsg wait" data-web-state="loading">
+        {webSearchErr ? `Cannot read the search settings: ${webSearchErr}` : 'Reading the search settings…'}
+      </div>
+    {:else}
+      <div class="srow" data-web-current>
+        <div>
+          <div class="srow-t">In use now</div>
+          <div class="srow-h">{webSearch.describing}</div>
+        </div>
+      </div>
+      <Choices
+        aria="Search provider"
+        value={webSearch.backend}
+        options={SEARCH_CHOICES}
+        disabled={webSearchBusy}
+        onpick={(v) => void chooseWebSearch(v)}
+      />
+      {#if webSearch.backend === 'searxng'}
+        <Field
+          label="Instance URL"
+          forId="cw-searxng-url"
+          hint="A SearXNG instance with format=json enabled in its settings.yml, e.g. http://127.0.0.1:8080/search"
+        >
+          <input
+            class="sinp mono"
+            id="cw-searxng-url"
+            type="text"
+            placeholder="http://127.0.0.1:8080/search"
+            bind:value={webSearchUrl}
+            onchange={() => void chooseWebSearch('searxng')}
+          />
+        </Field>
+      {/if}
+      {#if webSearch.backend === 'auto'}
+        <div class="srow" data-web-auto>
+          <div>
+            <div class="srow-t">The instance Cwoffee runs itself</div>
+            <div class="srow-h">{webSearch.auto?.note ?? 'checking…'}</div>
+            <div class="srow-h mono">
+              port {webSearch.auto_port} · idle {webSearch.auto_idle_secs}s · config
+              {webSearch.auto_dir}
+            </div>
+          </div>
+        </div>
+        {#if !webSearch.runtime}
+          <div class="smsg">
+            No podman or docker on this machine, so Cwoffee cannot run an instance of its own.
+            Search keeps working through DuckDuckGo and says so in every result until a runtime
+            appears.
+          </div>
+        {/if}
+      {/if}
+      <div class="srow" data-web-probe>
+        <div>
+          <div class="srow-t">Try one search</div>
+          <div class="srow-h">
+            {webSearchProbe
+              ? `${webSearchProbe.results.length} result${webSearchProbe.results.length === 1 ? '' : 's'} in ${webSearchProbe.ms}ms`
+              : 'asks the provider directly, not the model, so a working provider and a working model stay separate facts'}
+          </div>
+        </div>
+        <div class="srow-c">
+          <button class="set-btn" disabled={webSearchBusy} onclick={() => void runWebSearchProbe()}>
+            {webSearchBusy ? 'Searching…' : 'Run probe'}
+          </button>
+        </div>
+      </div>
+      {#if webSearchProbe && !webSearchProbe.error}
+        <div class="slist" data-web-results>
+          {#each webSearchProbe.results.slice(0, 3) as r (r.url)}
+            <div class="srow">
+              <div>
+                <div class="srow-t">{r.title}</div>
+                <div class="srow-h mono">{r.url}</div>
+              </div>
+            </div>
+          {/each}
+        </div>
+        {#if webSearchProbe.note}
+          <p class="set-note">{webSearchProbe.note}</p>
+        {/if}
+      {/if}
+      {#if webSearchProbe?.error}
+        <div class="smsg bad" data-web-error>{webSearchProbe.error}</div>
+      {/if}
+      {#if webSearchErr}
+        <div class="smsg bad" data-web-error>{webSearchErr}</div>
+      {/if}
+      {#if webSearch.env_override}
+        <p class="set-note">{webSearch.env_override}</p>
+      {/if}
+      {#if webSearch.saved_to}
+        <p class="set-note">Saved to {webSearch.saved_to}.</p>
+      {/if}
+    {/if}
+  {/snippet}
+
+  {#snippet keysBody()}
+    {#each SHORTCUTS as sc (sc.keys)}
+      <div class="srow">
+        <div class="srow-t">{sc.label}</div>
+        <div class="srow-c mono nowrap">{sc.keys}</div>
+      </div>
+    {/each}
+  {/snippet}
   {#snippet body(menu: Menu)}
       {#if menu.kind === 'mode'}
         <div class="pop-title">Approvals</div>
-        {#each MODES as m}
-          <button class="pop-item {mode === m ? 'on' : ''}" onclick={() => pickMode(m)} role="menuitemradio" aria-checked={mode === m}>
-            <span class="pop-lbl">{MODE_LABEL[m]}</span>
-            <span class="pop-sub">{MODE_HINT[m]}</span>
-          </button>
-        {/each}
+        {@render approvalsBody()}
       {:else if menu.kind === 'think'}
         <div class="pop-title">Thinking effort</div>
-        {#each THINKS as t}
-          <button class="pop-item {thinking === t ? 'on' : ''}" onclick={() => pickThinking(t)} role="menuitemradio" aria-checked={thinking === t}>
-            <span class="pop-lbl">{THINK_LABEL[t]}</span>
-          </button>
-        {/each}
+        {@render reasoningBody()}
       {:else if menu.kind === 'model'}
         <div class="pop-title">Model</div>
         {#if models.length}
@@ -10111,326 +11167,16 @@
             turn streams and stay for the rest of the session.
           </div>
         {/if}
-        <div class="mbar-row">
-          <span class="mlbl">context</span>
-          <span
-            class="mbar"
-            title="prompt tokens against the ceiling the endpoint states; the tick marks the engine's own prompt budget, the line history is trimmed past"
-          >
-            <i style="width:{Math.min(100, ctxPct)}%"></i>
-            {#if ctxLimit && hostState?.context_budget}
-              <u
-                style="left:{Math.min(100, (hostState.context_budget / ctxLimit) * 100)}%"
-                title="{hostState.context_budget.toLocaleString()} tokens: the engine's prompt budget"
-              ></u>
-            {/if}
-          </span>
-          <span
-            class="mval mono"
-            title="{(hostState?.context_tokens ?? 0).toLocaleString()} tokens used against a {ctxLimit ? ctxLimit.toLocaleString() : 'unknown'} token window the endpoint itself stated. The percentage is the number worth watching; the exact counts live here rather than on screen."
-          >
-            {#if ctxLimit}
-              {ctxPct}%
-            {:else}
-              no window reported
-            {/if}
-            {#if hostState?.context_budget}
-              <small
-                class="ctxtrim"
-                title="history is trimmed past this, not past the model's window"
-                >trims at {fmtTokens(hostState.context_budget)}</small
-              >
-            {/if}
-          </span>
-          <button
-            class="mbtn"
-            disabled={compacting || (hostState?.busy ?? false)}
-            title={hostState?.busy
-              ? 'A turn is running; compaction happens between turns'
-              : 'Ask the model to summarize the older turns. Recent turns stay word for word; the note reports the token counts pi measured, not an estimate from the UI.'}
-            onclick={() => void compactNow()}
-          >
-            {compacting ? 'compacting…' : 'compact'}
-          </button>
-        </div>
-        <div class="mbar-row">
-          <span class="mlbl">ceiling</span>
-          <span
-            class="mval mono"
-            title="The number this conversation is measured and folded against. Half the window is the default because the other half is the answer: a ceiling that leaves no room for the reply truncates it mid-sentence. On the pi core the model is told to fold at the same line, so the meter and the fold are one number stated twice."
-          >
-            {fmtTokens(hostState?.context_budget ?? 0)}
-            <small class="ctxtrim">
-              {hostState?.budget_pin
-                ? `pinned by you at ${fmtTokens(hostState.budget_pin)}`
-                : ctxLimit
-                  ? `derived: half of ${fmtTokens(ctxLimit)}`
-                  : 'derived: no window stated yet'}
-            </small>
-          </span>
-          <input
-            class="mbtn mnum mono"
-            type="number"
-            min="4096"
-            step="1024"
-            bind:value={budgetDraft}
-            placeholder={String(hostState?.context_budget ?? 0)}
-            title="Tokens. Below 4096 the app refuses: a prompt that small cannot hold the system prompt, the tool definitions and a tool result. Above the window the endpoint stated it also refuses, because the server would cut the prompt before this meter ever filled."
-          />
-          <button
-            class="mbtn"
-            disabled={budgetBusy}
-            title="Pin this ceiling. It is written to the config file before it is applied, so it survives a restart and a phone can read what the desktop chose."
-            onclick={pinBudget}
-          >
-            pin it
-          </button>
-          <button
-            class="mbtn"
-            disabled={budgetBusy || !hostState?.budget_pin}
-            title="Let go of the pin: the ceiling goes back to half of whatever window this model's endpoint states. This is not a number, so it is stored by removing the line — writing some sentinel instead would leave the next start pinned."
-            onclick={() => void setBudget(null)}
-          >
-            derive it
-          </button>
-        </div>
-        {#if budgetMsg}
-          <div class="set-note">{budgetMsg}</div>
-        {/if}
-        <div class="mbar-row">
-          <span class="mlbl">prefix cache</span>
-          <span class="mbar" title="how much of the prompt the server already had">
-            <i class="ok" style="width:{Math.min(100, cacheHit)}%"></i>
-          </span>
-          <span class="mval mono">{cacheLabel}</span>
-        </div>
-        <div class="mgrid">
-          <div class="mcell">
-            <b>{liveEstimate ? '\u2248 ' : ''}{fmt.rate(curDecode)}</b>
-            <span>decode/s now{liveEstimate ? ' · estimated' : ''}</span>
-          </div>
-          <div class="mcell"><b>{fmt.rate(avgDecode)}</b><span>decode/s session avg</span></div>
-          <div class="mcell"><b>{fmt.rate(curPrefill)}</b><span>prefill/s effective</span></div>
-          <div class="mcell"><b>{fmt.rate(avgPrefill)}</b><span>prefill/s raw avg</span></div>
-          <div class="mcell">
-            <b>{ttft || '\u2014'}<small>ms</small></b><span>first token</span>
-          </div>
-          <div class="mcell">
-            <b>{turnMs ? (turnMs / 1000).toFixed(1) : '\u2014'}<small>s</small></b>
-            <span>this turn</span>
-          </div>
-          <div class="mcell"><b>{fmt.pct(specPct)}</b><span>speculative accept</span></div>
-          <div class="mcell"><b>{lastUsage?.completion ?? 0}</b><span>tokens out</span></div>
-          <div class="mcell">
-            <b>{lastUsage?.prompt ?? promptTokens ?? 0}</b><span>tokens in (prompt)</span>
-          </div>
-          <div class="mcell">
-            <b>{hostState?.compactions ?? 0}</b>
-            <span title="history was dropped; the next prefill will be slow">compactions</span>
-          </div>
-        </div>
-        <div class="mfoot">
-          <span class="mfoot-lbl">render</span>
-          <span class="mfoot-v mono">
-            {frames} frames · {dropped} dropped · worst {worstFrame.toFixed(0)}ms
-          </span>
-        </div>
-        {#if transportKind === 'tauri'}
-          <div class="mfoot">
-            <span class="mfoot-lbl">host</span>
-            <span class="mfoot-v mono">
-              ipc {ipc.ok ? 'ok' : ipc.msg} ·
-              {gpu
-                ? gpuOk
-                  ? `iGPU ${gpuNodes.join(',')}`
-                  : `GPU LEAK ${gpuNodes.join(',')}`
-                : 'gpu not reported'}
-            </span>
-          </div>
-        {/if}
-        <div class="pop-note">
-          Rates marked ≈ are estimated from characters: the server reports token
-          counts only when a turn ends. Context is the ceiling the endpoint
-          states, not a reservation.
-        </div>
+        {@render sessionReadouts(true)}
       {:else if menu.kind === 'gateway'}
         <div class="pop-title">Remote access</div>
-        {#if transportKind !== 'tauri'}
-          <div class="pop-item static">
-            <span class="pop-lbl">You are on it</span>
-            <span class="pop-sub">
-              This window is served by the gateway running on the host machine.
-              Turn it off from the desktop app on that machine.
-            </span>
-          </div>
-          <div class="pop-note">
-            Plain http, no tls: anyone who can reach this address and read the
-            link can drive this agent, workspace and tools included.
-          </div>
-        {:else}
-          {@const on = !!gw?.running}
-          <button
-            class="pop-item gwsw"
-            role="menuitemcheckbox"
-            aria-checked={on}
-            disabled={gwBusy}
-            onclick={() => void setGateway(!on)}
-          >
-            <span class="pop-lbl">
-              {gwBusy ? 'changing\u2026' : on ? 'Turn off remote access' : 'Turn on remote access'}
-            </span>
-            <span class="switch {on ? 'on' : ''}" aria-hidden="true"><i></i></span>
-          </button>
-          <div class="pop-item static">
-            <span class="pop-lbl">Reachable from</span>
-            <span class="pop-sub">
-              {on
-                ? `bound to ${gw?.host}:${gw?.port}`
-                : gwScope === 'lan'
-                  ? 'next start: every interface (0.0.0.0)'
-                  : 'next start: this machine only'}
-            </span>
-          </div>
-          <div class="popseg">
-            <button
-              class="pop-item {gwScope === 'loopback' ? 'on' : ''}"
-              role="menuitemradio"
-              aria-checked={gwScope === 'loopback'}
-              onclick={() => void setScope('loopback')}
-            >
-              <span class="pop-lbl">This machine</span>
-              <span class="pop-sub">127.0.0.1</span>
-            </button>
-            <button
-              class="pop-item {gwScope === 'lan' ? 'on' : ''}"
-              role="menuitemradio"
-              aria-checked={gwScope === 'lan'}
-              onclick={() => void setScope('lan')}
-            >
-              <span class="pop-lbl">Any device</span>
-              <span class="pop-sub">0.0.0.0 · needs a token</span>
-            </button>
-          </div>
-          {#if on}
-            <div class="pop-item static">
-              <span class="pop-lbl">Attached now</span>
-              <span class="pop-sub mono">
-                {attachedLine(gw)} · token from {gw?.token_source ?? 'none'}
-              </span>
-            </div>
-            {#each gw?.urls ?? [] as u}
-              <button class="pop-item urlrow" onclick={() => void copyUrl(u)} role="menuitem">
-                <span class="pop-lbl mono url">{u}</span>
-                <span class="pop-sub">{copiedUrl || 'copy'}</span>
-              </button>
-            {/each}
-          {/if}
-          {#if gwErr}
-            <div class="ws-err">{gwErr}</div>
-          {/if}
-          <div class="pop-note">
-            Plain http, no tls. A drive token can send turns, move the workspace
-            and run sandboxed commands, so the link is the credential: anyone
-            who reads it can drive this agent.
-          </div>
-        {/if}
+        {@render devicesBody()}
       {:else if menu.kind === 'search'}
         <div class="pop-title">Web search</div>
-        <div class="pop-item static">
-          <span class="pop-lbl">In use now</span>
-          <span class="pop-sub">{webSearch ? webSearch.describing : 'reading\u2026'}</span>
-        </div>
-        <div class="popseg">
-          {#each SEARCH_PROVIDERS as p}
-            <button
-              class="pop-item {webSearch?.backend === p.id ? 'on' : ''}"
-              role="menuitemradio"
-              aria-checked={webSearch?.backend === p.id}
-              disabled={webSearchBusy || !webSearch}
-              onclick={() => void chooseWebSearch(p.id)}
-            >
-              <span class="pop-lbl">{p.label}</span>
-              <span class="pop-sub">{p.sub}</span>
-            </button>
-          {/each}
-        </div>
-        {#if webSearch?.backend === 'searxng'}
-          <label class="pop-item static field">
-            <span class="pop-lbl">Instance URL</span>
-            <input
-              class="ws-input pop-field-input"
-              type="text"
-              placeholder="http://127.0.0.1:8080/search"
-              bind:value={webSearchUrl}
-              onchange={() => void chooseWebSearch('searxng')}
-            />
-            <span class="pop-sub">
-              needs <span class="mono">format=json</span> enabled in its settings.yml
-            </span>
-          </label>
-        {/if}
-        {#if webSearch?.backend === 'auto'}
-          <div class="pop-item static status">
-            <span class="pop-lbl">Its own container</span>
-            <span class="pop-sub">
-              {webSearch?.auto?.note ?? 'checking\u2026'}
-            </span>
-            <span class="pop-sub mono s2">
-              port {webSearch?.auto_port} · idle {webSearch?.auto_idle_secs}s · config {webSearch?.auto_dir}
-            </span>
-          </div>
-          {#if !webSearch?.runtime}
-            <div class="pop-note">
-              No podman or docker on this machine, so Cwoffee cannot run an instance
-              of its own. Search keeps working through DuckDuckGo and says so in every
-              result until a runtime appears.
-            </div>
-          {/if}
-        {/if}
-        <button
-          class="pop-item"
-          role="menuitem"
-          disabled={webSearchBusy}
-          onclick={() => void runWebSearchProbe()}
-        >
-          <span class="pop-lbl">{webSearchBusy ? 'searching\u2026' : 'Try one search'}</span>
-          <span class="pop-sub">
-            {webSearchProbe ? `${webSearchProbe.results.length} result${webSearchProbe.results.length === 1 ? '' : 's'} in ${webSearchProbe.ms}ms` : 'asks the provider, not the model'}
-          </span>
-        </button>
-        {#if webSearchProbe && !webSearchProbe.error}
-          {#each webSearchProbe.results.slice(0, 3) as r}
-            <div class="pop-item static">
-              <span class="pop-lbl">{r.title}</span>
-              <span class="pop-sub mono">{r.url}</span>
-            </div>
-          {/each}
-          {#if webSearchProbe.note}
-            <div class="pop-note">{webSearchProbe.note}</div>
-          {/if}
-        {/if}
-        {#if webSearchErr}
-          <div class="ws-err">{webSearchErr}</div>
-        {/if}
-        {#if webSearch?.env_override}
-          <div class="pop-note">{webSearch.env_override}</div>
-        {/if}
-        {#if webSearch?.saved_to}
-          <div class="pop-note">saved to {webSearch.saved_to}</div>
-        {/if}
-        <div class="pop-note">
-          {transportKind !== 'tauri' ? 'the host\'s' : 'this machine\'s'}
-          <span class="pop-mono">~/.config/cwoffee/config.toml</span> holds the choice,
-          so it survives a restart. Turning this off never removes a container.
-        </div>
+        {@render webBody()}
       {:else if menu.kind === 'keys'}
         <div class="pop-title">Keyboard</div>
-        {#each SHORTCUTS as sc}
-          <div class="pop-item static">
-            <span class="pop-lbl">{sc.label}</span>
-            <span class="pop-key">{sc.keys}</span>
-          </div>
-        {/each}
+        {@render keysBody()}
       {:else}
         {@const sid = menu.sessionId ?? -1}
         <div class="pop-title">{titleOf(sid)}</div>
@@ -10485,380 +11231,741 @@
     >
       <header class="set-head">
         <span class="set-title">Settings</span>
-        <span class="set-sub">the choices the popups make, kept somewhere you can come back to</span>
         <button class="set-x" onclick={closeSettings} aria-label="Close settings" title="Close (Esc)">Esc</button>
       </header>
       <div class="set-grid">
-        <nav class="set-rail" aria-label="Settings sections">
-          {#each SET_TABS as t, i}
-            {#if i === 0 || SET_TABS[i - 1].group !== t.group}
-              <div class="set-group">{t.group}</div>
-            {/if}
+        <nav class="set-rail" aria-label="Settings categories">
+          <div class="set-rail-lbl">Settings</div>
+          {#each SET_PAGES as p (p.kind)}
             <button
-              class="set-tab {settings.tab === t.kind ? 'on' : ''}"
-              data-set-tab={t.kind}
-              onclick={() => pickSettingsTab(t.kind)}
-              aria-current={settings.tab === t.kind ? 'true' : undefined}
+              class="set-nav {settings.page === p.kind ? 'on' : ''}"
+              data-set-tab={p.kind}
+              onclick={() => gotoSettings(p.kind)}
+              aria-current={settings.page === p.kind ? 'true' : undefined}
             >
-              <span class="set-lbl">{t.label}</span>
-              <span class="set-hint">{t.hint}</span>
+              <svg
+                class="set-nav-ic"
+                width="15"
+                height="15"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d={p.icon}></path>
+              </svg>
+              <span class="set-lbl">{p.label}</span>
             </button>
           {/each}
         </nav>
-        <div class="set-body">
-          {#if settings.tab === 'display'}
-            <div class="mcur">
-              What the transcript shows while a turn works. These live in the app's own store, not in
-              the browser's: the desktop, a browser on another port and a phone read one answer.
-            </div>
-            {#each uiPrefs as p (p.key)}
-              <div class="prefrow" data-pref={p.key}>
-                <div class="preftxt">
-                  <div class="preflbl">{p.label}</div>
-                  <div class="prefhint">{p.hint}</div>
-                  {#if !p.is_default}
-                    <div class="prefnote">set by you: {p.value} (the default is {p.default})</div>
-                  {/if}
-                </div>
-                <div class="modesel prefseg" role="group" aria-label={p.label}>
-                  {#each p.values as v (v)}
-                    <button
-                      class="modesel-btn {p.value === v ? 'on' : ''}"
-                      data-pref-value={v}
-                      aria-pressed={p.value === v ? 'true' : 'false'}
-                      disabled={prefBusy}
-                      onclick={() => void setPref(p.key, v)}>{v}</button
-                    >
-                  {/each}
-                </div>
-              </div>
-            {/each}
-            <div class="setdiv"></div>
-            <div class="prefhint">
-              This list comes from the host. A setting the app does not act on never appears here, and
-              nothing here changes what the model is told - it is only about what you see.
-            </div>
-          {:else if settings.tab === 'tools'}
-            <div class="toolsec">
-              <p class="set-note">
-                Every tool below is defined once, in the Rust engine, and the model is handed
-                these same words. {#if personaNow === 'chat'}
-                  <b>Chat mode right now: none of them are mounted</b> — the model is answering
-                  with nothing attached.
-                {:else}
-                  All of them are mounted in this conversation.
-                {/if}
-              </p>
-              {#if toolsErr}<p class="set-note set-err">{toolsErr}</p>{/if}
-              {#each toolViews as t (t.name)}
-                <div class="toolrow">
-                  <code class="toolname">{t.name}</code>
-                  <p class="tooldesc">{toolBlurb(t.description)}</p>
-                </div>
-              {:else}
-                <p class="set-note">The engine reported no tools. That is a fault, not an empty list — check the app log.</p>
-              {/each}
-              <p class="set-note">
-                Nothing here is switchable yet. Per-tool permission is not wired into either
-                core, and a control that did nothing would be worse than no control.
-              </p>
-            </div>
-          {:else if settings.tab === 'model'}
-            <div class="toolsec">
-              <div class="mcur">
-                <span class="set-lbl">Answering with</span>
-                <code class="toolname">{hostState?.model || 'nothing picked yet'}</code>
-                <button class="set-btn" onclick={() => openSettings('think')}>thinking</button>
-              </div>
-              <p class="set-note">
-                One endpoint answers at a time. Adding another does not replace this one;
-                picking a model that lives on another endpoint moves the answer over, and the
-                conversation keeps its folder.
-              </p>
-              {#if pvMsg}<p class="set-note {pvBad ? 'set-err' : ''}">{pvMsg}</p>{/if}
 
-              <div class="pvadd">
-                <div class="pvgrid">
-                  <label class="pvf">
-                    <span>name</span>
-                    <input class="pill" bind:value={pvName} placeholder="the box on the LAN" />
-                  </label>
-                  <label class="pvf">
-                    <span>dialect</span>
-                    <select class="pill" bind:value={pvKind}>
-                      <option value="openai">openai</option>
-                      <option value="anthropic">anthropic</option>
-                      <option value="llama.cpp">llama.cpp</option>
-                    </select>
-                    <span class="set-note">left on the default when the URL already says what it is</span>
-                  </label>
-                  <label class="pvf wide">
-                    <span>API endpoint</span>
-                    <input class="pill" bind:value={pvUrl} placeholder="http://192.168.0.122:8080/v1" />
-                    <span class="set-note">
-                      {#if urlSaysV1}
-                        the <code>/v1</code> stays in the box on purpose: a llama.cpp or
-                        llama.cpp-style server answers at <code>/v1/chat/completions</code>, and
-                        the app would otherwise be one path short
-                      {:else}
-                        no <code>/v1</code> at the end — fine as a base URL; the app adds the
-                        path the dialect uses. If the endpoint expects <code>/v1</code> and you
-                        leave it out, Test connection will say so
-                      {/if}
-                    </span>
-                  </label>
-                  <label class="pvf">
-                    <span>API key</span>
-                    <input class="pill" type="password" bind:value={pvKey} />
-                    <span class="set-note">
-                      {#if pvKey}
-                        a key typed here is written to the config file, not shown back
-                      {:else if provRows.some((x) => x.current && x.has_key)}
-                        the endpoint answering now has a key stored; leave this empty to keep it
-                        untouched
-                      {:else}
-                        only if the endpoint asks for one — a local server usually does not
-                      {/if}
-                    </span>
-                  </label>
-                </div>
-                <div class="pvacts">
-                  <button class="set-btn" disabled={pvBusy || !pvUrl.trim()} onclick={() => void testProvider()}>
-                    {pvBusy ? 'asking the endpoint…' : 'Test connection'}
-                  </button>
-                  <button class="set-btn" disabled={probing || !pvUrl.trim()} onclick={() => void probeProvider()}>
-                    {probing ? 'probing…' : 'Probe models'}
-                  </button>
-                  <button class="set-btn primary" disabled={pvBusy || probed.length === 0} onclick={() => void addProvider()}>
-                    Add {pvName.trim() || 'this endpoint'} and {probed.length} model{probed.length === 1 ? '' : 's'}
-                  </button>
-                  <button
-                    class="set-btn"
-                    disabled={!probed.length && !pvMsg}
-                    onclick={() => {
-                      probed = []
-                      pvMsg = ''
-                    }}
-                  >
-                    clear
-                  </button>
-                </div>
-                {#if probing}
-                  <p class="set-note">
-                    Probing asks the endpoint what each model can do: the window it states,
-                    whether it accepts tool calls, whether it takes images, which thinking
-                    levels it names back. On a machine that is also running one of these models,
-                    give it a minute — this is a model call per model.
-                  </p>
-                {/if}
-                {#if probed.length}
-                  <div class="probelist">
-                    {#each probed as m (m.id)}
-                      <div class="prow">
-                        <code class="toolname">{m.id}</code>
-                        <span class="capset">
-                          {#each capLabel(m) as c (c)}<span class="cap">{c}</span>{/each}
-                        </span>
-                      </div>
+        <div class="set-body" data-set-page={settings.page} bind:this={setBodyEl}>
+          <h2 class="spage-title">{pageTitle}</h2>
+          <p class="spage-desc">{pageDesc}</p>
+
+          {#if settings.page === 'models'}
+            <Section
+              id="answering"
+              title="The model answering now"
+              desc="One model answers at a time in this conversation. Choosing another changes where the answer comes from; the conversation keeps its folder, its history and its approvals."
+            >
+              <div class="srow" data-current-model>
+                <div>
+                  <div class="srow-t mono">{hostState?.model || model || 'nothing picked yet'}</div>
+                  <div class="srow-h" data-current-endpoint>{currentModelLine}</div>
+                  <div class="capset" style="margin-top:6px">
+                    {#each capLabel(currentCapRow ?? { id: model }) as c (c)}
+                      <span class="cap">{c}</span>
                     {/each}
                   </div>
-                  <p class="set-note">
-                    Press Add and the endpoint plus every model above becomes a row you can open
-                    and edit. The window each one states is what the context ceiling and the
-                    model's own fold are built from, so adding a provider with a probe is what
-                    keeps the meter honest instead of guessed.
-                  </p>
-                {/if}
-                {#if !pvUrl.trim() && provRows.length}
-                  <p class="set-note">
-                    The fields start out as whatever the endpoint answering now uses — change
-                    the URL and you are describing a new endpoint, not editing that one.
-                  </p>
-                {/if}
+                </div>
+                <div class="srow-c" style="min-width:250px">
+                  <Select
+                    aria="Choose the model that answers"
+                    value={model}
+                    options={MODEL_CHOICES}
+                    mono
+                    disabled={busy || !models.length}
+                    onpick={(v) => void pickModel(v)}
+                  />
+                </div>
               </div>
+              {#if modelErr}
+                <div class="smsg bad" data-model-error>{modelErr}</div>
+              {:else if !models.length}
+                <!-- Three different reasons look the same from here unless they are
+                     named: no host, no endpoint, and an endpoint that lists nothing. -->
+                <div class="sempty" data-model-empty>
+                  {#if !ipc.ok}
+                    Not connected to the host, so no model list could be asked for: {ipc.msg}
+                  {:else}
+                    This endpoint lists no models. {model ? `Answering from ${model}.` : ''} Add the
+                    endpoint below to store what it states, or start the server it points at.
+                  {/if}
+                </div>
+              {:else}
+                <p class="set-note">
+                  The list is what this endpoint published. Capabilities marked “detected” were
+                  inferred from the chat template the server serves rather than stated by it.
+                </p>
+              {/if}
+            </Section>
 
-              <hr class="setdiv" />
-
-              <div class="prow-head">
-                <span class="set-lbl">Endpoints ({provRows.length})</span>
-                <button
-                  class="set-btn"
-                  onclick={() => {
-                    openProv = openProv.size === provRows.length ? new Set() : new Set(provRows.map((x) => x.name))
-                  }}
-                  disabled={!provRows.length}
+            <Section
+              id="endpoints"
+              title="Add an endpoint"
+              desc="Register another inference server without replacing the one in use. Nothing is written until Add endpoint; Add needs a completed discovery, so a guess cannot become configuration."
+            >
+              {#if pvMsg}
+                <div class="smsg {pvBad ? 'bad' : 'ok'}" data-pv-msg>{pvMsg}</div>
+              {/if}
+              <div class="sfld-grid">
+                <Field label="Endpoint name" forId="cw-pv-name" hint="A label for this list. It is not part of the address.">
+                  <input class="sinp" id="cw-pv-name" type="text" bind:value={pvName} placeholder="the box on the LAN" />
+                </Field>
+                <Field
+                  label="API compatibility"
+                  hint="Which dialect the server speaks. Left on the default when the URL already says which it is."
                 >
-                  {provRows.length && openProv.size === provRows.length ? 'collapse all' : 'expand all'}
+                  <Select
+                    id="cw-pv-kind"
+                    aria="API compatibility"
+                    value={pvKind}
+                    options={PROVIDER_KINDS}
+                    onpick={(v) => (pvKind = v)}
+                  />
+                </Field>
+                <Field
+                  label="Base URL"
+                  forId="cw-pv-url"
+                  wide
+                  hint={urlHintLine}
+                >
+                  <input
+                    class="sinp mono"
+                    id="cw-pv-url"
+                    type="text"
+                    spellcheck="false"
+                    bind:value={pvUrl}
+                    placeholder="http://192.168.0.122:8080/v1"
+                  />
+                </Field>
+                <Field
+                  label="API key"
+                  forId="cw-pv-key"
+                  hint="Only if the endpoint asks for one. A key typed here is written to the config file and never shown back on this screen."
+                >
+                  <input class="sinp mono" id="cw-pv-key" type="password" bind:value={pvKey} placeholder="not needed for a local server" />
+                </Field>
+              </div>
+              <div class="pvacts">
+                <button
+                  class="set-btn primary"
+                  disabled={pvBusy || probed.length === 0}
+                  title="Write this endpoint and everything discovery found into the config file."
+                  onclick={() => void addProvider()}
+                >
+                  Add endpoint{probed.length ? ` and ${probed.length} model${probed.length === 1 ? '' : 's'}` : ''}
+                </button>
+                <button class="set-btn" disabled={probing || !pvUrl.trim()} onclick={() => void probeProvider()}>
+                  {probing ? 'Discovering…' : 'Discover models'}
+                </button>
+                <button class="set-btn" disabled={pvBusy || !pvUrl.trim()} onclick={() => void testProvider()}>
+                  {pvBusy ? 'Contacting…' : 'Test connection'}
+                </button>
+                <button
+                  class="set-btn plain"
+                  disabled={!probed.length && !pvMsg}
+                  onclick={() => {
+                    probed = []
+                    pvMsg = ''
+                  }}
+                >
+                  Clear
                 </button>
               </div>
-              {#if !provRows.length}
+              {#if probing}
                 <p class="set-note">
-                  No endpoint rows yet. The one answering now comes from
-                  <code>config.toml</code>; probe it above and Add puts it on the list without
-                  replacing anything.
+                  Discovery asks the endpoint what each of its models can do: the window it states,
+                  whether it accepts tool calls, whether it takes images, which thinking levels it
+                  names back. It is one request per model, so on a machine that is also running one
+                  of these models it can take a minute.
                 </p>
-              {:else}
-                {#each provRows as p (p.name)}
-                  <div class="prov {openProv.has(p.name) ? 'open' : ''}">
-                    <button class="provhead" aria-expanded={openProv.has(p.name)} onclick={() => toggleProv(p.name)}>
-                      <span class="chev">{openProv.has(p.name) ? '▾' : '▸'}</span>
-                      <span class="provname">{p.name}</span>
-                      {#if p.current}<span class="cap now">answering now</span>{/if}
-                      <code class="provurl">{p.base_url}</code>
-                      <span class="provn">{p.models.length} model{p.models.length === 1 ? '' : 's'}</span>
-                    </button>
-                    {#if openProv.has(p.name)}
-                      <div class="provbody">
-                        <div class="pvline"><span>dialect</span><code>{p.kind}</code></div>
-                        <div class="pvline">
-                          <span>API key</span>
-                          <span>{p.has_key ? 'stored in the config file — never shown back here' : 'none: this endpoint takes none'}</span>
+              {:else if !pvUrl.trim() && provRows.length}
+                <p class="set-note">
+                  The fields start as whatever the endpoint in use has. Changing the URL describes a
+                  new endpoint rather than editing that one.
+                </p>
+              {/if}
+              {#if probed.length}
+                <div class="slist" data-probed>
+                  {#each probed as m (m.id)}
+                    <div class="srow">
+                      <div>
+                        <div class="srow-t mono">{m.id}</div>
+                        <div class="capset" style="margin-top:5px">
+                          {#each capLabel(m) as c (c)}<span class="cap">{c}</span>{/each}
                         </div>
-                        {#each p.models as id (id)}
-                          {@const m = capRows.find((x) => x.id === id)}
-                          {@const d = draftFor(id)}
-                          <div class="mrow2 {openModel.has(id) ? 'open' : ''}">
-                            <div class="mrow2top">
-                              <button class="mrow2name" aria-expanded={openModel.has(id)} onclick={() => toggleModel(id)}>
-                                <span class="chev">{openModel.has(id) ? '▾' : '▸'}</span>
-                                <code class="toolname">{id}</code>
-                              </button>
-                              <span class="capset">
-                                {#each capLabel(m ?? { id }) as c (c)}<span class="cap">{c}</span>{/each}
-                              </span>
-                              {#if m?.current}
-                                <span class="cap now">in use</span>
-                              {:else}
-                                <button class="set-btn" onclick={() => void useModel(id)}>use this</button>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+                <p class="set-note">
+                  Each row above becomes a model you can open and edit. The window an endpoint states
+                  is what the context meter, the derived ceiling and the core's own fold are built
+                  from, which is why adding an endpoint through discovery keeps those numbers
+                  measured instead of assumed.
+                </p>
+              {/if}
+            </Section>
+
+            <Section
+              id="endpoints-list"
+              title="Configured endpoints"
+              desc="Endpoints this app has been told about, and what it believes about each model on them. An empty field means “ask the endpoint”: saving it empty removes the stored value rather than writing a placeholder for it."
+            >
+              {#snippet actions()}
+                {#if provRows.length}
+                  <button
+                    class="set-btn plain"
+                    onclick={() => {
+                      openProv =
+                        openProv.size === provRows.length ? new Set() : new Set(provRows.map((x) => x.name))
+                    }}
+                  >
+                    {openProv.size === provRows.length ? 'Collapse all' : 'Expand all'}
+                  </button>
+                {/if}
+              {/snippet}
+              {#if !provRows.length}
+                <div class="sempty" data-prov-empty>
+                  No endpoint rows yet. The model answering now comes from
+                  <span class="mono">config.toml</span>; discover it above and Add endpoint puts it
+                  on this list without replacing anything.
+                </div>
+              {:else}
+                <div class="slist">
+                  {#each provRows as p (p.name)}
+                    <div class="sitem">
+                      <button class="sitem-h" aria-expanded={openProv.has(p.name)} onclick={() => toggleProv(p.name)}>
+                        <span class="chev">{openProv.has(p.name) ? '\u25BE' : '\u25B8'}</span>
+                        <span class="sitem-name">{p.name}</span>
+                        {#if p.current}<span class="cap now">in use</span>{/if}
+                        <code class="sitem-sub">{p.base_url}</code>
+                        <span class="sitem-n">{p.models.length} model{p.models.length === 1 ? '' : 's'}</span>
+                      </button>
+                      {#if openProv.has(p.name)}
+                        <div class="sitem-b">
+                          <div class="srow">
+                            <div class="srow-t">API compatibility</div>
+                            <div class="srow-c mono">{p.kind}</div>
+                          </div>
+                          <div class="srow">
+                            <div>
+                              <div class="srow-t">API key</div>
+                              <div class="srow-h">
+                                {p.has_key
+                                  ? 'stored in the config file; this screen never shows it back'
+                                  : 'none: this endpoint takes none'}
+                              </div>
+                            </div>
+                          </div>
+                          {#each p.models as id (id)}
+                            {@const m = capRows.find((x) => x.id === id)}
+                            {@const d = draftFor(id)}
+                            <div class="sitem">
+                              <div class="sitem-top">
+                                <button
+                                  class="sitem-h"
+                                  aria-expanded={openModel.has(id)}
+                                  onclick={() => toggleModel(id)}
+                                >
+                                  <span class="chev">{openModel.has(id) ? '\u25BE' : '\u25B8'}</span>
+                                  <span class="sitem-name mono">{id}</span>
+                                  <span class="capset">
+                                    {#each capLabel(m ?? { id }) as c (c)}<span class="cap">{c}</span>{/each}
+                                  </span>
+                                  {#if m?.current}<span class="sitem-n">in use</span>{/if}
+                                </button>
+                                {#if !m?.current}
+                                  <button
+                                    class="set-btn plain sitem-act"
+                                    title="Answer with this model. The conversation keeps its folder and its history."
+                                    onclick={() => void useModel(id)}
+                                  >
+                                    Use this
+                                  </button>
+                                {/if}
+                              </div>
+                              {#if openModel.has(id)}
+                                <div class="sitem-b">
+                                  <div class="sfld-grid">
+                                    <Field
+                                      label="Max context (tokens)"
+                                      forId={`cw-mw-${id}`}
+                                      hint="Stored here, this outranks what the endpoint claims and feeds the meter, the derived ceiling and the core's own fold."
+                                    >
+                                      <input
+                                        class="sinp num mono"
+                                        id={`cw-mw-${id}`}
+                                        inputmode="numeric"
+                                        bind:value={d.context_window}
+                                        placeholder="ask the endpoint"
+                                      />
+                                    </Field>
+                                    <Field label="Output cap (tokens)" forId={`cw-mt-${id}`} hint="The longest answer the endpoint is allowed to write.">
+                                      <input
+                                        class="sinp num mono"
+                                        id={`cw-mt-${id}`}
+                                        inputmode="numeric"
+                                        bind:value={d.max_tokens}
+                                        placeholder="the endpoint's own"
+                                      />
+                                    </Field>
+                                    <Field label="Temperature" forId={`cw-temp-${id}`} hint="Empty uses the server's default.">
+                                      <input class="sinp num" id={`cw-temp-${id}`} bind:value={d.temperature} placeholder="server default" />
+                                    </Field>
+                                    <Field label="top_p" forId={`cw-topp-${id}`} hint="Empty uses the server's default.">
+                                      <input class="sinp num" id={`cw-topp-${id}`} bind:value={d.top_p} placeholder="server default" />
+                                    </Field>
+                                    <Field label="top_k" forId={`cw-topk-${id}`} hint="Empty uses the server's default.">
+                                      <input class="sinp num" id={`cw-topk-${id}`} inputmode="numeric" bind:value={d.top_k} placeholder="server default" />
+                                    </Field>
+                                    <Field label="min_p" forId={`cw-minp-${id}`} hint="Empty uses the server's default.">
+                                      <input class="sinp num" id={`cw-minp-${id}`} bind:value={d.min_p} placeholder="server default" />
+                                    </Field>
+                                    <Field label="Seed" forId={`cw-seed-${id}`} hint="A seed makes repeated answers comparable. Empty means unseeded.">
+                                      <input class="sinp num" id={`cw-seed-${id}`} inputmode="numeric" bind:value={d.seed} placeholder="no seed" />
+                                    </Field>
+                                    <Field
+                                      label="Thinking levels"
+                                      forId={`cw-eff-${id}`}
+                                      wide
+                                      hint={`Comma-separated, in the order the endpoint takes them. ${m?.efforts?.length ? `This one answered: ${m.efforts.join(', ')}.` : 'Unknown until a discovery asks this endpoint what it accepts.'}`}
+                                    >
+                                      <input
+                                        class="sinp"
+                                        id={`cw-eff-${id}`}
+                                        bind:value={d.efforts}
+                                        placeholder="off,low,medium,high"
+                                      />
+                                    </Field>
+                                  </div>
+                                  <p class="set-note">
+                                    {#if m?.source}
+                                      What is stored here came from: {m.source}
+                                    {:else}
+                                      Nothing is stored for this model yet: its window comes from the
+                                      endpoint each time the app starts.
+                                    {/if}
+                                  </p>
+                                  <div class="pvacts">
+                                    <button class="set-btn primary" onclick={() => void saveModel(id)}>Save</button>
+                                    <button
+                                      class="set-btn plain"
+                                      onclick={() => {
+                                        delete mDraft[id]
+                                        void loadProviders()
+                                      }}
+                                    >
+                                      Revert
+                                    </button>
+                                    <button class="set-btn danger" onclick={() => void forgetModel(id)}>
+                                      Forget this model's settings
+                                    </button>
+                                  </div>
+                                </div>
                               {/if}
                             </div>
-                            {#if openModel.has(id)}
-                              <div class="mfields">
-                                <label class="pvf">
-                                  <span>max context (tokens)</span>
-                                  <input class="pill" inputmode="numeric" bind:value={d.context_window} placeholder="ask the endpoint" />
-                                </label>
-                                <label class="pvf">
-                                  <span>output cap</span>
-                                  <input class="pill" inputmode="numeric" bind:value={d.max_tokens} placeholder="the endpoint's own" />
-                                </label>
-                                <label class="pvf"><span>temperature</span><input class="pill" bind:value={d.temperature} placeholder="server default" /></label>
-                                <label class="pvf"><span>top_p</span><input class="pill" bind:value={d.top_p} placeholder="server default" /></label>
-                                <label class="pvf"><span>top_k</span><input class="pill" inputmode="numeric" bind:value={d.top_k} placeholder="server default" /></label>
-                                <label class="pvf"><span>min_p</span><input class="pill" bind:value={d.min_p} placeholder="server default" /></label>
-                                <label class="pvf"><span>seed</span><input class="pill" inputmode="numeric" bind:value={d.seed} placeholder="no seed" /></label>
-                                <label class="pvf wide">
-                                  <span>thinking levels</span>
-                                  <input class="pill" bind:value={d.efforts} placeholder="off,low,medium,high" />
-                                  <span class="set-note">
-                                    comma-separated, in the order the endpoint takes them —
-                                    {#if m?.efforts?.length}
-                                      this one answered: {m.efforts.join(', ')}
-                                    {:else}
-                                      unknown until a probe asks this endpoint what it accepts
-                                    {/if}
-                                  </span>
-                                </label>
-                                <p class="set-note">
-                                  {#if m?.source}
-                                    what is stored came from: {m.source}
-                                  {:else}
-                                    nothing is stored for this model yet — the window comes from
-                                    the endpoint every time the app starts
-                                  {/if}
-                                  · an empty field means "ask the endpoint", and saving it that
-                                  way deletes the key rather than writing a number for it
-                                </p>
-                                <div class="pvacts">
-                                  <button class="set-btn primary" onclick={() => void saveModel(id)}>Save</button>
-                                  <button
-                                    class="set-btn"
-                                    onclick={() => {
-                                      delete mDraft[id]
-                                      void loadProviders()
-                                    }}
-                                  >
-                                    revert
-                                  </button>
-                                  <button class="set-btn danger" onclick={() => void forgetModel(id)}>
-                                    forget this model's settings
-                                  </button>
-                                </div>
-                              </div>
-                            {/if}
+                          {:else}
+                            <p class="set-note">
+                              No models are filed under this endpoint row. Discover the endpoint and
+                              add it, and the models come with it.
+                            </p>
+                          {/each}
+                          <div class="pvacts">
+                            <button class="set-btn danger" onclick={() => void removeProvider(p.name)}>
+                              Remove endpoint row
+                            </button>
+                          </div>
+                          <p class="set-note">
+                            Removing the row leaves the stored model settings alone on purpose: a
+                            window or a sampling value someone set is a decision, not debris.
+                          </p>
+                        </div>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            </Section>
+
+            <Section
+              id="reasoning"
+              title="Reasoning"
+              desc="How much the model deliberates before it answers. Levels are a request: an endpoint that does not implement one answers anyway, at whatever depth it has."
+            >
+              {@render reasoningBody()}
+            </Section>
+
+            <Section
+              id="ceiling"
+              title="Context ceiling"
+              desc="The number this conversation is measured and folded against. It is a setting, kept in the config file, so a phone and the desktop agree instead of each inventing a window."
+            >
+              {@render ceilingRow()}
+              <p class="set-note">
+                A ceiling below 4096 tokens is refused in words: a prompt that small cannot hold the
+                system prompt, the tool definitions and a tool result, and still leave room for an
+                answer. One at or above the endpoint's window is refused too, because the server
+                would cut the prompt before this meter ever filled. A model process that is already
+                running keeps the threshold it started with; the next one reads what you set here.
+              </p>
+            </Section>
+          {:else if settings.page === 'workspace'}
+            <Section
+              id="tools"
+              title="Tools and capabilities"
+              desc="What the coworker can do. Each tool is defined once, in the engine, and the sentence beside its name is the same text the model is handed - a copy written in this window would be a second prompt that drifts."
+            >
+              {#if personaNow === 'chat'}
+                <div class="smsg" data-chat-note>
+                  This conversation is in Chat mode: none of these tools are mounted, and the model
+                  answers with nothing attached. Switch the conversation to Cowork to use them.
+                </div>
+              {/if}
+              {#if toolsErr}
+                <div class="smsg bad" data-tools-error>{toolsErr}</div>
+              {/if}
+              <div class="toolsec">
+                {#each toolViews as t (t.name)}
+                  <div class="toolrow">
+                    <code class="toolname">{t.name}</code>
+                    <p class="tooldesc">{toolBlurb(t.description)}</p>
+                  </div>
+                {:else}
+                  <div class="smsg bad">
+                    The engine reported no tools. That is a fault, not an empty list: check the app log.
+                  </div>
+                {/each}
+              </div>
+              <p class="set-note">
+                Nothing here is switchable yet. Per-tool permission is not wired into either core, and
+                a control that changed nothing would be worse than no control. What may run without
+                asking is set below, and where files may be written is set by the folder.
+              </p>
+            </Section>
+
+            <Section
+              id="approvals"
+              title="Approvals"
+              desc="What may run without asking you first. This decides whether a call waits for a person; it never decides what a call is allowed to touch."
+            >
+              {@render approvalsBody()}
+            </Section>
+
+            <Section
+              id="folders"
+              title="Folders the tools may work in"
+              desc="A conversation and its folder travel together: opening another conversation moves the working directory, and a turn that is already running keeps the folder it started in."
+            >
+              <div class="srow" data-ws-current>
+                <div>
+                  <div class="srow-t">Where this conversation's tools work</div>
+                  <div class="srow-h mono">{hostState?.workspace || 'sessions with no folder'}</div>
+                </div>
+                <div class="srow-c">
+                  <button
+                    class="set-btn"
+                    disabled={!hostState?.workspace}
+                    onclick={() => newSessionIn(hostState?.workspace ?? '')}
+                  >
+                    New session here
+                  </button>
+                </div>
+              </div>
+              <Field
+                label="Add a folder"
+                forId="cw-ws-add"
+                hint="Adding a folder to this list does not move the conversation you are in; choosing a conversation's folder does."
+              >
+                <div class="pvacts">
+                  {#if transportKind === 'tauri'}
+                    <button class="set-btn" onclick={() => void addFolderPicked()}>Choose a folder…</button>
+                  {/if}
+                  <input
+                    class="sinp mono"
+                    id="cw-ws-add"
+                    type="text"
+                    style="flex:1; min-width:16ch"
+                    placeholder="/home/you/project"
+                    bind:value={wsAddDraft}
+                    onkeydown={(e) => e.key === 'Enter' && void addFolderTyped()}
+                  />
+                  <button class="set-btn plain" disabled={!wsAddDraft.trim()} onclick={() => void addFolderTyped()}>
+                    Add path
+                  </button>
+                </div>
+              </Field>
+              {#if wsAddErr}
+                <div class="smsg bad" data-ws-error>{wsAddErr}</div>
+              {/if}
+              <div class="slist" data-ws-list>
+                {#each workspaces as w (w.path)}
+                  {@const inside = wsInside[w.path] ?? -1}
+                  <div class="sitem">
+                    <button class="sitem-h" aria-expanded={wsOpen.has(w.path)} onclick={() => void toggleWsRow(w.path)}>
+                      <span class="chev">{wsOpen.has(w.path) ? '\u25BE' : '\u25B8'}</span>
+                      <span class="sitem-name">{wsLabelOf(w)}</span>
+                      <code class="sitem-sub">{w.path}</code>
+                      {#if hostState?.workspace === w.path}<span class="cap now">in use</span>{/if}
+                      <span class="sitem-n">
+                        {inside >= 0 ? `${inside} conversation${inside === 1 ? '' : 's'} inside` : ''}
+                      </span>
+                    </button>
+                    {#if wsOpen.has(w.path)}
+                      <div class="sitem-b">
+                        {#if wsRenaming === w.path}
+                          <Field
+                            label="Label"
+                            forId="cw-ws-label"
+                            hint="Names the folder in the sidebar. The path on disk is never changed, and no conversation moves."
+                          >
+                            <input
+                              class="sinp"
+                              id="cw-ws-label"
+                              bind:value={wsLabelDraft}
+                              onkeydown={(e) => e.key === 'Enter' && void commitWsRename()}
+                            />
+                          </Field>
+                          <div class="pvacts">
+                            <button class="set-btn primary" onclick={() => void commitWsRename()}>Save label</button>
+                            <button class="set-btn plain" onclick={() => (wsRenaming = '')}>Cancel</button>
                           </div>
                         {:else}
+                          <div class="pvacts">
+                            <button class="set-btn" onclick={() => newSessionIn(w.path)}>New session here</button>
+                            <button class="set-btn plain" onclick={() => startWsRename(w.path, w.label)}>Rename</button>
+                            {#if gatewayRole() !== 'watch'}
+                              <button class="set-btn plain" onclick={() => void removeFolder(w.path)}>
+                                Take off the sidebar
+                              </button>
+                              <button
+                                class="set-btn danger"
+                                data-ws-delete={w.path}
+                                onclick={() => void deleteFolderAndRows(w.path)}
+                              >
+                                {wsDeleteArm === w.path
+                                  ? 'Press again to delete for good'
+                                  : inside > 0
+                                    ? `Delete folder and its ${inside} conversation${inside === 1 ? '' : 's'}`
+                                    : 'Delete folder'}
+                              </button>
+                            {/if}
+                          </div>
                           <p class="set-note">
-                            No models are filed under this endpoint row. Probe the endpoint and
-                            Add it, and the models come with it.
+                            {inside > 0
+                              ? 'Delete removes every conversation filed under this path, including chat conversations and empty drafts that the sidebar list does not show. A conversation mid-turn is left alone and the folder stays while anything remains.'
+                              : 'Nothing is filed here, so deleting it drops the row and nothing else.'}
                           </p>
-                        {/each}
-                        <div class="pvacts">
-                          <button class="set-btn danger" onclick={() => void removeProvider(p.name)}>
-                            Remove the {p.name} endpoint row
-                          </button>
-                        </div>
-                        <p class="set-note">
-                          Removing the endpoint row leaves the model rows alone on purpose: the
-                          window and sampling someone stored are decisions, not debris.
-                        </p>
+                          {#if gatewayRole() === 'watch'}
+                            <p class="set-note">
+                              This window is attached as a watcher: it can read this list but cannot
+                              change it. Connect with the drive token to make changes.
+                            </p>
+                          {/if}
+                        {/if}
                       </div>
                     {/if}
                   </div>
+                {:else}
+                  <div class="sempty">
+                    No folders are registered. The tools work in the folder shown above.
+                  </div>
                 {/each}
-              {/if}
-            </div>
+              </div>
+            </Section>
 
-          {:else if settings.tab === 'naming'}
-            <div class="toolsec">
+            <Section
+              id="search"
+              title="Search and web access"
+              desc="How web_search and web_fetch reach outside this machine, and what happens when no search instance is running."
+            >
+              {@render webBody()}
+            </Section>
+          {:else if settings.page === 'devices'}
+            <Section
+              id="gateway"
+              title="Connected devices"
+              desc="Other windows, phones and machines that attach to this app over the network, and the address they attach to."
+            >
+              {@render devicesBody()}
+            </Section>
+          {:else if settings.page === 'conversation'}
+            <Section
+              id="titles"
+              title="Conversation titles"
+              desc="What a conversation is called, and whether a small model on this machine is allowed to propose a better name once the first turn settles."
+            >
               <p class="set-note">
-                A conversation starts out called after its own first line, cut at 48
-                characters — true, and useless when the line is "hey can you look at this".
-                When this is on, a small model that runs on this machine proposes a phrase
-                after the first turn finishes, and the row renames itself. The conversation
-                never waits for its name, and a title you typed is never overwritten.
+                A conversation starts out named after its own first line, cut at 48 characters. When
+                local naming is on, a small model proposes a phrase after the first turn finishes and
+                the row renames itself. The conversation never waits for its name, and a title you
+                typed is never overwritten.
               </p>
-              {#if titlesErr}<p class="set-note set-err">{titlesErr}</p>{/if}
-              {#if titleInfo}
-                <div class="pop-item static">
-                  <span class="pop-lbl">{titleInfo.status.enabled ? 'Naming conversations locally: on' : 'Naming conversations locally: off'}</span>
-                  <span class="pop-sub">
-                    {#if titleInfo.status.enabled && titleInfo.status.script_found && titleInfo.status.python_found && titleInfo.status.weights_cached}
-                      ready: the helper, its python and the weights are all present
-                    {:else if titleInfo.status.enabled}
-                      on, but it cannot run: {titleInfo.status.script_found ? '' : 'no helper script; '}{titleInfo.status.python_found ? '' : 'no python; '}{titleInfo.status.weights_cached ? '' : 'no weights'} — conversations keep the automatic title, and the reason is in the log
-                    {:else}
-                      put <code>titlegen = true</code> in {titleInfo.config_path ?? 'the config file'} to turn it on
-                    {/if}
-                  </span>
+              {#if titlesErr}
+                <div class="smsg bad" data-titles-error>{titlesErr}</div>
+              {:else if titleInfo}
+                <div class="srow" data-titles-state>
+                  <div>
+                    <div class="srow-t">
+                      Naming conversations locally: {titleInfo.status.enabled ? 'on' : 'off'}
+                    </div>
+                    <div class="srow-h">
+                      {#if titleInfo.status.enabled && titleInfo.status.script_found && titleInfo.status.python_found && titleInfo.status.weights_cached}
+                        ready: the helper, its python and the weights are all present
+                      {:else if titleInfo.status.enabled}
+                        on, but it cannot run: {titleInfo.status.script_found ? '' : 'no helper script; '}{titleInfo.status.python_found ? '' : 'no python; '}{titleInfo.status.weights_cached ? '' : 'no weights'} - conversations keep the automatic title, and the reason is in the log
+                      {:else}
+                        put <span class="mono">titlegen = true</span> in
+                        <span class="mono">{titleInfo.config_path ?? 'the config file'}</span> to turn it on
+                      {/if}
+                      {#if titleInfo.status.in_flight === true}
+                        · a name is being proposed right now
+                      {/if}
+                    </div>
+                  </div>
                 </div>
-                <div class="toolrow">
-                  <code class="toolname">{titleInfo.status.model}</code>
-                  <p class="tooldesc">
-                    230M parameters, CPU only, weights in <code>{titleInfo.status.cache}</code>
-                    ({titleInfo.status.weights_cached ? 'cached' : 'not downloaded'}). Threads capped at
-                    {titleInfo.status.threads} because the real model and this window share the machine.
-                  </p>
+                <div class="srow">
+                  <div>
+                    <div class="srow-t mono">{titleInfo.status.model}</div>
+                    <div class="srow-h">
+                      230M parameters, CPU only, weights in <span class="mono">{titleInfo.status.cache}</span>
+                      ({titleInfo.status.weights_cached ? 'cached' : 'not downloaded'}). Threads are capped
+                      at {titleInfo.status.threads} because the real model and this window share the machine.
+                    </div>
+                  </div>
                 </div>
-                <div class="toolrow">
-                  <code class="toolname">≈{titleInfo.status.peak_rss_mb} MB for a few seconds</code>
-                  <p class="tooldesc">
-                    Measured, not promised: loading torch and the model peaks near this and
-                    falls straight back. That is more than the whole app normally costs, which
-                    is why this is opt-in and why the helper runs once per new conversation
-                    instead of staying resident.
-                  </p>
+                <div class="srow">
+                  <div>
+                    <div class="srow-t">≈{titleInfo.status.peak_rss_mb} MB for a few seconds</div>
+                    <div class="srow-h">
+                      Measured, not promised: loading the runtime and the model peaks near this and
+                      falls straight back. That is more than the rest of this app normally costs, which
+                      is why the feature is opt-in and why the helper runs once per new conversation
+                      instead of staying resident.
+                    </div>
+                  </div>
                 </div>
                 <p class="set-note">
-                  Helper <code>{titleInfo.status.script}</code> {titleInfo.status.script_found ? 'found' : 'missing'} ·
-                  python <code>{titleInfo.status.python}</code> {titleInfo.status.python_found ? 'found' : 'missing'}
+                  helper <span class="mono">{titleInfo.status.script}</span>
+                  {titleInfo.status.script_found ? 'found' : 'missing'} · python
+                  <span class="mono">{titleInfo.status.python}</span>
+                  {titleInfo.status.python_found ? 'found' : 'missing'}
                 </p>
               {:else}
-                <p class="set-note">Reading…</p>
+                <div class="smsg wait" data-titles-loading>Reading…</div>
               {/if}
-            </div>
-          {:else}
-            {@render body(menuFor(settings.tab))}
+            </Section>
+
+            <Section
+              id="session"
+              title="This conversation"
+              desc="What the conversation currently on screen has used: the context it carries, what the server already had cached, and how fast the answer arrived."
+            >
+              {#if !lastUsage && !turnMs}
+                <div class="smsg wait">
+                  Nothing measured in this window yet. These numbers appear while the first turn
+                  streams and stay for the rest of the session.
+                </div>
+              {/if}
+              {@render sessionReadouts(false)}
+              <div class="srow">
+                <div>
+                  <div class="srow-t">Context ceiling</div>
+                  <div class="srow-h" data-budget-provenance>
+                    {fmtTokens(hostState?.context_budget ?? 0)} tokens ·
+                    {hostState?.budget_pin
+                      ? `pinned at ${fmtTokens(hostState.budget_pin)}`
+                      : 'derived from the endpoint window'}
+                    - the setting itself is under Models
+                  </div>
+                </div>
+                <div class="srow-c">
+                  <button class="set-btn plain" onclick={() => openSettings('ceiling')}>
+                    Change the ceiling
+                  </button>
+                </div>
+              </div>
+            </Section>
+          {:else if settings.page === 'appearance'}
+            <Section
+              id="transcript"
+              title="Transcript"
+              desc="How much of the working the conversation shows: the thinking and tool steps a turn took are folded into one run, and this decides whether what they produced is folded too."
+            >
+              {#each uiPrefs as p (p.key)}
+                <div class="srow" data-pref={p.key}>
+                  <div>
+                    <div class="srow-t" data-pref-label>{p.label}</div>
+                    <div class="srow-h">{p.hint}</div>
+                    {#if !p.is_default}
+                      <div class="srow-h">set by you: {p.value} (the default is {p.default})</div>
+                    {/if}
+                  </div>
+                  <div class="srow-c">
+                    <Segmented
+                      aria={p.label}
+                      value={p.value}
+                      options={p.values.map((v) => ({ value: v, label: v }))}
+                      disabled={prefBusy}
+                      onpick={(v) => void setPref(p.key, v)}
+                    />
+                  </div>
+                </div>
+              {/each}
+              <p class="set-note">
+                This list is the host's, not this window's: a setting the app does not act on never
+                appears here, and it is stored in the app's own database, so the desktop, a browser on
+                another port and a phone read one answer. None of it changes what the model is told.
+              </p>
+            </Section>
+
+            <Section
+              id="theme"
+              title="Theme"
+              desc="The palette of the window you are looking at."
+            >
+              <div class="srow">
+                <div>
+                  <div class="srow-t">Colours</div>
+                  <div class="srow-h">
+                    Kept per window: a desktop and a browser opened against the same app can disagree,
+                    because this is a fact about the screen rather than about the conversation. With no
+                    choice saved, the app follows what the system asks for.
+                  </div>
+                </div>
+                <div class="srow-c">
+                  <Segmented
+                    aria="Theme"
+                    value={theme}
+                    options={[{ value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]}
+                    onpick={(v) => applyTheme(v === 'dark' ? 'dark' : 'light')}
+                  />
+                </div>
+              </div>
+            </Section>
+
+            <Section
+              id="shortcuts"
+              title="Keyboard shortcuts"
+              desc="The keys this app answers. They are the same in the desktop window and in a browser attached to it."
+            >
+              {@render keysBody()}
+            </Section>
           {/if}
         </div>
       </div>

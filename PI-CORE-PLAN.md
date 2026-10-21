@@ -1328,6 +1328,80 @@ before celebrating**, and expect to either trim UI or move the ceiling to 420 wi
     bytes — while admitting out loud that under root the mode does not bind, so the case is
     skipped rather than quietly passed.
 
+130. **A settings rail names things; the page describes them.** Eleven rail entries, each with a
+    caption sentence under it, were asking the rail to do two jobs: find the page and explain the
+    feature. Explaining is what the page is for, next to the control, where the sentence is read.
+    Five category names and one paragraph per page replaced them. Two things this is *not*: it is
+    not the old tabs with six of them hidden (the underlying components moved, the popup bodies
+    became shared snippets, and one CSS vocabulary replaced three), and it is not a restyle — the
+    point is that a reader can find a setting by name and understand it where they set it.
+
+131. **A check that cannot read its number must fail, not compare against NaN.** The dropdown case
+    asked the page for colours, got nothing back for one of them, and `NaN < 6` is false — so the
+    assertion that the menu lifts off the surface behind it was passing on an empty string. An
+    unparseable colour now throws into the case's own verdict. Related: `getComputedStyle` returns
+    a *live* object; read after the dropdown had closed and it reports nothing, so a verdict line
+    that printed it afterwards quoted "nothing" while the judgement had used real values. Colours
+    are snapshotted at the moment they are judged.
+
+132. **A floating surface needs its own token, and "lighter" is not a direction both themes
+    share.** `--color-raise` sits deeper than a near-white screen and paler than a near-black one.
+    The menu cannot wear `paper-2`, because `paper-2` is what the form controls wear: it would
+    separate from its own trigger and vanish into the page behind it.
+
+133. **One body, two surfaces.** The footer popups and the settings page render the same snippets
+    (`approvalsBody`, `reasoningBody`, `ceilingRow`, `sessionReadouts(showCeiling)`, `devicesBody`,
+    `webBody`, `keysBody`); only density differs, via `.pop .srow` rules. A control copied per
+    surface drifts within a week, and the settings screen and the popup then disagree about what a
+    setting *does*. A side benefit: because they are literally the same markup, a page case can
+    drive the popup's ceiling row and still be testing the settings control.
+
+134. **A `<button>` inside a `<button>` is markup the browser agrees to move.** The model row's
+    *Use this* sat inside its disclosure header; the row became a wrapper with the header and the
+    action as siblings. Same family, same file: option rows were `div`s with a click handler and
+    `role="option"` — reachable by pointer, unreachable by keyboard — and became
+    `button[role=option][tabindex=-1]` under a `role="combobox"` trigger that owns the arrow keys,
+    so `aria-activedescendant` is legal and the list is navigable without a mouse.
+
+135. **Renaming a destination breaks a promise unless the old names still land.** `SECTION_HOME`
+    maps twenty-nine names — the old tab kinds, the new page kinds, section ids, and hash
+    fragments like `#search` — onto a page and a section. The board walks every one of them and
+    fails if any lands on a page that does not contain the section it claims, because a bookmark
+    that opens a *plausible* page is a feature that broke without saying so.
+
+136. **`tick` was already taken.** Svelte's `tick` is imported here as `renderTick`: this component
+    has owned `let tick` (the status-polling interval handle) for months. The collision surfaced
+    only because both uses landed in one expression — `await tick()` on a number is a wait for
+    nothing, and the compiler caught it by accident of naming.
+
+137. **A harness that promises "nothing of yours is touched" has to name every store the core
+    writes to.** The pi core keeps a *fourth* home — its agent dir, under `XDG_STATE_HOME` by
+    default — holding `models.json`, `settings.json`, pi's own sessions, the cwoffee session map
+    and the child ledger. `selftest.sh` exported config and data and never state, so four board
+    runs wrote into `~/.local/share/cwoffee/pi/`, pointed the `cwoffee` provider at the mock, and
+    left sessions naming workspaces that the run had already deleted. The next run inherited them:
+    pi answered `Stored session working directory does not exist`, and the bridge reported "the
+    model process did not answer get_state" — a harness poisoning its own next run while looking
+    like a product hang. `XDG_STATE_HOME` and `CWOFFEE_PI_AGENT_DIR` are in the scratch block now
+    and printed in the header; the 17 dead sessions and the map entries that named them were removed
+    after reading each session's recorded `cwd`, and the product launcher's own
+    `pi-agent/` + `pi-sessions/` were left alone.
+
+138. **Two boards cannot share one port set, and the reds they produce look unrelated.** Two
+    `selftest.sh` runs overlapped on 8190/8199: the second app never bound, its mock died on
+    `EADDRINUSE`, and the log filled with "no turnEnd after 240000ms" and "cannot start the model
+    process". Nothing in that stack said *port*. Cleanup here is by exact pid after reading
+    `/proc/<pid>/cmdline` — and the two `pi` processes still running on this machine belong to
+    somebody else's sessions, have parents, and were not touched.
+
+139. **A pi-core board with no extension mounted is not a pi-core board.** The script has warned
+    for a while about a missing `cwtool` — without it every call is "tool not found" — and said
+    nothing about the *extension*. A run booted with `0 extension(s)` and then reported no approval
+    cards, no thinking block, no rendered table and no file chips: a dozen failures, one missing
+    file, and a settings section printing an ok above them. The board now points `CWOFFEE_PI_EXT`
+    at `pi-tools/cwoffee-tools.ts` itself, prints it, and refuses to grade anything when the boot
+    line says zero extensions.
+
 ## OPEN QUESTIONS (answer in the journal as we decide)
 
 1. ~~**Workspace pool policy**~~ **ANSWERED and BUILT** — no cap; idle reaper at **600 s**
@@ -1964,6 +2038,248 @@ was the light-theme icon; and go on with the harness plus the parity list.
 ---
 
 ---
+
+140. **State changes on the event; the DOM changes on the flush.** The endpoint case typed a URL
+    into the base-URL field and then read the *Discover models* button's `disabled` — in the same
+    task. `pvUrl` had the address, the button had not been told, and the case reported "not
+    reachable once a URL is typed" about a control that was reachable. A harness that acts and
+    judges between two flushes is measuring its own timing; `await renderTick()` between the
+    typing and the reading is what makes the judgement about the app.
+141. **A page case has to use the control that is there, in the block it opened.** Two more self
+    inflictions while driving the endpoint screen from the page: the helper that finds a button by
+    label looked in the endpoint form's action row, where `Save` for a *model* does not live; and
+    adding an endpoint leaves its row expanded, so a case that clicked the disclosure to open it
+    closed the very row it then went looking for. Scope the lookup to the provider's own `.sitem`
+    block, and ask `aria-expanded` before clicking a disclosure.
+142. **A model list that cannot say where its models answer from is half a claim.** `models_info`
+    on the pi core filled `server: None` — pi's catalogue names a provider and never an address.
+    The address is cwoffee's to state, because cwoffee wrote the provider entry pi is reading, so
+    the bridge now resolves it from the config it was started from: a filed `[providers."x"]` row,
+    else the top-level endpoint for the provider cwoffee registered itself, else nothing. "Nothing"
+    matters: an address for a provider nobody registered would be a guess wearing a fact, and the
+    settings page would use it to describe an endpoint it is about to write.
+
+143. **One client, two hosts: an argument name is a promise made in three places.** The Svelte
+    app calls `invoke('cmd', {...})` and `transport.ts` hands the same object to whichever host
+    is running — a Tauri command or the gateway's dispatch. Tauri's default is to expect
+    camelCase keys and map them onto snake_case Rust parameters; the gateway reads the engine's
+    own snake_case straight off the frame. The endpoint screen was written against the gateway,
+    so every multi-word argument — `base_url`, `api_key`, `context_window`, `max_tokens`,
+    `top_p`, `top_k`, `min_p` — was spelled wrong for the desktop, and Test connection, Discover
+    models and Save answered "invalid args `baseUrl` ... missing required key baseUrl": a
+    settings screen whose buttons could not work on the product's own shell. The 34 Rust tests
+    for those verbs never saw it, because **they spoke the server's dialect rather than the
+    client's**. The fix is one dialect — the engine's — spelled by both hosts via
+    `#[tauri::command(rename_all = "snake_case")]`, plus a gate that reads the three sources and
+    fails on drift (`scripts/wire-names.mjs`, run as a board pre-flight).
+144. **A test that speaks the server's dialect proves the server, not the product.** The search
+    backend had the mirror-image bug: the desktop command wanted `searxngUrl`, the UI sent it,
+    and the *gateway* read `searxng_url` — so picking "SearXNG, already running" and typing a
+    URL from a browser dropped the URL on the floor, and the engine then refused "no URL given"
+    about a field the person had filled in. The gateway's own test passed, because the test sent
+    the spelling that file reads. A payload in a test has to be the payload the client sends.
+145. **A verb that exists nowhere is only visible if the call site is not swallowing it.** The
+    folder-delete case moved the host back to the board's home folder with
+    `invoke('set_workspace_checked', ...)`, a name neither the gateway nor a desktop command
+    implements, behind a `.catch(() => {})`. Every later case therefore ran in the scratch
+    folder, and the board said nothing. The name-drift gate now reports a client verb no host
+    implements, and the call site asserts the workspace actually moved.
+146. **Half of a settings row is edited; the other half was observed.** A model row holds the
+    fields the screen offers (window, output cap, sampling) and the facts a probe found
+    (`supports_tools`, `supports_vision`, `source`). A whole-row write built from the form erased
+    the second half: pressing Save next to "Max context" un-probed whether the endpoint takes
+    tool calls, and rewrote where the numbers came from. The merge rule is now the engine's: a
+    field the screen shows follows the form — empty means cleared — and a field the screen never
+    shows is carried over unless the request states it, because the form has no authority to
+    clear what it never displayed.
+147. **"A message appeared" is not "the request finished."** The endpoint case clicked *Test
+    connection*, waited for the message element to exist, and judged the *Add endpoint* button while
+    the request was still in flight — the element it waited on was the placeholder its own click had
+    just written ("asking the endpoint whether it is there…"). A wait has to name the state the
+    control reads, not the fact that some text is on screen; `until(() => !pvBusy)` is the same
+    premise the button's own `disabled` uses.
+
+## Journal — session 24 (the settings screen gets a shape, and the controls get one set of measurements)
+
+A user's complaint, quoted almost exactly: *"the settings list is eleven items long, each one has
+a little sentence under it, and the whole thing is three different sizes of box."* Both halves are
+real, and only one of them is about colour.
+
+### What the rail is for
+
+Eleven rail entries used to carry a caption each — *Model / what answers here*, *Search / how
+web_search reaches out* — so the rail was doing two jobs at once: naming a destination and
+explaining a feature. The explanation is the part you read *while* using the control, so it moved
+into the page, under a heading, and the rail kept the five names:
+
+**Models · Workspace · Devices · Conversation · Appearance**
+
+Thinking is on the Models page, because a reasoning level is a property of the model that is
+answering. Tools, Approvals, Folders and Search are one page, because they are all answers to
+"what may this thing do, and where". Titles and the session readouts are one page, because both
+are about the conversation on screen. Transcript display and shortcuts are one page, because both
+are about the window.
+
+Nothing was dropped, and the claim is checked rather than asserted: `SECTION_HOME` maps
+**twenty-nine** names — old tab kinds (`model`, `think`, `metrics`, `naming`, `ws`, `keys`,
+`gateway`, `display`), new page names, section ids, and `#search`-style hash fragments — onto a
+page *and* a section, and the page board walks every one of them, failing if the page it lands on
+does not contain the section the name claims.
+
+```
+[cwoffee/page] settings rail ok (Models, Workspace, Devices, Conversation, Appearance)
+[cwoffee/page] settings pages ok (5 titled pages, 29 names still land, every section headed and described)
+```
+
+### One control, not three
+
+The complaint about sizes was a measurement away from being settled, so it is now a measurement:
+
+```
+[cwoffee/page] settings design system ok (fields 32px, select 32px, buttons 32px across 7;
+  panel "rgb(243, 240, 230)" lifts 19 off "rgb(253, 252, 249)", option text 12.6:1, inside the
+  column; focus ring painted)
+```
+
+One set of numbers in CSS (`--ctl-h: 32px`, `--ctl-r: 8px`, `--ctl-fs: 13px`) drives text fields,
+the select trigger, buttons and segmented controls; emphasis comes from four variants
+(`primary`, plain, `danger`, and the plain-quiet one) rather than from making a button bigger.
+The dropdown panel gets its own surface token, `--color-raise`, which goes *deeper* than a
+near-white screen and *paler* than a near-black one — "make it lighter" is not a direction both
+themes can go in. The assertions are about separation and contrast rather than colour names,
+because a light theme is allowed to have a light menu; what it is not allowed to have is a menu
+that is the same colour as the page behind it, or text at 2:1 on it.
+
+Two honest notes about how that case was built, both recorded as gotchas:
+
+* the first version parsed the colours badly and compared `NaN < 6`, which is false — a check that
+  silently became unloseable-by-nobody; an unreadable colour now throws into the verdict;
+* `getComputedStyle` hands back a *live* object, so a verdict line printed after the dropdown had
+  closed quoted an empty colour while the judgement had used the real one. Colours are snapshotted
+  at the moment they are judged.
+
+### One body, two surfaces
+
+The footer popups and the settings screen now render the *same* snippet for each shared body —
+`approvalsBody`, `reasoningBody`, `ceilingRow`, `sessionReadouts(showCeiling)`, `devicesBody`,
+`webBody`, `keysBody`. Only density differs (`.pop .srow`, `.pop .set-btn`, …). A control copied
+per surface drifts, and then the popup and the page disagree about what the setting *does*; and
+because the markup is literally the same, the board can drive the ceiling row out of the footer
+popup and still be testing the settings control.
+
+### Components, not styles
+
+`ui/src/lib/settings/` holds `Section`, `Field`, `Select`, `Segmented`, `Switch`, `Choices`.
+`Select` is the one that had to be written rather than borrowed: a native `<select>` in a webview
+arrives as the toolkit's own panel — bright white in a dark window, system font, nothing of the
+app's design on the part people actually look at. It is a `role="combobox"` trigger owning the
+arrow keys with a `listbox` under it, flipped and clamped to the scroll column it lives in. Two
+accessibility shapes had to be corrected after the first pass: `role="option"` on a `div` with a
+click handler (pointer-reachable, keyboard-invisible), and a `<button>` nested inside a `<button>`
+for the *Use this* action — markup the browser agrees to move somewhere else.
+
+### The endpoint round trip, driven from the page
+
+The verbs behind the endpoint screen have had Rust tests since they were built. What was missing
+was the page: discovery filling the chips, *Add endpoint* writing a row the list then shows, a
+window typed into a field outranking what the endpoint claims all the way into the host's stored
+picture, emptying the field giving the endpoint's answer back, and the row being removed again so
+the board leaves its scratch config as it found it. That is what it now reports, on the pi core:
+
+```
+[cwoffee/page] models page ok (discovered qwen3.8-flash-next-iq3_s, tested, added a row the host
+  kept, stored 40000 then freed it, what the probe found survived a save that never mentioned it,
+  removed the row: 0 -> 0)
+```
+
+### What driving the buttons found
+
+The endpoint case is what turned a layout refactor into a bug hunt. It presses the controls
+instead of calling the verbs, and its first honest run reported that three of them had never
+worked on the desktop:
+
+```
+invalid args `baseUrl` for command `provider_probe`:
+command provider_probe missing required key baseUrl
+```
+
+`invoke('cmd', {...})` is handed to whichever host is running — a Tauri command or the gateway's
+dispatch — unchanged by `transport.ts`, and the two hosts spell multi-word parameters differently
+by default: Tauri wants camelCase unless the command says otherwise, the gateway reads the
+engine's snake_case off the frame. The endpoint screen and the model row are the only verbs in the
+app with multi-word arguments, so they were the only verbs spelled for one host. Test connection,
+Discover models, Save, and the search provider's URL worked in a browser and failed on the
+product's own shell, while the 34 Rust tests for those verbs stayed green because they sent the
+gateway's spelling rather than the client's. Both hosts now take the engine's spelling
+(`#[tauri::command(rename_all = "snake_case")]`), and the class gets a gate rather than a promise:
+`scripts/wire-names.mjs` reads the client's payloads and both hosts' required names, and the board
+runs it before it builds anything.
+
+```
+[wire-names] client: 34 verbs with arguments; hosts read: 57 gateway arms, 56 desktop commands;
+  64 verb-host pairs graded; 1 payload(s) not literal: model_set: payload is not a literal object
+```
+
+Three more findings out of the same case, none of them about colour:
+
+* **A save that edits one field was erasing facts it never showed.** A model row holds the fields
+  the screen edits and the facts a probe found. Writing the whole row from the form un-probed
+  `supports_tools` and `supports_vision` and overwrote where the numbers came from. The merge rule
+  is the engine's now: a field the screen shows follows the form (empty means cleared), a field it
+  never shows is carried over unless the request states it.
+* **The board was calling a verb nobody implements** — `set_workspace_checked`, behind
+  `.catch(() => {})`. Every folder case after that one ran in the scratch folder, and the board
+  said nothing about it. A missing command is only invisible if the call site swallows the error.
+* **A message on the screen is not an answer.** The connection-test step waited for "a message" and
+  got the placeholder its own click had put there a moment earlier, then graded a button that was
+  still disabled because the request was still in flight. Wait for the state the control reads,
+  then read the sentence.
+
+The whole desktop board came through green on the pi core with that case in it:
+
+```
+[cwoffee/page] settings rail ok (Models, Workspace, Devices, Conversation, Appearance)
+[cwoffee/page] settings pages ok (5 titled pages, 29 names still land, every section headed and described)
+[cwoffee/page] settings design system ok (fields 32px, select 32px, buttons 32px across 7; panel
+  "rgb(243, 240, 230)" lifts 19 off "rgb(253, 252, 249)", option text 12.6:1, inside the column;
+  focus ring painted)
+[cwoffee/page] settings tools section ok (13 tools from the registry)
+[cwoffee/page] settings titles section ok (model, cost and availability are all stated)
+[cwoffee/page] models page ok (…the round trip above…)
+[cwoffee/page] folder delete ok (2 shown under the folder, 3 really inside, all gone, other folders untouched)
+[cwoffee/page] ceiling ok (pinned 87040 from the panel and the meter followed, 900 refused …)
+[cwoffee/page] display setting ok (the control writes the store, the runs follow both ways, the wording is the host's)
+```
+
+
+### Three harness findings, none of them about the settings screen
+
+The board went to the pi core to check the refactor on the product path, and instead found:
+
+1. **`0 extension(s)`.** The script warned for months about a missing `cwtool`, but said nothing
+   about the extension. A pi core with no extension mounted answers every call with "tool not
+   found", which came out as a dozen unrelated-looking reds — no cards, no thinking, no table, no
+   file chips — under a green settings section. The board now sets `CWOFFEE_PI_EXT` itself, prints
+   it, and refuses to grade anything if the boot line reports zero extensions.
+2. **A fourth store nobody exported.** The pi core's agent dir defaults under `XDG_STATE_HOME`;
+   `selftest.sh` exported config and data and never state, so four runs wrote into
+   `~/.local/share/cwoffee/pi/` — pointed the `cwoffee` provider at the mock, left 17 sessions
+   naming `/tmp` workspaces the runs had already deleted, and filled the cwoffee→pi session map
+   with rows from dead databases. The next run inherited them and pi said
+   `Stored session working directory does not exist`, which the bridge reported as "the model
+   process did not answer `get_state`": a harness poisoning its own next run while looking like a
+   product hang. Fixed in the scratch block (`XDG_STATE_HOME`, `CWOFFEE_PI_AGENT_DIR`, both
+   printed in the header). The litter in the real home was removed after reading each session's
+   recorded `cwd`, and the launcher's own `pi-agent/` + `pi-sessions/` were left alone — none of
+   that was the user's work.
+3. **Two boards, one port set.** An older run had not finished before a new one started; the
+   second app never bound to :8199 and its mock died on `EADDRINUSE`. The reds were "no turnEnd
+   after 240000ms" and "cannot start the model process". Cleanup by exact pid after reading
+   `/proc/<pid>/cmdline`; the two other `pi` processes on this machine have parents and were not
+   touched.
+
+With those three fixed, the desktop board on the pi core came back green for the first time —
+the same page cases that had been green on the Rust core, over the bridge, with tools mounted.
 
 ## Journal — session 23 (a turn's grouping has to survive the turn ending)
 

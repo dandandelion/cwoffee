@@ -125,6 +125,46 @@ pub struct PiHost {
     /// a little *longer* on purpose. If it gave up first, the caller would get a bare
     /// timeout with no counts and no statement that the history is intact.
     compact_wait: Duration,
+    /// The config file this host was started from. `models_info` needs it to say where a
+    /// model answers from: pi's catalogue names the provider and never the address, and the
+    /// address is cwoffee's to state because cwoffee wrote the provider entry pi reads.
+    cfg_path: Option<PathBuf>,
+}
+
+/// Which address a model answers from, given the provider pi named for it.
+///
+/// pi's catalogue is a list of names and windows; it has no notion of which cwoffee
+/// endpoint sits behind a provider. The settings screen needs that to describe an endpoint
+/// it is about to write, and a list that cannot say where its models live is half a claim,
+/// so the bridge answers from the config it was started from. A provider that is not filed
+/// there gets `None`: an address nobody registered is not something this function should
+/// invent.
+fn endpoint_for(cfg_path: Option<&std::path::Path>, provider: Option<&str>) -> Option<String> {
+    let path = cfg_path?;
+    let (cfg, _) = Config::load(Some(path)).ok()?;
+    let rows = cwoffee_engine::config::provider_rows_in(path);
+    let p = provider.unwrap_or("").trim();
+    if !p.is_empty() {
+        if let Some((_, r)) = rows.iter().find(|(n, _)| n == p) {
+            let u = r.base_url.trim();
+            if !u.is_empty() {
+                return Some(u.to_string());
+            }
+        }
+    }
+    // The provider pi calls `cwoffee` is the one cwoffee registered itself from the
+    // top-level `[provider]` section, so that section is the answer for it — and for an
+    // unqualified provider, since that is the endpoint the host was launched against.
+    let top = cfg.provider.base_url.trim().to_string();
+    if top.is_empty() {
+        return None;
+    }
+    let chosen = cwoffee_engine::config::provider_of_model(&cfg.provider.model);
+    if p.is_empty() || p == "cwoffee" || p == chosen {
+        Some(top)
+    } else {
+        None
+    }
 }
 
 /// The managed instance, when the config asks Cwoffee to run one. Built from the same
@@ -150,6 +190,7 @@ impl PiHost {
         // Read before `cfg` moves into the model task: this side of the channel needs the
         // compaction ceiling too, and needs to wait longer than the task does.
         let compact_wait = cfg.compact_timeout + Duration::from_secs(15);
+        let cfg_path = cfg.cfg_path.clone();
         // A bridge that died badly leaves its pi behind, and a pi has no reason to notice:
         // it goes on serving a client that is gone and keeps its context loaded while it
         // does. Two such orphans from killed runs measured 205 MB between them, with no
@@ -236,6 +277,7 @@ impl PiHost {
             q_rx: Some(q_rx),
             pi_version,
             compact_wait,
+            cfg_path,
         })
     }
 
@@ -377,7 +419,7 @@ impl HostOps for PiHost {
                 tools: None,
                 tools_inferred: false,
                 source: m.get("provider").and_then(|v| v.as_str()).map(str::to_string),
-                server: None,
+                server: endpoint_for(self.cfg_path.as_deref(), m.get("provider").and_then(|v| v.as_str())),
                 slots: None,
                 reasoning_efforts: Vec::new(),
                 reasoning_default: None,
@@ -2299,5 +2341,38 @@ mod tests {
         assert!(canon_question("Which format?", &mut next, &mut sets).is_none(), "an ordinary extension dialog keeps its ordinary shape");
         assert!(canon_question("CWOFFEEQ not json", &mut next, &mut sets).is_none());
         assert_eq!(next, 3, "a payload we could not read changes nothing: the arm builds the plain card");
+    }
+
+    #[test]
+    fn the_model_list_says_where_the_model_answers_from() {
+        // pi's catalogue names a provider and never an address. Three answers have to stay
+        // distinct: an endpoint that is filed, the endpoint the host was launched against,
+        // and a provider nobody registered — which has no address to report, and where a
+        // plausible one would be a guess wearing a fact.
+        let dir = std::env::temp_dir().join(format!("cw-epfor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:8190/v1\"\nmodel = \"cwoffee-mock\"\n\n[providers.\"the box\"]\nkind = \"openai\"\nbase_url = \"http://192.168.0.9:8080/v1\"\nmodels = [\"the box/thing\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            endpoint_for(Some(&path), Some("the box")).as_deref(),
+            Some("http://192.168.0.9:8080/v1"),
+            "a filed endpoint row is the address for the models under it"
+        );
+        assert_eq!(
+            endpoint_for(Some(&path), Some("cwoffee")).as_deref(),
+            Some("http://127.0.0.1:8190/v1"),
+            "pi's `cwoffee` provider is the one the top-level section registered"
+        );
+        assert_eq!(
+            endpoint_for(Some(&path), Some("who")).as_deref(),
+            None,
+            "an unregistered provider has no address in this file"
+        );
+        assert_eq!(endpoint_for(None, Some("cwoffee")), None, "no config, no claim");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

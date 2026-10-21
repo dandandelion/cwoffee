@@ -7,9 +7,12 @@
 # and made the next real conversation slow. A test suite has no right to spend
 # somebody else's cache.
 #
-# Default: scripts/mock-llm.mjs on 127.0.0.1:8190, a throwaway config/data/workspace,
-# and its own gateway port. Nothing touches ~/.config/cwoffee, ~/.local/share/cwoffee,
-# ~/cwoffee-workspace, or :8090.
+# Default: scripts/mock-llm.mjs on 127.0.0.1:8190, a throwaway config/data/state/workspace,
+# its own pi home, and its own gateway port. Nothing touches ~/.config/cwoffee,
+# ~/.local/share/cwoffee, ~/cwoffee-workspace, or :8090. For the pi core that means the pi
+# home too — it is a fourth store, and it lives under XDG_STATE_HOME by default, so a run
+# that exports only config and data writes into the user's real pi sessions, models.json and
+# session map. See the scratch block below.
 #
 # Real endpoint (deliberate, and it says what it costs):
 #   scripts/selftest.sh --real-endpoint http://127.0.0.1:8090/v1
@@ -106,9 +109,18 @@ fi
 # behind and changes what the next check sees. Everything here is disposable.
 if [ -z "$REAL" ]; then
   SCRATCH=$(mktemp -d /tmp/cwoffee-selftest.XXXXXX)
-  mkdir -p "$SCRATCH/config" "$SCRATCH/data" "$SCRATCH/ws"
+  mkdir -p "$SCRATCH/config" "$SCRATCH/data" "$SCRATCH/state" "$SCRATCH/pi" "$SCRATCH/ws"
   export XDG_CONFIG_HOME="$SCRATCH/config"
   export XDG_DATA_HOME="$SCRATCH/data"
+  # A fourth store, and the one this script used to miss. The pi core keeps its agent dir —
+  # models.json, settings.json, its own sessions, the cwoffee session map and the child
+  # ledger — under XDG_STATE_HOME unless told otherwise, so a run with only config/data set
+  # wrote into the user's real pi home and then deleted the workspace those sessions named.
+  # The next run inherited them and pi answered "Stored session working directory does not
+  # exist", which surfaced as a model process that "did not answer get_state": a harness
+  # poisoning its own next run, one deleted scratch dir at a time.
+  export XDG_STATE_HOME="$SCRATCH/state"
+  export CWOFFEE_PI_AGENT_DIR="$SCRATCH/pi"
   export CWOFFEE_WORKSPACE="$SCRATCH/ws"
   TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 else
@@ -128,6 +140,12 @@ export __GLX_VENDOR_LIBRARY_NAME=mesa
 note "endpoint   : $ENDPOINT"
 note "config dir : ${XDG_CONFIG_HOME:-$HOME/.config}"
 note "data dir   : ${XDG_DATA_HOME:-$HOME/.local/share}"
+note "state dir  : ${XDG_STATE_HOME:-$HOME/.local/share}"
+if [ "${CWOFFEE_CORE:-rust}" = pi ]; then
+  # Say it, because the claim "this run touches nothing of yours" is only worth what the
+  # reader can check from the header.
+  note "pi home    : ${CWOFFEE_PI_AGENT_DIR:-unset — the pi core would use the real one}"
+fi
 note "workspace  : ${CWOFFEE_WORKSPACE:-default}"
 note "gateway    : 127.0.0.1:${GW_PORT} (not 8099: the running app keeps its gateway)"
 # The board's meaning depends entirely on this line. A run with no CWOFFEE_CORE exercises the
@@ -204,6 +222,23 @@ if [ "$CLIP_TOOL" = 1 ] && [ -f "$CLIP_MARKER" ]; then
   rm -f "$CLIP_MARKER" "$CLIP_BACKUP_IMG" "$CLIP_BACKUP_TXT"
 fi
 
+# One client, two hosts: `invoke('cmd', {...})` reaches either a Tauri command or the gateway's
+# dispatch for the same verb, and `transport.ts` passes the payload through unchanged. Tauri
+# spells command parameters one way by default and the gateway reads the engine's own snake_case
+# off the frame, so an argument name is a promise made in three places at once. That has broken
+# twice for real: once an approval answer a phone could not deliver (`allow_session` against
+# `allowSession`), and once every multi-word argument on the endpoint screen answering
+# "invalid args `baseUrl` ... missing required key baseUrl" on the desktop while the Rust tests —
+# which spoke the server's own dialect — stayed green. Check the names before spending ten
+# minutes building a board that cannot press the buttons it grades.
+if [ -f scripts/wire-names.mjs ] && command -v node >/dev/null 2>&1; then
+  wn=$(node scripts/wire-names.mjs 2>&1) || die "the client's argument names and the hosts' do not agree:
+$wn"
+  note "wire names : $(printf '%s' "$wn" | head -1)"
+else
+  note "wire names : SKIPPED (no node, or scripts/wire-names.mjs is missing)"
+fi
+
 # ---- build ------------------------------------------------------------------
 # Which tree the artifacts come from decides what the board is actually testing, so it is
 # settled before the build rather than guessed afterwards. The upstream checkout defines
@@ -272,6 +307,20 @@ if [ "${CWOFFEE_CORE:-rust}" = pi ] && [ -z "${CWOFFEE_CWTOOL:-}" ]; then
   [ -z "$stale" ] || die "target/release/cwtool is older than $stale: rebuild it (cargo build --release -p cwoffee-bridge --bin cwtool) before trusting a tool-shaped red"
   export CWOFFEE_CWTOOL="$PWD/target/release/cwtool"
 fi
+if [ "${CWOFFEE_CORE:-rust}" = pi ]; then
+  # The extension is the other half of the tool story: cwtool carries the definitions and
+  # the guardrails, and this file is what hands them to pi. A board that runs a pi core with
+  # *no* extension sees "tool not found" for every call, and then prints a dozen red lines
+  # that are one missing file — which is how a run once reported no approval cards, no
+  # thinking block, no table and no file chips in the same breath, with a green-looking
+  # settings section above them.
+  if [ -z "${CWOFFEE_PI_EXT:-}" ]; then
+    [ -f "$ROOT/pi-tools/cwoffee-tools.ts" ] || die "the pi core needs the tool extension and pi-tools/cwoffee-tools.ts is missing"
+    export CWOFFEE_PI_EXT="$ROOT/pi-tools/cwoffee-tools.ts"
+  fi
+  [ -f "$CWOFFEE_PI_EXT" ] || die "CWOFFEE_PI_EXT does not name a file: $CWOFFEE_PI_EXT"
+  note "tool ext   : $CWOFFEE_PI_EXT"
+fi
 
 note "artifacts  : app $(date -r target/release/cwoffee-app '+%m-%d %H:%M:%S'), target dir $tgt (built from this tree)"
 
@@ -317,6 +366,26 @@ fi
 # not drive the user's endpoint, config or session store.
 CWOFFEE_SELFTEST=1 CWOFFEE_SELFTEST_CLIP_IMG="${CLIP_FIXTURE:-}" ./target/release/cwoffee-app >>"$log" 2>&1 &
 APP_PID=$!
+
+# The premise, checked before anything is graded. The pi core prints how many extensions it
+# mounted in its own boot line; zero means every tool-shaped case below is about a missing
+# file rather than about this tree. Stopping with that said beats printing fifteen failures
+# that share one cause.
+if [ "${CWOFFEE_CORE:-rust}" = pi ]; then
+  boot=""
+  for _ in $(seq 1 30); do
+    boot=$(grep -m1 'core pi .*extension' "$log" 2>/dev/null || true)
+    [ -n "$boot" ] && break
+    sleep 0.5
+  done
+  if [ -z "$boot" ]; then
+    die "no 'core pi ... up' line in the log after 15 s: the board cannot tell what core it is grading, so its verdict would mean nothing"
+  fi
+  case "$boot" in
+    *"0 extension"*) die "the pi core came up with no tool extension. Boot line: $boot" ;;
+    *) note "boot line  : ${boot#cwoffee/pi] }" ;;
+  esac
+fi
 
 # ---- wait for a verdict -----------------------------------------------------
 deadline=$((SECONDS + 900))

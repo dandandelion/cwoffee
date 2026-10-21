@@ -40,11 +40,12 @@ TUI — is **7.0 MB PSS**. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## What the pi core answers today
 
-Eleven tools mounted from the Rust registry (`cwtool specs/check/run`, `pi-tools/cwoffee-tools.ts`
+Thirteen tools mounted from the Rust registry (`cwtool specs/check/run`, `pi-tools/cwoffee-tools.ts`
 — no policy in the extension), approval cards with the engine's own summary, workspace following,
-attachments on the prompt, a context meter with a probed window, and **Chat mode**: `persona =
-"chat"` gives the model nothing — no tools, no folder, one line of system prompt — and the Cowork
-tab puts the tools back by restarting the model process between turns.
+attachments on the prompt, a context meter with a probed window, a settings screen in five
+categories, and **Chat mode**: `persona = "chat"` gives the model nothing — no tools, no folder,
+one line of system prompt — and the Cowork tab puts the tools back by restarting the model process
+between turns.
 
 ```bash
 # desktop, pi core, tools mounted
@@ -76,7 +77,43 @@ two different things:
 Bulk picking works the same way: picking a folder row means the folder *and* every conversation
 filed in it, chats and drafts included.
 
-### Endpoints and models (Settings › Model)
+### The settings screen
+
+Settings opens as one screen with five categories in the rail — **Models**, **Workspace**,
+**Devices**, **Conversation**, **Appearance** — and nothing else in the rail but those names.
+Captions used to sit under each rail entry, eleven of them, which meant the rail was busy
+explaining while the thing it is for was finding. The explaining moved into the page, under a
+heading, where it is read next to the control it describes:
+
+| Category | What lives there |
+| --- | --- |
+| **Models** | the model answering now, the endpoints and their models, thinking effort, the context ceiling |
+| **Workspace** | the tool set the engine reports, approval mode, the folders tools may work in, web search |
+| **Devices** | browsers and phones attached over the network, and what they may control |
+| **Conversation** | what a conversation is called, and what this one is using: context, cache, speed |
+| **Appearance** | how much of the working the transcript shows, the palette, the keys the app answers |
+
+One thing did not move: the number of decisions. Every control that existed before exists now,
+with the same persistence and the same host verbs behind it; the footer popups and the settings
+page render *the same* blocks, so there is one approvals control, one ceiling row, one search
+panel — not a copy that can drift. The popups are just denser.
+
+The controls share measurements rather than being made to look alike: one height for text fields,
+selects, buttons and segmented controls, four levels of emphasis (`primary`, plain, `danger`, and
+quiet), the same hairlines and the same focus ring in both themes. Dropdowns are drawn by the app
+rather than the toolkit, because a native menu in a webview arrives as a bright white panel in a
+dark window — the part people actually look at was the part the design did not reach. A floating
+menu gets its own surface token (`--color-raise`) so it separates from the page behind it: deeper
+cream on a near-white screen, paler ink on a near-black one, because "lighter" is not a direction
+both themes share.
+
+Old links still land. `#search`, `#tools`, "this session", "thinking": the names written down
+before this reshape are mapped to the page and section that hold them now, and the app's own page
+harness walks all twenty-nine of them, failing if any lands on a page that does not contain the
+section it claims. Narrow windows turn the rail into a strip along the top and let a row's control
+drop below its text, so the settings screen does not have to be scrolled sideways.
+
+### Endpoints and models (Settings › Models)
 
 One model answers at a time. Below that, the screen lists every endpoint the app knows:
 
@@ -99,6 +136,13 @@ What a model's stored window does: it outranks the endpoint's claim, and the con
 derived ceiling and pi's own fold threshold are all rebuilt from it. A model process already
 running keeps the window it started with — the next one reads what you saved.
 
+
+
+The screen drives the same verbs wherever it is drawn: discovery, add, save and remove go through
+the desktop command and through the gateway frame with one spelling, the engine's. Saving one
+edited field does not touch what a probe found — `supports_tools`, `supports_vision` and where the
+numbers came from are kept unless the request states them, because the form has no field for them
+and no authority to clear them.
 
 ### Where the model's own files go
 
@@ -141,8 +185,8 @@ The header is a live claim, not a label — `Thinking` while it reasons, `Workin
 once tools start, and once the answer lands, `Thought, then worked on your computer · 6 steps`.
 Open it and the entries are lines: the call, what it touched, whether it worked. Whether those
 lines carry their contents is a setting, not a button on every accordion — **Settings ›
-Transcript**, "Show what each step did" — because the question is answered once per person, not
-once per run. While a call is still running its output peeks out on its own regardless, because a
+Appearance**, in its Transcript section, "Show what each step did" — because the question is
+answered once per person, not once per run. While a call is still running its output peeks out on its own regardless, because a
 header sitting motionless for forty seconds on a local model reads as a hang.
 
 That setting lives in the app's own store (the same SQLite file as the conversations), not in the
@@ -194,12 +238,20 @@ Gates:
 ./scripts/gpu-check.sh cwoffee-app       # must hold renderD128 only
 ./scripts/sandbox-probe.sh             # re-run after any bwrap/kernel upgrade
 node scripts/gateway-smoke.mjs         # what a phone can actually rely on; mutates nothing
+node scripts/wire-names.mjs            # argument names: the client vs the desktop and the gateway
 ```
 
 The self-test is the other gate: build the UI with `VITE_SELFTEST=1`, run the binary, and read
 the `[cwoffee/page]` lines. It asserts the streaming contract in the real webview — append-only
 reveal, layout-neutral commit, markdown before `turnEnd`, follow without lurches, and that no
 entry animation ever restarts on content already on screen.
+
+The board starts with `scripts/wire-names.mjs`, which costs a second and earns its keep: the app
+calls `invoke('cmd', {...})` and the payload goes to whichever host is running — a Tauri command
+or the gateway's dispatch — unchanged. Those two hosts spell multi-word arguments differently by
+default, so a settings button can work in a browser and answer `missing required key baseUrl` on
+the desktop, which is exactly what happened to the endpoint screen until a page case pressed the
+buttons. The gate reads the client's payloads and both hosts' required names, and fails on drift.
 
 It runs against **a scripted endpoint by default**, not your model: `scripts/mock-llm.mjs` answers
 from `tests/scenarios/scenarios.json` in llama.cpp's wire shape, so the SSE parser, tool loop,
@@ -308,7 +360,7 @@ The old default was a hardcoded 8000 regardless of model, which compacted a 43k 
 on a 262k model and reported "context full". That is why the number now comes from the server.
 
 **You can change it without editing a file.** The telemetry panel (footer → *Session
-telemetry*, and the same body under Settings) has a **ceiling** row: it shows the number in
+telemetry*, and the same body under Settings › Models) has a **ceiling** row: it shows the number in
 force and says whether that is *pinned by you* or *derived: half of 262,144*. A box pins a
 new one, and **derive it** takes the pin off again — which is not a number, so freeing the
 setting deletes the line from `config.toml` instead of writing a sentinel into it. The file
@@ -404,7 +456,8 @@ Three rules keep it honest:
 * **A refusal changes nothing.** The helper rejects output that answers instead of naming
   ("Sure, here's a summary of your cashflow…"), the opening-line title stays, and the reason
   appears in the log and as a note. A wrong title is a false claim about the conversation.
-* **Availability is answerable cheaply.** Settings → Titles quotes the model, the paths, what
+* **Availability is answerable cheaply.** Settings › Conversation (the Titles section) quotes the
+  model, the paths, what
   is missing, and the 870 MB cost; `scripts/titlegen.py --check` reports the same in about a
   second without loading the weights. `node scripts/gateway-titlegen.mjs` is the gate.
 

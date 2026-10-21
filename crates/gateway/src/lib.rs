@@ -963,6 +963,22 @@ fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing string argument `{key}`"))
 }
 
+/// An optional string, under its engine spelling or the camelCase one.
+///
+/// The engine's spelling is the wire's, and the desktop command now asks for the same.
+/// The alias is here for a browser tab that still holds the bundle it loaded before the
+/// rename: reading only one name would drop the URL the person typed rather than refuse,
+/// and the engine would then answer "no URL given" about a field that was filled in.
+fn arg_opt_str(args: &serde_json::Value, key: &str, alt: &str) -> Option<String> {
+    args.get(key)
+        .or_else(|| args.get(alt))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// The names this dispatch actually reads, for the drift check in `scripts/wire-names.mjs`:
+/// a client and a host that disagree about an argument name produce an error naming a key
+/// the person never typed, or silently drop what they typed.
 fn arg_i64(args: &serde_json::Value, key: &str) -> Result<i64, String> {
     args.get(key)
         .and_then(|v| v.as_i64())
@@ -1249,7 +1265,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .set_search_backend(
                     &h.config_path,
                     &arg_str(&args, "backend")?,
-                    &args.get("searxng_url").and_then(|v| v.as_str()).unwrap_or_default(),
+                    &arg_opt_str(&args, "searxng_url", "searxngUrl").unwrap_or_default(),
                 )
                 .await?;
             serde_json::to_value(v).map_err(|e| e.to_string())
@@ -2349,6 +2365,32 @@ mod tests {
                 config_seq().fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             )),
         })
+    }
+
+
+    /// The desktop and the gateway take the same verbs with different host-side shapes, and
+    /// every multi-word argument is a spelling hazard: this file already carries a scar from
+    /// `"allow_session"` versus `"allowSession"`, which let a phone press Allow and stay
+    /// parked. The engine's spelling is the wire's; the camelCase one is read as an alias so a
+    /// stale tab loses a search URL loudly rather than silently.
+    #[tokio::test]
+    async fn an_argument_name_that_changed_is_still_read_for_what_it_carried() {
+        for key in ["searxng_url", "searxngUrl"] {
+            let h = test_handle();
+            let v = run_cmd(
+                "set_search_backend",
+                serde_json::json!({ "backend": "searxng", key: "http://127.0.0.1:8899/search" }),
+                Role::Drive,
+                &h,
+            )
+            .await
+            .expect("a driver may name the search instance");
+            assert_eq!(
+                v["searxng_url"].as_str(),
+                Some("http://127.0.0.1:8899/search"),
+                "`{key}` never reached the engine"
+            );
+        }
     }
 
     /// `migration_notes` used to answer `[]` from the gateway no matter what the

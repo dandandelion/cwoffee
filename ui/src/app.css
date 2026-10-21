@@ -9,6 +9,12 @@
   /* surfaces */
   --color-paper: #fdfcf9;
   --color-paper-2: #f7f5ef;
+  /* A floating surface has to separate from the screen it floats over, not just
+     from the control it came from. paper-2 is what the form controls wear, so a
+     menu wearing paper-2 disappears into the settings page; the lift goes the
+     other way in each theme - deeper cream on a near-white screen, paler ink on
+     a near-black one - because "lighter" is not a direction both themes share. */
+  --color-raise: #f3f0e6;
   --color-hairline: #e8e5dd;
   --color-hairline-2: #dcd8ce;
 
@@ -64,6 +70,7 @@
 [data-theme='dark'] {
   --color-paper: #1e1d1b;
   --color-paper-2: #26241f;
+  --color-raise: #2c2a24;
   --color-hairline: #35332d;
   --color-hairline-2: #4a473f;
 
@@ -2635,31 +2642,16 @@ body {
   transition: width var(--d3) var(--ease);
 }
 .mbar i.ok { background: var(--color-ok); }
-.mbar-row .mbtn {
-  /* A verb on a meter row: small, quiet, and next to the number it acts on. */
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--ink-2);
-  font-size: 10.5px;
-  letter-spacing: 0.02em;
-  padding: 1px 6px;
-  cursor: pointer;
-}
-/* The token count a person may type. It lives in a metrics row, so it is sized like the
-   row rather than like a form field: the only control that can carry a token count is a
-   number box, because the safe range belongs to the endpoint, not to a slider. */
-.mbar-row .mnum {
-  width: 8ch;
-  font-size: 10.5px;
-  padding: 1px 5px;
-  background: transparent;
-  color: var(--ink-2);
+/* The controls on a meter row are ordinary buttons and an ordinary number box
+   now, drawn by the settings design system. They used to have their own rules
+   here, written against var(--ink)/var(--line) - tokens this stylesheet never
+   defines - so the colour silently came from the parent instead of the theme. */
+.mbar-row .set-btn,
+.mbar-row .sinp {
+  flex: none;
 }
 .mnum::-webkit-outer-spin-button,
 .mnum::-webkit-inner-spin-button { opacity: 1; }
-.mbtn[disabled] { opacity: 0.45; cursor: default; }
-.mbtn:hover:not([disabled]) { border-color: var(--ink-3); color: var(--ink); }
 
 .mval { font-size: 11px; color: var(--color-ink-2); white-space: nowrap; }
 .mbar-row .mval .ctxtrim { display: block; font-size: 10px; color: var(--color-ink-3); }
@@ -2699,28 +2691,6 @@ body {
 .mfoot-v { color: var(--color-ink-2); }
 
 /* ----------------------------------------------------- gateway popover -- */
-.switch {
-  width: 34px;
-  height: 20px;
-  border-radius: 999px;
-  background: var(--color-hairline-2);
-  position: relative;
-  flex: none;
-  transition: background-color var(--d2) var(--ease);
-}
-.switch i {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--color-paper);
-  box-shadow: 0 1px 2px rgb(0 0 0 / 18%);
-  transition: transform var(--d2) var(--ease-out);
-}
-.switch.on { background: var(--color-ok); }
-.switch.on i { transform: translateX(14px); }
 .pop-item:disabled { opacity: 0.55; cursor: default; }
 .popseg {
   display: grid;
@@ -2877,11 +2847,11 @@ body {
   .pop, .filechip, .tin, .turn > * { animation: none; }
   .blk-reasoning .blk-body, .blk-tool .tool-detail { transition: none; }
   .pop-item, .btn-go, .btn-ghost, .btn-bad, .keyhelp, .fbtn, .tip, .filechip,
-  .sessrow, .wsrow, .cbtn, .att-x, .switch i, .mbar i { transition: none; }
+  .sessrow, .wsrow, .cbtn, .att-x, .ssw i, .mbar i { transition: none; }
   .cupwrap, .wisp, .wisps, .cores { animation: none; }
   /* Frozen mid-rise rather than switched off: the cup still reads as hot. */
   .wisp { opacity: 0.45; stroke-dashoffset: -24; }
-  .switch i, .mbar i { transition: none; }
+  .ssw i, .mbar i { transition: none; }
 }
 
 /* Every clickable thing says so. A browser does this for <a> only; this app is
@@ -2969,18 +2939,33 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   color: var(--color-ink-3);
 }
 
-/* ============================== settings screen ==============================
-   A popup answers a question you happened to be asking. A settings screen answers
-   the one you come back to: what search am I on, which folder are the tools in,
-   what does this session cost. It is a dialog with a rail, not a bigger popover:
-   the sections are the popups' own markup (see the `body` snippet in App.svelte),
-   so every control here *is* the control in the popup rather than a copy that can
-   drift into a different meaning.
+/* ============================ settings, one design system ==================
+   A popup answers the question you happened to be asking. This screen answers
+   the one you come back to: which model answers, which folders the tools may
+   touch, what a session costs. So it is built like a screen and not like a
+   large popover: a rail of categories, a page title with its description, and
+   blocks of controls each with its own heading.
 
-   Deliberately no new dependency and no second stylesheet: the tokens, the radii
-   and the motion durations are the ones the rest of the app already animates on,
-   and the whole thing is a grid. Bundle cost is the point of that, not aesthetics.
-*/
+   The numbers below exist because "consistent" has to be a number. Every text
+   field, select, segmented control and button in this screen is the same height
+   with the same radius; what differs between them is emphasis - primary,
+   plain, quiet, destructive - which is what a variant is for, and nothing else.
+
+   Colours come from this stylesheet's own tokens and nowhere else. Two blocks
+   here used var(--ink), var(--line) and var(--accent): names that are never
+   defined. Invalid declarations do not throw, they fall back, so those borders
+   and labels took their colour from the parent instead of the theme and looked
+   almost right in one theme only. Nothing here may do that again.
+--------------------------------------------------------------------------- */
+:root {
+  --ctl-h: 32px;
+  --ctl-r: 8px;
+  --ctl-fs: 13px;
+  --row-gap: 13px;
+  --sect-gap: 24px;
+  --ring: 0 0 0 2px color-mix(in srgb, var(--color-shell) 62%, transparent);
+}
+
 .scrim {
   position: fixed;
   inset: 0;
@@ -2988,11 +2973,12 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   background: rgba(0, 0, 0, 0.26);
   animation: cwoffee-fade var(--d2) var(--ease-out);
 }
+
 .settings {
   /* The dialog container is focused so a keyboard user starts inside it, which makes
      the user agent paint its own ring around the whole panel. That ring is not an
-     affordance — the affordances are the controls inside, which have their own focus
-     styles — so it is dropped here rather than styled into something louder. */
+     affordance - the affordances are the controls inside, which have their own focus
+     styles - so it is dropped here rather than styled into something louder. */
   position: fixed;
   z-index: 71;
   left: 50%;
@@ -3000,8 +2986,8 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   transform: translate(-50%, -50%);
   display: flex;
   flex-direction: column;
-  width: min(880px, calc(100vw - 28px));
-  max-height: min(660px, calc(100vh - 40px));
+  width: min(1010px, calc(100vw - 32px));
+  max-height: min(740px, calc(100vh - 44px));
   border: 1px solid var(--color-hairline);
   border-radius: 14px;
   background: var(--color-paper);
@@ -3009,166 +2995,535 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   animation: cwoffee-pop var(--d2) var(--ease-out);
 }
 .settings:focus { outline: none; }
+
 .set-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 10px;
-  padding: 11px 13px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--color-hairline);
 }
-.set-title { font-size: 14px; font-weight: 600; color: var(--color-ink); }
-.set-sub { font-size: 11.5px; color: var(--color-ink-3); }
+.set-title { font-size: 13.5px; font-weight: 600; color: var(--color-ink); }
 .set-x {
   margin-left: auto;
+  font: inherit;
   font-size: 11px;
   color: var(--color-ink-3);
-  padding: 2px 8px;
+  height: 26px;
+  padding: 0 10px;
   border: 1px solid var(--color-hairline);
   border-radius: 999px;
   background: var(--color-paper-2);
+  cursor: pointer;
 }
 .set-x:hover { color: var(--color-ink); border-color: var(--color-hairline-2); }
+.set-x:focus-visible { outline: none; box-shadow: var(--ring); }
+
 .set-grid {
   display: grid;
-  grid-template-columns: 208px minmax(0, 1fr);
+  /* The rail carries five names. It does not need the width a two-line label
+     needed, and the body gets the difference. */
+  grid-template-columns: 184px minmax(0, 1fr);
   flex: 1;
   min-height: 0;
 }
+
+/* --- rail: category names only ------------------------------------------ */
 .set-rail {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 8px;
+  gap: 1px;
+  padding: 10px 8px;
   border-right: 1px solid var(--color-hairline);
   overflow-y: auto;
 }
-.set-tab {
-  display: grid;
-  gap: 1px;
-  text-align: left;
-  padding: 6px 9px;
-  border: 0;
-  border-radius: 9px;
-  background: transparent;
-  cursor: pointer;
-}
-.set-tab:hover { background: var(--color-paper-2); }
-.set-tab.on { background: var(--color-tint); }
-.set-lbl { font-size: 12.5px; font-weight: 550; color: var(--color-ink); }
-.set-tab.on .set-lbl { font-weight: 600; }
-.set-hint { font-size: 11px; color: var(--color-ink-3); }
-.set-body {
-  padding: 10px 12px 14px;
-  overflow-y: auto;
-  /* The bodies were written as menus: 210px wide and scrolled. Here they are a column
-     of settings rows, so the rhythm changes - more air between a group's label and its
-     first row, and rows that use the width they are given. */
-}
-.set-body > .pop-title:first-child { margin-top: 0; }
-.set-body .pop-title { margin: 12px 0 4px; }
-.set-body .pop-item { padding: 7px 9px; }
-.set-body .pop-item .pop-sub { font-size: 11.5px; }
-.set-body .pop-note,
-.set-body .pop-empty { max-width: 62ch; }
-.set-body .pop-actions { display: flex; gap: 8px; margin-top: 10px; }
-
-/* Rail groups. Nine sections in a flat list read as nothing being categorised; the
-   labels say which decisions belong together without inventing another page. */
-.set-group {
-  margin: 12px 8px 3px;
+.set-rail-lbl {
+  padding: 2px 10px 8px;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--color-ink-3);
 }
-.set-group:first-child { margin-top: 2px; }
+.set-nav {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  color: var(--color-ink-2);
+  background: transparent;
+  border: 0;
+  border-radius: var(--ctl-r);
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
+}
+.set-nav:hover { background: var(--color-paper-2); color: var(--color-ink); }
+.set-nav:focus-visible { outline: none; box-shadow: var(--ring); }
+.set-nav.on {
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  font-weight: 600;
+  /* One 2px mark in the accent hue says which page is on without a filled
+     block, which would make the rail louder than the page it labels. */
+  box-shadow: inset 2px 0 0 var(--color-shell);
+}
+.set-nav-ic { flex: none; color: var(--color-ink-3); }
+.set-nav.on .set-nav-ic { color: var(--color-shell); }
+.set-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* The Tools section lists what the engine owns. The name is monospace because it is
-   the exact id the model calls, and the sentence beside it is the engine's own. */
-.toolsec { display: flex; flex-direction: column; gap: 8px; max-width: 74ch; }
-.set-note { font-size: 11.5px; line-height: 1.45; color: var(--color-ink-2); }
-.set-note.set-err { color: var(--color-danger); }
+/* --- body: page header, then sections ----------------------------------- */
+.set-body {
+  padding: 16px 20px 22px;
+  overflow-y: auto;
+  scroll-behavior: smooth;
+}
+.spage-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--color-ink);
+}
+.spage-desc {
+  margin: 5px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+  max-width: 70ch;
+}
+
+.ssect {
+  margin-top: var(--sect-gap);
+  padding-top: 16px;
+  border-top: 1px solid var(--color-hairline);
+  outline: none;
+}
+.ssect-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+.ssect-hh { min-width: 0; flex: 1; }
+.ssect-h {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+.ssect-d {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+  max-width: 68ch;
+}
+.ssect-acts { display: flex; gap: 7px; flex: none; }
+.ssect-b { display: flex; flex-direction: column; gap: var(--row-gap); }
+
+/* A deep link lands somewhere; the section it named says so for a moment
+   rather than leaving the reader to guess whether the link worked. */
+.ssect.flash {
+  animation: cwoffee-flash 1400ms var(--ease-out) 1;
+}
+@keyframes cwoffee-flash {
+  0% { background: color-mix(in srgb, var(--color-shell) 14%, transparent); }
+  100% { background: transparent; }
+}
+
+/* --- rows: a fact and its control, on one line -------------------------- */
+.srow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px 18px;
+  padding: 11px 0;
+  border-top: 1px solid var(--color-hairline);
+}
+.srow:first-child { border-top: 0; padding-top: 0; }
+.srow-t { font-size: 13px; color: var(--color-ink); }
+.srow-h {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+  max-width: 62ch;
+}
+.srow-c { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* --- fields ------------------------------------------------------------- */
+.sfld-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px 16px;
+}
+.sfld { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.sfld.wide { grid-column: 1 / -1; }
+.sfld-l {
+  font-size: 11.5px;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  color: var(--color-ink-2);
+}
+.sfld-h { font-size: 11.5px; line-height: 1.5; color: var(--color-ink-3); }
+.sfld-e { font-size: 11.5px; line-height: 1.5; color: var(--color-danger); }
+
+.sinp {
+  box-sizing: border-box;
+  width: 100%;
+  height: var(--ctl-h);
+  padding: 0 10px;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: var(--ctl-r);
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: var(--ctl-fs);
+  transition: border-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease);
+}
+.sinp.mono, .sinp[data-mono] { font-family: var(--font-mono); font-size: 12.5px; }
+.sinp::placeholder { color: var(--color-ink-3); }
+.sinp:hover:not(:disabled) { border-color: var(--color-ink-3); }
+.sinp:focus { outline: none; border-color: var(--color-shell); box-shadow: var(--ring); }
+.sinp:disabled { color: var(--color-ink-3); cursor: default; }
+.sinp.narrow { width: 11ch; flex: none; }
+.sinp.num { font-variant-numeric: tabular-nums; }
+.sinp.num::-webkit-outer-spin-button,
+.sinp.num::-webkit-inner-spin-button { opacity: 1; }
+
+/* --- the select the app draws ------------------------------------------ */
+.ssel { position: relative; min-width: 0; }
+.ssel-btn {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: var(--ctl-h);
+  padding: 0 9px 0 10px;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: var(--ctl-r);
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: var(--ctl-fs);
+  cursor: pointer;
+  transition: border-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease);
+}
+.ssel.mono .ssel-v { font-family: var(--font-mono); font-size: 12.5px; }
+.ssel-v { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ssel-v.ph { color: var(--color-ink-3); }
+.ssel-a { margin-left: auto; flex: none; color: var(--color-ink-3); }
+.ssel-btn:hover:not(:disabled) { border-color: var(--color-ink-3); }
+.ssel-btn:focus-visible, .ssel.open .ssel-btn { outline: none; border-color: var(--color-shell); box-shadow: var(--ring); }
+.ssel-btn:disabled { color: var(--color-ink-3); cursor: default; }
+.ssel-pop {
+  position: absolute;
+  z-index: 8;
+  left: 0;
+  top: calc(100% + 4px);
+  width: max(100%, 190px);
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 10px;
+  background: var(--color-raise);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.22), 0 1px 0 rgba(0, 0, 0, 0.06);
+  animation: cwoffee-pop 110ms var(--ease-out) both;
+}
+.ssel.up .ssel-pop { top: auto; bottom: calc(100% + 4px); }
+.ssel-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 6px 7px;
+  border-radius: 7px;
+  cursor: pointer;
+  color: var(--color-ink);
+  font-size: 12.5px;
+}
+.ssel-opt.cur { background: color-mix(in srgb, var(--color-shell) 15%, transparent); }
+.ssel-opt.sel { color: var(--color-ink); font-weight: 600; }
+.ssel-opt.dis { color: var(--color-ink-3); cursor: default; }
+.ssel-ck { width: 11px; flex: none; color: var(--color-shell); font-size: 11px; }
+.ssel-t { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ssel-h { font-size: 11px; color: var(--color-ink-3); }
+
+/* --- buttons: four levels of emphasis, one size ------------------------- */
+.set-btn {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--ctl-h);
+  padding: 0 12px;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: var(--ctl-r);
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease), color var(--d1) var(--ease);
+}
+.set-btn:hover:not(:disabled) { border-color: var(--color-ink-3); }
+.set-btn:focus-visible { outline: none; box-shadow: var(--ring); }
+.set-btn:disabled { opacity: 0.45; cursor: default; }
+/* Primary: the one action a section is for. Plain: a normal secondary action.
+   Quiet: a low-emphasis action (revert, clear). Destructive: it removes or
+   forgets something the app was told. */
+.set-btn.primary {
+  background: var(--color-tint);
+  border-color: var(--color-shell);
+  color: var(--color-ink);
+  font-weight: 600;
+}
+.set-btn.primary:hover:not(:disabled) { border-color: var(--color-shell-deep); }
+.set-btn.plain { background: transparent; border-color: var(--color-hairline); color: var(--color-ink-2); }
+.set-btn.plain:hover:not(:disabled) { color: var(--color-ink); border-color: var(--color-ink-3); }
+.set-btn.danger { color: var(--color-danger); border-color: var(--color-danger-hairline); background: transparent; }
+.set-btn.danger:hover:not(:disabled) { background: var(--color-danger-bg); border-color: var(--color-danger); }
+.pvacts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+/* --- segmented control, switch, radio rows ------------------------------ */
+.sseg {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 10px;
+  background: var(--color-paper-2);
+}
+.sseg-b {
+  min-height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-ink-2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
+}
+.sseg-b:hover:not(:disabled) { color: var(--color-ink); }
+.sseg-b:focus-visible { outline: none; box-shadow: var(--ring); }
+.sseg-b:disabled { opacity: 0.45; cursor: default; }
+.sseg-b.on {
+  background: var(--color-tint);
+  color: var(--color-ink);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--color-shell);
+}
+
+.ssw {
+  flex: none;
+  width: 36px;
+  height: 21px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--color-hairline-2);
+  position: relative;
+  cursor: pointer;
+  transition: background-color var(--d2) var(--ease);
+}
+.ssw i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: var(--color-paper);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 18%);
+  transition: transform var(--d2) var(--ease-out);
+}
+.ssw.on { background: var(--color-ok); }
+.ssw.on i { transform: translateX(15px); }
+.ssw:focus-visible { outline: none; box-shadow: var(--ring); }
+.ssw:disabled { opacity: 0.5; cursor: default; }
+
+.schoice-set { display: flex; flex-direction: column; gap: 6px; }
+.schoice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 10px;
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  cursor: pointer;
+  transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+}
+.schoice:hover:not(:disabled) { border-color: var(--color-ink-3); }
+.schoice:focus-visible { outline: none; box-shadow: var(--ring); }
+.schoice:disabled { opacity: 0.55; cursor: default; }
+.schoice.on { border-color: var(--color-shell); background: var(--color-tint); }
+.schoice-dot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  margin-top: 3px;
+  border-radius: 50%;
+  border: 1px solid var(--color-hairline-2);
+  background: var(--color-paper);
+}
+.schoice.on .schoice-dot {
+  border-color: var(--color-shell);
+  background: radial-gradient(circle at 50% 50%, var(--color-shell) 0 4px, transparent 4.5px);
+}
+.schoice-t { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.schoice-l { font-size: 13px; font-weight: 500; }
+.schoice-s { font-size: 11.5px; line-height: 1.45; color: var(--color-ink-2); }
+
+/* --- lists that open ---------------------------------------------------- */
+.slist { display: flex; flex-direction: column; gap: 7px; }
+.sitem {
+  border: 1px solid var(--color-hairline);
+  border-radius: 10px;
+  background: var(--color-paper-2);
+}
+.sitem-h {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--color-ink);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.sitem-h:focus-visible { outline: none; box-shadow: var(--ring); border-radius: 10px; }
+.sitem-name { font-weight: 600; font-size: 13px; }
+.sitem-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sitem-n { margin-left: auto; font-size: 11px; color: var(--color-ink-3); white-space: nowrap; flex: none; }
+.sitem-b { display: flex; flex-direction: column; gap: 10px; padding: 2px 12px 12px; }
+.chev { font-size: 10px; color: var(--color-ink-3); width: 9px; flex: none; }
+
+/* A row whose disclosure header sits beside an action: the action has to be a
+   sibling of the header, because a <button> inside a <button> is not markup the
+   browser agrees to keep where it was written. */
+.sitem-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 10px;
+}
+.sitem-top .sitem-h { flex: 1; min-width: 0; }
+.sitem-act { min-height: 27px; padding: 0 9px; flex: none; }
+
+/* Tools and other rows the engine owns the wording of. */
+.toolsec { display: flex; flex-direction: column; gap: 7px; }
 .toolrow {
   display: grid;
-  grid-template-columns: minmax(92px, auto) minmax(0, 1fr);
-  gap: 3px 10px;
+  grid-template-columns: minmax(96px, auto) minmax(0, 1fr);
+  gap: 2px 12px;
   align-items: baseline;
-  padding: 7px 9px;
-  border-radius: 8px;
+  padding: 9px 12px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 10px;
   background: var(--color-paper-2);
 }
 .toolname { font-family: var(--font-mono); font-size: 12px; color: var(--color-ink); }
-.tooldesc { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--color-ink-2); }
+.tooldesc { margin: 0; font-size: 11.5px; line-height: 1.45; color: var(--color-ink-2); }
 
-/* The model screen: endpoints that expand into models that expand into fields. The
-   nesting is deliberate — an endpoint list is only useful once you can see what is on
-   each one, and a model row is only useful once you can see what the app believes about
-   it. Capability chips say what was *observed*; "unknown" is a chip of its own, because
-   "never asked" and "refused" are different answers. */
-.mcur { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.setdiv { border: 0; border-top: 1px solid var(--color-hairline); margin: 16px 0 10px; }
-.pvadd { display: flex; flex-direction: column; gap: 9px; }
-.pvgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 12px; }
-.pvf { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; color: var(--color-ink-3); }
-.pvf.wide { grid-column: 1 / -1; }
-.pvf input, .pvf select { font-size: 12.5px; }
-.pvacts { display: flex; gap: 7px; flex-wrap: wrap; }
-.set-btn {
-  font: inherit; font-size: 12px;
-  padding: 5px 10px; border-radius: 7px;
-  border: 1px solid var(--color-hairline-2);
-  background: var(--color-paper-2); color: var(--color-ink-2);
-  cursor: pointer;
-}
-.set-btn:hover:not(:disabled) { border-color: var(--color-ink-3); color: var(--color-ink); }
-.set-btn:disabled { opacity: 0.45; cursor: default; }
-.set-btn.primary { background: var(--color-tint); border-color: var(--color-hairline-2); color: var(--color-ink); font-weight: 550; }
-.set-btn.danger { color: var(--color-danger); }
-.prow-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.probelist, .provbody { display: flex; flex-direction: column; gap: 7px; }
-.probelist { padding: 3px 0; }
-.prow { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+/* Capability chips. Three states, and "never asked" is one of them: a chip
+   that is absent reads as false, and the endpoint was never asked. */
 .capset { display: inline-flex; gap: 5px; flex-wrap: wrap; }
 .cap {
-  font-size: 10.5px; padding: 2px 6px; border-radius: 999px;
-  border: 1px solid var(--color-hairline); background: var(--color-paper-2);
+  font-size: 10.5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--color-hairline);
+  background: var(--color-paper);
   color: var(--color-ink-3);
 }
-.cap.now { color: var(--color-ink); border-color: var(--color-hairline-2); font-weight: 600; }
-.prov { border-radius: 9px; background: var(--color-paper-2); }
-.provhead {
-  display: flex; align-items: center; gap: 8px; width: 100%;
-  padding: 8px 10px; border: 0; background: transparent; cursor: pointer;
-  font: inherit; color: var(--color-ink); text-align: left;
-}
-.provname { font-weight: 600; font-size: 12.5px; }
-.provurl { font-family: var(--font-mono); font-size: 11px; color: var(--color-ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.provn { margin-left: auto; font-size: 11px; color: var(--color-ink-3); white-space: nowrap; }
-.chev { font-size: 10px; color: var(--color-ink-3); width: 9px; }
-.provbody { padding: 0 10px 10px; }
-.pvline { display: flex; gap: 8px; font-size: 11.5px; color: var(--color-ink-3); }
-.pvline code { font-family: var(--font-mono); color: var(--color-ink-2); }
-.mrow2 { border-top: 1px solid var(--color-hairline); padding: 6px 0 0; }
-.mrow2top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.mrow2name { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; cursor: pointer; font: inherit; color: inherit; padding: 0; }
-.mfields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 12px; padding: 8px 0 4px; }
-.mfields .set-note { grid-column: 1 / -1; }
-.mfields .pvacts { grid-column: 1 / -1; }
+.cap.now { color: var(--color-ink); border-color: var(--color-hairline-2); background: var(--color-tint); font-weight: 600; }
+.cap.no { color: var(--color-ink-3); border-style: dashed; }
 
-/* Phones and narrow windows: the rail becomes a strip along the top. A settings
-   screen you have to zoom sideways to navigate is not a settings screen. */
-@media (max-width: 720px) {
+/* --- status, empty, loading --------------------------------------------- */
+.smsg {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+  padding: 9px 11px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 9px;
+  background: var(--color-paper-2);
+}
+.smsg.bad { color: var(--color-danger); border-color: var(--color-danger-hairline); background: var(--color-danger-bg); }
+.smsg.ok { color: var(--color-ok); border-color: var(--color-ok); background: var(--color-ok-bg); }
+.smsg.wait { color: var(--color-ink-2); }
+.sempty {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+  padding: 14px;
+  border: 1px dashed var(--color-hairline-2);
+  border-radius: 10px;
+  max-width: 68ch;
+}
+.set-note { font-size: 11.5px; line-height: 1.5; color: var(--color-ink-2); max-width: 74ch; }
+.set-note.set-err { color: var(--color-danger); }
+.mono { font-family: var(--font-mono); }
+.nowrap { white-space: nowrap; }
+
+/* Popups render the same blocks as the settings screen - one control, one
+   meaning - but in a narrower, tighter surface. Only the density differs. */
+.pop .srow { padding: 7px 0; grid-template-columns: minmax(0, 1fr) auto; }
+.pop .srow-t { font-size: 12px; }
+.pop .srow-h { font-size: 11px; }
+.pop .set-btn { min-height: 26px; padding: 0 9px; font-size: 11.5px; }
+.pop .sinp { height: 28px; font-size: 12px; }
+.pop .ssel-btn { height: 28px; font-size: 12px; }
+.pop .sseg-b { min-height: 24px; padding: 0 8px; font-size: 11.5px; }
+.pop .schoice { padding: 7px 9px; }
+.pop .schoice-l { font-size: 12px; }
+.pop .schoice-s { font-size: 11px; }
+.pop .sfld-grid { grid-template-columns: minmax(0, 1fr); }
+
+/* Phones and narrow windows: the rail becomes a strip along the top, and a
+   row's control drops under its text rather than squeezing it to nothing. A
+   settings screen you have to zoom sideways to navigate is not one. */
+@media (max-width: 760px) {
   .set-grid { grid-template-columns: minmax(0, 1fr); }
   .set-rail {
     flex-direction: row;
+    gap: 4px;
     overflow-x: auto;
     border-right: 0;
     border-bottom: 1px solid var(--color-hairline);
   }
-  .set-tab { min-width: 116px; }
-  .set-hint { display: none; }
-  .set-group { display: none; }
+  .set-rail-lbl { display: none; }
+  .set-nav { min-width: 112px; }
+  .set-body { padding: 13px 14px 18px; }
+  .sfld-grid { grid-template-columns: minmax(0, 1fr); }
+  .srow { grid-template-columns: minmax(0, 1fr); }
+  .srow-c { justify-content: flex-start; }
 }
 
 /* ---- the run accordion --------------------------------------------------
@@ -3300,40 +3655,4 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 .filechip.ref {
   opacity: 0.78;
   font-style: italic;
-}
-
-/* The display settings. The segments reuse `.modesel` (the same control the Chat/Cowork
-   tabs use) so one affordance means one thing; `.prefseg` only fixes the width, because a
-   two-value group should not stretch across the screen. */
-.prefrow {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 0 14px;
-  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
-}
-.prefrow:last-of-type {
-  border-bottom: none;
-}
-.preftxt {
-  min-width: 0;
-}
-.preflbl {
-  font-size: 13.5px;
-  color: var(--ink);
-}
-.prefhint {
-  margin-top: 4px;
-  font-size: 12px;
-  line-height: 1.45;
-  color: color-mix(in srgb, var(--ink) 62%, transparent);
-}
-.prefnote {
-  margin-top: 5px;
-  font-size: 11.5px;
-  color: var(--accent);
-}
-.prefseg {
-  flex: 0 0 auto;
 }

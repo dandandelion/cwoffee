@@ -420,7 +420,13 @@ pub fn provider_status(state: tauri::State<'_, AppState>) -> Result<serde_json::
     serde_json::to_value(state.host.provider_status()).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+// `rename_all = "snake_case"` is not decoration. Tauri's default is to expect camelCase
+// keys in an `invoke` payload and map them onto snake_case Rust parameters, while the gateway
+// — the same verbs for a browser or a phone — reads the snake_case names straight off the
+// frame. Two hosts, two spellings, one client: whichever one the UI was written against, the
+// other one answers "missing required key ...". The wire dialect is the engine's own, so the
+// commands that take more than one word say so here.
+#[tauri::command(rename_all = "snake_case")]
 pub async fn provider_test(
     state: tauri::State<'_, AppState>,
     base_url: String,
@@ -437,7 +443,8 @@ pub async fn provider_test(
     Ok(state.host.provider_test(&req).await)
 }
 
-#[tauri::command]
+// See the note on `provider_test`: one wire dialect, spelled the engine's way.
+#[tauri::command(rename_all = "snake_case")]
 pub async fn provider_probe(
     state: tauri::State<'_, AppState>,
     base_url: String,
@@ -455,7 +462,8 @@ pub async fn provider_probe(
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+// See the note on `provider_test`: one wire dialect, spelled the engine's way.
+#[tauri::command(rename_all = "snake_case")]
 pub fn provider_add(
     state: tauri::State<'_, AppState>,
     base_url: String,
@@ -482,7 +490,8 @@ pub fn provider_remove(state: tauri::State<'_, AppState>, name: String) -> Resul
     Ok(state.host.provider_remove(&name))
 }
 
-#[tauri::command]
+// See the note on `provider_test`: one wire dialect, spelled the engine's way.
+#[tauri::command(rename_all = "snake_case")]
 pub fn model_set(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -649,7 +658,8 @@ pub async fn search_settings(
     Ok(state.host.search_view(&state.config_path).await)
 }
 
-#[tauri::command]
+// See the note on `provider_test`: one wire dialect, spelled the engine's way.
+#[tauri::command(rename_all = "snake_case")]
 pub async fn set_search_backend(
     state: tauri::State<'_, AppState>,
     backend: String,

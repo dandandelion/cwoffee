@@ -1698,8 +1698,27 @@ pub fn remove_provider_with(path: &std::path::Path, name: &str) -> String {
 
 /// Write one model row and say, in words, what changes when.
 pub fn set_model_with(path: &std::path::Path, id: &str, row: &ModelRow) -> String {
-    let bits = describe_model_write(id, row);
-    match set_model_row_in(path, id, row) {
+    let mut row = row.clone();
+    // Half of a model row is what the settings screen edits and half is what a probe found.
+    // The edited half follows the screen: a field left empty is a decision to stop pinning it,
+    // so it is dropped. The probed half does not appear as a field at all, so a request that
+    // says nothing about it must not erase it — pressing Save next to "Max context" has no
+    // business un-probing whether the endpoint takes tool calls. The same reasoning covers
+    // `source`, which says where the numbers came from: provenance belongs to the host that
+    // asked the endpoint, not to whatever client is holding the form.
+    if let Some((_, stored)) = model_rows_in(path).into_iter().find(|(k, _)| k == id) {
+        if row.supports_tools.is_none() {
+            row.supports_tools = stored.supports_tools;
+        }
+        if row.supports_vision.is_none() {
+            row.supports_vision = stored.supports_vision;
+        }
+        if row.source.trim().is_empty() {
+            row.source = stored.source;
+        }
+    }
+    let bits = describe_model_write(id, &row);
+    match set_model_row_in(path, id, &row) {
         Err(e) => format!("not saved: {e}"),
         Ok(changed) => format!("{} ({})", bits.join("; "), changed.len()),
     }
@@ -1956,6 +1975,85 @@ mod tests {
     /// A model row is a set of optional facts. Clearing one has to delete the key: a stale
     /// `context_window` line left behind after someone pressed "ask the endpoint" would be a
     /// number the meter keeps believing.
+    #[test]
+    fn a_save_from_the_model_screen_keeps_the_facts_it_was_never_shown() {
+        // The model row has two halves. One is fields the screen edits; the other is what a
+        // probe found, and the screen never shows it as a field. Pressing Save beside
+        // "Max context" must not un-probe a capability or forget where a number came from.
+        let dir = std::env::temp_dir().join(format!("cw-msave-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+        let req = ProviderReq {
+            name: "box".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            api_key: String::new(),
+            kind: "openai".into(),
+        };
+        let caps = vec![ModelSpec {
+            id: "box/thing".into(),
+            row: ModelRow {
+                context_window: Some(32768),
+                supports_tools: Some(true),
+                supports_vision: Some(false),
+                source: "probed from http://127.0.0.1:9/v1".into(),
+                ..Default::default()
+            },
+        }];
+        let added = add_provider_with(&path, &req, &caps);
+        assert!(added.contains("box"), "{added}");
+
+        // The screen's whole request: one number typed into one field.
+        let row = ModelRow {
+            context_window: Some(40000),
+            ..Default::default()
+        };
+        let saved = set_model_with(&path, "box/thing", &row);
+        assert!(saved.contains("40000"), "{saved}");
+        let rows = model_rows_in(&path);
+        let got = &rows
+            .iter()
+            .find(|(k, _)| k == "box/thing")
+            .expect("the row is still filed")
+            .1;
+        assert_eq!(got.context_window, Some(40000), "the window that was typed did not land");
+        assert_eq!(
+            got.supports_tools,
+            Some(true),
+            "Save un-probed a capability the screen never offered as a field"
+        );
+        assert_eq!(
+            got.supports_vision,
+            Some(false),
+            "a probed refusal is not the same as never having asked, and neither is `None`"
+        );
+        assert!(
+            got.source.contains("probed from"),
+            "provenance belongs to the side that asked the endpoint: {got:?}"
+        );
+
+        // An explicit answer still replaces: the merge covers only what the request said
+        // nothing about.
+        let row2 = ModelRow {
+            context_window: Some(40000),
+            supports_tools: Some(false),
+            ..Default::default()
+        };
+        set_model_with(&path, "box/thing", &row2);
+        let again = model_rows_in(&path);
+        let got2 = &again
+            .iter()
+            .find(|(k, _)| k == "box/thing")
+            .expect("still filed")
+            .1;
+        assert_eq!(
+            got2.supports_tools,
+            Some(false),
+            "an answer written on purpose has to outrank the one a probe left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_cleared_model_field_leaves_no_stale_number_behind() {
         let dir = std::env::temp_dir().join(format!("cw-model-{}", std::process::id()));
