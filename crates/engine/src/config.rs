@@ -1501,6 +1501,14 @@ pub struct ModelView {
 pub struct ProviderStatus {
     pub chosen: String,
     pub chosen_provider: String,
+    /// Where the chosen model answers from: the URL of the endpoint row it is filed under, or
+    /// the top-level `[provider]` section when that is what the app was started against. It
+    /// belongs on the endpoint picture rather than on a model row: a model row's own `server`
+    /// field names the *serving implementation* ("cwoffee-mock 1.0", a llama.cpp build), and a
+    /// core that cannot know that must not fill the slot with an address. The settings screen
+    /// needs an address — to prefill the form, to describe the endpoint it is about to write —
+    /// so both cores answer from one place rather than each inventing one.
+    pub chosen_base_url: String,
     pub providers: Vec<ProviderView>,
     pub models: Vec<ModelView>,
     /// `[sampling]` for the chosen model, so the screen can show what is in force without
@@ -1534,6 +1542,21 @@ pub fn provider_status_with(path: &std::path::Path, cfg: &Config) -> ProviderSta
     let chosen = cfg.provider.model.trim().to_string();
     let chosen_provider = provider_of_model(&chosen);
     let rows = provider_rows_in(path);
+    // The address the chosen model answers from: its own endpoint row when it has one, the
+    // top-level section otherwise. Not whichever row happens to share a name with something
+    // else — the row has to be the one this model is filed under.
+    let chosen_base_url = {
+        let from_row = rows
+            .iter()
+            .find(|(n, _)| !chosen_provider.is_empty() && n == &chosen_provider)
+            .map(|(_, r)| r.base_url.trim().to_string())
+            .unwrap_or_default();
+        if from_row.is_empty() {
+            cfg.provider.base_url.trim().to_string()
+        } else {
+            from_row
+        }
+    };
     let mut models = model_rows_in(path);
     // A model with no `[models."id"]` row still belongs on the screen: it is the model the app
     // answers with, and a settings screen that only lists what someone has already configured
@@ -1565,6 +1588,7 @@ pub fn provider_status_with(path: &std::path::Path, cfg: &Config) -> ProviderSta
     ProviderStatus {
         chosen,
         chosen_provider: chosen_provider.to_string(),
+        chosen_base_url: chosen_base_url.clone(),
         providers: rows
             .iter()
             .map(|(name, r)| ProviderView {
@@ -1975,6 +1999,42 @@ mod tests {
     /// A model row is a set of optional facts. Clearing one has to delete the key: a stale
     /// `context_window` line left behind after someone pressed "ask the endpoint" would be a
     /// number the meter keeps believing.
+    #[test]
+    fn the_endpoint_picture_names_the_address_the_chosen_model_answers_from() {
+        // Two shapes the app can start in: an endpoint filed as a `[providers."x"]` row, and the
+        // top-level `[provider]` section when nobody has registered anything. The settings screen
+        // needs an address in both — it prefills a form with it and describes an endpoint with it
+        // — and a model row's own `server` field cannot carry it, because that field names the
+        // serving implementation ("cwoffee-mock 1.0"), which a pi core has no way to know.
+        let dir = std::env::temp_dir().join(format!("cw-cbase-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:8090/v1\"\nmodel = \"solo/model-one\"\n\n[providers.\"the box\"]\nkind = \"openai\"\nbase_url = \"http://192.168.0.9:8080/v1\"\nmodels = [\"the box/model-two\"]\n",
+        )
+        .unwrap();
+        let (cfg, _) = Config::load(Some(&path)).unwrap();
+
+        let st = provider_status_with(&path, &cfg);
+        assert_eq!(
+            st.chosen_base_url,
+            "http://127.0.0.1:8090/v1",
+            "an unregistered endpoint still has the address the app answers at: {st:?}"
+        );
+
+        let mut cfg2 = cfg.clone();
+        cfg2.provider.model = "the box/model-two".into();
+        let st2 = provider_status_with(&path, &cfg2);
+        assert_eq!(
+            st2.chosen_base_url,
+            "http://192.168.0.9:8080/v1",
+            "a model filed under a registered row answers at that row, not at the default: {st2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_save_from_the_model_screen_keeps_the_facts_it_was_never_shown() {
         // The model row has two halves. One is fields the screen edits; the other is what a

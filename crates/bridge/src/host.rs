@@ -125,46 +125,6 @@ pub struct PiHost {
     /// a little *longer* on purpose. If it gave up first, the caller would get a bare
     /// timeout with no counts and no statement that the history is intact.
     compact_wait: Duration,
-    /// The config file this host was started from. `models_info` needs it to say where a
-    /// model answers from: pi's catalogue names the provider and never the address, and the
-    /// address is cwoffee's to state because cwoffee wrote the provider entry pi reads.
-    cfg_path: Option<PathBuf>,
-}
-
-/// Which address a model answers from, given the provider pi named for it.
-///
-/// pi's catalogue is a list of names and windows; it has no notion of which cwoffee
-/// endpoint sits behind a provider. The settings screen needs that to describe an endpoint
-/// it is about to write, and a list that cannot say where its models live is half a claim,
-/// so the bridge answers from the config it was started from. A provider that is not filed
-/// there gets `None`: an address nobody registered is not something this function should
-/// invent.
-fn endpoint_for(cfg_path: Option<&std::path::Path>, provider: Option<&str>) -> Option<String> {
-    let path = cfg_path?;
-    let (cfg, _) = Config::load(Some(path)).ok()?;
-    let rows = cwoffee_engine::config::provider_rows_in(path);
-    let p = provider.unwrap_or("").trim();
-    if !p.is_empty() {
-        if let Some((_, r)) = rows.iter().find(|(n, _)| n == p) {
-            let u = r.base_url.trim();
-            if !u.is_empty() {
-                return Some(u.to_string());
-            }
-        }
-    }
-    // The provider pi calls `cwoffee` is the one cwoffee registered itself from the
-    // top-level `[provider]` section, so that section is the answer for it — and for an
-    // unqualified provider, since that is the endpoint the host was launched against.
-    let top = cfg.provider.base_url.trim().to_string();
-    if top.is_empty() {
-        return None;
-    }
-    let chosen = cwoffee_engine::config::provider_of_model(&cfg.provider.model);
-    if p.is_empty() || p == "cwoffee" || p == chosen {
-        Some(top)
-    } else {
-        None
-    }
 }
 
 /// The managed instance, when the config asks Cwoffee to run one. Built from the same
@@ -190,7 +150,6 @@ impl PiHost {
         // Read before `cfg` moves into the model task: this side of the channel needs the
         // compaction ceiling too, and needs to wait longer than the task does.
         let compact_wait = cfg.compact_timeout + Duration::from_secs(15);
-        let cfg_path = cfg.cfg_path.clone();
         // A bridge that died badly leaves its pi behind, and a pi has no reason to notice:
         // it goes on serving a client that is gone and keeps its context loaded while it
         // does. Two such orphans from killed runs measured 205 MB between them, with no
@@ -277,7 +236,6 @@ impl PiHost {
             q_rx: Some(q_rx),
             pi_version,
             compact_wait,
-            cfg_path,
         })
     }
 
@@ -418,8 +376,14 @@ impl HostOps for PiHost {
                 // pi does not report chat-template tool support or a server build.
                 tools: None,
                 tools_inferred: false,
+                // No address here. pi's catalogue names a provider and never a server build, and
+                // this field means the serving implementation ("cwoffee-mock 1.0", a llama.cpp
+                // build) on the core that can answer it — putting the endpoint URL in this slot
+                // would make one field mean two things depending on which core filled it. The
+                // address lives on the endpoint picture instead: `provider_status.chosen_base_url`,
+                // which both cores answer from the config the app started with.
                 source: m.get("provider").and_then(|v| v.as_str()).map(str::to_string),
-                server: endpoint_for(self.cfg_path.as_deref(), m.get("provider").and_then(|v| v.as_str())),
+                server: None,
                 slots: None,
                 reasoning_efforts: Vec::new(),
                 reasoning_default: None,
@@ -568,6 +532,24 @@ impl HostOps for PiHost {
 
 /// What the bridge knows about an outstanding dialog, in both id spaces.
 /// Whether a standing grant covers this call. Two conditions, both taken from the Rust
+/// One line for the approval card: the tool, the engine's own sentence about the call, and the
+/// paths that leave the workspace when that sentence does not already name them.
+///
+/// The extension hands over `cwtool check`'s summary, and that sentence already carries the
+/// escape clause — so appending the list a second time used to produce
+/// `read_file: read: /etc/hostname — OUTSIDE the workspace: /etc/hostname — OUTSIDE the workspace: /etc/hostname`.
+/// Repeating a path is not emphasis: a card whose sentence stutters is a card a person cannot
+/// weigh, and the structured `escapes` field still carries the fact for the security rules that
+/// actually read it.
+fn approval_summary(tool: &str, message: &str, title: &str, escapes: &[String]) -> String {
+    let body = if message.trim().is_empty() { title } else { message };
+    if escapes.is_empty() || body.contains("OUTSIDE the workspace") {
+        format!("{tool}: {body}")
+    } else {
+        format!("{tool}: {body} — OUTSIDE the workspace: {}", escapes.join(", "))
+    }
+}
+
 /// core's gate (engine `ApprovalGate::check`), because a permit means the same thing on
 /// either core or the app has two security models:
 ///
@@ -1773,15 +1755,7 @@ impl Engine {
                 // the Rust core says: the tool, the thing it wants, and which paths
                 // leave the workspace. pi's dialog carries only title and message, so
                 // the escape list is derived here from the message text.
-                let summary = if escapes.is_empty() {
-                    if message.is_empty() { format!("{tool}: {title}") } else { format!("{tool}: {message}") }
-                } else {
-                    format!(
-                        "{tool}: {} — OUTSIDE the workspace: {}",
-                        if message.is_empty() { title.clone() } else { message.clone() },
-                        escapes.join(", ")
-                    )
-                };
+                let summary = approval_summary(&tool, &message, &title, &escapes);
                 let req = ApprovalRequest {
                     id,
                     tool: tool.clone(),
@@ -2219,6 +2193,35 @@ fn pi_level(r: &Reasoning) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_approval_card_says_each_path_once() {
+        // The extension hands over `cwtool check`'s sentence, which already names the path that
+        // leaves the workspace. The bridge used to append its own copy of the list, which made the
+        // card stutter; the structured `escapes` field is what the security rules read.
+        let escapes = vec!["/etc/hostname".to_string()];
+        let s = approval_summary(
+            "read_file",
+            "read: /etc/hostname — OUTSIDE the workspace: /etc/hostname",
+            "",
+            &escapes,
+        );
+        assert_eq!(s.matches("OUTSIDE the workspace").count(), 1, "{s}");
+        assert_eq!(s.matches("/etc/hostname").count(), 2, "the engine's sentence names it twice: {s}");
+
+        // A message that does not name the escape still gets the clause: the card has to be
+        // answerable from the card alone.
+        let s2 = approval_summary("exec", "run: rm -rf ./build", "", &escapes);
+        assert!(s2.contains("OUTSIDE the workspace: /etc/hostname"), "{s2}");
+
+        // Nothing escaping, nothing claimed.
+        let s3 = approval_summary("write_file", "write notes.md", "", &[]);
+        assert!(!s3.contains("OUTSIDE"), "{s3}");
+
+        // pi's dialog sometimes carries only a title; the card says that rather than nothing.
+        let s4 = approval_summary("ask_user", "", "Which of these?", &[]);
+        assert_eq!(s4, "ask_user: Which of these?");
+    }
+
     use super::*;
 
     #[test]
@@ -2343,36 +2346,4 @@ mod tests {
         assert_eq!(next, 3, "a payload we could not read changes nothing: the arm builds the plain card");
     }
 
-    #[test]
-    fn the_model_list_says_where_the_model_answers_from() {
-        // pi's catalogue names a provider and never an address. Three answers have to stay
-        // distinct: an endpoint that is filed, the endpoint the host was launched against,
-        // and a provider nobody registered — which has no address to report, and where a
-        // plausible one would be a guess wearing a fact.
-        let dir = std::env::temp_dir().join(format!("cw-epfor-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(
-            &path,
-            "[provider]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:8190/v1\"\nmodel = \"cwoffee-mock\"\n\n[providers.\"the box\"]\nkind = \"openai\"\nbase_url = \"http://192.168.0.9:8080/v1\"\nmodels = [\"the box/thing\"]\n",
-        )
-        .unwrap();
-        assert_eq!(
-            endpoint_for(Some(&path), Some("the box")).as_deref(),
-            Some("http://192.168.0.9:8080/v1"),
-            "a filed endpoint row is the address for the models under it"
-        );
-        assert_eq!(
-            endpoint_for(Some(&path), Some("cwoffee")).as_deref(),
-            Some("http://127.0.0.1:8190/v1"),
-            "pi's `cwoffee` provider is the one the top-level section registered"
-        );
-        assert_eq!(
-            endpoint_for(Some(&path), Some("who")).as_deref(),
-            None,
-            "an unregistered provider has no address in this file"
-        );
-        assert_eq!(endpoint_for(None, Some("cwoffee")), None, "no config, no claim");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

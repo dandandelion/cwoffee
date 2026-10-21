@@ -140,24 +140,34 @@ const stored = (await call('session_messages', { id: sess, limit: 40 })).data ??
 const rows = stored.messages ?? []
 // Read the tool rows by their shape, not by the dialect one core uses to name them: a tool
 // row is a tool row, and `tool_calls_json` is not a promise the bridge makes about its
-// storage. The engine's own opening lines are what identify each answer.
+// storage. `explore`'s answer is picked out by its own opening words; every other tool row
+// belongs to the tool the model had to discover. (The first version of this filter asked for a
+// colon, and `README.md (3 lines, showing 3)` has none — the gate then reported that the
+// discovered tool never ran while its own output sat in the row below.)
 const toolRows = rows.filter((m) => m.role === 'tool').map((m) => m.content ?? '')
 const foundOut = toolRows.find((c) => /tool\(s\) fit|tool\(s\) in this app|Nothing in the tool set/.test(c)) ?? ''
-const readOut = toolRows.filter((c) => /:.*\S/.test(c) && !/tool\(s\)/.test(c)).map((c) => c).join('\n')
+const readOut = toolRows.filter((c) => c !== foundOut).join('\n')
 const assistantSays = rows.filter((m) => m.role === 'assistant').map((m) => m.content ?? '')
 
-if (MODE === 'lean' && !/will declare only|lean: declaring|defaultTools/.test(gwLog)) {
-  notes.push('nothing in the boot log says the declared set was narrowed - check that mount_settings wrote defaultTools')
-}
+// Lean is a claim about what the model is shown, so the log has to say what the host actually
+// withholds - not what it was asked to withhold.
+// The extension does log what it withheld, but pi keeps an extension's own console output to
+// itself, so it never reaches this log. What lean mode changes about the prompt is measured by
+// scripts/gateway-prompt-shape.mjs, which reads the request bodies the endpoint received; what
+// lean mode changes about the session is measured here, by the discovered tool running.
 if (!foundOut) fails.push('no tool output for `explore` — the model never reached the discovery tool, or its answer never arrived')
 else {
   if (!/tool\(s\) fit/.test(foundOut)) fails.push(`the discovery answer is not a search answer: ${JSON.stringify(foundOut.slice(0, 160))}`)
   if (!foundOut.includes('read_file')) fails.push('the discovery answer does not name read_file for a request to read a file')
   if (!foundOut.includes('made callable from your next call'))
     fails.push('the host never signed for making the found tools callable — the model was promised something nobody claimed to deliver')
+
 }
 if (MODE === 'lean' && !readOut) {
-  fails.push('the discovered tool never ran: `read_file` is not declared at the start in lean mode, so an activation that did not take shows up exactly like this')
+  // In lean mode this is the load-bearing check: `read_file` is not in the model's list at the
+  // start of the turn, so a discovery that did not actually make the tool usable looks identical
+  // to a model that simply never asked.
+  fails.push('the discovered tool never ran: `read_file` is not in the model\'s list at the start of the turn in lean mode, so an activation that did not take shows up exactly like this')
 } else if (readOut) {
   if (!/Nothing here is precious/.test(readOut))
     fails.push(`read_file ran but did not return the fixture: ${JSON.stringify(readOut.slice(0, 160))}`)
@@ -172,6 +182,8 @@ console.log('')
 for (const f of fails) console.log(`FAIL ${f}`)
 if (fails.length) {
   console.log('EXPLORE GATE FAILED')
+  console.log(`  stored rows: ${rows.map((m) => m.role).join(",")}`)
+  for (const [i, c] of toolRows.entries()) console.log(`  tool row ${i}: ${JSON.stringify(c.slice(0, 200))}`)
   if (foundOut) console.log(`  explore said:\n    ${foundOut.split('\n').join('\n    ')}`)
   if (readOut) console.log(`  read_file said:\n    ${readOut.split('\n').join('\n    ')}`)
 } else {

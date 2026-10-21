@@ -133,41 +133,43 @@ function specs(): any {
  * question differently from the engine.
  *
  * Narrowing matters because tool declarations are prompt bytes measured in the request body
- * (~12 KB for the whole set), and on a small local model with a small window that is a fifth
- * of the room spent describing capabilities the turn will not use. `explore` is how the rest
- * comes back: the model describes the job, the registry searches itself, and the tools it
- * names are made callable here.
+ * (13,366 B for the whole set today), and on a small local model with a small window that is a
+ * fifth of the room spent describing capabilities the turn will not use. `explore` is how the
+ * rest come back: the model describes the job, the registry searches itself, and the tools it
+ * names were callable all along - what changes is that their parameter schemas stop being
+ * withheld from the prompt.
  */
 const TOOL_MODE = (process.env.CWOFFEE_TOOL_MODE ?? "full").trim().toLowerCase();
 
-/** The set this process declared last, kept so activation is a union and not a guess. */
-let declared: string[] = [];
+/** Tools the registry mounts and lean mode keeps out of the prompt. What is withheld is the
+ *  *declaration* only: the tool stays active, and therefore callable, for the whole session.
+ *
+ *  Narrowing the active set instead is wrong for this design, and pi says why in its own comment
+ *  on `setActiveToolsByName`: "Changes take effect on the next agent turn." A tool registered
+ *  inactive is not callable until that turn arrives - so a tool `explore` names partway through
+ *  a turn could not be used in the turn that discovered it, which is precisely the promise the
+ *  engine's answer and this host's note both make. */
+let discoverable = new Set<string>();
 
-/** Declare exactly these tools. Returns a sentence when it could not, for the caller to put
- *  in front of the model rather than in a log nobody reads. */
-function declareExactly(pi: any, names: string[]): string | null {
-	if (typeof pi.setActiveTools !== "function") {
-		return "this pi build cannot change the declared tool set, so the full set stays declared";
-	}
-	const missing = names.filter((n) => !registered.has(n));
-	declared = [...names];
-	pi.setActiveTools(declared);
-	if (missing.length) return `the registry named tools that are not mounted here: ${missing.join(", ")}`;
-	return null;
+/** Which of those `explore` has named to the model in this process. */
+const revealed = new Set<string>();
+
+/** What to withhold from this loadout: the tools the registry keeps behind `explore` that
+ *  `explore` has not named to the model yet in this process. */
+function withheld(loadout: { declared: readonly { name: string }[] }): string[] {
+	return loadout.declared
+		.map((t) => t.name)
+		.filter((n) => discoverable.has(n) && !revealed.has(n));
 }
 
-/** Add tools to what is already declared. Used by `explore`: a discovered tool that the host
- *  does not actually make callable is a promise the model was lied to about. */
-function declareMore(pi: any, names: string[]): string | null {
-	if (typeof pi.setActiveTools !== "function") {
-		return "this pi build cannot change the declared tool set, so the tools `explore` found are not callable";
+/** Ask pi to apply its loadout again so the `prepareLoadout` hook recomputes what is withheld.
+ *  The names passed are the current active set: pi recomputes unconditionally, and passing a
+ *  narrowed guess would deactivate tools nobody asked to deactivate. */
+function redeclare(pi: any): string | null {
+	if (typeof pi.setActiveTools !== "function" || typeof pi.getActiveTools !== "function") {
+		return "this pi build cannot re-apply its tool loadout, so the parameter schemas of the tools just named stay out of your prompt";
 	}
-	const have = new Set<string>(declared.length ? declared : registered);
-	for (const n of names) if (registered.has(n)) have.add(n);
-	declared = [...have];
-	pi.setActiveTools(declared);
-	const skipped = names.filter((n) => !registered.has(n));
-	if (skipped.length) return `not mounted in this process, so not made callable: ${skipped.join(", ")}`;
+	pi.setActiveTools([...pi.getActiveTools()]);
 	return null;
 }
 
@@ -188,16 +190,22 @@ export default function (pi: ExtensionAPI) {
 
 	for (const spec of tools) registered.add(spec.name as string);
 
-	if (TOOL_MODE === "lean") {
-		const lean: string[] = Array.isArray(spec.lean) ? spec.lean : [];
-		if (!lean.length) {
-			console.error("[cwoffee-tools] lean mode asked for but the registry gave no always-declared set; the full set stays declared");
-		} else {
-			const problem = declareExactly(pi, lean);
-			if (problem) console.error(`[cwoffee-tools] lean mode did not apply: ${problem}`);
-			else console.error(`[cwoffee-tools] lean mode: declaring ${lean.join(", ")} of ${registered.size} tools; the rest are behind \`explore\``);
-		}
+	// Which set is always declared comes from the registry through `cwtool specs`; what the
+	// bridge wants is in `CWOFFEE_TOOL_MODE`. Nothing here is a decision of its own.
+	const leanNames: string[] = Array.isArray(spec.lean) ? spec.lean : [];
+	const leanSet = new Set(leanNames);
+	const leanOn = TOOL_MODE === "lean" && leanSet.size > 0;
+	if (TOOL_MODE === "lean" && !leanSet.size) {
+		console.error(
+			"[cwoffee-tools] lean mode asked for but `cwtool specs` named no always-declared set; the full set stays declared",
+		);
 	}
+	// What sits behind `explore` comes from the registry, not from this file. In lean mode those
+	// tools are withheld from the prompt; in full mode nothing is withheld and every mounted tool
+	// is declared.
+	discoverable = new Set<string>(
+		leanOn ? (spec.discoverable ?? []).filter((n: unknown) => typeof n === "string") : [],
+	);
 
 	for (const spec of tools) {
 		const name = spec.name as string;
@@ -210,6 +218,21 @@ export default function (pi: ExtensionAPI) {
 			// JSON Schema from the engine's `schema()`. pi's parameter schema *is* JSON
 			// Schema, so the registry's definition is used without being rewritten.
 			parameters: spec.parameters,
+			// Every mounted tool is active, including the ones lean mode keeps out of the prompt:
+			// "callable" and "declared" are two different claims, and only the second one costs
+			// prompt bytes. See `withheld` for why the active set is not the lever.
+			//
+			// `explore` owns the withholding, since it is the tool that can put the words back:
+			// its `prepareLoadout` hook runs whenever pi applies a loadout and names the active
+			// tools whose declarations requests leave out.
+			...(name === "explore"
+				? {
+						prepareLoadout(loadout: { declared: readonly { name: string }[] }) {
+							if (!leanOn) return undefined;
+							return { hiddenDeclarations: withheld(loadout) };
+						},
+					}
+				: {}),
 
 			async execute(callId, params, _signal, _onUpdate, ctx) {
 				// Ask the engine how risky this specific call is. Not a guess from the tool
@@ -264,11 +287,36 @@ export default function (pi: ExtensionAPI) {
 				const found: string[] = Array.isArray(res?.activates)
 					? res.activates.filter((x: unknown) => typeof x === "string")
 					: [];
-				if (found.length) {
-					const problem = declareMore(pi, found);
-					const note = problem
-						? `\n\n[host] ${problem}`
-						: `\n\n[host] made callable from your next call: ${found.join(", ")}`;
+				const notMounted = found.filter((n) => !registered.has(n));
+				for (const n of found) if (registered.has(n)) revealed.add(n);
+				if (found.length || notMounted.length) {
+					const segs: string[] = [];
+					if (found.length) {
+						// The tools were callable already - they are active for the whole session,
+						// and only their declarations were withheld - so the engine's "available
+						// from your next call" is true either way. What the host still owes the
+						// model is the parameter schema, which arrives when the withholding lifts;
+						// if that cannot happen, the model is told rather than left wondering why
+						// a tool it was just told about answers with a validation error.
+						const problem = leanOn ? redeclare(pi) : null;
+						segs.push(problem ? `[host] ${problem}` : `[host] made callable from your next call: ${found.join(", ")}`);
+						// What pi itself still withholds, read back rather than assumed. This one
+						// is for a developer watching pi's own log: an extension's stderr does not
+						// reach the parent process, so no gate can grep for it - the claim about
+						// the prompt is graded by gateway-prompt-shape.mjs on request bytes, and the
+						// claim about usability by gateway-explore.mjs on the discovered tool running.
+						if (leanOn && typeof pi.getActiveTools === "function") {
+							const still = (pi.getActiveTools() as string[]).filter(
+								(n) => discoverable.has(n) && !revealed.has(n),
+							);
+							console.error(
+								`[cwoffee-tools] lean: still withheld after explore: ${still.length ? still.join(", ") : "nothing"}`,
+							);
+						}
+					}
+					if (notMounted.length)
+						segs.push(`[host] not mounted in this process, so not callable: ${notMounted.join(", ")}`);
+					const note = `\n\n${segs.join("\n\n")}`;
 				if (res) {
 					// The engine's own words first; this line is the host signing for the part
 					// of the promise it owns. The envelope carries `rendered` (the sentence the
@@ -292,6 +340,20 @@ export default function (pi: ExtensionAPI) {
 				const text = typeof res?.rendered === "string" && res.rendered.length > 0 ? res.rendered : JSON.stringify(res);
 				return { content: [{ type: "text", text }], details: res, isError: res?.ok !== true };
 			},
+		});
+	}
+	if (leanOn) {
+		// A claim read back from the host rather than recited from our own intent: the line names
+		// what is actually in front of the model and what is merely out of the prompt, since those
+		// are different facts, and the second one is what saves the tokens.
+		pi.on("session_start", () => {
+			const active: string[] = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
+			const shown = active.filter((n) => !discoverable.has(n) || revealed.has(n));
+			const held = active.filter((n) => discoverable.has(n) && !revealed.has(n));
+			console.error(
+				`[cwoffee-tools] lean mode: ${shown.length} declaration(s) (${shown.join(", ") || "none"}); declarations withheld for ${held.length ? held.join(", ") : "nothing"} - those stay callable`,
+			);
+			if (!shown.length) console.error("[cwoffee-tools] lean mode declared nothing at all: the model has no tools");
 		});
 	}
 	console.error(`[cwoffee-tools] ${tools.length} tool(s) mounted from the rust registry`);

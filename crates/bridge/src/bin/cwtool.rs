@@ -238,7 +238,19 @@ async fn main() -> std::process::ExitCode {
                     })
                 })
                 .collect();
-            out(json!({ "ok": true, "count": list.len(), "tools": list }));
+            // Which tools the model is *shown* is the registry's answer, not the extension's:
+            // the shim that mounts the tools must not also decide which of them are declared, or
+            // two places answer one question. `lean` is the always-declared set; `discoverable`
+            // is everything else, which `explore` can bring back on request.
+            let lean = cwoffee_engine::tools::Registry::lean_tool_names();
+            let discoverable = reg.discoverable_tool_names();
+            out(json!({
+                "ok": true,
+                "count": list.len(),
+                "lean": lean,
+                "discoverable": discoverable,
+                "tools": list,
+            }));
             std::process::ExitCode::SUCCESS
         }
         "questions" => {

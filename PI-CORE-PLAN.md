@@ -2099,6 +2099,164 @@ was the light-theme icon; and go on with the harness plus the parity list.
     control reads, not the fact that some text is on screen; `until(() => !pvBusy)` is the same
     premise the button's own `disabled` uses.
 
+148. **"Declared" and "callable" are two different claims, and only one of them costs tokens.**
+    Lean tool exposure first looked easy: register the thirteen cwoffee tools, then
+    `pi.setActiveTools(["explore","recall"])`. It printed a confident line about itself, and the
+    model still received all thirteen declarations. pi says the reason in its own comment on
+    `setActiveToolsByName` — *"Changes take effect on the next agent turn"* — and the runtime build
+    that happens after extensions load activates every registered extension tool. The lever that
+    works is `prepareLoadout`'s `hiddenDeclarations`: the tools stay **active and callable** for
+    the whole session, and only their *declarations* leave the request. That is also the only
+    version in which a tool `explore` names partway through a turn can be used **in that turn** —
+    which is exactly what the engine's answer and the host's note promise. Measured: cowork went
+    from 13 declarations / 12 808 B to 2 declarations / 1 524 B, and the whole first payload from
+    ~3 417 tokens to ~778.
+149. **An extension's stderr does not come back with its parent's.** Gates that grepped the
+    gateway log for `[cwoffee-tools]` lines were measuring an empty file: pi keeps an extension's
+    console output to itself. A claim about what the host did has to be asserted where the model,
+    the transcript, or the endpoint can see it — which is why lean mode is graded by
+    `gateway-prompt-shape.mjs` (request bodies) and discovery is graded by the discovered tool
+    running at all.
+150. **Classify an answer by what it says, not by an accident of its formatting.** The explore gate
+    picked the `read_file` row by looking for a colon, and `README.md (3 lines, showing 3)` has
+    none — so the gate reported *"the discovered tool never ran"* while the tool's own output sat
+    in the row immediately below it. It now takes `explore`'s answer by its opening words and calls
+    everything else the discovered tool.
+151. **A verb that reaches for `Config::default_path()` writes whoever is running the tests.**
+    Every provider/model verb went through a `HostOps` default that asked for the default settings
+    file, ignoring the config the shell named. The gateway's own test suite therefore added
+    `[models."somewhere/model-x"]` to a real `~/.config/cwoffee/config.toml`, where the running app
+    promptly listed it in the model screen. The verbs now take the handle's config path like
+    `set_context_budget` and `search_view` already did, and a test asserts both that the write lands
+    in that file and that the default file does not gain the row.
+152. **A field name is a wire contract on both ends.** The host answers `chosen_base_url`; the page
+    read `current_base_url`, so the endpoint address came back `undefined` and the Models page case
+    honestly skipped itself. The skip line is what made that findable rather than invisible — and
+    the live check over the gateway, which prints the same field, showed `at=NONE` before the fix
+    and `at=http://127.0.0.1:8090/v1` after.
+153. **The flat shape of a settings save is part of the interface.** A live check sent
+    `model_set` with a nested `row` object; the host deserialised an empty row and answered
+    *"window freed"* to a request that had set a window — the opposite of what was asked, said
+    politely. `ModelSpec` is `#[serde(flatten)]`, so the body is one flat object with the engine's
+    own key names. The wire-name gate cannot grade that call site (the page builds the body from a
+    field list, and the gate says so rather than guessing), so a Rust test now sends the exact flat
+    body `saveModel` builds and checks that every edited field lands.
+154. **The wrapper log is not the evidence log.** The board's per-case lines
+    (`[cwoffee/page] settings rail ok …`) go to the app log, `/tmp/cwoffee-selftest-<ts>.log`;
+    `/tmp/h*/self.log` carries the runner's notes and the final verdict. Reading only the wrapper
+    log makes a green board look as though it ran three checks. Related: a watchdog that is tighter
+    than the board is a way of destroying evidence — a run that needed longer reported *no verdict*
+    after 900 s with the whole transcript already gathered. The cap is now a knob and the run says
+    how long it took.
+155. **A card that repeats itself is a card nobody can weigh.** The bridge appended its own escape
+    list to a sentence that already carried one, producing
+    `read_file: read: /etc/hostname — OUTSIDE the workspace: /etc/hostname — OUTSIDE the workspace: /etc/hostname`.
+    The structured `escapes` field is what the security rules read; the sentence is what a person
+    reads, and it says each path once.
+
+## Journal — session 25 (the short menu is on, and the endpoint screen writes the file it reads)
+
+The lean tool menu had been configured, mounted, and wrong for two sessions. The extension
+called `pi.setActiveTools(["explore","recall"])` at load time and printed a line saying it had
+narrowed the set; `gateway-prompt-shape.mjs`, which reads the request body the endpoint actually
+received, said 13 declarations and 12,808 bytes. pi explains it in a comment:
+`setActiveToolsByName` notes *"Changes take effect on the next agent turn"*, and the runtime build
+that happens after extensions load activates every registered extension tool. So the loadout was
+rebuilt over our heads, and the log line was a claim about intent.
+
+The lever that works is `prepareLoadout` on `explore`: it returns `hiddenDeclarations`, which
+keeps tools **active and callable** while requests leave their declarations out. That is also the
+only shape in which the sentence the engine and the host both print — *"available from your next
+call"* — is true: a tool registered *inactive* cannot be called until the next agent turn, and the
+turn that discovers a tool is the turn that wants to use it. Which tools are always declared comes
+from the registry through `cwtool specs` (`lean`, `discoverable`), so nothing in TypeScript holds
+a list of its own. Measured afterwards, pi core:
+
+| | declarations | declaration bytes | first payload |
+|---|---|---|---|
+| cowork, full | 13 | 13,366 B | 14,469 B ≈ 3,617 tokens |
+| cowork, lean | 2 (`recall` 671 B, `explore` 853 B) | 1,524 B | 3,111 B ≈ **778 tokens** |
+| chat | 0 | 0 B | 233 B ≈ 58 tokens |
+
+`EXPLORE GATE OK (pi, lean: found it, the host made it callable, and the tool itself read the
+file…)` and the same gate green in full mode. Two of the three red lines it printed on the way
+were the gate's own bugs, not the app's: it picked the `read_file` row out of the transcript by
+looking for a colon (`README.md (3 lines, showing 3)` has none, so the gate announced the tool
+never ran while its output sat in the row below — gotcha 150), and it tried to prove lean mode by
+grepping the gateway log for the extension's own lines, which never arrive, because an extension's
+stderr belongs to pi and not to the parent process (gotcha 149). Lean mode is graded by request
+bytes; discovery is graded by the discovered tool's output existing.
+
+The endpoint screen learned where its endpoint is. `ModelInfo.server` was never the place: on the
+Rust core it holds the serving implementation (`cwoffee-mock 1.0`), and the page built a probe URL
+out of that string — the rust board's `bad endpoint url: relative URL without a base` was the
+symptom. The address now rides on the endpoint picture, `ProviderStatus.chosen_base_url`, answered
+from the config the shell started with: the row the chosen model is filed under if it has one, the
+top-level `[provider]` section otherwise, and a live check reads
+`at=http://127.0.0.1:8090/v1`. A model row's `server` stays honest: a core that cannot know the
+serving build says nothing rather than filling the slot with an address (gotcha 152).
+
+Two more wire facts, both caught by driving the real thing. A live `model_set` sent a nested `row`
+object; the host read an empty row and answered *"window freed"* to a request that had set a
+window (gotcha 153) — `ModelSpec` is flattened, the body is one flat object in the engine's own
+spelling, and a gateway test now posts the exact body `saveModel` builds and checks every edited
+field arrives, because the wire-name gate honestly reports that call site as ungradeable ("payload
+is not a literal object"). And every provider/model verb used to write
+`~/.config/cwoffee/config.toml` regardless of which config the shell named: the gateway's own test
+suite added `[models."somewhere/model-x"]` to a developer's real settings file, where the running
+app then listed it as a model. The verbs take the handle's config path now, like
+`set_context_budget` and `search_view` already did, and a test asserts the write lands in that
+file *and* that the default file did not gain the row (gotcha 151). The stray section was removed
+from the config by hand, byte for byte otherwise.
+
+An approval card that stuttered is fixed too: the bridge appended its own escape list to a
+sentence that already carried one, so the card read
+`read: /etc/hostname — OUTSIDE the workspace: /etc/hostname — OUTSIDE the workspace: /etc/hostname`
+(gotcha 155). The gate prints the card it was given, which is how this was noticed rather than
+admired:
+
+```text
+approval allow: 1 card(s), tool=read_file,
+  summary="read_file: read: /etc/hostname — OUTSIDE the workspace: /etc/hostname"
+```
+
+The gate family, against this tree's artifacts (gates that are clients were pointed at one scratch
+gateway on the pi core, with the fixture endpoint and a fresh database trio):
+
+```text
+GATEWAY SMOKE OK                                  MIDTURN SWITCH OK
+GATEWAY APPROVAL OK (allow / deny / allowSession) CHAT GATE OK
+ATTACH GATE OK                                    WORKSPACE GATE OK
+SCRATCH GATE OK (pi)                              SCRATCH GATE OK (rust)
+RECALL GATE OK (pi)                               RECALL GATE OK (rust)
+ASK GATE OK (pi)                                  ASK GATE OK (rust)
+EXPLORE GATE OK (pi, lean)                        EXPLORE GATE OK (pi, full)
+PROMPT SHAPE OK (pi lean / pi full / rust full)   TITLE GATE OK
+SEARCH PANEL OK                                   EXCEL GATE OK
+```
+
+and over the live app's own gateway: `model_set` storing 33333, the file saying so, `model_forget`
+giving it back, and the config byte-identical to what it was — a settings round trip that ends
+where it started, which is the only kind that can be rehearsed on a user's machine.
+
+Rust suites: engine 474 + 10 endpoint, bridge 18 + 16 fixtures, gateway 37, app 18, all green;
+`wire-names` clean (it names `model_set` as the one payload it cannot grade, which is the honest
+answer rather than a pass); `svelte-check` 0/0. The page board is green on the pi core including
+the endpoint round trip — `models page ok (discovered …, tested, added a row the host kept, stored
+40000 then freed it, what the probe found survived a save that never mentioned it, removed the row)`.
+
+Three lessons about reading the board itself (gotcha 154). The per-case lines live in the app log
+(`/tmp/cwoffee-selftest-<ts>.log`, ~1,900 lines), not in the runner's log, and reading only the
+latter makes a green board look like it ran three checks. Four failures in one run had one cause
+each time: the window was occluded, so zero frames, zero block entrances, six skipped geometry
+checks — the harness says that loudly instead of grading a page it cannot see, and the fix was to
+stop the product app whose window was on top. And a run that needed longer than the watchdog's 900
+seconds reported *no verdict* with its whole transcript already gathered: destroying evidence is
+the worst thing a harness can do, so the cap is a knob now. One 1,268 ms hitch during the
+streaming-cadence case, with `page long tasks 0` and a stream/idle ratio of 1.00, appeared while
+two other gates were running on the same machine — rerunning the board alone is the discriminator,
+and it is in flight.
+
 ## Journal — session 24 (the settings screen gets a shape, and the controls get one set of measurements)
 
 A user's complaint, quoted almost exactly: *"the settings list is eleven items long, each one has

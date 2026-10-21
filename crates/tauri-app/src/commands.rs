@@ -417,7 +417,7 @@ pub fn list_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<Session>, 
 /// when the inference box is down, which is when someone opens this screen.
 #[tauri::command]
 pub fn provider_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    serde_json::to_value(state.host.provider_status()).map_err(|e| e.to_string())
+    serde_json::to_value(state.host.provider_status(&state.config_path)).map_err(|e| e.to_string())
 }
 
 // `rename_all = "snake_case"` is not decoration. Tauri's default is to expect camelCase
@@ -440,7 +440,7 @@ pub async fn provider_test(
         api_key: api_key.unwrap_or_default(),
         kind: kind.unwrap_or_default(),
     };
-    Ok(state.host.provider_test(&req).await)
+    Ok(state.host.provider_test(&state.config_path, &req).await)
 }
 
 // See the note on `provider_test`: one wire dialect, spelled the engine's way.
@@ -458,7 +458,7 @@ pub async fn provider_probe(
         api_key: api_key.unwrap_or_default(),
         kind: kind.unwrap_or_default(),
     };
-    let rows = state.host.provider_probe(&req).await.map_err(|e| e.to_string())?;
+    let rows = state.host.provider_probe(&state.config_path, &req).await.map_err(|e| e.to_string())?;
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
@@ -482,12 +482,12 @@ pub fn provider_add(
         .map(|v| serde_json::from_value(v).map_err(|e| format!("probed models: {e}")))
         .transpose()?
         .unwrap_or_default();
-    Ok(state.host.provider_add(&req, &caps))
+    Ok(state.host.provider_add(&state.config_path, &req, &caps))
 }
 
 #[tauri::command]
 pub fn provider_remove(state: tauri::State<'_, AppState>, name: String) -> Result<String, String> {
-    Ok(state.host.provider_remove(&name))
+    Ok(state.host.provider_remove(&state.config_path, &name))
 }
 
 // See the note on `provider_test`: one wire dialect, spelled the engine's way.
@@ -520,12 +520,12 @@ pub fn model_set(
         supports_vision,
         source: source.unwrap_or_default(),
     };
-    Ok(state.host.model_set(&id, &row))
+    Ok(state.host.model_set(&state.config_path, &id, &row))
 }
 
 #[tauri::command]
 pub fn model_forget(state: tauri::State<'_, AppState>, id: String) -> Result<String, String> {
-    Ok(state.host.model_forget(&id))
+    Ok(state.host.model_forget(&state.config_path, &id))
 }
 
 /// Every conversation filed under one folder — the list a folder delete has to act on.

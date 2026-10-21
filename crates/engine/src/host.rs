@@ -243,6 +243,7 @@ async fn apply_context_budget(
     sampling: &crate::provider::Sampling,
     gauge: &Arc<std::sync::Mutex<crate::prompt::ContextGauge>>,
     announce: bool,
+    cfg_path: Option<&Path>,
 ) {
     let model = agent.model();
     let info = provider
@@ -252,7 +253,12 @@ async fn apply_context_budget(
         .into_iter()
         .find(|m| m.id == model);
     let advertised = info.as_ref().and_then(|m| m.context_tokens).map(|t| t as usize);
-    let stored = crate::config::window_override_in(&crate::config::Config::default_path(), &model);
+    // A stored window is a fact about a config file, so it is read from the file this shell was
+    // started with. Asking the default path instead makes the meter disagree with the settings
+    // screen: the screen edits one file, the meter reads another, and the number on the bar is
+    // neither.
+    let cfg_file = cfg_path.map(PathBuf::from).unwrap_or_else(crate::config::Config::default_path);
+    let stored = crate::config::window_override_in(&cfg_file, &model);
     let window = chosen_window(stored, advertised);
 
     let budget = pinned.unwrap_or_else(|| window.map(auto_budget).unwrap_or(FALLBACK_BUDGET));
@@ -907,6 +913,7 @@ impl SessionHost {
                 &cfg.sampling,
                 &gauge_bg,
                 true,
+                cfg.cfg_path.as_deref(),
             ).await;
 
             // The ceiling in force for this process. It starts as whatever the config
@@ -934,6 +941,7 @@ impl SessionHost {
                             &cfg.sampling,
                             &gauge_bg,
                             true,
+                            cfg.cfg_path.as_deref(),
                         )
                         .await;
                         let st = state_bg.lock().unwrap();
@@ -1075,6 +1083,7 @@ impl SessionHost {
                                 &cfg.sampling,
                                 &gauge_bg,
                                 true,
+                                cfg.cfg_path.as_deref(),
                             ).await;
                             // Read the session id in its own statement. A guard
                             // created inside a call's argument list lives until the
@@ -1251,6 +1260,7 @@ impl SessionHost {
                                 &cfg.sampling,
                                 &gauge_bg,
                                 false,
+                                cfg.cfg_path.as_deref(),
                             ).await;
                         }
                         let tel: TurnTelemetry =
@@ -1608,20 +1618,25 @@ pub trait HostOps: Send + Sync {
     }
 
     // ---- providers and models, as the settings screen sees them ----------------------
+    //
+    // Every one of these takes the config file the *shell* was started with, for the same reason
+    // `set_context_budget` and `search_view` do. A verb that reads `~/.config/cwoffee/config.toml`
+    // regardless is a verb that writes one file and reads another: the gateway's own test suite
+    // wrote a model row into a developer's real settings file, because the handle believed its
+    // `/tmp` path and the writer never looked.
 
     /// Every endpoint the app knows, the models filed under each, and which one is answering.
     ///
     /// File-based on purpose: this must answer without touching the network, because a settings
     /// screen that goes blank when the box is offline tells you nothing about why.
-    fn provider_status(&self) -> crate::config::ProviderStatus {
-        let path = crate::config::Config::default_path();
-        let (cfg, _) = crate::config::Config::load(None).unwrap_or_default();
-        crate::config::provider_status_with(&path, &cfg)
+    fn provider_status(&self, cfg_path: &Path) -> crate::config::ProviderStatus {
+        let (cfg, _) = crate::config::Config::load(Some(cfg_path)).unwrap_or_default();
+        crate::config::provider_status_with(cfg_path, &cfg)
     }
 
     /// Ask one endpoint whether it is there, registering nothing. The answer is a sentence,
     /// because that is what a settings row has room for.
-    async fn provider_test(&self, req: &crate::config::ProviderReq) -> String {
+    async fn provider_test(&self, _cfg_path: &Path, req: &crate::config::ProviderReq) -> String {
         crate::config::probe_endpoint(req).await
     }
 
@@ -1630,6 +1645,7 @@ pub trait HostOps: Send + Sync {
     /// endpoint has nothing on it", which is a different claim entirely.
     async fn provider_probe(
         &self,
+        _cfg_path: &Path,
         req: &crate::config::ProviderReq,
     ) -> Result<Vec<crate::config::ModelSpec>, String> {
         crate::config::probe_models(req).await
@@ -1639,25 +1655,26 @@ pub trait HostOps: Send + Sync {
     /// alongside are what make the window, the context ceiling and pi's fold agree from then on.
     fn provider_add(
         &self,
+        cfg_path: &Path,
         req: &crate::config::ProviderReq,
         caps: &[crate::config::ModelSpec],
     ) -> String {
-        crate::config::add_provider_with(&crate::config::Config::default_path(), req, caps)
+        crate::config::add_provider_with(cfg_path, req, caps)
     }
 
-    fn provider_remove(&self, name: &str) -> String {
-        crate::config::remove_provider_with(&crate::config::Config::default_path(), name)
+    fn provider_remove(&self, cfg_path: &Path, name: &str) -> String {
+        crate::config::remove_provider_with(cfg_path, name)
     }
 
     /// One model's window, sampling and thinking levels, written to the file that is the source
     /// of truth. A model process already running keeps what it started with; the next one picks
     /// this up. The sentence says that, because the meter moving is not the model re-reading.
-    fn model_set(&self, id: &str, row: &crate::config::ModelRow) -> String {
-        crate::config::set_model_with(&crate::config::Config::default_path(), id, row)
+    fn model_set(&self, cfg_path: &Path, id: &str, row: &crate::config::ModelRow) -> String {
+        crate::config::set_model_with(cfg_path, id, row)
     }
 
-    fn model_forget(&self, id: &str) -> String {
-        crate::config::forget_model_with(&crate::config::Config::default_path(), id)
+    fn model_forget(&self, cfg_path: &Path, id: &str) -> String {
+        crate::config::forget_model_with(cfg_path, id)
     }
 }
 

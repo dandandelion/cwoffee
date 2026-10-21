@@ -388,7 +388,13 @@ if [ "${CWOFFEE_CORE:-rust}" = pi ]; then
 fi
 
 # ---- wait for a verdict -----------------------------------------------------
-deadline=$((SECONDS + 900))
+# The board's own clock. It has grown as the page harness grew: the settings walk opens
+# twenty-odd screens and the models round trip waits for a discovery, a test and a save.
+# A cap that is too tight turns "slow" into "no verdict", which loses every piece of
+# evidence the run already gathered - so the number is a knob, and the verdict line says
+# how long the board actually took.
+BOARD_WAIT=${CWOFFEE_SELFTEST_WAIT:-1500}
+deadline=$((SECONDS + BOARD_WAIT))
 verdict=""
 while [ $SECONDS -lt $deadline ]; do
   if grep -q "SELFTEST ok" "$log" 2>/dev/null; then verdict=ok; break; fi
@@ -435,7 +441,7 @@ case $verdict in
     printf '\033[31mthe harness drives a real window: if that window was closed, minimised or\ncovered during the run, the run is not a failure of the app, it is a run that\nnever happened. Re-run with the window left alone.\033[0m\n' >&2
     exit 1 ;;
   timeout)
-    printf '\033[31mno verdict in 900s; last lines:\033[0m\n' >&2
+    printf '\033[31mno verdict in %ss; last lines:\033[0m\n' "$BOARD_WAIT" >&2
     tail -25 "$log" >&2; exit 1 ;;
   throw)
     # Not "a check failed": the harness itself died, so nothing after the throw was ever

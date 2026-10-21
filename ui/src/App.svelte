@@ -515,9 +515,12 @@
 
   async function loadProviders() {
     try {
-      const st = await invoke<{ chosen?: string; providers?: ProvRow[]; models?: CapRow[] }>(
-        'provider_status',
-      )
+      const st = await invoke<{
+        chosen?: string
+        chosen_base_url?: string
+        providers?: ProvRow[]
+        models?: CapRow[]
+      }>('provider_status')
       provRows = st.providers ?? []
       capRows = st.models ?? []
       // Prefill the add form with what is answering now: most people opening this screen are
@@ -529,6 +532,10 @@
           pvUrl = cur.base_url
           pvKind = cur.kind
         }
+        // The endpoint most installs answer with is the one in the file's top-level section, and
+        // that is not a registered row: the host says where the chosen model answers from, so the
+        // form still describes something real when no rows exist yet.
+        if (!pvUrl && st.chosen_base_url) pvUrl = st.chosen_base_url
       }
       // The endpoint answering now is worth having open: those are the models in use, and the
       // ones a person is most likely here to look at.
@@ -4481,12 +4488,16 @@
           fail('the Models page lists no models, so the endpoint round trip could not be driven at all')
           return
         }
-        const ep = models[0].server
+        // The case has to point the form at a real endpoint. The address comes from the endpoint
+        // picture — `chosen_base_url`, which both cores answer from the config they started with
+        // — and not from a model row's `server` field, which names the serving implementation
+        // instead ("cwoffee-mock 1.0") and is empty on a core that cannot know it.
+        const st0 = await invoke<{ chosen_base_url?: string }>('provider_status')
+        const ep = (st0.chosen_base_url ?? '').trim()
         if (!ep) {
-          // Say so instead of passing: the case needs the endpoint's own address, and the only
-          // honest source for it is what the host reported about its models. On a core that
-          // cannot name one, the bridge is the thing to fix — not the premise to weaken.
-          pageLog('models page round trip SKIPPED: the host named no server for its models (not passed)')
+          // Say so instead of passing: with no address from the host there is nothing honest for
+          // the form to name, and weakening the premise would grade the test, not the app.
+          pageLog('models page round trip SKIPPED: the host named no endpoint address (not passed)')
           return
         }
         const type = (el: HTMLInputElement, v: string) => {

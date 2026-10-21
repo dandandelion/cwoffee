@@ -997,18 +997,18 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         // The model screen's picture: every endpoint, the models filed under each, what is
         // known about them, and which one is answering. Read-only, and file-based, so a phone
         // can read it while the inference box is down — which is exactly when someone looks.
-        "provider_status" => serde_json::to_value(h.host.provider_status()).map_err(|e| e.to_string()),
+        "provider_status" => serde_json::to_value(h.host.provider_status(&h.config_path)).map_err(|e| e.to_string()),
         "provider_test" => {
             need_drive(role)?;
             let req: cwoffee_engine::config::ProviderReq =
                 serde_json::from_value(args.clone()).map_err(|e| format!("endpoint: {e}"))?;
-            Ok(json!(h.host.provider_test(&req).await))
+            Ok(json!(h.host.provider_test(&h.config_path, &req).await))
         }
         "provider_probe" => {
             need_drive(role)?;
             let req: cwoffee_engine::config::ProviderReq =
                 serde_json::from_value(args.clone()).map_err(|e| format!("endpoint: {e}"))?;
-            let rows = h.host.provider_probe(&req).await.map_err(|e| e.to_string())?;
+            let rows = h.host.provider_probe(&h.config_path, &req).await.map_err(|e| e.to_string())?;
             serde_json::to_value(rows).map_err(|e| e.to_string())
         }
         "provider_add" => {
@@ -1021,12 +1021,12 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .map(|v| serde_json::from_value(v).map_err(|e| format!("probed models: {e}")))
                 .transpose()?
                 .unwrap_or_default();
-            Ok(json!(h.host.provider_add(&req, &caps)))
+            Ok(json!(h.host.provider_add(&h.config_path, &req, &caps)))
         }
         "provider_remove" => {
             need_drive(role)?;
             let name = arg_str(&args, "name")?;
-            Ok(json!(h.host.provider_remove(&name)))
+            Ok(json!(h.host.provider_remove(&h.config_path, &name)))
         }
         // One model's window / sampling / thinking levels. A plain sentence again: what moved,
         // and which part a running model process will not notice.
@@ -1034,12 +1034,12 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             need_drive(role)?;
             let spec: cwoffee_engine::config::ModelSpec =
                 serde_json::from_value(args.clone()).map_err(|e| format!("model row: {e}"))?;
-            Ok(json!(h.host.model_set(&spec.id, &spec.row)))
+            Ok(json!(h.host.model_set(&h.config_path, &spec.id, &spec.row)))
         }
         "model_forget" => {
             need_drive(role)?;
             let id = arg_str(&args, "id")?;
-            Ok(json!(h.host.model_forget(&id)))
+            Ok(json!(h.host.model_forget(&h.config_path, &id)))
         }
         // Every conversation inside one folder, chat rows and empty drafts included. The
         // sidebar hides those from a folder group and `list_sessions` is a window of 50, so
@@ -2373,7 +2373,105 @@ mod tests {
     /// `"allow_session"` versus `"allowSession"`, which let a phone press Allow and stay
     /// parked. The engine's spelling is the wire's; the camelCase one is read as an alias so a
     /// stale tab loses a search URL loudly rather than silently.
+        #[tokio::test]
+    async fn every_model_field_the_settings_screen_edits_arrives() {
+        // The Models screen builds its payload from a list of field names, so the wire-name gate
+        // cannot grade that call site — it has to report it as "not a literal object" rather than
+        // pretend. This is where the promise is kept instead: the keys below are exactly what
+        // `saveModel` puts in the body, sent in the shape the page sends it, and the host has to
+        // read each one. Otherwise a person types a number, presses Save, and the number vanishes.
+        let h = test_handle();
+        let body = serde_json::json!({
+            "id": "somewhere/model-x",
+            "context_window": 40000,
+            "max_tokens": 2048,
+            "temperature": 0.4,
+            "top_p": 0.9,
+            "top_k": 20,
+            "min_p": 0.05,
+            "seed": 7,
+            "efforts": ["minimal", "high"],
+        });
+        run_cmd("model_set", body, Role::Drive, &h)
+            .await
+            .expect("the screen's own payload shape, spelled the engine's way");
+        let out = run_cmd("provider_status", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .unwrap();
+        let row = out["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "somewhere/model-x")
+            .expect("the model the screen edited comes back on the endpoint picture");
+        assert_eq!(row["context_window"].as_i64(), Some(40000), "{out}");
+        assert_eq!(row["max_tokens"].as_i64(), Some(2048), "{out}");
+        assert_eq!(row["seed"].as_i64(), Some(7), "{out}");
+        assert_eq!(
+            row["efforts"].as_array().map(|e| e.len()),
+            Some(2),
+            "the thinking levels the screen typed: {out}"
+        );
+
+        // A watcher may not change what the app believes about a model.
+        let refused = run_cmd(
+            "model_set",
+            serde_json::json!({ "id": "somewhere/model-x", "context_window": 1 }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watch connection may not rewrite the model the desktop answers with");
+        assert!(refused.contains("drive"), "{refused}");
+    }
+
     #[tokio::test]
+    async fn a_model_write_lands_in_the_config_this_gateway_was_started_with() {
+        // The verbs above go through `HostOps`, whose defaults used `Config::default_path()` —
+        // the settings file of whoever runs the test suite — instead of the file the shell named.
+        // The gateway's own tests wrote a `[models."somewhere/model-x"]` row into a real
+        // developer's config that way, where it still showed up in the running app's model list.
+        // A handle knows its config path; the writer has to use it, or one screen edits one file
+        // and the meter reads another.
+        let h = test_handle();
+        let mine = h.config_path.clone();
+        let _ = std::fs::remove_file(&mine);
+        let real = cwoffee_engine::config::Config::default_path();
+
+        run_cmd(
+            "model_set",
+            serde_json::json!({ "id": "here/model-mine", "context_window": 41000 }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap();
+
+        let text = std::fs::read_to_string(&mine).expect("the write belongs to the config this handle names");
+        assert!(text.contains("[models.\"here/model-mine\"]"), "{text}");
+        let elsewhere = std::fs::read_to_string(&real).unwrap_or_default();
+        assert!(
+            !elsewhere.contains("here/model-mine"),
+            "the write also landed in {real:?} — the default path is not this gateway's config"
+        );
+
+        // The read side uses the same file, which is what makes "press Save and the number comes
+        // back" true rather than lucky.
+        let out = run_cmd("provider_status", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .unwrap();
+        assert!(
+            out["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "here/model-mine"),
+            "the row is in the file but not on the screen: {out}"
+        );
+        let _ = std::fs::remove_file(&mine);
+    }
+
+#[tokio::test]
     async fn an_argument_name_that_changed_is_still_read_for_what_it_carried() {
         for key in ["searxng_url", "searxngUrl"] {
             let h = test_handle();

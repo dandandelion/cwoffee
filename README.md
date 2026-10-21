@@ -41,7 +41,9 @@ TUI — is **7.0 MB PSS**. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 ## What the pi core answers today
 
 Thirteen tools mounted from the Rust registry (`cwtool specs/check/run`, `pi-tools/cwoffee-tools.ts`
-— no policy in the extension), approval cards with the engine's own summary, workspace following,
+— no policy in the extension), two of them declared by default in **lean** mode with the rest
+reachable through `explore` (`tool_exposure = "lean"`: 13,366 B of declarations becomes 1,524 B),
+approval cards with the engine's own summary, workspace following,
 attachments on the prompt, a context meter with a probed window, a settings screen in five
 categories, and **Chat mode**: `persona = "chat"` gives the model nothing — no tools, no folder,
 one line of system prompt — and the Cowork tab puts the tools back by restarting the model process
@@ -142,7 +144,10 @@ The screen drives the same verbs wherever it is drawn: discovery, add, save and 
 the desktop command and through the gateway frame with one spelling, the engine's. Saving one
 edited field does not touch what a probe found — `supports_tools`, `supports_vision` and where the
 numbers came from are kept unless the request states them, because the form has no field for them
-and no authority to clear them.
+and no authority to clear them. And the file written is the config **this** app was started with,
+not whatever `~/.config` happens to hold: a settings verb that reaches for the default path writes
+a file the running app never reads — which is how the gateway's own test suite once added a model
+row to a developer's real settings file, where the app then cheerfully listed it.
 
 ### Where the model's own files go
 
@@ -252,6 +257,21 @@ or the gateway's dispatch — unchanged. Those two hosts spell multi-word argume
 default, so a settings button can work in a browser and answer `missing required key baseUrl` on
 the desktop, which is exactly what happened to the endpoint screen until a page case pressed the
 buttons. The gate reads the client's payloads and both hosts' required names, and fails on drift.
+
+Some gates are hosts and start their own scratch gateway and fixture endpoint
+(`gateway-explore`, `gateway-recall`, `gateway-scratch`, `gateway-titlegen`, `gateway-search`,
+`gateway-excel`, `gateway-ask`, `gateway-prompt-shape`, `gateway-workspace`, `gateway-chat` with
+`--core`); others are ordinary clients and need a gateway somebody else started
+(`gateway-smoke`, `gateway-approval`, `gateway-chat`, `gateway-attach`,
+`gateway-midturn-switch` — point them at the app with `--port 8122 --token DESKTOK`, or at a
+scratch gateway). One rule holds for both kinds: they assert what the model, the transcript or the
+filesystem can show, never what a log line claims, because an extension's own console output does
+not reach the parent process at all.
+
+The board needs its window visible. WebKitGTK stops compositing an occluded window, and the
+harness says so loudly — zero animation frames, zero block entrances, geometry checks skipped —
+rather than grading a page it cannot see. If the product app is running at the same time, its
+window will be the one on screen; stop it for the length of a board.
 
 It runs against **a scripted endpoint by default**, not your model: `scripts/mock-llm.mjs` answers
 from `tests/scenarios/scenarios.json` in llama.cpp's wire shape, so the SSE parser, tool loop,
@@ -393,35 +413,57 @@ instead: it starts an endpoint that logs the body and answers as a stream, point
 gateway at it, runs one cowork turn and one chat turn, and prints the system text, its
 sections and the byte cost of every tool declaration. Measured on this box:
 
-| mode | system text | tool declarations | payload | ≈ tokens |
+| core / mode | system text | tool declarations | payload | ≈ tokens |
 |---|---|---|---|---|
-| pi core, cowork | 3,183 B | 11 tools, 11,284 B | 14,467 B | 3,617 |
-| old core, cowork | 909 B (`cwoffee-v1`) | 11 tools, 11,284 B | 12,193 B | 3,048 |
-| pi core, chat | 79 B | none | 79 B | 20 |
+| pi core, cowork, full exposure | 1,103 B (`cwoffee-v2`) | 13 tools, 13,366 B | 14,469 B | 3,617 |
+| pi core, cowork, **lean** exposure | 1,587 B (+ the discovery note) | 2 tools, 1,524 B | 3,111 B | **778** |
+| pi core, chat | 233 B | none | 233 B | 58 |
+| old core, cowork | 1,154 B | 13 tools, 13,366 B | 14,520 B | 3,630 |
 
-Two things that table says, both of which were invisible before anyone read the bytes:
+Three things that table says, each invisible before anyone read the bytes:
 
 * **Chat mode really is empty.** `--system-prompt` replaces pi's default prompt (the additive
   form is `--append-system-prompt`), and `--no-tools` covers extension tools as well as pi's
   own four, so the tools section is absent and the whole instruction is one line. pi does
   still append its own `<cwd>` block naming the workspace folder — 41 bytes, but a folder claim
-  in a mode that has no file tools on purpose.
-* **Cowork on the pi core speaks with pi's voice, not cwoffee's.** The preamble defines the job
-  as "an expert coding assistant operating inside pi", and 1,478 bytes of the prompt is pi
-  telling the model to read pi's own docs and examples — files that are not in the user's
-  workspace. The old core sends 909 bytes of cwoffee's own words for the same conversation.
+  in a mode that has no file tools on purpose — so the chat prompt says outright that the mode
+  has no tools and no folder to work in.
+* **Cowork on the pi core used to speak with pi's voice, not cwoffee's.** The preamble defined
+  the job as "an expert coding assistant operating inside pi", and 1,478 bytes of the prompt was
+  pi telling the model to read pi's own docs and examples — files that are not in the user's
+  workspace. The pi core now sends cwoffee's own 1,103 bytes, the same text the old core sends.
+* **The declaration block, not the instructions, is the expensive part.** `ask_user` alone is
+  2,107 B; `exec` 1,904 B; `sheet_query` 1,630 B; `sheet_read` 1,571 B; `download_file` 1,218 B;
+  `write_xlsx` 758 B; `edit_file` 804 B; `explore` 853 B; `write_file` 672 B; `recall` 671 B;
+  `read_file` 535 B; `web_fetch` 339 B; `web_search` 304 B. On a small local model that is real
+  prefill on every single turn, for capabilities most turns never use.
 
-The declaration bytes are uneven enough to matter on a small local model: `ask_user` 2,107 B,
-`exec` 1,904 B, `sheet_query` 1,630 B, `sheet_read` 1,571 B, `edit_file` 804 B, `write_xlsx`
-758 B, `download_file` 755 B, `write_file` 577 B, `read_file` 535 B, `web_fetch` 339 B,
-`web_search` 304 B. The gate is a gate, not a report: it fails if a chat declares tools, or if a
-chat carries a coding harness's preamble, or if cowork declares nothing while claiming the tools
-are mounted.
+### Which tools the model is shown (`tool_exposure`)
 
-It also prints the *timing* between requests, because the first version of that endpoint
-answered with a non-streaming body and pi re-sent the same request four times at 2 s, 4 s and
-8 s. A "the app quadruples prefill" finding that was really a probe bug is exactly what the
-timing column is there to make impossible.
+`tool_exposure = "lean"` in the config (or `CWOFFEE_PI_TOOL_MODE=lean` in the environment)
+declares two tools and hides the rest: `explore` and `recall`, which is the set the Rust
+registry names — `cwtool specs` answers `lean` and `discoverable`, so neither the extension nor
+the UI holds a list of its own. What is withheld is the *declaration*: every mounted tool stays
+active and callable for the whole session, and the system prompt gains one short note saying the
+menu is a subset and that `explore` can name the rest. When `explore` answers, the tools it found
+keep their names callable immediately and their parameter schemas come back into the prompt; the
+host signs for that in the tool result rather than in a log nobody reads.
+
+The saving, measured by the gate above: 13 declarations and 13,366 bytes become 2 declarations
+and 1,524 bytes, and the first payload of a cowork turn drops from ~3,617 tokens to ~778 — with
+the same thirteen tools reachable, because `read_file` discovered mid-turn still runs in that
+turn (proved by `scripts/gateway-explore.mjs`, which fails if the discovered tool's own output
+never arrives).
+
+Full exposure is still the default. Lean is the option for a small local endpoint where those
+11 KB of declarations are the difference between a fast first token and a slow one.
+
+The gate is a gate, not a report: it fails if a chat declares tools, if cowork carries a coding
+harness's preamble, if lean declares more than three tools, or if lean's declarations still cost
+a kilo of bytes. It also prints the *timing* between requests, because the first version of that
+endpoint answered with a non-streaming body and pi re-sent the same request four times at 2 s,
+4 s and 8 s. A "the app quadruples prefill" finding that was really a probe bug is exactly what
+the timing column is there to make impossible.
 
 ### What a conversation is called
 
