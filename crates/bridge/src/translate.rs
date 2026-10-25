@@ -86,12 +86,20 @@ struct Run {
     open_text: String,
     open_reasoning: String,
     context_tokens: Option<usize>,
-    /// Time the run spent waiting on a human, and whether it is waiting right
-    /// now. A rate that counts a person thinking as slow generation is a lie, and
-    /// a measurable one: the first bridge run reported 2 tok/s for a turn where
-    /// the human took four seconds to answer an approval card.
-    parked_ms: u64,
+    /// Whether this run is waiting on a person right now, and since when. A rate
+    /// that counts a person thinking as slow generation is a lie, and a measurable
+    /// one: the first bridge run reported 2 tok/s for a turn where the human took
+    /// four seconds to answer an approval card. The wait is excluded from the
+    /// generation window rather than subtracted from it, which is why this is a
+    /// flag-and-start-time and not a running total.
     parked_since: Option<Instant>,
+    /// Generation time proper: the sum of the gaps *between* text/reasoning
+    /// deltas, each gap capped, with the anchor moved past any interval that is
+    /// provably not generation (a dialog waiting on a person, a tool running).
+    /// This is what the decode rate is divided by, on both cores, for the same
+    /// 500 ms reason - see `GEN_GAP_CAP_MS`.
+    gen_ms: u64,
+    last_delta_at: Option<Instant>,
 }
 
 impl Run {
@@ -109,18 +117,9 @@ impl Run {
             open_text: String::new(),
             open_reasoning: String::new(),
             context_tokens: None,
-            parked_ms: 0,
             parked_since: None,
-        }
-    }
-
-    /// How long this run has spent waiting on a person, including a card that is
-    /// still open: if the turn ends with a dialog outstanding, that wait is over,
-    /// and none of it was ever generation.
-    fn parked_total(&self, now: Instant) -> u64 {
-        match self.parked_since {
-            Some(since) => self.parked_ms + now.duration_since(since).as_millis() as u64,
-            None => self.parked_ms,
+            gen_ms: 0,
+            last_delta_at: None,
         }
     }
 }
@@ -201,9 +200,10 @@ impl Translator {
     /// engine's own timeout fired. Everything after this is generation again.
     pub fn dialog_resolved(&mut self, now: Instant) {
         if let Some(r) = self.run.as_mut() {
-            if let Some(since) = r.parked_since.take() {
-                r.parked_ms += now.duration_since(since).as_millis() as u64;
-            }
+            r.parked_since = None;
+            // Generation starts again here. Without moving the anchor, the four
+            // seconds a person spent deciding would land in the decode window.
+            r.last_delta_at = Some(now);
         }
     }
 
@@ -243,6 +243,14 @@ impl Translator {
             "tool_execution_end" => {
                 let (ev, (call, files)) = tool_end(self.turn_id, rec);
                 out.events.extend(ev);
+                if let Some(r) = self.run.as_mut() {
+                    // A tool's own runtime is not the model typing, and pi reports
+                    // the result once, at the end, so this is the boundary: anchor
+                    // the next gap here and the seconds the tool took never enter
+                    // the decode window. Whatever prefill follows the result is
+                    // still a gap, and the cap handles it.
+                    r.last_delta_at = Some(now);
+                }
                 if !files.is_empty() {
                     out.files_by_call.push((call, files));
                 }
@@ -316,6 +324,24 @@ impl Translator {
             out.context_tokens = r.context_tokens;
         }
         out
+    }
+
+    /// The text and reasoning this turn has streamed but not yet closed with a
+    /// `message_end`, as they stand right now.
+    ///
+    /// A page pointed at the gateway and reloaded mid-answer gets back the rows the host
+    /// already stored, and this is the rest of what the turn had said: without it the
+    /// reloaded page paints the answer starting at the first delta that arrives after the
+    /// reload, with the top of it gone. `None` means there is no run, or nothing open in it.
+    ///
+    /// The clone is a couple of kilobytes per published event, which is nothing next to the
+    /// request that produced it.
+    pub fn open_of_run(&self) -> Option<(String, String)> {
+        let r = self.run.as_ref()?;
+        if r.open_text.is_empty() && r.open_reasoning.is_empty() {
+            return None;
+        }
+        Some((r.open_text.clone(), r.open_reasoning.clone()))
     }
 
     /// Close an open run because the turn will never finish — the process died,
@@ -674,7 +700,7 @@ impl Translator {
         }
     }
 
-    fn settle(&mut self, rec: &Value, now: Instant, out: &mut Output) {
+    fn settle(&mut self, rec: &Value, _now: Instant, out: &mut Output) {
         let turn_id = self.turn_id;
         let r = match self.run.take() {
             Some(r) => r,
@@ -692,13 +718,7 @@ impl Translator {
                 fatal: false,
             });
         }
-        let streamed_ms = r
-            .first_delta
-            .map(|f| {
-                let total = now.duration_since(f).as_millis() as u64;
-                total.saturating_sub(r.parked_total(now))
-            })
-            .unwrap_or(0);
+        let streamed_ms = r.gen_ms;
         out.events.push(EngineEvent::Usage(TurnTelemetry {
             prompt_tokens: r.prompt_tokens,
             cached_tokens: r.cached_tokens,
@@ -893,8 +913,6 @@ fn stats(r: &mut Run, now: Instant) -> Option<EngineEvent> {
         return None;
     }
     r.last_stats = Some(now);
-    let streaming = now.duration_since(first).as_millis() as u64;
-    let streaming = streaming.saturating_sub(r.parked_total(now));
     let mut s = TurnStats {
         ttft_ms: first.duration_since(r.started).as_millis() as u64,
         streaming_ms: 0,
@@ -903,14 +921,33 @@ fn stats(r: &mut Run, now: Instant) -> Option<EngineEvent> {
         est_decode_tps: 0.0,
         thinking: r.thinking,
     };
-    s.derive(streaming);
+    s.derive(r.gen_ms);
     Some(EngineEvent::TurnStats(s))
 }
 
+/// The ceiling on one counted gap between deltas. A decoder has to fall under
+/// 2 tok/s before a legitimate inter-token gap reaches 500 ms, while every real
+/// non-generation boundary - a tool run, then the next round's prefill - is
+/// multiples of a second. The same constant is used in the engine's own agent
+/// loop: the two cores have to print the same number for the same turn.
+const GEN_GAP_CAP_MS: u64 = 500;
+
+/// A generated delta arrived. This both starts the TTFT clock and advances the
+/// generation window, because the window can only be built where the deltas
+/// actually land - measuring it later, as "end minus first delta", is what made
+/// a turn with tool calls report the tool's runtime as slow decoding.
 fn mark_first(r: &mut Run, now: Instant) {
     if r.first_delta.is_none() {
         r.first_delta = Some(now);
     }
+    if let Some(prev) = r.last_delta_at {
+        // A dialog that is open right now is not generation either, whatever the
+        // anchor says - the model may keep streaming while a card is up.
+        if r.parked_since.is_none() {
+            r.gen_ms += now.duration_since(prev).as_millis().min(GEN_GAP_CAP_MS as u128) as u64;
+        }
+    }
+    r.last_delta_at = Some(now);
 }
 
 /// `usage.input` excludes cached tokens, so the window holds input + read + write.
@@ -997,4 +1034,77 @@ fn joined(msg: &Value, block: &str) -> String {
 
 fn s(rec: &Value, key: &str) -> Option<String> {
     rec.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pi core's decode number has to be the model's, not the sandbox's.
+    ///
+    /// A turn with a tool call spends seconds in the tool and seconds more in the
+    /// next round's prefill before its first token. Measured as "end minus first
+    /// delta", that turn reports roughly a quarter of the rate the endpoint really
+    /// sustains - which is what the user meant by "decode seems off, it accounts
+    /// for tool calls that take time".
+    #[test]
+    fn the_decode_window_skips_a_tool_run_and_the_next_rounds_prefill() {
+        let t0 = Instant::now();
+        let mut r = Run::new(t0);
+
+        // Burst one: 20 deltas, 50 ms apart - 950 ms of real generation.
+        for i in 0..20u64 {
+            r.chars += 8;
+            mark_first(&mut r, t0 + Duration::from_millis(50 * i));
+        }
+
+        // pi reports a tool result once, at the end, and the bridge anchors the
+        // window there: the 3 s the tool took is not the model typing.
+        let tool_end = t0 + Duration::from_millis(950 + 3000);
+        r.last_delta_at = Some(tool_end);
+
+        // Then 2 s of prefill before the next token. That is a gap, so the cap
+        // decides what it costs: 500 ms, not 2000.
+        let next = tool_end + Duration::from_millis(2000);
+        for i in 0..20u64 {
+            r.chars += 8;
+            mark_first(&mut r, next + Duration::from_millis(50 * i));
+        }
+
+        // 320 chars = 80 est tokens. Honest window ~2.4 s -> ~33 tok/s. The old
+        // window said 6.45 s -> ~12 tok/s, which is the number the user saw.
+        assert!(
+            r.gen_ms >= 2300 && r.gen_ms <= 2600,
+            "decode window was {} ms for a turn that generated about 1.9 s of tokens",
+            r.gen_ms
+        );
+        let mut s = TurnStats::default();
+        s.chars = r.chars;
+        s.derive(r.gen_ms);
+        assert!(
+            s.est_decode_tps > 25.0 && s.est_decode_tps < 45.0,
+            "decode reads {:.1} tok/s over {} ms (est {} tokens)",
+            s.est_decode_tps,
+            s.streaming_ms,
+            s.est_tokens
+        );
+    }
+
+    /// A person deciding on an approval card is not a slow model either.
+    #[test]
+    fn a_run_parked_on_a_person_is_not_generation() {
+        let t0 = Instant::now();
+        let mut r = Run::new(t0);
+        for i in 0..4u64 {
+            r.chars += 8;
+            mark_first(&mut r, t0 + Duration::from_millis(50 * i));
+        }
+        r.parked_since = Some(t0 + Duration::from_millis(200));
+        // Deltas that arrive while a card is up (pi keeps streaming past some
+        // dialogs) must not pay for the wait, and neither must the first one
+        // after it.
+        r.chars += 8;
+        mark_first(&mut r, t0 + Duration::from_millis(4200));
+        assert_eq!(r.gen_ms, 150, "window was {} ms with a 4 s dialog inside it", r.gen_ms);
+    }
 }

@@ -20,7 +20,7 @@
 //!   decode counters, whether search is mounted) is reported as absent.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,7 +58,10 @@ pub struct PiHostConfig {
     /// to pi as the dialog's own `timeout`, so the countdown in the UI and the
     /// deny inside the engine cannot disagree.
     pub approval_timeout: Duration,
-    pub question_timeout: Duration,
+    /// `None` — the default — puts no clock on a question card: the turn parks until a
+    /// person answers or the turn is stopped. `question_timeout_secs` in config.toml is the
+    /// way to ask for a clock anyway.
+    pub question_timeout: Option<Duration>,
     /// Locked decision 14: no cap on live pi processes; an idle one is closed
     /// after this long and reopened on the next turn against the same pi session
     /// file, so nothing the model knew is lost.
@@ -173,6 +176,9 @@ impl PiHost {
             mode: cfg.mode.clone(),
             persona: cfg.persona,
             reasoning: cfg.reasoning.clone(),
+            reasoning_default: cfg.reasoning.clone(),
+            reasoning_overridden: false,
+            reasoning_levels: Vec::new(),
             busy: false,
             turns: 0,
             context_tokens: 0,
@@ -181,7 +187,11 @@ impl PiHost {
             budget_pin: cfg.budget_pin,
             model_window: cfg.model_window,
             approval_timeout_secs: cfg.approval_timeout.as_secs(),
-            question_timeout_secs: cfg.question_timeout.as_secs(),
+            question_timeout_secs: cfg.question_timeout.map(|d| d.as_secs()),
+            // Filled in as the run streams (`apply_output` publishes it) — a turn that has
+            // not started yet has said nothing.
+            open_text: String::new(),
+            open_reasoning: String::new(),
             workspace_refusal: None,
             refusal_seq: 0,
         }));
@@ -189,6 +199,9 @@ impl PiHost {
         let web_last = Arc::new(Mutex::new(None::<Instant>));
         let boot_workdir = cfg.launch.workdir.clone();
         let iter_cap = cfg.max_tool_iters;
+        // Read before `cfg` moves into the engine: the settings default is needed on both sides of
+        // the move (the reported state and the host's own bookkeeping).
+        let default_thinking = cfg.reasoning.clone();
         let engine = Engine {
             boot_workdir,
             cfg,
@@ -203,12 +216,12 @@ impl PiHost {
             turn_files: Vec::new(),
             last_assistant_row: None,
             resume_announced: std::collections::HashSet::new(),
+            title_slot: cwoffee_engine::titling::TitleSlot::default(),
+            row_thinking: HashMap::new(),
+            draft_thinking: None,
+            applied_thinking: HashMap::new(),
+            default_thinking,
             q_sets: HashMap::new(),
-            titlegen: cwoffee_engine::titlegen::TitleGen::new(
-                cwoffee_engine::config::Config::load(None)
-                    .map(|(c, _)| c.titlegen_cfg())
-                    .unwrap_or_default(),
-            ),
             map,
             cmd_tx: cmd_tx.clone(),
             deferred: Vec::new(),
@@ -426,14 +439,19 @@ impl HostOps for PiHost {
         searxng_url: &str,
     ) -> Result<SearchView, String> {
         let (cfg, _) = Config::load(Some(cfg_path)).unwrap_or_else(|_| (Config::default(), None));
+        let backend = backend.trim();
+        let url = searxng_url.trim();
         // The engine's own parser, so a typo is an error here exactly as it is in
         // the Rust core, and both cores read the same file afterwards.
-        cwoffee_engine::settings::parse_backend(backend, searxng_url, &cfg)?;
-        let mut keys = vec![("backend", backend.to_string())];
-        if !searxng_url.trim().is_empty() {
-            keys.push(("searxng_url", searxng_url.trim().to_string()));
-        }
-        let refs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        cwoffee_engine::settings::parse_backend(backend, url, &cfg)?;
+        // The values handed to the config writer are TOML *literals*, not bare words. The
+        // writer re-parses the edited file before it replaces it — the guard that keeps a
+        // settings click from writing a config the next boot cannot open — and `backend = auto`
+        // fails that parse, so on this core every provider switch answered
+        // `invalid string expected "` and saved nothing while the Rust core quoted it and
+        // worked. One helper, one quoting rule, checked by a test that reads the file back.
+        let keys = search_keys(backend, url);
+        let refs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let written = Config::set_search_keys(cfg_path, &refs)?;
         let mut view = self.search_view(cfg_path).await;
         view.saved_to = Some(written.join(", "));
@@ -574,7 +592,9 @@ enum Wait {
     Question {
         pi_id: String,
         kind: QKind,
-        deadline: Instant,
+        /// `None`: this card has no clock. The turn is parked, not failing — see
+        /// `PiHostConfig::question_timeout`.
+        deadline: Option<Instant>,
         answered: bool,
         /// The set this question belongs to, in this process's numbering. An answered or
         /// expired question releases its set, which is what lets a later call reuse the
@@ -606,6 +626,67 @@ enum QKind {
 /// payload ever fails to parse, the arms below fall back to treating the title as the
 /// question, which is what any other extension's dialog would do.
 pub const CANON_Q: &str = "CWOFFEEQ ";
+
+/// The coworker's prompt, plus the one sentence that depends on where this conversation is.
+///
+/// pi appends a `<cwd>` block naming the working directory, and for a conversation with no
+/// workspace that directory is a scratch folder under the system's temp root. Left alone the
+/// model reads that block and tells the person it is working in `/tmp` — which is the report:
+/// "the UI should say No workspace and the model should say none". The Rust core says the
+/// same thing in its `<env>` block (`engine::host::default_env_block`); two cores owe the
+/// person one answer, not two.
+///
+/// It is appended rather than folded into the shared prompt text because it is the one part
+/// of the stable prefix that varies by conversation, and it varies at most once per session:
+/// the bridge already restarts the child when the workspace changes, so nothing that was paid
+/// for is thrown away.
+fn cowork_prompt_with_workspace_note(lean: bool, workdir: &Path) -> String {
+    let mut prompt = cwoffee_engine::prompt::cowork_prompt_text(lean);
+    if cwoffee_engine::host::is_temp_root(&workdir.to_string_lossy()) {
+        prompt.push_str(
+            "\n\nThis conversation has no workspace. The folder named in <cwd> is a scratch folder this app made for itself: nobody chose it, it holds none of the person's files, and it is not theirs to be told about. Never call it their workspace, and if asked where they are working, answer \"none\". Files written with relative paths are still kept for this conversation.",
+        );
+    }
+    prompt
+}
+
+/// The `[search]` keys a backend change writes, already quoted as TOML literals.
+///
+/// Split out because the quoting is the whole failure this prevents. The config writer
+/// parses the edited text before it replaces the file — a settings click must not be able to
+/// write a config the next boot cannot open — and a bare word is not a TOML string. Handing
+/// it `backend = auto` made the write refuse itself, so the panel kept the old provider while
+/// the click looked like it had done nothing but show an error, in the app's own words:
+/// `invalid string expected "`. The Rust core quoted through `Config::toml_str`; this core
+/// passed the word through. A test re-reads the written file, and
+/// `scripts/gateway-search-write.mjs` asks the same question over the wire on either core.
+///
+/// The URL is written when the choice needs one. An address already in the file is left
+/// there when the choice moves away, on purpose: somebody who tried SearXNG and went back to
+/// DuckDuckGo should not have to type their address again to try it once more, and the panel
+/// keeps the box filled for the same reason. Which is why the wire gate asserts that the
+/// *choice* moved and that the file still parses, rather than asserting the line vanishes.
+fn search_keys(backend: &str, url: &str) -> Vec<(String, String)> {
+    let mut keys = vec![("backend".to_string(), Config::toml_str(backend))];
+    if backend == "searxng" && !url.is_empty() {
+        keys.push(("searxng_url".to_string(), Config::toml_str(url)));
+    }
+    keys
+}
+
+/// The card's own clock, if it has one. `None` means the card never closes by itself.
+///
+/// The tool extension asks pi's dialog primitives without a `timeout` for a cwoffee
+/// question, so `timeout_ms` arrives 0 and the card parks until a person answers or the
+/// turn is stopped — which is what the user asked for after three-minute cards answered
+/// questions they needed to take to somebody else. Any dialog that does state a budget is
+/// still honoured: the clock has to come from the caller, not from a default in here.
+fn question_deadline(timeout_ms: u64) -> Option<Instant> {
+    if timeout_ms == 0 {
+        return None;
+    }
+    Some(Instant::now() + Duration::from_millis(timeout_ms.max(1000)))
+}
 
 /// Recover the engine's question from a dialog title, and re-number it for this process.
 ///
@@ -702,9 +783,30 @@ struct Engine {
     /// it once per session per process; saying it on every switch would train the user to
     /// ignore a note that is only worth reading when the history is reopened.
     resume_announced: std::collections::HashSet<i64>,
-    /// The same local title helper the rust core offers, from the same config, so the
-    /// sidebar names conversations the same way whichever core is behind it.
-    titlegen: cwoffee_engine::titlegen::TitleGen,
+    /// One title request at a time, for the same reason the Rust core keeps one: the
+    /// ask delays a first answer, and two conversations should not both be stalled
+    /// while one of them waits for a name.
+    title_slot: cwoffee_engine::titling::TitleSlot,
+    /// The thinking effort chosen per conversation, for this run of the app.
+    ///
+    /// pi keeps a level inside each session file and restores it on `switch_session`; what this map
+    /// carries is the level chosen *during* this run, which has to survive the conversation's own
+    /// creation. That creation is lazy - a draft's first send makes the row and asks pi for a new
+    /// thread in the same breath - and a level applied to the pi session before that was thrown away
+    /// by it: pi starts a thread at its own default. Which is why the composer dial used to snap
+    /// back to the settings value at the moment the user pressed send.
+    row_thinking: HashMap<i64, Reasoning>,
+    /// A level chosen while the conversation is still a draft (row 0). It follows the draft into
+    /// the row it becomes.
+    draft_thinking: Option<Reasoning>,
+    /// The level this process last *set* for a conversation, whether it came from the person's
+    /// override or from the settings default at the conversation's creation. Not the person's
+    /// choice - that is `row_thinking` - and it exists because pi's own `get_state` answers with the
+    /// level the model can actually run (for a model that cannot think, "off"), which is a fact
+    /// about the model and not an answer to "what did this conversation ask for".
+    applied_thinking: HashMap<i64, Reasoning>,
+    /// What the settings screen says a new conversation starts at.
+    default_thinking: Reasoning,
     map: SessionMap,
     cmd_tx: mpsc::UnboundedSender<HostCmd>,
     /// Conversation-retargeting verbs that arrived during a turn. The Rust core queues
@@ -896,13 +998,26 @@ impl Engine {
             None => "derived: half of whatever window the endpoint states".to_string(),
         };
         match window {
-            Some(w) => match crate::mount::mount_settings(
-                &self.cfg.launch.agent_dir,
-                &self.cfg.launch.provider,
-                &model,
-                budget,
-                w,
-            ) {
+            Some(w) => {
+                // The key pi reads this under is its own pair, not cwoffee's spelling of the
+                // model: see `mount_fold_for`.
+                let (pi_provider, pi_model) = match self.cfg.cfg_path.as_ref().map(|p| {
+                    crate::mount::pi_target(p, &self.cfg.launch.provider, &model)
+                }) {
+                    Some(Ok(pair)) => pair,
+                    Some(Err(e)) => {
+                        self.err(format!("{e} — the ceiling was set, but pi was not told where to fold"));
+                        return;
+                    }
+                    None => (self.cfg.launch.provider.clone(), model.clone()),
+                };
+                match crate::mount::mount_settings(
+                    &self.cfg.launch.agent_dir,
+                    &pi_provider,
+                    &pi_model,
+                    budget,
+                    w,
+                ) {
                 Ok(Some(sentence)) => {
                     self.note(format!(
                         "context ceiling is now {budget} tokens ({pin_word}). {sentence}"
@@ -914,14 +1029,32 @@ impl Engine {
                 )),
                 Err(e) => self.err(format!(
                     "context ceiling is now {budget} tokens ({pin_word}) and the config was written, \
-                     but pi's own threshold could not be set: {e}"
+                     but pi's own threshold could not be set: {e}",
                 )),
+                }
             },
             None => self.note(format!(
                 "context ceiling is now {budget} tokens ({pin_word}); pi keeps its own folding default, \
                  because no window is known for this model to compute a threshold from"
             )),
         }
+    }
+
+    /// Tell pi where to fold, under the `provider/model` pair pi actually keys it by.
+    ///
+    /// `compaction.modelOverrides` is keyed `provider/model`. A reserve written under the
+    /// launch provider for a model pi reaches through a different provider is a number pi
+    /// never reads: the context meter and pi's own fold then disagree, one on each side of
+    /// the seam. `None` means no window is known, which is said out loud rather than left
+    /// as a threshold nobody computed.
+    fn mount_fold_for(&self, provider: &str, model: &str) -> Option<String> {
+        let (window, budget) = {
+            let st = self.state.lock().unwrap();
+            (st.model_window?, st.context_budget)
+        };
+        crate::mount::mount_settings(&self.cfg.launch.agent_dir, provider, model, budget, window)
+            .ok()
+            .flatten()
     }
 
     fn recompute_budget(&self, st: &mut HostState) {
@@ -980,6 +1113,39 @@ impl Engine {
         }
     }
 
+    /// What pi can answer for, as pi says it.
+    ///
+    /// pi clamps a thinking level onto the levels the model entry declares, and an entry that
+    /// declares nothing declares `off` alone. The only way to know whether the dial in front of the
+    /// reader is wired to anything is to ask the model process which levels exist - a question to
+    /// the process, not a call to the model, so it costs nothing and spends no prefill.
+    async fn learn_levels(&mut self) {
+        match self
+            .request(
+                json!({ "type": "get_available_thinking_levels" }),
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            Ok(data) => {
+                let levels = data
+                    .get("levels")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if std::env::var("CWOFFEE_PI_TRACE").is_ok() {
+                    eprintln!("[bridge] pi offers these thinking levels: {levels:?}");
+                }
+                self.state.lock().unwrap().reasoning_levels = levels;
+            }
+            Err(e) => eprintln!("[bridge] pi would not say which thinking levels it offers: {e}"),
+        }
+    }
+
     async fn ensure_child(&mut self) -> Result<(), String> {
         if let Some(c) = &self.child {
             if c.is_up() {
@@ -1012,7 +1178,7 @@ impl Engine {
             // note when the declared tool set is deliberately incomplete: a model that is
             // shown a subset and never told it is a subset concludes the app cannot do the
             // thing, and then it stops trying.
-            launch.system_prompt = Some(cwoffee_engine::prompt::cowork_prompt_text(lean));
+            launch.system_prompt = Some(cowork_prompt_with_workspace_note(lean, &launch.workdir));
         }
         launch.session_file = self.map.get(self.row()).map(str::to_string).map(PathBuf::from);
         // Name the root for the tools instead of trusting an inherited cwd. A shim that
@@ -1169,6 +1335,21 @@ impl Engine {
             HostCmd::SetContextBudget { target } => self.set_budget(target),
             HostCmd::Send { text, attachments, session } => self.on_send(text, attachments, session).await,
             HostCmd::Cancel => {
+                // Release the cards the turn is parked on *before* asking the model to stop.
+                // Two reasons, and they are not the same one.
+                //
+                // The card is the user's: a question parks a turn with no clock, so the only
+                // event that closes it is the turn ending, and Stop is that event.
+                //
+                // And the child is waiting on that answer too: its tool call does not unwind
+                // until its dialog resolves, and `abort` is only answered once the abort has
+                // finished - which is the tool call unwinding. Send `abort` first and wait for
+                // the reply and each side holds what the other needs. Measured on a pi core:
+                // Stop landed 10002ms later - the abort timeout to the millisecond - and the
+                // app then reported "could not stop the turn: the model process did not answer
+                // abort" about a turn that had in fact just stopped. The rust core has always
+                // released what a turn is parked on for the same reason.
+                self.release_open_cards();
                 if let Err(e) = self.request(json!({ "type": "abort" }), Duration::from_secs(10)).await {
                     self.err(format!("could not stop the turn: {e}"));
                 }
@@ -1180,19 +1361,137 @@ impl Engine {
                 let mut st = self.state.lock().unwrap();
                 st.mode = mode;
             }
-            HostCmd::SetReasoning { reasoning } => {
-                let level = pi_level(&reasoning);
-                match self.request(json!({ "type": "set_thinking_level", "level": level }), Duration::from_secs(10)).await {
+            HostCmd::SetReasoning { reasoning, persist } => {
+                if persist {
+                    // The settings screen: the effort a new conversation starts at. It goes in the
+                    // config file, exactly as the rust core writes it, so a phone and the desktop
+                    // read one answer - and it moves the current conversation too, if that
+                    // conversation has never moved its own dial.
+                    self.default_thinking = reasoning;
+                    let word = serde_json::to_value(reasoning)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| "low".into());
+                    cwoffee_engine::host::persist_setting(
+                        &self.cfg.cfg_path,
+                        "reasoning",
+                        &cwoffee_engine::Config::toml_str(&word),
+                    );
+                } else {
+                    // The composer: this conversation, for the rest of it, and nothing else. The
+                    // config file is not written - a level picked for one chat must not become the
+                    // level every future chat starts at.
+                    let row = self.row();
+                    if row == 0 {
+                        self.draft_thinking = Some(reasoning);
+                    } else {
+                        self.row_thinking.insert(row, reasoning);
+                    }
+                }
+                let level = if persist {
+                    let row = self.row();
+                    self.row_thinking.get(&row).copied().or(self.draft_thinking).unwrap_or(self.default_thinking)
+                } else {
+                    reasoning
+                };
+                let pi = pi_level(&level).to_string();
+                if std::env::var("CWOFFEE_PI_TRACE").is_ok() {
+                    // Which slot the choice went into, and what is about to be sent to pi: the two
+                    // ways this can be wrong (the draft never follows into the conversation, or the
+                    // row map is bypassed) are invisible without it.
+                    eprintln!(
+                        "[bridge] thinking: persist={persist} row={} slot={} sending {pi}",
+                        self.row(),
+                        if self.row() == 0 { "draft" } else { "row" }
+                    );
+                }
+                match self.request(json!({ "type": "set_thinking_level", "level": pi }), Duration::from_secs(10)).await {
                     Ok(_) => {
+                        let row = self.row();
                         let mut st = self.state.lock().unwrap();
-                        st.reasoning = reasoning;
+                        st.reasoning = level;
+                        st.reasoning_default = self.default_thinking;
+                        st.reasoning_overridden = self.row_thinking.get(&row).is_some()
+                            || (row == 0 && self.draft_thinking.is_some());
                     }
                     Err(e) => self.err(format!("the model refused that reasoning level: {e}")),
                 }
+                // pi clamps a level to what the model entry declares; a dial that moves while the
+                // wire says nothing is the complaint this answers. Ask pi what it can run, now that
+                // the request has just round-tripped and the process is certainly up.
+                self.learn_levels().await;
+                if !persist {
+                    // Remember what pi was told, for this conversation, so the next time this row is
+                    // entered the answer does not come from pi's model capability instead.
+                    let row = self.row();
+                    self.applied_thinking.insert(row, level);
+                }
             }
             HostCmd::SetModel { model, persist } => {
-                let provider = self.cfg.launch.provider.clone();
-                match self.request(json!({ "type": "set_model", "provider": provider, "modelId": model }), Duration::from_secs(20)).await {
+                // Which pi provider a cwoffee model id belongs to is not the launch
+                // provider. It used to be, and that is the whole reason a model added on the
+                // settings screen could not be used for inference: the app registered the
+                // endpoint, mounted it in pi's `models.json`, and then asked pi for
+                // `cwoffee/<that model>` — a model pi had never heard of. The answer came
+                // back as an error naming a model nobody had typed, and the model picker
+                // looked broken.
+                let cfg_path = match self.cfg.cfg_path.clone() {
+                    Some(p) => p,
+                    None => cwoffee_engine::config::Config::default_path(),
+                };
+                let (pi_provider, pi_model) =
+                    match crate::mount::pi_target(&cfg_path, &self.cfg.launch.provider, &model) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            self.err(format!("cannot answer with {model}: {e}"));
+                            return;
+                        }
+                    };
+                // A model registered while this window is open is in cwoffee's config and not
+                // yet in pi's file: the mount of endpoints happens at boot. Re-mounting here
+                // is what makes "add endpoint, pick model" work without a restart.
+                if !crate::mount::provider_has_model(&self.cfg.launch.agent_dir, &pi_provider, &pi_model) {
+                    let mounted = crate::mount::mount_provider_rows(&self.cfg.launch.agent_dir, &cfg_path);
+                    match &mounted {
+                        Ok(list) => {
+                            if list.is_empty() {
+                                self.err(format!(
+                                    "{model} is not on an endpoint cwoffee has registered, so pi cannot \
+                                     answer with it. Add the endpoint under Settings > Models first."
+                                ));
+                                return;
+                            }
+                            eprintln!(
+                                "[cwoffee/pi] mounted {} endpoint(s) for the switch to {model}: {}",
+                                list.len(),
+                                list.join(", ")
+                            );
+                        }
+                        Err(e) => {
+                            self.err(format!(
+                                "cannot tell pi about the endpoints registered in {}: {e} — {model} stays \
+                                 unreachable until that is fixed",
+                                cfg_path.display()
+                            ));
+                            return;
+                        }
+                    }
+                    if !crate::mount::provider_has_model(&self.cfg.launch.agent_dir, &pi_provider, &pi_model) {
+                        self.err(format!(
+                            "{model} is registered under {pi_provider} in {}, but pi's provider file has no \
+                             such model on it — press Probe models on that endpoint, or restart the app to \
+                             rewrite it.",
+                            cfg_path.display()
+                        ));
+                        return;
+                    }
+                }
+                match self.request(
+                    json!({ "type": "set_model", "provider": pi_provider, "modelId": pi_model }),
+                    Duration::from_secs(20),
+                )
+                .await
+                {
                     Ok(data) => {
                         {
                             let mut st = self.state.lock().unwrap();
@@ -1211,6 +1510,17 @@ impl Engine {
                             self.recompute_budget(&mut st);
                         }
                         self.cfg.launch.model = model.clone();
+                        // The ceiling has to travel with the model, not stay on the one that
+                        // was mounted at boot: pi folds on the reserve it read from
+                        // settings.json, and a reserve computed for the previous model makes
+                        // the fold and the context meter disagree.
+                        match self.mount_fold_for(&pi_provider, &pi_model) {
+                            Some(sentence) => eprintln!("[cwoffee/pi] {sentence}"),
+                            None => eprintln!(
+                                "[cwoffee/pi] compaction: no window known for {model}, so pi keeps the \
+                                 threshold it started with"
+                            ),
+                        }
                         if persist {
                             self.note(
                                 "the model change applies to this run; writing the default model to the config \
@@ -1218,7 +1528,12 @@ impl Engine {
                             );
                         }
                     }
-                    Err(e) => self.err(format!("could not switch model: {e}")),
+                    Err(e) => self.err(format!(
+                        "could not switch to {model}: pi was asked for {pi_provider}/{pi_model} and refused \
+                         ({e}). That endpoint is registered in {} — Probe models on it re-reads what it \
+                         actually serves.",
+                        cfg_path.display()
+                    )),
                 }
             }
             HostCmd::SetWorkspace { path } => {
@@ -1438,6 +1753,7 @@ impl Engine {
         self.tr.session = id;
         let _ = self.ev.send(EngineEvent::SessionChanged { session_id: id, title: title.to_string() });
         if self.child.as_ref().map(|c| c.is_up()) == Some(true) {
+            let mut fresh_thread = false;
             match self.map.get(id) {
                 Some(file) => {
                     let req = json!({ "type": "switch_session", "sessionPath": file });
@@ -1451,6 +1767,7 @@ impl Engine {
                     }
                 }
                 None => {
+                    fresh_thread = true;
                     if let Err(e) = self.request(json!({ "type": "new_session" }), Duration::from_secs(15)).await {
                         self.err(format!("pi could not start a thread for conversation {id}: {e}"));
                     } else {
@@ -1462,6 +1779,76 @@ impl Engine {
                              scratch; the stored transcript is unchanged"
                         ));
                     }
+                }
+            }
+            // The thinking effort belongs to the conversation, not to whatever pi's process was
+            // last asked for.
+            //
+            // This is where the reported bug lived, and this is the line that fixes it. A
+            // conversation's pi thread is created lazily: a draft's first send creates the row and
+            // `new_session`s pi in the same breath. A level chosen in the composer before anything
+            // was typed had been applied to a pi session that this very block then replaced, and pi
+            // brings a new thread up at its own default - which is the value from the settings
+            // screen. So the dial snapped back at the moment the user pressed send, which is exactly
+            // what it looked like from the chair: the send undoing the choice.
+            if let Some(t) = self.draft_thinking.take() {
+                // A level chosen while the conversation was a draft follows it into the conversation
+                // it becomes.
+                self.row_thinking.entry(id).or_insert(t);
+            }
+            let chosen = match self.row_thinking.get(&id).copied() {
+                Some(t) => Some(t),
+                // A brand-new thread starts at the settings default, whatever the previous
+                // conversation happened to be using.
+                None if fresh_thread => Some(self.default_thinking),
+                // Reopened inside this run: the level this process last set for it, which is what
+                // the person asked for. Asking pi instead answers with the level its model can
+                // actually run - for a model that cannot think, "off" - and that answer overwrites
+                // a choice nobody changed. A conversation this process never configured has no
+                // entry here, so this is None and pi's own restored level is the honest answer.
+                None => self.applied_thinking.get(&id).copied(),
+            };
+            if std::env::var("CWOFFEE_PI_TRACE").is_ok() {
+                eprintln!(
+                    "[bridge] thinking: conversation {id} has a {} thread; chosen={}, settings default={}, this row's stored={:?}",
+                    if fresh_thread { "fresh" } else { "resumed" },
+                    chosen
+                        .as_ref()
+                        .map(|c| pi_level(c).to_string())
+                        .unwrap_or_else(|| "leave pi alone".into()),
+                    pi_level(&self.default_thinking),
+                    self.row_thinking.get(&id).map(|t| pi_level(t).to_string()),
+                );
+            }
+            if let Some(level) = chosen {
+                let pl = pi_level(&level).to_string();
+                if let Err(e) = self
+                    .request(json!({ "type": "set_thinking_level", "level": pl }), Duration::from_secs(10))
+                    .await
+                {
+                    self.err(format!("this conversation asked for {pl} thinking and the model refused it: {e}"));
+                }
+                self.applied_thinking.insert(id, level);
+                let mut st = self.state.lock().unwrap();
+                st.reasoning = level;
+                st.reasoning_default = self.default_thinking;
+                st.reasoning_overridden = self.row_thinking.contains_key(&id);
+            } else if let Ok(d) = self.request(json!({ "type": "get_state" }), Duration::from_secs(10)).await {
+                // Nothing was chosen for this conversation in this run, so publish what pi is
+                // actually running at: the level that conversation last used, and possibly a clamped
+                // version of what was once asked for. A dial that shows a level the model is not at
+                // is a dial that lies.
+                if let Some(lvl) = d.get("thinkingLevel").and_then(|v| v.as_str()).and_then(from_pi_level) {
+                    if std::env::var("CWOFFEE_PI_TRACE").is_ok() {
+                        eprintln!(
+                            "[bridge] thinking: pi reports {} for conversation {id}; publishing that as-is",
+                            pi_level(&lvl)
+                        );
+                    }
+                    let mut st = self.state.lock().unwrap();
+                    st.reasoning = lvl;
+                    st.reasoning_default = self.default_thinking;
+                    st.reasoning_overridden = false;
                 }
             }
         }
@@ -1538,6 +1925,21 @@ impl Engine {
             }
         }
         let row = self.row();
+        // The conversation this window was standing in can stop existing between the
+        // click and the command: the desktop deletes by moving the host off the row
+        // first, and that move is queued. Answering into a row nothing lists any more
+        // produces an answer the reader can never open again, so the row is checked
+        // where it is checked on the Rust core - just before the turn, not at delete
+        // time.
+        let row = if row != 0 && self.cfg.store.session(row).ok().flatten().is_none() {
+            self.note(
+                "that conversation was deleted while your message was on its way. Nothing was \
+                 lost from your side: the reply starts a new conversation.",
+            );
+            0
+        } else {
+            row
+        };
         let row = if row == 0 {
             let title = self.title_for(0, &text);
             let (workspace, model) = {
@@ -1574,9 +1976,23 @@ impl Engine {
         }
         self.tr.store_user_early(&attachments);
 
+        // Name the conversation before pi answers it. Same ask, same parser, same
+        // fallback, same events as the Rust core's title pass: the pi core hands the
+        // answer to pi, and must not hand the *name* to pi, because pi would answer it
+        // inside the conversation's own context. The reader asked for those two to be
+        // separate, and a name that leaks into the history also costs prompt tokens on
+        // every later turn.
+        self.name_conversation(row, &text).await;
+
         if let Err(e) = self.ensure_child().await {
             self.err(format!("cannot start the model process: {e}"));
             return;
+        }
+        if self.state.lock().unwrap().reasoning_levels.is_empty() {
+            // A conversation is about to run at some level. Whether that level exists for this
+            // model is a fact the process knows and the settings screen does not, and "the dial did
+            // nothing" is only diagnosable once the offered list is on the state.
+            self.learn_levels().await;
         }
         self.tr.session = row;
         self.tr.model = self.state.lock().unwrap().model.clone();
@@ -1584,6 +2000,10 @@ impl Engine {
         {
             let mut st = self.state.lock().unwrap();
             st.busy = true;
+            // A new turn starts with nothing said. Left over from the previous one, a client
+            // that reloaded would be handed the last turn's tail as if it were this turn's.
+            st.open_text.clear();
+            st.open_reasoning.clear();
         }
         // `images` is pi's own ImageContent shape: unprefixed base64 plus the mime the
         // boundary check just allowed. A non-image attachment is refused above rather
@@ -1622,9 +2042,111 @@ impl Engine {
                 return s.title;
             }
         }
-        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("new conversation");
-        let chars: Vec<char> = first.trim().chars().take(60).collect();
-        chars.into_iter().collect()
+        // The placeholder, on this core exactly as on the Rust core. It used to be the
+        // opening line cut at 60 characters, which put a name on the row before the
+        // conversation had been understood - and in front of an animation that was
+        // about to type a different one.
+        let _ = text;
+        cwoffee_engine::store::UNTITLED.to_string()
+    }
+
+    /// The endpoint cwoffee answers through, as an engine provider, for the one ask
+    /// that is not a conversation: naming one.
+    ///
+    /// Built from cwoffee's own config through `Config::build_provider`, so the auth
+    /// headers and the chat-template knobs are the same ones the Rust core would use.
+    /// A title must not come from a different model than the one answering the question
+    /// it names.
+    fn title_provider(&self) -> Option<std::sync::Arc<dyn cwoffee_engine::provider::Provider>> {
+        let path = self.cfg.cfg_path.clone()?;
+        let (p, base) = title_provider_at(&path)?;
+        // Once per process, because a name that never arrives is otherwise a silent 8 s
+        // stall: the line says which endpoint was asked, and that is the difference between
+        // "the model gave us nothing usable" and "we asked somewhere else".
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("[cwoffee/titling] the endpoint asked for names is {base}");
+        }
+        Some(p)
+    }
+
+    /// Ask for this conversation's name, stream it out as it arrives, and settle it.
+    ///
+    /// Deliberately a mirror of the Rust core's title pass rather than a re-derivation:
+    /// `titling::TITLE_ASK`, the parser and the fallback are shared, so a conversation
+    /// gets the same name whichever core is running. A miss is not fatal and is not
+    /// silent: the row falls back to the opening line and the reason goes to the log,
+    /// because "every sidebar row says New Session" is the failure mode this path has to
+    /// avoid.
+    async fn name_conversation(&mut self, row: i64, text: &str) {
+        if !self.title_slot.claim() {
+            return;
+        }
+        let stored_title = self
+            .cfg
+            .store
+            .session(row)
+            .ok()
+            .flatten()
+            .map(|s| s.title)
+            .unwrap_or_default();
+        let first_user = match self.cfg.store.history(row) {
+            Ok(h) => h
+                .into_iter()
+                .find(|m| matches!(m.role, cwoffee_engine::provider::Role::User))
+                .map(|m| m.content)
+                .unwrap_or_else(|| text.to_string()),
+            Err(_) => text.to_string(),
+        };
+        if !cwoffee_engine::titling::still_untitled(&stored_title, &first_user) {
+            self.title_slot.release();
+            return;
+        }
+        let model = self.state.lock().unwrap().model.clone();
+        let outcome = match self.title_provider() {
+            Some(p) => {
+                let ev = self.ev.clone();
+                cwoffee_engine::titling::ask_title(
+                    p.as_ref(),
+                    &model,
+                    &first_user,
+                    |t, done| {
+                        let _ = ev.send(EngineEvent::TitleDelta {
+                            session_id: row,
+                            text: t.to_string(),
+                            done,
+                        });
+                    },
+                )
+                .await
+            }
+            None => {
+                // No reachable endpoint in the config: keep the placeholder rather than
+                // stalling a turn that pi is going to answer anyway.
+                self.title_slot.release();
+                return;
+            }
+        };
+        let name = match outcome {
+            cwoffee_engine::titling::Outcome::Named(n) => Some(n),
+            cwoffee_engine::titling::Outcome::FellBack(why) => {
+                eprintln!("[cwoffee/titling] conversation {row} keeps a fallback name: {why}");
+                let fb = cwoffee_engine::store::derive_title(&first_user);
+                if fb.is_empty() { None } else { Some(fb) }
+            }
+            cwoffee_engine::titling::Outcome::NotEligible => None,
+        };
+        self.title_slot.release();
+        if let Some(n) = name {
+            match self.cfg.store.rename_session(row, &n) {
+                Ok(()) => {
+                    let _ = self
+                        .ev
+                        .send(EngineEvent::SessionChanged { session_id: row, title: n });
+                }
+                Err(e) => eprintln!("[cwoffee/titling] named it but the rename failed: {e}"),
+            }
+        }
     }
 
     // ---- the stream -------------------------------------------------------
@@ -1654,23 +2176,17 @@ impl Engine {
             }
         }
         for (_, files) in out.files_by_call.drain(..) {
-            self.turn_files.extend(files);
+            for f in files {
+                merge_turn_file(&mut self.turn_files, f);
+            }
         }
         // Stamp at the end of the run, on the answer, once. `take()` so a second settle
         // in the same process cannot re-attach the same files to a later answer.
         if out.settled {
-            // Named after the turn, not during it: the row already carries an honest
-            // automatic title, and a phrase from a 230 M-parameter model is worth waiting
-            // a settled turn for but never worth delaying an answer.
-            let session = self.state.lock().unwrap().session_id;
-            if session != 0 {
-                cwoffee_engine::titlegen::maybe_name(
-                    &self.titlegen,
-                    &self.cfg.store,
-                    &self.ev,
-                    session,
-                );
-            }
+            // Naming happened before the answer, in `name_conversation`, not here: the
+            // reader asked for the title request to stall the first answer rather than
+            // trail it, and the ask shares its prompt, parser and fallback with the Rust
+            // core so a conversation gets the same name behind either core.
         }
         if out.settled && !self.turn_files.is_empty() {
             let files = std::mem::take(&mut self.turn_files);
@@ -1700,9 +2216,30 @@ impl Engine {
             self.on_ui_request(u);
         }
         {
+            // Publish what the turn has said so far, before anything else in this block.
+            // Computed outside the lock: `tr` is another field, and a guard held across a call
+            // that reads it is how this gets tangled.
+            let open = self.tr.open_of_run();
             let mut st = self.state.lock().unwrap();
             if let Some(ct) = out.context_tokens {
                 st.context_tokens = ct;
+            }
+            // The half of the answer that has no row yet. A browser page reloaded mid-answer
+            // asks for the stored rows and finds nothing for the message still streaming, so
+            // it painted the reply starting at whatever arrived after the reload — the top of
+            // the message missing, repairing itself only when the turn ended and its row was
+            // written. This is the part that had no row: the client paints it and the live
+            // deltas carry on underneath it. Cleared when the run has nothing open, so a
+            // settled turn cannot hand a later reload text that is already stored.
+            match open {
+                Some((t, r)) => {
+                    st.open_text = t;
+                    st.open_reasoning = r;
+                }
+                None => {
+                    st.open_text.clear();
+                    st.open_reasoning.clear();
+                }
             }
             if out.settled {
                 st.busy = false;
@@ -1845,13 +2382,13 @@ impl Engine {
                     let _ = self.ev.send(question_event(&q));
                     return;
                 }
-                let secs = timeout_ms.max(1000) / 1000;
+                let deadline = question_deadline(timeout_ms);
                 self.waits.insert(
                     id,
                     Wait::Question {
                         pi_id: pi_id.clone(),
                         kind: QKind::Select { options: labels },
-                        deadline: Instant::now() + Duration::from_secs(secs),
+                        deadline,
                         answered: false,
                         set_id: q.set.as_ref().map(|st| st.id),
                     },
@@ -1898,13 +2435,13 @@ impl Engine {
                     let _ = self.ev.send(question_event(&q));
                     return;
                 }
-                let secs = timeout_ms.max(1000) / 1000;
+                let deadline = question_deadline(timeout_ms);
                 self.waits.insert(
                     id,
                     Wait::Question {
                         pi_id: pi_id.clone(),
                         kind: QKind::Input,
-                        deadline: Instant::now() + Duration::from_secs(secs),
+                        deadline,
                         answered: false,
                         set_id: q.set.as_ref().map(|st| st.id),
                     },
@@ -1956,10 +2493,14 @@ impl Engine {
                     }
                 };
                 let Some((pi_id, tool, row)) = wait else {
-                    // The card already closed: pi denied on its own timeout, or
-                    // the turn was cancelled. Silently writing a response would
-                    // imply the human's answer reached the tool.
-                    self.note("an approval was answered after its card had closed; that answer was ignored");
+                    // The card already closed. A *dropped* sender is this host letting go of
+                    // the turn (Stop, or a window that went away): nobody answered, and a line
+                    // about an ignored answer would describe an answer that never existed. An
+                    // answer that turns up after the card closed is worth the one line, because
+                    // it means somebody pressed something the app had already let go of.
+                    if answer.is_some() {
+                        self.note("an approval was answered after its card had closed; that answer was ignored");
+                    }
                     return;
                 };
                 match answer {
@@ -1997,7 +2538,12 @@ impl Engine {
                 let (pi_id, options, set_id) = match wait {
                     Some(t) => t,
                     None => {
-                        self.note("a choice was answered after its card had closed; that answer was ignored");
+                        // Same rule as the approval above: the dropped-sender case is the
+                        // stop path, and the stop path already said what happened by closing
+                        // the card. Only a late answer is worth a line.
+                        if answer.is_some() {
+                            self.note("a choice was answered after its card had closed; that answer was ignored");
+                        }
                         return;
                     }
                 };
@@ -2032,6 +2578,57 @@ impl Engine {
                 let _ = self.ev.send(EngineEvent::QuestionAnswered { id });
             }
         }
+    }
+
+    /// Answer every dialog this process is holding open, because the turn that raised it is
+    /// being stopped. Returns how many cards were open.
+    ///
+    /// The window and the child both need this. The window needs the frame: a question card
+    /// has no clock any more, so nothing but the turn ending closes it, and a card left in
+    /// "waiting for you" offers a choice nothing will ever take. The child needs the reply:
+    /// pi's tool call is parked on the dialog, and an `abort` it never gets an answer to is
+    /// an `abort` that times out.
+    ///
+    /// An unanswered approval is answered here as a denial - the tool does not run, which is
+    /// the same thing the rust core's release-on-cancel does, and the safe direction for a
+    /// turn somebody just told the app to abandon.
+    fn release_open_cards(&mut self) -> usize {
+        // (wait id, pi's request id, the tool if it was an approval, the set if it was a question)
+        let open: Vec<(u64, String, Option<String>, Option<u64>)> = self
+            .waits
+            .iter()
+            .filter_map(|(id, w)| match w {
+                Wait::Approval { pi_id, tool, .. } => Some((*id, pi_id.clone(), Some(tool.clone()), None)),
+                Wait::Question { pi_id, answered, set_id, .. } if !*answered =>
+                    Some((*id, pi_id.clone(), None, *set_id)),
+                _ => None,
+            })
+            .collect();
+        let now = Instant::now();
+        let released = open.len();
+        for (id, pi_id, tool, set_id) in open {
+            self.waits.remove(&id);
+            self.tr.dialog_resolved(now);
+            match tool {
+                Some(tool) => {
+                    self.reply(&pi_id, json!({ "confirmed": false }));
+                    self.note(format!("{tool} was not answered; the tool did not run"));
+                }
+                None => {
+                    self.reply(&pi_id, json!({ "cancelled": true }));
+                    // The card is finished, so the next call that reuses this caller's key gets
+                    // a card of its own rather than another question on a dead one.
+                    if let Some(st) = set_id {
+                        mark_set_closed(&mut self.q_sets, st);
+                    }
+                    let _ = self.ev.send(EngineEvent::QuestionExpired {
+                        id,
+                        why: cwoffee_engine::event::QuestionWhy::TurnStopped,
+                    });
+                }
+            }
+        }
+        released
     }
 
     async fn on_tick(&mut self) {
@@ -2081,7 +2678,9 @@ impl Engine {
                 Wait::Approval { deadline, tool, .. } if now >= *deadline => {
                     expired.push((*id, Expired::Approval(tool.clone()), None))
                 }
-                Wait::Question { deadline, answered, set_id, .. } if now >= *deadline && !*answered => {
+                Wait::Question { deadline, answered, set_id, .. }
+                    if !*answered && deadline.map(|d| now >= d).unwrap_or(false) =>
+                {
                     expired.push((*id, Expired::Question, *set_id))
                 }
                 _ => {}
@@ -2101,7 +2700,10 @@ impl Engine {
                     if let Some(st) = set_id {
                         mark_set_closed(&mut self.q_sets, st);
                     }
-                    let _ = self.ev.send(EngineEvent::QuestionExpired { id });
+                    let _ = self.ev.send(EngineEvent::QuestionExpired {
+                        id,
+                        why: cwoffee_engine::event::QuestionWhy::TimedOut,
+                    });
                 }
             }
         }
@@ -2134,6 +2736,44 @@ impl Engine {
                 ));
             }
         }
+    }
+}
+
+/// One record per path for a whole turn, newest write winning.
+///
+/// pi reports the files a tool call produced, call by call, and a model that rebuilds the
+/// same workbook three times in one turn really did write it three times. Storing all three
+/// records is what put three near-identical attachment units in the transcript — same name,
+/// slightly different byte counts, and only one file on disk. The path is the identity the
+/// open and Save controls act on, so it is also the identity of the record; the byte count of
+/// an overwritten write describes bytes that are no longer there.
+/// Read cwoffee's config and build the provider it points at, **with the environment applied**.
+///
+/// `Config::load` reads the file; the environment is applied by the caller - the desktop does it
+/// at boot with `apply_env`. Re-loading a config for one ask and skipping that step produced a
+/// quiet and expensive bug on the pi core: with no config file yet (a first run, or a self-test
+/// scratch home) the load answered `Config::default()`, whose base url is the documented local
+/// endpoint `http://127.0.0.1:8090/v1` - the reader's own model server. Every conversation then
+/// stalled eight seconds waiting for a name from an endpoint the app was not answering through,
+/// and on a normal machine that ask is a real request to a real model, costing a prefill nobody
+/// agreed to. The harness sets `CWOFFEE_URL` for exactly this reason; honouring it here is what
+/// keeps a test off the reader's cache.
+pub fn title_provider_at(
+    cfg_path: &Path,
+) -> Option<(Arc<dyn cwoffee_engine::provider::Provider>, String)> {
+    let (mut cfg, _) = Config::load(Some(cfg_path)).ok()?;
+    cfg.apply_env();
+    let base = cfg.provider.base_url.clone();
+    Some((cfg.build_provider().ok()?, base))
+}
+
+fn merge_turn_file(
+    turn: &mut Vec<cwoffee_engine::tools::OutputFile>,
+    f: cwoffee_engine::tools::OutputFile,
+) {
+    match turn.iter().position(|e| e.path == f.path) {
+        Some(at) => turn[at] = f,
+        None => turn.push(f),
     }
 }
 
@@ -2191,8 +2831,102 @@ fn pi_level(r: &Reasoning) -> &'static str {
     }
 }
 
+/// pi's vocabulary back to cwoffee's. pi names two levels cwoffee does not (`minimal`, `max`); both
+/// fold to the nearest cwoffee level rather than being dropped, because this mapping's job is to
+/// report the depth a model is actually running at - for instance after pi clamped a request the
+/// selected model could not honour.
+fn from_pi_level(s: &str) -> Option<Reasoning> {
+    Some(match s {
+        "off" => Reasoning::Off,
+        "minimal" | "low" => Reasoning::Low,
+        "medium" => Reasoning::Medium,
+        "high" => Reasoning::High,
+        "xhigh" | "max" => Reasoning::XHigh,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    /// The endpoint the titler asks has to be the endpoint the turns go to.
+    ///
+    /// A self-test run, and the dev launcher, name their endpoint through `CWOFFEE_URL` and
+    /// write no config file at all. Loading the file and stopping there answers
+    /// `Config::default()`, whose base url is the documented local endpoint - the reader's own
+    /// model server on 127.0.0.1:8090. Measured in a pi-core pass: 42 conversations each
+    /// stalled 8 s on a name that never came back, and on a normal machine those are 42 requests
+    /// to a model the reader pays for. So the env has to be applied here exactly as the desktop
+    /// applies it at boot.
+    #[test]
+    fn the_title_endpoint_follows_the_environment_the_turns_follow() {
+        // One env var, one process: serialise against anything else that touches it.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("cw-title-url-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml"); // deliberately never written
+
+        std::env::set_var("CWOFFEE_URL", "http://127.0.0.1:8190/v1");
+        let got = title_provider_at(&path);
+        let (_, base) = match got {
+            Some(v) => v,
+            None => {
+                std::env::remove_var("CWOFFEE_URL");
+                panic!("an endpoint named in the environment must be usable for the title ask")
+            }
+        };
+        assert_eq!(base, "http://127.0.0.1:8190/v1", "the name ask goes where the turns go");
+
+        // And with nothing in the environment, the default is still the documented local
+        // server - which is the right answer for a normal start, and the reason the env has to
+        // be honoured when it is set.
+        std::env::remove_var("CWOFFEE_URL");
+        let (_, base) = title_provider_at(&path).expect("the default endpoint is still an endpoint");
+        assert_eq!(base, "http://127.0.0.1:8090/v1", "no env, no surprise: the documented local endpoint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Three writes of one path are one attachment.
+    ///
+    /// The session this comes from asked for one spreadsheet. The model rebuilt it three times
+    /// in one turn, the bridge stored all three records, and the transcript printed three units
+    /// for one file — same name, three byte counts, and a disk holding exactly one copy.
+    #[test]
+    fn three_writes_of_one_path_are_one_record() {
+        use cwoffee_engine::tools::{FileKind, OutputFile};
+        let sheet = |bytes: u64| OutputFile {
+            path: ".cws/assistant_attachments/ph_used_laptops.xlsx".into(),
+            name: "ph_used_laptops.xlsx".into(),
+            mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+            bytes,
+            kind: FileKind::Attachment,
+        };
+        let mut turn: Vec<OutputFile> = Vec::new();
+        for write in [sheet(10_094), sheet(10_678), sheet(11_736)] {
+            merge_turn_file(&mut turn, write);
+        }
+        assert_eq!(turn.len(), 1, "one path, one record: {turn:?}");
+        assert_eq!(turn[0].bytes, 11_736, "the newest write is the file on disk");
+
+        // A different path in the same turn is a different deliverable, and arrival order —
+        // which is the reader's order — survives the merge.
+        merge_turn_file(
+            &mut turn,
+            OutputFile {
+                path: ".cws/assistant_attachments/notes.md".into(),
+                name: "notes.md".into(),
+                mime: "text/markdown".into(),
+                bytes: 7,
+                kind: FileKind::Attachment,
+            },
+        );
+        merge_turn_file(&mut turn, sheet(12_000));
+        assert_eq!(turn.len(), 2);
+        assert_eq!(turn[0].path, ".cws/assistant_attachments/ph_used_laptops.xlsx");
+        assert_eq!(turn[0].bytes, 12_000);
+    }
+
     #[test]
     fn an_approval_card_says_each_path_once() {
         // The extension hands over `cwtool check`'s sentence, which already names the path that
@@ -2338,12 +3072,86 @@ mod tests {
     }
 
     #[test]
+    fn a_question_card_has_no_clock_unless_somebody_asks_for_one() {
+        // The extension sends no `timeout` for a cwoffee question, so the bridge must not
+        // invent a deadline of its own: an invented one re-times-out the exact card the
+        // user said should stay open until they answer.
+        assert!(question_deadline(0).is_none(), "no stated budget must mean no clock");
+        assert!(question_deadline(180_000).is_some(), "a stated budget is honoured");
+    }
+
+    #[test]
     fn a_plain_dialog_title_is_still_just_a_question() {
         let mut next = 3u64;
         let mut sets: HashMap<String, QSet> = HashMap::new();
         assert!(canon_question("Which format?", &mut next, &mut sets).is_none(), "an ordinary extension dialog keeps its ordinary shape");
         assert!(canon_question("CWOFFEEQ not json", &mut next, &mut sets).is_none());
         assert_eq!(next, 3, "a payload we could not read changes nothing: the arm builds the plain card");
+    }
+
+    /// The model's answer to "where are you working?" is whatever it was told, and pi names
+    /// the working directory in a `<cwd>` block of its own. For a conversation with no
+    /// workspace that directory is a scratch folder under the temp root, so the model recited
+    /// `/tmp` to a person who had never chosen a folder. The note is appended only for those
+    /// conversations — and for the others the prompt must stay byte for byte what it was,
+    /// because the stable prefix is what the endpoint's prefix cache is keyed on and a spare
+    /// sentence in there is paid for by every session that has a real folder.
+    #[test]
+    fn a_conversation_with_a_folder_is_told_exactly_what_it_was_before() {
+        let before = cwoffee_engine::prompt::cowork_prompt_text(false);
+        let after = cowork_prompt_with_workspace_note(false, Path::new("/home/u/cwoffee-workspace"));
+        assert_eq!(before, after, "the stable prompt grew for conversations that do have a workspace");
+    }
+
+    #[test]
+    fn a_conversation_in_the_temp_folder_is_told_it_has_none() {
+        let p = cowork_prompt_with_workspace_note(false, Path::new("/tmp"));
+        assert!(p.contains("no workspace"), "{p}");
+        assert!(p.contains("answer \"none\""), "{p}");
+        // Naming the scratch path in the note would put the words back in its mouth.
+        assert!(!p.contains("/tmp"), "the note recited the scratch path: {p}");
+        // A folder inside the temp folder was chosen by somebody, so it is a workspace.
+        let r = cowork_prompt_with_workspace_note(false, Path::new("/tmp/cwoffee-project"));
+        assert_eq!(
+            cwoffee_engine::prompt::cowork_prompt_text(false),
+            r,
+            "a chosen folder inside the temp folder was called no-workspace"
+        );
+    }
+
+    /// The user's report: "can't switch search engine", with the app quoting a TOML parse
+    /// error — `backend = auto`, `invalid string expected "` — and saving nothing. The pi
+    /// core built the key list by hand and left the value unquoted; the writer's own
+    /// re-parse guard then refused the edit. So the assertion is not "the value contains a
+    /// quote", it is "the file the writer produces still parses, and says what was clicked".
+    #[test]
+    fn a_search_backend_choice_writes_a_line_the_config_file_can_still_read() {
+        let text = "# my notes — do not lose me\nmode = \"ask\"\n\n[search]\nbackend = \"duckduckgo\"\nmax_results = 8\n";
+        for want in ["auto", "duckduckgo", "searxng"] {
+            let keys = if want == "searxng" {
+                search_keys(want, "http://127.0.0.1:8080/search")
+            } else {
+                search_keys(want, "")
+            };
+            let refs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let (out, changed) = Config::set_search_keys_in(text, &refs);
+            assert!(!changed.is_empty(), "nothing was written for backend={want}");
+            let back: cwoffee_engine::config::Config =
+                toml::from_str(&out).unwrap_or_else(|e| panic!("backend={want} wrote a file that will not parse: {e}\n{out}"));
+            assert_eq!(back.search.backend, want, "the file does not say what was clicked: {out}");
+            assert!(out.contains("# my notes"), "the notes went away: {out}");
+            assert!(out.contains("max_results = 8"), "the rest of the section went away: {out}");
+            if want == "searxng" {
+                assert!(
+                    out.contains("searxng_url = \"http://127.0.0.1:8080/search\""),
+                    "the manual instance needs its URL in the file: {out}"
+                );
+            }
+        }
+        // A provider that does not use a URL must not leave one behind as a claim.
+        let keys = search_keys("duckduckgo", "http://127.0.0.1:8080/search");
+        assert_eq!(keys.len(), 1, "a duckduckgo choice wrote a searxng URL: {keys:?}");
+        assert_eq!(keys[0].1, "\"duckduckgo\"", "the value is not a TOML literal: {keys:?}");
     }
 
 }

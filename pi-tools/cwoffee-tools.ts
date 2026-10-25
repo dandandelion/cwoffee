@@ -19,10 +19,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const CWTOOL = process.env.CWOFFEE_CWTOOL ?? "";
 // Fail-closed, like cwoffee's ApprovalRequested: if the UI is gone, pi resolves to a deny.
 const APPROVAL_TIMEOUT_MS = Number(process.env.CWOFFEE_APPROVAL_TIMEOUT_MS ?? 15_000);
-// Longer than an approval on purpose, and it matches the engine's own default: an
-// unanswered approval costs nothing, while a question is a decision the user may be
-// thinking about. The bridge mirrors the timeout from the card side anyway.
-const QUESTION_TIMEOUT_MS = Number(process.env.CWOFFEE_QUESTION_TIMEOUT_MS ?? 180_000);
+// No clock on a question, by default. A question is a decision parked in front of a person:
+// it may take them an hour because the answer belongs to somebody else, and a card that
+// expires answers it for them. The turn simply pauses; Stop ends it. Set
+// CWOFFEE_QUESTION_TIMEOUT_MS to put a clock back on purpose — the bridge honours whatever
+// budget arrives with the dialog (question_deadline in crates/bridge/src/host.rs), and
+// question_timeout_secs in cwoffee's config.toml is the Rust core's own knob.
+const QUESTION_TIMEOUT_MS = Number(process.env.CWOFFEE_QUESTION_TIMEOUT_MS ?? 0);
 // Off by default: this extension runs inside the model's process, and chatter on stderr
 // lands in whoever is reading the bridge's log. One flag turns it on when the question
 // round trip is the thing being debugged.
@@ -62,6 +65,17 @@ function splitPicks(value: string, labels: string[]): number[] {
  * per question — asking them one after another would make the user answer three cards and
  * would be punished by a budget the tool already sized for a single reading.
  */
+/**
+ * Options for one question dialog. Empty object = no `timeout` key, which in pi's rpc mode
+ * means the dialog resolves only when the host answers it or the turn aborts — exactly the
+ * paused state the card is supposed to be. Passing `timeout: 0` would be the same today,
+ * but writing the key out would make "is there a clock on this?" a question about a number
+ * rather than about the absence of one.
+ */
+function dialogOpts(): Record<string, unknown> {
+	return QUESTION_TIMEOUT_MS > 0 ? { timeout: QUESTION_TIMEOUT_MS } : {};
+}
+
 async function askOne(ctx: any, q: any, callId: string): Promise<unknown> {
 	// `k` names this call for the bridge, and it has to name *this* call: `cwtool` numbers a
 	// fresh set in every process, so the engine's own set id is 1 for the first set of every
@@ -71,7 +85,7 @@ async function askOne(ctx: any, q: any, callId: string): Promise<unknown> {
 	const title = `${CANON_Q}${JSON.stringify({ k: key, q })}`;
 	const labels: string[] = (q.options ?? []).map((o: any) => String(o.label));
 	if (labels.length > 0) {
-		const picked = await ctx.ui.select(title, labels, { timeout: QUESTION_TIMEOUT_MS });
+		const picked = await ctx.ui.select(title, labels, dialogOpts());
 		if (DEBUG) console.error(`[cwoffee-tools] select ${JSON.stringify(q.question)} -> ${JSON.stringify(picked)}`);
 		if (picked === undefined || picked === null) {
 			console.error(`[cwoffee-tools] nobody answered "${String(q.question).slice(0, 60)}" — the tool will say so rather than guess`);
@@ -81,7 +95,7 @@ async function askOne(ctx: any, q: any, callId: string): Promise<unknown> {
 		const picks = splitPicks(value, labels);
 		return picks.length > 0 ? { text: value, options: picks } : { text: value, options: [] };
 	}
-	const typed = await ctx.ui.input(title, "type an answer", { timeout: QUESTION_TIMEOUT_MS });
+	const typed = await ctx.ui.input(title, "type an answer", dialogOpts());
 	if (DEBUG) console.error(`[cwoffee-tools] input ${JSON.stringify(q.question)} -> ${JSON.stringify(typed)}`);
 	if (typed === undefined || typed === null) {
 		console.error(`[cwoffee-tools] nobody answered "${String(q.question).slice(0, 60)}" — the tool will say so rather than guess`);

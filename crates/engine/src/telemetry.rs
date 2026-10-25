@@ -61,7 +61,9 @@ pub const CHARS_PER_TOKEN: f64 = 4.0;
 pub struct TurnStats {
     /// ms from request start to the first delta; 0 until one arrives.
     pub ttft_ms: u64,
-    /// ms since that first delta.
+    /// ms the model spent generating so far — the sum of the gaps between
+    /// text/reasoning deltas, each capped, so neither a tool run, a dialog
+    /// waiting on a person, nor the next round's prefill is charged to decode.
     pub streaming_ms: u64,
     /// Characters generated so far, answer and reasoning together.
     pub chars: u64,
@@ -76,11 +78,15 @@ pub struct TurnStats {
 
 impl TurnStats {
     /// Recompute the derived fields from the raw counters.
-    pub fn derive(&mut self, since_first_delta_ms: u64) {
-        self.streaming_ms = since_first_delta_ms;
+    ///
+    /// `gen_ms` is generation time, not wall time: whoever calls this owns the
+    /// decision about what counts as generating. Passing a whole turn's elapsed
+    /// seconds here reports the sandbox's runtime as the model's typing speed.
+    pub fn derive(&mut self, gen_ms: u64) {
+        self.streaming_ms = gen_ms;
         self.est_tokens = (self.chars as f64 / CHARS_PER_TOKEN).round() as u64;
-        self.est_decode_tps = if since_first_delta_ms > 0 {
-            self.est_tokens as f64 / (since_first_delta_ms as f64 / 1000.0)
+        self.est_decode_tps = if gen_ms > 0 {
+            self.est_tokens as f64 / (gen_ms as f64 / 1000.0)
         } else {
             0.0
         };

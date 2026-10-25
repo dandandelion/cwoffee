@@ -96,6 +96,64 @@ fn data_dir() -> PathBuf {
         .join("cwoffee")
 }
 
+/// The part of a gateway hand-off that does not change while the window is open.
+///
+/// These are the values a standalone gateway cannot recover by itself: the core and the endpoint
+/// came from this command line or this environment, and the config path is whatever `--config`
+/// named. Everything the user may have moved during the session — model, folder, mode, persona —
+/// is read from the host at close time instead, in `handoff_ctx`.
+struct HandoffStatic {
+    core: String,
+    url: String,
+    dist: Option<std::path::PathBuf>,
+    config_path: std::path::PathBuf,
+}
+
+/// The full argument set for a hand-off: the static half plus what the host holds **now**.
+///
+/// Read at close rather than remembered from boot. A conversation that changed model, folder,
+/// mode or persona halfway through would otherwise be handed to a gateway configured for the
+/// conversation the user started the window with.
+fn handoff_ctx(
+    st: &HandoffStatic,
+    host: &dyn cwoffee_engine::host::HostOps,
+) -> gateway_ctl::HandoffCtx {
+    let hs = host.state();
+    gateway_ctl::HandoffCtx {
+        core: st.core.clone(),
+        url: st.url.clone(),
+        model: hs.model.clone(),
+        workspace: hs.workspace.clone(),
+        mode: hs.mode.as_str().to_string(),
+        persona: hs.persona.as_str().to_string(),
+        dist: st.dist.clone(),
+        config_path: st.config_path.clone(),
+    }
+}
+
+/// The "keep devices working after this window closes" setting, acted on.
+///
+/// Off is the default and the quiet path: the gateway is a task inside this process, so closing
+/// the window stops it. On hands the port to the standalone gateway first, then lets the window
+/// go — see `gateway_ctl::handoff` for why one listener cannot survive its own process. What
+/// happened goes to the log and to the hand-off's own log file, because a process with no
+/// terminal has no other audience, and the settings panel has already said what it would do.
+fn handoff_at_close(state: &AppState, st: &HandoffStatic) {
+    if !cwoffee_engine::prefs::is_on(state.store.as_ref(), "gateway_on_exit") {
+        return;
+    }
+    match state.gateway.handoff(&handoff_ctx(st, state.host.as_ref())) {
+        Ok(r) => eprintln!(
+            "[cwoffee] gateway hand-off: {}; started as pid {} via {}; stop it with `{}`",
+            r.note, r.pid, r.via, r.stop
+        ),
+        Err(e) => eprintln!(
+            "[cwoffee] gateway NOT kept running: {e}\n[cwoffee] (the setting was on, so this \
+             window tried to hand the port over and could not)"
+        ),
+    }
+}
+
 fn main() {
     // MUST be the first thing that happens: the GPU policy has to be in place
     // before GTK/EGL is initialised, or libglvnd hands us an NVIDIA context on a
@@ -296,6 +354,14 @@ fn main() {
         eprintln!(
             "[cwoffee] persona: chat is not available on the rust core — that core is the coworker prompt, \
              the tool registry and a workspace. Set CWOFFEE_CORE=pi for a tool-less chat, or persona = cowork."
+        );
+        // Worth naming where this line goes, because for a desktop launch there is no
+        // terminal: the app exits at boot and the icon looks like a launcher that does
+        // nothing. The reason is real, it is just filed somewhere nobody thinks to look.
+        eprintln!(
+            "[cwoffee] no window will appear from this. started from a .desktop file this output only \
+             reaches the journal (journalctl --user -b | grep cwoffee.desktop); the core a menu launch \
+             gets is recorded by scripts/install-desktop.sh, which reads persona from the config."
         );
         std::process::exit(1);
     }
@@ -517,6 +583,31 @@ fn main() {
     }
 
     let quit_armed: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+    let handoff_static = Arc::new(HandoffStatic {
+        core: core.clone(),
+        url: appcfg.provider.base_url.clone(),
+        dist: Some(ui_dist_dir()),
+        config_path: config_path.clone(),
+    });
+    // A flag, not a setting, so a script can watch a hand-off happen without driving a window:
+    // hand the port over with this process's own values, print the verdict, and leave. Used by
+    // scripts/gateway-handoff.mjs, which then asks the port who is answering it.
+    if args.iter().any(|a| a == "--handoff-gateway") {
+        match state.gateway.handoff(&handoff_ctx(&handoff_static, state.host.as_ref())) {
+            Ok(r) => {
+                eprintln!(
+                    "[handoff] bound={} pid={} via={} binary={} stop=`{}`\n[handoff] {}",
+                    r.bound, r.pid, r.via, r.binary, r.stop, r.note
+                );
+                // Leave the child alone; this process has no business owning it.
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("[handoff] failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let rendered_flag = state.rendered.clone();
     let app = tauri::Builder::default()
         // Rendered markdown contains links to pages the model fetched. Those must
@@ -556,6 +647,61 @@ fn main() {
                     );
                 }
             }
+            // One ask at startup is not enough, and the reason is worse than a slow frame clock.
+            // When this window is covered, WebKitGTK does not merely stop firing requestAnimationFrame:
+            // it freezes the page's timer loop entirely, so the harness cannot run even its own
+            // watchdog. Two runs ended with no verdict and no error because of that - the log just
+            // stopped, mid-chain, and the board clock answered 25 minutes later. So the *application*
+            // keeps its own window on top for the length of an armed run: the page's timers are
+            // precisely the thing that cannot be trusted when the window is gone.
+            if commands::selftest_armed() {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    // Wayland ignores always-on-top for a normal toplevel, so the only lever that
+                    // actually moves this window in the stack is activate (focus). Taking focus back
+                    // is rude, so it is rationed: at most one activation per minute, ten in a run.
+                    // A hard cap of three was tried first and spent all of them in the first minute,
+                    // on a window that had barely lost focus during startup, leaving nothing for the
+                    // silence that arrived twenty minutes later - which is the one that costs the run
+                    // its geometry checks.
+                    //
+                    // One per minute turned out to be too slow for the ordinary case: the terminal
+                    // the harness was started from is a maximised window, it takes focus back every
+                    // time a command prints, and a covered window is not painted at all. A run lost
+                    // 29 of its geometry checks that way and came back with failures that were about
+                    // the compositor. So: one per twenty seconds, thirty in a run - still only in an
+                    // armed run, which is a test the person started on purpose.
+                    let mut focuses = 0u32;
+                    let mut last = std::time::Instant::now();
+                    for i in 1..=120u64 {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        let Some(win) = handle.get_webview_window("main") else { return };
+                        if win.is_minimized().unwrap_or(false) {
+                            // Nothing is painted into a minimised window at all, so putting it back
+                            // is not a courtesy question.
+                            let _ = win.unminimize();
+                            let _ = win.set_focus();
+                            eprintln!("[selftest] the window was minimised at t={}s; the run puts it back", i * 5);
+                            last = std::time::Instant::now();
+                            continue;
+                        }
+                        if focuses >= 30 || last.elapsed() < std::time::Duration::from_secs(20) {
+                            continue;
+                        }
+                        if win.is_focused().unwrap_or(true) {
+                            continue;
+                        }
+                        focuses += 1;
+                        last = std::time::Instant::now();
+                        let _ = win.set_focus();
+                        eprintln!(
+                            "[selftest] this window had lost focus (activation {} of 30 at t={}s); the run activates it, because a page nothing composites cannot be measured",
+                            focuses,
+                            i * 5
+                        );
+                    }
+                });
+            }
             let cfg = app.config();
             let cfg_build = cfg.build.clone();
             eprintln!(
@@ -592,6 +738,10 @@ fn main() {
             let mut armed = quit_armed.lock().unwrap();
             let already = armed.map(|t| t.elapsed() < std::time::Duration::from_secs(8)).unwrap_or(false);
             if !busy {
+                // The window is going away for good. This is the only place the "keep devices
+                // working" setting can be honoured, and it has to be before the process dies:
+                // the gateway is a task in here.
+                handoff_at_close(&state, &handoff_static);
                 return;
             }
             if !already {
@@ -615,6 +765,9 @@ fn main() {
                 if still_busy { "and " } else { "" },
                 if still_busy { " — its children are being killed" } else { "" }
             );
+            // Same as the calm path: the turn is settled, the window is going, so this is the
+            // moment to hand the gateway over if the setting says so.
+            handoff_at_close(&state, &handoff_static);
         })
         .invoke_handler(tauri::generate_handler![
             commands::attach,
@@ -628,12 +781,12 @@ fn main() {
             commands::set_reasoning,
             commands::set_persona,
             commands::tools_view,
-            commands::titlegen_status,
             commands::list_models,
             commands::migration_notes,
             commands::gateway_status,
             commands::gateway_start,
             commands::gateway_stop,
+            commands::gateway_handoff_plan,
             commands::set_model,
             commands::session_state,
             commands::list_sessions,
@@ -651,6 +804,7 @@ fn main() {
             commands::session_messages,
             commands::share_markdown,
             commands::save_markdown_file,
+            commands::save_attachment_as,
             commands::search_settings,
             commands::set_search_backend,
             commands::search_probe,
@@ -668,6 +822,9 @@ fn main() {
             commands::clear_session,
             commands::switch_session,
             commands::selftest_armed,
+            commands::present_selftest_window,
+            commands::selftest_window_state,
+            commands::selftest_config,
             commands::gpu_report,
             commands::clipboard_image,
             commands::selftest_stage_clipboard,
@@ -747,18 +904,50 @@ async fn pi_host(
         );
     } else {
         let key = appcfg.api_key().unwrap_or_else(|| "unused".into());
-        let path = cwoffee_bridge::mount::write_dev_provider(
+        let (path, mounted) = cwoffee_bridge::mount::write_dev_provider(
             &agent_dir,
             PI_PROVIDER,
             &appcfg.provider.base_url,
             model,
             &key,
             cwoffee_bridge::mount::pi_api_for_kind(&appcfg.provider.kind),
+            &appcfg.provider.kind,
             window,
+            // The thinking levels the probe found for this model. pi clamps any level the
+            // entry does not declare, so a model that can think and is filed without this
+            // list answers every conversation at its own template default.
+            &appcfg
+                .models
+                .get(model)
+                .map(|r| r.efforts.clone())
+                .unwrap_or_default(),
         )
         .map_err(|e| format!("cannot write {}: {e}", models.display()))?;
-        println!("[cwoffee/pi] provider cwoffee -> {} (written to {})", appcfg.provider.base_url, path.display());        // Endpoints registered on the model screen have to be reachable by name, or "use this
-        // model" is a button the core cannot honour.
+        // What the boot line claims has to be what the function did. The old line printed
+        // "(written to …)" on every path, including the one where the file was left pointing
+        // at another endpoint — which is the shape of "the installed app cannot find the
+        // model": a stale scripted provider entry in pi's file, the app asking pi for a model
+        // that entry did not list, and turns ending with nothing on screen.
+        match &mounted {
+            cwoffee_bridge::mount::MountOutcome::Written => println!(
+                "[cwoffee/pi] provider {PI_PROVIDER} -> {} (written to {})",
+                appcfg.provider.base_url,
+                path.display()
+            ),
+            cwoffee_bridge::mount::MountOutcome::Replaced { previous } => println!(
+                "[cwoffee/pi] provider {PI_PROVIDER} -> {} (replaced the entry that pointed at {previous}; \
+                 it did not list {model}, and pi cannot answer with a model it has never seen)",
+                appcfg.provider.base_url,
+            ),
+            cwoffee_bridge::mount::MountOutcome::Foreign { base_url } => println!(
+                "[cwoffee/pi] provider {PI_PROVIDER} was left as it is: {} lists {model}, so requests for \
+                 {model} go there, not to {} in cwoffee's config. If that is not what you want, remove that \
+                 provider from {}.",
+                base_url,
+                appcfg.provider.base_url,
+                path.display()
+            ),
+        }
         let cfg_path = cwoffee_engine::config::Config::default_path();
         match cwoffee_bridge::mount::mount_provider_rows(&agent_dir, &cfg_path) {
             Ok(list) if !list.is_empty() => println!(

@@ -11,6 +11,12 @@
 //!   * static files: the built `ui/dist`, so the normal UI runs in a browser
 //!   * `/ws`: JSON RPC plus a pushed event stream
 //!
+//! The socket beats every 25s with `{"type":"beat"}` as well as a WebSocket ping. The
+//! control frame alone is not enough: the browser answers it without telling the page,
+//! so a client has no way to notice a peer that vanished while it was backgrounded. A
+//! data frame it can timestamp is what makes "silent for twice the beat interval" a
+//! detectable dead connection (see `revalidateSocket` in ui/src/lib/transport.ts).
+//!
 //! ## Security posture, and its limits
 //!
 //! A cwoffee session has a sandboxed shell and file writes in a workspace. A
@@ -714,6 +720,17 @@ async fn websocket(
                 }
             }
             _ = ping.tick() => {
+                // The control-frame ping keeps the connection warm and tells the page
+                // nothing: a browser answers it silently, so a client cannot use it to
+                // tell a live socket from a half-open one. That is exactly the state a
+                // phone tab comes back to after it was backgrounded mid-turn - `readyState`
+                // still OPEN, peer reaped while the page was frozen - and every call it then
+                // makes waits out its own timeout, which reads as "nothing works until I
+                // refresh". So the beat also travels as a data frame: the front end stamps
+                // the arrival time of any frame it sees, and silence past this interval is
+                // what tells it the socket is lying about being open.
+                let beat = serde_json::to_string(&serde_json::json!({ "type": "beat" })).unwrap_or_default();
+                if sink.send(txt(beat)).await.is_err() { gw_bye!(addr, "heartbeat write failed"); }
                 if sink.send(Message::Ping(Default::default())).await.is_err() { gw_bye!(addr, "ping write failed"); }
             }
         }
@@ -1078,6 +1095,47 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             serde_json::to_value(cwoffee_engine::share::share_document(&row.title, &row.workspace, &rows))
                 .map_err(|e| e.to_string())
         }
+        // An attachment across the network: the file lives on the host and the browser
+        // tab or phone does not have a filesystem to reach, so the bytes travel inside
+        // the reply. Two things are decided by the engine rather than here, on purpose:
+        // what counts as an attachment (only this conversation's
+        // `.cws/assistant_attachments/` — never a path the model chose to name) and how
+        // much is too much to inline. Both answers come back as a sentence a person can
+        // act on, because a failed request with no way forward is how a working feature
+        // gets abandoned.
+        //
+        // Watch-readable, like `share_markdown`: a watcher can already read every tool
+        // result in this conversation, and the file is this conversation's own output,
+        // confined to its own folder. It writes nothing.
+        "attachment_bytes" => {
+            use cwoffee_engine::tools::scratch::{human_bytes, InlineFit};
+            let path = arg_str(&args, "path")?;
+            let id = arg_i64(&args, "session")?;
+            let row = h
+                .store
+                .session(id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("session {id} does not exist"))?;
+            match cwoffee_engine::tools::scratch::inline_attachment(
+                std::path::Path::new(&row.workspace),
+                &path,
+            ) {
+                Ok(InlineFit::Inlined(a)) => Ok(json!({
+                    "name": a.name,
+                    "mime": a.mime,
+                    "bytes": a.bytes,
+                    "b64": a.b64,
+                })),
+                Ok(InlineFit::TooBig { bytes, limit }) => Err(format!(
+                    "{path} is {}, and this channel hands over at most {}. It is saved in this \
+                     conversation's folder as {path} — open the folder from the conversation's \
+                     header and copy the file from there.",
+                    human_bytes(bytes),
+                    human_bytes(limit),
+                )),
+                Err(e) => Err(e),
+            }
+        }
         // ---- web search: the panel on a phone drives the same file the desktop
         // panel writes. Reading is open to a watch token (it names a provider, not
         // a payload); choosing one and running a probe are drive-only: the first
@@ -1221,20 +1279,18 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 "xhigh" => cwoffee_engine::Reasoning::XHigh,
                 other => return Err(format!("unknown reasoning level {other:?}")),
             };
-            h.host.send(HostCmd::SetReasoning { reasoning: r });
+            // `persist` says which dial was moved: the settings screen (the default for new
+            // conversations, written to the config file) or the composer (this conversation only).
+            // Absent means the composer, so a client that never learned the difference cannot
+            // rewrite someone's default by accident.
+            let persist = args.get("persist").and_then(|v| v.as_bool()).unwrap_or(false);
+            h.host.send(HostCmd::SetReasoning { reasoning: r, persist });
             Ok(json!(true))
         }
-        // What the local titler is and does. Read-only by design: the switch that turns
-        // it on is a config key, because the cost is an ~870 MB spike per new conversation
-        // and that belongs in a file someone chose, not in a toggle pressed by accident.
-        "titlegen_status" => {
-            let (cfg, path) = cwoffee_engine::config::Config::load(None).unwrap_or_default();
-            let v = serde_json::to_value(cfg.titlegen_cfg().status(None)).map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({
-                "status": v,
-                "config_path": path.map(|p| p.display().to_string()),
-            }))
-        }
+        // The local titler is gone, and with it this verb: a conversation is named by
+        // the endpoint it already answers through, in a request the bridge and the engine
+        // share (`crates/engine/src/titling.rs`), so there is no helper to report on and
+        // nothing for a remote client to ask about.
         "tools_view" => {
             // Read-only, and from the registry rather than a copy: the list a client
             // shows is the list the model is offered.
@@ -1478,6 +1534,14 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         }
         "set_model" => {
             need_drive(role)?;
+            // `persist: true` here is deliberate, and it is not an oversight next to
+            // `set_reasoning`, where a remote pick must not write the default. There is no
+            // per-conversation model control anywhere in this app: the model is chosen on the
+            // settings screen and the composer only reports it. So a phone asking for a different
+            // model is making the same ask as the desktop's settings screen, and one answer - the
+            // config file - is what keeps a phone tab and the desktop from disagreeing about which
+            // model is running. Thinking effort is the opposite case: it has a composer dial, and
+            // that dial belongs to one conversation.
             h.host.send(HostCmd::SetModel { model: arg_str(&args, "model")?, persist: true });
             Ok(json!(true))
         }
@@ -3004,6 +3068,78 @@ mod tests {
 
         assert_eq!(h.host.state().turns, turns_before, "sharing ran a turn");
         assert_eq!(h.host.state().session_id, before, "sharing moved the host");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the attachments rule: a phone tab gets the file itself, and the
+    /// one folder it can come from is enforced by the engine, not by this arm trusting
+    /// the path in the request. The path arrives from a tool result the model wrote, so
+    /// "only under `.cws/assistant_attachments/`, and only for the session you named" is
+    /// the boundary that keeps a turn from offering `/etc/passwd` or another
+    /// conversation's work.
+    #[tokio::test]
+    async fn an_attachment_crosses_the_wire_only_from_its_own_folder() {
+        use cwoffee_engine::tools::scratch::base64;
+        let dir = unique_dir("attach");
+        let h = test_handle_in(&dir);
+        let id = match run_cmd("new_session", serde_json::json!({ "title": "hand me the file" }), Role::Drive, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("new_session returned {other:?}"),
+        };
+        let here = std::path::Path::new(&dir).join(".cws/assistant_attachments");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::write(here.join("hand.html"), b"<html>hi</html>").unwrap();
+        // A file the model wrote while working, and one that belongs to the person —
+        // neither is reachable through this command.
+        std::fs::write(std::path::Path::new(&dir).join("report.md"), b"work").unwrap();
+        std::fs::write(std::path::Path::new(&dir).join("notes.md"), b"theirs").unwrap();
+
+        let out = match run_cmd(
+            "attachment_bytes",
+            serde_json::json!({ "session": id, "path": ".cws/assistant_attachments/hand.html" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .unwrap()
+        {
+            serde_json::Value::Object(o) => o,
+            other => panic!("attachment_bytes returned {other:?}"),
+        };
+        assert_eq!(out["name"], "hand.html");
+        assert_eq!(out["mime"], "text/html");
+        assert_eq!(out["bytes"], 15);
+        assert_eq!(out["b64"], base64(b"<html>hi</html>"), "the bytes must survive the wire");
+
+        for bad in ["report.md", "notes.md", "/etc/passwd", ".cws/assistant_attachments/../secret.txt"] {
+            let err = run_cmd("attachment_bytes", serde_json::json!({ "session": id, "path": bad }), Role::Watch, &h)
+                .await
+                .expect_err("{bad} is not an attachment");
+            assert!(!err.is_empty(), "{bad}: refused with no reason");
+        }
+
+        // A conversation that does not exist has no folder to read, and the reply must
+        // not go looking at the host's current one.
+        let err = run_cmd(
+            "attachment_bytes",
+            serde_json::json!({ "session": 900_001i64, "path": ".cws/assistant_attachments/hand.html" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a conversation that does not exist has no attachments");
+        assert!(err.contains("does not exist"), "got {err}");
+
+        // The request has to name the file: an empty path is a bug in the client, and
+        // silently reading the folder would hide it.
+        let err = run_cmd("attachment_bytes", serde_json::json!({ "session": id }), Role::Watch, &h)
+            .await
+            .expect_err("a missing path must be an error, not a listing");
+        assert!(err.contains("path"), "got {err}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

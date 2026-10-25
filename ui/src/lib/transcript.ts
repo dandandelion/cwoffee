@@ -1,4 +1,18 @@
 import { pageLog } from './pagelog'
+import { LoopHold, IDLE_HOLD, prefersStill } from './anipause'
+
+/**
+ * The transcript's cup: two drawings, one element. The loop that runs while a block is producing
+ * output, the loop that runs when it is resting, and a still of each for reduced motion.
+ */
+const CUP_ART = {
+  busy: '/cwoffee_generating_generation_1.webp',
+  busyStill: '/cwoffee_generating_generation_still.webp',
+  idle: '/cwoffee_generating_idle_1.webp',
+  idleStill: '/cwoffee_generating_idle_still.webp',
+}
+/** The pause between laps of the resting cup: the same range the opening-screen cup draws from. */
+const CUP_IDLE_HOLD = IDLE_HOLD
 
 // Resolved once: the plugin module does not exist in a plain browser build, and a
 // static import would make the preview crash at load rather than at click.
@@ -48,19 +62,28 @@ async function openExternal(href: string) {
  */
 
 import type { AttachmentMeta, EngineEvent, ExecStream, FileChange, StoredMessage } from './events'
-import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, firstItemEnd, listMarker, maybeListMarker, tableHeadEnd, tableHeadPending, tableRowEnd, tableSkeletonHtml, tableRowHtml, fenceOpen, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, InlineStream } from './markdown'
-import { fmtThink } from './think'
-import { openPreview, inlineSvg } from './preview'
+import { renderMarkdown, LiveMarkdown, needsMarkdown, firstBlockEnd, firstItemEnd, listMarker, maybeListMarker, tableHeadEnd, tableHeadPending, tableRowEnd, tableSkeletonHtml, tableRowHtml, fenceOpen, fenceStart, codeHeadHtml, blockKind, foldsWhenClosed, actIcon, lineGutterHtml, lineGutterDelta, lineNumbers, revealOn, revealWords, revealDuration, REVEAL_ANIM_MS, InlineStream } from './markdown'
+import { fmtThink, fmtWords, countWords } from './think'
+import { LoopWatch, describeLoop, type LoopFinding } from './loop'
+import { openPreview, inlineSvg, inlineRender } from './preview'
 
-/** Clipboard feedback without a toast system: the button says it, briefly. */
-function markCopied(btn: HTMLElement) {
-  const prev = btn.textContent ?? 'copy'
-  btn.textContent = 'copied'
+/**
+ * Clipboard feedback without a toast system: the button says it, briefly.
+ *
+ * It says it by changing the glyph, not the text. This used to write the word "copied" into the
+ * button, and the button is a 24px icon box: the word was clipped to a couple of letters, and on
+ * restoring, `prev` was the button's old `textContent` - empty, because its content is an inline
+ * SVG - so the icon came back as nothing and the button went on being clickable while invisible.
+ * A tick in the same slot, with the saved markup put back afterwards, is the same message at the
+ * size the row has.
+ */
+function markCopied(btn: HTMLElement, icon: string) {
+  btn.innerHTML = actIcon('check', 14)
   btn.classList.add('done')
   window.setTimeout(() => {
-    btn.textContent = prev
+    btn.innerHTML = icon
     btn.classList.remove('done')
-  }, 1200)
+  }, 1400)
 }
 import type { OutputFile, QuestionRequested } from './events'
 
@@ -73,6 +96,27 @@ function fmtSize(n: number): string {
 function shortMime(mime: string): string {
   const sub = mime.split('/')[1] ?? mime
   return sub.split(';')[0]
+}
+
+/**
+ * Replace one finished reveal span with the text it wraps.
+ *
+ * Returns 1 when the span went away and 0 when it stayed: a span that holds markup —
+ * a link, a code span, a bold run, a hard break — is the markup, and collapsing that
+ * would lose the thing the word *is* rather than the thing the animation was.
+ */
+function collapseSpan(s: HTMLElement): number {
+  if (s.firstElementChild) return 0
+  const kids = s.childNodes
+  if (kids.length === 1 && kids[0].nodeType === Node.TEXT_NODE) {
+    s.replaceWith(document.createTextNode(kids[0].nodeValue ?? ''))
+    return 1
+  }
+  if (!kids.length) {
+    s.remove()
+    return 1
+  }
+  return 0
 }
 
 /**
@@ -173,6 +217,12 @@ async function copyToClipboard(text: string): Promise<boolean> {
 
 export type BlockKind = 'user' | 'reasoning' | 'answer' | 'tool' | 'note' | 'warn' | 'fail'
 
+/**
+ * What kind of growth just happened, which is what decides whether the view follows it. See
+ * `Transcript.follow`.
+ */
+export type Growth = 'work' | 'ask' | 'text' | 'chrome' | 'you'
+
 
 interface ToolRefs {
   card: HTMLElement
@@ -214,11 +264,25 @@ export class Transcript {
   private raf = 0
   /** Collected during a turn so it can be committed once, at stream end. */
   private collected: { answer: string; reasoning: string } = { answer: '', reasoning: '' }
-  // Thinking blocks are clamped to a few lines by default. While the model is
-  // thinking they follow the tail (the newest thought is the interesting one);
-  // once the turn is over they snap back to the start, which is where a reader
-  // scanning a finished block expects to begin.
+  // What the thinking blocks of this turn left on screen: one header line each, rewritten from
+  // "thinking" to the duration when the thought ends. There is no body to clamp or scroll - see
+  // `thoughtLine`.
   private reasoningEls: HTMLElement[] = []
+  /**
+   * The loop detector for the turn being streamed, and whether its finding has been shown yet.
+   * Live only: a session reloaded from disk is not replayed through it, because a turn that already
+   * finished is not going to start looping again, so paying for the check on load would be paying
+   * for nothing. The cost is measured in `scripts/loop-probe.mjs`: about 12µs per 18-character
+   * delta, which is about 0.2ms of a 16.7ms frame at a typical token rate, on a 400-word ring with
+   * a map capped at 800 entries - so it does not grow with the length of the turn.
+   */
+  private loop: LoopWatch | null = null
+  private loopShown = false
+  /** Set by the app, so "this looks stuck" can be said out loud once per turn. */
+  onLoop?: (f: LoopFinding) => void
+  /** The thought line currently streaming, and how much thinking has landed behind it. */
+  private thoughtBuf: HTMLElement | null = null
+  private thoughtWords = 0
   /**
    * Answer bodies created this turn. Markdown is applied to them exactly once,
    * at stream end — never per delta.
@@ -258,6 +322,23 @@ export class Transcript {
    * lands as a `<tr>` instead of the whole table replacing a paragraph at the end.
    */
   private liveTable: { delim: string; tbody: HTMLElement } | null = null
+  /**
+   * The fenced block being written, when the model is inside one right now.
+   *
+   * A code fence is the one block a reader can watch being built, and until now what they watched
+   * was backticks and raw lines rather than a block. So the head lands the moment the opening fence
+   * does - language, line count, actions, all of it disabled - and the code streams into the
+   * `<code>` that is already on screen. The block still *commits* only when the closing fence
+   * lands: rendering early is a display decision, committing early would re-parse text that has not
+   * arrived yet, and `firstBlockEnd` keeps that half of the rule.
+   */
+  private liveCode: {
+    wrap: HTMLElement
+    code: HTMLElement
+    lines: number
+    meta: HTMLElement | null
+    gutter: HTMLElement | null
+  } | null = null
   /** Files produced so far this turn, deduped by path, and the one row that
    *  shows them. */
   private turnFiles: OutputFile[] = []
@@ -268,7 +349,10 @@ export class Transcript {
    */
   private notes: { text: string; session: number | null }[] = []
   private questionCards = new Map<number, HTMLElement>()
-  private fileStrip: HTMLElement | null = null
+  /** A turn's file line is one or two elements: the attachments on their own right-aligned line,
+   *  and the working strip underneath. Tracked together because both belong to the turn, and a
+   *  leftover element re-parents yesterday's files into today's turn. */
+  private fileEls: HTMLElement[] = []
   private live = new LiveMarkdown()
   /**
    * How much of `live` has been turned into nodes. The streaming paint is
@@ -300,6 +384,16 @@ export class Transcript {
   /** Following the stream: pin to the bottom unless the reader scrolled away. */
   private pinned = true
   private programmatic = false
+  /**
+   * The position the app wrote with its own scroll, so a scroll event can be attributed.
+   *
+   * A boolean flag is not enough, and the bug it caused was the user's: the flag is cleared on the
+   * next frame, and a wheel notch or a drag that lands inside that one-frame window is mistaken for
+   * the app's own scroll. The reader's gesture is dropped, `pinned` stays true, and the view they
+   * just moved is yanked back down - which is what my own harness caught by scrolling the page by
+   * hand. So the event is only attributed to us when the position actually matches what we wrote.
+   */
+  private wroteTop = -1
   private followRaf = 0
   private followVel = 0
   private scHooked: HTMLElement | null = null
@@ -312,6 +406,12 @@ export class Transcript {
   private lastPaintAt = 0
   private lastLiveRender = 0
   private liveTimer = 0
+  /**
+   * Collapse a finished turn's per-word reveal spans back into text. On by default;
+   * the off switch exists for the measurement that proves the collapse is what makes
+   * a long session scrollable (`scripts/perf-rig.mjs --collapse off`).
+   */
+  collapseSettled = true
 
   /** Set by the shell: opening a file is a Tauri concern, not a renderer one. */
   onOpenFile: ((path: string) => void) | null = null
@@ -329,6 +429,30 @@ export class Transcript {
    * then treated the export as something it had produced.
    */
   onShare: ((session: number) => Promise<string>) | null = null
+  /**
+   * "Save" on an attachment. The transcript has no filesystem and no idea which
+   * transport it is on, so it asks: the desktop answers with a save dialog, a browser
+   * tab by pulling the bytes over the wire and downloading them. Resolves to one
+   * sentence for the toast ("saved to …", "downloaded …"), or rejects with the reason.
+   *
+   * Only attachments get this control, because only attachments are *meant* to be
+   * handed over: the model wrote them into `.cws/assistant_attachments/` on purpose.
+   * Everything else a turn produces is working material, and offering to save a
+   * `probe.py` is how a chat log turns into a pile of the model's leftovers.
+   */
+  onDeliver: ((path: string) => Promise<string | null>) | null = null
+
+  /**
+   * Where an app-level note goes now that it is no longer a block in the transcript.
+   *
+   * Notes used to be painted into the stream between the turns: a migration notice, a
+   * compaction, "the endpoint defaults to X". They were never part of an answer, and they
+   * landed next to the answer anyway, so a reader scanning a conversation could not tell
+   * what the model had said from what the software had muttered. They are still worth
+   * showing — that is what this hook is for — but in the chrome, where they can be
+   * dismissed, and out of the record of what was said.
+   */
+  onNote: ((text: string, session: number | null) => void) | null = null
   /** Feedback for actions the user can otherwise not tell worked (copy, share). */
   onToast: ((msg: string, bad?: boolean) => void) | null = null
   /** Conversation the transcript is showing; export is addressed to it. */
@@ -351,19 +475,58 @@ export class Transcript {
         const blk = act.closest('.codeblk') as HTMLElement | null
         const code = blk?.querySelector('pre code') as HTMLElement | null
         if (!blk || !code) return
-        const kind = (blk.dataset.lang ?? '') as 'html' | 'svg'
+        // A block whose fence has not closed has no working buttons. The browser already refuses
+        // real clicks on a disabled control; this refuses the synthetic ones a harness (or a helper
+        // that dispatches events) can aim at it, so "the buttons wait for the fence" is true of
+        // every way to press them.
+        if (blk.classList.contains('streaming') || act.matches(':disabled')) return
+        const kind = blk.dataset.kind ?? blockKind(blk.dataset.lang ?? '')
         const src = code.textContent ?? ''
         switch (act.dataset.act) {
-          case 'copy':
-            markCopied(act)
-            void navigator.clipboard?.writeText(src).catch((err) => pageLog(`copy failed: ${err}`))
+          case 'copy': {
+            const ico = act.innerHTML
+            // The tick is a receipt, not a promise. It arrives once the clipboard has the text - the
+            // reader's eye is already on this corner of the row, so it does not also need a toast -
+            // and a refusal says so where the reader can act on it.
+            void (navigator.clipboard?.writeText(src) ?? Promise.reject(new Error('no clipboard')))
+              .then(() => markCopied(act, ico))
+              .catch((err) => {
+                pageLog(`copy failed: ${err}`)
+                this.onToast?.('the webview refused the clipboard', true)
+              })
             break
+          }
           case 'preview':
             if (kind === 'html' || kind === 'svg') openPreview(kind, src)
             break
+          case 'render': {
+            // The eye answers "what does this source make?" without leaving the paragraph the
+            // reader is in. Folded-by-default blocks are useless without it: the source is hidden,
+            // so the render is the thing that should be one press away.
+            const on = inlineRender(blk, src)
+            act.setAttribute('aria-pressed', String(on))
+            act.title = on ? 'Hide the rendered block' : 'Show the rendered block'
+            // A folded block that just gained a render is showing something; one that lost it is
+            // showing nothing but a title, so it opens back up rather than going blank.
+            if (!on && blk.classList.contains('folded')) {
+              blk.classList.remove('folded')
+              const f = blk.querySelector('.code-fold') as HTMLElement | null
+              if (f) {
+                f.setAttribute('aria-expanded', 'true')
+                f.title = 'Collapse this block'
+              }
+            }
+            break
+          }
           case 'inline':
             inlineSvg(blk, src)
             break
+          case 'fold': {
+            const folded = blk.classList.toggle('folded')
+            act.setAttribute('aria-expanded', String(!folded))
+            act.title = folded ? 'Expand this block' : 'Collapse this block'
+            break
+          }
         }
         return
       }
@@ -374,27 +537,10 @@ export class Transcript {
         if (path && this.onOpenFile) this.onOpenFile(path)
         return
       }
-      // A clamped thinking block expands in place. While it is collapsed the
-      // whole block is the target - three lines of italic text is a small and
-      // annoying thing to aim at. Once expanded, only the label collapses it,
-      // so selecting text inside a long block does not hide it.
-      const rblk = t?.closest?.('.blk-reasoning')
-      if (rblk) {
-        // Inside a run accordion the entry is a line, not a control. Its contents
-        // are the run's `show outputs`, which reveals the whole run at once: nine
-        // nine small expanders is what the accordion replaced.
-        if (rblk.closest('.blk-run') && !rblk.closest('.show-out')) return
-        const body = rblk.querySelector('.blk-body') as HTMLElement | null
-        const head = rblk.querySelector('.blk-head') as HTMLElement | null
-        if (!body) return
-        const open = body.classList.contains('expanded')
-        if (open && !t?.closest?.('.blk-head')) return
-        const nowOpen = body.classList.toggle('expanded')
-        head?.classList.toggle('open', nowOpen)
-        rblk.classList.toggle('is-open', nowOpen)
-        if (nowOpen) body.scrollTop = 0
-        return
-      }
+      // A thought is a line and nothing else: there is no body to open, so nothing here expands.
+      // The old branch toggled a `.blk-body` that streamed the model's reasoning - see
+      // `thoughtLine` for why it is gone.
+      if (t?.closest?.('.blk-reasoning')) return
       const a = t?.closest?.('a')
       if (!a) return
       e.preventDefault()
@@ -405,17 +551,20 @@ export class Transcript {
 
   clear() {
     this.stopFollow()
+    this.stopCup()
     this.root.textContent = ''
     this.turn = null
     this.runGroup = null
     this.textBuf = null
+    this.loop = null
+    this.loopShown = false
     this.tools.clear()
     this.answerEls = []
     this.liveEl = null
     this.setLive(null)
     this.live = new LiveMarkdown()
     this.turnFiles = []
-    this.fileStrip = null
+    this.fileEls = []
     this.turnAnswer = []
     this.livePainted = 0
     this.liveTail = null
@@ -423,17 +572,23 @@ export class Transcript {
     this.liveTextHost = null
     this.liveList = null
     this.liveTable = null
+    this.liveCode = null
     this.tailStructured = false
     this.blockStart = 0
     this.wordRate = 0
     this.lastPaintAt = 0
+    // `textContent = ''` detached the cup with everything else. Put it back and let it hide itself:
+    // an empty transcript sits under the opening screen's own, bigger cup, and two of the same
+    // drawing on one page reads as a bug whether or not either of them moves.
+    this.placeCup()
   }
 
   /**
-   * Mark the one block that is currently producing output. The indicator is on
-   * the latest active block only - several pulsing at once reads as noise - and
-   * it is removed outright at turn end rather than left idle, so a settled
-   * transcript carries no animation at all.
+   * Mark the one block that is currently producing output, and with it the state of the
+   * transcript's cup: the generating loop while output moves, the resting loop once it stops.
+   * Nothing else in the transcript animates on its own - the old pulsing dot was removed
+   * everywhere, in the gutter and beside every card inside the folded group - so the cup is the
+   * whole "is it working?" tell, and it is the same element either way, only a different drawing.
    */
   private setLive(body: HTMLElement | null) {
     // A tool card is its own block, so its marker belongs on the card. Taking the
@@ -441,9 +596,16 @@ export class Transcript {
     // indicator at all while a running answer did.
     const wrap = body?.classList?.contains('blk') ? body : (body?.parentElement ?? null)
     if (this.liveWrap === wrap) return
+    const wasBusy = !!this.liveWrap
     this.liveWrap?.classList.remove('live')
     this.liveWrap = wrap
     wrap?.classList.add('live')
+    // The name row still carries the turn's state - CSS and the checks read `.live` - and the flip
+    // is what changes the transcript's cup: the generating loop while a block produces output, the
+    // resting loop with its random holds once none does.
+    const marker = (this.turn?.querySelector(':scope > .turn-who-cwoffee') ?? null) as HTMLElement | null
+    marker?.classList.toggle('live', !!body)
+    if (wasBusy !== !!body) this.repaintCup()
   }
 
   private liveWrap: HTMLElement | null = null
@@ -469,34 +631,261 @@ export class Transcript {
     return b
   }
 
+  /**
+   * The one name marker a turn carries for cwoffee, hung in the gutter and stuck to the top
+   * of the scroller while that turn's text is being read.
+   *
+   * Every said block used to repeat the name down the left edge: a turn with a run and four
+   * paragraphs said "CWOFFEE" five times, and the gutter turned into a column of identical
+   * words. One per turn, floating, is the same affordance `.code-head` uses for a code block's
+   * buttons — you always know whose text you are in the middle of, without being told five
+   * times. The marker is a zero-height sticky row so the name costs no vertical space; the word
+   * itself hangs in the gutter where the labels already live, so it never nudges the text
+   * column. Yours is not here: your label sits with your bubble, which is where it is read.
+   */
+  private whoCwoffee(): HTMLElement {
+    this.ensureTurn()
+    const found = this.turn!.querySelector(':scope > .turn-who-cwoffee') as HTMLElement | null
+    if (found) return found
+    const wrap = this.el('turn-who turn-who-cwoffee')
+    wrap.append(this.el('who-name', 'cwoffee'))
+    this.turn!.appendChild(wrap)
+    return wrap
+  }
+
+  // ---- the transcript's cup ---------------------------------------------------------------
+  // One picture for the whole transcript, and one place for it to sit: the bottom band of the
+  // transcript pane, reserved by the scroller's padding, where nothing else is drawn. It used to
+  // hang under each turn's name (a column of small cups), then became the last element in the
+  // content (one cup that the whole turn pushed around). The band is the third shape and the first
+  // one where the picture does not move: it is still the artwork at the bottom of the conversation,
+  // still exactly one of them, and now it stays put while lines arrive.
+  // One picture for the whole transcript, moved to the end of whatever it contains, rather than one
+  // under each turn's name. Under the name it multiplied - a session of short turns became a column
+  // of small cups, which is the same turn-per-label mistake the name itself already had - and a cup
+  // small enough to fit a 58px gutter is too small to read as a drawing at all. At the end of the
+  // content there is exactly one, big enough to be the artwork, and turn end puts it under the
+  // Copy / Share / Branch row because that row belongs to the turn while this belongs to the page.
+  //
+  // It is never created twice: `cup()` makes the element once and `placeCup()` moves it. That is
+  // also what the earlier per-turn rule was working around - an animated raster decodes its own
+  // frame stream per element, so a cup per turn costs a decode per turn, and a loaded session used
+  // to get stills because of it. Which is why a loaded session's cup looked frozen.
+
+  private cupImg: HTMLImageElement | null = null
+  private cupHold: LoopHold | null = null
+  private cupVisible = true
+  /** How far above the end of the content the reader may be and still be shown the cup. The cup is
+   *  pinned to the pane, so anything deeper into the transcript than this is text that would sit
+   *  under a 136px drawing. The band is 168px deep and the drawing plus its seat is 144px, so the
+   *  picture stops clearing the content at almost exactly that distance - the number is geometry,
+   *  not taste. */
+  private static readonly CUP_REST_PX = 24
+  /** How long the reader has to be away from the end before the picture is put away. The follow's
+   *  own catch-up leaves the view 20-60px short of the bottom for a frame or two at a time; a cup
+   *  that vanishes and returns inside half a second is a blink, and this one is 136px wide. */
+  private static readonly CUP_HIDE_MS = 400
+  private cupHideTimer = 0
+
+  /** The cup element, made once per transcript and re-used for as long as this transcript lives. */
+  private cup(): HTMLImageElement {
+    if (!this.cupImg) {
+      const img = document.createElement('img')
+      img.className = 'transcript-cup'
+      img.alt = ''
+      img.draggable = false
+      img.setAttribute('src', this.cupSrc())
+      this.cupImg = img
+    }
+    return this.cupImg
+  }
+
+  /** Which of the four files this cup should be showing right now. */
+  private cupSrc(): string {
+    const busy = !!this.liveWrap
+    const still = prefersStill()
+    if (still) return busy ? CUP_ART.busyStill : CUP_ART.idleStill
+    return busy ? CUP_ART.busy : CUP_ART.idle
+  }
+
+  /**
+   * Move the cup after whatever was last added, and hide it when the transcript holds nothing: the
+   * opening screen has its own, larger cup, and a page showing the same drawing twice is a bug
+   * whether or not it is animated.
+   *
+   * The picture lives in the pane, not in the page that scrolls. The scroller's bottom padding
+   * reserves the band it sits in (see `.transcript-cup` and `--cup-band` in app.css), so the newest
+   * line of text stops above it and the drawing never travels. Appending it to `this.root` - the
+   * old shape, the last thing in the content - made the picture's on-screen position a function of
+   * every arriving line and every follow step: measured in `ui/perf/probe.ts` over three streamed
+   * turns that was 1,348px of travel, p95 261px in a single frame, and six reversals of direction.
+   * A drawing that reverses is what the eye reads as jitter, and this one is 136px across.
+   */
+  private placeCup() {
+    const img = this.cup()
+    const host = this.root.closest('.scrollerwrap') ?? this.root.parentElement ?? this.root
+    if (img.parentElement !== host) {
+      // Two transcripts in one pane (a session switch that rebuilds the transcript object) must not
+      // leave two pictures in the band. The transcript guarantees one cup; this is where that is
+      // enforced, since the band belongs to the pane rather than to this transcript's content.
+      for (const stale of Array.from(host.children))
+        if (stale !== img && stale.classList?.contains('transcript-cup')) stale.remove()
+      host.appendChild(img)
+    }
+    img.classList.toggle('bare', this.root.children.length === 0)
+    this.updateCup()
+  }
+
+  /**
+   * Show the pinned cup only when the reader is at rest at the end of the transcript.
+   *
+   * The cup is pinned to the pane, but the text under it scrolls. Kept lit while the reader is
+   * anywhere else, a 136px drawing sits on top of other people's paragraphs halfway through a
+   * conversation - a picture painted over prose is worse than a missing picture. The band the
+   * scroller reserves is the end of the content, so at rest the band is empty and the drawing has
+   * somewhere to live. It is lit again the moment the view comes back down, which includes every
+   * moment the follow is holding the view at the bottom while the model writes.
+   */
+  private updateCup(readerMoved = false) {
+    const img = this.cupImg
+    if (!img) return
+    const sc = this.hookScroller()
+    if (!sc) return
+    const away = sc.scrollHeight - sc.clientHeight - sc.scrollTop
+    const atEnd = this.root.children.length > 0 && away <= Transcript.CUP_REST_PX
+    if (atEnd) {
+      if (this.cupHideTimer) {
+        clearTimeout(this.cupHideTimer)
+        this.cupHideTimer = 0
+      }
+      this.setCupShown(true)
+      return
+    }
+    if (readerMoved) {
+      if (this.cupHideTimer) {
+        clearTimeout(this.cupHideTimer)
+        this.cupHideTimer = 0
+      }
+      this.setCupShown(false)
+      return
+    }
+    if (this.cupHideTimer || !this.cupVisible) return
+    this.cupHideTimer = window.setTimeout(() => {
+      this.cupHideTimer = 0
+      this.setCupShown(false)
+    }, Transcript.CUP_HIDE_MS)
+  }
+
+  private setCupShown(on: boolean) {
+    const img = this.cupImg
+    if (!img || on === this.cupVisible) return
+    this.cupVisible = on
+    img.classList.toggle('cup-out', !on)
+  }
+
+  /**
+   * Re-pick the drawing and its motion. The generating loop runs at the artist's timing with no
+   * hold inserted; the resting loop is re-armed every lap with a fresh hold drawn from CUP_IDLE_HOLD
+   * (see anipause.ts); reduced motion gets a still, because a media query cannot pause a raster
+   * loop. Called whenever the transcript's busy state flips and when the motion setting changes.
+   */
+  repaintCup() {
+    const img = this.cup()
+    const busy = !!this.liveWrap
+    this.stopCup()
+    img.setAttribute('src', this.cupSrc())
+    img.classList.toggle('busy', busy)
+    if (!busy && !prefersStill()) this.cupHold = new LoopHold(img, this.cupSrc(), CUP_IDLE_HOLD[0], CUP_IDLE_HOLD[1])
+  }
+
+  private stopCup() {
+    this.cupHold?.stop()
+    this.cupHold = null
+  }
+
   private ensureTurn() {
     if (this.turn) return
     this.turn = this.el('turn')
     this.root.appendChild(this.turn)
+    // A loop is a property of one turn. A model that repeated itself three turns ago is not looping
+    // now, and carrying the history over would mean a map full of the wrong turn.
+    this.loop = new LoopWatch()
+    this.loopShown = false
+    // The cup belongs under the newest thing, so a new turn takes its place.
+    this.placeCup()
   }
 
-  /** Start a new visual block. Structural change: allowed to touch layout. */
+  /**
+   * Start a new visual block. Structural change: allowed to touch layout.
+   *
+   * A thought does not go through here: it has no body (see `thoughtLine`).
+   */
   private block(kind: BlockKind, label: string): HTMLElement {
     this.ensureTurn()
     const wrap = this.el(`blk blk-${kind}`)
     const head = this.el('blk-head', label)
     const body = this.el('blk-body')
     wrap.append(head, body)
-    // Thinking joins the run accordion; anything the model *said* ends it. A note
-    // or a warning ends it too: those are the app interrupting, and folding an
-    // approval notice into "working on your computer" would hide a fact the user
-    // has to see without clicking.
+    // One name per turn. Said blocks used to repeat "CWOFFEE" down the left edge, once per
+    // paragraph. Your own label stays on your bubble (see `.blk-user > .blk-head`), and two of
+    // your messages in one turn is still one ask — so the first of them keeps the name and the
+    // rest are quiet.
+    if (kind === 'user') {
+      // Two of your messages in one turn is still one ask, so the first of them carries the
+      // name and the rest are quiet. (A message typed while a turn was open lands in that turn
+      // and gets its own name later, when the divider moves it into the turn it opens.)
+      if (this.turn!.querySelector('.blk-user')) wrap.classList.add('nameless')
+    } else {
+      this.whoCwoffee()
+    }
+    // Thinking joins the run accordion; so does any later tool call, even one that
+    // happens after the model has said something. What the model *said* goes below the
+    // accordion instead of splitting it in two — see `ensureRunGroup`. A note or a warning
+    // still lands in the stream: those are the app interrupting, and folding an approval
+    // notice into "working on your computer" would hide a fact the user has to see without
+    // clicking. (Informational notes no longer come here at all; they go to `onNote`.)
     if (kind === 'reasoning') {
       this.runBodyOf(this.ensureRunGroup()).appendChild(wrap)
     } else {
-      // The work is over: the model is talking. The run folds to its header at the
-      // same moment it ends, so a turn that said three things does not leave three
-      // open accordions stacked above the answer.
+      // The working pauses while the model talks. It does not end: another tool call joins
+      // this same accordion, which is what keeps one turn one block on screen.
       this.closeRunGroup(true)
       this.turn!.appendChild(wrap)
     }
-    this.scrollIfNeeded()
+    // Anything that reaches here lands outside the run accordion - your message, what the model
+    // said, a note or a failure the app is interrupting for - so it counts as content, and a
+    // pinned reader follows it. Thoughts and tool cards never come through here.
+    this.scrollIfNeeded('text')
     return body
+  }
+
+  /**
+   * The one line a thought leaves in the transcript, inside the run accordion.
+   *
+   * It used to own a body that streamed the model's reasoning into reveal spans: a second body
+   * of text growing on every token, under a header, inside an accordion that is closed by
+   * default. That is the most expensive thing a long turn can do on a fanless screen - the
+   * report was "the preview of the thinking blocks lags the UI too much" - and the words behind
+   * it were three clicks away from nobody. So there is no body: no preview, no expander, and
+   * the reasoning is never put in the DOM at all. It is still collected, because the store, a
+   * branch and the model's cache need the text; only the picture of it is gone.
+   *
+   * What is left has to carry the liveness the preview used to, so the line counts words while
+   * it runs (`thinking · 1.4k words`) and states the duration afterwards (`thought for 9.4s`).
+   * A number that climbs is a model that is producing; a number that sits still is the stall
+   * the preview used to hide behind its own motion.
+   */
+  private thoughtLine(): HTMLElement {
+    this.ensureTurn()
+    const wrap = this.el('blk blk-reasoning')
+    const head = this.el('blk-head streaming', 'thinking')
+    wrap.append(head)
+    // The working is cwoffee's too, so a turn that opens with a thought still gets its name.
+    this.whoCwoffee()
+    this.runBodyOf(this.ensureRunGroup()).appendChild(wrap)
+    const run = this.runGroup
+    if (run) this.bumpRun(run, 'think')
+    return head
   }
 
   /**
@@ -536,8 +925,16 @@ export class Transcript {
       wrap.classList.add('show-out', 'open')
       head.classList.add('open')
     }
+    // **Closed by default, live turns included.** The run used to be pinned open while it
+    // ran — "the streaming output is the feedback that the app is alive" — and on a local
+    // model that pinned-open group is the biggest thing on the screen for a minute, with a
+    // dozen tool cards inside it that most people never read. The header is what carries
+    // liveness instead: it says `Working on your computer` and counts the steps as they
+    // land, and the one thing that must never hide — a question waiting for an answer —
+    // forces the group open on its own (see `runForQuestion`).
     wrap.dataset.think = '0'
     wrap.dataset.tool = '0'
+    wrap.dataset.ask = '0'
     return wrap
   }
 
@@ -561,7 +958,7 @@ export class Transcript {
     }
     // Revealing a run's contents changes the height under the reader, so the view gets
     // the same nudge a fold gets, rather than leaving them somewhere in the middle.
-    this.follow()
+    this.follow('chrome')
   }
 
   /** Paint one run's header from what it contains. Static so history can call it. */
@@ -583,9 +980,30 @@ export class Transcript {
       const ms = Number(wrap.dataset.thinkMs ?? 0)
       text = ms ? `Thought for ${fmtThink(ms)}` : 'Thought'
     }
-    label.textContent = text
+    // A run holding a question nobody has answered says so on its face. This is the
+    // difference between a folded group that reads as "the app is done, here is what it did"
+    // and one that reads as "the app is stopped, and it is waiting on you" — which matters
+    // most in exactly the case the folding rule above allows: a reader who folded the group
+    // by hand while a card was open.
+    const asks = Number(wrap.dataset.ask ?? 0)
+    wrap.classList.toggle('awaits', asks > 0)
+    // The suffix goes into the label, not after it: assigning the text first and appending
+    // to the local variable afterwards is how a waiting run ended up saying nothing about
+    // waiting, which is the one thing a folded group has to say.
+    label.textContent = asks > 0 ? `${text} · waiting for you` : text
     const steps = tools + thinks
-    count.textContent = steps > 1 ? `${steps} steps` : ''
+    // While a run is thinking and has not touched a tool yet, the step count says nothing a
+    // folded group needs: one step, forever. The live word count is the fact that matters - it
+    // tells a reader, without opening the group, that the model is producing rather than
+    // stalled, and it is the only sign of life a thought with no preview has.
+    const words = Number(wrap.dataset.words ?? 0)
+    if (running && tools === 0 && thinks > 0 && words > 0) count.textContent = `${fmtWords(words)} words`
+    else count.textContent = steps > 1 ? `${steps} steps` : ''
+    // A detected loop stays on the header for the rest of the turn, running or settled: it is the
+    // fact a reader needs in order to decide to stop the turn, and afterwards it is the record of
+    // why the answer reads the way it does. The quoted phrase is kept short on purpose.
+    const loop = wrap.dataset.loop ?? ''
+    if (loop) count.textContent = count.textContent ? `${count.textContent} · ${loop}` : loop
     // Nothing else to paint here. An earlier version hid the reveal control on a
     // thinking-only run, which left two kinds of run with different affordances - the
     // display setting applies to every run, so the header only has to say what ran.
@@ -593,18 +1011,30 @@ export class Transcript {
 
   private ensureRunGroup(): HTMLElement {
     this.ensureTurn()
-    if (this.runGroup && this.runGroup.parentElement === this.turn) return this.runGroup
+    // The working is cwoffee's too: a turn that opens with a tool call still gets its name.
+    this.whoCwoffee()
+    const existing = this.runGroup
+    if (existing && existing.parentElement === this.turn) {
+      // One accordion per turn, reopened rather than replaced. The model putting a
+      // paragraph between two tool calls is not three turns pretending to be one: what it
+      // said goes under the accordion, and the work carries on inside it. Two accordions
+      // stacked above one answer was the mess; this is the same events, one home for the
+      // working and one for the saying.
+      if (!existing.classList.contains('running')) {
+        existing.classList.add('running')
+        // A fresh measurement window: the header's "thought for 4.2s" should describe the
+        // thinking that is happening now, not the span since the turn first started.
+        existing.dataset.opened = String(Math.round(performance.now()))
+        delete existing.dataset.thinkMs
+        this.paintRunHead(existing)
+      }
+      return existing
+    }
     const wrap = this.mkRun()
     wrap.dataset.opened = String(Math.round(performance.now()))
-    wrap.classList.add('running', 'open')
-    ;(wrap.querySelector('.blk-head') as HTMLElement).classList.add('open')
+    wrap.classList.add('running')
     this.turn!.appendChild(wrap)
     this.runGroup = wrap
-    wrap.dataset.think = '0'
-    wrap.dataset.tool = '0'
-    wrap.dataset.opened = String(Math.round(performance.now()))
-    wrap.classList.add('running', 'open')
-    ;(wrap.querySelector('.blk-head') as HTMLElement).classList.add('open')
     this.paintRunHead(wrap)
     return wrap
   }
@@ -632,13 +1062,21 @@ export class Transcript {
   }
 
   /**
-   * End the run accordion. `settle` collapses it: while a run is happening it is
-   * open because you are watching it, and once the turn is over it folds to its
-   * header because the transcript you scan is a list of what happened, not of how.
+   * Settle the run accordion. `settle` collapses it: the transcript you scan is a list of
+   * what happened, not of how, so a finished run folds to its header.
+   *
+   * Settling is not the end of the run. The element stays the turn's run, so a tool call
+   * that arrives after a paragraph of answer goes back into it (`ensureRunGroup`), which is
+   * what keeps a turn to one block of working above one body of saying. The run is dropped
+   * when the turn ends.
+   *
+   * One fold never happens: a run holding a question nobody has answered stays open.
+   * Folding it would hide the one card in the turn that is addressed to the reader, and a
+   * run whose header they cannot open looks like a hang rather than like a question. The
+   * header says so anyway (`waiting for you`) in case the run was folded by hand.
    */
   private closeRunGroup(settle = false) {
     const wrap = this.runGroup
-    this.runGroup = null
     if (!wrap) return
     wrap.classList.remove('running')
     if (!wrap.dataset.thinkMs) {
@@ -647,7 +1085,7 @@ export class Transcript {
         wrap.dataset.thinkMs = String(Math.round(performance.now() - opened))
       }
     }
-    if (settle && !this.verbose) {
+    if (settle && !this.verbose && Number(wrap.dataset.ask ?? 0) === 0) {
       // A reader who asked to see the working does not get it folded away at the moment the
       // answer lands. That fold is the disappearance that made a finished turn look like a
       // stack of separate cards.
@@ -657,39 +1095,128 @@ export class Transcript {
     this.paintRunHead(wrap)
     // Folding a run takes height away underneath the reader, which is the one
     // moment a follower ends up short of the bottom without noticing.
-    if (settle) this.follow()
+    if (settle) this.follow('chrome')
   }
 
   /**
-   * Settle the thinking block that just ended.
+   * The run group a question card belongs to, opened.
    *
-   * This used to happen once, at turn end, so every reasoning block of a long turn
-   * read "thinking" - and stayed expanded - until the answer finished. A block
-   * ends when the model stops reasoning: the first content delta or tool call
-   * after it is the period at the end of that sentence, and that is when the
-   * header becomes the useful fact (how long it took) and the body collapses.
+   * A question is the only block in a transcript that is *for* the reader rather than about
+   * what the app did, so the folding rule that keeps a long turn scannable cannot be allowed
+   * to apply to it. The card used to sit outside the grouped block altogether — which is how
+   * "the question and its answer clutter the conversation next to the answer" got reported:
+   * a settled question stayed a wide open card between the run and the reply forever.
+   * It lives inside the run now, and the run is open for exactly as long as it needs an
+   * answer.
    */
-  private closeReasoning() {
-    this.settleReasoning()
-    if (this.textKind === 'reasoning' && this.textBuf) {
-      this.textBuf.classList.remove('streaming')
+  private runForQuestion(): HTMLElement {
+    const run = this.ensureRunGroup()
+    run.dataset.ask = String(Number(run.dataset.ask ?? 0) + 1)
+    if (!run.classList.contains('ask-open')) {
+      run.classList.add('ask-open')
+      run.classList.add('open')
+      run.querySelector('.blk-head')?.classList.add('open')
     }
+    this.paintRunHead(run)
+    return run
   }
 
-  /** Collapse the thinking blocks of a finished turn back to their first lines. */
+  /** A question stopped needing an answer: let the run that holds it fold again. */
+  /** Question cards on screen that still want an answer. */
+  private askedCount(): number {
+    let n = 0
+    for (const card of this.questionCards.values())
+      if (!card.classList.contains('answered') && !card.classList.contains('expired')) n++
+    return n
+  }
+
+  private releaseQuestion(card: HTMLElement) {
+    const run = card.closest('.blk-run') as HTMLElement | null
+    if (!run) return
+    const left = Math.max(0, Number(run.dataset.ask ?? 0) - 1)
+    run.dataset.ask = String(left)
+    // Whatever closed the card - an answer here, an answer on another device, a stopped turn -
+    // the jump button stops claiming someone is waiting.
+    this.setAsked(this.askedCount())
+    if (left > 0) {
+      this.paintRunHead(run)
+      return
+    }
+    // Only fold back what the question itself opened. A group the reader opened by hand
+    // stays as they left it.
+    if (run.classList.contains('ask-open') && !this.verbose) {
+      run.classList.remove('ask-open', 'open')
+      run.querySelector('.blk-head')?.classList.remove('open')
+    }
+    this.paintRunHead(run)
+  }
+
+  /** Settle the thought line that just ended: the header becomes the duration. */
+  private closeReasoning() {
+    this.settleReasoning()
+    this.thoughtBuf = null
+    this.thoughtWords = 0
+  }
+
+  /** Rewrite this turn's thought lines from "thinking" to what they cost. */
   private settleReasoning() {
-    for (const el of this.reasoningEls) {
-      el.classList.add('settled')
-      el.scrollTop = 0
-      // The label changes once thinking is over: while it runs "thinking" is
-      // the truth, afterwards the useful fact is how long it took.
-      const started = Number(el.dataset.thinkStart ?? 0)
+    for (const head of this.reasoningEls) {
+      // The label changes once thinking is over: while it runs "thinking" is the
+      // truth, afterwards the useful facts are how long it took and how much came of it.
+      const started = Number(head.dataset.thinkStart ?? 0)
       if (started) {
-        const head = el.parentElement?.querySelector('.blk-head')
-        if (head) head.textContent = fmtThink(performance.now() - started)
+        const words = Number(head.dataset.words ?? 0)
+        head.textContent = `${fmtThink(performance.now() - started)}${words ? ` · ${fmtWords(words)} words` : ''}`
+        head.classList.remove('streaming')
+        head.parentElement?.classList.remove('live')
       }
     }
     this.reasoningEls = []
+  }
+
+  /** The live readout on the thought line that is streaming. Cheap on purpose. */
+  private paintThought() {
+    if (!this.thoughtBuf) return
+    this.thoughtBuf.dataset.words = String(this.thoughtWords)
+    this.thoughtBuf.textContent = this.thoughtWords >= 40
+      ? `thinking · ${fmtWords(this.thoughtWords)} words`
+      : 'thinking'
+    // The accordion header is what the reader actually sees while the group is folded, so the
+    // same number rides there: "Thinking · 1.4k words" is the difference between a model that
+    // is working and one that has nothing to say.
+    const run = this.runGroup
+    if (run?.classList.contains('running')) {
+      run.dataset.words = String(this.thoughtWords)
+      this.paintRunHead(run)
+    }
+  }
+
+  /**
+   * A loop has been detected in this turn. It is said once: the run header carries it for the rest
+   * of the turn, and the app raises one note. Repeating the warning every fifty words would be the
+   * same mistake as the loop itself.
+   *
+   * Nothing is stopped here, on purpose. A wrong stop throws away a real answer mid-flight, and the
+   * composer already has a Stop control: the detector's job is to make the loop visible enough that
+   * reaching for it is obvious. (The one-line version of "and stop it myself at the third cycle" is
+   * `this.host.abort?.()` here, if that is ever wanted.)
+   */
+  private markLoop(f: LoopFinding) {
+    if (this.loopShown) return
+    this.loopShown = true
+    const phrase = f.phrase.length > 34 ? `${f.phrase.slice(0, 31)}…` : f.phrase
+    const shown = { ...f, phrase }
+    const run = this.runGroup
+    if (run) {
+      run.dataset.loop = describeLoop(shown)
+      run.classList.add('loops')
+      this.paintRunHead(run)
+    }
+    pageLog(
+      `loop detected in turn ${this.turn?.dataset.turn ?? '?'}: ${describeLoop(f)} ` +
+        `(${f.words} words after ${f.deltas} deltas)`,
+    )
+    this.onLoop?.(shown)
   }
 
   private flush() {
@@ -697,7 +1224,16 @@ export class Transcript {
     if (!this.pending.length) return
     const joined = this.pending.join('')
     this.pending = []
-    if (!this.textBuf) return
+    // The loop check runs on the same coalesced chunk the renderer already built, so it costs one
+    // call per paint rather than one per token, and it sees the thinking text the reader no longer
+    // gets a preview of - which is the whole reason it exists.
+    if (this.loop) {
+      const hit = this.loop.push(joined)
+      if (hit) this.markLoop(hit)
+    }
+    // A thought has no buffer to paint into - that is the point of it - but its deltas still
+    // arrive here, and counting them is what keeps the header honest.
+    if (!this.textBuf && this.textKind !== 'reasoning') return
     if (this.textKind === 'answer') {
       this.turnAnswer.push(joined)
       // Answers format as they arrive. The naive version re-parses the whole
@@ -707,17 +1243,15 @@ export class Transcript {
       this.live.push(joined)
       this.renderLive(false)
     } else if (this.textKind === 'reasoning') {
-      // Reasoning is plain text - it arrives with half-written tags and asterisks
-      // that are not formatting - but it reveals the same way an answer does.
-      this.appendReveal(this.textBuf, joined, performance.now())
-    } else {
+      // A thought is counted, never rendered. The words still have somewhere to go - the event
+      // handler keeps them for the store - but putting them in the DOM is what made a thinking
+      // turn cost a second growing body of text next to the answer.
+      for (const chunk of joined.split(/\s+/)) if (chunk) this.thoughtWords++
+      this.paintThought()
+    } else if (this.textBuf) {
       this.textBuf.appendChild(document.createTextNode(joined))
     }
-    if (this.textKind === 'reasoning' && this.textBuf.classList.contains('clamp')
-        && !this.textBuf.classList.contains('expanded')) {
-      this.textBuf.scrollTop = this.textBuf.scrollHeight
-    }
-    this.scrollIfNeeded()
+    this.scrollIfNeeded(this.textKind === 'reasoning' ? 'work' : 'text')
   }
 
   /**
@@ -738,7 +1272,7 @@ export class Transcript {
       // A forced paint is still a paint: if it did not follow, the newest line
       // can sit below the fold until some later event rescues it - which is the
       // lurch coming back through the side door.
-      this.follow()
+      this.follow('text')
       return
     }
     const now = performance.now()
@@ -756,7 +1290,7 @@ export class Transcript {
     // Follow even when nothing committed: a paragraph that has not ended yet
     // still grows a line at a time, and a view that only moves at blank lines
     // leaves the newest line below the fold until the next paragraph lands.
-    this.follow()
+    this.follow('text')
   }
 
   /**
@@ -888,6 +1422,45 @@ export class Transcript {
       // Tables: build the skeleton once the delimiter row makes the shape known,
       // then append each completed row. The parser's own rules (splitRow, alignment,
       // padding) do the cells, so a live row and a parsed row are the same thing.
+      // A fence that has opened is a block the reader should see as a block, not as backticks.
+      // The head arrives with the opening line and the code streams under it; the actions on that
+      // head are disabled until the fence closes, because copying half a document or rendering an
+      // unclosed <div> is not a thing to offer. Committing still waits for the closing fence.
+      if (!this.liveCode) {
+        const fs = fenceStart(rest)
+        if (fs) {
+          const wrap = document.createElement('div')
+          wrap.className = 'codeblk streaming'
+          wrap.dataset.lang = fs.lang
+          wrap.dataset.kind = blockKind(fs.lang)
+          wrap.innerHTML = `${codeHeadHtml(fs.lang, true, 0)}\n<pre>${lineGutterHtml(0)}<code${
+            fs.lang ? ` class="lang-${fs.lang}"` : ''
+          }></code></pre>`
+          this.liveEl!.append(wrap)
+          const codeEl = wrap.querySelector('pre code') as HTMLElement | null
+          if (!codeEl) break
+          this.liveCode = {
+            wrap,
+            code: codeEl,
+            lines: 0,
+            meta: wrap.querySelector('.code-meta'),
+            gutter: wrap.querySelector('pre .ln'),
+          }
+          this.liveTail = wrap
+          this.tailStructured = true
+          this.liveTextHost = codeEl
+          this.inlineHost = null
+          this.inline.reset()
+          // The opening fence line is chrome: painting ``` into the body and taking it away later
+          // would rewrite settled text. But `blockStart` stays where the block starts, exactly as a
+          // list marker's does. Moving it past the fence line made the next `firstBlockEnd` call read
+          // the *closing* fence as an opening one - the block then never committed, and the turn ended
+          // with an empty, still-streaming block where fifteen lines of HTML had been typed.
+          const openLineEnd = Math.min(rest.length, rest.split('\n', 1)[0].length + 1)
+          this.livePainted = Math.max(this.livePainted, this.blockStart + openLineEnd)
+          continue
+        }
+      }
       if (!this.liveTable && !fenceOpen(rest)) {
         const headEnd = tableHeadEnd(rest)
         if (headEnd !== null) {
@@ -1004,6 +1577,15 @@ export class Transcript {
       }
       this.liveTable = null
     }
+    // A fence that closed (or a stream that stopped inside one) is finished in place, not handed
+    // to the parser. The block already on screen has the right shape - head, actions, the code as
+    // text nodes - and replacing it with freshly parsed markup would re-raster every line of code
+    // the reader has already read, which is the one thing this design refuses to do. The old path
+    // did exactly that, and worse: the rebuilt block came from a source range the live paint had
+    // already consumed, so a fifteen-line HTML answer ended as an empty block whose buttons were
+    // still disabled.
+    const liveCode = this.liveCode
+    this.liveCode = null
     const el = this.liveTail
     const builtLive = this.tailStructured
     this.liveTail = null
@@ -1011,6 +1593,11 @@ export class Transcript {
     this.liveTextHost = null
     this.tailStructured = false
     this.inline.reset()
+    if (liveCode && el === liveCode.wrap) {
+      this.settleLiveCode(liveCode)
+      this.liveList = null
+      return
+    }
     if (!el) {
       // Nothing was ever painted for this block. That used to mean "empty"; now it
       // can also mean "held back because its first line looked like a table header
@@ -1057,6 +1644,49 @@ export class Transcript {
   }
 
   /**
+   * Flip a live fenced block to its finished shape, without touching the code inside it.
+   *
+   * What changes when a fence closes is what the buttons are allowed to do, plus two facts the head
+   * has to state now that the block is over: how long it is, and whether it is folded.
+   */
+  private settleLiveCode(st: {
+    wrap: HTMLElement
+    code: HTMLElement
+    lines: number
+    meta: HTMLElement | null
+    gutter: HTMLElement | null
+  }) {
+    const { wrap, code } = st
+    // The closing fence arrives as text in the same delta that closes the block. The parser would
+    // have eaten it, so eat it here: backticks left in the body read as a block that never ended.
+    const txt = code.textContent ?? ''
+    const tail = /(?:^|\n) {0,3}(?:```|~~~)[ \t]*$/.exec(txt)
+    if (tail) code.textContent = txt.slice(0, tail[0].startsWith('\n') ? tail.index : 0)
+    const lines = (code.textContent ?? '').split('\n').length
+    const kind = blockKind(wrap.dataset.lang ?? '')
+    wrap.classList.remove('streaming')
+    wrap.dataset.kind = kind
+    wrap.dataset.lines = String(lines)
+    const folded = foldsWhenClosed(kind, lines)
+    if (folded) wrap.classList.add('folded')
+    const meta = wrap.querySelector('.code-meta')
+    const metaText = lines > 0 ? `${lines} lines` : ''
+    if (meta && meta.textContent !== metaText) meta.textContent = metaText
+    // The gutter is rewritten once, at the end: while streaming it was appended to line by line, and
+    // the closing fence that was eaten above can change the count, so the settled numbers are the
+    // ones that are true.
+    if (st.gutter) st.gutter.textContent = lineNumbers(lines)
+    for (const b of Array.from(wrap.querySelectorAll<HTMLButtonElement>('.code-act'))) {
+      b.disabled = false
+      b.title = b.title.replace(' - still being written', '')
+      if (b.dataset.act === 'fold') {
+        b.setAttribute('aria-expanded', folded ? 'false' : 'true')
+        b.title = folded ? 'Expand this block' : 'Collapse this block'
+      }
+    }
+  }
+
+  /**
    * Put an arrival on screen as words, in nodes that are never touched again.
    *
    * This replaces a design that re-rendered the growing paragraph and kept the
@@ -1095,6 +1725,30 @@ export class Transcript {
     // The live text host is a `<p class="live-para">` or, for a list, the `<li>`
     // being written. Both get inline constructs opened as they complete; an open
     // code fence does not, because `**` inside a code block is the text `**`.
+    if (this.liveCode && (host === this.liveCode.code || host === this.liveTail)) {
+      // A code fence is written, not typeset. No inline markup (`**` inside a fence is the text
+      // `**`), and no span per word: a span for every token of a 200-line file is a node cost the
+      // reader pays for in scroll and an animation on text that wants to be read, not performed.
+      // The block-level paint path hands over the block's own box, not the `<code>` inside it, so
+      // the text always goes to `liveCode.code`: writing it to `host` put the code next to the
+      // element that renders it, which is how a fifteen-line fence settled as an empty block whose
+      // head claimed one line.
+      const codeEl = this.liveCode.code
+      codeEl.appendChild(document.createTextNode(delta))
+      // The head answers "how big is this thing?" while it grows. The count is kept by counting the
+      // newlines in the arrival, never the whole buffer: a per-paint scan of a 200KB file is the
+      // same mistake the loop detector was built to avoid, and this runs on every paint.
+      const st = this.liveCode
+      const before = st.lines
+      st.lines += (delta.match(/\n/g)?.length ?? 0) + (st.lines === 0 && delta ? 1 : 0)
+      const text = st.lines > 0 ? `${st.lines} lines` : ''
+      if (st.meta && st.meta.textContent !== text) st.meta.textContent = text
+      // The gutter grows with the code rather than being rewritten at the end: the numbers are the
+      // reader's place in a document that is still arriving, and the one-node-per-block rule that
+      // keeps a finished 200-line file cheap has to hold while it is becoming 200 lines long.
+      if (st.gutter && st.lines > before) st.gutter.append(lineGutterDelta(before, st.lines))
+      return
+    }
     if (host === this.liveTextHost && allowInline) {
       // Inline emphasis in the paragraph being written: open a <strong>/<em>/
       // <code> when the opener is recognised and append the coming words inside
@@ -1163,16 +1817,30 @@ export class Transcript {
     const sc = this.root.closest('.scroller') as HTMLElement | null
     if (!sc || sc === this.scHooked) return sc
     this.scHooked = sc
+    // The content's own height is the only reliable signal that something landed which no follow
+    // call reported - a tool card, a thought counting words, a table growing a row. The observer
+    // does not scroll anything; it keeps the jump button's arithmetic true.
+    this.watchHeight()
     sc.addEventListener(
       'scroll',
       () => {
-        if (this.programmatic) return
+        // Ours, or theirs? Only swallow the event when the position is the one we wrote. A wheel
+        // notch that lands in the frame between our write and the flag clearing is a reader saying
+        // "stop following", and dropping it both ignores them and keeps them chained to the bottom.
+        if (this.programmatic && Math.abs(sc.scrollTop - this.wroteTop) <= 1.5) return
         const away = sc.scrollHeight - sc.scrollTop - sc.clientHeight
         // Reading backwards is a choice; being left behind by the stream is not.
         // 48px is deliberately smaller than a line's worth of growth per paint,
         // so a reader who has been outrun is re-pinned rather than stranded.
         this.pinned = away < 48
+        // A reader who moved is a fact about the reader, not a transient of the follow, so the
+        // picture is put away on the same gesture rather than after its patience: the jump button
+        // appears off the same gesture, and the two must not share the corner of the pane.
+        this.updateCup(true)
         pageLog(`follow ${this.pinned ? 'on' : 'off'}: ${Math.round(away)}px from the bottom`)
+        // The jump button answers "how far below the fold is the newest line", so it is measured
+        // here too: this is the one place a reader's own scroll shows up.
+        this.measureFollow()
       },
       { passive: true },
     )
@@ -1180,25 +1848,131 @@ export class Transcript {
   }
 
   /**
-   * Keep the newest line on screen without lurching.
+   * Keep the newest line on screen without lurching - for the kind of growth that should.
    *
-   * Two rules, both learned from frames rather than from taste. Follow on the
-   * frame clock, not the paint clock: the old "jump to the bottom if it is
-   * within 160px" rule left the newest line below the fold until a whole
-   * paragraph rescued it (112px, 92px, 46px steps), and pinning on every paint
-   * only shrank the step to a couple of lines, which still reads as a blink.
-   * So the follow runs as its own animation, at most FOLLOW_MAX_STEP px per
-   * frame, and only a structural gap larger than FOLLOW_SNAP_PX moves at once.
+   * Two rules, both learned from frames rather than from taste. Follow on the frame clock, not
+   * the paint clock: the old "jump to the bottom if it is within 160px" rule left the newest line
+   * below the fold until a whole paragraph rescued it (112px, 92px, 46px steps), and pinning on
+   * every paint only shrank the step to a couple of lines, which still reads as a blink. So the
+   * follow runs as its own animation, at most FOLLOW_MAX_STEP px per frame, and only a structural
+   * gap larger than FOLLOW_JUMP of the viewport moves at once.
+   *
+   * The third rule is new, and it exists because the transcript stopped growing where the reader
+   * is not looking. With the working folded into one block above the answer, a turn spends most of
+   * its life adding height nobody asked to see, and dragging the view down after every tool card
+   * is what made the transcript feel like it was running away. So growth is now classified:
+   *
+   *   `work`   a tool card landing, a build log growing, a thought counting itself - never scrolls
+   *   `ask`    a question card waiting for an answer - never scrolls; the jump button says so
+   *   `text`   the answer streaming, the deliverable row, a turn's actions - follows when pinned
+   *   `chrome` a fold/unfold or the show-the-working setting - follows when pinned, because that
+   *            takes height away from under the reader rather than adding it below them
+   *   `you`    your own message - the view is placed at the bottom, because you asked for it
+   *
+   * A reader who scrolled up and stayed there before the answer started is never moved: `pinned`
+   * says what they chose, and only `you` and an explicit jump override it.
    */
-  private follow() {
+  private follow(why: Growth = 'chrome') {
     const sc = this.hookScroller()
     if (!sc) return
+    if (why === 'you') {
+      this.pinned = true
+      this.placeAtBottom(sc)
+      this.measureFollow(true)
+      return
+    }
+    if (why === 'work' || why === 'ask') {
+      // The view holds its ground; the jump button is what tells the reader there is more below.
+      this.measureFollow()
+      return
+    }
     if (!this.pinned) {
       this.stopFollow()
+      this.measureFollow()
       return
     }
     this.armFollow()
   }
+
+  /** Put the view at the bottom now, and mark it as the app's own scroll. */
+  private placeAtBottom(sc: HTMLElement) {
+    this.stopFollow()
+    this.scrollTo(sc, sc.scrollHeight - sc.clientHeight)
+  }
+
+  /** Write scrollTop and claim the resulting scroll event - but only the one that matches. */
+  private scrollTo(sc: HTMLElement, top: number) {
+    this.programmatic = true
+    sc.scrollTop = top
+    this.wroteTop = sc.scrollTop
+    requestAnimationFrame(() => {
+      this.programmatic = false
+    })
+  }
+
+  /**
+   * Jump to the newest line. This is what the transcript's jump button calls, and it is the only
+   * way back to a pinned view other than scrolling there by hand: the button exists because "I
+   * read something further up" and "I want the newest line again" are both true of the same person.
+   */
+  jumpToBottom() {
+    const sc = this.hookScroller()
+    if (!sc) return
+    this.pinned = true
+    this.placeAtBottom(sc)
+    this.measureFollow(true)
+    this.follow()
+  }
+
+  // ---- what the reader is looking at, as the app sees it ---------------------
+  /** How far the bottom of the content is from the bottom of the view, in px. */
+  private away = 0
+  /** Question cards waiting for an answer, so the jump button can say "cwoffee is asking". */
+  private asked = 0
+  private lastEmit = { pinned: true, away: -1e9, ask: false }
+  /** The app draws the jump button; this is how it learns when to. */
+  onFollowState?: (s: { pinned: boolean; away: number; ask: boolean }) => void
+
+  /**
+   * Measure where the reader is and tell the app, but only when the answer moved: a scroll
+   * handler, a resize observer and every growth event all ask this question within a frame of each
+   * other, and a button that re-renders on each of them is a new source of jank.
+   */
+  private measureFollow(force = false) {
+    const sc = this.hookScroller()
+    this.updateCup()
+    if (!sc || !this.onFollowState) return
+    const away = Math.max(0, Math.round(sc.scrollHeight - sc.clientHeight - sc.scrollTop))
+    const ask = this.asked > 0
+    const moved = Math.abs(away - this.lastEmit.away) >= 24
+    if (!force && !moved && ask === this.lastEmit.ask && this.pinned === this.lastEmit.pinned) return
+    this.away = away
+    this.lastEmit = { pinned: this.pinned, away, ask }
+    this.onFollowState(this.lastEmit)
+  }
+
+  /** A question card landed or went away. */
+  private setAsked(n: number) {
+    this.asked = Math.max(0, n)
+    this.measureFollow()
+  }
+
+  /** Watch the content's own height: growth that no follow call reports. */
+  private watchHeight() {
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => {
+      if (this.measureRaf) return
+      this.measureRaf = requestAnimationFrame(() => {
+        this.measureRaf = 0
+        this.measureFollow()
+      })
+    })
+    ro.observe(this.root)
+    this.ro = ro
+  }
+
+  private ro: ResizeObserver | null = null
+  private measureRaf = 0
 
   /**
    * One step per animation frame, however many events asked for a follow.
@@ -1226,16 +2000,17 @@ export class Transcript {
     const gap = target - sc.scrollTop
     if (gap <= 0.5) {
       this.followVel = 0
+      // The button and the "how far below am I" number are computed from the same distance the
+      // follow loop just closed. Scroll events from our own writing are attributed to us and do not
+      // re-measure, so without this the pill kept offering a way down to a reader the loop had
+      // already carried to the bottom.
+      this.measureFollow(true)
       return
     }
     if (gap > sc.clientHeight * FOLLOW_JUMP) {
       pageLog(`follow: ${Math.round(gap)}px behind is a view change, not a stream; placing the view`)
       this.followVel = 0
-      this.programmatic = true
-      sc.scrollTop = target
-      requestAnimationFrame(() => {
-        this.programmatic = false
-      })
+      this.scrollTo(sc, target)
       return
     }
     const want = Math.min(gap, Math.max(FOLLOW_MAX_STEP, gap * FOLLOW_CATCHUP))
@@ -1244,11 +2019,8 @@ export class Transcript {
     if (step > FOLLOW_MAX_STEP + 1)
       pageLog(`follow catch-up: ${Math.round(gap)}px behind, moving ${Math.round(step)}px this frame`)
     const before = sc.scrollTop
-    this.programmatic = true
-    sc.scrollTop = before + step
-    requestAnimationFrame(() => {
-      this.programmatic = false
-    })
+    this.scrollTo(sc, before + step)
+    this.measureFollow()
     // The engine rounds scrollTop. If a step bought nothing, finish the trip
     // rather than spin on sub-pixel residue.
     if (sc.scrollTop - before < 0.5) {
@@ -1272,11 +2044,7 @@ export class Transcript {
     this.followVel = 0
     const sc = this.hookScroller()
     if (!sc) return
-    this.programmatic = true
-    sc.scrollTop = sc.scrollHeight
-    requestAnimationFrame(() => {
-      this.programmatic = false
-    })
+    this.scrollTo(sc, sc.scrollHeight)
   }
 
   /** Start a streaming block region: one element per markdown block. */
@@ -1293,6 +2061,7 @@ export class Transcript {
     this.liveTextHost = null
     this.liveList = null
     this.liveTable = null
+    this.liveCode = null
     this.tailStructured = false
     this.inline.reset()
     this.blockStart = 0
@@ -1301,7 +2070,10 @@ export class Transcript {
     el.classList.add('streaming')
   }
   private push(s: string, kind: BlockKind) {
-    if (this.textKind !== kind || !this.textBuf) {
+    // A thought owns no buffer - that is the point of it - so "is this still the same block?"
+    // cannot be asked of `textBuf` for reasoning: asked that way, every delta opened a new thought
+    // line, which is one header line per word.
+    if (this.textKind !== kind || (!this.textBuf && kind !== 'reasoning')) {
       // Drain first. `flush` joins the whole queue and routes it by whatever
       // `textKind` is *at paint time*, so a queue that survives the switch paints
       // the tail of a thinking block inside the answer - and glues that prose to
@@ -1314,32 +2086,34 @@ export class Transcript {
       // formatting of the part already on screen.
       if (this.textKind === 'answer') this.finalizeAnswer()
       if (this.textKind === 'reasoning') this.closeReasoning()
-      const label = kind === 'reasoning' ? 'thinking' : kind === 'user' ? 'you' : 'cwoffee'
-      this.textBuf = this.block(kind, label)
-      this.textKind = kind
       if (kind === 'reasoning') {
-        this.textBuf.classList.add('clamp', 'streaming')
-        this.textBuf.dataset.thinkStart = String(performance.now())
-        this.reasoningEls.push(this.textBuf)
-        const run = this.runGroup
-        if (run) this.bumpRun(run, 'think')
+        // A line, not a body: see `thoughtLine`. `textBuf` stays null so nothing downstream
+        // can paint reasoning text into the page by accident.
+        this.textBuf = null
+        this.thoughtBuf = this.thoughtLine()
+        this.thoughtBuf.dataset.thinkStart = String(performance.now())
+        this.thoughtWords = 0
+        this.reasoningEls.push(this.thoughtBuf)
+      } else {
+        const label = kind === 'user' ? 'you' : 'cwoffee'
+        this.textBuf = this.block(kind, label)
+        if (kind === 'answer') {
+          this.answerEls.push(this.textBuf)
+          this.beginLive(this.textBuf)
+        }
       }
-      if (kind === 'answer') {
-        this.answerEls.push(this.textBuf)
-        this.beginLive(this.textBuf)
-      }
-      this.setLive(this.textBuf)
+      this.textKind = kind
+      this.setLive(this.thoughtBuf ?? this.textBuf)
     }
     this.pending.push(s)
     if (!this.raf) this.raf = requestAnimationFrame(() => this.flush())
   }
 
   /**
-   * Follow the bottom unless the user scrolled up to read something. Fighting a
-   * reader's scroll is the most annoying thing a streaming chat can do.
+   * Report a change in the transcript, with what kind of change it was: see `follow`.
    */
-  private scrollIfNeeded() {
-    this.follow()
+  private scrollIfNeeded(why: Growth = 'chrome') {
+    this.follow(why)
   }
 
   /** Where a reader deliberately is: false once they scroll up, true at the bottom. */
@@ -1353,6 +2127,23 @@ export class Transcript {
     switch (ev.kind) {
       case 'turnStart': {
         this.flushNow()
+        // Your own words belong to *this* turn, but they are already on screen: the composer
+        // paints them the moment you press send, while `this.turn` still points at the turn
+        // that just finished. Starting a new turn and putting the divider at its top therefore
+        // slid the divider *under* your message, which reads as your message belonging to the
+        // answer above it. So the trailing user blocks — and their name marker — come along
+        // into the turn they belong to, and the divider lands above them.
+        const prev = this.turn
+        const trailing: HTMLElement[] = []
+        if (prev) {
+          for (
+            let n = prev.lastElementChild;
+            n && n.classList.contains('blk-user');
+            n = n.previousElementSibling as HTMLElement | null
+          ) {
+            trailing.unshift(n as HTMLElement)
+          }
+        }
         this.turn = null
         this.textBuf = null
         this.textKind = null
@@ -1360,13 +2151,20 @@ export class Transcript {
         // re-parented into the new one by the next `addFiles` - which is how a
         // "clean up those downloads" turn ended up wearing the files it deleted.
         this.turnFiles = []
-        this.fileStrip = null
+        this.fileEls = []
         this.runGroup = null
         this.collected = { answer: '', reasoning: '' }
         this.answerEls = []
         const head = this.el('turn-head', `turn ${ev.d.turn_id} · ${ev.d.model}`)
         this.ensureTurn()
-        this.turn!.insertBefore(head, this.turn!.firstChild)
+        this.turn!.appendChild(head)
+        for (const n of trailing) {
+          // The one that opens this turn carries your name again: it was quiet in the turn it
+          // happened to be typed into, and here it is the line the turn starts with.
+          n.classList.remove('nameless')
+          this.turn!.appendChild(n)
+        }
+        trailing.slice(1).forEach((n) => n.classList.add('nameless'))
         break
       }
       case 'text':
@@ -1400,12 +2198,13 @@ export class Transcript {
         // rendered by the composer overlay, not inline: it needs the keyboard
         break
       case 'note':
-        // Rendered inline, and deliberately *not* recorded in the note memory:
-        // an event that arrives through apply() carries no conversation id, so
-        // replaying it would follow the reader into unrelated sessions. Real
-        // engine notes are routed by App through showNote(msg, viewId) instead.
+        // Out of the transcript and into the chrome. An event that arrives through apply()
+        // carries no conversation id, so it is not remembered for replay either — it would
+        // follow the reader into unrelated sessions. Notes are the app talking about itself;
+        // they are worth seeing once, and they were making the record of a conversation hard
+        // to read.
         this.flushNow()
-        this.block('note', 'note').textContent = ev.d.message
+        this.showNote(ev.d.message)
         break
       case 'error':
         this.flushNow()
@@ -1425,12 +2224,58 @@ export class Transcript {
         // read, the files are what it produced, and copying is a thing you do to
         // a finished turn rather than one still arriving.
         this.appendTurnActions()
+        // And then the turn stops paying for its own animation. See the method.
+        this.collapseRevealSpans()
         break
       case 'usage':
       case 'toolCallArgs':
       case 'toolExecStart':
         break
     }
+  }
+
+  /**
+   * Drop the reveal scaffolding from a finished turn.
+   *
+   * One `<span class="tin">` per word is what buys the word-by-word arrival, and it
+   * is also what makes a long session hard to scroll. Measured in the app's own
+   * webview (WebKitGTK, `scripts/perf-rig.mjs --mode live`): a hundred streamed
+   * turns leave **200,905 nodes** in the transcript, of which **192,694 are `.tin`
+   * spans** — spans that finished animating turns ago and now hold nothing. Load the
+   * same conversation from history and the same text arrives as 2,931 nodes, which is
+   * exactly the report: reopening a chat feels fine, *living* in one does not.
+   *
+   * The span earns its keep while the word arrives and costs after that. The reveal
+   * is a CSS animation with `backwards` fill and no post-animation class, so a
+   * finished span has no visual state left to hold: replacing it with the text node it
+   * wraps changes nothing you can see, and `wordAt`/`charAt`/`pointToCaret`/the quote
+   * and copy paths already read plain text nodes. A span that wraps markup — a link,
+   * a code span, a bold run, a hard break — keeps its element, because there the
+   * element is the meaning and not the animation.
+   *
+   * The last few words are left alone, and swept on a timer: replacing a span whose
+   * animation has not finished would pop the word into view, and the tail of a turn is
+   * precisely where a pop would be noticed.
+   */
+  collapseRevealSpans(): void {
+    // The negative control for the measurement above: with this off, the spans stay.
+    // `scripts/perf-rig.mjs --collapse off` sets it, so the claim "collapsing is what
+    // fixed it" can be falsified in the same run that makes it.
+    if (!this.collapseSettled || !this.turn) return
+    const turn = this.turn
+    const spans = Array.from(turn.querySelectorAll<HTMLElement>('.tin'))
+    if (!spans.length) return
+    const tail = Math.min(24, spans.length)
+    let collapsed = 0
+    for (const s of spans.slice(0, spans.length - tail)) collapsed += collapseSpan(s)
+    pageLog(`live: collapsed ${collapsed} reveal span(s) in the finished turn`)
+    if (!tail) return
+    setTimeout(() => {
+      if (!turn.isConnected) return
+      let rest = 0
+      for (const s of Array.from(turn.querySelectorAll<HTMLElement>('.tin'))) rest += collapseSpan(s)
+      if (rest) pageLog(`live: collapsed the last ${rest} reveal span(s) after their animation`)
+    }, 1500)
   }
 
   /** Flush any buffered deltas. Call before reading textContent or ending a turn. */
@@ -1482,6 +2327,9 @@ export class Transcript {
     this.textKind = 'user'
     body.textContent = text
     this.appendAttachmentTags(body, attachments)
+    // Your own words are the one thing that always moves the view: a message typed while the
+    // reader was looking further up belongs at the bottom, and they wrote it.
+    this.follow('you')
   }
 
   /**
@@ -1497,6 +2345,34 @@ export class Transcript {
       row.append(this.el('atttag', `${a.name ?? a.mime} · ${kb} kB`))
     }
     body.append(row)
+  }
+
+  /**
+   * Paint the part of a running turn that happened before this client arrived.
+   *
+   * A page pointed at the gateway and reloaded mid-answer is handed the stored rows, which
+   * stop at the last closed message. Everything streamed since then is in the host's memory,
+   * not on disk yet, so the reloaded page would otherwise paint the reply starting at the
+   * first delta that arrives after the reload — the top of the message missing, fixing itself
+   * only when the turn ends and its row is written. The host hands over that open half and
+   * this puts it on screen, fed through the same buffer the live deltas use so the answer
+   * continues *inside the same block* rather than starting a second one.
+   *
+   * It defers to whatever is already streaming: if deltas arrived before the host's answer
+   * did, painting the earlier half now would put it below the later half, so it is dropped
+   * instead of mis-ordered.
+   */
+  seedOpen(text: string, reasoning: string) {
+    if (!text && !reasoning) return
+    if (this.textBuf) return
+    if (reasoning) {
+      this.push(reasoning, 'reasoning')
+      this.flushNow()
+    }
+    if (text) {
+      this.push(text, 'answer')
+      this.flushNow()
+    }
   }
 
   /** Surface a shell-level failure in the transcript, not just the log. */
@@ -1519,21 +2395,7 @@ export class Transcript {
     // A note about conversation 18 does not belong on screen while the reader is
     // looking at 3. It is kept, and replayNotes brings it back the moment 18 is on
     // screen - which, for the note a session switch emits, is one repaint later.
-    if (paintHere) this.appendNote(msg)
-  }
-
-  private appendNote(msg: string) {
-    const el = document.createElement('div')
-    el.className = 'blk blk-note'
-    const body = document.createElement('div')
-    body.className = 'blk-body'
-    body.textContent = msg
-    el.appendChild(body)
-    // ensureTurn, not this.turn!: a startup note can arrive before any turn
-    // exists, and the first version of this dereferenced a null turn.
-    this.ensureTurn()
-    this.turn!.appendChild(el)
-    this.scrollIfNeeded()
+    if (paintHere && this.onNote) this.onNote(msg, session ?? null)
   }
 
   /**
@@ -1541,10 +2403,17 @@ export class Transcript {
    * rebuilt. Only notes stamped with a session come back: an unstamped note has no
    * conversation to be loyal to, and replaying one into every transcript turns a
    * one-line notice into a stalker.
+   *
+   * One notice, not all of them: these are now transient toasts, and replaying six
+   * stacked notes about a conversation the reader is arriving at is a wall of chrome.
+   * The newest one is the one that explains what just happened.
    */
   replayNotes(session: number) {
-    for (const n of this.notes) {
-      if (n.session === session) this.appendNote(n.text)
+    const mine = this.notes.filter((n) => n.session === session)
+    if (mine.length && this.onNote) {
+      const last = mine[mine.length - 1]
+      const more = mine.length - 1
+      this.onNote(more > 0 ? `${last.text} (+${more} earlier note${more > 1 ? 's' : ''})` : last.text, session)
     }
   }
 
@@ -1686,6 +2555,10 @@ export class Transcript {
         if (n instanceof HTMLInputElement || n instanceof HTMLButtonElement) n.disabled = true
       })
       onAnswer({ text, options })
+      // The card no longer needs an answer, so the grouped run holding it may fold again the
+      // way any other finished run does. Without this the question keeps its group open for
+      // the rest of the conversation, which is the clutter the report was about.
+      this.releaseQuestion(card)
     }
 
     const submit = () => {
@@ -1739,12 +2612,17 @@ export class Transcript {
     // up, answers correctly when driven by a test that reaches it by id - and is
     // never on screen. A rewrite of this method lost exactly these three lines,
     // and the self-test caught it as "question card did not render".
-    // Never inside the accordion: a question that needs an answer cannot hide
-    // behind a header, and a run whose card you cannot see looks like a hang.
-    this.closeRunGroup(true)
-    this.turn!.appendChild(card)
+    // The card belongs to the run that asked it - inside the grouped block, not beside
+    // it - and that group is open for as long as the card needs an answer. A question
+    // that can hide behind a folded header is a hang wearing a transcript.
+    this.runForQuestion().querySelector('.run-body')!.appendChild(card)
     this.questionCards.set(q.id, card)
-    this.scrollIfNeeded()
+    // A question waiting for an answer is the one thing in the transcript that must not hide, and
+    // it does not need the view dragged down to avoid hiding: the jump button says "cwoffee is
+    // asking" and the group holding the card is forced open (see `runForQuestion`). Dragging the
+    // view down instead would interrupt a reader who was reading something else.
+    this.setAsked(this.askedCount())
+    this.scrollIfNeeded('ask')
   }
 
   /**
@@ -2000,7 +2878,10 @@ export class Transcript {
       })
       label.textContent = got ? `answered ${got} of ${n}` : 'declined'
       answers.forEach((a) => onAnswer(a.id, { text: a.text, options: a.options }))
-      self.scrollIfNeeded()
+      // The card no longer needs an answer, so the group holding it may fold like any
+      // other finished run. `releaseQuestion` only closes what the question opened.
+      self.releaseQuestion(card)
+      self.scrollIfNeeded('text')
     }
 
     back.addEventListener('click', () => show(cur - 1))
@@ -2016,11 +2897,13 @@ export class Transcript {
       submit()
     })
 
-    this.closeRunGroup()
-    this.turn!.appendChild(card)
+    // The question joins the run that asked it, and that run stays open until it is
+    // answered: see `runForQuestion`.
+    this.runForQuestion().querySelector('.run-body')!.appendChild(card)
     for (const p of panes) this.questionCards.set(p.q.id, card)
     show(0)
-    this.scrollIfNeeded()
+    this.setAsked(this.askedCount())
+    this.scrollIfNeeded('ask')
   }
 
   /** Close a question card answered elsewhere - another tab, another device. */
@@ -2029,22 +2912,38 @@ export class Transcript {
     if (!card || card.classList.contains('answered')) return
     card.classList.add('answered', 'by-other')
     card.append(this.el('ask-answered', 'answered elsewhere'))
+    this.releaseQuestion(card)
   }
 
   /**
-   * Close a question that closed *without* an answer. The engine says so when its
-   * tool stops waiting: the reply channel is gone, so clicking Send from here
-   * aims an answer at a call that has already returned, and the turn has moved on
-   * having been told to decide for itself. Saying "no answer in time" is the
-   * difference between a dead button and an explained one.
+   * Close a question that closed *without* an answer.
+   *
+   * This is no longer about a clock. By default a question does not expire at all — the
+   * turn is parked, not failing — so what reaches here is the tool stopping its wait: the
+   * person pressed Stop, or the reply channel died with a window that went away. (A clock
+   * is still possible if `question_timeout_secs` is written down on purpose.) Saying
+   * "nobody answered" is the difference between a dead button and an explained one.
+   *
+   * `why` says which of those happened, because the three sentences are not
+   * interchangeable: "the model was told it got none" about a turn the reader stopped
+   * themselves describes an event that never took place, and it is the one line in the
+   * transcript that a stopped question leaves behind. No `why` (an older stream, or a card
+   * closed by a reply the host had already let go of) gets the wording that is true for
+   * all three.
    */
-  expireQuestion(id: number) {
+  expireQuestion(id: number, why?: 'turnStopped' | 'timedOut' | 'windowGone') {
     const card = this.questionCards.get(id)
     if (!card || card.classList.contains('answered') || card.classList.contains('expired')) return
+    const said =
+      why === 'turnStopped'
+        ? 'no answer — the turn was stopped; the tool did not run'
+        : why === 'timedOut'
+          ? 'no answer — the clock ran out; the model was told it got none and to decide for itself'
+          : why === 'windowGone'
+            ? 'no answer — the window holding this card closed'
+            : 'no answer — the card closed; the model was told it got none'
     card.classList.add('expired')
-    card.append(
-      this.el('ask-expired', 'no answer in time — the model was told to decide for itself'),
-    )
+    card.append(this.el('ask-expired', said))
     card
       .querySelectorAll('.ask-opt, .ask-input, .ask-submit, .ask-decline')
       .forEach((n) => {
@@ -2052,6 +2951,7 @@ export class Transcript {
         if (n instanceof HTMLInputElement || n instanceof HTMLButtonElement) n.disabled = true
       })
     card.querySelectorAll('.ask-opt').forEach((n) => (n as HTMLElement).setAttribute('aria-disabled', 'true'))
+    this.releaseQuestion(card)
   }
 
   addFiles(files: OutputFile[]) {
@@ -2063,28 +2963,47 @@ export class Transcript {
       if (at >= 0) this.turnFiles[at] = f
       else this.turnFiles.push(f)
     }
-    this.fileStrip?.remove()
-    this.fileStrip = this.fileRow(this.turnFiles)
+    for (const el of this.fileEls) el.remove()
+    this.fileEls = this.fileRow(this.turnFiles)
+    for (const el of this.fileEls) this.turn!.appendChild(el)
     this.closeRunGroup(true)
-    this.turn!.appendChild(this.fileStrip)
-    this.scrollIfNeeded()
+    this.scrollIfNeeded('text')
   }
 
-  private fileRow(files: OutputFile[]): HTMLElement {
+  private fileRow(files: OutputFile[]): HTMLElement[] {
+    // One entry per path, newest write winning. The host records every write, so a model that
+    // rebuilt the same workbook three times left three near-identical units in the strip — the
+    // same file, and only the newest of them is on disk. Three chips each pretend to be a
+    // different deliverable; how many writes it took is better told in the tooltip.
+    const byPath = new Map<string, OutputFile & { writes: number }>()
+    for (const f of files) byPath.set(f.path, { ...f, writes: (byPath.get(f.path)?.writes ?? 0) + 1 })
+    const all = [...byPath.values()]
     const row = this.el('filestrip')
-    // Two kinds of file, two shapes. A deliverable - the downloaded archive, the
-    // xlsx, the one-file HTML page - wants a chip you can click. A file the model
-    // changed while implementing a feature wants a count and a list: a real
-    // feature in a real repository is dozens of files, and a strip of 38 chips
-    // used to bury the one artifact in the turn. Below the threshold, chips are
-    // the right shape for changes too - two edited files are worth seeing.
-    const deliverables = files.filter((f) => f.kind === 'artifact')
+    const line = this.el('attachline')
+    // Three kinds of file, three shapes. An attachment is the model saying "this one is
+    // for you" — it chose to write into `.cws/assistant_attachments/`, so it is the only
+    // file the host will copy somewhere the person picks, and it never folds. An
+    // artifact is a generated file to open from the chat. A file the model changed while
+    // implementing a feature wants a count and a list: a real feature in a real
+    // repository is dozens of files, and a strip of 38 chips used to bury the one
+    // artifact in the turn. Below the threshold, chips are the right shape for changes
+    // too — two edited files are worth seeing.
+    const deliverables = all.filter((f) => f.kind === 'artifact')
+    const attachments = all.filter((f) => f.kind === 'attachment')
     // A file the model fetched for itself landed under .cws/ on purpose, so the
     // transcript does not present it as something the person asked for. It is
     // still one click away — hidden is not the same as gone, and a file the model
     // read should be checkable by the person who was told about it.
-    const scratch = files.filter((f) => (f as { kind?: string }).kind === 'scratch')
-    const changes = files.filter((f) => f.kind !== 'artifact' && (f as { kind?: string }).kind !== 'scratch')
+    const scratch = all.filter((f) => (f as { kind?: string }).kind === 'scratch')
+    const changes = all.filter(
+      (f) => f.kind !== 'artifact' && f.kind !== 'attachment' && (f as { kind?: string }).kind !== 'scratch',
+    )
+    // Attachments on their own line, against the right edge of the column. They are the files the
+    // model wrote *to hand over*, and they are read differently from the working strip: the strip
+    // says what the turn touched (left, under the prose, in the order it touched them), the line
+    // says what it made for you. Sharing one left-aligned row made a deliverable look like one more
+    // file it edited - which is how a person ends up hunting for the thing they came back to fetch.
+    for (const f of attachments) line.append(this.attachmentUnit(f))
     for (const f of deliverables) row.append(this.fileChip(f))
     if (scratch.length) row.append(this.scratchGroup(scratch))
     if (changes.length <= ROLL_FILES_AT) {
@@ -2092,7 +3011,73 @@ export class Transcript {
     } else if (changes.length) {
       row.append(this.changeRoll(changes))
     }
-    return row
+    // An empty line is not a line: a turn that produced no attachment must not reserve a band of
+    // blank column above its working chips.
+    return [line, row].filter((el) => el.childElementCount > 0)
+  }
+
+  /**
+   * An attachment and the control that hands it over.
+   *
+   * The button is separate from the chip because the chip opens the file *where it
+   * already sits* — in the assistant's folder — while a person asking for a file
+   * usually means "put it somewhere I chose". The transcript cannot pick a destination
+   * and does not try: it asks the shell, which on the desktop opens a save dialog and
+   * on a browser tab downloads.
+   */
+  private attachmentUnit(f: OutputFile & { writes?: number }): HTMLElement {
+    const unit = this.el('attachunit')
+    // A file the model meant you to have — and say where it is, rather than drawing a box
+    // around it. The folder starts with a dot, so no file manager, screenshot or listing shows
+    // it: a solid border promises a container that is not there, and a second box inside a box
+    // is what turned a filename into a 200px block. A dashed hairline is the outline of a box
+    // that is deliberately not quite there.
+    if (f.writes && f.writes > 1)
+      unit.title = `${f.name} — written ${f.writes} times this turn; the ${fmtSize(f.bytes)} copy is what is on disk`
+    unit.append(this.fileChip(f))
+    // The save control is an icon, like every other action on a block: the row is one line tall and
+    // the filename is the thing that has to stay readable. What it does, and what just happened,
+    // live in `title` and `aria-label` - a name in those costs no pixels and is still announced.
+    const idle = `Save ${f.name} (${fmtSize(f.bytes)}) wherever you choose`
+    const btn = this.btn('attach-save', '')
+    btn.innerHTML = actIcon('download', 13)
+    btn.title = idle
+    btn.setAttribute('aria-label', `Save ${f.name} to a place you choose`)
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation()
+      if (!this.onDeliver) {
+        if (this.onToast) this.onToast('this connection cannot save files', true)
+        return
+      }
+      btn.disabled = true
+      btn.title = `Saving ${f.name}…`
+      try {
+        const msg = await this.onDeliver(f.path)
+        if (msg && this.onToast) this.onToast(msg)
+        // The glyph changes to a tick and stays that way for a moment: the file picker has already
+        // taken the reader's attention, so a word they may not have seen is not enough proof.
+        btn.classList.add('done')
+        btn.innerHTML = actIcon('check', 13)
+        btn.title = `Saved ${f.name}`
+      } catch (err) {
+        // The tick has to go back at once. A download glyph that turned into a tick and then lied
+        // is worse than no answer at all, and the failure path is exactly where a reader looks for
+        // proof. The reason goes to the toast, not the console.
+        btn.classList.remove('done')
+        btn.innerHTML = actIcon('download', 13)
+        btn.title = idle
+        if (this.onToast) this.onToast(`could not save ${f.name}: ${err}`, true)
+      } finally {
+        btn.disabled = false
+        setTimeout(() => {
+          btn.classList.remove('done')
+          btn.innerHTML = actIcon('download', 13)
+          btn.title = idle
+        }, 2500)
+      }
+    })
+    unit.append(btn)
+    return unit
   }
 
   /** The reference files of a turn, folded into one line: `2 reference files`. */
@@ -2121,13 +3106,27 @@ export class Transcript {
     chip.className = 'filechip'
     chip.type = 'button'
     chip.dataset.path = f.path
-    chip.title = `Open ${f.path}`
+    // The size belongs in the tooltip for an attachment: copying a 400 kB page to your
+    // own folder and copying a 400 MB archive are different acts, and the chip looks
+    // identical either way.
+    chip.title =
+      f.kind === 'attachment'
+        ? `${f.name} — ${fmtSize(f.bytes)} in .cws/assistant_attachments/. Click to open it here, Save to copy it wherever you choose.`
+        : `Open ${f.path}`
     const ico = this.el('file-ico')
     ico.append(fileIcon(f.mime))
     chip.append(ico)
     const meta = this.el('file-meta')
     meta.append(this.el('file-name', f.name))
-    meta.append(this.el('file-sub', `${shortMime(f.mime)} · ${fmtSize(f.bytes)}`))
+    // An attachment is one line: the mime type of a file the model already told you about is
+    // not information, and the size is what you weigh before saving a copy. The rest of the
+    // detail is in the tooltip.
+    if (f.kind === 'attachment') {
+      chip.classList.add('one-line')
+      meta.append(this.el('file-sub', fmtSize(f.bytes)))
+    } else {
+      meta.append(this.el('file-sub', `${shortMime(f.mime)} · ${fmtSize(f.bytes)}`))
+    }
     chip.append(meta)
     return chip
   }
@@ -2237,7 +3236,7 @@ export class Transcript {
     this.turn.appendChild(this.turnActionsRow(text, this.sessionId))
     // The row lands after the last paint, so a reader who was being followed
     // ends up 30-odd pixels short of the bottom exactly when the turn closes.
-    this.follow()
+    this.follow('text')
   }
 
   // ---- tool cards ---------------------------------------------------------
@@ -2327,7 +3326,7 @@ export class Transcript {
       stdout: '',
       stderr: '',
     })
-    this.scrollIfNeeded()
+    this.scrollIfNeeded('work')
   }
 
   private refs(id: string): ToolRefs | undefined {
@@ -2358,7 +3357,7 @@ export class Transcript {
     if (!t.detail.classList.contains('expanded')) {
       t.detail.scrollTop = t.detail.scrollHeight
     }
-    this.scrollIfNeeded()
+    this.scrollIfNeeded('work')
   }
 
   /**
@@ -2472,6 +3471,10 @@ export class Transcript {
   loadHistory(msgs: StoredMessage[]) {
     this.clear()
     this.root.appendChild(this.historyFragment(msgs))
+    // One cup for the page, under everything the store produced, resting: a loaded session is a
+    // finished one, so this is the loop with the random holds rather than a still.
+    this.placeCup()
+    this.repaintCup()
     pageLog(`history: loaded ${msgs.length} messages`)
   }
 
@@ -2504,6 +3507,25 @@ export class Transcript {
     let lastCard: { out: HTMLElement; stat: HTMLElement; detail: HTMLElement; card: HTMLElement } | undefined
 
     let lastWrap: HTMLElement | undefined
+    // The run for the turn being rendered. One per turn here too, and it survives the
+    // paragraphs in between: `blk` settles it, the next reasoning row reopens it, and only a
+    // user row — the line where one turn stops and the next starts — throws it away. The
+    // stored rows stay exactly as they are and in the order they are in; only their
+    // arrangement on screen changes, because rewriting history mid-conversation is how a
+    // prompt cache stops matching and every turn starts costing full price again.
+    let run: HTMLElement | null = null
+    // One name per turn here too. A stored transcript has no `.turn` element to bound the
+    // marker, so it sticks to the scroller until the next turn replaces it — the same
+    // affordance seen from the other end: whoever's words fill the screen is named at the top
+    // of it. `asked` counts as cwoffee speaking: a question the agent asked is its turn.
+    let whoSaid = false
+    const whoCwoffee = () => {
+      if (whoSaid) return
+      whoSaid = true
+      const wrap = this.el('turn-who turn-who-cwoffee')
+      wrap.append(this.el('who-name', 'cwoffee'))
+      frag.appendChild(wrap)
+    }
     // The last thing this page's turns actually said. One actions row per turn, the
     // same affordance a live turn puts under its final answer - emitted per assistant
     // row, it stamped `Copy | Share as markdown | Branch` under every intermediate
@@ -2522,6 +3544,7 @@ export class Transcript {
     }
     const blk = (kind: string, label: string) => {
       endRun()
+      if (kind !== 'user') whoCwoffee()
       const wrap = this.el(`blk blk-${kind}`)
       const head = this.el('blk-head', label)
       const body = this.el('blk-body')
@@ -2533,13 +3556,13 @@ export class Transcript {
     // Stored turns are grouped the same way live turns are. If the two were
     // grouped differently, a conversation would look tidier while it ran than
     // after you left and came back, and the second look is the one people trust.
-    let run: HTMLElement | null = null
-    // The display setting, captured so the nested end-run can honour it: a stored transcript
+    // The display setting, captured so the nested settle-run can honour it: a stored transcript
     // has to open its runs exactly like the live one, or the same conversation looks different
     // depending on whether you are watching it or coming back to it.
     const verboseRuns = this.verbose
     const runBody = () => {
       if (!run) {
+        whoCwoffee()
         run = this.mkRun()
         frag.appendChild(run)
         lastWrap = run
@@ -2561,26 +3584,42 @@ export class Transcript {
         if (ms) run.dataset.thinkMs = String(ms)
       }
       Transcript.paintRun(run)
-      run = null
+      // Not `run = null`: this turn's accordion is still the place its next working block
+      // belongs, and a paragraph of answer in between is not a reason to build a second one.
     }
 
     for (const m of msgs) {
       if (m.role === 'user') {
         // A user row is where one turn stops and the next starts, so it is where the
-        // previous turn's actions row gets placed.
+        // previous turn's actions row gets placed — and where this turn's accordion is
+        // dropped, so the next turn gets its own rather than inheriting this one's steps.
         flushAnswerActs()
+        endRun()
+        run = null
+        whoSaid = false
         const body = blk('user', 'you')
         body.textContent = m.content
         this.appendAttachmentTags(body, m.attachments ?? [])
       } else if (m.role === 'assistant') {
         if (m.reasoning) {
+          // A line, not a body: the stored reasoning is not rendered at all. It is still counted,
+          // so a session reopened hours later says the same thing about the thought that was said
+          // while it was live - and counting it costs a scan of text that used to cost a thousand
+          // spans in the page.
           const wrap = this.el('blk blk-reasoning')
-          const head = this.el('blk-head', m.reasoning_ms ? fmtThink(m.reasoning_ms) : 'thinking')
-          const body = this.el('blk-body')
-          wrap.append(head, body)
-          body.classList.add('clamp', 'settled')
-          body.textContent = m.reasoning
-          if (m.reasoning_ms) wrap.dataset.thinkMs = String(m.reasoning_ms)
+          const words = countWords(m.reasoning)
+          const ms = Number(m.reasoning_ms ?? 0)
+          const head = this.el(
+            'blk-head',
+            ms
+              ? `${fmtThink(ms)}${words ? ` · ${fmtWords(words)} words` : ''}`
+              : words
+                ? `${fmtWords(words)} words of thinking`
+                : 'thinking',
+          )
+          wrap.append(head)
+          if (ms) wrap.dataset.thinkMs = String(ms)
+          if (words) wrap.dataset.words = String(words)
           const rb = runBody()
           rb.appendChild(wrap)
           run!.dataset.think = String(Number(run!.dataset.think ?? 0) + 1)
@@ -2608,8 +3647,7 @@ export class Transcript {
           // chips at the *top* of a reloaded transcript, above every message: a
           // session reopened after writing a file looked like it had no attachment,
           // which is exactly the "the file was not shown at turn end" report.
-          const strip = this.fileRow(m.files)
-          frag.insertBefore(strip, lastWrap ? lastWrap.nextSibling : null)
+          for (const el of this.fileRow(m.files)) frag.insertBefore(el, lastWrap ? lastWrap.nextSibling : null)
         }
         for (const call of parseCalls(m.tool_calls_json)) {
           if (call.name === 'ask_user') {
@@ -2617,7 +3655,11 @@ export class Transcript {
             // mechanism and hides the only interesting part, which is the question
             // the agent actually asked. The answer (the tool result) lands in the
             // same block, so the exchange reads as one exchange.
-            const body = blk('note', 'asked you')
+            // Not a note: this exchange is part of what was said, and notes are the app
+            // talking about itself, which now lives outside the transcript. A question the
+            // agent asked and the answer given are the conversation's own record, so they
+            // stay in the stream, as their own block kind.
+            const body = blk('asked', 'asked you')
             let q = ''
             try {
               const a = JSON.parse(call.arguments)

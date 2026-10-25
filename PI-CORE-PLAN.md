@@ -22,12 +22,23 @@
   a **context ceiling you can pin or free**, and a settings screen with categories.
   `cwoffee-gateway --core pi` and `CWOFFEE_CORE=pi` on the desktop; `master` still defaults to
   the Rust core, which stays the fallback and the A/B half.
-- **Last updated:** 2026-10-19T16:20Z (assistant, session 19) — the context ceiling is **one
-  number** now: the config file holds the pin (or the line is removed to derive it), both cores
-  measure and refuse against it, and pi is told to fold at `window − ceiling` for this model,
-  so the meter and the model's fold finally name the same line. Page harness green on the pi
-  core (`verdict: ok`) with a new case that drives the control itself. Gates: engine 436 + 10,
-  bridge 15 + 16, gateway 32, `svelte-check` 0.
+- **Last updated:** 2026-10-22T08:10Z (assistant, session 28) — a fresh clone now has one entry
+  point, and closing the window can leave the devices served. `./setup.sh` probes the build's
+  requirements by name (the same `pkg-config` modules `SETUP.md` records for one machine, plus the
+  toolchain and the run-time helpers the app actually consults), prints required vs optional, names
+  the package that provides anything missing, and then builds UI + release binaries; `--deps`,
+  `--tests`, `--board`, `--desktop`, `--endpoint/--model` (never over an existing config).
+  Settings > Devices gained **"Keep devices working after this window closes"**, default **off**: at
+  close the app releases `:8099`, starts `cwoffee-gateway` as its own transient systemd unit with the
+  session's XDG paths and pi-core paths handed over by `--setenv=` (never a token — that travels as a
+  file, because `ps` reads argv), appends its lines to `~/.local/state/cwoffee/gateway-handoff.log`
+  via `--property=StandardOutput=append:`, and then probes the port for 4s instead of assuming a
+  spawn is a server. The settings row prints which binary, which port, which stop command, and the
+  case where it cannot be honoured. `node scripts/gateway-handoff.mjs` grades the promise from
+  outside on both cores and from the installed launcher, with `--omit-ext` as the negative control.
+  Traps 125–126, gotchas 162–167. Numbers: engine **478**, desktop-app bin **23**, gateway bin **4**,
+  `svelte-check` 0 errors, page board **verdict: ok on both cores** (the new page case:
+  `keep-gateway ok …`), hand-off script **HANDOFF OK** on rust, pi and the installed copy.
 - **Verdict:** feasible, and cheaper than it looks — because the UI and the tools both
   survive untouched. Measured, not assumed. Three real costs: **+~90 MB PSS**, **two
   languages in the runtime**, and **pi gives you no sandbox** (that stays ours to own).
@@ -220,6 +231,17 @@ The store's automatic title has always been `derive_title`: the opening line, wh
 collapsed, cut at 48 characters. It is honest, and useless in exactly one place — a sidebar
 of forty rows that begin "hey can you", "can you look", "I want to". Nobody finds a
 conversation by reading those.
+
+> **Superseded on 2026-10-25, and removed.** The borrowed local model is gone: script, config
+> keys (`titlegen*`), the `titlegen_status` verb, the Settings cost sheet and the after-the-turn
+> `maybe_name` call on both cores. A conversation is now created as **New Session** and named by
+> the endpoint that already answers it, in one short request made *before* its first answer, in
+> its own context, with the name typed into the sidebar row as it arrives. The text below stays
+> as the measurement log: the 861–864 MB figure is why that design was opt-in, and it is the
+> reason the replacement had to cost about forty tokens and no memory at all. The rules now in
+> force are in `crates/engine/src/titling.rs`, gated by its tests plus
+> `host::a_new_conversation_is_named_before_it_is_answered`; the ask-and-fallback copy is in
+> `docs/TITLE-THINKING-DECODE-DELETE.md`.
 
 Locked shape:
 
@@ -2153,6 +2175,297 @@ was the light-theme icon; and go on with the harness plus the parity list.
     `read_file: read: /etc/hostname — OUTSIDE the workspace: /etc/hostname — OUTSIDE the workspace: /etc/hostname`.
     The structured `escapes` field is what the security rules read; the sentence is what a person
     reads, and it says each path once.
+156. **Stop has to release the dialogs it is parked on before it asks for the abort.** On a pi
+    core, `cancel` sent `{"type":"abort"}` and waited for the reply; pi answers `abort` only after
+    `session.abort()` unwinds the tool call, and that call was parked on the question card the
+    bridge was still holding. Each side waited on the other until the bridge's own 10 s request
+    timeout broke the tie. Measured, before: Stop landed at **10002 ms** — the timeout to the
+    millisecond — and the app then announced *"could not stop the turn: the model process did not
+    answer abort"* about a turn that had in fact just stopped. After releasing the waits first
+    (answering pi's own pending requests with `cancelled: true` / `confirmed: false`, emitting the
+    expiries, then aborting): **15 ms**, no error, cards closed. The rust core has always released
+    first; this is the pi bridge owing the same ordering. `gateway-ask.mjs` now presses Stop with a
+    card open on either core and wants `questionExpired`, `why: "turnStopped"`, a settled turn, and
+    the next `ask_user` call getting a card of its own.
+157. **`--bin` filters every selected package, so a multi-`-p` build line can grade an artifact
+    older than the source you changed.** `cargo build --release -p cwoffee-gateway -p cwoffee-bridge
+    --bin cwtool -p cwoffee-app` rebuilt `cwtool` at 09:11 and left `cwoffee-gateway` at 08:57 —
+    the gateway has no bin named `cwtool`, so it silently produced nothing for it, and the next
+    green gate run was grading a core that did not contain the change under test. Build the bin you
+    mean in its own cargo invocation, and check the binary's timestamp when a gate agrees with you
+    suspiciously fast.
+158. **A sticky offset is measured from the scrollport's *content* edge, not its border box.**
+    `.code-head { top: 0 }` inside a transcript with 24 px of top padding parked the sticky header
+    24 px below the top of the window, with a band of scrolling code above the copy button — the
+    complaint, 24 px smaller. The gutter is now `--scroller-pad-top` on `.scroller` and the header
+    sticks at `calc(-1 * var(--scroller-pad-top))`. The geometry check that found it was right and
+    the CSS was right; what was wrong was comparing against `sr.top` while the rule said `top: 0`.
+    (`overflow: hidden` on the block was the other half: it makes the block a scroll container, and
+    a sticky child of a scroll container never moves. It is `overflow: clip`.)
+159. **A check that inherits another case's UI state is a check that fails on an unrelated
+    change**, and a check that reads the page in the same tick it poked it fails on timing. The
+    ceiling case clicked `button[aria-label="Session telemetry"]` and then looked for
+    `[data-set-ceiling]`, which exists only inside the settings dialog; then it read the row's text
+    in the same tick as its own backend poll. Fix: open the surface you assert on
+    (`openSettings('models')` — the ceiling lives on the Models page, not Conversation), and poll
+    with a deadline (`rowSays(want)`), naming the page's own numbers in the failure.
+160. **A dialog that changes size when you change tab is the complaint, not the polish.** The
+    settings screen remembered its size per page, so the frame jumped every time the rail moved.
+    One size is remembered for the dialog, in one storage key, clamped back into the window; the
+    pages are tabs of one surface and get one frame. Related: blocking clicks behind a modal is a
+    promise (dim + `inert` + `pointer-events: none` on the shell's children), and the selftest
+    should grade the promise — a click that lands on the scrim, a background control that is
+    `inert` **or** hit-test-transparent — not one particular recipe.
+161. **A reveal inside a folded group never animates, so a check for the reveal has to take the
+    reader's gesture.** Runs are now closed by default including live turns; the streaming-reveal
+    case found zero words mid-fade and reported "the reveal is invisible". Correct on both sides:
+    the product folds the group, and the check must click the run's own header (`.blk-run.running >
+    .blk-head`) before it can see anything animate. Same lesson as `display: none` scrollers: a
+    measurement taken in a subtree nothing paints is not evidence.
+
+162. **A launcher that installs cleanly and opens nothing is an environment bug, not an icon bug.**
+    The core is chosen by `CWOFFEE_CORE`, and a desktop launch inherits the **session** environment,
+    not the shell's — so the value `scripts/run-pi-app.sh` exports is absent, and the config file's
+    `persona = chat` (written by the window's own Chat tab) makes the Rust core `exit(1)` before a
+    window exists. The symptom is a click that does nothing; the reason is only in the journal
+    (`journalctl --user -b | grep cwoffee.desktop`). `install-desktop.sh` now derives the core from
+    that config plus pi-core state on disk, records it in a wrapper it writes, installs its own copy
+    of the binary instead of pointing into `target/release`, and proves the window paints by
+    launching the entry with `gio launch` and reading the app's own `render OK`. Rule: grade the
+    promise the user makes (click the icon), never the artefact you wrote (a `.desktop` file).
+
+163. **A `systemd-run` unit gets the *user manager's* environment, not yours.** `systemd-run --user`
+    starts the service with the manager's environment: `echo ${CWOFFEE_PI:-unset}` inside one prints
+    `unset`. Everything with a default survives that — which is why it would have shipped — and the
+    things without one do not: a scratch config, a moved `XDG_DATA_HOME`, and on the pi core
+    `CWOFFEE_PI_EXT`/`CWOFFEE_CWTOOL`, which decide whether the model has tools at all. So the
+    variables a hand-off child needs are named one by one (`HANDOFF_ENV`), and the check reads them
+    back from the unit (`systemctl --user show <unit> -p Environment`) rather than trusting the argv
+    the app built. A bare/`setsid` child *does* inherit the environment; that is not the fallback's
+    weakness, its weakness is the cgroup scope, which is why the systemd route exists.
+164. **`--replace` and `--output=` are not systemd-run options (259), and a spawned process is not a
+    server.** `systemd-run: unrecognized option '--replace'` exits instantly, and the hand-off report
+    said `bound=false pid=307041 via=systemd-run` — a pid belonging to a process that had printed a
+    usage error and died. So: stop the previous unit by name (`systemctl --user stop
+    cwoffee-gateway-<port>`, ignoring "no such unit"), and put the child's exit status in the report
+    (`exited with exit status: 1 inside 4.0s`). Same for the log: the descriptors passed to
+    `systemd-run` never reach the unit, so `--property=StandardOutput=append:<path>` is what makes
+    "its own lines are in …" true. Every flag on that page is a fact to be probed, not a memory.
+165. **A checker that prints a red line and keeps going prints a green one next.** The first
+    `gateway-handoff.mjs` used `die(msg)` = print + async cleanup, and call sites did not return, so a
+    failure ran every later step and ended with `HANDOFF OK`. Its cleanup also awaited
+    `child.on('exit')` on a process that had already exited — which never fires — so node reported
+    "Detected unsettled top-level await" rather than a result, and it left a gateway holding the test
+    port so the next run's first check graded somebody else's listener. One `main()`, `die` throws,
+    one `.catch`, and the unit is stopped whatever happened. Then prove the check has teeth:
+    `--omit-ext` drops the extension variables and the run must fail.
+166. **A preference needs an address, and a hand-off needs a moment where two processes own one
+    database.** `UiPref` now carries `group: "transcript" | "devices"`, so a pref with no page — or
+    with two — is a compile-time-visible mistake and a test pins the count. The devices row is not
+    just a switch: it prints the plan (`gateway_handoff_plan`) so "there is no standalone gateway
+    binary to start" is said while a window is still open to say it in. And `Store::setup` sets
+    `busy_timeout(5000)`, because between releasing the listener and the child opening the same
+    sqlite file, two processes hold it for about a second.
+167. **The toolchain can be on disk and invisible.** `cargo: command not found` on this box with a
+    working rustup at `~/.cargo/bin`: a non-login shell (and every script this repo runs) has no
+    `~/.cargo/env`. `setup.sh` probes `$HOME/.cargo/bin/cargo` *before* editing `PATH`, so it can say
+    "it is installed, your shell cannot see it, add this line" instead of reporting a missing
+    toolchain. Ordering matters: after `export PATH=…` the fact is unobservable.
+
+## Journal — session 28 (one command from a clone, and a gateway that stays when the window goes)
+
+Two asks, one of them about getting started and one about what "closing the app" means:
+
+> *add a `setup.sh` so a fresh pull and a single run gets anybody going (maybe `--tests`)*
+> *an option to close the app while the gateway keeps running — put it in devices settings, call it
+> "keep gateway running on exit", default off*
+
+**The setup script turned out to be a documentation bug.** `SETUP.md` lists the exact `pkg-config`
+modules the build needs, verified by hand on 2026-10-01, with a compile transcript. That is a record
+of one machine and cannot tell a fresh clone what is missing. So the same probes became data in
+`setup.sh` — nine modules, eight tools, seven optional helpers — each printed with the package that
+provides it (`rpm -qf /usr/lib64/pkgconfig/webkit2gtk-4.1.pc` answers `webkit2gtk4.1-devel`; the apt
+and pacman columns are upstream's names, marked as unverified here). It refuses to overwrite an
+existing config, refuses to `sudo` without `--deps`, and refuses to spend the prompt cache: `--tests`
+runs the lib suites and the screen checks, `--board` runs the page board on both cores against
+`scripts/mock-llm.mjs`. Then it builds the production UI, then the release binaries under
+`cargo-guard`, then (with `--desktop`) the launcher — and rebuilds the production bundle itself first,
+because a board run leaves a test bundle in `ui/dist` and the installer refuses that on purpose.
+
+**The pref had to be honest about being a different process.** The gateway in the window is a task in
+the app's process; `stop()` is the only lever it has. So `gateway_on_exit` does not "not stop the
+task": at close the app releases the port, starts `cwoffee-gateway` as a transient systemd unit, and
+probes for a listener. The wording in the row says "a different process: <binary> on :<port>". The
+values handed over are read from the live host at close (`handoff_ctx`), not from boot, so a
+conversation that changed model, folder, mode or persona is handed over as it ended. Both quit paths
+do it — the calm close and the quit-while-busy settle — because the listener dies with the process
+either way. Default off, and the pref test in `prefs.rs` now pins the count and the group, because a
+pref nobody renders is a control that does not exist.
+
+**Then it did not work, three times, in three different ways** — which is what running it for real is
+for. See gotchas 163–165 and Trap 126: `--replace` does not exist; the unit inherits nothing; the log
+file was empty; and the checker reported success after failing. Each fix is paired with something that
+reads the artefact from outside — the unit's `Environment` property, the child's exit status, the port
+after the app exited, the token file rather than argv — because the app's own claim ("I started it")
+was the thing that was lying.
+
+Verified on this box: `node scripts/gateway-handoff.mjs` → `HANDOFF OK` for the rust core, the pi core
+and the **installed** launcher's copy (`--app ~/.local/share/cwoffee-desktop/bin/cwoffee-app`), each
+stopping cleanly afterwards (`units-after=0`); `--omit-ext` fails as it must; `cargo test -p
+cwoffee-app --bin cwoffee-app` 23 passed; engine 478; gateway bin 4; `svelte-check` 0; page board
+`verdict: ok` on both cores with the new case `keep-gateway ok (plan names … on :8199 via
+systemd-run; the control writes the store both ways; one control, one page)`; the desktop install
+re-run copies `cwoffee-gateway` next to the app and still opens a window from the entry.
+
+What is still open, stated rather than filed: no **turn** has been run through a handed-off gateway
+(the mock scenario machinery would have to point at a gateway it did not start), and an in-flight turn
+still dies with the window — the setting keeps devices *connectable*, not a half-finished answer alive.
+
+
+## Journal — session 27 (the launcher that installed perfectly and never opened)
+
+*"It seems to install fine but doesn't wanna open (when opening from apps menu)."* Every direct
+test said the launcher was fine, which is the trap: `gio launch` of the installed entry opened a
+window, `desktop-file-validate` was clean, nothing else in the search path was called `Cwoffee`, and
+a launch with a stripped session environment from cwd `/` still printed `render OK`. The failure was
+already in the journal, from the real click — `app-gnome-cwoffee-1170778.scope - Application
+launched by gnome-shell`, three boot lines, then `persona: chat is not available on the rust core`
+and exit 1. The config had `persona = chat` because Chat had been picked in the window, and the core
+travels only in the environment, which a menu launch does not have. Two more silent failures turned
+up while fixing it: `Exec=` pointed into `target/release` (deleted and rewritten by every cargo
+build, with no `TryExec=` to make the desktop say so), and the entry carried comment lines inside
+`[Desktop Entry]`.
+
+The script now grades the promise instead of the artwork. It installs a copy of the binary, the UI
+bundle and `cwtool` under `$XDG_DATA_HOME/cwoffee-desktop` — deliberately not under
+`$XDG_DATA_HOME/cwoffee`, which is the app's own data dir, where clearing data would have deleted
+the binary under a launcher — writes a launcher that records the pi core's paths, and derives which
+core to record from the config the app will read plus the pi-core state on disk, printing its reason
+and refusing `--core rust` against a `persona = chat` config. It refuses a `ui/dist` that carries the
+self-test bundle, because the board overwrites that directory constantly. Then it launches the
+installed entry through `gio launch` — GAppInfo, the app grid's own path — and reads the app's
+sentence for what it started (`engine up: core=pi persona=chat`) and for a window that painted
+(`render OK: titlebar=true …`), killing only the instance it started. A process that exits before
+painting prints its own first lines; a window that maps and never paints is judged by the app's own
+`SUSPECT` line and sent to `scripts/gpu-check.sh`.
+
+Evidence, all on this box: the reproduced symptom (menu-style launch, `persona = chat`, no
+`CWOFFEE_CORE` → exit 1, no window); the same config through the installed entry → `core=pi
+persona=chat` and `render OK`; the real install on the real store → `core=pi persona=cowork` and
+`render OK`; `--core rust` with a chat config refused; a launcher whose binary had been deleted
+reported as the silent case instead of timing out. The app gained one line: that refusal now says no
+window will appear, that a desktop launch's output reaches only the journal, and that this script is
+what records the core. Traps 125, gotcha 162.
+
+## Journal — session 26 (nine things somebody reported, and a Stop that had been waiting ten seconds)
+
+The report was nine items of surface behaviour: a device switch that needed pressing twice, a
+search provider that refused to save, a settings screen you could click through, a mode switch
+that left the old conversation on screen, a conversation with no folder that named one anyway,
+a status bar that ran off a phone, code-block buttons that scrolled away, a question card with a
+clock on it, and a working surface that opened itself. Six of the nine were one layer down from
+where they were reported, and three of them are the same bug wearing different clothes: a control
+that shows one thing and does another.
+
+**The search click wrote a file the app could not read.** The report quoted the app quoting
+`TOML parse error at line 44, column 11 | 44 | backend = auto | ^ invalid string expected "`,`
+…"` and saving nothing. The pi bridge built the `[search]` key list by hand and wrote the value
+bare; the config writer re-parses edited text before replacing the file — the guard that keeps a
+settings click from writing a config the next boot cannot open — refused the edit it had been
+asked to make. One helper (`search_keys`) now produces the keys and quotes them through the same
+writer the rust core uses. The unit test re-parses the file rather than grepping for a quote mark,
+and a new wire gate, `scripts/gateway-search-write.mjs`, runs the whole click on either core
+against a config that already *has* a `[search]` section (that is where the line numbers in the
+error came from), reads the panel back, parses the resulting file with `tomllib` — a reader that
+belongs to neither core — and checks that `max_results = 8`, a key nobody touched, is still there.
+The second half of the item, *"SearXNG needs a URL … and there is no box for it"*: the box
+existed and was drawn only for the backend the host had **accepted**, so when the save was refused
+the box vanished with it. `webSearchPending` keeps the box on screen while the choice is offered.
+
+**Pressing Stop had been waiting ten seconds, and then lying about it** (gotcha 156). The pi
+bridge sent `{"type":"abort"}` and waited for pi's reply; pi answers `abort` only after
+`session.abort()` has unwound the tool call, and that call was parked on the question card the
+bridge was still holding. Nothing gave up until the bridge's own 10 s request timeout broke the
+tie. Measured before, from a scratch gateway with a card open: every frame of the unwind — both
+questions, the tool end, `turnEnd` — at **10002 ms**, the timeout to the millisecond, plus an
+error card reading *"could not stop the turn: the model process did not answer abort; its last
+lines: [cwoffee-tools] 13 tool(s) mounted…"* about a turn that had just stopped. Now the bridge
+releases its dialogs first — answering pi's own pending requests with `cancelled: true` /
+`confirmed: false`, emitting the expiries, closing the set slots — and then asks for the abort:
+**15 ms**, no error, no stray "that answer was ignored" notes (a dropped sender is the stop path,
+not a late answer, and it no longer gets a sentence about an answer that never existed).
+
+**A question that closes says *why* it closed.** With the clock gone by default (session 25 left
+that half in place), the ways a card ends without an answer are few enough to name, and they need
+different sentences: `questionExpired {id, why}` now carries `turnStopped` / `timedOut` /
+`windowGone`, and the card ends with "the turn was stopped; the tool did not run" or "the clock
+ran out; the model was told it got none" accordingly. The reason is not decoration: after a Stop,
+"the model was told it got none" describes an event that never took place, and it is the only
+trace a stopped question leaves in the transcript. `gateway-ask.mjs` grew a third and fourth turn
+for this: ask, refuse to answer, press Stop, and require the expiry frame for the right id with
+`why: "turnStopped"`, a turn that settles, and then a *new* `ask_user` call in the same
+conversation getting a card of its own — which is the set-key release visible from outside. Green
+on both cores, with the pi core closing questions 7 and 9 and the rust core 8 and 9.
+
+**Three controls that reported the wrong thing.** The gateway scope switch displayed the stored
+choice while the listener was bound to something else, so "Any device" compared equal to what was
+stored and did nothing until "This machine" had been pressed first — one derived value (the
+running listener's bind if there is one, the pending choice if not) is now both what the control
+shows and what a click is measured against. A mode switch left the previous mode's turn on
+screen, which reads like a switch that was refused; it now lands on the start screen and keeps the
+conversation it switched away from, rows and all — the check for that has to give the view
+something to reset first, or it passes vacuously. The header `+` inherited whichever folder the
+previous draft was aimed at; it asks for a conversation with no folder picked.
+
+**"No workspace" is now three words used in three places.** A conversation parked in the system
+temp folder showed `/tmp` in the chip, in the sidebar and in the model's `<env>` block, which
+reads like a folder somebody chose. The chip, the sidebar group and the pop-title say **No
+workspace**; the env block says `workspace: none (… a scratch folder that the user did not choose
+and does not keep)`; and the pi core needs an appended note in its system prompt because pi prints
+its own `<cwd>` block naming the same path. Two tests keep that honest: a conversation *with* a
+folder is told exactly what it was told before, byte for byte (that prefix is what the endpoint's
+cache is keyed on), and the temp-root conversation's note never prints the path.
+
+**The working surface folds, and the question lives inside it.** The grouped block is closed by
+default, live turns included — the header carries liveness — and a question card sits *inside* the
+run that asked it instead of next to the answer forever. An unanswered question forces its run
+open and marks the header `waiting for you`; answering it releases the run, which is where
+`finish()` had forgotten to call `releaseQuestion` and left `dataset.ask` at 1 for the life of the
+session.
+
+**Two fits.** The status bar asks its own width, not the window's (`container-type:
+inline-size`): below 660 px the pills go thumb-sized and lose their summary, below 470 px the
+brief pills keep only their dot, and the two controls that used to fall off a phone's right edge
+are 34 px targets that cannot be displaced. A keyed-to-the-viewport rule would have missed the
+700 px desktop window with the same problem, and would have been ungradeable — the board narrows
+the bar in place instead. The code-block header sticks: `overflow: clip` on the block (`hidden`
+made it a scroll container, so a sticky child never moved) and `top:
+calc(-1 * var(--scroller-pad-top))`, because a sticky offset is measured from the scrollport's
+content edge and `top: 0` parked the header a gutter below the top with a band of scrolling code
+above the copy button (gotcha 158). The settings screen is one dialog with one remembered size and
+a dim that is a wall — darker, blurred, `inert` plus `pointer-events: none` — and the context menu
+offers nothing inside a modal, because the app menu is built out of the transcript the dialog put
+out of reach.
+
+**The board taught four things** (gotchas 159-161). Six reds on the first run: the sticky header
+24 px off (CSS correct, check correct, comparison wrong); a run waiting on a person not saying so
+(`paintRun` assigned the label before appending the suffix); an answered question still holding
+its run open; a ceiling row read stale (the check clicked the telemetry pill and looked for a row
+that only exists in the settings dialog, then read the page in the same tick it had poked it — now
+it opens the surface it asserts on, *Models*, and polls with a deadline); a reveal that was
+"invisible" because the group it lives in is now folded, so the check has to take the reader's
+gesture and click the run's header; and a chip that read "no folder" for a conversation with no
+path at all because the temp-root test ran before the empty-path test. A second run's abort
+(`list_models returned nothing`) was the mock endpoint being dead between runs, not the app.
+
+Gates and counts, all on the pi core unless said: page board **verdict: ok** on both cores
+(`CWOFFEE_CORE=pi` and the default rust board, 0 red each, one legitimate skip each); engine 477
+(+1: a stopped card must say the turn was stopped), bridge 22, gateway 37, `svelte-check` 0;
+`ASK GATE OK` on pi and rust with the stop phases; `SEARCH PANEL OK`, `SEARCH WRITE OK` on pi and
+rust; `PROMPT SHAPE OK (pi: cowork 14581 B payload with 13 tools, chat 233 B with 0)`. One build
+line lied on the way (gotcha 157): `cargo build -p cwoffee-gateway -p cwoffee-bridge --bin cwtool
+-p cwoffee-app` rebuilds `cwtool` and silently does nothing for the gateway, which left a green
+`ASK GATE OK` grading a binary from before the change under test.
 
 ## Journal — session 25 (the short menu is on, and the endpoint screen writes the file it reads)
 

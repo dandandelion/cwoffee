@@ -36,6 +36,14 @@ fn escapes_workspace(ctx: &ToolCtx, raw: &str) -> Option<String> {
     }
 }
 
+/// Where a write actually lands, given the call. One function, used by the risk
+/// verdict and by the write itself: an approval card that names one file while the
+/// tool writes another is the thing an approval card exists to prevent.
+fn placed(args: &Value, raw: &str) -> (String, super::scratch::Place) {
+    let place = super::scratch::Place::of_write(args);
+    (super::scratch::destination_for(raw, place), place)
+}
+
 /// Snapshot of a file's text before a write, for the diff in the tool card.
 /// `None` means "no useful snapshot": the file did not exist, was too big, or
 /// was binary - in which case the card says what it can rather than guessing.
@@ -308,7 +316,8 @@ impl Tool for WriteFileTool {
             "properties": {
                 "path":    { "type": "string", "description": "Path relative to the workspace root" },
                 "content": { "type": "string", "description": "Full text content. For .docx and .pdf this is markdown and gets converted." },
-                "mode":    { "type": "string", "enum": ["overwrite", "append"], "description": "Default overwrite" }
+                "mode":    { "type": "string", "enum": ["overwrite", "append"], "description": "Default overwrite" },
+                "place":   { "type": "string", "enum": ["workspace", "attach"], "description": "\"workspace\" (default): the path as written. \"attach\": write under `.cws/assistant_attachments/` instead — the only folder the transcript attaches to the turn. Use it for a file you are handing over." }
             },
             "required": ["path", "content"]
         })
@@ -323,13 +332,14 @@ impl Tool for WriteFileTool {
     /// outside the workspace it needs a yes with the path spelled out.
     fn risk_for(&self, args: &Value, ctx: &ToolCtx) -> CallRisk {
         let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        if let Some(out) = escapes_workspace(ctx, raw) {
+        let (dest, _) = placed(args, raw);
+        if let Some(out) = escapes_workspace(ctx, &dest) {
             return CallRisk {
                 level: Risk::Sensitive,
                 escapes: vec![out],
             };
         }
-        match resolve_path(ctx, raw) {
+        match resolve_path(ctx, &dest) {
             Some(p) if p.exists() => CallRisk::at(Risk::Workspace),
             _ => CallRisk::harmless(),
         }
@@ -345,13 +355,29 @@ impl Tool for WriteFileTool {
             None => return ToolResult::err("write_file: missing required string field \"content\""),
         };
         let append = args.get("mode").and_then(|v| v.as_str()) == Some("append");
+        let (dest, place) = placed(&args, raw);
 
-        let path = match confine_permitted(&ctx.workspace, raw, &ctx.permits) {
+        let path = match confine_permitted(&ctx.workspace, &dest, &ctx.permits) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
         if path == ctx.workspace || path.is_dir() {
             return ToolResult::err(format!("{} is a directory, not a file", path.display()));
+        }
+        // An attachment goes in a folder that may not exist yet in this workspace, and
+        // the document writers below (`docx`, `pdf`) write straight to `path` rather than
+        // creating parents. Create it here, with the scratch folder's self-ignoring
+        // `.gitignore`, so the first attachment in a fresh conversation does not fail on
+        // a missing directory.
+        if matches!(place, super::scratch::Place::Attach) {
+            if let Err(e) = super::scratch::ensure_scratch(&ctx.workspace) {
+                return ToolResult::err(e);
+            }
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return ToolResult::err(format!("cannot create {}: {e}", parent.display()));
+                }
+            }
         }
 
         // Document formats: the content is markdown and the extension decides
@@ -374,7 +400,15 @@ impl Tool for WriteFileTool {
                 if append {
                     return ToolResult::err("cannot append to a .docx/.pdf; rewrite the whole document");
                 }
-                return write_document(&path, content, &ext, ctx).await;
+                let mut res = write_document(&path, content, &ext, ctx).await;
+                if res.ok && matches!(place, super::scratch::Place::Attach) {
+                    res.output.push('\n');
+                    res.output.push_str(&super::scratch::place_note(
+                        place,
+                        &display_rel(&ctx.workspace, &path),
+                    ));
+                }
+                return res;
             }
             _ => {}
         }
@@ -411,6 +445,12 @@ impl Tool for WriteFileTool {
                 if let Some(after) = after {
                     res.changes
                         .push(line_change(&ctx.workspace, &path, before.as_deref(), &after));
+                }
+                if matches!(place, super::scratch::Place::Attach) {
+                    // Stated, so the rule is learned rather than guessed: the next turn
+                    // should not have to rediscover which folder the transcript attaches.
+                    res.output.push('\n');
+                    res.output.push_str(&super::scratch::place_note(place, &display_rel(&ctx.workspace, &path)));
                 }
                 res
             }
@@ -707,6 +747,8 @@ mod tests {
         ToolCtx { workspace: dir.to_path_buf(), max_output_bytes: 4096, ..Default::default() }
     }
 
+    use crate::tools::FileKind;
+
     fn tmp(label: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
@@ -866,6 +908,89 @@ mod tests {
         let mut s = vec![b'a'; 9000];
         s[8500] = 0;
         assert!(!looks_binary(&s));
+    }
+
+    /// The attachments folder is a placement the tool implements, not a convention the
+    /// prompt hopes for. The report this ends: a turn's file strip filled with probe files
+    /// and scaffolding, because nothing distinguished "written while working" from "handed
+    /// to the person". One word in the call does, and the transcript then has a fact to
+    /// attach from.
+    #[tokio::test]
+    async fn a_write_can_be_placed_as_an_attachment_and_says_so() {
+        let d = tmp("attach");
+        let r = WriteFileTool
+            .run(
+                json!({ "path": "page.html", "content": "<html>hi</html>", "place": "attach" }),
+                &ctx_in(&d),
+                &sink(),
+            )
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        let landed = d.join(".cws/assistant_attachments/page.html");
+        assert!(landed.is_file(), "the attachment did not land in the attachments folder: {}", r.output);
+        assert!(!d.join("page.html").exists(), "an attach must not also write into the person's folder");
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(r.files[0].kind, FileKind::Attachment, "the transcript attaches from this kind alone");
+        assert_eq!(r.files[0].path, ".cws/assistant_attachments/page.html");
+        // The rule is stated back to the model, so the next turn does not have to
+        // rediscover which folder the transcript reads.
+        assert!(r.output.contains("assistant_attachments"), "placement not stated: {}", r.output);
+        // The scratch folder keeps its self-ignoring .gitignore even when the very first
+        // write in a fresh workspace is an attachment.
+        assert_eq!(
+            std::fs::read_to_string(d.join(".cws/.gitignore")).unwrap(),
+            "*\n",
+            "an attachment folder created from nothing left the scratch folder unignored"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The other direction, which is the one that would silently move people's files:
+    /// a write that says nothing about placement lands exactly where its path says.
+    #[tokio::test]
+    async fn a_write_without_place_still_lands_where_the_path_says() {
+        let d = tmp("keep");
+        let r = WriteFileTool
+            .run(json!({ "path": "notes/page.html", "content": "<html>hi</html>" }), &ctx_in(&d), &sink())
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert!(d.join("notes/page.html").is_file(), "a named write was moved: {}", r.output);
+        assert!(!d.join(".cws").exists(), "a plain write created the scratch folder");
+        assert_ne!(r.files[0].kind, FileKind::Attachment, "a plain write is not an attachment");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The approval card and the write must agree on the destination, or a person said yes
+    /// to one file and got another.
+    #[tokio::test]
+    async fn an_attachment_call_is_risked_at_the_folder_it_will_actually_write() {
+        let d = tmp("risk");
+        let ctx = ctx_in(&d);
+        let r = WriteFileTool.risk_for(&json!({ "path": "x.html", "place": "attach" }), &ctx);
+        assert_eq!(r.level, Risk::Harmless, "creating an attachment is creating a file: {r:?}");
+        // Same call, asked about with the destination it will use: also inside, also
+        // harmless. The point is that placement cannot turn a workspace write into an
+        // escape, in either direction.
+        let r2 = WriteFileTool.risk_for(&json!({ "path": ".cws/assistant_attachments/x.html" }), &ctx);
+        assert_eq!(r2.level, Risk::Harmless, "{r2:?}");
+        // A relative `..` is absorbed by the prefix: `.cws/assistant_attachments/../../x`
+        // resolves to `<workspace>/x`, which is a workspace write, not an escape. Saying so
+        // here matters because the same resolution is what the card shows: the path a
+        // person approves is the path the tool resolves, in both directions.
+        let absorbed =
+            WriteFileTool.risk_for(&json!({ "path": "../../outside.html", "place": "attach" }), &ctx);
+        assert_eq!(absorbed.level, Risk::Harmless, "the prefix absorbs it: {absorbed:?}");
+        assert!(
+            ctx.workspace.join("outside.html").starts_with(&ctx.workspace),
+            "the absorbed destination left the workspace"
+        );
+        // One level more than the prefix can absorb is an escape, and attach does not
+        // paper over it.
+        let esc = WriteFileTool.risk_for(&json!({ "path": "../../../outside.html", "place": "attach" }), &ctx);
+        assert_eq!(esc.level, Risk::Sensitive, "an attach is not a licence to escape: {esc:?}");
+        let abs = WriteFileTool.risk_for(&json!({ "path": "/etc/outside.html", "place": "attach" }), &ctx);
+        assert_eq!(abs.level, Risk::Sensitive, "an absolute path stays an escape: {abs:?}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]

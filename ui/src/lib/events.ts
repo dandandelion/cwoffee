@@ -43,10 +43,13 @@ export type OutputFile = {
   name: string
   mime: string
   bytes: number
-  // Mirrors engine FileKind. `artifact` is a deliverable to open from the chat;
-  // `edit` is a file the model changed in a tree; `unknown` is a row stored
-  // before the distinction existed, and is rendered the way those always were.
-  kind?: 'artifact' | 'edit' | 'unknown'
+  // Mirrors engine FileKind. `attachment` is the only kind the host will hand over:
+  // the model wrote it into `.cws/assistant_attachments/` on purpose, so a control to
+  // save it where you like appears. `artifact` is an older generated-file label still
+  // present in rows written before the attachments folder existed; `scratch` is
+  // working material under `.cws/`, `edit` a file changed in your own tree, and
+  // `unknown` a row stored before the distinction existed (rendered as it always was).
+  kind?: 'artifact' | 'edit' | 'scratch' | 'attachment' | 'unknown'
 }
 
 // Mirrors engine `Risk`. Harmless never prompts; Workspace changes a file that
@@ -94,6 +97,13 @@ export interface ModelInfo {
 
 export type EngineEvent =
   | { kind: 'sessionChanged'; d: { session_id: number; title: string } }
+  /**
+   * A conversation naming itself, live. `text` is the *cumulative* title rather than
+   * an increment, so a client can drop a duplicate or receive one out of order and
+   * still settle on the same string. `done` marks the final paint; the row drops its
+   * caret there. The stored rename arrives right behind this as `sessionChanged`.
+   */
+  | { kind: 'titleDelta'; d: { session_id: number; text: string; done: boolean } }
   | { kind: 'turnStart'; d: { turn_id: number; model: string; session_id: number } }
   | { kind: 'text'; d: string }
   | { kind: 'reasoning'; d: string }
@@ -111,9 +121,13 @@ export type EngineEvent =
     }
   | { kind: 'questionRequested'; d: QuestionRequested }
   | { kind: 'questionAnswered'; d: { id: number } }
-  // The question closed with no answer: the tool timed out, or the turn was
-  // cancelled while it was parked. The card must stop offering a choice.
-  | { kind: 'questionExpired'; d: { id: number } }
+  // The question closed with no answer: the person stopped the turn, a clock somebody
+  // wrote down ran out, or the window holding the card went away. The card must stop
+  // offering a choice, and it has to say which of those three happened — "the model was
+  // told it got none" about a turn the reader stopped themselves is a sentence about
+  // something that did not happen. `why` is optional: an older stream, or a card settled
+  // by a failed reply, has no reason attached and gets the neutral wording.
+  | { kind: 'questionExpired'; d: { id: number; why?: 'turnStopped' | 'timedOut' | 'windowGone' } }
   | { kind: 'turnStats'; d: TurnStats }
   | { kind: 'usage'; d: TurnTelemetry }
   | { kind: 'turnEnd'; d: { turn_id: number; finish: FinishReason } }
@@ -141,6 +155,18 @@ export interface HostState {
    */
   persona?: 'cowork' | 'chat'
   reasoning: ReasoningLevel
+  /** The effort new conversations start at - what the settings screen edits. Optional because a
+    page may talk to a gateway built before the field existed. */
+  reasoning_default?: ReasoningLevel
+  /** Whether `reasoning` is this conversation's own override rather than the default. The composer
+    chip says "this chat" when it is true, because one control now serves two different asks. */
+  reasoning_overridden?: boolean
+  /** The levels this model says it can answer for, in the words the dial uses, as the host learned
+    them: probed from the endpoint on the Rust core, asked of the model process on the pi core.
+    Empty means nobody asked, which is not a claim that the model cannot think. A dial step that the
+    model folds or rejects is how a reader ends up believing the knob is dead, so the offered list
+    belongs next to the dial rather than in a log. */
+  reasoning_levels?: string[]
   busy: boolean
   turns: number
   context_tokens: number
@@ -164,6 +190,15 @@ export interface HostState {
   /** How long an `ask_user` card stays open. Names itself in the timeout text. */
   question_timeout_secs: number
   approval_timeout_secs: number
+  /**
+   * What the running turn has said but not yet closed. A page that reloads in the middle of
+   * an answer is handed stored rows that stop at the last closed message, so without this the
+   * reply on screen starts wherever the reload landed. The pi core fills this as it streams;
+   * an empty string means the host has nothing to give, which is how it looks to a client
+   * talking to the Rust core.
+   */
+  open_text?: string
+  open_reasoning?: string
   workspace: string
   /**
    * Why the last workspace change was refused, and a counter so a caller can tell a

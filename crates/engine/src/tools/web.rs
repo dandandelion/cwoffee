@@ -279,8 +279,8 @@ impl Tool for DownloadTool {
                 },
                 "place": {
                     "type": "string",
-                    "enum": ["scratch", "keep"],
-                    "description": "\"scratch\" (default) saves under `.cws/` in the workspace; \"keep\" saves where `path` says, in the person's view. Only choose \"keep\" for a file they asked for."
+                    "enum": ["scratch", "keep", "attach"],
+                    "description": "\"scratch\" (default): under `.cws/`. \"keep\": where `path` says, in the person's folder — only for a file they asked for. \"attach\": under `.cws/assistant_attachments/`, which the transcript attaches to the turn."
                 }
             },
             "required": ["url"]
@@ -353,7 +353,10 @@ impl Tool for DownloadTool {
         };
         let place = super::scratch::Place::of(&args);
         let requested = super::scratch::destination_for(&requested, place);
-        if place == super::scratch::Place::Scratch {
+        if place != super::scratch::Place::Keep {
+            // Both non-Keep destinations live under `.cws/` — the scratch folder itself,
+            // or the attachments folder inside it — and either way the scratch folder's
+            // self-ignoring `.gitignore` has to exist before anything lands in it.
             if let Err(e) = super::scratch::ensure_scratch(&ctx.workspace) {
                 return ToolResult::err(e);
             }
@@ -451,10 +454,10 @@ impl Tool for DownloadTool {
             // The placement, not the extension: a reference PDF the model fetched for
             // itself is not a deliverable the person asked for, and the transcript should
             // not put it in the same strip as the file they asked to be built.
-            kind: if place == super::scratch::Place::Scratch {
-                super::FileKind::Scratch
-            } else {
-                super::FileKind::Artifact
+            kind: match place {
+                super::scratch::Place::Scratch => super::FileKind::Scratch,
+                super::scratch::Place::Attach => super::FileKind::Attachment,
+                super::scratch::Place::Keep => super::FileKind::Artifact,
             },
         };
         let note = super::scratch::place_note(place, &rel);

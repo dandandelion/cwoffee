@@ -46,6 +46,18 @@ turn is handled by the *view*. The host's command loop is inside the turn, so a
 moves its own view immediately rather than awaiting it, and the sidebar shows a
 spinner on the session that is working.
 
+**A repaint of a session that is mid-turn paints your own message only if the store has
+not already given it back.** The two cores persist at different moments: the rust core
+writes a turn when it ends, so while it runs the store has no row for the sentence that
+started it and the view supplies its own copy; the pi bridge writes the user's row
+*before* the provider call - "a send is a fact before it is asked of a model" - so that a
+message survives a crash mid-turn, and a history reload of that same session already
+contains it. Painting both stamped the same sentence on the screen twice, which is how
+"switch to another session and back and my first message is duplicated" got reported. So
+the client asks the page it just loaded (`storeHoldsSentDraft` in `ui/src/App.svelte`)
+instead of assuming either core. `scripts/gateway-user-row-early.mjs` asks the same
+question over the wire and says which answer the live core gives.
+
 What is built now
 
 `crates/gateway` is a small axum-free HTTP + WebSocket server that mirrors the
@@ -159,6 +171,31 @@ fetch never returned and the menu fell through to its "server said no" branch.
 The menu now checks connection state first and says **Not connected to the host**
 with the actual reason, and the banner's `retry` re-fetches state, sessions and
 the model list without a page reload.
+
+### Coming back from the background
+
+A phone tab that is minimised is frozen, and it comes back wrong in two ways. Both were
+reported as one symptom: "I can't interact with any input, especially the composer; I
+always have to refresh. The trigger seems to be minimising the browser and coming back."
+
+1. **The socket is a lie.** The page was frozen, the gateway reaped the peer, and the
+   browser never reported the close, so `readyState` still says OPEN. Every call then
+   waits out its own 20s timeout, which reads as a frozen app. A WebSocket ping is no
+   help here: the browser answers control frames silently, so the page learns nothing.
+   That is why the gateway also beats each socket every 25 seconds with a **data** frame,
+   `{"type":"beat"}`. The front end stamps the arrival time of any frame it sees, and a
+   socket silent for more than twice that interval is dropped on the spot
+   (`revalidateSocket` in `ui/src/lib/transport.ts`) rather than trusted.
+2. **`busy` outlives its turn.** The `turnEnd` that would clear it went to a frozen page
+   and is gone. The composer is `disabled={busy}`, and the client would not believe the
+   host's "not busy" about a turn it started itself - a rule that exists so a send does
+   not re-enable the composer a command-queue hop before the host flips the flag. That
+   rule now expires: on `visibilitychange` the page re-reads host state with `force`, and
+   a forced read beats this client's memory of a turn unless the send is only moments old.
+   Reconnects, and the server's `resync` frame, are forced reads for the same reason.
+
+What a forced read does *not* do is yank the view somewhere else: the wake check repaints
+the conversation already on screen, and only when a turn was in flight and is now over.
 
 ### When auth fails
 
@@ -301,6 +338,16 @@ What that implies, in order of how likely it is to matter:
 - **Scope is a bind address, so changing it restarts the listener.** "This machine"
   is 127.0.0.1; "Any device" is 0.0.0.0. Switching while running stops and starts
   the accept loop; connected clients reconnect.
+- **The scope control shows the bind, not the setting.** One derived value — the running
+  listener's address if there is one, the pending choice if there is not — is what the
+  segmented control displays *and* what a click is measured against. It used to display the
+  stored choice, so after a start on 0.0.0.0 the control still read "This machine": pressing
+  "Any device" compared equal to the stored value and did nothing, and the panel looked dead
+  until the other half had been pressed first. That is the report — "in devices I have to
+  click this device before any device works" — and an order the user has to guess is not an
+  interface. Starting from the panel syncs the stored choice to the address that actually
+  came up, so an environment-started gateway does not leave the control pointing at a bind
+  it is not using.
 - **No token, no LAN bind.** The refusal is stated in the panel rather than logged
   somewhere nobody reads. `~/.config/cwoffee/gateway.token` is read if present,
   and created with mode 0600 if it is not — so clicking "any device" on a laptop
@@ -325,6 +372,84 @@ What that implies, in order of how likely it is to matter:
 Covered by the in-app self-test (`VITE_SELFTEST=1`, desktop only): status →
 start on a private port (8123, never the one in use) → status agrees → stop →
 status agrees → a second stop must error rather than pretend.
+
+## Keeping devices working after the window closes
+
+Settings > Devices has a switch: **"Keep devices working after this window closes"**. Off by
+default — a gateway that answers after the window is gone is a door you did not know you left
+open, so it has to be chosen. When it is on, closing the window hands port `:8099` to a
+**different process**: `cwoffee-gateway`, which starts its own engine, opens the same session
+store, and reads the same token file.
+
+The wording matters, and the settings row says it: the gateway in this window is a task *inside
+the app's process* — it shares the host, the store and the approval table, and no amount of
+"don't stop the task" keeps a process alive after it exits. So a phone that reconnects five
+seconds later is talking to a fresh host. What carries over is everything filed in the store —
+conversations, models, workspace, search settings — plus the model, folder, approval mode and
+persona **as they were when the window closed**, read from the live host rather than from boot
+values. What does not carry over is an in-flight turn: it dies with the window, and a card
+(approval or question) that was open on the phone goes stale.
+
+Order is the whole feature:
+
+1. release the listener (`GatewayCtl::stop`) — in the other order the child refuses the port this
+   process still holds;
+2. start the child;
+3. probe the port for up to 4s and report what the probe saw. "Spawned" is not "serving": the note
+   is either `serving http://127.0.0.1:8099 again as systemd-run/340328; its own lines are in …`
+   or it says the child `exited with exit status: 1 inside 4.0s`.
+
+How it is started, and why that shape:
+
+- `systemd-run --user --collect --unit=cwoffee-gateway-<port>`. A plain child of a GUI app stays in
+  the app's cgroup scope, and systemd kills what is left when that scope stops — the setting would
+  read as broken within a second. `--replace` is *not* an option on systemd 259, so a unit left by
+  an earlier window is stopped by name first.
+- The unit does not inherit the app's environment, so the variables the child needs are named with
+  `--setenv=`: the XDG config/data/state trio (a hand-off must serve the *same* session), `PATH`,
+  locale, and the pi core's `CWOFFEE_PI`, `CWOFFEE_PI_EXT`, `CWOFFEE_PI_TOOLS`, agent and session
+  dirs, `CWOFFEE_CWTOOL`. **Tokens are never forwarded**, in either direction: `--setenv=` puts a
+  value in argv, and any local process reads argv with `ps`. The child finds
+  `~/.config/cwoffee/gateway.token` by path instead — which is why the standalone gateway's token
+  flags fall back to the token *file*.
+- Its stdout and stderr are appended to `$XDG_STATE_HOME/cwoffee/gateway-handoff.log` with
+  `--property=StandardOutput=append:…`; file descriptors passed to `systemd-run` do not reach the
+  unit, and systemd-run has no `--output=`.
+- Without a session bus (a shell, a container, CI) the fallback is `setsid`, and there is no scope
+  to kill it there. `plan()` reports which route it picked (`via`).
+
+How to stop one later — the sentence the app printed, and the panel shows before you close:
+
+```bash
+systemctl --user stop cwoffee-gateway-8099      # or: pkill -f 'cwoffee-gateway.*--port 8099'
+```
+
+The panel shows the plan before anyone presses close, because the one case that cannot be honoured
+— no standalone binary installed next to the app — is worth saying while there is still a window to
+say it in: `cargo build --release -p cwoffee-gateway`, or `scripts/install-desktop.sh`, which now
+copies the gateway next to the launcher's copy of the app.
+
+Check it without a phone:
+
+```bash
+node scripts/gateway-handoff.mjs                 # rust core, loopback
+CWOFFEE_CORE=pi node scripts/gateway-handoff.mjs # pi core: the extension must survive the hand-off
+node scripts/gateway-handoff.mjs --lan           # 0.0.0.0, token created by the app
+node scripts/gateway-handoff.mjs --app ~/.local/share/cwoffee-desktop/bin/cwoffee-app
+node scripts/gateway-handoff.mjs --omit-ext      # negative control: this one must fail
+```
+
+It uses `scripts/mock-llm.mjs` and a scratch config/data/state/workspace, so it spends no prompt
+cache and touches no real session. It grades: the port still answers after the app exited; a
+websocket on it authenticates with the token **file**; `session_state` answers, so it is a working
+gateway and not a socket somebody left open; the unit's `Environment` property names this session's
+paths (and, on the pi core, the extension and the tool host) and no credential; the hand-off log is
+not empty; and the printed stop command actually stops it. What it does not grade is a turn run
+through the handed-off gateway — see the note in `docs/TESTING.md`.
+
+Two supporting facts: sqlite gets `busy_timeout(5000)` because for about a second the closing window
+and the starting gateway hold the same database file; and `cwoffee-app --handoff-gateway` performs a
+hand-off with this process's values and exits, which is how the script drives it without a window.
 
 ## Security — read this before binding 0.0.0.0
 
@@ -380,11 +505,28 @@ exposed on purpose — a leaked token should not also be a directory browser.
   it. Cancelling releases the parked tool with a "cancelled" result instead of
   leaving one of the four tool workers idle until the question times out.
 - **A question can close without an answer, and every client must hear about it.**
-  If the timeout expires, the tool emits `questionExpired {id}`. The shells cannot
-  report this themselves: they hold the `oneshot::Sender`, and a sender whose
-  receiver is gone says nothing until someone tries to use it. A browser that never
-  hears it keeps showing a card whose Send button fails forever, and the answer it
+  A question has no clock by default — the turn is parked, not failing — so the ways it
+  closes now are a person pressing Stop, a written-down `question_timeout_secs` running
+  out, or the window holding the card going away. The tool emits
+  `questionExpired {id, why}` with `why` one of `turnStopped` / `timedOut` / `windowGone`,
+  because the card has to end with a sentence that is true: "the model was told it got
+  none" about a turn the reader stopped themselves describes something that never happened.
+  The shells cannot report any of this themselves: they hold the `oneshot::Sender`, and a
+  sender whose receiver is gone says nothing until someone tries to use it. A browser that
+  never hears it keeps showing a card whose Send button fails forever, and the answer it
   eventually sends aims at a tool call that already returned.
+- **Stop releases the parked dialogs before asking the model to stop, on both cores.**
+  The gateway drains its pending approval/question senders and the pi bridge answers its
+  own waits (`confirmed: false`, `cancelled: true`) and emits the expiries. The ordering is
+  not cosmetic: pi's tool call is parked on the dialog, and pi only answers `abort` once
+  `session.abort()` has unwound that call. Ask for the abort first and each side holds what
+  the other needs — measured on a pi core, Stop landed 10002ms later, the abort timeout to
+  the millisecond, and the app reported "could not stop the turn: the model process did not
+  answer abort" about a turn that had just stopped. Released first, the same Stop settles
+  the turn in 15ms. `scripts/gateway-ask.mjs` presses Stop with a card open on either core
+  and wants `questionExpired` with `why: "turnStopped"`, a turn that settles, and the next
+  `ask_user` call in the same conversation getting a card of its own — which is the release
+  being visible from outside.
 - **A multi-question call is still one event per question.** `ask_user` with
   `questions` sends N `questionRequested` events, each with its own `id` and each
   answered by its own `respond_question`. What ties them together is the optional
@@ -411,12 +553,28 @@ exposed on purpose — a leaked token should not also be a directory browser.
 - **`@tauri-apps/api` must not be imported at module scope** in a browser build.
   `pagelog.ts` already imports it lazily for exactly this reason; the same care
   applies to the transport.
-- **Frameless window chrome is meaningless in a browser.** The titlebar and the
-  min/max/close buttons need to disappear when not running under Tauri.
+- **Frameless window chrome is meaningless in a browser, and is now drawn only where it
+  works.** The min/max/close buttons render under `transportKind === 'tauri'`. Outside
+  Tauri there is no window handle for them to call, so on a phone they were three inert
+  decorations whose handlers could only log a failure.
 - **Viewport height on mobile browsers** is not stable — the URL bar resizing
   changes `100%`. `dvh` is the fix; `#app { height: 100% }` alone will misbehave.
-- **Reconnect.** A phone sleeping drops the socket. The gateway needs to buffer or
-  replay recent events, otherwise a reconnect loses the middle of a turn.
+- **A dim layer needs its own name.** The sidebar drawer and the settings screen each dim
+  the app behind them, and for a while both were `.scrim`. The settings rule sits later in
+  the stylesheet at the same specificity, so it won the cascade for `position` and
+  `z-index`, and the drawer's dim became `position: fixed` at z-index 70 - above the drawer
+  (40) it is supposed to sit behind. Every touch on an open drawer landed on the dim, whose
+  entire job is to close it: "the sidebar's contents are unclickable on a phone; I tap and
+  it just hides, and I have to zoom the page out until the sidebar docks." They are
+  `.scrim` and `.mscrim` now, and the ordering is asserted in the self-test. Above 768px
+  the drawer dim is `display: none`: there is no drawer to dim, and a mounted dim covers a
+  docked sidebar, which has no z-index of its own to answer it with.
+- **Reconnect.** A phone sleeping drops the socket. The gateway does not replay a turn's
+  events to a late joiner - the transcript is the durable record - so what a reconnect owes
+  a client is *state*, not history: `bootstrap` plus a forced `session_state` read (see
+  "Coming back from the background"). A client that is merely slow rather than gone is told
+  `{"type":"resync","d":{"missed":N}}` and keeps its socket; hanging it up used to lose the
+  `turnEnd` that was the whole point of the stream.
 - **One host, many viewers.** `SessionHost::take_receivers()` hands the event
   stream to exactly one consumer. A gateway with a phone and a desktop open needs
   a fan-out broadcast, not a second `take`.
@@ -426,3 +584,19 @@ exposed on purpose — a leaked token should not also be a directory browser.
 The frontend is already responsive: below 768px the sidebar is an overlay drawer
 with a titlebar toggle and scrim, the telemetry bar drops spec/ttft/jank, and the
 composer uses a 16px font so iOS does not zoom on focus. Verified at 390x844.
+
+The drawer is anchored to the window (`position: fixed`), not to the document: a mobile
+browser moves the initial containing block when the keyboard opens or the URL bar hides,
+and an absolutely positioned drawer drifts off the pixels you are looking at - visible and
+untouchable. Scrolling it cannot scroll the page behind it (`overscroll-behavior`).
+
+Below 768px the tap targets are sized for a thumb rather than a mouse: 42px session rows,
+38px controls, and `touch-action: manipulation` so a fast tap is not held for 300ms while
+the browser decides whether it was a double tap. Hover-only affordances do not exist on a
+touch screen, so the session row's `⋯` menu is drawn at full opacity there.
+
+The titlebar carries the drawer toggle, the mark, the wordmark, and then the conversation
+on screen - nothing else. It used to carry the model name too, which read as a second word
+in a 44px row and named something you cannot change from a titlebar; the model lives on the
+composer's chip, next to the control that changes it. The window controls appear only in
+the frameless desktop window.

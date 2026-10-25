@@ -38,6 +38,20 @@ pub enum FinishReason {
     Other,
 }
 
+/// How a question card came to close with no answer on it. Three sentences, because
+/// three different things happened to the reader: they pressed Stop, a clock somebody
+/// wrote down ran out, or the window holding the card went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QuestionWhy {
+    /// the person stopped the turn the card was parked on
+    TurnStopped,
+    /// `question_timeout_secs` was written down, and it ran out
+    TimedOut,
+    /// the window holding the card closed, or its answer channel went away
+    WindowGone,
+}
+
 /// One event in a turn's stream. The engine emits these in order; a front end
 /// renders them incrementally and must never need to re-read history to paint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +65,20 @@ pub enum EngineEvent {
     SessionChanged {
         session_id: i64,
         title: String,
+    },
+    /// A conversation is being named, live. `text` is the **cumulative** title so
+    /// far, not an increment: a front end can paint it in any order, drop
+    /// duplicates, and settle on the same string a reload would show. `done` says
+    /// the name is final — the sidebar row stops typing and drops its caret.
+    ///
+    /// This exists so the name arrives as a name rather than as a row that
+    /// changes text under the cursor. The settled truth is still `SessionChanged`
+    /// and the stored row, so a front end that ignores this event loses the
+    /// animation and nothing else.
+    TitleDelta {
+        session_id: i64,
+        text: String,
+        done: bool,
     },
     TurnStart {
         turn_id: u64,
@@ -179,8 +207,14 @@ pub enum EngineEvent {
     /// every window - and clicking Send on it then aims an answer at a tool call
     /// that has already returned, which is how a five-minute-old question ends up
     /// answering nothing.
+    ///
+    /// `why` rides along because the card has to say something true, and the three
+    /// ways a card closes without an answer need three sentences: a turn somebody
+    /// stopped is not a turn the model gave up on, and a card whose window went away
+    /// was never going to be answered by anybody.
     QuestionExpired {
         id: u64,
+        why: QuestionWhy,
     },
 
     /// Live progress, emitted a few times a second while a turn streams.

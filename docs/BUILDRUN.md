@@ -2310,3 +2310,137 @@ and the client — a phone in a pocket and a TUI in a terminal are not the same
 audience. Negative control: with the context value ignored, the test measures the
 wait and fails.
 
+### Trap 125: a launcher that installs perfectly and opens nothing is an environment bug
+
+`scripts/install-desktop.sh` verified the wrong thing. It copied the icon set, compared every
+installed PNG to its source by sha256, printed a table of `current`, and announced "installed" —
+while the thing the user actually does with a launcher (click it in the app grid) was never run
+once. Then the report arrived: *"seems to install fine but doesn't wanna open (when opening from
+apps menu)"*.
+
+Every direct test passed, which is what made it hard: `gio launch` of the installed entry opened a
+window, `desktop-file-validate` was clean, no second entry was called `Cwoffee`, and a launch with
+a stripped session environment and cwd `/` still printed `render OK`. What actually happened was
+in the journal all along — one entry from the real click, `app-gnome-cwoffee-1170778.scope -
+Application launched by gnome-shell`, three boot lines, and then the last word:
+
+```
+[cwoffee] persona: chat is not available on the rust core — … Set CWOFFEE_CORE=pi for a tool-less
+chat, or persona = cowork.
+```
+
+`exit(1)` before a window exists. The core is chosen by the **environment**, and a desktop launch
+has none: the menu hands over the session's environment, not the shell's, so `CWOFFEE_CORE=pi` —
+which `scripts/run-pi-app.sh` exports — is simply absent. Meanwhile the *config file* had
+`persona = chat`, because picking Chat in the window writes that key down, and chat does not exist
+on the Rust core. A shared config file plus a core that only travels in the environment is a
+launcher that works until the user changes a tab, and then fails with its reason filed somewhere
+nobody thinks to look.
+
+Two more ways the same script failed silently, both found while fixing it: `Exec=` pointed at
+`target/release/cwoffee-app`, i.e. into a build tree that every `cargo build --release` (and every
+board run) deletes and rewrites — a click during that window is a click that does nothing, with no
+TryExec to make the desktop say so; and the entry carried comment lines inside `[Desktop Entry]`.
+
+What the script does now, in order of how much it is worth:
+
+- **Grades the promise, not the artefact.** It launches the installed entry the way the desktop
+  does (`gio launch`, i.e. GAppInfo — the same path the app grid takes, honouring `Exec=`, `Path=`
+  and the quoting it just wrote) and reads the app's own evidence: `engine up: core=… persona=…`
+  for *which app this launcher starts*, then `render OK: titlebar=true …` for *a window that
+  painted*. `SUSPECT: no render report after 8s` is the blank-window verdict, and a process that
+  exits before painting prints its own first lines. `--check-only` re-runs just that.
+- **Installs a copy** of the binary, the UI bundle and `cwtool` under `$XDG_DATA_HOME/cwoffee-desktop`
+  (not under `$XDG_DATA_HOME/cwoffee`, which is the app's own data dir — clearing one's data must
+  not delete the binary under a launcher). `TryExec=` points at the copy, so a missing binary is a
+  refused launch with a reason instead of a silent nothing.
+- **Writes a launcher** that records what a menu launch cannot inherit, and **derives the core**
+  from the config the app will read (`persona = chat` forces pi) plus the pi-core state on disk —
+  printing which it chose and why. `--core rust` against a `persona = chat` config is refused:
+  that combination cannot start, so installing it would be shipping the bug.
+- **Refuses a `ui/dist` that carries the self-test bundle** — the board overwrites it constantly, so
+  an install without that check quietly ships whichever build the last board run left behind.
+
+The app got one line too: the chat-on-Rust refusal now says no window will appear, that a desktop
+launch's output reaches only the journal, and that the core a menu launch gets is recorded by this
+script. `journalctl --user -b | grep cwoffee.desktop` is the diagnostic that was missing; it is now
+printed by both halves.
+
+
+### Trap 126: a process you start while dying inherits neither your environment nor your file descriptors
+
+Settings > Devices now offers **"Keep devices working after this window closes"** (off by default).
+The gateway in the window is a task *inside the app's process* — it shares the engine, the session
+store and the approval table — so it cannot outlive the window no matter how it is stopped. The only
+honest form of the promise is a second process: `cwoffee-gateway` on the same port, reading the same
+config, the same store and the same token file. Starting one at exit is where three facts about
+systemd turned up, all of them invisible from inside the app.
+
+**1. The wrapper's flags are not a wish list.** The first version passed `--replace`, on the
+reasonable theory that a gateway left behind by an earlier window should be replaced rather than
+refuse the port. systemd 259 has no such option:
+
+```
+$ systemd-run --user --quiet --collect --replace --unit=cwoffee-gateway-8192 -- …
+systemd-run: unrecognized option '--replace'
+```
+
+The app's report was worse than the bug: `bound=false pid=307041 via=systemd-run` — a pid that
+belonged to a process which had printed a usage error and died. So the unit is stopped **by name**
+before spawning (`systemctl --user stop cwoffee-gateway-<port>`, error ignored: most of the time
+there is no such unit), and the report now reads the child's status: *"pid 307041 (started via
+systemd-run) exited with exit status: 1 inside 4.0s"*. A spawned process was never the promise; the
+listener is, and the child's exit status is the half that says why there isn't one.
+
+**2. A transient unit gets the *user manager's* environment, not the app's.** Verified directly:
+
+```
+$ systemd-run --user --collect --unit=cwoffee-envprobe-99 -- /bin/sh -c 'echo "CWOFFEE_PI=${CWOFFEE_PI:-unset}"'
+…  CWOFFEE_PI=unset
+```
+
+For a loopback gateway that is harmless, which is exactly why it would have shipped: everything it
+needs has a default, and the defaults point at `~/.config/cwoffee` and `~/.local/share/cwoffee`. On
+a hand-off from a scratch config, or from a user who moved `XDG_DATA_HOME`, or on the **pi core** —
+where `CWOFFEE_PI_EXT` and `CWOFFEE_CWTOOL` decide whether the model has any tools at all — the same
+silence produces a healthy-looking gateway with no tools, or a different session than the window it
+came from. So the variables are named one by one with `--setenv=`, from a list (`HANDOFF_ENV`) that
+is checked by a test to contain nothing credential-shaped: the token is deliberately *not* forwarded,
+because `--setenv=` puts it in argv, and the child already reads it from
+`~/.config/cwoffee/gateway.token` by path.
+
+**3. The log file was empty.** `handoff` pointed the child's stdout and stderr at
+`$XDG_STATE_HOME/cwoffee/gateway-handoff.log`, and the file stayed zero bytes: those descriptors are
+inherited by **systemd-run**, not by the unit it asks the manager to start. `systemd-run` has no
+`--output=` either (259 rejects it, same as `--replace`). The properties are the way:
+
+```
+--property=StandardOutput=append:/home/you/.local/state/cwoffee/gateway-handoff.log
+--property=StandardError=append:…
+```
+
+Without them the note that says "its own lines are in …" is a lie, and a hand-off that failed leaves
+nothing behind but a suspicion.
+
+**And the checker had the bug too.** `scripts/gateway-handoff.mjs` starts a mock endpoint, starts the
+app with `--handoff-gateway`, waits for the app's own verdict line, then — after the app has exited —
+connects to the port, authenticates with the token file, and asks `session_state`. It reads
+`systemctl --user show cwoffee-gateway-<port> -p Environment` to check what the unit was *handed*, and
+runs the stop sentence the app printed and proves the port went quiet. Its first version had two
+defects of its own: a failed check printed a red line and then **carried on running the steps after
+it**, so a red line sat above a green summary; and its cleanup awaited `child.on('exit')` on a process
+that had already exited, which never fires, so node reported *"Detected unsettled top-level await"*
+instead of a result. It also left the gateway it started holding the port, which turns the next run's
+first check into a lie about somebody else's gateway. One exit path now, one summary line, and the
+gateway is stopped whatever happened. `--omit-ext` (drop `CWOFFEE_PI_EXT`/`CWOFFEE_CWTOOL` from the
+environment) is the negative control: it must fail, and it does.
+
+What it still does not prove: a **turn** run through the handed-off gateway. That would need the mock
+scenario machinery pointed at a gateway it did not start; `scripts/gateway-ask.mjs` covers a turn on a
+gateway it starts itself, and the gap is stated in the script's output rather than in a footnote here.
+
+Two supporting changes, both for the same moment in time: `Store::setup` sets `busy_timeout(5000)`,
+because for a second the closing window and the starting gateway hold the same sqlite file; and
+`crates/gateway/src/main.rs` now takes its token, core and pi paths from the environment as well as
+from flags (flag > env > file), which is what lets a launcher-started hand-off serve the engine that
+launcher was built for. `ps` is why the token is the one exception: it comes from a file, never argv.

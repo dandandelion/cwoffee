@@ -313,18 +313,20 @@ pub fn mount_provider_rows(
         if models.is_empty() {
             continue;
         }
-        let mut entry = serde_json::json!({
+        let entry = serde_json::json!({
             "baseUrl": row.base_url,
             "api": api,
-            "apiKey": if row.api_key.trim().is_empty() { "__cwoffee_no_key".to_string() } else { row.api_key.clone() },
+            // A provider entry with no `apiKey` is not registered by pi at all — probed
+            // against pi 1.2.0: a row mounted without a key never appears in
+            // `get_available_models`, and `set_model` answers "Model not found" for a model
+            // the settings screen had just offered. That is why every endpoint added on the
+            // screen was useless for inference. A keyless local server gets the same
+            // placeholder cwoffee's own provider entry has always carried ("unused"), which
+            // llama.cpp ignores and pi accepts. Omitting the field, which this used to do to
+            // avoid an empty Authorization header, is what hid the endpoint.
+            "apiKey": if row.api_key.trim().is_empty() { "unused".to_string() } else { row.api_key.clone() },
             "models": models,
         });
-        if row.api_key.trim().is_empty() {
-            // pi reads `apiKey` as a literal or an env reference. An empty string makes it send
-            // an empty Authorization header, which some servers reject; leaving the field out
-            // means "no key", which is what a local server expects.
-            entry.as_object_mut().unwrap().remove("apiKey");
-        }
         providers
             .as_object_mut()
             .expect("object")
@@ -338,6 +340,97 @@ pub fn mount_provider_rows(
     Ok(mounted)
 }
 
+/// The thinking-level fields for one provider kind, or nothing when cwoffee cannot say
+/// which dialect that endpoint speaks. See `write_dev_provider` for why the fields exist.
+fn reasoning_decl(kind: &str, efforts: &[String]) -> Option<serde_json::Value> {
+    let known: Vec<String> = efforts.iter().map(|e| e.trim().to_lowercase()).collect();
+    // No probe data: fall back to the values the dialect itself documents, which is what the
+    // rust core assumes for the same kind. Stated as the dialect's values, not as a claim
+    // about this particular server - a level the server rejects shows up as an endpoint error
+    // the user can read, which beats a dial that silently does nothing.
+    let known = if !known.is_empty() {
+        known
+    } else {
+        match kind {
+            "llama.cpp" | "llamacpp" | "local" => vec!["low".into(), "medium".into(), "xhigh".into()],
+            "openai" => vec!["low".into(), "medium".into(), "high".into()],
+            _ => return None,
+        }
+    };
+    let takes = |v: &str| known.iter().any(|e| e == v);
+    // pi's own levels are off, minimal, low, medium, high, xhigh, max. `xhigh` and `max` are
+    // only offered at all when the map names them, so the map is written per level rather
+    // than left to pi's defaults.
+    let map = serde_json::json!({
+        "minimal": if takes("minimal") { serde_json::json!("minimal") } else if takes("low") { serde_json::json!("low") } else { serde_json::Value::Null },
+        "low": if takes("low") { serde_json::json!("low") } else if takes("minimal") { serde_json::json!("minimal") } else { serde_json::Value::Null },
+        "medium": if takes("medium") { serde_json::json!("medium") } else { serde_json::Value::Null },
+        "high": if takes("high") { serde_json::json!("high") } else if takes("xhigh") { serde_json::json!("xhigh") } else { serde_json::Value::Null },
+        "xhigh": if takes("xhigh") { serde_json::json!("xhigh") } else { serde_json::Value::Null },
+        "max": if takes("max") { serde_json::json!("max") } else { serde_json::Value::Null },
+    });
+    match kind {
+        // A llama.cpp server feeds the template, so the knob is a template variable: exactly
+        // the pair the rust core sends, and for the same reason - `enable_thinking` alone
+        // leaves the effort at the template's own default, which makes the menu a no-op.
+        "llama.cpp" | "llamacpp" | "local" => Some(serde_json::json!({
+            "reasoning": true,
+            "thinkingLevelMap": map,
+            "compat": {
+                "thinkingFormat": "chat-template",
+                "chatTemplateKwargs": {
+                    "enable_thinking": { "$var": "thinking.enabled" },
+                    "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true },
+                },
+            },
+        })),
+        // A vanilla OpenAI-shaped endpoint takes a top-level `reasoning_effort`.
+        "openai" => Some(serde_json::json!({
+            "reasoning": true,
+            "thinkingLevelMap": map,
+            "compat": { "thinkingFormat": "openai", "supportsReasoningEffort": true },
+        })),
+        _ => None,
+    }
+}
+
+/// What `write_dev_provider` actually did to pi's `models.json`.
+///
+/// This exists because the boot line used to print "provider cwoffee -> <url> (written
+/// to …)" unconditionally, and in the case that mattered nothing had been written: the
+/// file still held a provider cwoffee pointing at an endpoint from an earlier run (the
+/// scripted one, on a port nothing was listening on), the app still asked pi for the
+/// model it had configured under that provider, pi could not find it, and every turn
+/// ended with an empty answer and no error anywhere. A log line that asserts a write is
+/// worse than no log line when it is wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MountOutcome {
+    /// The entry now says what this app says it should: absent and created, or already
+    /// pointing at this endpoint and refreshed with the window and modalities just probed.
+    Written,
+    /// The entry pointed at another endpoint and could not answer for the model this app
+    /// is about to ask pi for, so it was replaced. `previous` names the baseUrl that was
+    /// there, because "why did my pi config change" deserves an address.
+    Replaced { previous: String },
+    /// A provider entry that *can* answer for this model, on a baseUrl cwoffee did not
+    /// write, was left alone — and that baseUrl is where the requests will really go.
+    Foreign { base_url: String },
+}
+
+/// Write a single-provider `models.json` pointing at `base_url`.
+///
+/// The ownership rule, in one sentence: **an entry that cannot answer for the model this
+/// app is about to request is replaced; an entry that can is left exactly as it is.**
+/// That is the whole guard. "Same provider name, different baseUrl, therefore not ours"
+/// was the old rule, and it stranded a stale scripted endpoint in the file forever: the
+/// app then held a model name pi had never heard of, and the conversation died with zero
+/// characters on screen and no error to read. Keeping a working hand-written entry is
+/// still the right call, and when that happens the caller says which baseUrl the requests
+/// will actually travel to.
+///
+/// **Development and smoke only** in origin: the gateway needs *some* provider file to
+/// point pi at cwoffee's own mock endpoint, which is what makes a pi-core gateway
+/// testable with cwoffee's existing fixtures. Real packaging is S4.1's decision.
 pub fn write_dev_provider(
     agent_dir: &Path,
     provider: &str,
@@ -345,8 +438,10 @@ pub fn write_dev_provider(
     model: &str,
     api_key: &str,
     api: &str,
+    kind: &str,
     window: Option<u64>,
-) -> anyhow::Result<PathBuf> {
+    efforts: &[String],
+) -> anyhow::Result<(PathBuf, MountOutcome)> {
     std::fs::create_dir_all(agent_dir)?;
     // The context window goes in when we know it. Without it pi reports no window for
     // this model, cwoffee's metrics panel has no denominator, and the user sees "no
@@ -359,6 +454,29 @@ pub fn write_dev_provider(
     // matches what the app already promises the user; an endpoint that cannot see images
     // then says so in the response, which is a failure the user can actually read.
     entry["input"] = serde_json::json!(["text", "image"]);
+    // Thinking levels, declared rather than assumed. pi-ai's `getSupportedThinkingLevels`
+    // returns `["off"]` for a model entry that does not say `reasoning: true`, and
+    // `clampThinkingLevel` then turns whatever the app asked for into `off` before the request
+    // is built - so on a pi core the composer's dial was accepted, reported back as applied,
+    // and never reached the wire. That is the whole of "changing reasoning effort does nothing".
+    //
+    // Which fields to write is a claim about the endpoint, so it comes out of cwoffee's own
+    // config: the provider kind picks the wire dialect (the same choice `Config::build_provider`
+    // makes for the rust core, where `Flavor::LlamaCpp` sends `chat_template_kwargs` and
+    // `Flavor::OpenAi` sends a top-level `reasoning_effort`), and the probed `reasoning_efforts`
+    // list picks which levels exist. A level the endpoint never offered is written as `null`,
+    // which is how pi is told not to offer it either - better than sending a value the server
+    // answers with a 400.
+    if let Some(decl) = reasoning_decl(kind, efforts) {
+        for (k, v) in decl.as_object().expect("reasoning_decl builds an object") {
+            entry[k] = v.clone();
+        }
+    } else {
+        eprintln!(
+            "[cwoffee/pi] no thinking levels declared for {model} (provider kind {kind:?} is not one \
+             cwoffee knows how to speak): pi will clamp every reasoning request to off for this model"
+        );
+    }
     if let Some(w) = window {
         entry["contextWindow"] = serde_json::json!(w);
         // pi's provider composer defaults a model's max output tokens to 16384 when the
@@ -396,20 +514,46 @@ pub fn write_dev_provider(
             ))
         }
     };
-    let ours = doc
-        .get("providers")
-        .and_then(|p| p.get(provider))
-        .map(|p| p.get("baseUrl").and_then(|b| b.as_str()) == Some(base_url))
-        .unwrap_or(true);
-    if !ours {
+    let existing = doc.get("providers").and_then(|p| p.get(provider));
+    let previous = existing
+        .and_then(|p| p.get("baseUrl"))
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .to_string();
+    let same_base = existing.is_some() && previous == base_url;
+    // Can this entry answer for the model the app is about to ask pi for? That single
+    // question replaces "is this file ours": if the answer is no, the app cannot use the
+    // entry either way, so leaving it behind is not caution — it is a guaranteed failure
+    // with no error message.
+    let answers_for_model = existing
+        .and_then(|p| p.get("models"))
+        .and_then(|m| m.as_array())
+        .map(|list| {
+            list.iter()
+                .any(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))
+        })
+        .unwrap_or(false);
+    let outcome = if existing.is_some() && !same_base && answers_for_model {
         eprintln!(
-            "[cwoffee/pi] {} already defines provider {provider} for another baseUrl ({}). Not overwriting a config we do not own — cwoffee's context window and modality claims will not apply, so a picture may be dropped by pi before the request.",
-            path.display(),
-            doc["providers"][provider]["baseUrl"]
-                .as_str()
-                .unwrap_or("(none)")
+            "[cwoffee/pi] provider {provider} in {} points at {previous}, not at the endpoint in \
+             cwoffee's config ({base_url}) — but it does list {model}, so it is somebody's entry and it \
+             stays. Requests for {model} will go to {previous}, not to {base_url}.",
+            path.display()
         );
-        return Ok(path);
+        MountOutcome::Foreign { base_url: previous }
+    } else if existing.is_none() || same_base {
+        MountOutcome::Written
+    } else {
+        eprintln!(
+            "[cwoffee/pi] provider {provider} in {} pointed at {previous}, which does not list {model}. \
+             Replacing it: cwoffee is about to ask pi for {provider}/{model}, and an entry without that \
+             model is a turn that ends with nothing on screen and no error to read.",
+            path.display()
+        );
+        MountOutcome::Replaced { previous }
+    };
+    if matches!(outcome, MountOutcome::Foreign { .. }) {
+        return Ok((path, outcome));
     }
     if doc.get("providers").is_none() {
         doc["providers"] = serde_json::json!({});
@@ -419,18 +563,183 @@ pub fn write_dev_provider(
         "models": [entry]
     });
     std::fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
-    Ok(path)
+    Ok((path, outcome))
+}
+
+/// Which provider/model pair pi has to be told about for a cwoffee model id.
+///
+/// The two spellings differ, and confusing them is why a model added on the settings
+/// screen could not be used for inference. cwoffee files a registered endpoint's models
+/// under a row (`[providers."openrouter"]` with `models = ["claude-x"]`) and the screen
+/// offers the model by the name in that row; pi keys the same thing by its provider entry
+/// name. Sending the launch provider (`cwoffee`) for every model — which is what this
+/// used to do — asks pi for `cwoffee/claude-x`, a model pi has never heard of, so the
+/// button that says "answer with this" answers with an error.
+///
+/// `Err` names the ambiguity instead of picking one: two registered endpoints that both
+/// list the same model id mean nothing says which server the person meant, and guessing
+/// picks a bill or a model they did not choose.
+pub fn pi_target(cfg_path: &Path, own_provider: &str, id: &str) -> anyhow::Result<(String, String)> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(anyhow::anyhow!("no model was named"));
+    }
+    let rows = cwoffee_engine::config::provider_rows_in(cfg_path);
+    // An explicit `row/model` spelling wins: it is what `mount_provider_rows` writes into
+    // pi's file, and it is unambiguous by construction.
+    if let Some((row, bare)) = id.split_once('/') {
+        if rows.iter().any(|(n, _)| n == row) {
+            return Ok((row.to_string(), bare.to_string()));
+        }
+        // The launch provider's own prefix is not a row: `[provider]` has no name in the
+        // config file, so a spelling like `cwoffee/gpt` can only mean "the endpoint cwoffee
+        // owns the entry for". Leaving the prefix on the model id would hand pi a model name
+        // with a slash in it, and pi would answer "Model not found" for a model that is
+        // sitting in its own file.
+        if row == own_provider && !bare.is_empty() {
+            return Ok((own_provider.to_string(), bare.to_string()));
+        }
+    }
+    let hits: Vec<String> = rows
+        .iter()
+        .filter(|(_, r)| r.models.iter().any(|m| m.trim() == id))
+        .map(|(n, _)| n.clone())
+        .collect();
+    match hits.len() {
+        0 => Ok((own_provider.to_string(), id.to_string())),
+        1 => Ok((hits[0].clone(), id.to_string())),
+        _ => Err(anyhow::anyhow!(
+            "{id} is registered on {} of cwoffee's endpoints ({}), so nothing says which server to \
+             answer with. Remove one of those endpoint rows, or register the model under one endpoint.",
+            hits.len(),
+            hits.join(", ")
+        )),
+    }
+}
+
+/// Is this provider/model pair already in pi's `models.json`?
+///
+/// The mount of registered endpoints happens at boot, which is a snapshot: an endpoint
+/// added while the window is open is in cwoffee's config and not in pi's file, and
+/// "answer with this model" then fails over a model pi has never seen.
+pub fn provider_has_model(agent_dir: &Path, provider: &str, model: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(agent_dir.join("models.json")) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    doc.get("providers")
+        .and_then(|p| p.get(provider))
+        .and_then(|p| p.get("models"))
+        .and_then(|m| m.as_array())
+        .map(|list| {
+            list.iter()
+                .any(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The entry pi is handed has to be one pi will answer a thinking level with.
+    ///
+    /// pi-ai's `getSupportedThinkingLevels` returns `["off"]` for a model entry that does not
+    /// say `reasoning: true`, and `clampThinkingLevel` then maps whatever the app asked for onto
+    /// that - before the request is built. An entry filed without these fields is therefore a
+    /// composer dial that reports success and changes nothing on the wire, which is exactly the
+    /// report we got: "changing reasoning effort doesn't take effect".
+    ///
+    /// The fields are pinned against `tests/fixtures/pi-model-entry.json`, and
+    /// `scripts/pi-reasoning-gate.mjs` feeds that same fixture to pi's own functions. One
+    /// fixture, both halves: this test grades what cwoffee writes, the gate grades what pi makes
+    /// of it.
+    #[test]
+    fn the_pi_entry_declares_the_thinking_levels_the_rust_core_would_send() {
+        let root = std::env::temp_dir().join(format!("cw-reasoning-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let efforts: Vec<String> = ["low", "medium", "xhigh"].iter().map(|s| s.to_string()).collect();
+        let (p, _) = write_dev_provider(
+            &root,
+            "cwoffee",
+            "http://127.0.0.1:8090/v1",
+            "m1",
+            "k",
+            "openai-completions",
+            "llama.cpp",
+            Some(262144),
+            &efforts,
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let entry = &doc["providers"]["cwoffee"]["models"][0];
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/pi-model-entry.json")).unwrap();
+        for key in ["reasoning", "thinkingLevelMap", "compat"] {
+            assert_eq!(entry[key], fixture[key], "{key} differs from the fixture pi is graded against");
+        }
+        // `high` is folded onto `xhigh` because that is what the template on this endpoint
+        // accepts - the same folding the rust core does in `llama_effort`, so a conversation
+        // gets the same thinking whichever core is behind the window.
+        assert_eq!(entry["thinkingLevelMap"]["high"], "xhigh", "high folds to the level the template takes");
+        // A level the endpoint never offered is written as null, which is pi's own "do not offer
+        // this": sending a value the server 400s on is worse than a dial with fewer stops.
+        assert!(entry["thinkingLevelMap"]["max"].is_null(), "no max claimed for a template that has none");
+
+        // No probe data is not the same claim as no thinking: the dialect's documented values
+        // go in, because the failure being fixed is a dial that silently does nothing.
+        let blind = root.join("blind");
+        write_dev_provider(
+            &blind,
+            "cwoffee",
+            "http://127.0.0.1:8090/v1",
+            "m1",
+            "k",
+            "openai-completions",
+            "llama.cpp",
+            None,
+            &[],
+        )
+        .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(blind.join("models.json")).unwrap()).unwrap();
+        let entry = &doc["providers"]["cwoffee"]["models"][0];
+        assert_eq!(entry["reasoning"], serde_json::json!(true), "an unprobed llama.cpp endpoint still gets a dial that reaches the wire");
+        assert!(
+            entry["compat"]["chatTemplateKwargs"]["reasoning_effort"].is_object(),
+            "enable_thinking alone leaves the effort at the template's own default"
+        );
+
+        // A dialect cwoffee does not speak gets no claim at all - and the boot line says pi will
+        // clamp, rather than leaving it to be discovered as a broken dial.
+        let other = root.join("other");
+        write_dev_provider(
+            &other,
+            "cwoffee",
+            "http://127.0.0.1:8090/v1",
+            "m1",
+            "k",
+            "anthropic-messages",
+            "anthropic",
+            None,
+            &[],
+        )
+        .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(other.join("models.json")).unwrap()).unwrap();
+        let entry = &doc["providers"]["cwoffee"]["models"][0];
+        assert!(entry.get("reasoning").is_none(), "a dialect cwoffee cannot speak is not a dialect to guess about");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_provider_entry_we_write_carries_the_window_and_both_modalities() {
         let root = std::env::temp_dir().join(format!("cw-provider-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let p = write_dev_provider(&root, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(262144)).unwrap();
+        let (p, wrote) = write_dev_provider(&root, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", "llama.cpp", Some(262144), &[]).unwrap();
+        assert_eq!(wrote, MountOutcome::Written, "a fresh file is a write");
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         let entry = &doc["providers"]["cwoffee"]["models"][0];
         assert_eq!(entry["contextWindow"].as_u64(), Some(262144), "the probed window goes in");
@@ -438,26 +747,160 @@ mod tests {
         assert_eq!(entry["maxTokens"].as_u64(), Some(131_072), "half the window, or pi cuts the reply at 16384");
         // A small window keeps pi's default rather than inventing a smaller cut.
         let small = root.join("small");
-        write_dev_provider(&small, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(8192)).unwrap();
+        write_dev_provider(&small, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", "llama.cpp", Some(8192), &[]).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&small.join("models.json")).unwrap()).unwrap();
         assert_eq!(doc["providers"]["cwoffee"]["models"][0]["maxTokens"].as_u64(), Some(4_096), "never above the window minus the prompt");
         // And no window means no claim: pi's own default stays in charge.
         let blind = root.join("blind");
-        write_dev_provider(&blind, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", None).unwrap();
+        write_dev_provider(&blind, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", "llama.cpp", None, &[]).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&blind.join("models.json")).unwrap()).unwrap();
         assert!(doc["providers"]["cwoffee"]["models"][0].get("maxTokens").is_none(), "no probed window, no invented cap");
         // Same baseUrl: refreshed in place, so a window learned later actually lands.
-        write_dev_provider(&root, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(131072)).unwrap();
+        let (again_path, wrote) = write_dev_provider(&root, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", "llama.cpp", Some(131072), &[]).unwrap();
+        assert_eq!(again_path, p, "the same file, not a second one");
+        assert_eq!(wrote, MountOutcome::Written, "same baseUrl is a refresh, not a takeover");
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(doc["providers"]["cwoffee"]["models"][0]["contextWindow"].as_u64(), Some(131072));
-        // Someone else's provider of the same name is left alone.
+        // An entry under cwoffee's own provider name that cannot answer for the model this
+        // app is about to request gets replaced, whatever baseUrl it points at. This is the
+        // installed-app bug: a previous run had left provider `cwoffee` pointing at the
+        // scripted endpoint on a dead port, listing only `cwoffee-mock`. The old rule saw a
+        // different baseUrl and refused to touch "a config we do not own"; the app went on
+        // asking pi for `cwoffee/qwen3.8-flash-next-iq3_s`, pi had no such model, and every
+        // turn ended with nothing on screen and no error to read.
         let other = root.join("other");
-        write_dev_provider(&other, "cwoffee", "http://elsewhere/v1", "x", "k", "openai-completions", None).unwrap();
-        std::fs::create_dir_all(&other).ok();
-        std::fs::write(other.join("models.json"), std::fs::read_to_string(&p).unwrap()).unwrap();
-        write_dev_provider(&other, "cwoffee", "http://127.0.0.1:8090/v1", "m1", "k", "openai-completions", Some(9)).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&other.join("models.json")).unwrap()).unwrap();
-        assert_eq!(doc["providers"]["cwoffee"]["baseUrl"].as_str(), Some("http://127.0.0.1:8090/v1"), "ours was replaced, not theirs");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join("models.json"),
+            r#"{"providers":{"cwoffee":{"api":"openai-completions","apiKey":"unused","baseUrl":"http://127.0.0.1:8193/v1","models":[{"id":"cwoffee-mock"}]},"someone-else":{"baseUrl":"https://their.server/v1","models":[{"id":"keepme"}]}}}"#,
+        )
+        .unwrap();
+        let (p2, wrote) = write_dev_provider(&other, "cwoffee", "http://127.0.0.1:8090/v1", "qwen3.8-flash-next-iq3_s", "k", "openai-completions", "llama.cpp", Some(262144), &[]).unwrap();
+        assert_eq!(
+            wrote,
+            MountOutcome::Replaced { previous: "http://127.0.0.1:8193/v1".into() },
+            "a stale entry that cannot answer for the model is replaced, and the old address is named"
+        );
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p2).unwrap()).unwrap();
+        assert_eq!(doc["providers"]["cwoffee"]["baseUrl"].as_str(), Some("http://127.0.0.1:8090/v1"), "ours was rewritten to the endpoint in use");
+        assert_eq!(doc["providers"]["cwoffee"]["models"][0]["id"].as_str(), Some("qwen3.8-flash-next-iq3_s"), "the model pi is about to be asked for is in the entry");
+        assert_eq!(doc["providers"]["someone-else"]["baseUrl"].as_str(), Some("https://their.server/v1"), "a different provider in the same file is not ours to touch");
+        // The other direction, which is the reason the guard exists at all: an entry that
+        // *can* answer for this model on a baseUrl cwoffee did not write is somebody's
+        // configuration, so it stays — and the caller is told where the requests go.
+        let mine = root.join("mine");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(
+            mine.join("models.json"),
+            r#"{"providers":{"cwoffee":{"api":"openai-completions","baseUrl":"https://hand.written/v1","models":[{"id":"qwen3.8-flash-next-iq3_s"}]}}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(mine.join("models.json")).unwrap();
+        let (p3, wrote) = write_dev_provider(&mine, "cwoffee", "http://127.0.0.1:8090/v1", "qwen3.8-flash-next-iq3_s", "k", "openai-completions", "llama.cpp", Some(262144), &[]).unwrap();
+        assert_eq!(
+            wrote,
+            MountOutcome::Foreign { base_url: "https://hand.written/v1".into() },
+            "an entry that lists the model is left alone"
+        );
+        assert_eq!(std::fs::read_to_string(&p3).unwrap(), before, "left alone means not one byte changed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The fact the whole mount depends on, probed against pi 1.2.0 rather than assumed:
+    /// a provider entry **without an `apiKey` is not registered at all**. It does not appear
+    /// in `get_available_models`, and `set_model` for a model under it answers "Model not
+    /// found" — for a model the settings screen had just offered, on an endpoint the person
+    /// had just added. Every mounted provider therefore carries a key: the row's if it has
+    /// one, the same placeholder cwoffee's own provider entry has always used otherwise.
+    #[test]
+    fn a_mounted_endpoint_is_a_provider_pi_will_actually_register() {
+        let root = std::env::temp_dir().join(format!("cw-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = root.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[providers.\"lan\"]\nkind = \"llama.cpp\"\nbase_url = \"http://192.168.0.122:8080/v1\"\napi_key = \"\"\nmodels = [\"lan/qwen3-4b\"]\n\n[providers.\"paid\"]\nkind = \"openai\"\nbase_url = \"https://paid/v1\"\napi_key = \"sk-real\"\nmodels = [\"paid/big\"]\n",
+        )
+        .unwrap();
+        mount_provider_rows(&root, &cfg).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("models.json")).unwrap()).unwrap();
+        for name in ["lan", "paid"] {
+            let key = doc["providers"][name]["apiKey"].as_str().unwrap_or("");
+            assert!(!key.is_empty(), "{name}: an entry with no apiKey is invisible to pi");
+        }
+        assert_eq!(doc["providers"]["lan"]["apiKey"].as_str(), Some("unused"), "the placeholder, not an empty header");
+        assert_eq!(doc["providers"]["paid"]["apiKey"].as_str(), Some("sk-real"), "a real key is the person's own, untouched");
+        // And pi's own rule, from the same probe: `set_model` needs the provider/model pair.
+        // An id that only carries cwoffee's spelling cannot be looked up.
+        assert!(provider_has_model(&root, "lan", "qwen3-4b"), "pi knows it under its row, not under cwoffee");
+        assert!(!provider_has_model(&root, "cwoffee", "lan/qwen3-4b"), "nor under a provider that was never mounted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A model id is not a provider. cwoffee offers a registered endpoint's model by the
+    /// name in its row; pi needs the pair. Getting this wrong is "added models cannot be
+    /// used for inference": the app asked pi for `cwoffee/<model>`, a model pi had never
+    /// heard of, and the model picker's answer was an error about a model nobody named.
+    #[test]
+    fn a_model_id_becomes_the_provider_pi_keys_it_under() {
+        let root = std::env::temp_dir().join(format!("cw-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = root.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[provider]\nkind = \"llama.cpp\"\nbase_url = \"http://127.0.0.1:8090/v1\"\nmodel = \"qwen3.8-flash-next-iq3_s\"\n\n[providers.\"box\"]\nkind = \"llama.cpp\"\nbase_url = \"http://192.168.0.122:8080/v1\"\napi_key = \"\"\nmodels = [\"box/qwen3-4b\"]\n\n[providers.\"127.0.0.1-8090-v1\"]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:8090/v1\"\napi_key = \"\"\nmodels = [\"qwen3.8-flash-next-iq3_s\"]\n",
+        )
+        .unwrap();
+        // The prefixed spelling, which is what a probed endpoint writes into `[models.]`.
+        assert_eq!(pi_target(&cfg, "cwoffee", "box/qwen3-4b").unwrap(), ("box".into(), "qwen3-4b".into()));
+        // The bare spelling, filed under a row that lists it (this user's config shape).
+        assert_eq!(
+            pi_target(&cfg, "cwoffee", "qwen3.8-flash-next-iq3_s").unwrap(),
+            ("127.0.0.1-8090-v1".into(), "qwen3.8-flash-next-iq3_s".into())
+        );
+        // A model on no row at all is the endpoint in `[provider]`, which is the one cwoffee
+        // owns the entry for.
+        assert_eq!(pi_target(&cfg, "cwoffee", "unlisted-model").unwrap(), ("cwoffee".into(), "unlisted-model".into()));
+        // A slash that names no row is not a provider: inventing one produces a model pi has
+        // never seen, which is the failure this whole function exists to stop.
+        assert_eq!(pi_target(&cfg, "cwoffee", "nosuchrow/m1").unwrap(), ("cwoffee".into(), "nosuchrow/m1".into()));
+        // The launch provider's own prefix does mean its provider, because it is the one name
+        // that is not a row in the file: `[provider]` is unnamed.
+        assert_eq!(pi_target(&cfg, "cwoffee", "cwoffee/m1").unwrap(), ("cwoffee".into(), "m1".into()));
+        // Two endpoints offering the same model: refuse, and name both.
+        std::fs::write(
+            &cfg,
+            "[providers.\"a\"]\nkind = \"openai\"\nbase_url = \"http://a/v1\"\nmodels = [\"same\"]\n\n[providers.\"b\"]\nkind = \"openai\"\nbase_url = \"http://b/v1\"\nmodels = [\"same\"]\n",
+        )
+        .unwrap();
+        let err = pi_target(&cfg, "cwoffee", "same").unwrap_err().to_string();
+        assert!(err.contains("a") && err.contains("b") && err.contains("same"), "not actionable: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The mount of registered endpoints runs at boot, so an endpoint added while the
+    /// window is open is in cwoffee's config and not yet in pi's file. The model switch
+    /// has to be able to notice that, or "answer with this model" fails over a model pi
+    /// has never seen.
+    #[test]
+    fn a_model_added_after_boot_is_not_in_pis_file_until_it_is_mounted() {
+        let root = std::env::temp_dir().join(format!("cw-hasmodel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = root.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[providers.\"box\"]\nkind = \"llama.cpp\"\nbase_url = \"http://192.168.0.122:8080/v1\"\napi_key = \"\"\nmodels = [\"box/qwen3-4b\"]\n",
+        )
+        .unwrap();
+        assert!(!provider_has_model(&root, "box", "qwen3-4b"), "a missing file has no models in it");
+        mount_provider_rows(&root, &cfg).unwrap();
+        assert!(provider_has_model(&root, "box", "qwen3-4b"), "mounted, so pi can be told about it");
+        assert!(!provider_has_model(&root, "box", "other-model"), "not the same thing as claiming everything");
+        assert!(!provider_has_model(&root, "cwoffee", "qwen3-4b"), "under its own provider, not cwoffee's");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -475,7 +918,7 @@ mod tests {
         )
         .unwrap();
         // The chosen endpoint first, the way boot does it.
-        write_dev_provider(&root, "here", "http://127.0.0.1:9/v1", "m1", "k", "openai-completions", Some(262144)).unwrap();
+        let (_p, _w) = write_dev_provider(&root, "here", "http://127.0.0.1:9/v1", "m1", "k", "openai-completions", "llama.cpp", Some(262144), &[]).unwrap();
         let mounted = mount_provider_rows(&root, &cfg).unwrap();
         assert_eq!(mounted, vec!["box (2 model(s))".to_string()], "{mounted:?}");
         let doc: serde_json::Value =
@@ -485,7 +928,7 @@ mod tests {
         let boxp = &doc["providers"]["box"];
         assert_eq!(boxp["baseUrl"].as_str(), Some("http://192.168.0.122:8080/v1"));
         assert_eq!(boxp["api"].as_str(), Some("openai-completions"), "a llama.cpp server speaks the openai wire");
-        assert!(boxp.get("apiKey").is_none(), "an endpoint with no key must not get an empty one");
+        assert_eq!(boxp["apiKey"].as_str(), Some("unused"), "a keyless local endpoint still needs an apiKey, or pi will not register the provider at all");
         let small = &boxp["models"][0];
         assert_eq!(small["id"].as_str(), Some("qwen3-4b"), "pi's id is bare under its provider");
         assert_eq!(small["contextWindow"].as_u64(), Some(131_072), "the stored window is what pi is told");

@@ -5,11 +5,12 @@
 //! end answers, so the failure modes matter more than the happy path:
 //!
 //!   * nobody is attached        -> the send fails, the model is told so
-//!   * nobody answers in time    -> the model is told to decide for itself and
-//!                                  to say that it asked
+//!   * nobody answers            -> the turn stays parked. It is a *paused* state, not a
+//!                                  failing one: the card waits until a person answers or
+//!                                  the turn is stopped. `question_timeout_secs` in
+//!                                  config.toml puts a clock back on purpose
 //!   * the user stops the turn   -> the reply sender is dropped, which wakes the
 //!                                  tool immediately instead of leaving it parked
-//!                                  until the timeout
 //!
 //! The question never enters the prompt on its own: what goes back to the model
 //! is the answer text, in the tool_result slot, exactly like any other tool.
@@ -87,24 +88,29 @@ pub type QuestionTx = mpsc::UnboundedSender<QuestionRx>;
 
 pub struct AskUserTool {
     next_id: AtomicU64,
-    timeout: std::time::Duration,
+    /// `None` — the default — waits for a person for as long as it takes.
+    timeout: Option<std::time::Duration>,
 }
 
 impl Default for AskUserTool {
     fn default() -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            // Shorter than the approval timeout on purpose. An unanswered
-            // approval costs nothing; an unanswered question holds a turn that
-            // the user may have walked away from.
-            timeout: std::time::Duration::from_secs(180),
+            // No clock. An unanswered approval costs nothing and fails closed; an unanswered
+            // question is a decision parked in front of a person who may be reading a
+            // spreadsheet, asking a colleague, or on a phone with the screen off. The old
+            // 180 seconds expired, the model answered itself, and the user apologised four
+            // messages later. A parked turn is a *paused* state: Stop ends it.
+            timeout: None,
         }
     }
 }
 
 impl AskUserTool {
+    /// Put a clock on the wait. Only a caller that means it should: `question_timeout_secs`
+    /// in config.toml is the user's way of asking for one.
     pub fn with_timeout(mut self, d: std::time::Duration) -> Self {
-        self.timeout = d;
+        self.timeout = Some(d);
         self
     }
 
@@ -164,7 +170,8 @@ impl Tool for AskUserTool {
          the one you recommend, and keep the question to one sentence. When one step \
          needs several decisions, ask them in a single call with `questions` (2-4 of \
          them, same fields each) instead of one call per question: the user answers \
-         them as one card and every answer comes back together."
+         them as one card and every answer comes back together. The turn pauses while you \
+         wait: an unanswered question never expires on its own, so do not answer one yourself."
     }
 
     fn schema(&self) -> Value {
@@ -264,11 +271,12 @@ impl Tool for AskUserTool {
         // sequential ones. Reading and answering three questions takes longer than
         // answering one, and a per-question timeout would punish the model for
         // asking them together - which is what the description just told it to do.
-        // The host's configured budget wins; the tool's own default covers callers
-        // that build a ToolCtx without a host.
-        let timeout = ctx.question_timeout.unwrap_or(self.timeout);
-        let budget = timeout.mul_f64(1.0 + 0.5 * (total - 1) as f64);
-        let deadline = tokio::time::Instant::now() + budget;
+        // The host's configured budget wins; `None` (the default, and the tool's own)
+        // means there is no clock: the turn is parked, and the only ways out are an
+        // answer, a cancelled question, or Stop.
+        let budget = ctx.question_timeout.or(self.timeout);
+        let scaled = budget.map(|b| b.mul_f64(1.0 + 0.5 * (total - 1) as f64));
+        let deadline = scaled.map(|b| tokio::time::Instant::now() + b);
         let mut got: Vec<Option<Answer>> = Vec::with_capacity(total);
         let mut timed_out = false;
         for (id, _, rx) in waiting.iter_mut() {
@@ -278,8 +286,18 @@ impl Tool for AskUserTool {
                 got.push(None);
                 continue;
             }
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(left, rx).await {
+            // The wait itself, chosen once per question. There is no `Duration::MAX`
+            // stand-in for "no clock": tokio computes an instant from the duration and an
+            // instant that far out is an overflow, i.e. a panic in the one tool whose job
+            // is to be patient.
+            let res = match deadline {
+                Some(d) => {
+                    let left = d.saturating_duration_since(tokio::time::Instant::now());
+                    tokio::time::timeout(left, rx).await.map_err(|_| ())
+                }
+                None => Ok(rx.await),
+            };
+            match res {
                 Ok(Ok(a)) => {
                     got.push(Some(a));
                     // An answer belongs to one window, but the card sits in all of them.
@@ -308,19 +326,31 @@ impl Tool for AskUserTool {
         // dead by then, so the shells cannot report it: they are the ones holding the
         // sender, and a sender whose receiver is gone says nothing until someone
         // tries to use it.
-        let expire = |ev: &ToolCtx, id: u64| {
+        let expire = |ev: &ToolCtx, id: u64, why: crate::event::QuestionWhy| {
             if let Some(tx) = &ev.events {
-                let _ = tx.send(crate::event::EngineEvent::QuestionExpired { id });
+                let _ = tx.send(crate::event::EngineEvent::QuestionExpired { id, why });
             }
         };
-        let unanswered: Vec<u64> = waiting
+        // Which sentence the card gets. Once one question's clock runs out the whole set
+        // stops waiting, so the rest of that set inherits the same reason; anything left
+        // over is a turn that was stopped, whose reply senders went away with it.
+        let unanswered: Vec<(u64, crate::event::QuestionWhy)> = waiting
             .iter()
             .zip(got.iter())
             .filter(|(_, a)| a.is_none())
-            .map(|((id, _, _), _)| *id)
+            .map(|((id, _, _), _)| {
+                (
+                    *id,
+                    if timed_out {
+                        crate::event::QuestionWhy::TimedOut
+                    } else {
+                        crate::event::QuestionWhy::TurnStopped
+                    },
+                )
+            })
             .collect();
-        for id in &unanswered {
-            expire(ctx, *id);
+        for (id, why) in &unanswered {
+            expire(ctx, *id, *why);
         }
 
         if total == 1 {
@@ -357,10 +387,10 @@ impl Tool for AskUserTool {
                 None if timed_out => ToolResult::err(format!(
                     "ask_user: the user did not answer within {}s. Pick the option you \
                      recommended (or the most sensible one), say in your reply that you \
-                     asked and got no answer, and continue. If the answer needs asking \
-                     someone else, question_timeout_secs in config.toml sets how long this \
-                     card stays open.",
-                    timeout.as_secs()
+                     asked and got no answer, and continue. That clock is not the default: \
+                     question_timeout_secs in config.toml is what put it there, and leaving \
+                     the key out leaves the card open until somebody answers.",
+                    scaled.map(|b| b.as_secs()).unwrap_or(0)
                 )),
                 None => ToolResult::err(
                     "ask_user: the question was cancelled before it was answered. Stop and \
@@ -374,9 +404,9 @@ impl Tool for AskUserTool {
                     format!(
                         "ask_user: the user answered none of the {total} questions within {}s. \
                          Decide them yourself, say in your reply that you asked and got no \
-                         answer, and continue. question_timeout_secs in config.toml sets how \
-                         long these cards stay open.",
-                        budget.as_secs()
+                         answer, and continue. That clock is not the default: \
+                         question_timeout_secs in config.toml is what put it there.",
+                        scaled.map(|b| b.as_secs()).unwrap_or(0)
                     )
                 } else {
                     format!(
@@ -670,7 +700,10 @@ mod tests {
         assert!(said.contains("did not answer within"), "{said}");
         let ev = erx.recv().await.expect("the expiry must be announced");
         match ev {
-            crate::event::EngineEvent::QuestionExpired { id } => assert_eq!(id, qid),
+            crate::event::EngineEvent::QuestionExpired { id, why } => {
+                assert_eq!(id, qid);
+                assert_eq!(why, crate::event::QuestionWhy::TimedOut);
+            }
             other => panic!("expected QuestionExpired, got {other:?}"),
         }
         assert!(erx.try_recv().is_err(), "exactly one expiry per question");
@@ -681,6 +714,47 @@ mod tests {
     /// The host's budget is the wait, not the tool's own default, and the expiry has
     /// to name the key. Session 1306 lost a question the user needed to take to a
     /// second person, and nothing in the transcript said a knob existed.
+    /// A stopped turn has to say so on the card. The clock is gone by default, so Stop is
+    /// now the usual way an unanswered question ends — and "the model was told it got none"
+    /// about a turn the reader stopped themselves describes something that did not happen.
+    /// In this core, the reply sender going away *is* the stop.
+    #[tokio::test]
+    async fn a_card_the_reader_stopped_says_the_turn_was_stopped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            question_timeout: None,
+            ask: Some(tx),
+            events: Some(etx),
+            permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
+        };
+        let (idx, iqx) = oneshot::channel::<u64>();
+        tokio::spawn(async move {
+            let (q, reply) = rx.recv().await.unwrap();
+            idx.send(q.id).unwrap();
+            // The turn was stopped: the shell releases its sender without answering.
+            drop(reply);
+        });
+        let r = AskUserTool::default()
+            .run(json!({"question": "Which month?", "options": [{"label": "January"}]}), &ctx, &sink())
+            .await;
+        let qid = iqx.await.unwrap();
+        assert!(!r.ok, "a stopped question is not an answered one: {:?}", r.text());
+        match erx.recv().await.expect("the stopped card must close") {
+            crate::event::EngineEvent::QuestionExpired { id, why } => {
+                assert_eq!(id, qid);
+                assert_eq!(why, crate::event::QuestionWhy::TurnStopped);
+            }
+            other => panic!("expected QuestionExpired, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn the_hosts_budget_is_the_wait_and_names_the_knob_when_it_bites() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
@@ -703,8 +777,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         });
         let started = std::time::Instant::now();
-        // AskUserTool::default() would wait 180s. If the context value were ignored
-        // this test would sit for three minutes instead of a sixth of one.
+        // AskUserTool::default() would wait for a person forever. If the context value were
+        // ignored this test would sit there until the runtime is torn down instead of
+        // finishing in a sixth of a second.
         let r = AskUserTool::default()
             .run(
                 json!({"question": "Ask the treasurer which month?", "options": [{"label": "January"}]}),
@@ -720,6 +795,65 @@ mod tests {
         );
         assert!(said.contains("did not answer within"), "{said}");
         assert!(said.contains("question_timeout_secs"), "the expiry must name the knob: {said}");
+    }
+
+    /// The report this pins: "remove the timeout on the question — it should just be a
+    /// paused state". Session 1306's user needed to ask someone else, the card closed, the
+    /// model answered itself, and the transcript never showed that the app had given up on
+    /// its own. So the default is no clock, and the assertions are the two halves of that:
+    /// the tool parks rather than expiring, and a late answer is still an answer.
+    #[tokio::test]
+    async fn a_question_parks_the_turn_until_somebody_answers_it() {
+        // Half one: the default carries no deadline at all.
+        assert_eq!(
+            AskUserTool::default().timeout,
+            None,
+            "an unanswered question must not have a clock on it: the turn is paused, not failing"
+        );
+
+        // Half two: a person who takes longer than the old 180s default's scaled cousin
+        // still gets asked, and their answer is what the model is given.
+        let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
+        let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            max_output_bytes: 4096,
+            question_timeout: None,
+            ask: Some(tx),
+            events: Some(etx),
+            permits: Vec::new(),
+            store: None,
+            session: None,
+            search_backend: Default::default(),
+            exec_cfg: Default::default(),
+        };
+        tokio::spawn(async move {
+            let (_q, reply) = rx.recv().await.unwrap();
+            // Longer than any budget the old build would have had at this scale, and short
+            // enough to keep the test honest about waiting rather than sleeping.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = reply.send(Answer { text: "Ask the treasurer".into(), options: vec![] });
+        });
+        let started = std::time::Instant::now();
+        let r = AskUserTool::default()
+            .run(
+                json!({"question": "Which month does the treasurer mean?", "options": [{"label": "January"}]}),
+                &ctx,
+                &sink(),
+            )
+            .await;
+        assert!(r.ok, "a parked question came back as a failure: {:?}", r.error);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250), "it did not wait");
+        let said = r.text();
+        assert!(said.contains("Ask the treasurer"), "the late answer was thrown away: {said}");
+        match erx.recv().await.expect("an answered question announces its answer") {
+            crate::event::EngineEvent::QuestionAnswered { .. } => {}
+            other => panic!("a parked question that got an answer announced {other:?}, not QuestionAnswered"),
+        }
+        assert!(
+            erx.try_recv().is_err(),
+            "a question that waited and was answered must never announce an expiry"
+        );
     }
 
     #[tokio::test]
@@ -1293,7 +1427,12 @@ mod tests {
         }
         let ev = erx.recv().await.expect("the unanswered question must be closed");
         match ev {
-            crate::event::EngineEvent::QuestionExpired { id } => assert_eq!(id, lost),
+            crate::event::EngineEvent::QuestionExpired { id, why } => {
+                assert_eq!(id, lost);
+                // This test's tool is built with a clock, so the card that closes has to say
+                // the clock ran out, not that somebody stopped the turn.
+                assert_eq!(why, crate::event::QuestionWhy::TimedOut, "{ev:?}");
+            }
             other => panic!("expected QuestionExpired, got {other:?}"),
         }
         assert!(erx.try_recv().is_err(), "one announcement per question, and only the unanswered one expires");

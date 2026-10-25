@@ -97,6 +97,14 @@ pub async fn gateway_start(
     state.gateway.start(bind, port, drive, watch, source).await
 }
 
+/// What the next window-close would do to the gateway. Shown beside the "keep devices working"
+/// toggle, so the one case where it cannot be honoured — no standalone gateway binary to start —
+/// is said while there is still a window around to say it in.
+#[tauri::command]
+pub fn gateway_handoff_plan(state: tauri::State<'_, AppState>) -> crate::gateway_ctl::HandoffPlan {
+    state.gateway.plan()
+}
+
 /// Turn it off. Aborting the task drops the listener and every connection on
 /// it; clients reconnect when it is turned back on.
 #[tauri::command]
@@ -364,19 +372,6 @@ pub fn tools_view(state: tauri::State<'_, AppState>) -> Vec<cwoffee_engine::host
     cwoffee_engine::host::tool_views()
 }
 
-/// What the local titler is, where it is, and what it costs. Read from the config rather
-/// than from the running host: the helper is a subprocess that comes and goes, and the
-/// question the panel is answering is "would this work here, and what does it cost", not
-/// "is one running this instant" - which the status reports as unknown rather than guessed.
-#[tauri::command]
-pub fn titlegen_status() -> serde_json::Value {
-    let (cfg, path) = cwoffee_engine::config::Config::load(None).unwrap_or_default();
-    serde_json::json!({
-        "status": cfg.titlegen_cfg().status(None),
-        "config_path": path.map(|p| p.display().to_string()),
-    })
-}
-
 /// Cowork or chat. Both cores answer through the same verb: the pi bridge restarts the
 /// model process between turns, the rust core refuses in words. `session_state` is what
 /// the window reads back, so the tab cannot end up claiming a mode the host did not take.
@@ -388,7 +383,11 @@ pub fn set_persona(state: tauri::State<'_, AppState>, persona: String) -> Result
 }
 
 #[tauri::command]
-pub fn set_reasoning(state: tauri::State<'_, AppState>, level: String) -> Result<(), String> {
+pub fn set_reasoning(
+    state: tauri::State<'_, AppState>,
+    level: String,
+    persist: Option<bool>,
+) -> Result<(), String> {
     let r = match level.as_str() {
         "off" => Reasoning::Off,
         "low" => Reasoning::Low,
@@ -397,7 +396,11 @@ pub fn set_reasoning(state: tauri::State<'_, AppState>, level: String) -> Result
         "xhigh" => Reasoning::XHigh,
         other => return Err(format!("unknown reasoning level {other:?}")),
     };
-    state.host.send(HostCmd::SetReasoning { reasoning: r });
+    // `persist` is the difference between the settings screen and the composer dial: true is the
+    // default every new conversation starts at (and lands in the config file), false is an override
+    // for this conversation alone. A missing flag means false, so an old client cannot move a
+    // person's default without asking.
+    state.host.send(HostCmd::SetReasoning { reasoning: r, persist: persist.unwrap_or(false) });
     Ok(())
 }
 
@@ -607,6 +610,35 @@ pub fn share_markdown(
     Ok(cwoffee_engine::share::share_document(&row.title, &row.workspace, &rows))
 }
 
+/// Ask the person where a file should go, offering the name we suggest.
+///
+/// One implementation for every "save this" control in the app, because two dialogs
+/// that drift become two buttons that behave differently while looking identical.
+/// `None` is a real answer: the person pressed cancel.
+async fn pick_save_path(app: &tauri::AppHandle, name: &str) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(name)
+        .save_file(move |p| {
+            eprintln!(
+                "[cwoffee] save dialog: {}",
+                match &p {
+                    Some(tauri_plugin_dialog::FilePath::Path(_)) => "path",
+                    Some(tauri_plugin_dialog::FilePath::Url(_)) => "url",
+                    None => "cancelled",
+                }
+            );
+            let _ = tx.send(p.and_then(picked_to_path));
+        });
+    // A dialog the user never closes must not pin a task forever.
+    tokio::time::timeout(std::time::Duration::from_secs(300), rx)
+        .await
+        .map_err(|_| "save dialog timed out".to_string())?
+        .map_err(|_| "save dialog closed without a result".to_string())
+}
+
 /// Ask the person where the shared document should go, then write it there.
 ///
 /// Desktop-only by construction: a browser page cannot put a file wherever it
@@ -619,32 +651,50 @@ pub async fn save_markdown_file(
     name: String,
     contents: String,
 ) -> Result<Option<String>, String> {
-    use tauri_plugin_dialog::DialogExt;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .set_file_name(&name)
-        .save_file(move |p| {
-            eprintln!(
-                "[cwoffee] save dialog: {}",
-                match &p {
-                    Some(tauri_plugin_dialog::FilePath::Path(_)) => "path",
-                    Some(tauri_plugin_dialog::FilePath::Url(_)) => "url",
-                    None => "cancelled",
-                }
-            );
-            let _ = tx.send(p.and_then(picked_to_path));
-        });
-    let chosen = tokio::time::timeout(std::time::Duration::from_secs(300), rx)
-        .await
-        .map_err(|_| "save dialog timed out".to_string())?
-        .map_err(|_| "save dialog closed without a result".to_string())?;
-    let Some(path) = chosen else {
+    let Some(path) = pick_save_path(&app, &name).await? else {
         return Ok(None);
     };
     std::fs::write(&path, contents.as_bytes()).map_err(|e| format!("cannot write {path}: {e}"))?;
     eprintln!("[cwoffee] share: wrote {path}");
     Ok(Some(path))
+}
+
+/// Hand over an attachment: the file the assistant wrote into
+/// `.cws/assistant_attachments/`, copied to wherever the person says.
+///
+/// Desktop-only by construction: the save dialog is a desktop window, so over the
+/// gateway the same control downloads (see `attachment_bytes` in the gateway's dispatch).
+///
+/// The `session` argument is not decorative. The path arrives from a tool result the
+/// model wrote, and a conversation can live in any folder the person chose; resolving it
+/// against the folder of whichever conversation the host happens to be working on would
+/// read the wrong one. The engine's own rule — only a file under this conversation's
+/// attachments folder, never an arbitrary path — is what stops a turn from offering some
+/// other file on the machine.
+#[tauri::command]
+pub async fn save_attachment_as(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    path: String,
+) -> Result<Option<String>, String> {
+    let row = state
+        .store
+        .session(session)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("session {session} does not exist"))?;
+    let full =
+        cwoffee_engine::tools::scratch::attachment_path(std::path::Path::new(&row.workspace), &path)?;
+    let name = full
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.clone());
+    let Some(dest) = pick_save_path(&app, &name).await? else {
+        return Ok(None);
+    };
+    let copied = std::fs::copy(&full, &dest).map_err(|e| format!("cannot write {dest}: {e}"))?;
+    eprintln!("[cwoffee] attachment: {path} -> {dest} ({copied} bytes)");
+    Ok(Some(dest))
 }
 
 /// Web search settings. The logic lives in the engine (`settings`), because the
@@ -810,6 +860,143 @@ pub fn selftest_armed() -> bool {
     std::env::var("CWOFFEE_SELFTEST").map(|v| v == "1").unwrap_or(false)
 }
 
+/// What the page-side check chain should run.
+///
+/// `CWOFFEE_SELFTEST_ONLY=cup,code-chrome` narrows a pass to the groups that were touched; the page
+/// matches each term against a group's id and against the words of its own section label, so `cup`
+/// catches both cup groups and `follow` catches the scroll one. Empty means every group — which is
+/// the only setting whose green means "the suite passed" — and the page puts the count of groups it
+/// ran, and the names of the ones it did not, on its final line so a narrowed run can never be read
+/// as a full one.
+///
+/// Gated on the same arming as the rest of the harness: in an ordinary run of the app this answers
+/// with an empty filter, because nothing outside a self-test should be able to switch off checks.
+#[tauri::command]
+pub fn selftest_config() -> serde_json::Value {
+    let only: Vec<String> = if selftest_armed() {
+        std::env::var("CWOFFEE_SELFTEST_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    serde_json::json!({ "only": only })
+}
+
+/// Ask the window manager for the window back, from inside the app.
+///
+/// This exists because the layout and animation checks can only measure a page the compositor is
+/// painting. When something else covers this window, WebKitGTK stops firing requestAnimationFrame,
+/// CSS animations freeze at their start value, and a run answers with frame gaps, follow catch-up
+/// that never converges and a dozen skipped geometry checks - all of which read as a broken UI
+/// rather than a hidden window. The startup code already asks for the window; that ask is one shot,
+/// and a fullscreen application that raises itself takes it back mid-run.
+///
+/// The app presenting its own window is the only raise available on this desktop. Raising it from
+/// outside means either an X client faking input - which Wayland answers with a remote-desktop
+/// consent dialog, an interruption no test is allowed to cause - or Shell unsafe mode.
+///
+/// Gated on the same arming as the harness itself: a normal run of the app must never find a
+/// command that changes its window stacking.
+#[tauri::command]
+pub fn present_selftest_window(app: tauri::AppHandle) -> Result<String, String> {
+    if !selftest_armed() {
+        return Err("this process is not an armed self-test run; the window stacking is not mine to change".into());
+    }
+    // The ask runs on its own thread, and that is not a style choice. A Wayland window call
+    // round-trips through the compositor's event queue, and that queue is drained by the same main
+    // loop that is executing this command: asking for focus from inside the IPC handler parks the
+    // handler, which parks the webview's message channel with it. The page then sits on an `await
+    // invoke(...)` that never settles and stops logging mid-run - twice observed, both times right
+    // after a page-side window ask, with the app's own watcher thread still reporting. The startup
+    // raise and the run's focus watcher already do their window work on a thread of their own, and
+    // that path is proven on this desktop.
+    std::thread::spawn(move || {
+        // The window lookup lives on the Manager trait; imported here rather than at the top of the
+        // file so the rest of the command module keeps its current imports.
+        use tauri::Manager;
+        let Some(w) = app.get_webview_window("main") else {
+            println!("[selftest] present_selftest_window was asked and there is no main window");
+            return;
+        };
+        let mut said: Vec<String> = Vec::new();
+        if w.is_minimized().unwrap_or(false) {
+            if w.unminimize().is_ok() {
+                said.push("un-minimized".into());
+            }
+        }
+        if w.show().is_ok() {
+            said.push("shown".into());
+        }
+        // Not `set_always_on_top`: on this Wayland desktop mutter ignores it for a normal
+        // toplevel, and every log line that claimed "pinned above others" was a claim about a
+        // stacking order the app does not have. A diagnostic that lies about what it did is worse
+        // than no diagnostic, because the next person reads it and stops looking.
+        if w.set_focus().is_ok() {
+            said.push("focused".into());
+        }
+        // On Wayland a plain present is a *request*, and a compositor that is guarding against
+        // focus stealing answers it by doing nothing. That is the state this run kept hitting:
+        // the window is on another workspace or behind another window, mutter never paints what
+        // it is not showing, `requestAnimationFrame` goes silent, and twenty-odd layout checks
+        // measure a page that does not exist. The one lever an app genuinely owns over its own
+        // surface is its minimized state, and mutter honours the restore: it brings the window
+        // back onto the current workspace and gives it focus. So if the present above did not
+        // actually land, minimize and restore deliberately. It blinks, and only in an armed
+        // self-test run - a normal run has no command that can reach here at all.
+        // What was tried, so nobody tries it again from the log alone. Asking twice, and
+        // escalating, does nothing on this compositor: a plain present, a minimize/restore cycle
+        // and a fullscreen request were all issued for a window that stayed `focused=false`, and
+        // `xdg_toplevel` gives an app no way to name a workspace or demand a stacking order. The
+        // fix for the frame clock is not a window trick - it is `WEBKIT_DISABLE_COMPOSITING_MODE=1`
+        // in scripts/selftest.sh, which takes `requestAnimationFrame` off the compositor's frame
+        // callbacks entirely. What this command is good for is the state line printed below, which
+        // is how a run says "the window was not on screen" in the app's own words.
+        let size = w
+            .inner_size()
+            .map(|s| format!("{}x{}", s.width, s.height))
+            .unwrap_or_else(|_| "unknown size".into());
+        let how = if said.is_empty() { "nothing took".to_string() } else { said.join(", ") };
+        println!(
+            "[selftest] the page asked for its own window: {} ({}, focused={} visible={} minimized={})",
+            how,
+            size,
+            w.is_focused().unwrap_or(false),
+            w.is_visible().unwrap_or(false),
+            w.is_minimized().unwrap_or(false),
+        );
+    });
+    Ok("asked on its own thread, so the ask cannot park the page that asked".into())
+}
+
+/// What the window knows about itself, without asking the compositor for anything.
+///
+/// The run needs this because the frame clock belongs to the compositor: `focused=false` means
+/// `requestAnimationFrame` stops, and every layout, motion and cadence claim from that point on is
+/// unverifiable. Reading the state is free - tao keeps it locally, since Wayland offers no way to ask
+/// a compositor synchronously. *Changing* it is the part this desktop refuses, which is why the ask
+/// above and the read here are separate commands: one is a request the app is entitled to make, and
+/// the other is the honest answer about whether it landed.
+#[tauri::command]
+pub fn selftest_window_state(app: tauri::AppHandle) -> Result<String, String> {
+    if !selftest_armed() {
+        return Err("this process is not an armed self-test run; the window's business is none of ours".into())
+    }
+    use tauri::Manager;
+    let Some(w) = app.get_webview_window("main") else {
+        return Err("there is no main window to report on".into())
+    };
+    Ok(format!(
+        "focused={} visible={} minimized={}",
+        w.is_focused().unwrap_or(false),
+        w.is_visible().unwrap_or(false),
+        w.is_minimized().unwrap_or(false),
+    ))
+}
+
 #[tauri::command]
 pub fn switch_session(state: tauri::State<'_, AppState>, id: i64) {
     state.host.send(HostCmd::SwitchSession { id });
@@ -965,7 +1152,13 @@ pub async fn clipboard_image() -> crate::clipboard::ClipProbe {
 pub struct RenderReport {
     pub titlebar: bool,
     pub sidebar: bool,
-    pub footer: bool,
+    /// The pinned identity row at the foot of the sidebar (`Settings`, then the mark, the name and the
+    /// three icons). This was `footer`, reporting the bottom toolbar; the toolbar was removed to give
+    /// the transcript and the sidebar its height back, and the signal the watchdog wants - the shell's
+    /// chrome rendered - moved with the controls. Defaulted so an older UI bundle still parses; a
+    /// bundle that cannot report it is a bundle this line cannot vouch for, which is what SUSPECT means.
+    #[serde(default)]
+    pub sidefoot: bool,
     pub stream_el: bool,
     /// True when the view is showing the draft/empty state. Reported because a
     /// hidden transcript is expected there, and a diagnostic that lies about it
@@ -975,6 +1168,11 @@ pub struct RenderReport {
     pub overlay_present: bool,
     pub text_len: usize,
     pub device_pixel_ratio: f64,
+    /// Which picture the opening screen loaded, or `none` when that screen is not on show.
+    /// An asset that is not in the installed bundle fails silently: no console line, no broken
+    /// icon, just a screen missing its one drawing. Defaulted so an older UI bundle still parses.
+    #[serde(default)]
+    pub cup: String,
 }
 
 #[tauri::command]
@@ -983,23 +1181,24 @@ pub fn render_report(state: tauri::State<'_, AppState>, report: RenderReport) {
     // healthy from every outside signal.
     state.rendered.store(true, std::sync::atomic::Ordering::SeqCst);
     let sane = report.titlebar
-        && report.footer
+        && report.sidefoot
         && !report.overlay_present
         && report.text_len > 0
         && report.body_bg != "rgba(0, 0, 0, 0)"
         && report.body_bg != "rgb(0, 0, 0)";
     eprintln!(
-        "[cwoffee] render {}: titlebar={} sidebar={} footer={} stream={} empty={} overlay={} text={} bg={} dpr={:.2}",
+        "[cwoffee] render {}: titlebar={} sidebar={} sidefoot={} stream={} empty={} overlay={} text={} bg={} dpr={:.2} cup={}",
         if sane { "OK" } else { "SUSPECT" },
         report.titlebar,
         report.sidebar,
-        report.footer,
+        report.sidefoot,
         report.stream_el,
         report.empty_mode,
         report.overlay_present,
         report.text_len,
         report.body_bg,
         report.device_pixel_ratio,
+        report.cup,
     );
 }
 

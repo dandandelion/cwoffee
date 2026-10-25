@@ -20,7 +20,7 @@ pub mod host;
 pub mod share;
 pub mod settings;
 pub mod store;
-pub mod titlegen;
+pub mod titling;
 pub mod telemetry;
 pub mod stream;
 pub mod tools;

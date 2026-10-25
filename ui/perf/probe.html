@@ -1,0 +1,23 @@
+<!doctype html>
+<!--
+  Transcript scroll probe. NOT part of the shipped bundle: this page lives under
+  ui/perf/ and is built by its own vite config (ui/perf/vite.config.ts) into a
+  scratch directory, so `ui/dist` never contains it.
+
+  Why it exists: the report was "when text accumulates, scrolling slows down by A LOT"
+  in the app, and a claim about scroll cost needs the real engine to be worth
+  anything. This page mounts the real transcript renderer (ui/src/lib/transcript.ts)
+  with the real stylesheet, paints a synthetic conversation of a chosen size, and
+  measures what scrolling it costs. scripts/webview-probe.py drives it inside the same
+  WebKitGTK build the desktop app links.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>cwoffee transcript scroll probe</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./probe.ts"></script>
+  </body>
+</html>

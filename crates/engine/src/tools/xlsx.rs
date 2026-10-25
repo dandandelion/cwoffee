@@ -80,7 +80,9 @@ impl Tool for WriteXlsxTool {
     /// already has is not, and outside the workspace needs the path named.
     fn risk_for(&self, args: &Value, ctx: &ToolCtx) -> CallRisk {
         let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let resolved = lexical_resolve(&ctx.workspace, raw);
+        // The same destination the write will use, so the card names the file it describes.
+        let dest = super::scratch::destination_for(raw, super::scratch::Place::of_write(args));
+        let resolved = lexical_resolve(&ctx.workspace, &dest);
         let ws = lexical_resolve(&ctx.workspace, ".");
         if resolved != ws && !resolved.starts_with(&ws) {
             return CallRisk {
@@ -100,6 +102,11 @@ impl Tool for WriteXlsxTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Workspace-relative .xlsx path" },
+                "place": {
+                    "type": "string",
+                    "enum": ["workspace", "attach"],
+                    "description": "\"workspace\" (default): the path as written. \"attach\": under `.cws/assistant_attachments/`, the only folder the transcript attaches from."
+                },
                 "sheets": {
                     "type": "array",
                     "description": "One entry per sheet",
@@ -134,7 +141,16 @@ impl Tool for WriteXlsxTool {
         let Some(raw) = args.get("path").and_then(|p| p.as_str()) else {
             return ToolResult::err("write_xlsx needs a `path` string");
         };
-        let path = match confine_permitted(&ctx.workspace, raw, &ctx.permits) {
+        let place = super::scratch::Place::of_write(&args);
+        let dest = super::scratch::destination_for(raw, place);
+        if matches!(place, super::scratch::Place::Attach) {
+            // The attachments folder lives under the scratch folder, whose `.gitignore`
+            // keeps it out of the person's `git status`. Create both.
+            if let Err(e) = super::scratch::ensure_scratch(&ctx.workspace) {
+                return ToolResult::err(e);
+            }
+        }
+        let path = match confine_permitted(&ctx.workspace, &dest, &ctx.permits) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
@@ -223,12 +239,19 @@ impl Tool for WriteXlsxTool {
         // save() is sync and does its own IO; the workspace is small so blocking
         // here is cheaper than pulling in a blocking-pool hop for one call.
         match wb.save(&path) {
-            Ok(_) => ToolResult::ok(format!(
-                "wrote {} ({})",
-                super::path::display_rel(&ctx.workspace, &path),
-                summary.join("; ")
-            ))
-            .with_file(super::OutputFile::from_path(&ctx.workspace, &path)),
+            Ok(_) => {
+                let rel = super::path::display_rel(&ctx.workspace, &path);
+                let mut res = ToolResult::ok(format!(
+                    "wrote {rel} ({})",
+                    summary.join("; ")
+                ))
+                .with_file(super::OutputFile::from_path(&ctx.workspace, &path));
+                if matches!(place, super::scratch::Place::Attach) {
+                    res.output.push('\n');
+                    res.output.push_str(&super::scratch::place_note(place, &rel));
+                }
+                res
+            }
             Err(e) => ToolResult::err(format!("cannot write {}: {e}", path.display())),
         }
     }
@@ -263,6 +286,30 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::tools::ExecChunk>();
         let r = WriteXlsxTool.run(args, &c, &tx).await;
         (r, ws)
+    }
+
+    /// A workbook is the most likely thing a person asks to be handed over, so the
+    /// attachments placement has to exist here too — otherwise `place: "attach"` would
+    /// work for a page and not for a spreadsheet, and the model would learn that the rule
+    /// is a suggestion.
+    #[tokio::test]
+    async fn a_workbook_can_be_placed_as_an_attachment() {
+        let (r, ws) = run(json!({
+            "path": "q2.xlsx",
+            "place": "attach",
+            "sheets": [{ "name": "Q2", "rows": [["a", 1], ["b", 2]] }]
+        }))
+        .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert!(
+            ws.join(".cws/assistant_attachments/q2.xlsx").is_file(),
+            "not in the attachments folder: {}",
+            r.output
+        );
+        assert!(!ws.join("q2.xlsx").exists(), "an attach must not also write where it was named");
+        assert_eq!(r.files[0].kind, super::super::FileKind::Attachment);
+        assert!(r.output.contains("assistant_attachments"), "placement not stated: {}", r.output);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[tokio::test]

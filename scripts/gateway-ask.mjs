@@ -46,6 +46,12 @@ const notes = []
 const questions = []
 const answersSent = []
 const kinds = {}
+// A turn stopped with a card open: the card has to close with the turn. `stopPhase` keeps
+// this client from answering, so the question stays outstanding when Stop is pressed.
+let stopPhase = false
+let stoppedQ = null
+const stopQs = []
+const expired = []
 let toolOut = ''
 let sid = 0
 let rpcId = 0
@@ -104,11 +110,18 @@ ws.addEventListener('message', (ev) => {
       const q = typeof p === 'object' ? p : {}
       questions.push(q)
       console.log(`  question event: id=${q.id} set=${JSON.stringify(q.set ?? null)} rec=${q.recommended} allow_custom=${q.allow_custom} multi=${q.multi} opts=${JSON.stringify((q.options ?? []).map((o) => o.label))}`)
+      if (stopPhase) {
+        // Recorded, not answered: this is the card Stop has to close.
+        stoppedQ = stoppedQ ?? q
+        stopQs.push(q)
+        return
+      }
       // Answer each question in turn: first pick for the first, second pick for the second,
       // which is what the scenario's `require` strings are written against.
-      // Which question of *this call* (calls come two at a time when the same prompt is
-      // asked twice, which is the point of the second half of this gate).
-      const which = (questions.length - 1) % 2
+      // Which pick of *this answer* — counted from the answers this client actually sent,
+      // not from the questions that arrived: a stopped turn leaves questions unanswered, and
+      // counting those would hand the next call the wrong half of the pair.
+      const which = answersSent.length % 2
       const label = q.options?.[which === 0 ? 0 : 1]?.label ?? ''
       if (!label) {
         fail.push(`question ${which + 1} arrived with no options to pick: ${JSON.stringify(q).slice(0, 200)}`)
@@ -119,6 +132,8 @@ ws.addEventListener('message', (ev) => {
       // A client that nests them gets an empty answer, and the tool then reports — correctly
       // — that nobody answered, which is a confusing way to debug your own client.
       rpc(ws, 'respond_question', { id: q.id, text: label, options: [which === 0 ? 0 : 1] })
+    } else if (kind === 'questionExpired' || kind === 'question_expired') {
+      expired.push({ id: typeof p === 'object' ? p?.id : p, why: p?.why })
     } else if (/toolExec/i.test(kind)) {
       const text = typeof p === 'string' ? p : JSON.stringify(p ?? '')
       if (text.length > toolOut.length) toolOut = text
@@ -144,6 +159,36 @@ if (sid && after1 > 0) {
   for (let i = 0; i < 90 && turnEnds() < after1 + 1; i++) await t(500)
 }
 console.log(`  second call: ${questions.length - before2} question event(s), set ${JSON.stringify(questions[before2]?.set ?? null)} (first call set was ${setA})`)
+
+// ---- a turn stopped with a card open has to close that card ----------------
+// A question is a parked turn now, not a failing one: nothing times out. The only event
+// that closes an unanswered card is the turn ending, and pressing Stop *is* that event.
+// A card left in "waiting for you" after a Stop offers a choice nothing will ever take,
+// and the conversation looks wedged from the user's side.
+const stopTurnEnds = turnEnds()
+const stopQBefore = questions.length
+const expBefore = expired.length
+stopPhase = true
+if (sid) rpc(ws, 'start_turn', { session: sid, text: 'Ask me two questions before writing the report, then write it.' })
+for (let i = 0; i < 40 && questions.length < stopQBefore + 1; i++) await t(500)
+if (stoppedQ) rpc(ws, 'cancel_turn', {})
+// The turn settling is part of the claim: a card can be closed while the session stays
+// busy, which is the same wedged conversation wearing a different hat.
+for (let i = 0; i < 60 && (expired.length < expBefore + 1 || turnEnds() < stopTurnEnds + 1); i++) await t(500)
+// Give any second dialog of that set (a set's questions are in flight together) a chance to
+// turn up and be recorded unanswered before the next call starts asking.
+await t(1500)
+stopPhase = false
+const stoppedSet = stoppedQ?.set?.id ?? null
+
+// ---- and the conversation still works afterwards ---------------------------
+// The stopped call held a card key in the bridge. If stopping did not release it, the next
+// ask_user call in the same conversation draws its questions onto the dead card.
+const recTurnEnds = turnEnds()
+const recQBefore = questions.length
+if (sid) rpc(ws, 'start_turn', { session: sid, text: 'Ask me two questions before writing the report, then write it.' })
+for (let i = 0; i < 90 && turnEnds() < recTurnEnds + 1; i++) await t(500)
+const recQ = questions.slice(recQBefore)
 ws.send(JSON.stringify({ id: 90, cmd: 'session_messages', args: { id: sid } }))
 await t(1500)
 
@@ -153,18 +198,25 @@ const stored = rows
   .join('\n')
 
 if (questions.length < 2) fail.push(`expected 2 questions, got ${questions.length}`)
-if (questions.length !== 4)
-  fail.push(`a second ask_user call in the same conversation produced ${questions.length - 2} question event(s); its card merged into the first one or never opened`)
+// The two answered calls this gate opens first are the pair the assertions below are
+// written against. The stopped turn and the one after it add their own question events,
+// and grading them with the pair's arithmetic would report a merged card that never merged.
+const paired = questions.slice(0, 4)
+if (paired.length !== 4)
+  fail.push(`two ask_user calls in the same conversation produced ${paired.length} question event(s), not 4; a card merged into another or never opened`)
 else {
-  const second = questions.slice(2)
+  const second = paired.slice(2)
   if (second[0].set?.id !== second[1].set?.id)
     fail.push(`the second call's two questions carry different set ids (${second[0].set?.id}, ${second[1].set?.id})`)
   if (second[0].set?.id === setA)
     fail.push(`the second call reused set id ${setA} — one conversation would show one card with four questions`)
 }
-const sets = questions.map((q) => q.set).filter(Boolean)
-if (sets.length !== questions.length)
-  fail.push(`every question of a set call should carry the marker; got ${sets.length}/${questions.length} set markers`)
+const sets = paired.map((q) => q.set).filter(Boolean)
+const allSets = questions.map((q) => q.set).filter(Boolean)
+if (allSets.length !== questions.length)
+  fail.push(`every question of a set call should carry the marker; got ${allSets.length}/${questions.length} set markers`)
+if (sets.length !== paired.length)
+  fail.push(`the two answered calls lost their set markers: ${sets.length}/${paired.length}`)
 else {
   // Grouping is per call: the two questions of one call share one id ("question 1 of 2" on
   // one card), and the two calls must not share an id with each other.
@@ -181,8 +233,8 @@ else if (!q1.options.some((o) => (o.detail ?? '').length > 0))
   fail.push(`the options lost the engine's one-line trade-offs: ${JSON.stringify(q1.options).slice(0, 200)}`)
 if (q1.recommended !== 0) fail.push(`the recommendation the model marked is missing: ${JSON.stringify(q1.recommended)}`)
 if (q1.allow_custom !== false) fail.push(`the model said allow_custom=false and the card offers free text anyway: ${JSON.stringify(q1).slice(0, 200)}`)
-if (answersSent.length !== questions.length)
-  fail.push(`${answersSent.length} answer(s) were sent back for ${questions.length} question(s)`)
+if (answersSent.length !== questions.length - stopQs.length)
+  fail.push(`${answersSent.length} answer(s) were sent back for ${questions.length - stopQs.length} question(s) that needed one (${stopQs.length} were left unanswered on purpose, to have something to stop)`)
 if (!turnDone) fail.push('the turn never settled')
 if (!toolOut.includes('User chose: 1: Engineers') || !toolOut.includes('User chose: 2: Two pages'))
   fail.push(`the picks never reached the tool's own words: ${JSON.stringify(toolOut).slice(0, 260)}`)
@@ -192,6 +244,21 @@ if (!stored.includes('Written, with those two settled.'))
 if (notes.some((n) => /ask_user|question payload|nobody|cannot show|did not answer/.test(String(n))))
   fail.push(`the round trip produced complaints: ${JSON.stringify(notes.filter((n) => /ask_user|question payload|nobody|cannot show|did not answer/.test(String(n)))).slice(0, 400)}`)
 
+// A stopped turn owes its card: the frame, and a session that is not stuck.
+if (!stoppedQ) fail.push('the stopped turn never asked a question, so Stop had no card to close')
+else if (!expired.slice(expBefore).some((e) => e.id === stoppedQ.id))
+  fail.push(`Stop was pressed with question ${stoppedQ.id} unanswered and no frame closed the card — it would sit in "waiting for you" with buttons nothing will take`)
+// The reason travels, because the sentence the card ends with is what the reader can act
+// on later. A stopped turn must not be reported as a clock running out or as the model
+// being told it got no answer: the reader stopped it, and the tool never ran.
+else if (expired.slice(expBefore).find((e) => e.id === stoppedQ.id)?.why !== 'turnStopped')
+  fail.push(`the card a Stop closed says ${JSON.stringify(expired.slice(expBefore).find((e) => e.id === stoppedQ.id))}; it has to say the turn was stopped`)
+if (turnEnds() < stopTurnEnds + 1) fail.push('the stopped turn never settled: the session stayed busy after Stop')
+if (recQ.length < 2)
+  fail.push(`the ask_user call after a stopped turn produced ${recQ.length} question event(s), not 2 — the stopped call kept its card`)
+else if (stoppedSet !== null && recQ[0].set?.id === stoppedSet)
+  fail.push(`the call after a stopped turn drew onto the stopped call's card (set id ${stoppedSet} reused, and its questions were never closed)`)
+
 ws.close()
 for (const k of kids) k.kill('SIGTERM')
 await t(400)
@@ -200,6 +267,7 @@ console.log(`ask round trip on the ${CORE} core: ${questions.length} question ev
 console.log(`  answered: ${answersSent.join(' | ')}`)
 console.log(`  tool said: ${JSON.stringify((toolOut.split('\n').pop() ?? '').slice(0, 90))}`)
 console.log(`  turn settled=${turnDone} rows=${rows.length} events=${JSON.stringify(kinds)}`)
+console.log(`  stopped turn: question ${stoppedQ?.id} of set ${stoppedSet}, closed by ${JSON.stringify(expired.slice(expBefore))}; the call after it asked ${recQ.length} question(s) on set ${JSON.stringify(recQ[0]?.set?.id ?? null)}`)
 if (fail.length) {
   for (const f of fail) console.log(`  FAIL ${f}`)
   console.log(`ASK GATE FAILED (${CORE})`)

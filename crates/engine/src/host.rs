@@ -63,10 +63,11 @@ pub struct HostConfig {
     pub env_override: Option<String>,
     /// How long an unanswered approval prompt waits before refusing.
     pub approval_timeout: std::time::Duration,
-    /// How long an `ask_user` card stays open. `question_timeout_secs` in
-    /// config.toml; three minutes is right for someone at the keyboard and wrong
-    /// for a question they have to take to someone else.
-    pub question_timeout: std::time::Duration,
+    /// How long an `ask_user` card stays open. `question_timeout_secs` in config.toml.
+    /// `None` — the default — puts no clock on it: the card is a **paused turn**, and it
+    /// stays open until a person answers or the turn is stopped. A three-minute default
+    /// answered questions on the user's behalf when the answer was not theirs to give.
+    pub question_timeout: Option<std::time::Duration>,
     /// Attachment guardrails. Enforced at the host boundary rather than in the
     /// UI, because the UI is not the only client and never will be again.
     pub max_attachments: usize,
@@ -109,7 +110,7 @@ impl HostConfig {
             context_budget: None,
             env_override: None,
             approval_timeout: std::time::Duration::from_secs(300),
-            question_timeout: std::time::Duration::from_secs(180),
+            question_timeout: None,
             max_attachments: DEFAULT_MAX_ATTACHMENTS,
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             sampling: crate::provider::Sampling::default(),
@@ -313,10 +314,76 @@ async fn apply_context_budget(
 
 /// Write one top-level setting to the config file the shells pointed us at.
 ///
+/// Public because a second core has the same obligation: the pi bridge changes the same settings
+/// from the same screens, and a file that only one core writes is two answers to one question.
+///
 /// Written *before* the live value is announced, for the same reason the search
 /// panel does it that way: if the running app and `config.toml` disagree, then
 /// one of them is lying, and the one the user reads is the file.
-fn persist_setting(path: &Option<std::path::PathBuf>, key: &str, toml_value: &str) {
+/// The thinking levels this model can answer for, spelled in the words the dial uses.
+///
+/// Three different claims, and the function is written so they cannot be confused:
+/// * a probed model reports exactly the efforts its endpoint named - the strongest claim, and the
+///   only one that came from this machine's server;
+/// * an unprobed model gets its **dialect's documented** efforts, which is what the Rust provider
+///   would send anyway. Reporting nothing here would imply "this model cannot think", which is a
+///   different claim and a false one;
+/// * a level the endpoint never named is left out, because a dial step that the server folds or
+///   rejects is the thing that made a reader believe the knob was dead.
+///
+/// `high` and `xhigh` fold onto one template value for a llama.cpp-shaped server - the same folding
+/// `llama_effort` applies when building the request - so an endpoint that accepts `xhigh` can be set
+/// from either dial step. An OpenAI-shaped endpoint has both as its own values, so no folding there.
+fn dial_levels(cfg_path: Option<&std::path::Path>, model: &str) -> Vec<String> {
+    const TEMPLATE: [&str; 3] = ["low", "medium", "xhigh"];
+    const OPENAI: [&str; 3] = ["low", "medium", "high"];
+    let mut cfg_kind = String::new();
+    let mut efforts: Vec<String> = Vec::new();
+    if let Some(p) = cfg_path {
+        if let Ok((cfg, _)) = Config::load(Some(p)) {
+            cfg_kind = cfg.provider.kind.clone();
+            efforts = cfg
+                .models
+                .get(model)
+                .map(|r| r.efforts.clone())
+                .unwrap_or_default();
+        }
+    }
+    let openai = cfg_kind.eq_ignore_ascii_case("openai");
+    if efforts.is_empty() {
+        efforts = if openai {
+            OPENAI.iter().map(|s| s.to_string()).collect()
+        } else {
+            TEMPLATE.iter().map(|s| s.to_string()).collect()
+        };
+    }
+    let mut out = vec!["off".to_string()];
+    for e in efforts.iter().map(|e| e.as_str()) {
+        let add: &[&str] = match e {
+            "low" => &["low"],
+            "medium" => &["medium"],
+            "high" => &["high"],
+            // A template that takes xhigh is reached by both top dial steps; an OpenAI-shaped
+            // endpoint spells them apart.
+            "xhigh" => {
+                if openai {
+                    &["xhigh"]
+                } else {
+                    &["high", "xhigh"]
+                }
+            }
+            _ => &[],
+        };
+        for w in add {
+            if !out.iter().any(|have| have == w) {
+                out.push((*w).to_string());
+            }
+        }
+    }
+    out
+}
+
+pub fn persist_setting(path: &Option<std::path::PathBuf>, key: &str, toml_value: &str) {
     let Some(p) = path.as_ref() else { return };
     // `model` belongs to `[provider]`; everything else here is top-level. Writing a
     // bare `model` at the top level - which is what this used to do - produced a file
@@ -522,7 +589,16 @@ pub enum HostCmd {
         session: Option<i64>,
     },
     SetMode { mode: ApprovalMode },
-    SetReasoning { reasoning: Reasoning },
+    /// Set the thinking effort.
+    ///
+    /// `persist` says which dial was moved, and the two are different asks:
+    ///
+    /// * `true` - the settings screen. This is the effort a *new* conversation starts at, and it
+    ///   goes in the config file, where a phone and the desktop read the same answer.
+    /// * `false` - the composer. This is an override for **this conversation**, kept for the rest of
+    ///   it, and it must not move the default. Writing config from here is what made the dial feel
+    ///   broken: the next conversation silently inherited a choice made for one chat.
+    SetReasoning { reasoning: Reasoning, persist: bool },
     /// Pin the context ceiling, or `None` to derive it from what the endpoint states
     /// about the model's window. The value here is already read back from the config
     /// file: the file is the authority, so a phone and the desktop cannot end up with
@@ -559,6 +635,27 @@ pub struct HostState {
     /// switch the host did not make.
     pub persona: Persona,
     pub reasoning: Reasoning,
+    /// The effort new conversations start at - what the settings screen sets. `reasoning` is what
+    /// *this* conversation is using. The two part company the moment the composer dial moves, and a
+    /// settings screen that displayed the second would appear to change the default every time
+    /// somebody changed their mind for one chat.
+    #[serde(default)]
+    pub reasoning_default: Reasoning,
+    /// Whether `reasoning` is a per-conversation override rather than the default. The composer and
+    /// the settings screen are the same control, so the only honest label for it is one that says
+    /// which of the two is currently in force.
+    #[serde(default)]
+    pub reasoning_overridden: bool,
+    /// The thinking levels this model can answer for, as the host learned them: the endpoint's own
+    /// probe on the Rust core, pi's model entry on the pi core.
+    ///
+    /// This exists because the dial used to move and the wire to say nothing: pi clamps a request to
+    /// what the model entry declares, and an entry that declares no thinking answers only `off`. A
+    /// host that offers levels the model cannot run is showing a control with no effect, so the
+    /// offered list belongs on the state rather than being inferred from the settings screen. Empty
+    /// means nobody looked - which is not the same claim as "the model can do nothing".
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
     pub busy: bool,
     /// Turns completed so far. A UI uses this to know a turn finished without
     /// inferring it from the event stream; it also makes tests deterministic,
@@ -585,8 +682,25 @@ pub struct HostState {
     pub approval_timeout_secs: u64,
     /// Seconds an unanswered `ask_user` card stays open, same reason as the approval
     /// countdown: a turn parked on a person and a turn still working look identical.
+    /// `None` means there is no clock on it — the turn is paused until somebody answers.
     #[serde(default)]
-    pub question_timeout_secs: u64,
+    pub question_timeout_secs: Option<u64>,
+    /// What the in-flight turn has said so far but not yet closed — answer text and
+    /// reasoning, each empty until there is any.
+    ///
+    /// This exists for one situation: a browser page pointed at the gateway that is
+    /// reloaded while an answer is arriving. The stored rows it gets back stop at the last
+    /// closed message, so the answer it paints begins at whatever delta arrives after the
+    /// reload — the top of the message is silently missing, and it only repairs itself when
+    /// the turn ends and the whole row lands. A client that has this paints the part that
+    /// already happened instead.
+    #[serde(default)]
+    pub open_text: String,
+    #[serde(default)]
+    pub open_reasoning: String,
+    // (The pi core publishes these as the run streams. The Rust core leaves them empty —
+    //  its agent loop holds the streaming text in a place that does not reach `state()`, and
+    //  the reloaded page falls back to starting where it connected, exactly as before.)
     /// Why the last workspace change was refused, and a counter so a caller that
     /// polls `state()` can tell a fresh refusal from an old one.
     ///
@@ -642,19 +756,13 @@ impl SessionHost {
         // the model asking for input, and conflating them means a "yes" answers
         // both.
         let (ask_tx, ask_rx) = mpsc::unbounded_channel::<crate::tools::ask::QuestionRx>();
-        // The local title helper, if the config asks for one. Read from the app config
-        // here rather than threaded through HostConfig: HostConfig describes the *turn*
-        // (model, mode, workspace), and whether a subprocess may load a 870 MB model on
-        // this machine is a property of the installation.
-        let appcfg = crate::config::Config::load(None).map(|(c, _)| c).unwrap_or_default();
-        let titlegen = crate::titlegen::TitleGen::new(appcfg.titlegen_cfg());
-        if titlegen.cfg.enabled && !titlegen.cfg.usable() {
-            let st = titlegen.cfg.status(None);
-            eprintln!(
-                "[cwoffee] titlegen is on but cannot run: script {} found={} python {} found={} weights={}; conversations keep their automatic titles",
-                st.script, st.script_found, st.python, st.python_found, st.weights_cached
-            );
-        }
+        // One title request at a time, process-wide. A conversation names itself
+        // through the same endpoint it is about to answer (`crate::titling`): there
+        // is no second model, no weights to cache, no helper script, and nothing for
+        // a person to configure or apologize for. The slot is here because the ask
+        // stalls a first answer, and two conversations should not both be stalled
+        // while one of them waits.
+        let title_slot = std::sync::Arc::new(crate::titling::TitleSlot::default());
         // The folder you start in is a workspace too. Registering it means the
         // sidebar shows where a brand-new session would write, instead of an
         // empty list until the first message happens to create a row.
@@ -666,12 +774,20 @@ impl SessionHost {
             mode: cfg.mode,
             persona: cfg.persona,
             reasoning: cfg.reasoning,
+            reasoning_default: cfg.reasoning,
+            reasoning_overridden: false,
+            reasoning_levels: dial_levels(cfg.cfg_path.as_deref(), &cfg.model),
             busy: false,
             turns: 0,
             context_tokens: 0,
             compactions: 0,
             approval_timeout_secs: cfg.approval_timeout.as_secs(),
-            question_timeout_secs: cfg.question_timeout.as_secs(),
+            question_timeout_secs: cfg.question_timeout.map(|d| d.as_secs()),
+            // The Rust core's agent loop keeps streaming text somewhere that does not reach
+            // `state()`, so this core publishes nothing here: a gateway client that reloads
+            // mid-answer falls back to starting where it connected, as it always did.
+            open_text: String::new(),
+            open_reasoning: String::new(),
             workspace_refusal: None,
             refusal_seq: 0,
             context_budget: cfg.context_budget.unwrap_or(FALLBACK_BUDGET),
@@ -711,7 +827,7 @@ impl SessionHost {
             workspace: cfg.workspace.clone(),
             max_output_bytes: 24 * 1024,
             ask: Some(ask_tx),
-            question_timeout: Some(cfg.question_timeout),
+            question_timeout: cfg.question_timeout,
             events: None,
             // The store this host already owns, handed to the one tool that reads memory
             // instead of files. Which conversation is asking is *not* set here: a host outlives
@@ -765,6 +881,55 @@ impl SessionHost {
             // into a sidebar full of identical blanks. A session row now appears
             // when the first message is sent.
             let mut session_id: i64 = 0;
+            // The thinking effort each conversation is using, and the effort a new one starts at.
+            //
+            // Two dials in this app share one control, and they ask for different things: the
+            // settings screen sets the effort a *new* conversation starts at (and that goes in the
+            // config file, where every client reads the same answer), while the composer overrides
+            // it for *this* conversation. The override has to be remembered per row, because a
+            // conversation's identity outlives the prompt that made it: the row is created at the
+            // first send, so an effort chosen before anything was typed would otherwise be thrown
+            // away at exactly the moment it should have been applied. That was the bug - pick a
+            // level in the composer of a new chat, press send, and the level went back to the
+            // default, because the conversation did not exist yet.
+            let mut row_thinking: std::collections::HashMap<i64, Reasoning> = Default::default();
+            let mut draft_thinking: Option<Reasoning> = None;
+            let mut default_reasoning = cfg.reasoning;
+
+            /// Point the agent at the effort that belongs to `id`, and say on the reported state
+            /// whether that is an override or the default. Called on every conversation change,
+            /// including the one that happens implicitly when a draft's first message creates its
+            /// row - which is where the override used to be lost.
+            macro_rules! apply_thinking {
+                ($target:expr) => {{
+                    let id = $target;
+                    if id != 0 {
+                        // A draft's dial follows the draft into the conversation it becomes.
+                        if let Some(t) = draft_thinking {
+                            row_thinking.entry(id).or_insert(t);
+                            draft_thinking = None;
+                        }
+                    }
+                    let chosen = if id == 0 {
+                        draft_thinking.unwrap_or(default_reasoning)
+                    } else {
+                        row_thinking.get(&id).copied().unwrap_or(default_reasoning)
+                    };
+                    let overridden = if id == 0 {
+                        draft_thinking.is_some()
+                    } else {
+                        row_thinking.contains_key(&id)
+                    };
+                    agent.set_reasoning(chosen);
+                    {
+                        let mut st = state_bg.lock().unwrap();
+                        st.reasoning = chosen;
+                        st.reasoning_overridden = overridden;
+                        st.reasoning_default = default_reasoning;
+                    }
+                    chosen
+                }};
+            }
             // Sessions already told about a resumed history. Saying it once per
             // session per process is enough; the user re-clicking a row in the
             // sidebar does not make the cache warmer.
@@ -813,6 +978,8 @@ impl SessionHost {
                             // the reported state, or the resumed session's new
                             // messages land in whichever session was active.
                             session_id = id;
+                            // Whichever conversation this is, its thinking effort comes with it.
+                            apply_thinking!(id);
                             // A session lives where its row says it lives. The
                             // sidebar groups sessions by folder, so the tools
                             // have to follow when one is clicked - and a folder
@@ -981,6 +1148,7 @@ impl SessionHost {
                         session_id = 0;
                         persisted_next = 0;
                         agent.replace_prompt(PromptBuilder::new());
+                        apply_thinking!(0);
                         // Clearing the transcript must not reset the sizing: the
                         // budget belongs to the model, not to the conversation.
                         {
@@ -1067,7 +1235,14 @@ impl SessionHost {
                         } else {
                             agent.set_model(model.clone());
                             let model_now = agent.model();
-                            state_bg.lock().unwrap().model = model;
+                            {
+                                let mut st = state_bg.lock().unwrap();
+                                st.model = model;
+                                // Levels belong to the model. Carrying the previous model's list
+                                // would keep a dial offering levels this one clamps to off, which
+                                // is the failure the list exists to catch.
+                                st.reasoning_levels = dial_levels(cfg.cfg_path.as_deref(), &model_now);
+                            }
                             if persist {
                                 persist_setting(&cfg.cfg_path, "model", &Config::toml_str(&model_now));
                             }
@@ -1105,14 +1280,34 @@ impl SessionHost {
                         persist_setting(&cfg.cfg_path, "mode", &Config::toml_str(mode.as_str()));
                     }
 
-                    HostCmd::SetReasoning { reasoning } => {
-                        agent.set_reasoning(reasoning);
-                        state_bg.lock().unwrap().reasoning = reasoning;
-                        let word = serde_json::to_value(reasoning)
-                            .ok()
-                            .and_then(|v| v.as_str().map(String::from))
-                            .unwrap_or_else(|| "low".into());
-                        persist_setting(&cfg.cfg_path, "reasoning", &Config::toml_str(&word));
+                    HostCmd::SetReasoning { reasoning, persist } => {
+                        if persist {
+                            // The settings screen: the effort new conversations start at. It goes
+                            // in the config file, and it also moves a conversation that has never
+                            // moved its own dial - a default that only applied to conversations you
+                            // had not started yet would read as the setting not taking effect.
+                            default_reasoning = reasoning;
+                            let word = serde_json::to_value(reasoning)
+                                .ok()
+                                .and_then(|v| v.as_str().map(String::from))
+                                .unwrap_or_else(|| "low".into());
+                            persist_setting(&cfg.cfg_path, "reasoning", &Config::toml_str(&word));
+                            apply_thinking!(session_id);
+                        } else {
+                            // The composer: this conversation, for the rest of it, and nothing else.
+                            // The config file is deliberately not written - a level chosen for one
+                            // chat must not become the level every future chat starts at.
+                            if session_id == 0 {
+                                draft_thinking = Some(reasoning);
+                            } else {
+                                row_thinking.insert(session_id, reasoning);
+                            }
+                            agent.set_reasoning(reasoning);
+                            let mut st = state_bg.lock().unwrap();
+                            st.reasoning = reasoning;
+                            st.reasoning_overridden = true;
+                            st.reasoning_default = default_reasoning;
+                        }
                     }
 
                     HostCmd::NewSession { title } => {
@@ -1126,6 +1321,9 @@ impl SessionHost {
                             Ok(id) => {
                                 session_id = id;
                                 persisted_next = 0;
+                                // A new conversation starts at the default, or at the dial this draft
+                                // had already moved to - not at whatever the last chat was using.
+                                apply_thinking!(id);
                                 *agent.prompt_mut() = {
                                     let mut p = PromptBuilder::new();
                                     // The budget resolved for the loaded model, not
@@ -1190,6 +1388,7 @@ impl SessionHost {
                             session_id = 0;
                             persisted_next = 0;
                             agent.replace_prompt(PromptBuilder::new());
+                            apply_thinking!(0);
                                                 {
                                 let mut s = state_bg.lock().unwrap();
                                 s.session_id = 0;
@@ -1214,15 +1413,36 @@ impl SessionHost {
                                 }
                             }
                         }
+                        // The conversation can stop existing between the moment the
+                        // reader looked at it and the moment their message lands: the
+                        // desktop deletes a conversation by moving the host off the row
+                        // first, but that move is a *queued command*, and a send that
+                        // raced it would run a whole turn into an id nothing lists any
+                        // more — an answer nobody can open again. Ask where we actually
+                        // are, and if the answer is "nowhere", start a conversation
+                        // rather than write into a grave.
+                        if session_id != 0 && store.session(session_id).ok().flatten().is_none() {
+                            let _ = ev_tx.send(EngineEvent::Note {
+                                session: Some(session_id),
+                                message: "that conversation was deleted while your message was on its way. \
+                                          Nothing was lost from your side: the reply starts a new conversation."
+                                    .to_string(),
+                            });
+                            session_id = 0;
+                        }
                         if session_id == 0 {
                             let ws = agent.workspace().display().to_string();
                             let _ = store.add_workspace(&ws);
                             let model = agent.model();
-                            match store.create_session("new session", &ws, &model) {
+                            match store.create_session("New Session", &ws, &model) {
                                 Ok(id) => {
                                     session_id = id;
                                     persisted_next = 0;
                                     state_bg.lock().unwrap().session_id = id;
+                                    // The row exists now. Whatever effort was chosen while this was
+                                    // still a draft belongs to it, and it has to be re-applied here
+                                    // rather than trusted to have stuck from before.
+                                    apply_thinking!(id);
                                 }
                                 Err(e) => {
                                     let _ = ev_tx.send(EngineEvent::Error {
@@ -1263,6 +1483,72 @@ impl SessionHost {
                                 cfg.cfg_path.as_deref(),
                             ).await;
                         }
+                        // --- name the conversation before answering it -------------------
+                        // It arrived titled "New Session" (or it is an older conversation
+                        // that was never named). Ask this same endpoint, in its own context,
+                        // for a name, and stream it out as it arrives so the sidebar row
+                        // types it. The answer waits for that on purpose; `crate::titling`
+                        // carries the reasoning and the eight-second bound. A miss is not a
+                        // failure the reader pays for: the row falls back to the opening
+                        // line, because a sidebar of identical rows says nothing.
+                        if title_slot.claim() {
+                            let row = store.session(session_id).ok().flatten();
+                            let title_now = row.as_ref().map(|r| r.title.clone()).unwrap_or_default();
+                            let first_user = {
+                                let stored = store.history(session_id).unwrap_or_default();
+                                stored
+                                    .into_iter()
+                                    .find(|m| matches!(m.role, Role::User))
+                                    .map(|m| m.content)
+                                    .unwrap_or_else(|| text.clone())
+                            };
+                            if crate::titling::still_untitled(&title_now, &first_user) {
+                                let ev2 = ev_tx.clone();
+                                let sid = session_id;
+                                let outcome = crate::titling::ask_title(
+                                    agent.provider(),
+                                    &agent.model(),
+                                    &first_user,
+                                    |t, done| {
+                                        let _ = ev2.send(EngineEvent::TitleDelta {
+                                            session_id: sid,
+                                            text: t.to_string(),
+                                            done,
+                                        });
+                                    },
+                                )
+                                .await;
+                                match outcome {
+                                    crate::titling::Outcome::Named(name) => {
+                                        if let Err(e) = store.rename_session(session_id, &name) {
+                                            eprintln!("[cwoffee/titling] named it {name:?} but the rename failed: {e}");
+                                        } else {
+                                            let _ = ev_tx.send(EngineEvent::SessionChanged {
+                                                session_id,
+                                                title: name,
+                                            });
+                                        }
+                                    }
+                                    crate::titling::Outcome::FellBack(why) => {
+                                        let fb = crate::store::derive_title(&first_user);
+                                        if !fb.is_empty() {
+                                            if let Err(e) = store.rename_session(session_id, &fb) {
+                                                eprintln!("[cwoffee/titling] fallback rename failed: {e}");
+                                            } else {
+                                                let _ = ev_tx.send(EngineEvent::SessionChanged {
+                                                    session_id,
+                                                    title: fb,
+                                                });
+                                            }
+                                        }
+                                        eprintln!("[cwoffee/titling] session {session_id} keeps a fallback name: {why}");
+                                    }
+                                    crate::titling::Outcome::NotEligible => {}
+                                }
+                            }
+                            title_slot.release();
+                        }
+
                         let tel: TurnTelemetry =
                             agent.run_turn(&text, attachments, &ev_tx, session_id).await;
 
@@ -1307,12 +1593,11 @@ impl SessionHost {
                             }
                         }
 
-                        // A conversation's name. The store already gave it an honest one —
-                        // the opening line, cut short — the moment that line was stored;
-                        // this only ever improves on a name nobody chose, and it runs
-                        // after the turn so the conversation never waits for its title.
-                        let dynstore: Arc<dyn crate::store::StoreOps> = store.clone();
-                        crate::titlegen::maybe_name(&titlegen, &dynstore, &ev_tx, session_id);
+                        // Naming happened before the answer, not after it: see the title
+                        // pass above and `crate::titling`. Nothing runs here — a
+                        // conversation that reaches its second turn with a name the reader
+                        // did not choose has already been offered one, and the rule that a
+                        // name a person typed is never overwritten still holds.
 
                         if tel.prompt_tokens > 0 {
                             let _ = store.record_turn(session_id, &tel);
@@ -1806,6 +2091,18 @@ mod question_wire_tests {
 /// Build the volatile environment block. Kept out of the system prompt on
 /// purpose: putting a date there changes the leading bytes of every prompt and
 /// guarantees a prefix-cache miss on every single turn.
+/// What the model is told about where it is working.
+///
+/// The `workspace:` line is the answer the model gives when somebody asks it "where are you
+/// working?", so it has to be phrased the way the app phrases it. A conversation parked in
+/// the system's temp folder has no workspace in any sense the user would recognise: nobody
+/// chose it, nothing of theirs is in it, and it is gone on the next reboot. Reciting
+/// `/tmp/...` made it sound as if a folder had been picked, which is how the report reads:
+/// "the backend workspace is /tmp; the UI should say No workspace and the model should say
+/// none." So the path is not printed for those conversations - the tools resolve relative
+/// paths against it themselves, so naming it only invited the model to quote it back - and
+/// what is true instead is said in words: no workspace, a scratch folder that is not the
+/// user's, writable.
 pub fn default_env_block(workspace: &std::path::Path, os: &str, egress: crate::tools::net::NetMode) -> String {
     // One line, three truths. It said "no network" whatever the config said, which
     // is a second place (after the system prompt) where the model was told it was
@@ -1815,11 +2112,19 @@ pub fn default_env_block(workspace: &std::path::Path, os: &str, egress: crate::t
         crate::tools::net::NetMode::Proxy => "network via an allowlist proxy",
         crate::tools::net::NetMode::Open => "network open",
     };
+    let scratch = is_temp_root(&workspace.to_string_lossy());
+    let (ws_line, writable) = if scratch {
+        (
+            "workspace: none (this conversation has no workspace: the tools work in a scratch folder that the user did not choose and does not keep)".to_string(),
+            "only the scratch folder",
+        )
+    } else {
+        (format!("workspace: {}", workspace.display()), "only the workspace")
+    };
     format!(
-        "<env>\nos: {os}\nworkspace: {}\nshell: sh\n\
-         commands run sandboxed: {egress_line}, only the workspace is writable\n\
+        "<env>\nos: {os}\n{ws_line}\nshell: sh\n\
+         commands run sandboxed: {egress_line}, {writable} is writable\n\
          </env>",
-        workspace.display()
     )
 }
 
@@ -1904,6 +2209,59 @@ pub fn check_attachments(atts: &[crate::provider::Attachment], limits: Attachmen
 
 #[cfg(test)]
 mod tests {
+    /// The dial's steps have to be the levels this model answers for.
+    ///
+    /// Three claims, deliberately kept apart here: what this endpoint was **probed** to accept, what
+    /// the **dialect** documents, and what a dial may therefore honestly offer. The bug this pins is
+    /// a UI offering steps a model cannot run - a control that moves and a wire that says nothing.
+    #[test]
+    fn the_levels_offered_are_the_levels_this_model_answers_for() {
+        let dir = std::env::temp_dir().join(format!("cw-dial-levels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Probed: this endpoint named two efforts, so only those two are on the dial. "high" is
+        // absent because nothing here said the server takes it.
+        crate::config::set_model_row_in(
+            &path,
+            "probed/two",
+            &crate::config::ModelRow {
+                efforts: vec!["low".into(), "medium".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dial_levels(Some(&path), "probed/two"), ["off", "low", "medium"]);
+
+        // Not probed: the dialect's documented values. An unprobed model is not a model that cannot
+        // think, and reporting nothing would say exactly that.
+        let all = dial_levels(Some(&path), "never/probed");
+        assert_eq!(all, ["off", "low", "medium", "high", "xhigh"], "a llama.cpp-shaped dialect by default");
+
+        // The fold is the template's, not a universal: an OpenAI-shaped endpoint spells high and
+        // xhigh apart, so an endpoint that named only xhigh is reachable by the top step alone.
+        crate::config::set_model_row_in(
+            &path,
+            "oa/xhigh",
+            &crate::config::ModelRow {
+                efforts: vec!["low".into(), "xhigh".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::config::Config::set_provider_keys(&path, &[("kind", "\"openai\"")]).unwrap();
+        assert_eq!(dial_levels(Some(&path), "oa/xhigh"), ["off", "low", "xhigh"]);
+        // And the same file read for a model nobody probed gives the OpenAI dialect's documented
+        // values, which do not include xhigh.
+        assert_eq!(dial_levels(Some(&path), "oa/never-probed"), ["off", "low", "medium", "high"]);
+
+        // A model nobody has any information about still gets the honest answer: off is always
+        // available, and the list is never empty.
+        assert!(!dial_levels(None, "nope").is_empty(), "no config file is not the same as no thinking");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The window the person typed beats the window the endpoint claims, and only when there
     /// is one. A default that quietly preferred the endpoint would make the setting in the
     /// model screen decorative.
@@ -1962,6 +2320,29 @@ mod tests {
             req: &crate::provider::ChatRequest,
             sink: &crate::provider::DeltaSink,
         ) -> Result<(), ProviderError> {
+            // A conversation names itself before its first answer (`crate::titling`).
+            // That ask belongs to no conversation, so here it is not drawn from
+            // `replies`, not counted in `calls`, and not recorded in `seen_wire`: a
+            // scripted conversation must not have to budget a round for its own name,
+            // and a test that audits what the conversation sent must not find the title
+            // prompt in the audit. It gets a name, and the fixture moves on.
+            if req.messages.len() == 1
+                && req.messages[0].role == crate::provider::Role::User
+                && req.messages[0].content.starts_with(crate::titling::TITLE_ASK)
+            {
+                // A fixture that wants to see the fallback path says so in its own
+                // first message; the endpoint then answers the ask with nothing.
+                if req.messages[0].content.contains("no title please") {
+                    sink.send(Delta::Done(FinishReason::Stop))
+                        .map_err(|_| ProviderError::Cancelled)?;
+                    return Ok(());
+                }
+                sink.send(Delta::Text("a scripted name".into()))
+                    .map_err(|_| ProviderError::Cancelled)?;
+                sink.send(Delta::Done(FinishReason::Stop))
+                    .map_err(|_| ProviderError::Cancelled)?;
+                return Ok(());
+            }
             let seen = req
                 .messages
                 .iter()
@@ -2406,7 +2787,7 @@ mod tests {
             cfg,
         );
         ready(&h).await;
-        h.send(HostCmd::SetReasoning { reasoning: Reasoning::High });
+        h.send(HostCmd::SetReasoning { reasoning: Reasoning::High, persist: true });
         h.send(HostCmd::SetModel { model: "picked-model".into(), persist: true });
 
         let mut seen = String::new();
@@ -2428,6 +2809,99 @@ mod tests {
         assert_eq!(parsed.reasoning_checked().unwrap(), Some(Reasoning::High), "{seen}");
         assert_eq!(parsed.provider.model, "picked-model", "{seen}");
         assert_eq!(h.state().reasoning, Reasoning::High);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The thinking level, scoped the way the report asks for it: the settings screen owns a
+    /// default, a new conversation starts at that default, and a composer pick overrides it for
+    /// that conversation alone - for the whole conversation, until it is moved again.
+    ///
+    /// The complaint: "when I try to pick another thinking level in a new session's composer, after
+    /// I send the message, it uses the default again instead of my pick". The moment is not a
+    /// coincidence. On both cores the conversation's row - and on the pi core its pi thread - is
+    /// created by the *first send*, and a fresh pi thread seeds itself from pi's own default. The
+    /// level had been applied to a session that the send then replaced. So the assertion that
+    /// matters is the one taken after a send, and the one after that.
+    #[tokio::test]
+    async fn a_composers_thinking_pick_outlives_the_send_that_creates_the_conversation() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_think_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "reasoning = \"low\"\n\n[provider]\nbase_url = \"http://127.0.0.1:8090/v1\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let mut cfg = HostConfig::new("m", dir.join("ws"));
+        cfg.cfg_path = Some(path.clone());
+        // What a shell puts in this field is the value it read out of the file, so the file and the
+        // field agreeing is part of the premise, not a convenience.
+        cfg.reasoning = Reasoning::Low;
+        let h = SessionHost::spawn(
+            Arc::new(Scripted {
+                replies: std::sync::Mutex::new(vec!["ok".into(), "ok".into()]),
+                window: None,
+                window_from_call: 0,
+                asks: std::sync::atomic::AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                seen_attachments: Arc::new(AtomicUsize::new(0)),
+                seen_wire: Default::default(),
+            }),
+            Registry::new(),
+            Arc::new(Store::in_memory().unwrap()),
+            cfg,
+        );
+        ready(&h).await;
+
+        // 1. a conversation nobody touched starts at the default and claims no override.
+        assert_eq!(h.state().reasoning, Reasoning::Low, "the settings default did not reach the row");
+        assert_eq!(h.state().reasoning_default, Reasoning::Low);
+        assert!(!h.state().reasoning_overridden, "an untouched conversation claims its own override");
+
+        // 2. the composer's dial, moved while the conversation is still a draft (session 0), which
+        //    is exactly when a person reaches for it.
+        h.send(HostCmd::SetReasoning { reasoning: Reasoning::XHigh, persist: false });
+        wait_for("the composer's pick to land".into(), || h.state().reasoning == Reasoning::XHigh).await;
+        assert!(h.state().reasoning_overridden, "a composer pick is an override, not a new default");
+        assert_eq!(h.state().reasoning_default, Reasoning::Low, "the composer pick moved the default");
+
+        // 3. and it must not write the settings file. This is the other half of the same bug: if a
+        //    per-chat dial moved the default, one experiment in one chat would quietly change every
+        //    conversation started afterwards.
+        let file = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(file.contains("reasoning = \"low\""), "the file lost the default: {file}");
+        assert!(!file.to_lowercase().contains("xhigh"), "a composer pick was persisted: {file}");
+
+        // 4. send: the step that used to undo the dial, because it is where a draft becomes a row.
+        h.submit("first");
+        turns_done(&h, 1).await;
+        assert_eq!(
+            h.state().reasoning,
+            Reasoning::XHigh,
+            "the send reverted the pick to the default - this is the reported bug"
+        );
+        assert!(h.state().reasoning_overridden, "after the send the row no longer reports its own override");
+        assert_eq!(h.state().reasoning_default, Reasoning::Low, "after the send the default reads as the pick");
+        let file = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(file.contains("reasoning = \"low\""), "sending persisted a per-chat pick: {file}");
+
+        // 5. a second turn in the same conversation keeps it: the override is for the conversation,
+        //    not for the one message that happened to be typed while it was set.
+        h.submit("second");
+        turns_done(&h, 2).await;
+        assert_eq!(h.state().reasoning, Reasoning::XHigh, "the pick did not last the whole conversation");
+
+        // 6. a different conversation is untouched by all of it. `turns` counts every turn the host
+        //    has ever run, so it is not the signal for "the new row is live"; `session_id` is.
+        h.send(HostCmd::NewSession { title: "elsewhere".into() });
+        wait_for(
+            "a new conversation starting at the default".into(),
+            || h.state().session_id != 0 && h.state().reasoning == Reasoning::Low,
+        )
+        .await;
+        assert_eq!(h.state().reasoning, Reasoning::Low, "one chat's pick travelled to the next chat");
+        assert!(!h.state().reasoning_overridden, "the next chat inherited the previous chat's override");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3108,6 +3582,112 @@ mod tests {
         assert_eq!(store.session_totals(sid).unwrap().turns, 1);
     }
 
+    /// A conversation names itself before it answers, and the name never enters the
+    /// conversation.
+    ///
+    /// Three claims, all of them user-visible: the row starts as the placeholder; the
+    /// model's name arrives *before* the first answer starts, which is the stall the
+    /// reader asked for and the reason the sidebar is not sitting on "New Session"
+    /// while an answer scrolls past; and the title request lives in its own context,
+    /// so the conversation's own history has no trace of it.
+    #[tokio::test]
+    async fn a_new_conversation_is_named_before_it_is_answered() {
+        let (mut h, store) = host(vec!["the answer arrives here".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+        h.submit("why is my cashflow sheet off by 300 dollars");
+        turns_done(&h, 1).await;
+
+        let sid = h.state().session_id;
+        let row = store.session(sid).unwrap().expect("the conversation exists");
+        assert_eq!(row.title, "a scripted name", "the titler did not name the conversation");
+
+        let evs = drain_events(&mut ev).await;
+        let named = evs
+            .iter()
+            .position(|e| matches!(e, EngineEvent::TitleDelta { text, .. } if text == "a scripted name"));
+        let answered = evs.iter().position(|e| matches!(e, EngineEvent::TurnStart { .. }));
+        assert!(named.is_some(), "no TitleDelta reached the front end: {} events", evs.len());
+        assert!(answered.is_some(), "the turn never started");
+        assert!(
+            named.unwrap() < answered.unwrap(),
+            "the name arrived after the answer had already started"
+        );
+
+        // Separate context: the ask is nowhere in the conversation.
+        let hist = store.history(sid).unwrap();
+        assert_eq!(hist.len(), 2, "the title request must not become a row: {hist:?}");
+        assert_eq!(hist[0].content, "why is my cashflow sheet off by 300 dollars");
+        assert!(
+            !hist.iter().any(|m| m.content.contains(crate::titling::TITLE_ASK)),
+            "a title prompt leaked into the conversation: {hist:?}"
+        );
+    }
+
+    /// The name is the model's, or it is the opening line — but the row is never
+    /// left holding the placeholder after a turn that could not name it.
+    ///
+    /// The fixture's hook is the phrase `no title please` in the first message: the
+    /// scripted endpoint then answers the title ask with nothing at all, which is the
+    /// real-world case of a server that accepts the request and produces no usable
+    /// name. A sidebar of identical rows is a sidebar that says nothing, so the
+    /// opening line takes over - the same rule the store used to enforce by renaming
+    /// rows itself, with only the mechanism moved.
+    #[tokio::test]
+    async fn a_title_that_never_arrives_falls_back_to_the_opening_line() {
+        let (mut h, store) = host(vec!["the answer arrives here".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+        h.submit("no title please: explain gross versus net margin in one paragraph");
+        turns_done(&h, 1).await;
+        let sid = h.state().session_id;
+        let title = store.session(sid).unwrap().unwrap().title;
+        assert_ne!(title, crate::store::UNTITLED, "the placeholder survived a finished turn");
+        assert!(
+            title.starts_with("no title please"),
+            "the fallback is the opening line, got {title:?}"
+        );
+        drain_events(&mut ev).await;
+    }
+
+    /// A conversation that stops existing while a message is on its way must not
+    /// receive that message.
+    ///
+    /// The desktop's delete path moves the host off the row first and only then
+    /// removes it — but that move is a queued command. This test is the race: the row
+    /// is gone and the host still believes it is standing in it. Answering there
+    /// writes rows nothing lists, an answer the reader can never open again.
+    #[tokio::test]
+    async fn a_deleted_conversation_does_not_take_the_turn_that_raced_it() {
+        let (mut h, store) = host(vec!["first answer".into(), "second answer".into()]);
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        ready(&h).await;
+        h.submit("first, in a conversation that is about to go");
+        turns_done(&h, 1).await;
+        let doomed = h.state().session_id;
+        assert!(doomed > 0);
+
+        store.delete_session(doomed).unwrap();
+        assert!(store.session(doomed).unwrap().is_none());
+
+        h.submit("this message raced the delete");
+        turns_done(&h, 2).await;
+
+        let now = h.state().session_id;
+        assert_ne!(now, doomed, "the host answered into a conversation that no longer exists");
+        let hist = store.history(now).unwrap();
+        assert!(
+            hist.iter().any(|m| m.content == "this message raced the delete"),
+            "the message was dropped instead of starting a conversation: {hist:?}"
+        );
+        let evs = drain_events(&mut ev).await;
+        assert!(
+            evs.iter().any(|e| matches!(e, EngineEvent::Note { message, .. }
+                if message.contains("was deleted while your message was on its way"))),
+            "the reader was never told where their message went"
+        );
+    }
+
     #[tokio::test]
     async fn history_accumulates_across_turns() {
         let (h, store) = host(vec!["one".into(), "two".into(), "three".into()]);
@@ -3358,5 +3938,21 @@ mod tests {
         assert!(!p.contains("no network"), "the env block called a proxy sandbox offline: {p}");
         let o = default_env_block(std::path::Path::new("/home/u/ws"), "linux", N::Open);
         assert!(o.contains("network open"), "{o}");
+    }
+
+    #[test]
+    fn a_conversation_parked_in_the_temp_folder_tells_the_model_it_has_none() {
+        use crate::tools::net::NetMode as N;
+        let b = default_env_block(std::path::Path::new("/tmp"), "linux", N::Proxy);
+        assert!(b.contains("workspace: none"), "{b}");
+        assert!(b.contains("scratch folder"), "{b}");
+        // The path is the part that must not be printed. The tools resolve relative paths
+        // against it themselves, so all naming it achieves is a model that quotes `/tmp`
+        // back to the person when asked where it is working - which is the report.
+        assert!(!b.contains("/tmp"), "the env block recited the scratch path: {b}");
+        // A folder *inside* the temp folder was chosen by somebody, so it gets its name.
+        let r = default_env_block(std::path::Path::new("/tmp/cwoffee-project"), "linux", N::Proxy);
+        assert!(r.contains("workspace: /tmp/cwoffee-project"), "{r}");
+        assert!(!r.contains("none"), "{r}");
     }
 }

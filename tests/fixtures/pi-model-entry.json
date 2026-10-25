@@ -1,0 +1,18 @@
+{
+  "reasoning": true,
+  "thinkingLevelMap": {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "xhigh",
+    "xhigh": "xhigh",
+    "max": null
+  },
+  "compat": {
+    "thinkingFormat": "chat-template",
+    "chatTemplateKwargs": {
+      "enable_thinking": { "$var": "thinking.enabled" },
+      "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true }
+    }
+  }
+}

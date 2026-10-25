@@ -115,6 +115,26 @@ harness walks all twenty-nine of them, failing if any lands on a page that does 
 section it claims. Narrow windows turn the rail into a strip along the top and let a row's control
 drop below its text, so the settings screen does not have to be scrolled sideways.
 
+The screen has a size of its own. It used to be `max-height`, so the frame was whatever the page
+inside it happened to need: **Appearance** collapsed it and **Models** grew it, and changing page
+moved the control you were aiming at out from under the pointer. It opens at a fixed size, opens
+upward when you drag its corner, and keeps the size you left it at — stored in the browser's own
+storage, because the size belongs to the window rather than to any conversation, and clamped back
+into the window on the way out, because a laptop
+unplugged from its monitor has fewer pixels than the last opening promised. One size for the whole
+screen rather than one per page, because the pages are tabs of the same dialog and a frame that
+changes size when you change tab is the behaviour that was complained about.
+
+And the app behind it is out of reach while it is open. The dim is dark enough to read as a wall
+and blurs what is under it, and the controls beneath it are taken out of the running twice over:
+`inert` on everything that is not the dialog, and a stylesheet rule that switches off pointer
+events for the same set. Either half is sufficient on an engine that supports it; the other is
+there because a guarantee that rests on a single property is a guarantee that disappears quietly
+when that property is unsupported. The self-test checks the promise rather than the recipe: it
+puts a click where the metrics button is, and fails if anything other than the dim receives it —
+and then fails the other way if the status bar is still inert after the dialog has closed, which
+would leave an app you cannot use with no dialog on screen to blame.
+
 ### Endpoints and models (Settings › Models)
 
 One model answers at a time. Below that, the screen lists every endpoint the app knows:
@@ -203,12 +223,53 @@ it — the store is shared, so pressing that switch changes what somebody else's
 Folding is CSS, not deletion: the arguments, output and diffs of a finished call are still in the
 page, so a search finds them and the app's own harness can still assert what a tool said.
 
+**The group is closed by default, and a live turn is no exception.** It used to be pinned open
+while the model worked — "the streaming output is the feedback that the app is alive" — and on a
+local model that pinned-open group is the biggest object on the screen for a minute, holding a
+dozen lines most people never read. The header is what carries liveness now: it changes tense,
+and it counts the steps as they land. What still forces a group open is the one block in a
+transcript that is addressed to the reader rather than about the model: a question waiting for an
+answer. Its header adds `· waiting for you`, and the fold that normally lands when an answer does
+is refused while any card in the group is unanswered — hiding the one thing on the screen that is
+for you is worse than a long turn.
+
+A question card now sits *inside* the group that asked it, not in the conversation next to it. The
+report was that questions and answers "clutter the conversation", and they did: an answered card
+stayed a wide open block between the run and the reply for as long as the turn was on screen, and
+nothing about it ever folded. The group opens for the question and closes back to exactly what it
+was when the answer arrives — including the case where the reader had opened it by hand, which
+stays open, because they put it there.
+
 The stored transcript groups itself the same way a live turn does, and two rules keep that honest.
 An assistant row with no text in it — the row a tool call leaves behind — paints nothing at all.
 It used to paint a `CWOFFEE` label, an empty body and a `Copy | Share as markdown | Branch` line
 under nothing, and that bare strip between two accordions is what made a finished turn look
 ungrouped the instant it settled. And the footer line belongs to a turn, once, under what the turn
 last said; it used to appear under every message.
+
+## From a clone to a running app
+
+```bash
+./setup.sh                       # requirements, then the UI and the release binaries
+./setup.sh --deps                # install the missing system packages first (asks, unless --yes)
+./setup.sh --tests               # + the unit suites, svelte-check, the markdown test, wire-names
+./setup.sh --board               # + the page board on both cores (scripted endpoint, no prefill)
+./setup.sh --desktop             # + a launcher, verified by launching it and reading the window
+./setup.sh --endpoint http://127.0.0.1:8090/v1 --model your-model-id   # only if you have no config
+```
+
+One run, from a fresh clone. It probes what the build needs — `pkg-config` modules
+(`webkit2gtk-4.1`, `gtk+-3.0`, `libsoup-3.0`, `javascriptcoregtk-4.1`, glib, `openssl`, `xkbcommon`),
+the toolchain (`cargo`, `node` ≥ 20, `cc`), and the run-time helpers the app consults (`bwrap` for
+the sandbox, `systemd-run` for keeping a gateway alive, `python3` for local titles, `podman` for the
+managed search container, `pi` for the pi core, pinned to the version in `crates/bridge/src/process.rs`)
+— and prints them in one table, required versus optional, with the package that provides each.
+Missing required ones stop it, with the `dnf`/`apt`/`pacman` line that would fix them.
+
+Three things it deliberately does not do: rewrite a config you already have (`--endpoint` against an
+existing `~/.config/cwoffee/config.toml` prints a warning and changes nothing), `sudo` anything
+without `--deps`, or spend your prompt cache — the checks that talk to an endpoint use
+`scripts/mock-llm.mjs`. `SETUP.md` is the record of one machine; this is the check that runs on yours.
 
 ## Run it
 
@@ -243,6 +304,7 @@ Gates:
 ./scripts/gpu-check.sh cwoffee-app       # must hold renderD128 only
 ./scripts/sandbox-probe.sh             # re-run after any bwrap/kernel upgrade
 node scripts/gateway-smoke.mjs         # what a phone can actually rely on; mutates nothing
+node scripts/gateway-handoff.mjs       # the gateway outliving the window: port, token file, unit env
 node scripts/wire-names.mjs            # argument names: the client vs the desktop and the gateway
 ```
 
@@ -259,12 +321,15 @@ the desktop, which is exactly what happened to the endpoint screen until a page 
 buttons. The gate reads the client's payloads and both hosts' required names, and fails on drift.
 
 Some gates are hosts and start their own scratch gateway and fixture endpoint
-(`gateway-explore`, `gateway-recall`, `gateway-scratch`, `gateway-titlegen`, `gateway-search`,
-`gateway-excel`, `gateway-ask`, `gateway-prompt-shape`, `gateway-workspace`, `gateway-chat` with
-`--core`); others are ordinary clients and need a gateway somebody else started
-(`gateway-smoke`, `gateway-approval`, `gateway-chat`, `gateway-attach`,
+(`gateway-explore`, `gateway-recall`, `gateway-scratch`,
+`gateway-excel`, `gateway-ask`, `gateway-search-write`, `gateway-prompt-shape`,
+`gateway-workspace`, `gateway-chat` with `--core`); others are ordinary clients and need a
+gateway somebody else started (`gateway-smoke`, `gateway-approval`, `gateway-search`,
+`gateway-chat`, `gateway-attach`,
 `gateway-midturn-switch` — point them at the app with `--port 8122 --token DESKTOK`, or at a
-scratch gateway). One rule holds for both kinds: they assert what the model, the transcript or the
+scratch gateway; `gateway-search` reads the panel of a gateway that is already running, so
+pointing it at a port nothing answers prints `backend=undefined`, which is a broken command
+line rather than a broken app). One rule holds for both kinds: they assert what the model, the transcript or the
 filesystem can show, never what a log line claims, because an extension's own console output does
 not reach the parent process at all.
 
@@ -280,6 +345,20 @@ It also gets its own config dir, data dir, workspace and gateway port, so a test
 in your sessions list. The real endpoint is opt-in and says what it costs:
 `./scripts/selftest.sh --real-endpoint http://127.0.0.1:8090/v1`. See
 [`docs/TESTING.md`](docs/TESTING.md).
+## Devices, and the gateway that stays up
+
+The footer pill turns the gateway on: `:8099 · 2 devices`, loopback or LAN, token in
+`~/.config/cwoffee/gateway.token`. Settings > Devices adds one switch that changes what happens when
+you *close* the window: **"Keep devices working after this window closes"** — off by default, because
+a gateway that answers after the window is gone is a door you did not know you left open. On, the
+port is handed to `cwoffee-gateway`, a separate process with its own engine reading the same store
+and the same token file; the phone reconnects to a fresh host with the same conversations, the model
+and folder as they were at close, and no in-flight turn. The row says which binary would start, on
+which port, and how to stop it (`systemctl --user stop cwoffee-gateway-8099`) — including the case
+where it cannot be honoured because no standalone gateway is installed.
+[`docs/GATEWAY.md`](docs/GATEWAY.md) has the mechanism, the systemd traps, and the check
+(`node scripts/gateway-handoff.mjs`).
+
 
 ## Docs
 
@@ -340,6 +419,29 @@ count, and a panel that turns remote access on and off, chooses loopback or LAN,
 and lists copyable URLs. `docs/GATEWAY.md` explains what that costs in security
 terms, because it is the one control in the app that widens what a stranger could
 reach.
+
+That scope control is one switch, not a sequence. It used to show the *setting* rather than
+the *bind*: after a start on 0.0.0.0 the segment still read "This machine", so "Any device"
+looked pressable, did nothing, and the panel seemed broken until the other half had been
+clicked first. It now shows what the running listener actually does — 127.0.0.1 or 0.0.0.0 —
+and decides whether a click means anything against that, so the order of the two halves is
+not part of the interface.
+
+The bar also fits the window it is given, and it asks its *own* width rather than the
+screen's. The report: "the footer items are too tiny and too long — on my phone the theme
+and help buttons are off-screen". The row never wrapped and nothing in it could shrink, so a
+narrow window cut it off after whatever was added last, and what was added last was the theme
+toggle and the keyboard help — the two icons a person reaches for on a phone. Below 660px of
+*bar* it is thumb-sized (34px controls in 46px of height); the two pills whose entire summary
+is an address or a port lose that summary, because their panel carries it; the metrics pill
+keeps its numbers, because those are the reason it exists, and ellipsises instead of pushing
+its neighbours out of the window; and the diagnostic that reports the app's own round-trip
+time goes away, since nobody reads it on a phone. Below 470px even the words "on" and "off"
+cost too much and those pills keep their dot alone. Keying this to the bar rather than to the
+viewport is not tidiness: a 700px-wide desktop window has the same problem as a phone and, key
+to a viewport media query, got none of the fix — and it is the only way the self-test can
+prove the rule, by narrowing the bar in place and asking whether every control is still
+inside it and still big enough for a thumb.
 
 ### Thinking levels, measured
 
@@ -467,43 +569,41 @@ the timing column is there to make impossible.
 
 ### What a conversation is called
 
-A conversation starts out named after its own first line, cut at 48 characters. That is
-truthful, and it is why nobody uses the sidebar to find anything: forty rows that begin
-"hey can you", "can you look", "I want to".
+A conversation is created as **New Session**. Before it answers its first message, the model
+behind Cwoffee is asked, in one separate request of its own:
 
-Turn on `titlegen = true` and a 230M-parameter model **running on this machine** proposes a
-phrase instead, after the first turn finishes:
-
-```bash
-# once per machine: a private venv (CPU-only torch) and the weights, ~460 MB
-uv venv ~/.local/share/cwoffee/titlegen/venv --python 3.12   # py 3.12, torch 2.14.1+cpu
-~/.local/share/cwoffee/titlegen/venv/bin/python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu torch transformers
-hf download LiquidAI/LFM2.5-230M --cache-dir ~/.local/share/cwoffee/titlegen/models
+```text
+Title this conversation in under ~10 words and say nothing more: <the very first message>
 ```
 
-```toml
-# ~/.config/cwoffee/config.toml, before the first [table]
-titlegen = true
-```
+no system prompt, no tools, thinking off — and the name **types itself into the sidebar row** as
+it arrives, caret and all. The first real answer starts after that. The stall is the trade: a
+name that appears forty seconds late, on a page that has already moved on, is not a name.
 
-Measured on this box, per new conversation: **2.6–2.8 s to load, 0.4–0.7 s to generate,
-861–864 MB peak resident**, then straight back down. That number is why the helper is a
-one-shot subprocess rather than a resident server, and why it runs *after* the turn — a
-conversation is never made to wait for its name. It is why the feature is opt-in.
+There is no second model. The titler that used to do this — a python helper loading a
+230M-parameter model on this machine, `titlegen = true`, 861–864 MB peak per new conversation,
+naming the row *after* the turn had finished — is gone: script, config keys, wire verb and
+Settings cost sheet.
 
-Three rules keep it honest:
+Three rules survived the rewrite, and each one has a test:
 
-* **A name you chose is never overwritten.** The helper is only offered a row whose title is
-  still the one the store derived from the first message (or `new session`).
-* **A refusal changes nothing.** The helper rejects output that answers instead of naming
-  ("Sure, here's a summary of your cashflow…"), the opening-line title stays, and the reason
-  appears in the log and as a note. A wrong title is a false claim about the conversation.
-* **Availability is answerable cheaply.** Settings › Conversation (the Titles section) quotes the
-  model, the paths, what
-  is missing, and the 870 MB cost; `scripts/titlegen.py --check` reports the same in about a
-  second without loading the weights. `node scripts/gateway-titlegen.mjs` is the gate.
+* **A name you chose is never overwritten.** Only a row still carrying the placeholder (or one of
+  the placeholders older versions used, including the opening-line cut) is ever offered to the
+  model.
+* **Separate contexts.** The title request is one user message: no system prompt, no tools,
+  thinking off, and it is never appended to the conversation — so it cannot inflate a later turn
+  and cannot disturb what the server has cached of the real prompt.
+  `titling::the_ask_is_one_user_turn_with_no_system_prompt_and_thinking_off` asserts the request
+  shape; `host::a_new_conversation_is_named_before_it_is_answered` asserts the order and that the
+  ask never becomes a row.
+* **A miss is not fatal, and not silent.** If the endpoint returns nothing usable — silence, a
+  timeout, or a name left inside a thinking block by a model that ignored `enable_thinking=false`
+  — the parser reads the thinking block too, and if there is still nothing the row falls back to
+  your opening line rather than sitting on "New Session": a sidebar of identical rows says
+  nothing. The reason goes to the log.
 
-Nothing is sent anywhere for this: no endpoint call, no network once the weights are cached.
+Both cores run the same code (`crates/engine/src/titling.rs`), so a conversation gets the same
+name whichever core is behind the window.
 
 ### When the model runs out of tool budget
 
@@ -908,12 +1008,30 @@ number keys. The turn parks while it waits; cancel does not make the question
 disappear but releases the parked tool with a "cancelled" result the model can act
 on. Over the gateway, a watch-only client sees the question and cannot answer it.
 
-The card stays open for **180 seconds** by default, and `question_timeout_secs` in
-config.toml changes that. The knob exists because of a real turn where the model
-asked something the user could only answer by asking someone else: at three minutes
-the questions expired, the model answered them itself, and the user apologised four
-messages later. A set gets one shared budget that grows with the number of questions,
-so asking three is not punished relative to asking one.
+A parked question has **no clock by default**: the card stays open until a person answers it
+or the turn is stopped. It used to expire after 180 seconds, and the expiry was the failure —
+the model was told nothing had been heard and answered its own question. The real turn that
+motivated the knob is the same one that killed the default: the user could only answer by
+asking someone else, and at three minutes the card closed on them. A pause is not a failure,
+so a pause is what it is now. Put `question_timeout_secs = 900` in config.toml (15..=3600, or
+`CWOFFEE_QUESTION_TIMEOUT_MS` for the pi core) and the clock comes back for the cases where a
+stale card is worse than a parked turn; the app does not choose a budget on your behalf, and
+the pi core omits the `timeout` key from pi's own dialog rather than passing a zero that means
+different things in different versions. A set still gets one shared budget rather than one per
+question, because a person answering three questions in one card takes longer than one
+answering one.
+
+With the clock gone, the ways a card closes without an answer are few enough to name, and each
+gets its own sentence: **you stopped the turn** ("the turn was stopped; the tool did not run"),
+**a written-down clock ran out** ("the clock ran out; the model was told it got none"), or
+**the window holding the card went away**. The frame carries the reason for the same reason the
+card does: after a Stop, "the model was told it got none" describes an event that never took
+place, and it is the only trace a stopped question leaves in the transcript. Stopping has to
+release the dialogs *before* asking the model to stop, on either core: pi's tool call is parked
+on the card, and pi answers `abort` only once that call unwinds, so asking first means each side
+waits on the other — the Stop that used to land 10002ms later, the abort timeout to the
+millisecond, and then announce that the model process had not answered. Press Stop now and the
+turn is over in 15ms, with the card closed and its run free to fold.
 
 When one step needs several decisions, the model asks them in **one call with
 `questions`** (2–4) instead of one call each. The card shows them one at a time —
@@ -940,12 +1058,12 @@ card that answers by accident:
   later has no idea that "PDF" was an answer to anything, so the tool result carries
   the question and the options it offered alongside what you chose or typed.
 
-A question that closes with no answer - the timeout expired, or you cancelled the
-turn while it was parked - closes in every window as "no answer in time". Left
-alone it would sit there offering Send, and the answer would aim at a tool call that
-has already returned. A set gets one budget rather than one per question, because a
-person answering three questions in one card takes longer than one answering one, and
-a per-question clock would punish the model for asking them together.
+A question that closes with no answer — the turn was stopped while it was parked, the reply
+channel died with a window that went away, or a clock was written down and ran out — closes in
+every window as "no answer — the model was told it got none and to decide for itself". Left
+alone it would sit there offering Send, and the answer would aim at a tool call that has
+already returned. The wording says what reaches the model, because "nobody answered" and
+"nobody answered in time" are different facts and the model behaves differently about them.
 
 ## What you can do with a finished turn
 
@@ -976,7 +1094,19 @@ message, quote it into the composer, copy the selection. It is clamped to the vi
 on Escape or a click away, and stays open when the transcript scrolls itself to follow the
 stream. Inside the composer the **native** menu is deliberately left alone: the webview's own
 Paste entry is wired to the clipboard in a way a page cannot reach, so suppressing it would
-remove a capability rather than improve a menu.
+remove a capability rather than improve a menu. Inside a modal dialog it offers nothing at all:
+this app's menu is built from the transcript the dialog deliberately put out of reach, so a menu
+opened from the settings screen would act on something behind it.
+
+A code block's header stays where the buttons are. A 200-line HTML or SVG answer used to carry
+`copy` and `preview` at the *top of the block*, so half way through reading the code they had
+scrolled off, and the buttons that make a long block usable were the one thing not to hand. The
+header is sticky: it holds at the top of the transcript for exactly as long as its own block is on
+screen, then leaves with it rather than floating over the next answer. The fix turned out to be one
+word — the block's `overflow` is `clip`, not `hidden`. `hidden` makes the block a scroll container
+of its own, and a sticky child measured against a box that can never scroll never moves; that is
+how a header sat at the top of its own block, doing nothing, through several confident attempts at
+`position: sticky`.
 
 ## When a call fails, the failure says what to do
 
@@ -1068,9 +1198,13 @@ lives in `~/Projects` quietly writes into `~/cwoffee-workspace`.
   means a new session in that folder, which the sidebar `+` does in one click; a draft
   that has not been sent yet can still choose its folder.
 - `/tmp` is not a folder you work in, it is where sessions live before anyone chooses
-  one. Sessions stored there group under **Default** instead of getting a `tmp` row
-  beside a `No workspace` row, and registering the temp root as a workspace is refused
-  and said out loud in a toast rather than only written to a log.
+  one. Sessions stored there group under **No workspace** — the same three words the
+  composer chip uses for them and the same words the model is given — rather than getting a
+  `tmp` row beside a `No workspace` row, and registering the temp root as a workspace is
+  refused and said out loud in a toast rather than only written to a log. The scratch
+  folder is still real, and the tools still run in it; what the app refuses to do is show
+  its path where a folder name belongs, because a path in that slot reads like a choice
+  somebody made.
 - Renaming a group changes the label, never the path.
 - **The model is told the folder the tools actually run in.** Each request carries a
   volatile `<env>` block with the workspace in it, and the host derives it per turn from
@@ -1080,6 +1214,14 @@ lives in `~/Projects` quietly writes into `~/cwoffee-workspace`.
   own `pwd` said `~/Projects`, and the model then typed absolute paths for a tree it was
   not sandboxed in. Ask the model "what does your env block say?" and ask it to run `pwd`:
   if those two answers differ, this is the bug.
+- **A conversation with no workspace is told it has none, and says `none`.** For those
+  the `<env>` line reads `workspace: none (…a scratch folder that the user did not choose
+  and does not keep)` and the scratch path is left out of it: the tools resolve relative
+  paths against that folder themselves, so printing it only gives the model something to
+  quote back as if it were a workspace. The pi core is given the same sentence in its
+  system prompt, because pi appends a `<cwd>` block of its own naming that folder and
+  would otherwise be the only thing the model has to go on. Two cores owe a person one
+  answer, not two — and both now agree with the sidebar and the chip.
 
 Every file a turn produces appears once as an attachment however many times it was
 written, and file tools show the path they act on in the card header, so you can
@@ -1132,6 +1274,35 @@ Switching sessions during a turn is allowed and instant: the view moves at once 
 host finishes the turn it is inside. In the sidebar, a turning arc means that session is
 answering; a pulse means a turn finished there while you were looking elsewhere.
 
+Coming back to a session that is answering rebuilds it from two sources - what the store
+has, and what this window saw before it looked away - and they overlap. Your own message is
+painted from whichever source has it, not both: the pi core files it in the moment you send
+it, the rust core when the turn ends. Painting both is how one message ended up on screen
+twice after a round trip through the sidebar.
+
+### On a phone
+
+A phone tab gets the same app, not a phone-shaped one. Below 768px the sidebar slides in as
+a drawer over a dim that sits *behind* it (the settings screen dims with a different layer,
+at a different level; sharing one class put the dim on top of the drawer and every touch
+just closed it), the drawer is anchored to the window rather than the document, and the tap
+targets are thumb-sized: 42px session rows, 38px controls, no 300ms double-tap hesitation.
+The status bar along the bottom does the same for itself, and asks its own width rather than
+the window's: it gives up a pill's summary before it gives up a control, and the two icons
+that used to fall off the right edge on a phone — theme and keyboard help — are 34px targets
+that cannot be displaced. See *What the status bar actually measures*.
+
+The titlebar carries the drawer toggle, the mark, the wordmark, and the conversation on
+screen. Nothing else. Window controls belong to the frameless desktop window and are not
+drawn in a browser, where they had no window to act on; the model name lives on the
+composer's chip, next to the control that changes it.
+
+A phone that was minimised mid-turn comes back to a dead socket and a turn that already
+ended without saying so. It now checks the connection against the gateway's 25-second beat,
+drops a socket that has said nothing for twice that, and re-reads the host's state — which
+outranks this window's memory of a turn it started. Before that, the composer stayed
+disabled until you reloaded the page.
+
 ## The empty screen
 
 The cup, the greeting, the tips and the composer are centred as one group - centring only
@@ -1141,9 +1312,22 @@ twice (a wide blurred body and a brighter thread inside) with a puff travelling 
 curve and a gradient that fades it out toward the top. Anchoring it to the artwork's
 space rather than to pixel offsets is what keeps it coming out of the cup at any size.
 
-At the top of the sidebar sits a Cowork / Chat tab. It is not wired to anything: Chat mode
-does not exist yet, and a control that pretends otherwise is worse than a missing one.
-`+ New session` survives as a small `+`, plus Ctrl+N and the `+` on each workspace row.
+At the top of the sidebar sits the **Cowork / Chat** tab, and it is the only way in or out of
+Chat mode: `persona = "chat"` gives the model no tools, no folder and one line of system prompt,
+and the Cowork tab puts the tools back by restarting the model process between turns. Because a
+mode is a different *kind* of conversation rather than a filter on the same one, switching lands
+you on the screen the app opens on — cup, greeting, composer — instead of leaving you inside the
+other mode's last turn. What does not change is the conversation you came from: it keeps its rows,
+keeps its place in the sidebar, and a turn that was still running there keeps writing into it. A
+switch that left the old turn on screen reads like a switch that was refused, which is how "changing
+mode should go back to the first screen" got reported.
+
+`+ New session` survives as a small `+` here, plus Ctrl+N and the `+` on each workspace row. The
+header's `+` — the one in line with the mode switch — asks for a conversation with **no folder
+picked**: it does not inherit the folder a previous draft was aimed at, and the folder the host
+will really use is named in the same words the sidebar and the model use, which for the scratch
+folder is "No workspace" rather than `/tmp`. The `+` on a workspace row starts a conversation that
+already knows its folder.
 
 
 ## Icons
@@ -1183,6 +1367,21 @@ Two promises the code keeps rather than implies:
   and a probe (`Try one search`) asks the provider rather than asking the model to demonstrate
   that it used a tool. A card that prints the config value cannot tell "auto with a container"
   from "auto on a machine with no container runtime", and those need different fixes.
+- **A provider change is written the way the file is read.** Changing provider used to fail with
+  the app quoting `TOML parse error at line 44 … backend = auto … invalid string expected "` and
+  saving nothing: the pi core built the `[search]` lines by hand and left the value bare, and the
+  config writer — which parses the edited text before it replaces the file, so that a settings
+  click can never write a config the next boot cannot open — refused the edit it had been asked
+  to make. The keys now come from one helper that quotes through the same writer the rust core
+  uses, and the test that guards it re-parses the file the click produced instead of grepping for
+  a quote mark. `scripts/gateway-search-write.mjs` asks the same question over the wire on either
+  core: it seeds a config that already has a `[search]` section in it (which is where the line
+  numbers in that error came from), clicks SearXNG with a URL, reads the panel again, and then
+  parses the resulting file with a TOML reader that belongs to neither core — and checks that a
+  key nobody touched (`max_results`) is still the value it was. The `searxng_url` box travels with
+  that fix: it stays on screen while the choice is *offered* rather than only after it is accepted,
+  which is how "SearXNG needs a URL, for example http://127.0.0.1:8080/search" arrived with no way
+  to give it one.
 
 ## The sandbox's network is a setting, and the setting says what it guarantees
 

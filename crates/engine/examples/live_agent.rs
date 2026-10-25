@@ -112,6 +112,13 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
             EngineEvent::SessionChanged { session_id, .. } => {
                 println!("(session changed -> {session_id})");
             }
+            // A conversation naming itself, token by token. The example prints the name
+            // once, when it is final, because a live agent run is read as a transcript.
+            EngineEvent::TitleDelta { text, done, .. } => {
+                if done {
+                    println!("(named itself: {text:?})");
+                }
+            }
             // Live mid-turn estimates: the examples print the final telemetry line.
             EngineEvent::TurnStats(_) => {}
             // The example has no UI to answer with, so the tool's own timeout
@@ -120,7 +127,7 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
                 println!("(the model asks: {question} - nobody here to answer)")
             }
             EngineEvent::QuestionAnswered { .. } => {}
-            EngineEvent::QuestionExpired { id } => {
+            EngineEvent::QuestionExpired { id, .. } => {
                 println!("[ask] question {id} closed without an answer");
             }
             EngineEvent::TurnStart { turn_id, model, .. } => {

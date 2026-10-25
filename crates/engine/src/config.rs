@@ -121,9 +121,12 @@ pub struct Config {
     #[serde(default)]
     pub tool_exposure: Option<String>,
     /// How long an `ask_user` card stays open before the model is told nobody
-    /// answered. Absent means 180 seconds. Raise it when the answer is not yours to
-    /// give: a question the user has to take to someone else cannot be answered
-    /// inside three minutes, which is what session 1306 found. Range 15..=3600.
+    /// answered. **Absent means no timeout at all**: the turn stays parked — a paused
+    /// state, not a failed one — until a person answers it or the turn is stopped.
+    /// A question the user has to take to someone else cannot be answered inside three
+    /// minutes, which is what session 1306 found; the old 180-second default answered on
+    /// the user's behalf and they apologised four messages later. Write a number only to
+    /// put a clock back on purpose. Range 15..=3600.
     #[serde(default)]
     pub question_timeout_secs: Option<u64>,
     /// How long a **manual compaction** may take before cwoffee stops waiting and says
@@ -134,25 +137,6 @@ pub struct Config {
     /// broken, and the user pays for the summary twice.
     #[serde(default)]
     pub compact_timeout_secs: Option<u64>,
-    /// Name conversations with a small model running on this machine, instead of cutting
-    /// the opening line at forty-eight characters. **Off by default**: the helper peaks
-    /// near 870 MB of resident memory for a few seconds per conversation, on a machine
-    /// that is also running the model process and the UI, and it is not on any critical
-    /// path — a conversation is never made to wait for its name.
-    #[serde(default)]
-    pub titlegen: Option<bool>,
-    #[serde(default)]
-    pub titlegen_python: Option<String>,
-    #[serde(default)]
-    pub titlegen_script: Option<String>,
-    #[serde(default)]
-    pub titlegen_model: Option<String>,
-    #[serde(default)]
-    pub titlegen_cache: Option<String>,
-    #[serde(default)]
-    pub titlegen_threads: Option<usize>,
-    #[serde(default)]
-    pub titlegen_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -333,6 +317,90 @@ fn env2(new: &str, old: &str) -> Option<String> {
 /// nothing. The example config shipped with exactly that mistake, which is how
 /// a user ended up with a workspace setting the app never read. Unknown fields
 /// are now rejected; this turns the common case into an actionable message.
+/// Keys that named a feature this app no longer has, and what replaced it.
+///
+/// Deleting a feature is a breaking change to every config file written while it existed, and the
+/// parser here deliberately rejects keys it has not declared - which is right for a typo, and wrong
+/// for a key that used to be valid. The distinction is intent: a misspelled live key is a setting
+/// somebody means to be using, so silence would be worse than an error; a retired key is a leftover,
+/// so it is commented out with the reason beside it. The first entry is the one that bricked an
+/// install when the borrowed titler was removed.
+static RETIRED: &[(&str, &str)] = &[
+    (
+        "titlegen",
+        "Conversations now name themselves by asking the model that answers them, in its own words: there is nothing to configure, install or keep warm.",
+    ),
+    (
+        "titlegen_python",
+        "the interpreter the helper script ran under is gone with it",
+    ),
+    (
+        "titlegen_script",
+        "the helper script is gone",
+    ),
+    (
+        "titlegen_model",
+        "no separate titling model is used; the conversation's own model is asked once",
+    ),
+    (
+        "titlegen_cache",
+        "there are no weights to cache",
+    ),
+    (
+        "titlegen_threads",
+        "there is no local inference to thread",
+    ),
+    (
+        "titlegen_timeout_secs",
+        "the title ask is bounded by its own budget and never blocks a turn beyond it",
+    ),
+];
+
+/// Comment out retired top-level keys, and report which ones were touched.
+///
+/// Only keys before the first `[table]` header are candidates. In TOML a bare key belongs to
+/// whichever table is open, so a `titlegen` sitting inside `[models."x"]` is that row's business -
+/// and a row that carries a field it was never given is a mistake worth reporting, not one to
+/// paper over.
+fn retire_known_keys(text: &str) -> (String, Vec<(&'static str, &'static str)>) {
+    let mut out = String::with_capacity(text.len());
+    let mut hit: Vec<(&'static str, &'static str)> = Vec::new();
+    let mut in_table = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if !in_table && t.starts_with('[') {
+            in_table = true;
+        }
+        let mut retired_here: Option<&'static str> = None;
+        if !in_table && !t.starts_with('#') {
+            if let Some(eq) = t.find('=') {
+                let key = t[..eq].trim().trim_matches('"').trim_matches('\'');
+                if let Some(entry) = RETIRED.iter().find(|(k, _)| *k == key) {
+                    let (name, why): (&'static str, &'static str) = *entry;
+                    retired_here = Some(why);
+                    if !hit.iter().any(|(k, _)| *k == name) {
+                        hit.push((name, why));
+                    }
+                }
+            }
+        }
+        match retired_here {
+            Some(why) => {
+                out.push_str("# retired: ");
+                out.push_str(line.trim_start());
+                out.push_str("\n#   ");
+                out.push_str(why);
+                out.push('\n');
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    (out, hit)
+}
+
 fn table_hint(err: &toml::de::Error) -> String {
     let msg = err.message().to_string();
     let top_level = [
@@ -341,9 +409,6 @@ fn table_hint(err: &toml::de::Error) -> String {
         "persona",
         "approval_timeout_secs",
         "compact_timeout_secs",
-        "titlegen",
-        "titlegen_python",
-        "titlegen_script",
         "question_timeout_secs",
         "theme",
         "provider",
@@ -383,8 +448,34 @@ impl Config {
         }
         let text = std::fs::read_to_string(&p)
             .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-        let mut cfg: Config = toml::from_str(&text)
+        // A feature that has been deleted leaves its key behind in every file that was written while
+        // it existed. Comment those out and say so, rather than refusing the file: this exact shape
+        // bricked an install, because the parser rejects keys it has not declared and the message
+        // (`unknown field \`titlegen\``) named no way out.
+        let (text2, retired) = retire_known_keys(&text);
+        let mut cfg: Config = toml::from_str(&text2)
             .map_err(|e| format!("malformed {}: {}{}", p.display(), e, table_hint(&e)))?;
+        if !retired.is_empty() && text2 != text {
+            // Repair the file once instead of warning at every start for as long as somebody keeps
+            // the old line. The edit is a comment, so nothing they wrote is lost and the reason is
+            // sitting in the file next to the line.
+            if let Err(e) = std::fs::write(&p, &text2) {
+                eprintln!(
+                    "[cwoffee] config: retired key(s) ignored for this start ({}), but they could not be\
+                     commented out in {}: {e}",
+                    retired.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", "),
+                    p.display()
+                );
+            } else {
+                for (key, why) in retired.iter() {
+                    eprintln!(
+                        "[cwoffee] config: `{key}` is no longer a setting, so it is now a comment in {}.\
+                         {why}",
+                        p.display()
+                    );
+                }
+            }
+        }
         if let Some(w) = cfg.workspace.take() {
             cfg.workspace = Some(Self::expand_tilde(&w));
         }
@@ -791,85 +882,9 @@ impl Config {
         }
     }
 
-    pub fn question_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.question_timeout_secs.unwrap_or(180))
-    }
-
-    /// Accept either a path or a bare program name. Someone writing `titlegen_python =
-    /// "python3"` means the one on PATH, and a check that only looks for a file at the
-    /// literal string reports "no python" while a perfectly good python sits right there.
-    fn resolve_exec(p: &std::path::Path) -> std::path::PathBuf {
-        if p.components().count() == 1 {
-            if let Ok(path) = std::env::var("PATH") {
-                for dir in std::env::split_paths(&path) {
-                    let cand = dir.join(p);
-                    if cand.is_file() {
-                        return cand;
-                    }
-                }
-            }
-        }
-        p.to_path_buf()
-    }
-
-    /// Assemble the title-helper settings: config file first, then the environment, so a
-    /// gate can point the feature at a scripted helper without editing anyone's config.
-    pub fn titlegen_cfg(&self) -> crate::titlegen::TitleGenCfg {
-        let mut cfg = crate::titlegen::TitleGenCfg::default();
-        let s = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        // Held as owned strings first: the environment values are temporaries, and a
-        // reference into one of them would not outlive the call.
-        let env_python = s("CWOFFEE_TITLEGEN_PYTHON");
-        let env_script = s("CWOFFEE_TITLEGEN_SCRIPT");
-        let env_model = s("CWOFFEE_TITLEGEN_MODEL");
-        let env_cache = s("CWOFFEE_TITLEGEN_CACHE");
-        let env_threads = s("CWOFFEE_TITLEGEN_THREADS");
-        let env_timeout = s("CWOFFEE_TITLEGEN_TIMEOUT_SECS");
-        let env_flag = s("CWOFFEE_TITLEGEN");
-        cfg.enabled = self.titlegen.unwrap_or(false);
-        cfg.python = self
-            .titlegen_python
-            .as_deref()
-            .or_else(|| env_python.as_deref())
-            .map(PathBuf::from)
-            .map(|p| Self::resolve_exec(&p))
-            .unwrap_or(cfg.python);
-        cfg.script = self
-            .titlegen_script
-            .as_deref()
-            .or_else(|| env_script.as_deref())
-            .map(PathBuf::from)
-            .map(|p| Self::resolve_exec(&p))
-            .unwrap_or(cfg.script);
-        cfg.model = self
-            .titlegen_model
-            .as_deref()
-            .or_else(|| env_model.as_deref())
-            .map(str::to_string)
-            .unwrap_or(cfg.model);
-        cfg.cache = self
-            .titlegen_cache
-            .as_deref()
-            .or_else(|| env_cache.as_deref())
-            .map(PathBuf::from)
-            .unwrap_or(cfg.cache);
-        cfg.threads = self
-            .titlegen_threads
-            .or_else(|| env_threads.as_deref().and_then(|v| v.parse().ok()))
-            .unwrap_or(cfg.threads)
-            .clamp(1, 16);
-        cfg.timeout = std::time::Duration::from_secs(
-            self.titlegen_timeout_secs
-                .or_else(|| env_timeout.as_deref().and_then(|v| v.parse().ok()))
-                .unwrap_or(45),
-        );
-        if matches!(env_flag.as_deref(), Some("1") | Some("true") | Some("yes")) {
-            cfg.enabled = true;
-        }
-        if matches!(env_flag.as_deref(), Some("0") | Some("false") | Some("no")) {
-            cfg.enabled = false;
-        }
-        cfg
+    /// `None` means the card does not close on a clock: `ask_user` waits for a person.
+    pub fn question_timeout(&self) -> Option<std::time::Duration> {
+        self.question_timeout_secs.map(std::time::Duration::from_secs)
     }
 
     /// The budget for one manual compaction. Deliberately generous, and deliberately a
@@ -880,19 +895,21 @@ impl Config {
     }
 
     /// Validate the question timeout. A tiny value makes `ask_user` useless (the card
-    /// closes before it can be read), and an enormous one can park a turn for an hour
-    /// on a phone that is in a pocket. Both are typos, so both name the key.
-    pub fn question_timeout_checked(&self) -> Result<std::time::Duration, String> {
+    /// closes before it can be read), and an enormous one is a typo for "no timeout",
+    /// which is a key of its own: leaving the line out. Absent means *no clock*, so a
+    /// parked turn is a paused turn rather than an expiring one; Stop is how you leave it.
+    pub fn question_timeout_checked(&self) -> Result<Option<std::time::Duration>, String> {
         match self.question_timeout_secs {
-            None => Ok(std::time::Duration::from_secs(180)),
+            None => Ok(None),
             Some(secs) => {
                 if !(15..=3600).contains(&secs) {
                     return Err(format!(
                         "question_timeout_secs = {secs} is outside 15..=3600 \
-                         (180 is the default)"
+                         (leave the key out entirely for no timeout: the card then stays \
+                         open until you answer or stop the turn)"
                     ));
                 }
-                Ok(std::time::Duration::from_secs(secs))
+                Ok(Some(std::time::Duration::from_secs(secs)))
             }
         }
     }
@@ -1537,8 +1554,18 @@ pub fn provider_of_model(id: &str) -> String {
     }
 }
 
-/// The provider/model picture, built from the file alone.
+/// The provider/model picture, built from the file plus the environment the app itself answers
+/// through.
+///
+/// The environment belongs here, and that is not a nicety. The desktop layers `CWOFFEE_URL` and its
+/// friends over the file at boot, so a picture built from the file alone tells the reader the app
+/// talks to the documented local endpoint when it is in fact talking to wherever the environment
+/// pointed it. Measured in a self-test pass: the settings screen offered to probe
+/// 127.0.0.1:8090 - somebody's real model server - while every turn of that run went to the mock on
+/// :8190, and a reader who clicked it would have pointed the app's own config at a dead endpoint.
 pub fn provider_status_with(path: &std::path::Path, cfg: &Config) -> ProviderStatus {
+    let mut cfg = cfg.clone();
+    cfg.apply_env();
     let chosen = cfg.provider.model.trim().to_string();
     let chosen_provider = provider_of_model(&chosen);
     let rows = provider_rows_in(path);
@@ -1822,6 +1849,10 @@ fn drop_region(text: &str, header: &str) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+    /// Tests that read or write process-wide environment variables take this, because `CWOFFEE_URL`
+    /// is one variable shared by the whole test binary: two tests editing it decide the outcome by
+    /// scheduling rather than by assertion.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// The settings screen asks "what do you know about endpoints and models?" without going
     /// on the network, and then adds a provider from a probe it already ran. Both halves have
     /// to answer in sentences a person can read, and the second has to leave the file in a
@@ -2559,18 +2590,24 @@ base_url = "http://127.0.0.1:9/v1"
         assert_eq!(c.mode(), ApprovalMode::Ask);
     }
 
-    /// `ask_user` is the one tool that waits on a person, and the right wait depends
-    /// on who that person is. Absent means three minutes; a written value is
-    /// range-checked and names itself when out of range.
+    /// `ask_user` is the one tool that waits on a person, and the right wait depends on
+    /// who that person is. Absent means **no clock**: the card stays open until somebody
+    /// answers or the turn is stopped. A written value is range-checked and names itself
+    /// when out of range.
     #[test]
     fn question_timeout_is_a_knob_and_a_bad_value_names_itself() {
         use std::time::Duration;
         let c: Config = toml::from_str("").unwrap();
-        assert_eq!(c.question_timeout(), Duration::from_secs(180), "absent means three minutes");
-        assert_eq!(c.question_timeout_checked().unwrap(), Duration::from_secs(180));
+        assert_eq!(
+            c.question_timeout(),
+            None,
+            "absent means the question does not expire: session 1306's user needed an hour, and \
+             the old 180s default answered for them"
+        );
+        assert_eq!(c.question_timeout_checked().unwrap(), None);
 
         let c: Config = toml::from_str("question_timeout_secs = 900").expect("parses");
-        assert_eq!(c.question_timeout_checked().unwrap(), Duration::from_secs(900));
+        assert_eq!(c.question_timeout_checked().unwrap(), Some(Duration::from_secs(900)));
 
         let c: Config = toml::from_str("question_timeout_secs = 5").expect("parses");
         let err = c.question_timeout_checked().unwrap_err();
@@ -2715,6 +2752,7 @@ searxng_url = "http://127.0.0.1:8888/search"
 
     #[test]
     fn env_beats_the_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut c = Config::default();
         c.provider.base_url = "http://from-file/v1".into();
         unsafe {
@@ -2725,6 +2763,96 @@ searxng_url = "http://127.0.0.1:8888/search"
             std::env::remove_var("CWOFFEE_URL");
         }
         assert_eq!(c.provider.base_url, "http://from-env/v1");
+    }
+
+    /// Deleting a feature must not brick an install whose config file still mentions it.
+    ///
+    /// This is the exact shape that stopped an app from starting: the file written while the borrowed
+    /// titler existed carried `titlegen = true`, the parser rejects keys it has not declared, and the
+    /// message named a field with no remedy in it. The line is commented out, in place, with the
+    /// reason beside it - and the rest of the file still applies.
+    #[test]
+    fn a_config_left_over_from_a_removed_feature_still_boots() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_retire_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "mode = \"ask\"\nreasoning = \"xhigh\"\n\n# Name conversations with a 230M model.\ntitlegen = true\ntitlegen_threads = 2\n\n[provider]\nkind = \"llama.cpp\"\nbase_url = \"http://127.0.0.1:8090/v1\"\nmodel = \"m-one\"\n",
+        )
+        .unwrap();
+        let (cfg, loaded) = Config::load(Some(&path)).expect("an old file must still boot the app");
+        assert_eq!(loaded.as_deref(), Some(path.as_path()));
+        assert_eq!(cfg.mode.as_deref(), Some("ask"), "the rest of the file is not collateral");
+        assert_eq!(cfg.provider.model, "m-one");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# retired: titlegen = true"), "the line is commented, not deleted: {text}");
+        assert!(text.contains("nothing to configure"), "and the reason is in the file: {text}");
+        assert!(!text.contains("\ntitlegen = true"), "it cannot take effect on the next start either");
+        // Second load: nothing left to repair, and the answer is stable.
+        let (cfg2, _) = Config::load(Some(&path)).expect("the repaired file loads clean");
+        assert_eq!(cfg2.mode, cfg.mode);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A key that is merely misspelled is a setting somebody means to be using. Retiring leftovers
+    /// must not turn the parser lenient, or that setting is ignored in silence.
+    #[test]
+    fn a_misspelled_live_key_still_fails_loudly() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_typo_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "titlegnn = true\nreasoning_mode = \"xhigh\"\n").unwrap();
+        let err = Config::load(Some(&path)).unwrap_err();
+        assert!(err.contains("unknown field"), "got {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The repair pass touches top-level keys only. Inside a table, the same word is that row's
+    /// business - and a model row ignores unknown fields today rather than refusing them, so the one
+    /// thing this pass must never do is reach into a table and make someone's row look intentional.
+    #[test]
+    fn a_retired_name_inside_a_table_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_tbl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[models.\"p/m\"]\ntitlegen = true\n").unwrap();
+        let (cfg, _) = Config::load(Some(&path)).expect("a model row's own keys are not this pass's business");
+        assert!(cfg.models.contains_key("p/m"), "the row still loaded");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "[models.\"p/m\"]\ntitlegen = true\n", "nothing inside the table was rewritten: {text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The endpoint the settings screen describes has to be the endpoint the turns go to.
+    ///
+    /// A file-only picture says `http://127.0.0.1:8090/v1` - the documented local server - to anyone
+    /// who set their endpoint through the environment, and the screen then offers to discover,
+    /// probe and rewrite config for a server the app is not using. Serialized against
+    /// `env_beats_the_file`: both edit one process-wide variable.
+    #[test]
+    fn the_endpoint_picture_honours_the_environment_the_app_answers_through() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("cwoffee_pic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[provider]\nkind = \"llama.cpp\"\nbase_url = \"http://from-file/v1\"\nmodel = \"from-file/m\"\n").unwrap();
+        let (file_cfg, _) = Config::load(Some(&path)).unwrap();
+
+        // Without the environment, the picture is the file.
+        unsafe { std::env::remove_var("CWOFFEE_URL") };
+        let st = provider_status_with(&path, &file_cfg);
+        assert_eq!(st.chosen_base_url, "http://from-file/v1", "the file speaks for itself");
+
+        // With it, the picture follows the app, not the file.
+        unsafe { std::env::set_var("CWOFFEE_URL", "http://127.0.0.1:8190/v1") };
+        let st = provider_status_with(&path, &file_cfg);
+        unsafe { std::env::remove_var("CWOFFEE_URL") };
+        assert_eq!(
+            st.chosen_base_url, "http://127.0.0.1:8190/v1",
+            "the settings screen has to describe the endpoint the turns actually go through"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

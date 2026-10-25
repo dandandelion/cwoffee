@@ -325,7 +325,7 @@ fn a_process_that_dies_mid_turn_still_closes_the_turn() {
 #[test]
 fn a_turn_parked_on_a_human_reports_the_generation_rate_not_the_wall_clock() {
     let now = Instant::now();
-    let mut t = |ms: u64| now + Duration::from_millis(ms);
+    let t = |ms: u64| now + Duration::from_millis(ms);
     let mut tr = Translator::default();
     let usage_records = vec![
         serde_json::json!({"type": "agent_start"}),

@@ -22,6 +22,14 @@
 #   scripts/selftest.sh --no-build      use the binaries as they are
 #   scripts/selftest.sh --speed 2       mock streams 2x faster
 #   scripts/selftest.sh --keep          leave the temp dirs and the log behind
+#   scripts/selftest.sh --list          name the check groups
+#   scripts/selftest.sh cup             only the groups whose id or label matches (repeatable)
+#
+# A targeted run is the everyday one: most changes touch a line of CSS or one label, and a full pass
+# costs minutes. `scripts/selftest.sh cup live-fence` runs those groups and nothing else; the filter
+# also matches words from a group's own section label, so `cup` catches both cup checks and `code`
+# catches the code-chrome and live-fence ones. What is *not* run is printed on the verdict line, and
+# a targeted green is never a green for the suite.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -33,19 +41,34 @@ SPEED=1
 NO_BUILD=0
 KEEP=0
 REAL=""
+ONLY=""
+LIST=0
 for a in "$@"; do
   case "$a" in
     --no-build) NO_BUILD=1 ;;
     --keep) KEEP=1 ;;
     --speed) : ;;
     --speed=*) SPEED=${a#--speed=} ;;
+    --only) : ;;
+    --only=*) ONLY=${a#--only=} ;;
+    --list) LIST=1 ;;
     --real-endpoint) : ;;
     --real-endpoint=*) REAL=${a#--real-endpoint=} ;;
     --mock-port) : ;;
     --mock-port=*) MOCK_PORT=${a#--mock-port=} ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
+    --*) ;;
+    # A bare word is a check group, which is what you type on a normal day: the section's own label
+    # is what you remember ("cup"), not an id you have to look up. `--only cup code` works too.
+    *) ONLY="${ONLY:+$ONLY,}$a" ;;
   esac
 done
+if [ "$LIST" = 1 ]; then
+  echo "check groups (scripts/selftest.sh <id-or-word> ...):"
+  grep -o "want('[a-z0-9-]*', '[^']*'" ui/src/App.svelte |
+    tr -d "\"" | sed -e 's/^want(.//' -e "s/', '/  /" -e "s/.'$//" | sort -u
+  exit 0
+fi
 # `--real-endpoint <url>` (space-separated) as well as `=` form
 if [ -z "$REAL" ]; then
   prev=""
@@ -83,24 +106,50 @@ else
   # version refused any listener, which told the operator to kill a mock that had just
   # been started with the current file - and told them to pattern-kill it, which is the
   # kind of instruction that once ended an unrelated process with the same name.
+  want=$(node -e 'const c=require("node:crypto"),f=require("node:fs");process.stdout.write(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex").slice(0,12))' tests/scenarios/scenarios.json)
+  fp_of() {
+    node -e 'const s=JSON.parse(process.argv[1]||"{}");process.stdout.write(String(s.fingerprint ?? ""))' "$1"
+  }
   state=$(curl -fsS "http://127.0.0.1:${MOCK_PORT}/mock/state" 2>/dev/null || true)
   if [ -n "$state" ]; then
-    want=$(node -e 'const c=require("node:crypto"),f=require("node:fs");process.stdout.write(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex").slice(0,12))' tests/scenarios/scenarios.json)
-    got=$(node -e 'const s=JSON.parse(process.argv[1]||"{}");process.stdout.write(String(s.fingerprint ?? ""))' "$state")
+    got=$(fp_of "$state")
     if [ -n "$got" ] && [ "$got" = "$want" ]; then
       note "port ${MOCK_PORT} answers as a mock-llm with the CURRENT scenarios.json (fingerprint $got) - reusing it"
+      MOCK_REUSED=1
     else
       pid=$(ss -ltnp "sport = :${MOCK_PORT}" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
       die "port ${MOCK_PORT} answers as a mock-llm with a stale or unknown scenario set (it says ${got:-no fingerprint}, the file says $want). End that one server by its pid (${pid:-not found from ss}) — do not pattern-kill by name, something else may answer to it — or set MOCK_PORT=…"
     fi
   fi
-  note "starting mock endpoint on 127.0.0.1:${MOCK_PORT} (speed x${SPEED})"
-  node scripts/mock-llm.mjs --port "$MOCK_PORT" --speed "$SPEED" >>"$log" 2>&1 &
-  MOCK_PID=$!
-  for _ in $(seq 1 40); do
-    if curl -fsS "http://127.0.0.1:${MOCK_PORT}/health" >/dev/null 2>&1; then break; fi
-    sleep 0.2
-  done
+  if [ "${MOCK_REUSED:-0}" != 1 ]; then
+    # Two runs back to back, or a run started while an older one is still winding down, and the port
+    # is taken by a server this script does not own. Refusing to listen is not fatal - the health
+    # probe answers happily from the *other* server, which is exactly the failure that let one run
+    # test against scenarios it had never read. So: start ours, and only accept the port if the
+    # answer carries the fingerprint of the file we are looking at. If it does not, move up a port.
+    for try in 0 1 2 3; do
+      port=$((MOCK_PORT + try))
+      [ "$try" -gt 0 ] && note "port ${port} - trying it (the one before answers with someone else's scenarios)"
+      note "starting mock endpoint on 127.0.0.1:${port} (speed x${SPEED})"
+      node scripts/mock-llm.mjs --port "$port" --speed "$SPEED" >>"$log" 2>&1 &
+      MOCK_PID=$!
+      for _ in $(seq 1 25); do
+        kill -0 "$MOCK_PID" 2>/dev/null || break
+        curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1 && break
+        sleep 0.2
+      done
+      state=$(curl -fsS "http://127.0.0.1:${port}/mock/state" 2>/dev/null || true)
+      if [ -n "$state" ] && [ "$(fp_of "$state")" = "$want" ] && kill -0 "$MOCK_PID" 2>/dev/null; then
+        MOCK_PORT=$port
+        ENDPOINT="http://127.0.0.1:${MOCK_PORT}/v1"
+        break
+      fi
+      # Not ours, or never bound. End the process this loop started, by its pid, and move on.
+      kill "$MOCK_PID" 2>/dev/null
+      MOCK_PID=""
+    done
+    [ -n "$MOCK_PID" ] || die "no port from ${MOCK_PORT} on would host this run's mock endpoint (see $log)"
+  fi
   curl -fsS "http://127.0.0.1:${MOCK_PORT}/health" >/dev/null 2>&1 || die "mock endpoint did not come up (see $log)"
 fi
 
@@ -160,22 +209,37 @@ elif [ "${CWOFFEE_CORE:-rust}" = pi ]; then
   note "toolhost   : ${CWOFFEE_CWTOOL} (from the environment; this run does NOT rebuild it)"
 fi
 note "log        : $log"
+if [ -n "$ONLY" ]; then
+  export CWOFFEE_SELFTEST_ONLY="$ONLY"
+  note "checks     : TARGETED [$ONLY] - the other groups are NOT running, so a green here covers these groups only"
+  note "           : the whole suite is: scripts/selftest.sh (no arguments); names: scripts/selftest.sh --list"
+else
+  note "checks     : every group (a full pass)"
+fi
 
 cleanup() {
   # Only the instance this script started. The user may be running the real app
   # right now, and a test script has no business closing it; the scratch config
   # and data dirs are why two instances can coexist.
+  # The idle keeper goes back before anything is deleted: it restores the session's own
+  # idle-delay on this signal, and a keeper that is left running is a desktop that never
+  # blanks. Ended by the pid it printed, never by a name pattern - the launching shell has
+  # the script's text in its own command line.
+  if [ -n "${KEEPER_PID:-}" ]; then
+    kill "$KEEPER_PID" >/dev/null 2>&1
+    for i in 1 2 3 4 5; do kill -0 "$KEEPER_PID" >/dev/null 2>&1 || break; sleep 0.2; done
+  fi
   [ -n "${APP_PID:-}" ] && kill "$APP_PID" >/dev/null 2>&1
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" >/dev/null 2>&1
   # The clipboard goes back before anything is deleted: a test that quietly eats
   # what you had copied is a test that costs you an afternoon of work.
   if [ "${CLIP_ARMED:-0}" = 1 ] && [ -d "${SCRATCH:-}/clip" ]; then
     if [ -s "$SCRATCH/clip/image.png" ]; then
-      wl-copy --type image/png < "$SCRATCH/clip/image.png" >/dev/null 2>&1
+      timeout 6 wl-copy --type image/png < "$SCRATCH/clip/image.png" >/dev/null 2>&1
     elif [ -s "$SCRATCH/clip/text.txt" ]; then
-      wl-copy < "$SCRATCH/clip/text.txt" >/dev/null 2>&1
+      timeout 6 wl-copy < "$SCRATCH/clip/text.txt" >/dev/null 2>&1
     else
-      wl-copy --clear >/dev/null 2>&1
+      timeout 6 wl-copy --clear >/dev/null 2>&1
     fi
     rm -f "$CLIP_MARKER" "$CLIP_BACKUP_IMG" "$CLIP_BACKUP_TXT"
   fi
@@ -209,10 +273,10 @@ CLIP_BACKUP_TXT=/tmp/cwoffee-clipboard-backup.txt
 if [ "$CLIP_TOOL" = 1 ] && [ -f "$CLIP_MARKER" ]; then
   prev_img=$(sed -n '1p' "$CLIP_MARKER")
   fixture_hash=$(sed -n '2p' "$CLIP_MARKER")
-  now_hash=$(wl-paste -n -t image/png 2>/dev/null | sha256sum | cut -d' ' -f1)
+  now_hash=$(timeout 5 wl-paste -n -t image/png 2>/dev/null | sha256sum | cut -d' ' -f1)
   if [ -n "$now_hash" ] && [ "$now_hash" = "$fixture_hash" ]; then
     if [ -s "$prev_img" ]; then
-      wl-copy --type image/png < "$prev_img" >/dev/null 2>&1
+      timeout 6 wl-copy --type image/png < "$prev_img" >/dev/null 2>&1
       note "clipboard  : a previous run left its fixture on the selection; the image you had went back"
     else
       wl-copy --clear >/dev/null 2>&1
@@ -327,13 +391,44 @@ note "artifacts  : app $(date -r target/release/cwoffee-app '+%m-%d %H:%M:%S'), 
 # No pkill here: this run owns its own config, data dir, workspace and gateway
 # port, so it coexists with an app the user already has open.
 
+# ---- keep the desktop painting for the length of the run -------------------
+# The page checks pace themselves on requestAnimationFrame. When the session goes idle the
+# screen blanks, the compositor stops painting the app window, and rAF goes silent: every
+# frame-paced check then falls back to its timeout floor, the run stretches to twice its
+# length, and the checks that need a real paint skip instead of asserting. This run hit that:
+# sixteen minutes of silence after the loop check, and the cup-band check never ran.
+#
+# The lever is the desktop's own idle switch through the desktop's own API. See the header of
+# scripts/idlekeep.py for why it is not an X client (on this Wayland session an X client that
+# fakes input is a remote-desktop request, and the portal answers with a consent dialog in
+# front of the window the script was trying to keep painted). DPMS is not touched, the lock
+# screen is not touched, and no input is injected. The keeper restores the value it took down,
+# including when a previous keeper was killed and never got to.
+KEEPER_PID=""
+if command -v gsettings >/dev/null 2>&1; then
+  python3 -u scripts/idlekeep.py >"$SCRATCH/idlekeep.out" 2>&1 &
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    KEEPER_PID=$(sed -n 's/^pid \([0-9]\{1,9\}\)$/\1/p' "$SCRATCH/idlekeep.out" | head -1)
+    [ -n "$KEEPER_PID" ] && break
+    sleep 0.2
+  done
+  note "idle keeper: $(grep -v '^pid ' "$SCRATCH/idlekeep.out" | head -1)"
+  [ -n "$KEEPER_PID" ] && note "idle keeper: pid $KEEPER_PID (ended by that number, and it puts idle-delay back on the way out)"
+else
+  note "idle keeper: no gsettings on this desktop; the session's own blanking is left alone"
+fi
+
 note "launching the app"
 # The paste check needs an image on the selection. Whatever was there is saved
 # first and put back by cleanup(), in the same order it was found.
 if [ "$CLIP_TOOL" = 1 ]; then
   mkdir -p "$SCRATCH/clip"
-  wl-paste -l 2>/dev/null | grep -qx 'image/png' && wl-paste -n -t image/png > "$SCRATCH/clip/image.png" 2>/dev/null
-  wl-paste -l 2>/dev/null | grep -qx 'text/plain' && wl-paste -n -t text/plain > "$SCRATCH/clip/text.txt" 2>/dev/null
+  # Every wl-paste call here gets a timeout. `wl-paste` blocks forever when the selection's owner is
+  # gone - which is exactly the state a killed self-test app leaves behind, because the app that had the
+  # clipboard died without giving it up. Without the timeout the run stops *before launching the app*,
+  # and the log's last line is "launching the app": a harness stall that reads like an app crash.
+  timeout 3 wl-paste -l 2>/dev/null | grep -qx 'image/png' && timeout 5 wl-paste -n -t image/png > "$SCRATCH/clip/image.png" 2>/dev/null
+  timeout 3 wl-paste -l 2>/dev/null | grep -qx 'text/plain' && timeout 5 wl-paste -n -t text/plain > "$SCRATCH/clip/text.txt" 2>/dev/null
   # Outlive $SCRATCH: cleanup() deletes that directory, and a run that survives to
   # cleanup() does not need this copy. A run that does not reach cleanup() does.
   cp "$SCRATCH/clip/image.png" "$CLIP_BACKUP_IMG" 2>/dev/null || true
@@ -342,7 +437,7 @@ if [ "$CLIP_TOOL" = 1 ]; then
   # cannot see the harness fixture directory, so the fixture is staged where both
   # sides know to look - otherwise the byte comparison silently does nothing.
   cp tests/fixtures/clipboard.png /tmp/cwoffee-selftest-fixture.png 2>/dev/null || true
-  if wl-copy --type image/png < tests/fixtures/clipboard.png 2>/dev/null; then
+  if timeout 6 wl-copy --type image/png < tests/fixtures/clipboard.png 2>/dev/null; then
     # The receipt is written only once the fixture is actually installed: a marker
     # for a run that never touched the clipboard would "restore" something nobody
     # took.
@@ -357,14 +452,26 @@ if [ "$CLIP_TOOL" = 1 ]; then
     CLIP_FIXTURE=/tmp/cwoffee-selftest-fixture.png
     note "clipboard  : a $(wc -c < tests/fixtures/clipboard.png)-byte PNG is on the selection; the old content goes back after"
   else
-    note "clipboard  : wl-copy refused the fixture; the paste check will report the failure"
+    # Not armed, so the app is told there is no fixture (`CWOFFEE_SELFTEST_CLIP_IMG` stays empty)
+    # and the check reports its own skip. A desktop whose clipboard is wedged - a killed app still
+    # owning the selection does exactly this - must cost one check, not the run.
+    note "clipboard  : wl-copy would not take the fixture (or the clipboard is wedged); the paste check will say it was skipped"
   fi
 fi
 # Two keys arm the harness: a self-test bundle *and* an armed process. See
 # commands.rs::selftest_armed - the release binary embeds whatever ui/dist holds,
 # so a production start right after this script unarms the same bundle and must
 # not drive the user's endpoint, config or session store.
-CWOFFEE_SELFTEST=1 CWOFFEE_SELFTEST_CLIP_IMG="${CLIP_FIXTURE:-}" ./target/release/cwoffee-app >>"$log" 2>&1 &
+# WebKitGTK's accelerated compositing drives `requestAnimationFrame` off the compositor's frame
+# callbacks, and mutter stops sending those as soon as it decides it is not showing the window. On
+# this Wayland desktop an app has no legal way to insist on being shown: a plain present is refused,
+# a minimize/restore is refused, `set_always_on_top` is ignored, and the log says `focused=false`
+# however often we ask. Measured in the same run both ways: accelerated compositing gave 0 frames
+# across 76 frame waits and forced 13 layout checks to be skipped; with compositing disabled the run
+# had 0 stalls and every layout check ran. The frame-paced numbers then describe JS and layout cost
+# instead of paint scheduling, which is what those checks are actually claiming. This is set for the
+# armed run only - a production start never sees it.
+CWOFFEE_SELFTEST=1 CWOFFEE_SELFTEST_CLIP_IMG="${CLIP_FIXTURE:-}" CWOFFEE_SELFTEST_ONLY="${CWOFFEE_SELFTEST_ONLY:-}" WEBKIT_DISABLE_COMPOSITING_MODE=1 ./target/release/cwoffee-app >>"$log" 2>&1 &
 APP_PID=$!
 
 # The premise, checked before anything is graded. The pi core prints how many extensions it
@@ -402,7 +509,7 @@ while [ $SECONDS -lt $deadline ]; do
   # A page-side exception inside the harness kills the run mid-chain: no verdict is
   # printed, and the only signal would otherwise be a 900 s watchdog expiring with the
   # crash three seconds in. Say which line threw, because that is the whole diagnosis.
-  if grep -q "UNCAUGHT:" "$log" 2>/dev/null; then verdict=throw; break; fi
+  if grep -qE "UNCAUGHT:|REJECTION:" "$log" 2>/dev/null; then verdict=throw; break; fi
   # "Is there a process slot" is not "is it running". A window the user closed leaves a
   # reaped-or-zombie pid that `kill -0` happily answers for, and the run then sits out the
   # whole 900 s before saying what happened in the first three seconds. Read the state.
@@ -419,7 +526,14 @@ if [ -z "$REAL" ]; then
   curl -fsS "http://127.0.0.1:${MOCK_PORT}/mock/state" 2>/dev/null \
     | node -e '
       let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
-        const j=JSON.parse(s);
+        // This block reports; it must not be able to end the run. An empty stdin means curl got
+        // nothing (the mock is already down, or the port moved), and an uncaught throw here used to
+        // take the script down before it printed the verdict - a truncated run that reads as a hang.
+        let j;
+        try { j = JSON.parse(s) } catch (e) {
+          console.log(`  the mock state endpoint answered with nothing parseable (${JSON.stringify(s.slice(0, 90))}); its counts are unknown, not zero`);
+          return;
+        }
         const hits=Object.entries(j.hits??{}).sort((a,b)=>b[1]-a[1]);
         console.log(`  requests ${j.requests}, turns served ${j.turns}, thinking-off ${j.thinking_off}, thinking-on ${j.thinking_on}`);
         for (const [n,c] of hits) console.log(`  ${String(c).padStart(3)}x ${n}`);
@@ -448,7 +562,7 @@ case $verdict in
     # measured and the board says nothing about the app. Quote the throw, and say plainly
     # that the red is the harness's own.
     printf '\033[31mthe page harness threw an uncaught error; nothing after it ran:\033[0m\n' >&2
-    grep -E "UNCAUGHT:" "$log" | tail -5 >&2
+    grep -E "UNCAUGHT:|REJECTION:" "$log" | tail -5 >&2
     tail -12 "$log" >&2
     exit 1 ;;
   *)

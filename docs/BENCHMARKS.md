@@ -604,8 +604,10 @@ then no option row, input, Back/Next or Send left in the settled card, a head li
 `answered 2 of 2`, and a Q&A summary that is hidden until the head is expanded. Declining sends an
 empty answer for each and reads `declined`.
 
-Engine side: a set is one budget (`timeout × (1 + 0.5·(n−1))`), partial answers are kept and
-labelled, and every question that went unanswered gets its own `questionExpired`.
+Engine side: a set is one budget (`timeout × (1 + 0.5·(n−1))`, and by default there is no
+`timeout` at all, so the set waits for a person), partial answers are kept and
+labelled, and every question that went unanswered gets its own `questionExpired {id, why}`
+so a card closed by Stop does not read like one closed by a clock.
 
 ### Frame clock: the baseline is now part of the measurement
 

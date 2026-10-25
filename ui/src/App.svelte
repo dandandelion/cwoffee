@@ -4,7 +4,7 @@
   // own tick is aliased rather than shadowed: an await that resolves to a number is a bug
   // the compiler only caught because the names happened to collide.
   import { tick as renderTick } from 'svelte'
-  import { invoke, Channel, transportKind, gatewayRole, onReconnect, onResync } from './lib/transport'
+  import { invoke, Channel, transportKind, gatewayRole, onReconnect, onResync, revalidateSocket } from './lib/transport'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import type {
     ApprovalAnswer,
@@ -22,6 +22,8 @@
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
   import { Transcript, linkProbe, subjectFor, riskHeadline } from './lib/transcript'
+  import { describeLoop, LoopWatch } from './lib/loop'
+  import { LoopHold, IDLE_HOLD, aniFrames, armedFromUrl } from './lib/anipause'
   import { installContextMenu } from './lib/ctxmenu'
   import { pageLog } from './lib/pagelog'
   import Section from './lib/settings/Section.svelte'
@@ -34,12 +36,23 @@
   // ---- state --------------------------------------------------------------
   let rootEl: HTMLDivElement | undefined = $state()
   let transcript: Transcript | null = null
+  /**
+   * Where the reader is, as the transcript reports it: pinned means it will follow the newest
+   * line, `away` is how far the bottom of the content sits below the view, and `ask` says a
+   * question card is waiting. This is what the jump button is drawn from; the transcript owns it
+   * because only the transcript knows which growth was work and which was the answer.
+   */
+  let followState = $state({ pinned: true, away: 0, ask: false })
 
   let busy = $state(false)
   let model = $state('')
   let draft = $state('')
   let mode = $state<'ask' | 'session' | 'auto'>('ask')
   let thinking = $state<ReasoningLevel>('xhigh')
+  /** What the settings screen says a *new* conversation starts at. `thinking` is what this
+    conversation is using; the two differ as soon as the composer dial moves, and the settings page
+    has to show the first while the composer shows the second. */
+  let thinkingDefault = $state<ReasoningLevel>('xhigh')
   let hostState = $state<HostState | null>(null)
 
   let sessions = $state<Session[]>([])
@@ -67,8 +80,11 @@
    * engine could be refused with the panel already closed, and the only trace was a
    * line in the server log. Anything the user asked for and did not get says so here.
    */
-  let toast = $state<{ text: string; bad: boolean } | null>(null)
+  let toast = $state<{ text: string; bad: boolean; note?: boolean } | null>(null)
   let toastTimer = 0
+  /** Every app-level note this window has shown, oldest first. The checks read this
+      instead of scraping the transcript, because notes are no longer in the transcript. */
+  const noteLog: string[] = []
   /** Read the current toast text. Reading `toast` directly inside a long async
       block lets TS narrow the $state to `null` after an assignment and then call
       the next read `never`. */
@@ -76,10 +92,35 @@
     return (toast as { text: string } | null)?.text ?? ''
   }
 
-  function say(text: string, bad = false) {
+  function say(text: string, bad = false, dwell = 4600) {
     toast = { text, bad }
     if (toastTimer) clearTimeout(toastTimer)
-    toastTimer = setTimeout(() => (toast = null), 4600)
+    toastTimer = setTimeout(() => (toast = null), dwell)
+  }
+
+  let noteStack = 0
+
+  /**
+   * An app-level note: a migration, a compaction, "this endpoint has no window set".
+   *
+   * These used to be painted into the transcript between the turns, and that is what made
+   * the transcript messy: a reader scanning what the model had said kept hitting lines about
+   * the software. They still deserve to be seen once, so they come here — with a longer dwell
+   * than a refusal, because nobody has to act on them and 4.6s is how a notice becomes a
+   * blur. A note that lands while one is already up is counted, not stacked: three migration
+   * lines are one notice that says three arrived.
+   */
+  function noteToast(text: string) {
+    noteLog.push(text)
+    if (noteLog.length > 60) noteLog.shift()
+    if (toast?.note) noteStack++
+    else noteStack = 0
+    toast = { text: noteStack ? `${text} (+${noteStack} earlier)` : text, bad: false, note: true }
+    if (toastTimer) clearTimeout(toastTimer)
+    toastTimer = setTimeout(() => {
+      toast = null
+      noteStack = 0
+    }, 11000)
   }
 
   let query = $state('')
@@ -134,7 +175,7 @@
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
   type MenuKind =
-    'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'search' | 'tools' | 'naming' | 'display'
+    | 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'wspick' | 'search' | 'tools' | 'naming' | 'display'
 
   /** Mirror of the desktop's GatewayStatus. Not reachable over the gateway
       itself: the payload carries the token inside ready-to-open URLs. */
@@ -165,11 +206,11 @@
     top: number
     bottom: number
     /**
-     * Top edge of the bar the opener lives in (the footer, for the search /
-     * telemetry / gateway pills), or the opener's own top when it is not in a bar.
+     * Top edge of the pinned strip the opener lives in (the sidebar's identity row, for the
+     * telemetry / gateway / theme buttons), or the opener's own top when it is not in a strip.
      * A panel that flips upward has to clear this, not just the pill: the pill sits
      * inside the bar with padding above it, and clearing only the pill left the
-     * panel painted over the footer's own text.
+     * panel painted over the identity row's own text.
      */
     barTop: number
   }
@@ -190,6 +231,8 @@
     key: string
     label: string
     hint: string
+    /** Which settings page renders it. A pref with no page is a control that exists nowhere. */
+    group: string
     value: string
     default: string
     is_default: boolean
@@ -318,32 +361,6 @@
   // The tool list is read from the engine, never typed here: the description a tool
   // carries is the same text the model is handed, so a UI-side copy is a second copy of
   // prompt bytes that will drift.
-  type TitleStatus = {
-    enabled: boolean
-    script: string
-    script_found: boolean
-    python: string
-    python_found: boolean
-    weights_cached: boolean
-    model: string
-    cache: string
-    threads: number
-    peak_rss_mb: number
-    in_flight: boolean | null
-  }
-  // Every fact on the Titles screen comes from the host. The one number that does not is
-  // the peak memory, and that is quoted from a measurement rather than invented - the
-  // screen exists so the cost is visible before someone turns the feature on.
-  let titleInfo = $state<{ status: TitleStatus; config_path?: string } | null>(null)
-  let titlesErr = $state('')
-  async function loadTitles() {
-    try {
-      titleInfo = await invoke<{ status: TitleStatus; config_path?: string }>('titlegen_status')
-      titlesErr = ''
-    } catch (e) {
-      titlesErr = String(e)
-    }
-  }
   let toolViews = $state<{ name: string; description: string }[]>([])
   let toolsErr = $state('')
   async function loadTools() {
@@ -363,6 +380,96 @@
   let settings = $state<{ page: SetPage; flash: string } | null>(null)
   let settingsEl = $state<HTMLElement | null>(null)
   let setBodyEl = $state<HTMLElement | null>(null)
+  /** The app's own root, so the settings dialog can make everything else inert. */
+  let shellEl = $state<HTMLElement | null>(null)
+
+  /**
+   * The size the settings dialog opens at, as the person left it.
+   *
+   * The dialog is destroyed when it closes, so a size dragged with `resize: both` would
+   * otherwise be gone on the next opening - a control that resets every time you use it is a
+   * control that does not exist. One size for the whole screen, not one per page: the pages
+   * are tabs of the same dialog, and a frame that changes size when you change tab is the
+   * behaviour that was complained about in the first place.
+   */
+  const SETTINGS_SIZE_KEY = 'cwoffee.settings.size.v1'
+  let settingsSize = $state<{ w: number; h: number } | null>(readSettingsSize())
+
+  function readSettingsSize(): { w: number; h: number } | null {
+    try {
+      const raw = localStorage.getItem(SETTINGS_SIZE_KEY)
+      if (!raw) return null
+      const v = JSON.parse(raw)
+      if (typeof v?.w === 'number' && typeof v?.h === 'number' && v.w > 200 && v.h > 200) return v
+      return null
+    } catch {
+      // A quota or a corrupt value is not worth an error message: the default size is fine.
+      return null
+    }
+  }
+
+  /** The dialog's inline size, if one was remembered. Clamped to the window on the way
+   *  out, because a laptop unplugged from its monitor has fewer pixels than the last
+   *  opening promised - and the CSS max-width/max-height are the second net. */
+  function settingsStyle(): string {
+    const s = settingsSize
+    if (!s) return ''
+    const w = Math.min(s.w, window.innerWidth - 16)
+    const h = Math.min(s.h, window.innerHeight - 16)
+    return `width:${w}px; height:${h}px`
+  }
+
+  /**
+   * A `use:` action on the dialog: remember the size when it changes and again when it
+   * goes away. The element fires `resize` when the person drags the corner (`resize: both`
+   * in app.css is what makes that handle appear), which is the only moment the size stops
+   * being the app's own.
+   */
+  function rememberSize(node: HTMLElement) {
+    const save = () => {
+      const w = node.offsetWidth
+      const h = node.offsetHeight
+      if (!w || !h) return
+      settingsSize = { w, h }
+      try {
+        localStorage.setItem(SETTINGS_SIZE_KEY, JSON.stringify(settingsSize))
+      } catch {
+        /* private mode, quota: the size just does not persist */
+      }
+    }
+    node.addEventListener('resize', save)
+    return { destroy: save }
+  }
+
+  /**
+   * While the settings dialog is open, the rest of the app is not a place you can act in.
+   *
+   * The dim was always painted over the toolbar, but painting over is not the same as being
+   * unreachable: the toolbar's buttons stayed focusable, tabbable and - at 26% black -
+   * indistinguishable from live controls. One report called it "clicks go through the
+   * settings screen to the metrics bar"; whether the click landed on the dim or on the
+   * button, the answer to the user was the same: the thing behind the dialog still seemed
+   * to be theirs to press. `inert` is the browser's own word for that, and it covers what a
+   * dim cannot: keyboard focus, tab order, and hit-testing. The dialog and its dim are the
+   * two siblings left alone, because the dim is how you get out.
+   */
+  $effect(() => {
+    const open = settings !== null
+    if (!shellEl) return
+    for (const kid of Array.from(shellEl.children)) {
+      const el = kid as HTMLElement
+      if (el === settingsEl || el.classList.contains('mscrim')) continue
+      // `inert` is a property in current engines and nothing at all in older ones; the CSS
+      // rule on `.app-shell.modal-open` is the half that works everywhere, so setting the
+      // property can only add, never regress.
+      try {
+        ;(el as HTMLElement).inert = open
+      } catch {
+        /* no inert support here; the CSS rule is doing the work */
+      }
+      el.setAttribute('aria-hidden', open ? 'true' : 'false')
+    }
+  })
 
   const setPage = $derived(SET_PAGES.find((p) => p.kind === settings?.page) ?? SET_PAGES[0])
   const pageTitle = $derived(setPage.title)
@@ -752,10 +859,7 @@
       if (!webSearch) void loadWebSearch()
     }
     if (page === 'devices') void loadGateway()
-    if (page === 'conversation') {
-      if (!titleInfo) void loadTitles()
-      void refreshState()
-    }
+    if (page === 'conversation') void refreshState()
   }
 
   /** Which folder rows are open on the Workspace page. Opening one is the moment to
@@ -875,11 +979,35 @@
   const thinkingNote = $derived.by(() => {
     const eff = currentCapRow?.efforts ?? []
     const on = THINK_LABEL[thinking]
+    const here =
+      hostState?.reasoning_overridden
+        ? `This conversation is running at ${on}, a choice made in its own composer; it keeps that level for the rest of the conversation and no other conversation sees it.`
+        : `This conversation is running at ${on}, which is the default.`
+    const dflt = `New conversations start at ${THINK_LABEL[thinkingDefault]}.`
+    // What the model process itself says it can answer for. This is the one sentence in the app that
+    // answers "did the dial take effect?": a model that declares no thinking runs at off no matter
+    // what the dial shows, and that used to be invisible - the level was clamped inside the model
+    // process, before the request was built, and every surface still said `low`.
+    const offered = hostState?.reasoning_levels ?? []
+    const wire = !offered.length
+      ? ' Nobody has asked the model process which levels it offers, so nothing here can promise this one reaches the wire.'
+      : offered.includes(thinking)
+        ? ` The model process says it answers for ${offered.join(', ')}, and this level is among them.`
+        : ` The model process says it answers for ${offered.join(', ')} and not this one - the dial is set, but the level is not reaching the wire.`
     if (!eff.length)
-      return `Set to ${on}. No discovery has asked this endpoint which levels it accepts, so the request goes out and the server answers at whatever depth it has. Discover the model to see the levels it names back.`
+      return `${here} ${dflt} No discovery has asked this endpoint which levels it accepts, so the request goes out and the server answers at whatever depth it has. Discover the model to see the levels it names back.${wire}`
     if (!eff.includes(thinking))
-      return `Set to ${on}. This endpoint named ${eff.join(', ')} and did not name this one, so the answer may come at the nearest level it implements.`
-    return `Set to ${on}. This endpoint named ${eff.join(', ')}. The level travels with each turn, so the next request carries it; a model process that is already running keeps the level it started with.`
+      return `${here} ${dflt} This endpoint named ${eff.join(', ')} and did not name this one, so the answer may come at the nearest level it implements.${wire}`
+    return `${here} ${dflt} This endpoint named ${eff.join(', ')}. The level travels with each turn of this conversation; a model process that is already running keeps the level it started with.${wire}`
+  })
+  /** The settings page's own note: it edits the default, and the reader has to be able to tell that
+    apart from the dial in the composer, which edits one conversation. */
+  const thinkingDefaultNote = $derived.by(() => {
+    const here = THINK_LABEL[thinking]
+    const dflt = THINK_LABEL[thinkingDefault]
+    return hostState?.reasoning_overridden
+      ? `Every new conversation starts here. The one you are in has its own level (${here}), chosen in its composer, and it keeps that for the rest of the conversation - changing this does not change it.`
+      : `Every new conversation starts here. The conversation you are in has not moved its own dial, so it follows this: ${here}.`
   })
   function titleOf(id: number) {
     return sessions.find((x) => x.id === id)?.title ?? 'session'
@@ -974,7 +1102,12 @@
     // Hiding work because the sidebar had no row for it is the failure mode.
     for (const [path, list] of byPath) {
       if (seen.has(path)) continue
-      out.push({ path, label: path ? basenameOf(path) : 'Default', list })
+      // The word the person asked for. "Default" is the name of a setting, not of a place,
+      // and it sits in a list of folder names - so a group of conversations that were never
+      // given a folder read as if they had been given the app's chosen one. The chip, the
+      // row menu, the model's own environment block and this header now all say the same
+      // three words.
+      out.push({ path, label: path ? basenameOf(path) : 'No workspace', list })
       seen.add(path)
     }
     return out
@@ -1003,10 +1136,34 @@
   // The folder shown next to the composer is the folder of the conversation on
   // screen, not whatever the engine last moved to: since browsing no longer moves
   // the engine, the two legitimately differ.
+  /**
+   * What the workspace chip says about a folder, in one function so the harness can ask it
+   * directly instead of rebuilding the state a `$derived` needs.
+   *
+   * A conversation parked in the system's temp folder has no folder in the sense the person
+   * means: nobody chose it, nothing of theirs is in it, and a reboot clears it. Drawing it as
+   * `tmp` makes it look like a folder was picked, which is the report: "the backend workspace
+   * is /tmp; the UI should say No workspace". The tools do run somewhere, and the app is not
+   * going to pretend otherwise to the engine - but the word the app uses for that somewhere
+   * has to be the one already used by the sidebar group and by the model's own environment
+   * block, or the three disagree in front of the person.
+   */
+  function wsChipText(path: string): string {
+    // No path at all is a different fact from a path in the temp folder, and it gets its own
+    // words: a conversation that was never given a place says "no folder", while one parked
+    // in the system's scratch folder says the phrase the sidebar and the model use.
+    if (!path) return 'no folder'
+    if (isTempRoot(path)) return 'No workspace'
+    return basenameOf(path)
+  }
+
   const wsChipLabel = $derived.by(() => {
-    if (viewId === null) return draftWorkspace ? draftWsLabel : shortWorkspace
-    const stored = sessions.find((s) => s.id === viewId)?.workspace ?? ''
-    return stored ? basenameOf(stored) : 'no folder'
+    const path =
+      viewId === null
+        ? draftWorkspace || (hostState?.workspace ?? '')
+        : (sessions.find((s) => s.id === viewId)?.workspace ?? '')
+    if (viewId === null && draftWorkspace) return draftWsLabel
+    return wsChipText(path)
   })
 
   const draftWsLabel = $derived(
@@ -1118,7 +1275,13 @@
     }
   }
 
-  /** Delete rows by the same verb the row menu uses, one row at a time. */
+  /**
+   * Delete rows by the same verb the row menu uses, one row at a time.
+   *
+   * A bulk delete that includes the conversation on screen has to unload it, or the
+   * transcript keeps painting rows that no longer exist and the composer stays armed
+   * against an id the engine can no longer load.
+   */
   async function deleteRows(ids: number[]): Promise<{ gone: number; failed: number }> {
     let gone = 0
     let failed = 0
@@ -1130,6 +1293,7 @@
           pageLog(`delete_session ${id} failed: ${e}`)
         })
     }
+    if (viewId !== null && ids.includes(viewId)) showStartScreen()
     return { gone, failed }
   }
 
@@ -1499,7 +1663,7 @@
       right: r.right,
       top: r.top,
       bottom: r.bottom,
-      barTop: anchor.closest('footer')?.getBoundingClientRect().top ?? r.top,
+      barTop: anchor.closest('.side-foot')?.getBoundingClientRect().top ?? r.top,
     }
   }
 
@@ -1518,9 +1682,9 @@
     x = Math.max(8, Math.min(x, vw - w - 8))
     let y = m.bottom + 6
     if (y + h + 8 > vh) {
-      // Flip above the opener - but above the *bar* the opener sits in. Clearing
-      // only the pill left the panel's lower edge 4px inside the footer band, and
-      // the footer text showed through the panel's shadow.
+      // Flip above the opener - but above the *row* the opener sits in. Clearing
+      // only the button left the panel's lower edge a few px inside the sidebar's pinned
+      // footer, and the identity row showed through the panel's shadow.
       const above = Math.min(m.top, m.barTop) - h - 6
       y = above >= 8 ? above : Math.max(8, vh - h - 8)
     }
@@ -1530,6 +1694,7 @@
   function closeMenu() {
     menu = null
     menuPos = null
+    wsFilter = ''
     confirmDeleteId = null
   }
 
@@ -1650,7 +1815,9 @@
   }
   async function pickThinking(t: ReasoningLevel) {
     menu = null
-    await setThinking(t)
+    // The composer dial is the per-conversation ask. It must never write the config file, or a
+    // level chosen for one chat becomes the level every future chat starts at.
+    await setThinking(t, false)
   }
   async function pickModel(m: string) {
     menu = null
@@ -1666,7 +1833,7 @@
   }
 
   let gpu = $state<GpuReport | null>(null)
-  // IPC health is surfaced in the footer. An empty catch here once hid a CSP
+  // IPC health is reported through render_report and the console. An empty catch here once hid a CSP
   // misconfiguration that killed every invoke, and every other gate still passed.
   let ipc = $state<{ ok: boolean; msg: string }>({ ok: false, msg: 'not tried' })
   // Why the transport failed, in words the server chose. A rejected token and an
@@ -1741,6 +1908,19 @@
   let gw = $state<GatewayStatus | null>(null)
   let gwErr = $state('')
   let gwBusy = $state(false)
+  // What closing this window would do to the gateway, from the host: which binary it would
+  // start, or why it cannot. The "keep devices working" toggle is only honest next to that,
+  // because the setting is a promise about a process that does not exist yet.
+  interface GatewayPlan {
+    binary: string | null
+    running: boolean
+    host: string
+    port: number
+    via: string
+    stop: string
+    log: string
+  }
+  let gwPlan = $state<GatewayPlan | null>(null)
 
   // ---- web search provider ------------------------------------------------
   // Three providers, one dropdown, and a test button. The status line comes from
@@ -1778,6 +1958,18 @@
   let webSearchBusy = $state(false)
   let webSearchProbe = $state<WebSearchProbe | null>(null)
   let webSearchUrl = $state('')
+  /**
+   * The provider the panel is *offering*, whether or not the config accepted it yet.
+   *
+   * The URL box used to hang off the saved backend alone, which made a refused choice its
+   * own cover story: pick "SearXNG, already running" with the box empty, the engine refuses
+   * with "SearXNG needs a URL, for example http://127.0.0.1:8080/search", the saved backend
+   * stays `auto`, and the field that message is asking for is the one that just stopped
+   * rendering. The dead end is worse than the refusal. So visibility follows the offered
+   * choice, and the choice only clears when the config takes it or the person picks
+   * something else.
+   */
+  let webSearchPending = $state<string | null>(null)
 
   const SEARCH_PROVIDERS: { id: string; label: string; sub: string }[] = [
     {
@@ -1832,6 +2024,9 @@
     webSearchBusy = true
     webSearchErr = ''
     webSearchProbe = null
+    // The offered choice is visible immediately, and stays visible if the write is refused:
+    // "SearXNG needs a URL" has to come with the URL box, not with its disappearance.
+    webSearchPending = id
     try {
       webSearch = await invoke<SearchView>('set_search_backend', {
         backend: id,
@@ -1839,6 +2034,10 @@
         // off the frame, and the desktop command now asks for them by the same spelling.
         searxng_url: webSearchUrl,
       })
+      // Only a config that took the value gets to claim it. `webSearch.backend` is what the
+      // file says, and the engine can answer with a different provider than the one asked
+      // for (an unusable choice is refused and the old one kept).
+      webSearchPending = webSearch.backend === id ? null : webSearch.backend
       say(`search: ${webSearch.describing}`)
     } catch (e) {
       // The engine refused (no URL for a manual instance, a typo in the name).
@@ -1868,6 +2067,17 @@
   // still refuses that bind outright if no token exists.
   let gwScope = $state<'loopback' | 'lan'>('lan')
 
+  /**
+   * Which scope the Devices panel is offering, in one place. While a gateway is running the
+   * answer is the address it is actually bound to; only when it is off does the panel get to
+   * show what the next start would ask for. Both the control and the code that decides
+   * whether a click has anything to do read this, so they cannot drift - and when they
+   * drifted, one of the two scope buttons silently did nothing.
+   */
+  const gwScopeShown = $derived<'loopback' | 'lan'>(
+    gw?.running ? (gw.host === '127.0.0.1' ? 'loopback' : 'lan') : gwScope,
+  )
+
   const gwText = $derived(
     transportKind !== 'tauri'
       ? 'you are on it'
@@ -1896,6 +2106,14 @@
     } catch (e) {
       gwErr = cleanErr(`${e}`)
     }
+    try {
+      gwPlan = await invoke<GatewayPlan>('gateway_handoff_plan')
+    } catch (e) {
+      // The panel still renders without it; what it would lose is the sentence that says
+      // whether "keep devices working" can be honoured at all.
+      gwPlan = null
+      pageLog(`gateway hand-off plan: ${e}`)
+    }
   }
 
   async function setGateway(on: boolean) {
@@ -1909,6 +2127,10 @@
             lan: gwScope === 'lan',
           })
         : await invoke<GatewayStatus>('gateway_stop')
+      // The bind the app settled on is now the scope, whatever was asked for: a LAN bind
+      // refused for want of a token leaves the gateway on loopback, and a panel still
+      // showing "any device" over a 127.0.0.1 listener is how the next click goes wrong.
+      if (gw?.running) gwScope = gw.host === '127.0.0.1' ? 'loopback' : 'lan'
       pageLog(
         `gateway ${on ? 'on' : 'off'}: ${gw?.running ? `${gw.host}:${gw.port}` : 'stopped'}`,
       )
@@ -1923,7 +2145,14 @@
   }
 
   async function setScope(which: 'loopback' | 'lan') {
-    if (gwScope === which) return
+    // Compare against what the panel *shows*, not against `gwScope`. The control's value
+    // comes from the running listener whenever there is one, and `gwScope` is only what this
+    // window last asked for. They disagree in the commonest case: a gateway that came back on
+    // loopback (boot default, a refused LAN bind, another window) while this panel still said
+    // "any device". Clicking "any device" then returned early, did nothing, and the only way
+    // to reach the LAN was to click "this machine" first - twice - which is exactly what the
+    // Devices page used to require.
+    if (gwScopeShown === which) return
     gwScope = which
     // Scope is a bind address, so changing it live means a new listener. Doing
     // it in one action beats telling the user to toggle twice.
@@ -2021,6 +2250,45 @@
   // running turn's reasoning block was painted into whatever session happened
   // to be on screen, which read as "this conversation lost its history".
   let viewId = $state<number | null>(null)
+
+  /**
+   * A conversation typing its own name.
+   *
+   * `titleDelta` arrives once per token, carrying the name so far; the row is not
+   * renamed in the store until the name is final. So while a name is in flight the row
+   * paints from here, and deliberately *not* by writing into `sessions`: a
+   * `loadSessions()` landing mid-name would put "New Session" back on the row and the
+   * animation would read as a glitch rather than as a name arriving.
+   */
+  let namingId = $state<number | null>(null)
+  let namingText = $state('')
+  /** When the first name paint for `namingId` arrived, for the ordering claim in the selftest. */
+  let namingFirstAt = 0
+  /** The final name the engine claimed for `namingId`, once it said it was done. */
+  let namingDone = $state('')
+  function namingOf(s: Session): string {
+    return namingShownFor(s) ? namingText : s.title
+  }
+  /**
+   * Whether the in-flight name may paint over this row's stored title.
+   *
+   * Two states, and the difference between them is a bug each:
+   *  - the row still carries a placeholder: the name is arriving, so paint it;
+   *  - the store has a real title: it wins, *unless* it is the same name the engine just
+   *    finished claiming, in which case the caret gets its beat and the text is identical
+   *    either way. Painting an in-flight name over a *different* stored title is how a rename
+   *    somebody had just typed disappeared for a second and a half.
+   */
+  function namingShownFor(s: Session): boolean {
+    if (namingId !== s.id || !namingText) return false
+    if (isPlaceholderTitle(s.title)) return true
+    return namingDone !== '' && s.title === namingDone
+  }
+  /** The names a conversation carries before anything has named it. */
+  function isPlaceholderTitle(t: string): boolean {
+    const x = (t || '').trim().toLowerCase()
+    return x === '' || x === 'new session'
+  }
   let turnSessionId = $state<number | null>(null)
   /// Whether the turn currently in flight is one *this* client started. Only
   /// that case is allowed to hold `busy` against the host's answer: see
@@ -2056,7 +2324,57 @@
   let resyncSeq = 0
   // Empty view = draft, or a session with nothing in it yet.
   const showEmpty = $derived(viewId === null || (viewMsgCount === 0 && !busy))
+
+  // The cup on the opening screen. Its picture carries its own idle motion now — an animated
+  // WebP, whose frame table ends with a hold — so nothing in CSS moves it. That costs two things
+  // the old CSS animation gave for free.
+  //
+  // One: `prefers-reduced-motion` can freeze a keyframe but cannot pause a raster loop. So the
+  // reduced-motion case is a *different file* rather than the same file styled differently: frame
+  // 0 of the same artwork, lifted out of the animation as a single-frame WebP, no re-encode and no
+  // second generation of quality.
+  //
+  // Two: the pause baked into the file is a fixed pause, and a cup that rests for exactly 5.042s
+  // every time reads as a clock. So the hold is rewritten per lap in memory — the last frame's
+  // duration edited in a copy of the shipped bytes, three bytes and one object URL per cycle — and
+  // drawn from IDLE_HOLD. The baked 5042ms stays as what plays before those bytes are in hand, and
+  // as what keeps looping if the fetch ever fails.
+  let reducedMotion = $state(false)
+  const idleArt = $derived(reducedMotion ? '/cwoffee_idle_still.webp' : '/cwoffee_initial_idle_1.webp')
+  let cupEl = $state<HTMLImageElement | null>(null)
+  {
+    const mq = matchMedia('(prefers-reduced-motion: reduce)')
+    reducedMotion = mq.matches
+    const sync = () => {
+      reducedMotion = mq.matches
+      // The cups in a transcript decide their own picture at paint time, so a change to the
+      // setting has to reach them; waiting for the next turn would leave the conversation on
+      // screen still moving (or still) after the user already asked it not to.
+      transcript?.repaintCup()
+    }
+    mq.addEventListener('change', sync)
+    onDestroy(() => mq.removeEventListener('change', sync))
+  }
+  $effect(() => {
+    const el = cupEl
+    if (!el || reducedMotion || !showEmpty) return
+    const hold = new LoopHold(el, '/cwoffee_initial_idle_1.webp', IDLE_HOLD[0], IDLE_HOLD[1])
+    return () => hold.stop()
+  })
+  /**
+   * What the titlebar says after the wordmark: the conversation on screen.
+   * Empty for a draft, where there is no conversation to name and the wordmark is
+   * the whole title. Taken from the session list rather than from the host, because
+   * the titlebar titles the *view* — which is not the session the engine is inside.
+   */
+  const viewTitle = $derived(
+    viewId === null ? '' : sessions.find((s) => s.id === viewId)?.title ?? '',
+  )
   let sentDraft: { text: string; atts: { mime: string; name: string; bytes: number }[] } | null = null
+  // When this client sent the turn it believes is in flight, for `syncBusy`: a forced
+  // reconciliation has to tell "that turn is a memory of one that ended while this tab
+  // slept" from "that send has not reached the host yet".
+  let turnSentAt = 0
   // A cap on *entries*, and entries are merged blocks, not tokens: see
   // `bufferLive`. 4000 raw deltas was the number that lost a turn's tail.
   const LIVE_CAP = 3000
@@ -2206,6 +2524,27 @@
     }
 
     switch (ev.kind) {
+      case 'titleDelta': {
+        // The name arriving, one paint per token. Cumulative by contract, so this is
+        // a plain assignment: no append, no ordering hazard, no double-paint risk.
+        const sid = ev.d.session_id
+        if (namingId !== sid) namingFirstAt = performance.now()
+        namingId = sid
+        namingText = ev.d.text
+        if (ev.d.done) {
+          namingDone = ev.d.text
+          // The caret outlives the last token by a beat. Dropped on the same frame as
+          // the final character, the name reads as cut off mid-word.
+          setTimeout(() => {
+            if (namingId === sid) {
+              namingId = null
+              namingText = ''
+              namingDone = ''
+            }
+          }, 1400)
+        }
+        break
+      }
       case 'sessionChanged':
         sessionChangedCount++
         // The host's switch only repaints the view when it matches what the
@@ -2287,9 +2626,10 @@
         transcript?.settleQuestion(ev.d.id)
         break
       case 'questionExpired':
-        // The tool stopped waiting: timeout, or the turn was cancelled with the
-        // question still parked. Left alone, the card looks answerable forever.
-        transcript?.expireQuestion(ev.d.id)
+        // The tool stopped waiting: the person pressed Stop, a written-down clock ran
+        // out, or the window holding the card closed. Left alone, the card looks
+        // answerable forever; the `why` decides which sentence it ends with.
+        transcript?.expireQuestion(ev.d.id, ev.d.why)
         break
       case 'approvalRequested':
         approval = { id: ev.d.id, tool: ev.d.tool, risk: ev.d.risk, summary: ev.d.summary }
@@ -2341,7 +2681,7 @@
         // model prefilling at 17 tok/s, and the difference decides who is buggy.
         lastPrefill = s.effectivePrefillTps
         // Prove the bar is populated rather than assume it: these are the exact
-        // values the footer binds.
+        // values the sidebar row's titles bind.
         pageLog(
           `telemetry: cache=${s.cacheHitPct}% (${ev.d.cached_tokens}/${ev.d.prompt_tokens}) ` +
             `prefill=${s.effectivePrefillTps}/s avg=${avgPrefill}/s decode=${s.decodeTps}/s ` +
@@ -2428,6 +2768,19 @@
   const shortWorkspace = $derived(
     hostState?.workspace ? hostState.workspace.replace(/\/+$/, '').split('/').pop() || hostState.workspace : '',
   )
+  /**
+   * The folder in prose rather than in a chip: a sentence needs the whole path, and needs
+   * to say *none* when the path is the system's temp folder. `/tmp` in a sentence reads as
+   * a folder somebody chose; it was not chosen, it is what a conversation with no folder
+   * gets. The engine still runs its tools somewhere — that is not a lie to tell — but the
+   * name the app uses for it is "no workspace", the same words the sidebar group and the
+   * model's own environment block use.
+   */
+  const wsShownText = $derived(
+    isTempRoot(hostState?.workspace)
+      ? 'no workspace'
+      : (hostState?.workspace ?? '').replace(/\/+$/, ''),
+  )
   let theme = $state<'light' | 'dark'>('light')
   let attachErr = $state('')
 
@@ -2470,13 +2823,69 @@
   const isTauri = () => typeof (window as any).__TAURI_INTERNALS__ !== 'undefined'
 
   /** Retry the socket after a failure, without reloading the page. */
-  async function retryAttach() {
+  async function retryAttach(force = false) {
     connNote = ''
     await attachChannel()
     if (connNote) return
-    if (transportKind === 'gateway' && (await bootstrapGateway())) return
-    await Promise.all([refreshState(), loadSessions(), loadModels()])
+    if (transportKind === 'gateway' && (await bootstrapGateway(force))) return
+    await Promise.all([refreshState(force), loadSessions(), loadModels()])
     await adoptHostSession()
+  }
+
+  /**
+   * The page is being looked at again after being hidden.
+   *
+   * On a phone this is where several "the app froze" reports live, and none of them
+   * are a frozen app. Two things go wrong while the tab is backgrounded, and both are
+   * still wrong when it comes back:
+   *
+   *   * the socket. iOS suspends the page, the gateway reaps the peer, and the browser
+   *     never reports the close, so `readyState` goes on saying OPEN while every call
+   *     hangs out its timeout. Nothing would notice until an RPC timed out twice.
+   *   * `busy`. The turn's `turnEnd` event is simply gone, and this client believes the
+   *     turn it started is still running, which keeps the composer `disabled` - the one
+   *     state on the screen that stops a person typing.
+   *
+   * So: put the socket through a check it can fail, then re-read the host's state with
+   * `force` so its answer beats this client's memory, then repaint the conversation on
+   * screen so the answer that arrived while we were away is actually shown. Reload is
+   * not an acceptable fix on a phone that was only multitasking.
+   */
+  let waking = false
+  async function wakeCheck() {
+    if (transportKind === 'tauri' || waking) return
+    waking = true
+    try {
+      const { alive, silentMs } = revalidateSocket()
+      pageLog(
+        `page visible again: socket ${alive ? 'alive' : 'revalidating'} after ${
+          Number.isFinite(silentMs) ? Math.round(silentMs / 1000) + 's silent' : 'no connection'
+        }, busy=${busy} turnOurs=${turnOurs}`,
+      )
+      if (!alive) {
+        // A reconnect is already armed, and the reconnected handler re-reads
+        // everything. Don't start a second boot on top of it.
+        return
+      }
+      const wasBusy = busy
+      await refreshState(true)
+      await loadSessions()
+      // A turn that finished while the page slept left an answer in the store this view
+      // never saw: its replay buffer only holds as much as arrived before the sleep, and
+      // the `turnEnd` that would have settled it is gone. If nothing was in flight there
+      // is nothing to repaint - a browser queues the frames it received while hidden and
+      // delivers them on resume, so the transcript is already current, and repainting on
+      // every tab switch would throw away where the reader had scrolled.
+      if (wasBusy && !busy && viewId !== null) await resyncView(viewId)
+    } catch (e) {
+      pageLog(`wake check failed: ${e}`)
+    } finally {
+      waking = false
+    }
+  }
+
+  function onVisibility() {
+    if (document.visibilityState === 'visible') void wakeCheck()
   }
 
   async function chooseWorkspace() {
@@ -2531,6 +2940,147 @@
     if (!path) return
     if (viewId === null) applyDraftWorkspace(path)
     else void applyWorkspace(path)
+  }
+
+  /**
+   * The folder row on the greeting screen, and the list it opens.
+   *
+   * Before this, a session that had not been written showed a folder only *after* one was picked,
+   * and the only way to pick one was a native file dialog launched from the composer's row. That is
+   * two screens away from the decision, and it made the common case - "work in the folder I already
+   * added" - into a browse. The picker puts the added folders in front of the composer with two
+   * standing alternatives under them: add one, or choose none. The filter is kept while the panel is
+   * open and dropped when it closes, because a list remembered with half a word typed in it is a
+   * list that looks broken the next time it opens.
+   */
+  let wsFilter = $state('')
+
+  /** The folders this machine knows, most recent activity first.
+   *
+   * The store returns them in whatever order its union of "registered" and "has sessions" comes back
+   * in, which is not an order a person can predict. What they can predict is that the folder they were
+   * working in yesterday is the one they are reaching for today. Nothing is hidden by the ranking - the
+   * list is a fixed-height scroll box - the ranking only decides what is at the top.
+   */
+  const wsRanked = $derived.by(() => {
+    const last = new Map<string, number>()
+    for (const s of sessions) {
+      if (!s.workspace) continue
+      const prev = last.get(s.workspace) ?? 0
+      if (s.updated_at > prev) last.set(s.workspace, s.updated_at)
+    }
+    return [...workspaces].sort((a, b) => {
+      const la = last.get(a.path) ?? 0
+      const lb = last.get(b.path) ?? 0
+      if (la !== lb) return lb - la
+      return wsLabelOf(a).localeCompare(wsLabelOf(b))
+    })
+  })
+
+  /**
+   * The exchange rule, stated inside the picker as well as on the chip.
+   *
+   * The chip in front of the composer is already disabled for a session that has a folder, so this
+   * reads as redundant until the picker is open and the person is mid-ask. A row that looks clickable,
+   * is clickable, and then refuses is a control that lies about what it does; a row that says it is
+   * closed and why is a control that is still informing them. Both cores enforce the rule anyway -
+   * the engine refuses `set_workspace` on a session that already has one - so this is the honest
+   * surface of a rule that is already real.
+   */
+  const wsPickLocked = $derived(wsLocked)
+  const wsPickLockNote = $derived(
+    `this conversation already works in ${shortWorkspace}: a session keeps its folder, so start a new one to work somewhere else`,
+  )
+
+  /** True after the refusal was spoken, so the caller can bail without duplicating the sentence. */
+  function refuseLockedPick(): boolean {
+    if (!wsPickLocked) return false
+    say(wsPickLockNote, true)
+    closeMenu()
+    return true
+  }
+
+  const wsFiltered = $derived.by(() => {
+    const q = wsFilter.trim().toLowerCase()
+    if (!q) return wsRanked
+    return wsRanked.filter(
+      (w) => wsLabelOf(w).toLowerCase().includes(q) || w.path.toLowerCase().includes(q),
+    )
+  })
+
+  /**
+   * The composer's folder chip: opens the picker, not the folder dialog.
+   *
+   * Choosing a workspace is mostly choosing among folders this machine already has, and a native dialog
+   * cannot show that list - it can only show the filesystem. The dialog is still there, one more press
+   * away under the seam, where asking for a *new* folder is the honest label for it. A session that has
+   * already exchanged keeps its refusal, because a dead control has to say why it is dead.
+   */
+  function openWorkspacePicker(anchor: HTMLElement) {
+    if (wsLocked) {
+      void chooseWorkspace()
+      return
+    }
+    wsFilter = ''
+    openMenu('wspick', anchor)
+  }
+
+  function pickDraftWorkspace(path: string) {
+    if (refuseLockedPick()) return
+    applyDraftWorkspace(path)
+    closeMenu()
+  }
+
+  /** "No workspace selected": the draft goes back to having no folder. */
+  function clearDraftWorkspace() {
+    if (refuseLockedPick()) return
+    if (!draftWorkspace) {
+      closeMenu()
+      return
+    }
+    draftWorkspace = ''
+    wsEditing = false
+    wsDraft = ''
+    wsErr = ''
+    say('this session will have no folder: no tools, nothing written anywhere')
+    closeMenu()
+  }
+
+  /**
+   * "New workspace": add the folder to the list and put the draft in it, in that order.
+   *
+   * Adding is kept separate from applying everywhere else in this app, because a folder joining the
+   * list must not move the tools out from under a session that is already running. Here it cannot:
+   * the session has no folder yet, so "add it" and "work there" are one ask made by one press.
+   */
+  async function newWorkspaceFromPicker() {
+    if (refuseLockedPick()) return
+    if (transportKind !== 'tauri') {
+      // There is no folder dialog on a machine you are not sitting at. The typed-path field is the
+      // same ask, and it is the composer's, where the folder for a draft is edited already.
+      closeMenu()
+      wsDraft = draftWorkspace
+      wsEditing = true
+      return
+    }
+    wsAddErr = ''
+    try {
+      const picked = (await invoke('pick_workspace')) as string | null
+      if (!picked) {
+        say('no folder chosen')
+        return
+      }
+      await addFolderFor(picked)
+      if (wsAddErr) {
+        say(`not added: ${wsAddErr}`, true)
+        return
+      }
+      pickDraftWorkspace(picked)
+    } catch (e) {
+      wsAddErr = cleanErr(e)
+      say(`not added: ${wsAddErr}`, true)
+      pageLog(`pick_workspace from the workspace picker failed: ${String(e)}`)
+    }
   }
 
   /** Focus an element on mount. `autofocus` is flagged by a11y checks and is
@@ -2902,6 +3452,33 @@
    * rather than assumed free.
    */
   /** Sample the frame clock while nothing is streaming: the machine's own ceiling. */
+  /**
+   * Ask for the window back, from inside the app.
+   *
+   * The layout and frame checks are only meaningful on a page the compositor is painting, and the
+   * desktop's other applications take the window away mid-run. The app can present its own window;
+   * anything outside it would have to fake input, which this desktop answers with a remote-desktop
+   * consent dialog - and a test run must not be the reason that dialog appears. So the harness asks
+   * whenever it finds itself blind. At component scope, because the frame sampler needs it as much
+   * as the layout checks do.
+   */
+  let windowAsks = 0
+  async function presentWindow(why: string) {
+    if (transportKind !== 'tauri') return
+    windowAsks++
+    try {
+      const said = await invoke<string>('present_selftest_window')
+      pageLog(`selftest window (${why}, ask ${windowAsks}): ${said}`)
+      // The host answers at once and does the window work on its own thread, because a window call
+      // made from the IPC handler can park the handler - and the page's message channel with it.
+      // So the ask has only been *started* when this returns; give the compositor a beat to answer
+      // before the caller measures whether the window came back.
+      await new Promise((r) => setTimeout(r, 350))
+    } catch (e) {
+      pageLog(`selftest window could not be presented (${why}): ${e}`)
+    }
+  }
+
   async function idleFrameSample(ms = 900) {
     const stop = startFrameCadence()
     await new Promise((r) => setTimeout(r, ms))
@@ -2953,7 +3530,18 @@
       id = requestAnimationFrame(tick)
     }
     id = requestAnimationFrame(tick)
+    // The clock stopping is the symptom of an uncomposited window, and rAF cannot report it: when
+    // there are no frames, there is no tick to notice the absence. So a timer watches the silence
+    // and asks for the window back - Wayland honours an activate (focus) for a normal toplevel even
+    // though it ignores "always on top", which is why the startup pin alone does not hold.
+    let askedForWindow = false
+    const watchdog = setInterval(() => {
+      if (askedForWindow || performance.now() - last < 700) return
+      askedForWindow = true
+      void presentWindow('the frame clock went silent')
+    }, 350)
     return () => {
+      clearInterval(watchdog)
       cancelAnimationFrame(id)
       obs?.disconnect()
       const sorted = gaps.slice(1).sort((a, b) => a - b)
@@ -2990,7 +3578,7 @@
         // The folder the `+` on a workspace row preselected. Empty means "wherever
         // the host is now", which is the old behaviour.
         const id = await invoke<number>('new_session', {
-          title: 'new session',
+          title: 'New Session',
           workspace: draftWorkspace || null,
         })
         // A chat is not a conversation that happens to have no tools; it belongs to a
@@ -3009,6 +3597,10 @@
         }
         viewId = id
         draftWorkspace = ''
+        // The row exists now, so say so now. Without this the sidebar has no row for
+        // the conversation you are typing into until the turn ends - no spinner, and a
+        // titlebar that names nothing while the first question is already on screen.
+        void loadSessions()
       } catch (e) {
         pageLog(`new_session on first send failed: ${e}`)
         return
@@ -3022,6 +3614,7 @@
     // back.
     turnSessionId = viewId
     turnOurs = true
+    turnSentAt = performance.now()
     sentDraft = { text, atts: shown }
     liveBuf = []
     transcript?.addUser(text, shown)
@@ -3082,18 +3675,39 @@
    * knows whether a turn is up, so for any turn this client did not start, the
    * host's answer wins.
    */
-  function syncBusy(h: HostState) {
+  function syncBusy(h: HostState, force = false) {
     // A turn this client started is trusted locally: the host flips `busy` a
     // command-queue hop after we send, and reading false in that window would
     // re-enable the composer mid-send.
-    if (turnOurs) return
+    //
+    // That trust has to expire, because `turnOurs` outlives the turn it describes
+    // whenever the `turnEnd` event never arrives. A phone that backgrounds its tab
+    // mid-turn is frozen by the OS; the socket dies with it and the event is gone for
+    // good. `busy` then stays true forever, `disabled={busy}` keeps the composer dead,
+    // and reloading the page is the only way out — which is exactly what was reported:
+    // "on the phone I can't interact with any input, especially the composer; I always
+    // have to refresh. The trigger seems to be minimising the browser and coming back."
+    //
+    // So a *forced* read - one taken because the page or the connection just came back
+    // - takes the host's answer even about a turn we started. One exception stays
+    // guarded: a send made a moment ago may still be crossing the network, and the host
+    // is right to report it as not busy yet.
+    if (turnOurs && (!force || (turnSentAt && performance.now() - turnSentAt < 2500))) return
     if (busy !== h.busy) {
-      pageLog(`busy corrected ${busy}->${h.busy} from host state`)
+      pageLog(`busy corrected ${busy}->${h.busy} from host state${force ? ' (forced)' : ''}`)
       // A stale `turnSessionId` misroutes the live buffer, so a client that
       // missed the end of a turn has to let go of it too.
       turnSessionId = null
       liveBuf = []
       busy = h.busy
+      if (!h.busy) {
+        // The host says nothing is running, so this client's claim that it started one
+        // - and the copy of the message it typed, kept for repainting a partial turn -
+        // are both memories of something that is over.
+        turnOurs = false
+        sentDraft = null
+        turnStartTs = 0
+      }
     }
     // The sidebar spinner is the one piece of state that outlives a missed event:
     // a turn that ended while this tab was asleep would spin forever. The host runs
@@ -3123,9 +3737,20 @@
       const said = await invoke<string>('set_context_budget', { target })
       budgetMsg = said
       say(said)
-      // The host moves the meter itself; re-reading it is how the panel shows the
-      // number that is actually in force rather than the one it hoped for.
+      // The host moves the meter on its own loop, so the command's reply can outrun the change.
+      // One read here used to catch the pin still in place, and the row then kept saying "pinned by
+      // you at <the number it had just stopped meaning>" until some later event refreshed the page.
+      // So wait for the pair the host publishes together - the pin and the number - instead of
+      // hoping one read lands after the other. Bounded: a refused ceiling will never land, and the
+      // refusal text is the answer in that case.
       hostState = await invoke<HostState>('session_state')
+      for (let i = 0; i < 12; i++) {
+        const s = hostState
+        const landed = target === null ? s.budget_pin == null : s.budget_pin === target
+        if (landed) break
+        await new Promise((r) => setTimeout(r, 100))
+        hostState = await invoke<HostState>('session_state')
+      }
       budgetDraft = ''
     } catch (e) {
       budgetMsg = String(e)
@@ -3158,7 +3783,7 @@
     }
   }
 
-  async function refreshState() {
+  async function refreshState(force = false) {
     // The pill says "on :8099 · 2 devices"; a value cached at boot would be a
     // guess within a minute. Cheap local read, so refresh it with the rest.
     void loadGateway()
@@ -3167,8 +3792,9 @@
       if (hostState) {
         mode = hostState.mode
         thinking = hostState.reasoning
+        thinkingDefault = hostState.reasoning_default ?? thinking
         model = hostState.model
-        syncBusy(hostState)
+        syncBusy(hostState, force)
       }
     } catch (e) {
       ipc = { ok: false, msg: String(e).slice(0, 140) }
@@ -3207,7 +3833,7 @@
    * is what feels slow. Returns false when the server has no such command, so
    * boot falls back to the individual calls rather than showing nothing.
    */
-  async function bootstrapGateway(): Promise<boolean> {
+  async function bootstrapGateway(force = false): Promise<boolean> {
     try {
       const b = await invoke<{
         state: HostState
@@ -3221,8 +3847,9 @@
       if (hostState) {
         mode = hostState.mode
         thinking = hostState.reasoning
+        thinkingDefault = hostState.reasoning_default ?? thinking
         model = hostState.model
-        syncBusy(hostState)
+        syncBusy(hostState, force)
       }
       sessions = b.sessions ?? []
       recordSeen(sessions)
@@ -3236,10 +3863,32 @@
         // The server picked which session to show using the same rule this client
         // would have applied, so the transcript arrives with the rest.
         viewId = b.session_id
+        // The transcript owns buttons that name a conversation (export, branch), so it
+        // needs the id of what it is holding. A boot that skipped this left them at 0,
+        // and "Share as markdown" on a phone's first load answered "this conversation is
+        // not saved yet" about a conversation that plainly was.
+        if (transcript) transcript.sessionId = b.session_id
         transcript?.clear()
         transcript?.loadHistory(page.messages)
         transcript?.replayNotes(b.session_id)
-        viewMsgCount = page.messages.length
+        // A turn that is still running is the one thing this page cannot show on its
+        // own: neither core has finished writing it. Same rule as `resyncView` - paint
+        // the question only if the store has not already given it back, then replay what
+        // this client saw before it lost the connection.
+        if (turnSessionId === b.session_id) {
+          if (sentDraft && !storeHoldsSentDraft(page.messages))
+            transcript?.addUser(sentDraft.text, sentDraft.atts)
+          // The one thing neither core has written to storage yet: the half of this turn's
+          // answer that is still streaming. A page reloaded mid-answer used to paint the
+          // reply starting at whatever arrived after the reload — the top of it simply gone,
+          // and only the end of the turn put it back. The host keeps that open half in its
+          // state, so the reloaded page can show what already happened and let the deltas
+          // carry on underneath it.
+          if (hostState?.busy && (hostState.open_text || hostState.open_reasoning))
+            transcript?.seedOpen(hostState.open_text ?? '', hostState.open_reasoning ?? '')
+          for (const e of liveBuf) transcript?.apply(e)
+        }
+        viewMsgCount = turnSessionId === b.session_id ? Math.max(page.messages.length, 1) : page.messages.length
         hasOlder = page.has_older
         oldestId = page.messages.length ? page.messages[0].id : null
       }
@@ -3296,7 +3945,11 @@
   // goes to the session being viewed.
   async function openSession(id: number) {
     closeDrawerOnMobile()
-    if (id === viewId) return
+    // Looking at the conversation already on screen is a no-op - but only when it is actually
+    // on screen. A view can be *named* (viewId set, row count known from the host) while its
+    // transcript never painted; bailing out here left that state unfixable, because the one
+    // thing a person would try - clicking the row again - did nothing at all.
+    if (id === viewId && document.querySelectorAll('.transcript .turn').length > 0) return
     // Looking is not working. This used to end in `switch_session`, so every click
     // in the sidebar moved the engine: the workspace line changed, a cold-cache note
     // appeared, and a glance at another conversation rewrote the state of the one
@@ -3323,8 +3976,9 @@
     // engine happens to be working on.
     if (transcript) transcript.sessionId = id
     transcript?.clear()
+    let rows: StoredMessage[] = []
     try {
-      await loadTranscript(id, keepRows)
+      rows = await loadTranscript(id, keepRows)
     } catch (e) {
       pageLog(`session_messages failed: ${e}`)
     }
@@ -3339,28 +3993,82 @@
     // did not send still has to show the answer it watched, which is the whole
     // reason the buffer exists.
     if (turnSessionId === id) {
-      if (sentDraft) transcript?.addUser(sentDraft.text, sentDraft.atts)
+      // Paint the question this client typed only if the store has not already given
+      // it back. See `storeHoldsSentDraft`.
+      if (sentDraft && !storeHoldsSentDraft(rows))
+        transcript?.addUser(sentDraft.text, sentDraft.atts)
       for (const e of liveBuf) transcript?.apply(e)
     }
     await refreshState()
   }
 
+  /**
+   * Does the page just loaded from the store already contain the message this client
+   * sent for the turn in flight?
+   *
+   * The two cores answer that at different moments, which is why the answer cannot be
+   * hardcoded. The rust core persists a turn when it ends, so while one runs the store
+   * has no row for the sentence you just typed and the view has to supply its own copy.
+   * The pi bridge writes the user's row *before* the model is asked - "a send is a fact
+   * before it is asked of a model", crates/bridge/src/host.rs - so that a message the
+   * user sent survives a crash mid-turn. Reloading that session brings the row back in
+   * the page, and painting `sentDraft` on top of it put the same sentence on screen
+   * twice. That is the report: "switch from a session that is answering to another and
+   * back, and my first message has been duplicated."
+   *
+   * Only the newest user row can be this turn's - every earlier one already has an
+   * answer under it - so the scan stops at the first user row from the end.
+   */
+  function storeHoldsSentDraft(rows: StoredMessage[]): boolean {
+    if (!sentDraft) return false
+    const text = sentDraft.text.trim()
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const m = rows[i]
+      if (m.role !== 'user') continue
+      return (
+        (m.content ?? '').trim() === text &&
+        (m.attachments?.length ?? 0) === sentDraft.atts.length
+      )
+    }
+    return false
+  }
+
   // Draft, not a new row: a fresh session is a blank view. The row appears when
   // the first message is sent, already titled by that message.
   function newSession() {
-    viewId = null
-    if (transcript) transcript.sessionId = 0
-    viewMsgCount = 0
-    hasOlder = false
-    oldestId = null
-    draftWorkspace = ''
-    transcript?.clear()
+    // The engine's own "start over": a fresh session row arrives on the first send, and
+    // `clear_session` releases the host's hold on the previous one so its history is not
+    // carried into the new mode/folder.
     try {
       invoke('clear_session')
     } catch (e) {
       pageLog(`clear_session failed: ${e}`)
     }
+    showStartScreen()
     void loadSessions()
+  }
+
+  /**
+   * Back to the screen the app opens on: the cup, the composer, nothing else.
+   *
+   * This is a *view* reset, not a deletion. The conversation being left keeps its rows in
+   * the store, and a turn that is still running keeps writing into its own session - the
+   * event router buffers output that does not belong to the view on screen, and opening the
+   * session again replays it. Nothing here may touch that.
+   */
+  function showStartScreen() {
+    viewId = null
+    // A draft's folder is a choice about *that* draft, so it belongs to the draft and not to
+    // the screen. Carrying it across a new session or a mode switch is how the report reads as
+    // "the top `+` started me in a folder I never picked": the header's `+` asks for a
+    // conversation with no folder chosen, and the chip then says what the host will actually
+    // use - "No workspace" when that is the scratch folder, which is the honest name for it.
+    draftWorkspace = ''
+    if (transcript) transcript.sessionId = 0
+    viewMsgCount = 0
+    hasOlder = false
+    oldestId = null
+    transcript?.clear()
     setTimeout(() => composerEl?.focus(), 0)
   }
 
@@ -3390,9 +4098,20 @@
   /// menu set `confirmDeleteId`, then called this, which cleared it and saw
   /// "not yet confirmed" - so it re-armed the prompt and returned without
   /// deleting. Every delete from the menu was a no-op. One owner, one confirm.
+  /**
+   * Forget a conversation, and forget that we were looking at it.
+   *
+   * The Rust half was already right: `delete_session` refuses while that row's turn is
+   * running, and otherwise moves the host off the row before removing it. The screen
+   * half was not — the transcript kept painting a conversation that no longer existed,
+   * and the composer stayed armed against an id the engine cannot load, so the next
+   * message went at a conversation the reader had just deleted. The view goes back to
+   * the start screen; the host's next `session_state` says where we actually are.
+   */
   async function removeSession(id: number) {
     try {
       await invoke('delete_session', { id })
+      if (viewId === id) showStartScreen()
       await loadSessions()
       await refreshState()
     } catch (e) {
@@ -3431,14 +4150,14 @@
   /** Ceiling on a repaint that has to preserve an already-loaded window. */
   const RESYNC_MAX_ROWS = 1200
 
-  async function loadTranscript(id: number, atLeastRows = 0) {
+  async function loadTranscript(id: number, atLeastRows = 0): Promise<StoredMessage[]> {
     viewMsgCount = 0
     const want = Math.max(PAGE_ROWS, atLeastRows)
     if (want > RESYNC_MAX_ROWS)
       pageLog(
         `resync: the view held ${atLeastRows} rows; the repaint keeps ${RESYNC_MAX_ROWS} and leaves the rest one click away`,
       )
-    const page = await invoke<{ messages: any[]; has_older: boolean }>('session_messages', {
+    const page = await invoke<{ messages: StoredMessage[]; has_older: boolean }>('session_messages', {
       id,
       limit: Math.min(RESYNC_MAX_ROWS, want),
     })
@@ -3453,6 +4172,9 @@
     viewMsgCount = turnSessionId === id ? Math.max(page.messages.length, 1) : page.messages.length
     hasOlder = page.has_older
     oldestId = page.messages.length ? page.messages[0].id : null
+    // The rows, handed back: a caller repainting a session that is mid-turn has to
+    // know whether the store already holds the message that turn started with.
+    return page.messages
   }
 
   async function loadOlder() {
@@ -3496,9 +4218,15 @@
     await invoke('set_model', { model: m }).catch((e) => pageLog(`set_model: ${e}`))
     await refreshState()
   }
-  async function setThinking(l: string) {
-    thinking = l as any
-    await invoke('set_reasoning', { level: l }).catch((e) => pageLog(`set_reasoning: ${e}`))
+  async function setThinking(l: ReasoningLevel, persist: boolean) {
+    // Two dials, one control, two different asks. `persist` is which one was moved: the settings
+    // screen sets the effort every *new* conversation starts at, the composer overrides it for
+    // *this* conversation alone. Keeping them apart is what makes the composer dial trustworthy -
+    // and it is why the override is sent with persist=false: writing the config file from here is
+    // how a choice made for one chat used to become everyone's default.
+    thinking = l
+    if (persist) thinkingDefault = l
+    await invoke('set_reasoning', { level: l, persist }).catch((e) => pageLog(`set_reasoning: ${e}`))
   }
 
   /**
@@ -3522,6 +4250,19 @@
       pageLog(`set_persona: ${e}`)
     }
     await refreshState()
+    // A mode is a new kind of conversation, not the same one with the tools switched off,
+    // so the switch lands the user back on the start screen - the cup and the composer -
+    // whether it went in or was refused. Two reasons, both about lying:
+    //
+    //  * the switch restarts the model process (tools and the system prompt are chosen when
+    //    it starts), so the transcript still on screen is a record of a conversation the
+    //    app can no longer continue in that mode;
+    //  * a refused switch leaves the tab honest about the old mode, and the screen should
+    //    show the mode the tab claims rather than a half-and-half view of both.
+    //
+    // Only the view moves. The conversation keeps its rows and its place in the sidebar, and
+    // a turn still running keeps writing into its own session (see `showStartScreen`).
+    showStartScreen()
   }
 
   /**
@@ -3537,6 +4278,46 @@
       fails++
       pageLog(`SELFTEST FAIL: ${m}`)
     }
+    /**
+     * Which check groups this run was asked for, read from the environment by the app.
+     *
+     * A full pass costs minutes, and most days the change being checked is one line of CSS or one
+     * label. So each named group can be run on its own: `./scripts/selftest.sh cup` runs the cup
+     * checks and nothing else, and the filter matches the group id or any word in the section's own
+     * label, because "cup" is what you remember and not what you have to look up.
+     *
+     * What it does *not* do is pretend a partial pass is a pass: the count of groups that ran, and
+     * the names of the ones that did not, go into the final line, and the harness says TARGETED at
+     * the top of the run. Groups were never designed to depend on each other - each one makes its
+     * own session and clears the transcript - but an unnamed block in the middle of a chain is setup
+     * for the chain, so those always run.
+     */
+    let onlyTerms: string[] = []
+    const groups = { ran: 0, skipped: [] as string[] }
+    try {
+      const cfg = await invoke<{ only?: string[] }>('selftest_config')
+      onlyTerms = (cfg?.only ?? []).map((t) => String(t).trim().toLowerCase()).filter(Boolean)
+    } catch (e) {
+      pageLog(`selftest note: could not read the check filter (${e}); running every group`)
+    }
+    const want = (id: string, label: string) => {
+      if (!onlyTerms.length) {
+        groups.ran++
+        return true
+      }
+      const hay = `${id} ${label}`.toLowerCase()
+      if (onlyTerms.some((t) => hay.includes(t))) {
+        groups.ran++
+        return true
+      }
+      groups.skipped.push(id)
+      return false
+    }
+    if (onlyTerms.length)
+      pageLog(
+        `selftest note: TARGETED run, filter [${onlyTerms.join(', ')}]. A green here covers the groups that ran; ` +
+          'the suite is ./scripts/selftest.sh with no arguments',
+      )
     // Geometry checks need a window that is actually on screen. WebKitGTK hands an
     // occluded or blanked page a zero-size viewport, so every rect measures 0 and
     // one locked screen produced fourteen failures that read like CSS bugs.
@@ -3599,67 +4380,42 @@
         )
         return ok
       }
-      // ---- what the footer claimed before anyone clicked it ------------------
-      // The toolbar states two facts the window does not need to start a turn:
-      // which search provider is live, and whether the gateway is up. Both used to
-      // be fetched only when their popover opened, so the pill printed "unknown"
-      // until it was interrogated - and for the gateway, an "off" that a phone
-      // contradicts is a claim about a network-exposed agent.
+      // ---- what the pinned row claimed before anyone clicked it --------------
+      //
+      // The bottom toolbar used to print these facts as words. It is gone, and most of the facts went
+      // with it (the search provider lives in Settings now). Two survived, because they are the two
+      // that decide whether you need to act: is the gateway up, and is this window in the approval
+      // mode the engine is actually in. The gateway fact now rides on the icon's title and a dot, and
+      // it is still a claim the app makes *before* anyone opens the panel - which is the whole reason
+      // this check exists: an "off" a phone contradicts is a claim about a network-exposed agent.
       {
-        const footVal = (label: string) => {
-          const b = [...document.querySelectorAll('footer button.fbtn')].find(
-            (x) => x.querySelector('.flbl')?.textContent?.trim() === label,
-          )
-          return (b?.querySelector('.fsum')?.textContent ?? '<no control>').trim()
+        const gwBtn = document.querySelector('button[aria-label="Remote access"]') as HTMLElement | null
+        if (!gwBtn) fail('the sidebar footer has no gateway control, so nothing states whether the gateway is up')
+        else {
+          const g = await invoke<{ running: boolean; port: number; note: string }>('gateway_status')
+          const dot = gwBtn.querySelector('.sfi-dot') ? 'lit' : 'unlit'
+          const title = gwBtn.getAttribute('title') ?? ''
+          if (g.running && !title.includes(String(g.port)))
+            fail(
+              `the gateway control's title is "${title}" while it is serving on :${g.port}: the row is a placeholder that only fills in when opened`,
+            )
+          else if (!g.running && gwBtn.querySelector('.sfi-dot'))
+            fail('the gateway control carries a live dot while the gateway is not running')
+          const hostBoot = await invoke<HostState>('session_state')
+          const modeChip = [...document.querySelectorAll('.cbtn.chip')]
+            .map((c) => (c.textContent ?? '').trim())
+            .find((t) => Object.values(MODE_LABEL).some((v) => t.includes(v)))
+          if (!modeChip) fail('the composer shows no approval-mode chip')
+          else if (!modeChip.includes(MODE_LABEL[hostBoot.mode]))
+            fail(
+              `the mode chip reads "${modeChip}" while the engine is in mode=${hostBoot.mode}: ` +
+                'two clients of one engine are showing two different answers',
+            )
+          else
+            pageLog(
+              `pinned row truth ok (gateway title "${title}" with a ${dot} dot for running=${g.running}, mode chip "${modeChip}" for mode=${hostBoot.mode})`,
+            )
         }
-        const searchVal = await waitFor(
-          'the footer to state the search provider',
-          () => footVal('search') !== 'unknown' && footVal('search') !== '',
-          4000,
-        )
-          ? footVal('search')
-          : footVal('search')
-        const view = await invoke<{ backend: string }>('search_settings')
-        const allowed =
-          view.backend === 'auto'
-            ? ['searxng', 'no container runtime']
-            : view.backend === 'searxng'
-              ? ['searxng']
-              : ['duckduckgo']
-        if (!allowed.some((a) => searchVal.startsWith(a)))
-          fail(
-            `the search control says "${searchVal}" before anyone opened it, while the engine says ` +
-              `backend=${view.backend} (no boot fetch, so the toolbar is a placeholder)`,
-          )
-        const g = await invoke<{ running: boolean; port: number; note: string }>('gateway_status')
-        const gwVal = footVal('gateway')
-        // The approval chip is the control the drift report was about: the window
-        // was on full-auto, the gateway said ask, and then the window asked for
-        // approvals again. The chip has to read the engine's mode, never its own
-        // default, and the engine now writes its mode to config.toml so a second
-        // client and the next start see the same thing.
-        const hostBoot = await invoke<HostState>('session_state')
-        const modeChip = [...document.querySelectorAll('.cbtn.chip')]
-          .map((c) => (c.textContent ?? '').trim())
-          .find((t) => Object.values(MODE_LABEL).some((v) => t.includes(v)))
-        if (gwVal === 'unknown' || gwVal === '<no control>')
-          fail(`the gateway control says "${gwVal}" while the engine reports running=${g.running}`)
-        else if (g.running && !gwVal.includes(String(g.port)))
-          fail(`the gateway control says "${gwVal}" while it is serving on :${g.port}`)
-        else if (!g.running && !gwVal.startsWith('off'))
-          fail(`the gateway control says "${gwVal}" while it is not running`)
-        else if (!modeChip)
-          fail('the composer shows no approval-mode chip')
-        else if (!modeChip.includes(MODE_LABEL[hostBoot.mode]))
-          fail(
-            `the mode chip reads "${modeChip}" while the engine is in mode=${hostBoot.mode}: ` +
-              'two clients of one engine are showing two different answers',
-          )
-        else
-          pageLog(
-            `footer truth ok (search "${searchVal}" for backend=${view.backend}, ` +
-              `gateway "${gwVal}" running=${g.running}, mode chip "${modeChip}" for mode=${hostBoot.mode})`,
-          )
       }
 
       // A session with messages, not merely the first row. An empty session keeps the
@@ -3729,6 +4485,9 @@
     // their starting values, and a check that then asks "is this word still
     // half-drawn?" is measuring the window manager.
     let framePaints = 0
+    /** What the run has already spent waiting for a compositor that stopped sending frames. */
+    let reviveSpentMs = 0
+    const REVIVE_TOTAL_MS = 60_000
     /** Wait for `paints` real paints, settling on a floor if they never come.
      *  Resolves true when the page actually painted, false when the floor won. */
     function frame(settleMs = 0, paints = 1): Promise<boolean> {
@@ -3736,6 +4495,7 @@
         let left = paints
         let settled = false
         let timer = 0
+        let lastAsk = 0
         const step = () => {
           if (settled) return
           left -= 1
@@ -3749,23 +4509,48 @@
           requestAnimationFrame(step)
         }
         requestAnimationFrame(step)
-        timer = setTimeout(() => {
+        const floor = () => {
           if (settled) return
+          // A silent frame clock means the desktop stopped compositing this window; it does not mean
+          // the page cannot paint. On Wayland an app cannot take focus back - mutter decides - so the
+          // honest move is to wait a few seconds, asking once in a while, and only then admit the
+          // clock is gone. Writing off 31 checks measures the window manager either way; this at
+          // least stops measuring it slowly, and it catches the common case where the window comes
+          // back on its own between two checks.
+          if (reviveSpentMs < REVIVE_TOTAL_MS) {
+            reviveSpentMs += 1500
+            const now = performance.now()
+            if (now - lastAsk > 4000) {
+              lastAsk = now
+              void presentWindow('the frame clock went silent')
+            }
+            timer = setTimeout(floor, 1500)
+            return
+          }
           settled = true
+          clearTimeout(timer)
           rafStalls += 1
           const now = Date.now()
           if (now - lastStallLogged > 5000) {
             lastStallLogged = now
             blindSkips += 1
             pageLog(
-              `selftest note: requestAnimationFrame stayed silent for ${400 + settleMs}ms - the page is not ` +
+              `selftest note: requestAnimationFrame stayed silent for ${400 + settleMs + reviveSpentMs}ms - the page is not ` +
                 'being composited, so the frame-paced checks are settling on a timeout floor instead of on paints',
             )
           }
           setTimeout(() => res(false), settleMs)
-        }, 400 + settleMs)
+        }
+        timer = setTimeout(floor, 400 + settleMs)
       })
     }
+    /** A page can be perfectly laid out and still not be painted: that is what an occluded window
+     *  looks like from the inside, and it is invisible to a layout test. Motion claims need paints,
+     *  so they ask this instead of `offScreen()`, which only answers the layout question. */
+    const unpainted = () =>
+      framePaints < 4 || rafStalls > framePaints * 3
+        ? `the page reported ${framePaints} paint(s) against ${rafStalls} frame-clock timeout(s)`
+        : null
     const blind = async (where: string) => {
       let b = offScreen()
       if (!b) return false
@@ -3777,13 +4562,60 @@
         pageLog(`selftest note: the view had drifted for ${where}; reopened a session`)
         return false
       }
+      // Second recovery: ask for the window back. Recent blind runs reported the same shape -
+      // frame gaps, follow catch-up that never converged, geometry checks reading 0x0 - and the
+      // cause was another application covering this one, not the code under test. A window that
+      // is not composited cannot answer a single layout question, so it is worth one ask before
+      // twelve checks are written off.
+      await presentWindow(where)
+      b = offScreen()
+      if (!b) {
+        pageLog(`selftest note: the window came back for ${where}`)
+        return false
+      }
       blindSkips++
       pageLog(`selftest note: skipped ${where}; ${b}`)
       return true
     }
+    await presentWindow('the start')
     if (await blind('at the start')) {
       pageLog('SELFTEST ABORTED: nothing was measured')
       return
+    }
+    // The compositor owns the frame clock, and this desktop will not hand focus back to an app that
+    // asks for it: `set_focus` from a background window is refused as focus stealing, and everything
+    // downstream - rAF, CSS animations, sticky geometry - goes quiet. Only a person clicking the
+    // window fixes that. So the run says what it needs and waits for it once, up front: waiting a
+    // minute produces a measured run, while pushing on produces thirty-odd notes saying nothing was
+    // observable and a verdict nobody can act on.
+    if (transportKind === 'tauri') {
+      const state = async () => {
+        try {
+          return await invoke<string>('selftest_window_state')
+        } catch {
+          return ''
+        }
+      }
+      const focusedNow = async () => (await state()).includes('focused=true')
+      if (!(await focusedNow())) {
+        pageLog(
+          'selftest note: the desktop is not compositing this window (window state: ' +
+            (await state()) +
+            '). Layout, motion and cadence claims cannot be measured until it has focus, and an app cannot take focus back on Wayland - clicking the cwoffee window once does it. Waiting up to 90s.',
+        )
+        const untilFocus = performance.now() + 90_000
+        let beats = 0
+        while (performance.now() < untilFocus && !(await focusedNow())) {
+          if (beats % 5 === 0) await presentWindow('the run is waiting for the window')
+          beats += 1
+          await new Promise((r) => setTimeout(r, 1000))
+        }
+        pageLog(
+          (await focusedNow())
+            ? 'selftest note: the window has the desktop focus; the layout and paint claims below are measured, not skipped'
+            : 'selftest note: the window never got the desktop focus; the layout, motion and cadence claims below are graded blind',
+        )
+      }
     }
       // Sessions created lazily by a check's `newSession(); send()` pair are not
       // the `selftest` session this harness deletes by id, and auto-titling renames
@@ -3814,7 +4646,7 @@
       let reasoning0 = 'xhigh'
       async function restoreSettings() {
         await invoke('set_mode', { mode: mode0 }).catch(() => {})
-        await invoke('set_reasoning', { level: reasoning0 }).catch(() => {})
+        await invoke('set_reasoning', { level: reasoning0, persist: true }).catch(() => {})
         pageLog(`selftest restored mode=${mode0} reasoning=${reasoning0}`)
       }
 
@@ -3832,7 +4664,7 @@
         // inference on a single-slot endpoint is a gate nobody runs. Thinking is still
         // exercised at medium; the block, its duration label and its reveal are all
         // asserted below.
-        await invoke('set_reasoning', { level: 'medium' })
+        await invoke('set_reasoning', { level: 'medium', persist: true })
         pageLog(
           `selftest pinned mode=auto reasoning=medium (was mode=${mode0}, reasoning=${reasoning0})`,
         )
@@ -4026,7 +4858,13 @@
         const stAfter = await invoke<HostState>('session_state')
         if (stAfter.session_id !== stNow.session_id)
           fail(`opening a session moved the host: ${stNow.session_id} -> ${stAfter.session_id}`)
-        const noise = [...document.querySelectorAll('.blk-note, .blk-warn')]
+        // Notes are not in the transcript any more, so "browsing said nothing about host
+        // plumbing" is checked against what is left in the stream plus whatever the chrome is
+        // currently holding.
+        const noise = [
+          ...document.querySelectorAll('.blk-warn'),
+          ...(document.querySelectorAll('.toast:not(.note)') as NodeListOf<HTMLElement>),
+        ]
           .map((n) => n.textContent ?? '')
           .filter((t) => /prompt cache|workspace/i.test(t))
         if (noise.length)
@@ -4082,6 +4920,146 @@
         }
       }
 
+      // --- the thinking level: a default, and an override that belongs to one conversation ----
+      // Reported as: set a default in settings, start a new conversation, move the composer's
+      // thinking dial, press send - and the level goes back to the default. It is not a coincidence
+      // that send is the moment: a conversation's row (and, on the pi core, its pi thread) is
+      // created by the first send, and the level had been applied to a session that the send then
+      // replaced. What should happen, in the words of the report: settings is the default, a new
+      // conversation starts at it, and a composer choice overrides it for that conversation alone,
+      // for the whole conversation, until moved again.
+      if (want('thinking', 'the thinking level: a default, and an override that belongs to one conversatio')) {
+        const verdict: string[] = []
+        const st = async () => invoke<HostState>('session_state')
+        const nap = (ms: number) => new Promise((r) => setTimeout(r, ms))
+        // A conversation switch during a running turn is deliberately deferred - the turn finishes
+        // first, and that is right for a person who pressed New chat mid-answer. It scrambles a
+        // check that issues the commands back to back: the switch, the dial move and the send all
+        // land in a different order than they were written, and the dial then looks like it was
+        // reset. So this check waits for the host to be quiet before moving between conversations,
+        // and waits for the move to have actually taken.
+        const quiet = async (why: string) => {
+          for (let i = 0; i < 80 && (await st()).busy; i++) await nap(100)
+          if ((await st()).busy) verdict.push(`the host was still busy for 8s before ${why}`)
+        }
+        /**
+         * Wait for the host to *say* it, rather than assuming the invoke already took.
+         *
+         * Commands are queued, and a switch that arrives while the previous turn is still unwinding
+         * is deliberately applied after it - which is right for a person who pressed New chat
+         * mid-answer. Reading state the instant after invoking therefore asks about a command that
+         * has not run yet, and a correct pi core starts reporting a dial that was reset. This is the
+         * same discipline the engine's own regression test uses: poll for the fields the host
+         * publishes together, and say so when they never arrive.
+         */
+        const until = async (why: string, ok: (s: HostState) => boolean, ms = 3000) => {
+          let s = await st()
+          for (let i = 0; i < ms / 100 && !ok(s); i++) {
+            await nap(100)
+            s = await st()
+          }
+          if (!ok(s))
+            verdict.push(
+              `the host never published ${why} within ${ms}ms (row ${s.session_id}, reasoning ${s.reasoning}, default ${JSON.stringify(s.reasoning_default)}, overridden ${s.reasoning_overridden})`,
+            )
+          return s
+        }
+        // The default, from the settings screen's path.
+        await quiet('the settings default')
+        await invoke('set_reasoning', { level: 'medium', persist: true })
+        let s = await until('the settings default at medium', (x) => x.reasoning_default === 'medium')
+        if (s.reasoning_default !== 'medium')
+          verdict.push(`the settings screen's own level reads ${JSON.stringify(s.reasoning_default)} after being set to medium`)
+        // A new conversation starts at the default, and does not claim an override.
+        await quiet('the first new conversation')
+        const convA = await invoke<number>('new_session', { title: 'selftest thinking scope', workspace: null })
+        // The dial belongs to a conversation, so the host has to be standing in it - and to have
+        // said so, because entering a row is where the level for it is applied.
+        s = await until(
+          `the host on conversation ${convA} at the default with no override of its own`,
+          (x) => x.session_id === convA && x.reasoning === 'medium' && x.reasoning_default === 'medium' && !x.reasoning_overridden,
+        )
+        if (s.session_id !== convA)
+          verdict.push(`the host is on conversation ${s.session_id} although the check created ${convA}`)
+        if (s.reasoning !== 'medium') verdict.push(`a new conversation starts at ${s.reasoning}, expected the default medium`)
+        if (s.reasoning_overridden) verdict.push('a conversation that was never touched reports its own override')
+        // The composer dial, moved while this conversation is still a draft. 'off' is chosen on
+        // purpose: it is the level that keeps the two turns below cheap.
+        await invoke('set_reasoning', { level: 'off', persist: false })
+        s = await until(
+          "the composer's off on this conversation without moving the default",
+          (x) => x.reasoning === 'off' && x.reasoning_default === 'medium' && x.reasoning_overridden === true,
+        )
+        if (s.reasoning !== 'off') verdict.push(`the composer's choice did not take effect (state says ${s.reasoning})`)
+        if (s.reasoning_default !== 'medium')
+          verdict.push(`the composer's choice moved the settings default to ${s.reasoning_default}`)
+        // Send. This is the step that used to undo the dial, because it is where the conversation
+        // starts to exist.
+        let p = (await st()).turns
+        await invoke('start_turn', {
+          text: 'Reply with the single word ok. Use no tools and create no files.',
+          attachments: [],
+          session: null,
+        })
+        if (!(await waitTurnDone(p))) verdict.push('the scope check turn never finished')
+        s = await st()
+        if (s.reasoning !== 'off')
+          verdict.push(`sending the message reverted the thinking level to ${s.reasoning} - this is the reported bug`)
+        if (!s.reasoning_overridden) verdict.push('after the send the conversation no longer reports its own override')
+        if (s.reasoning_default !== 'medium')
+          verdict.push(`after the send the settings default reads ${s.reasoning_default}, expected medium`)
+        // A second turn in the same conversation keeps it.
+        p = (await st()).turns
+        await invoke('start_turn', {
+          text: 'Reply with the single word ok again. Use no tools and create no files.',
+          attachments: [],
+          session: null,
+        })
+        if (!(await waitTurnDone(p))) verdict.push("the scope check's second turn never finished")
+        s = await st()
+        if (s.reasoning !== 'off') verdict.push(`the second turn in the same conversation ran at ${s.reasoning}, expected off`)
+        // And a different conversation is untouched by all of it.
+        await quiet("the second new conversation")
+        const convB = await invoke<number>('new_session', { title: 'selftest thinking scope two', workspace: null })
+        s = await until(
+          `the host on conversation ${convB} back at the default`,
+          (x) => x.session_id === convB && x.reasoning === 'medium' && x.reasoning_default === 'medium' && !x.reasoning_overridden,
+        )
+        if (s.session_id !== convB)
+          verdict.push(`the host is on conversation ${s.session_id} although the check created ${convB}`)
+        if (s.reasoning !== 'medium')
+          verdict.push(`a second new conversation inherited ${s.reasoning}; one chat's choice must not travel`)
+        if (s.reasoning_overridden) verdict.push("a second conversation claims the first one's override")
+        // What this model says it can answer for. On the pi core this is pi's own answer, and it is
+        // where the dial used to be wired to nothing: a model entry that declares no thinking offers
+        // only "off", and every level the reader picked was clamped away before the request was even
+        // built - the dial moved, the wire said nothing, and nothing anywhere reported it. An empty
+        // list is a finding rather than a skip: either nobody asked the model, or its entry declares
+        // no thinking, and both are worth knowing out loud.
+        s = await until('the thinking levels this model offers', (x) => (x.reasoning_levels?.length ?? 0) > 0, 5000)
+        const offered = s.reasoning_levels ?? []
+        if (!offered.length) {
+          verdict.push('the host published no thinking levels at all: nobody asked the model what it can run, or its model entry declares no thinking and pi offers only "off"')
+        } else {
+          for (const need of ['low', 'medium', 'high']) {
+            if (!offered.includes(need))
+              verdict.push(`the dial offers ${need} but the model says it cannot answer for it (offered ${JSON.stringify(offered)})`)
+          }
+          if (!offered.includes(String(s.reasoning)))
+            verdict.push(`this conversation is set to ${s.reasoning}, which the model does not offer (offered ${JSON.stringify(offered)})`)
+        }
+        if (verdict.length) {
+          const f = await st()
+          fail(
+            `thinking scope: ${verdict.join('; ')} [host row ${f.session_id}, reasoning ${f.reasoning}, default ${f.reasoning_default}, overridden ${f.reasoning_overridden}, offered ${JSON.stringify(f.reasoning_levels ?? [])}]`,
+          )
+        }
+        else
+          pageLog(
+            `thinking scope ok: settings is the default, a new conversation starts there, the composer override survived the send that creates the conversation, kept it through a second turn, and did not move the default; this model says it answers for ${JSON.stringify(offered)}`,
+          )
+      }
+
       // Links: navigation inside the webview is always prevented, and the URL is
       // handed to the opener plugin. file:// must be refused by the plugin's
       // scope - if it reports "opened", the scope is too wide and that is a bug.
@@ -4119,14 +5097,14 @@
         // real conversation, and a turn aimed at a different one is refused - correctly,
         // but it reads as "the attachment path is broken".
         await useSession(target.id)
-        await invoke('set_reasoning', { level: 'off' })
+        await invoke('set_reasoning', { level: 'off', persist: true })
         await invoke('start_turn', {
           text: 'What colour is this image? Answer in one word.',
           attachments: [{ mime: 'image/png', data_b64: PNG1x1, name: 'probe.png' }],
           session: target.id,
         })
         const done = await waitTurnDone(turnsBefore)
-        await invoke('set_reasoning', { level: 'medium' })
+        await invoke('set_reasoning', { level: 'medium', persist: true })
         restore()
         if (!done) {
           // One stalled endpoint turn must not become ten downstream failures: say
@@ -4164,7 +5142,7 @@
       // would pass that and lie. The scripted endpoint now answers with the image
       // blocks it actually received, so the transcript is the receipt, and the same
       // case runs against either core.
-      {
+      if (want('clipboard', 'the picture has to reach the endpoint, not merely the store')) {
         const attSess = await invoke<number>('new_session', { title: 'selftest attach' })
         await useSession(attSess)
         const turnsBeforeAtt = await turnCount()
@@ -4259,7 +5237,7 @@
       // for every one of them. The second is measured, not admired: the heights of
       // the fields, the select trigger against the text inputs, and the colours the
       // open dropdown paints itself with.
-      {
+      if (want('settings', 'the settings board keeps the design system: names, heights, colours, focus ring, dial')) {
         openSettings('tools')
         await new Promise((r) => setTimeout(r, 900))
 
@@ -4427,10 +5405,39 @@
               // where they are in a form, and a 1px hairline is not that.
               const navBtn = document.querySelector('.set-rail [data-set-tab]') as HTMLElement
               navBtn.focus()
-              const ring = getComputedStyle(navBtn).boxShadow
-              if (!ring || ring === 'none')
-                fail('the focused settings category has no focus ring: the keyboard user cannot see where they are')
-              else
+              let ring = getComputedStyle(navBtn).boxShadow
+              // A page whose document does not have the desktop's focus paints no `:focus` ring at all:
+              // WebKit reports `matches(':focus')` false there, whatever the stylesheet says. That is a
+              // fact about the window, not about the app's CSS, so the window is asked for and the ring
+              // measured again before anything is judged.
+              if (!ring || ring === 'none') {
+                await presentWindow('the settings focus ring')
+                for (let i = 0; i < 12 && !document.hasFocus(); i++)
+                  await new Promise((r) => setTimeout(r, 100))
+                navBtn.focus()
+                ring = getComputedStyle(navBtn).boxShadow
+              }
+              if (!ring || ring === 'none' ) {
+                if (!document.hasFocus()) {
+                  blindSkips++
+                  pageLog(
+                    'selftest note: skipped the focus-ring claim; this window never got the desktop focus back '
+                      + `(activeElement is the button: ${document.activeElement === navBtn}, matches :focus: ${navBtn.matches(':focus')}) - ` +
+                      'a document without focus paints no focus ring in any stylesheet',
+                  )
+                } else {
+                  // Four different faults end in the same sentence, so the sentence carries which one:
+                  // focus never landed, `:focus` did not match the element that has focus, the ring
+                  // custom property is empty here, or the whole document is unfocused.
+                  const ncs = getComputedStyle(navBtn)
+                  fail(
+                    'the focused settings category has no focus ring: the keyboard user cannot see where they are '
+                      + `[active is the button: ${document.activeElement === navBtn}, matches :focus: ${navBtn.matches(':focus')}, `
+                      + `class "${navBtn.className}", --ring "${ncs.getPropertyValue('--ring').trim() || 'empty'}", `
+                      + `document.hasFocus ${document.hasFocus()}, disabled ${(navBtn as HTMLButtonElement).disabled}]`,
+                  )
+                }
+              } else
                 pageLog(
                   `settings design system ok (fields ${hs(inputs).join('/')}px, select ${Math.round(sels[0].getBoundingClientRect().height)}px, buttons ${hs(btns).join('/')}px across ${btns.length}; panel ${JSON.stringify(panelBg)} lifts ${lift.toFixed(0)} off ${JSON.stringify(screen)}, option text ${contrast.toFixed(1)}:1, inside the column; focus ring painted)`,
                 )
@@ -4447,20 +5454,59 @@
           fail(`the Tools section is not the engine's list: ${JSON.stringify(rows)}`)
         else pageLog(`settings tools section ok (${rows.length} tools from the registry)`)
 
-        // The Titles section holds the same rule as every status panel here: it says
-        // what is on this machine, including "not installed", and it quotes the cost
-        // next to the switch that turns it on. A screen that only says "on" is an
-        // advertisement.
+        // A dial is not a ruler. The reasoning control is five one-word choices; a column stretches
+        // its children, which used to turn it into a track the width of the panel with the choices
+        // parked at one end of nothing. It has to hug its labels and sit where the panel keeps the
+        // things you act on.
+        openSettings('reasoning')
+        await new Promise((r) => setTimeout(r, 700))
+        const dial = document.querySelector('.ssect-b .sseg') as HTMLElement | null
+        if (!dial) fail('the reasoning section has no segmented control to measure')
+        else {
+          const bs = [...dial.querySelectorAll('.sseg-b')].map((b) => b.getBoundingClientRect().width)
+          const labels = bs.reduce((a, b) => a + b, 0)
+          const dr = dial.getBoundingClientRect()
+          if (labels === 0) fail('the reasoning dial has no choices to measure')
+          else if (dr.width > labels + 14)
+            fail(
+              `the dial's track is ${Math.round(dr.width)}px around ${Math.round(labels)}px of choices: it spans the panel instead of hugging them`,
+            )
+          const panel = dial.closest('.ssect-b') as HTMLElement | null
+          if (!panel) fail('the reasoning dial is not inside a section panel')
+          else {
+            const pr = panel.getBoundingClientRect()
+            const padR = parseFloat(getComputedStyle(panel).paddingRight) || 0
+            const off = Math.round(pr.right - padR - dr.right)
+            if (Math.abs(off) > 5)
+              fail(`the dial sits ${off}px off the panel's right inner edge, where this screen keeps its controls`)
+            else pageLog(`settings dial ok (${bs.length} choices, ${Math.round(labels)}px of label in a ${Math.round(dr.width)}px track, flush right)`) 
+          }
+        }
+
+        // The Titles section used to be a cost sheet for a borrowed model: which weights,
+        // where the helper script is, how many MB it spikes per conversation. That feature
+        // is gone, so the screen now explains the rule that replaced it - and what it checks
+        // is that it explains the *trade* (a stalled first answer) and the fallback, while no
+        // trace of the old machinery is left to send someone looking for a file that no
+        // longer exists.
         {
           openSettings('naming')
-          await new Promise((r) => setTimeout(r, 1200))
+          await new Promise((r) => setTimeout(r, 700))
           const txt = document.querySelector('.set-body')?.textContent ?? ''
-          if (!/LFM2\.5-230M/.test(txt))
-            fail(`the Titles section does not name the model it is talking about: ${txt.slice(0, 140)}`)
-          else if (!/MB for a few seconds/.test(txt))
-            fail('the Titles section hides what the feature costs to run')
-          else if (!/on|off/i.test(txt)) fail('the Titles section does not say whether the feature is on')
-          else pageLog('settings titles section ok (model, cost and availability are all stated)')
+          const ghosts = ['titlegen', 'helper script', 'weights', 'python', '.py', '870 MB', '861', 'LFM2.5'].filter(
+            (w) => txt.toLowerCase().includes(w.toLowerCase()),
+          )
+          if (!/New Session/.test(txt)) {
+            fail(`the Titles section never says what a new conversation is called: ${txt.slice(0, 160)}`)
+          } else if (!/Title this conversation in under/.test(txt)) {
+            fail('the Titles section does not show the ask the model is given')
+          } else if (!/falls back/i.test(txt)) {
+            fail('the Titles section hides what happens when the endpoint gives no usable name')
+          } else if (ghosts.length) {
+            fail(`the Titles section still describes the removed titler: ${ghosts.join(', ')}`)
+          } else {
+            pageLog('settings titles section ok (placeholder, the ask and the fallback are stated; no trace of the old helper)')
+          }
         }
         closeSettings()
       }
@@ -4866,13 +5912,39 @@
               document.querySelector('[data-approvals]:not([data-approvals="none"])')
             )
               fail('the approvals control is still offered in chat mode, where nothing can need approving')
+            // A mode switch resets the view, so the check has to give it a view to reset:
+            // open the chat the way a person does, by clicking its row. Without that the
+            // claim below would be vacuous — switching with nothing on screen looks correct
+            // whatever the code does.
+            const chatRow = [...side.querySelectorAll('.sessbtn')].find((b) =>
+              (b.textContent ?? '').includes('selftest chat list'),
+            ) as HTMLElement | undefined
+            if (!chatRow) fail('the chat row in the sidebar has no button to open it')
+            else {
+              chatRow.click()
+              await renderTick()
+              if (viewId !== chatSess)
+                fail(`clicking the chat row did not put it in the view (viewId=${viewId})`)
+            }
             // Back to cowork: the chat must not reappear in a folder. It has one listed
             // nowhere, and a row that shows up in both lists is two lies.
             workTab.click()
             await new Promise((r) => setTimeout(r, 400))
             if ((await personaOf()) !== 'cowork') {
               fail(`Cowork did not restore the host (it reports ${await personaOf()})`)
-            } else {
+            } else if (viewId !== null)
+              // Cowork and Chat are different kinds of conversation, so the switch lands on
+              // the screen the app opens on — the cup and the composer — rather than leaving
+              // the reader inside the other mode's last turn. What is *not* deleted is the
+              // conversation itself: a mode switch is a change of view, not an edit.
+              fail(
+                `switching mode left the view parked on session ${viewId}; a mode is a new kind of conversation and belongs on the start screen`,
+              )
+            else if (!document.querySelector('.empty .cup'))
+              fail('after a mode switch the start screen is not on screen (no cup)')
+            else if (!(await invoke<Session[]>('list_sessions')).some((s) => s.id === chatSess))
+              fail('the mode switch destroyed the conversation it switched away from')
+            else {
               const side2 = document.querySelector('.sidebar') ?? document.body
               const t2 = [...side2.querySelectorAll('.sess-title')].map((e) => e.textContent)
               if (t2.includes('selftest chat list'))
@@ -4970,7 +6042,7 @@
         // which failed the suite on a message about the previous turn. Thinking is off
         // for the same reason: the round trip is under test, not how much the model
         // reflects. The thinking path is asserted separately, with thinking on.
-        await invoke('set_reasoning', { level: 'off' })
+        await invoke('set_reasoning', { level: 'off', persist: true })
         await invoke('start_turn', {
           text: 'Use read_file to read the file /etc/hostname and tell me what it says.',
           session: apprSess,
@@ -5058,7 +6130,7 @@
       // parks on an approval nobody is listening for, and the check reads as a
       // hung turn rather than a harness that changed the rules three steps back.
       await invoke('set_mode', { mode: 'auto' })
-      await invoke('set_reasoning', { level: 'medium' })
+      await invoke('set_reasoning', { level: 'medium', persist: true })
 
       // And make sure nothing is still running: the workspace steps below read host
       // state, and the engine answers "a turn is running, so the workspace change is
@@ -5211,6 +6283,20 @@
         if (!/one|\b1\b/i.test(backText)) {
           fail(`returning to the running session lost its output: ${backText.slice(0, 120)}`)
         }
+        // ...and it must be there exactly once. The store holds the user's own message
+        // from the moment the turn was sent (crates/bridge/src/host.rs writes the row
+        // before the model is asked, so a message survives a crash mid-turn), which means
+        // the history this repaint just loaded already contained the row that `sentDraft`
+        // is a copy of. Painting both stamped the same sentence on the screen twice, which
+        // is the report: "switch from an active session to another and back, and the first
+        // turn's user message is duplicated."
+        const mineRows = [...(rootEl?.querySelectorAll('.blk-user') ?? [])]
+        if (mineRows.length !== 1)
+          fail(
+            `the turn in flight shows ${mineRows.length} copies of the message you sent; want exactly 1 (${mineRows
+              .map((u) => JSON.stringify(u.textContent?.slice(0, 24)))
+              .join(' | ')})`,
+          )
         // This check is about browsing during a turn, not about how long a local
         // model takes to think about fifteen numbers: xhigh on a loaded endpoint has
         // run past three minutes here. Waiting it out makes the harness fail on a busy
@@ -5237,10 +6323,255 @@
       await invoke('delete_session', { id: sessB })
       await useSession(target.id)
 
+      // --- a turn that outlived the tab that started it ---------------------
+      // The phone report: background the browser during a turn, come back, and nothing
+      // is typeable — "I can't interact with any input, especially the composer, and I
+      // always have to refresh."
+      //
+      // The composer is `disabled={busy}`, and `busy` was stuck true: the `turnEnd` that
+      // would clear it was delivered to a frozen page and is gone, and `turnOurs` made
+      // every later read of host state get thrown away before it could correct anything.
+      // The harness cannot background a webview, so the *state* a background leaves
+      // behind is manufactured here and handed to the same reconciliation the wake
+      // handler runs.
+      if (want('outlived-tab', 'a turn that outlived the tab that started it')) {
+        const hNow = await invoke<HostState>('session_state')
+        if (hNow.busy) {
+          pageLog('selftest note: skipped the stale-turn check; the host is busy with something else, and its answer would not be idle')
+        } else {
+          busy = true
+          turnOurs = true
+          turnSentAt = performance.now() - 90_000
+          await refreshState(true)
+          if (busy)
+            fail(
+              'a forced host read still trusted a 90s-old claim that this client was mid-turn: the composer stays dead',
+            )
+          if (turnOurs) fail('the stale "this turn is mine" claim survived the forced read')
+
+          // The guard has to face the other way as well. A send that left this client a
+          // moment ago may still be crossing the network, and the host is right to report
+          // "not busy yet" about it; believing that would re-enable the composer mid-send.
+          busy = true
+          turnOurs = true
+          turnSentAt = performance.now()
+          await refreshState(true)
+          if (!busy) fail('a send made a moment ago was treated as finished')
+          busy = false
+          turnOurs = false
+          turnSentAt = 0
+        }
+      }
+
+      // --- two dims, two names ---------------------------------------------
+      // The sidebar drawer dims the app behind it, and the settings screen dims the app
+      // behind it. They used to be the same class: the settings rule sits later in the
+      // stylesheet at the same specificity, so it won the cascade for `position` and
+      // `z-index`, and the drawer's dim became `fixed` at z-index 70 — above the drawer
+      // it is meant to sit behind (40). Every touch on an open drawer landed on the dim,
+      // whose entire job is to close it. That is the report: "in mobile view the sidebar's
+      // content is unclickable; I tap and it just hides, and I have to zoom the page out
+      // until the sidebar docks so I can use it."
+      if (want('dims', 'two dims, two names')) {
+        setSidebar(true)
+        await renderTick()
+        const dim = document.querySelector('button.scrim') as HTMLElement | null
+        if (!dim) fail('the sidebar drawer has no dim to tap away')
+        else {
+          const cs = getComputedStyle(dim)
+          const dimZ = Number(cs.zIndex)
+          if (!Number.isFinite(dimZ) || dimZ >= 40)
+            fail(
+              `the drawer's dim sits at z-index ${dimZ}, at or above the drawer's own 40: it covers the session list and eats its taps`,
+            )
+          // Above 768px there is no drawer, so there is nothing to dim. A dim mounted there
+          // covers a docked sidebar, which has no z-index of its own to answer it with -
+          // which is how Ctrl+B made the session list unclickable on the desktop too.
+          if (window.innerWidth >= 768 && cs.display !== 'none')
+            fail('the drawer dim is mounted at desktop width, where it sits over a docked sidebar and blocks it')
+        }
+        setSidebar(false)
+        openSettings('models')
+        await renderTick()
+        const mdim = document.querySelector('.mscrim') as HTMLElement | null
+        const panel = document.querySelector('.settings') as HTMLElement | null
+        if (!mdim || !panel)
+          fail('the settings overlay has no dim of its own (.mscrim): it must not share the drawer dim\'s class')
+        else {
+          const mZ = Number(getComputedStyle(mdim).zIndex)
+          const pZ = Number(getComputedStyle(panel).zIndex)
+          if (!(mZ > 40)) fail(`the settings dim sits at z-index ${mZ}; it has to clear the drawer's 40`)
+          if (!(pZ > mZ)) fail(`the settings panel (${pZ}) is not above its own dim (${mZ})`)
+          // A dim that paints over the app is not the same as an app you cannot reach. The
+          // report was that the status bar under the dialog read as live — the metrics and
+          // gateway controls stayed visible at 26% black and a click there did something
+          // other than what was aimed at. So: the dim covers the window, the click over a
+          // background control lands on the dim, and the background itself is inert.
+          if (offScreen()) {
+            pageLog(`selftest note: the settings frame and what is behind it were not measurable here; ${offScreen()}`)
+          } else {
+          const dr = mdim.getBoundingClientRect()
+          if (dr.width < window.innerWidth - 1 || dr.height < window.innerHeight - 1)
+            fail(`the settings dim covers ${Math.round(dr.width)}x${Math.round(dr.height)} of a ${window.innerWidth}x${window.innerHeight} window`)
+          const under = document.querySelector('.side-id [data-menu]') as HTMLElement | null
+          if (!under) fail('the sidebar footer row has no control to test the dim against')
+          else {
+            const ub = under.getBoundingClientRect()
+            const hit = document.elementFromPoint(ub.x + ub.width / 2, ub.y + ub.height / 2)
+            if (hit && !hit.classList.contains('mscrim'))
+              fail(`a click over the sidebar footer row while settings is open lands on .${String(hit.className || hit.tagName)}, not on the dim`)
+            if (!document.querySelector('.app-shell.modal-open'))
+              fail('the app shell does not mark a modal open, so nothing behind the dialog is taken out of the tab order')
+            // `inert` is a property on current engines and nothing at all on older ones; the
+            // CSS rule is the half that works everywhere, so either answer is a pass and a
+            // third one (still interactive) is the bug.
+            const inertBehind = (under as any).inert === true || getComputedStyle(under).pointerEvents === 'none'
+            if (!inertBehind)
+              fail('the sidebar footer row behind the settings dialog is still interactive (neither inert nor pointer-events: none)')
+          }
+          // The frame belongs to the dialog, not to whichever page happens to be open.
+          // It used to be `max-height`, so the short pages collapsed it and the long ones
+          // grew it, and every page change moved the controls out from under the pointer.
+          const first = panel.getBoundingClientRect()
+          if (getComputedStyle(panel).resize === 'none')
+            fail('the settings dialog has no resize handle; the person cannot make it bigger')
+          gotoSettings('appearance')
+          await renderTick()
+          const second = panel.getBoundingClientRect()
+          if (Math.abs(second.height - first.height) > 2 || Math.abs(second.width - first.width) > 2)
+            fail(
+              `changing settings page resized the dialog: ${Math.round(first.width)}x${Math.round(first.height)} to ${Math.round(second.width)}x${Math.round(second.height)}`,
+            )
+          else
+            pageLog(
+              `settings frame is the dialog's own (${Math.round(first.width)}x${Math.round(first.height)}, same on two pages of wildly different length, resizable, background inert)`,
+            )
+          }
+        }
+        closeSettings()
+        await renderTick()
+        const stillInert = document.querySelector('.side-id [data-menu]') as HTMLElement | null
+        if (stillInert && (stillInert as any).inert === true)
+          fail('the sidebar footer row stayed inert after settings closed: the app would be unusable with no dialog on screen')
+      }
+
+      // --- the status bar fits the window it is given -------------------------
+      //
+      // ---- what stays pinned in the sidebar ---------------------------------
+      //
+      // Two things in the sidebar are chrome, not content, and both used to scroll: the "Workspaces"
+      // heading (which carries fold-all and add-a-folder, so losing it mid-list means losing the
+      // controls, not just a label) and the identity row that replaced the bottom toolbar. A heading
+      // you can only reach by scrolling to the top of the list is a heading that hides the controls it
+      // owns. And the row at the foot is where telemetry, the gateway and the theme live now, so if it
+      // scrolls, the app loses its switches in the middle of a long conversation list.
+      if (want('sidebar-chrome', 'the sidebar keeps its heading and its identity row pinned')) {
+        const side = document.querySelector('aside.sidebar') as HTMLElement | null
+        const list = side?.querySelector('.sesslist') as HTMLElement | null
+        const head = side?.querySelector('.sesshead') as HTMLElement | null
+        const row = side?.querySelector('[data-side-id]') as HTMLElement | null
+        if (!side || !list || !head || !row)
+          fail(`the sidebar is missing a part: aside=${!!side} list=${!!list} heading=${!!head} identity row=${!!row}`)
+        else if (await blind('the sidebar pinning check')) {
+          /* rects would all read 0 and the failures would read like CSS bugs */
+        } else {
+          const bad: string[] = []
+          if (list.contains(head))
+            bad.push('the Workspaces heading is inside the scrolling list, so it scrolls away with the conversations')
+          if (list.contains(row))
+            bad.push('the identity row is inside the scrolling list, so the switches scroll away')
+
+          // Scroll the list to its far end and ask whether the chrome is still where it was.
+          const maxScroll = list.scrollHeight - list.clientHeight
+          list.scrollTop = maxScroll
+          await renderTick()
+          const sr = side.getBoundingClientRect()
+          const hr = head.getBoundingClientRect()
+          const rr = row.getBoundingClientRect()
+          const lr = list.getBoundingClientRect()
+          if (maxScroll > 8 && list.scrollTop < 8)
+            bad.push(`the session list would not scroll (${list.scrollTop} of ${maxScroll}px): the check has nothing to prove`)
+          if (hr.top < sr.top - 1 || hr.bottom > sr.bottom + 1)
+            bad.push(`the heading left the sidebar while the list was scrolled to its end (${Math.round(hr.top)}..${Math.round(hr.bottom)} against ${Math.round(sr.top)}..${Math.round(sr.bottom)})`)
+          if (rr.top < sr.top - 1 || rr.bottom > sr.bottom + 1)
+            bad.push(`the identity row left the sidebar while the list was scrolled (${Math.round(rr.top)}..${Math.round(rr.bottom)} against ${Math.round(sr.top)}..${Math.round(sr.bottom)})`)
+          // Rows must not be able to travel underneath the heading: the scroller starts below it.
+          if (lr.top < hr.bottom - 1)
+            bad.push(`the list can scroll rows underneath the heading (list starts at ${Math.round(lr.top)}, the heading ends at ${Math.round(hr.bottom)})`)
+          const add = head.querySelector('.ws-addall') as HTMLElement | null
+          if (!add) bad.push('the pinned heading carries no add-a-folder control, so pinning it bought nothing')
+          else {
+            const ar = add.getBoundingClientRect()
+            if (ar.right > sr.right + 1 || ar.left < sr.left - 1)
+              bad.push('the add-a-folder control in the pinned heading hangs off the sidebar edge')
+          }
+          // The row has to say who it belongs to, not just hold three buttons.
+          if (!row.querySelector('img')) bad.push('the identity row has no mark')
+          if (!(row.textContent ?? '').includes('Cwoffee')) bad.push('the identity row does not name the app')
+          list.scrollTop = 0
+          await renderTick()
+          if (bad.length) bad.forEach((b) => fail(b))
+          else
+            pageLog(
+              `sidebar chrome pinned ok ("${head.textContent?.trim().slice(0, 12)}" and the identity row sit outside the ${Math.round(maxScroll)}px of scrollable list; the list starts ${Math.round(lr.top - hr.bottom)}px below the heading, and the row still holds its mark, its name and 3 controls)`,
+            )
+        }
+      }
+
+      // "The footer items are too tiny and too long: on my phone the theme and help buttons are
+      // off-screen." That bar is gone, but the failure mode it was measured for did not go away with
+      // it: the sidebar footer row is the new pinned strip of controls, and on a phone the sidebar is
+      // an overlay narrower than this one. So the same question gets asked of the row that replaced the
+      // bar - narrow the sidebar in place and ask whether every control still fits inside it, and is
+      // still big enough for a thumb. The name is allowed to ellipsize; the controls are not allowed to
+      // shrink, move, or fall off.
+      if (want('statusbar', 'the sidebar footer row fits the window it is given')) {
+        const row = document.querySelector('[data-side-id]') as HTMLElement | null
+        const side = document.querySelector('aside.sidebar') as HTMLElement | null
+        if (!row || !side) fail('the sidebar has no identity row to measure')
+        else if (document.querySelector('footer')) fail('the bottom toolbar is still on the page')
+        else if (await blind('the sidebar footer row fit check')) {
+          /* rects would all read 0 and the failures would read like CSS bugs */
+        } else {
+          const wanted = '208px'
+          const prev = side.style.width
+          side.style.width = wanted
+          await renderTick()
+          const rr = row.getBoundingClientRect()
+          const sr = side.getBoundingClientRect()
+          const controls = [...row.querySelectorAll('button')] as HTMLElement[]
+          const shown = controls.filter((c) => c.getBoundingClientRect().width > 0)
+          const outside = shown.filter((c) => {
+            const r = c.getBoundingClientRect()
+            return r.right > rr.right + 1 || r.left < rr.left - 1 || r.right > sr.right + 1
+          })
+          const tiny = shown.filter((c) => {
+            const r = c.getBoundingClientRect()
+            return r.height < 28 || r.width < 24
+          })
+          const names = (xs: HTMLElement[]) =>
+            xs.map((c) => c.getAttribute('aria-label') ?? String(c.className)).join(', ')
+          const labels = controls.map((c) => c.getAttribute('aria-label') ?? '?')
+          side.style.width = prev
+          await renderTick()
+          if (controls.length !== 3)
+            fail(
+              `the sidebar footer row holds ${controls.length} control(s) (${labels.join(', ')}); it holds exactly three: telemetry, gateway, theme. ipc, search and the shortcut sheet belong in Settings`,
+            )
+          else if (!shown.length) fail(`at ${wanted} of sidebar every control is hidden: a narrow window has no controls at all`)
+          else if (outside.length) fail(`at ${wanted} of sidebar, ${outside.length} control(s) sit outside the row: ${names(outside)}`)
+          else if (tiny.length) fail(`at ${wanted} of sidebar, ${tiny.length} control(s) are smaller than a thumb: ${names(tiny)}`)
+          else
+            pageLog(
+              `sidebar footer row fits ${wanted} of sidebar (${labels.join(', ')}; all inside a ${Math.round(rr.width)}px row, each at least 28px tall)`,
+            )
+        }
+      }
+
       // --- draft sessions ----------------------------------------------------
       // "New session" must not leave an empty row behind, and the row must
       // appear only when the first message is sent - already titled by it.
-      {
+      if (want('drafts', 'draft sessions')) {
         const beforeDraft = await invoke<Session[]>('list_sessions')
         newSession()
         await new Promise((r) => setTimeout(r, 300))
@@ -5249,6 +6580,24 @@
           fail(`new session created a row: ${beforeDraft.length} -> ${afterDraft.length}`)
         }
         if (!showEmpty) fail('draft view did not present the empty state')
+        // The header `+` sits in line with the mode switch and asks for a conversation with no
+        // folder picked. It used to keep whichever folder the previous draft was aimed at, so
+        // the chip named a folder this conversation was never given - and when that folder was
+        // the scratch one, it named it by path, which reads like a choice somebody made.
+        // Seeded with the host's own folder first: the assertion below is about the value
+        // surviving, and seeding keeps the rest of this check behaving the same either way.
+        draftWorkspace = hostState?.workspace ?? ''
+        newSession()
+        await renderTick()
+        if (draftWorkspace)
+          fail(
+            `the header + carried the folder ${JSON.stringify(draftWorkspace)} over from the previous draft`,
+          )
+        else if (isTempRoot(hostState?.workspace ?? '')) {
+          const chip = document.querySelector('.wsrow')?.textContent ?? ''
+          if (!chip.includes('No workspace'))
+            fail(`the host sits in the scratch folder and the composer chip says ${JSON.stringify(chip.trim())}`)
+        }
 
         // Deliberately tool-free: a prompt that tempts the model into a tool
         // call would park this step on an approval nobody is there to answer.
@@ -5268,47 +6617,67 @@
           if (afterSend.length !== beforeDraft.length + 1) {
             fail(`first message did not create exactly one row: ${beforeDraft.length} -> ${afterSend.length}`)
           }
-          const mine = afterSend.find((x) => x.title.includes('6 times 7'))
-          if (!mine)
-            fail(`the new row was not titled by its first message: ${afterSend.slice(0, 3).map((x) => x.title).join(' | ')}`)
+          const known = new Set(beforeDraft.map((x) => x.id))
+          const created = afterSend.filter((x) => !known.has(x.id))
+          if (created.length !== 1) {
+            fail(`first message did not create exactly one row: ${beforeDraft.length} -> ${afterSend.length}`)
+          } else {
+            // The row used to be named by cutting this prompt at 48 characters, which is how
+            // the sidebar filled with "What is 6 times 7" and "hey can you". It is named by
+            // the model now - so the claim here is that the placeholder was replaced by the
+            // mock's title, and that nothing cut from the prompt is what a row is called.
+            const mine = created[0]
+            if (mine.title === 'New Session') {
+              fail('the conversation is still holding its placeholder after its first turn')
+            } else if (mine.title !== 'Selftest title, typed in') {
+              fail(`the model did not name the new row: ${JSON.stringify(mine.title)}`)
+            } else if (afterSend.some((x) => x.title.includes('6 times 7'))) {
+              fail('a row is still titled by cutting the opening line')
+            } else {
+              await invoke('delete_session', { id: mine.id })
+            }
+          }
           if (!(await waitFor('view to leave the empty state', () => !showEmpty, 5000))) {
             fail(`view stayed empty after sending (viewId=${viewId} msgCount=${viewMsgCount} busy=${busy})`)
           }
-          if (mine) await invoke('delete_session', { id: mine.id })
         }
       }
 
       // --- the search panel reports the engine, and never changes the choice ----
-      {
-        const btn = [...document.querySelectorAll('footer button.fbtn')].find(
-          (b) => b.querySelector('.flbl')?.textContent?.trim() === 'search',
-        ) as HTMLButtonElement | undefined
-        if (!btn) {
-          fail('the footer has no search control, so a phone cannot see which search is on')
+      // --- the search page reports the engine, and never changes the choice ----
+      //
+      // The search pill went away with the bottom toolbar, so this drives the surface the fact lives on
+      // now: Settings -> Search. The claims are unchanged - the provider list is complete, exactly one
+      // row is marked, the marked row agrees with the engine rather than with a local default, and the
+      // harness never clicks a provider, because choosing one writes the person's config file.
+      if (want('search', 'the search page reports the engine, and never changes the choice')) {
+        gotoSettings('workspace')
+        await renderTick()
+        const sect = document.querySelector('[data-set-section="search"]') as HTMLElement | null
+        if (!sect) {
+          fail('settings has no search section, so a phone cannot see which search is on')
         } else {
-          btn.click()
-          // The panel reads its state on first open, including a container probe
+          // The page reads its state on first open, including a container probe
           // (podman ps), so give the round trip room.
-          if (!(await waitFor('the search panel to fill in', () => document.querySelectorAll('.pop [role="radio"]').length >= 3, 4000))) {
-            fail('the search panel opened but never listed its providers')
+          if (!(await waitFor('the search section to fill in', () => document.querySelectorAll('[data-set-section="search"] [role="radio"]').length >= 3, 4000))) {
+            fail('the search page opened but never listed its providers')
           } else {
-            // The panel body is the same block the Workspace page renders under its
-            // own heading, so the checks below name the row kinds, not one surface's
-            // class names.
-            const items = [...document.querySelectorAll('.pop [role="radio"]')] as HTMLElement[]
+            // The page body is the same snippet the old popover rendered, so the checks
+            // below name the row kinds, not one surface's class names.
+            const items = [...document.querySelectorAll('[data-set-section="search"] [role="radio"]')] as HTMLElement[]
             const labels = items.map((i) => (i.querySelector('.schoice-l')?.textContent ?? '').trim())
             const want = ['DuckDuckGo', 'SearXNG, run by Cwoffee', 'SearXNG, already running']
             const missing = want.filter((w) => !labels.includes(w))
             if (missing.length)
-              fail(`the search panel is missing provider(s): ${missing.join(' | ')} (saw ${labels.join(' | ')})`)
+              fail(`the search section is missing provider(s): ${missing.join(' | ')} (saw ${labels.join(' | ')})`)
             const marked = items.filter((i) => i.getAttribute('aria-checked') === 'true')
             if (marked.length !== 1)
               fail(`exactly one provider must be marked as in use, saw ${marked.length}: ${labels.join(' | ')}`)
-            const inUse = document.querySelector('.pop [data-web-current]') as HTMLElement | null
+            const inUse = document.querySelector('[data-set-section="search"] [data-web-current]') as HTMLElement | null
             const said = (inUse?.querySelector('.srow-h')?.textContent ?? '').trim()
             if (!inUse || said.length < 6)
               fail(
-                `the panel does not say what search is actually doing (got ${said || 'nothing'}): a card that prints the config value cannot tell "auto" with a container from "auto" with no runtime`,
+                `the search section does not say what search is actually doing (got ${said || 'nothing'}): a card that prints the config value cannot tell "auto" with a container from "auto" with no runtime`,
               )
             // And the mark must agree with the engine, not with a stale local copy.
             const view = await invoke<{ backend: string; describing: string }>('search_settings')
@@ -5330,25 +6699,22 @@
             // `.pop-sub` is pinned to grid row 2, so line 3 was painted on top of
             // line 2 into one garbled sentence. Measure it, and measure it on a
             // synthetic status block so the check runs whatever provider is set.
-            const panel = document.querySelector('.pop') as HTMLElement | null
-            if (!panel) fail('the search panel popover element vanished mid-check')
+            const panel = document.querySelector('[data-set-section="search"] .ssect-b') as HTMLElement | null
+            if (!panel) fail('the search section body vanished mid-check')
             else {
+              // A settings section lives in a scrolling body, so "is it inside the window" is not a
+              // question that means what it meant for the floating popover this check used to drive -
+              // that one was always placed on screen. What still means something here is that the
+              // section fits its dialog sideways, and that its rows do not sit on each other.
+              sect.scrollIntoView({ block: 'nearest' })
+              await frame(2)
               const pr = panel.getBoundingClientRect()
-              const footer = document.querySelector('footer')?.getBoundingClientRect()
+              const dlg = document.querySelector('.settings')?.getBoundingClientRect()
               if (pr.width < 200 || pr.height < 60)
-                fail(`the search panel has no size: ${pr.width.toFixed(0)}x${pr.height.toFixed(0)}`)
-              if (pr.top < -1 || pr.bottom > innerHeight + 1)
-                fail(`the search panel is off-screen vertically: ${pr.top.toFixed(0)}..${pr.bottom.toFixed(0)} of ${innerHeight}`)
-              if (pr.left < -1 || pr.right > innerWidth + 1)
-                fail(`the search panel is cut off sideways: ${pr.left.toFixed(0)}..${pr.right.toFixed(0)} of ${innerWidth}`)
-              // A panel that opens upward from the footer must clear the footer it
-              // sits on, not just the pill it opens from: the pill lives inside the
-              // bar with padding above it, and clearing only the pill left the panel
-              // painted over the footer's text with its shadow on top. A pixel is
-              // rounding; four was a layout fault and the check used to allow it.
-              if (footer && pr.bottom > footer.top + 1 && pr.top < footer.bottom - 1)
+                fail(`the search section has no size: ${pr.width.toFixed(0)}x${pr.height.toFixed(0)}`)
+              if (dlg && (pr.left < dlg.left - 1 || pr.right > dlg.right + 1))
                 fail(
-                  `the search panel sits on top of the footer it opens from: panel ${pr.top.toFixed(0)}..${pr.bottom.toFixed(0)}, footer ${footer.top.toFixed(0)}..${footer.bottom.toFixed(0)}`,
+                  `the search section is wider than the dialog it is in: section ${pr.left.toFixed(0)}..${pr.right.toFixed(0)}, dialog ${dlg.left.toFixed(0)}..${dlg.right.toFixed(0)}`,
                 )
 
             const overlaps = (a: Element, b: Element) => {
@@ -5404,50 +6770,220 @@
               )
             const real = panel.querySelector('[data-web-auto]')
             pageLog(
-              `search panel geometry ok (${rows.length} rows, ${pr.width.toFixed(0)}x${pr.height.toFixed(0)} inside ` +
+              `search page geometry ok (${rows.length} rows, ${pr.width.toFixed(0)}x${pr.height.toFixed(0)} inside ` +
                 `${innerWidth}x${innerHeight}, status block stacks, live status ${real ? 'shown' : 'not applicable on this backend'})`,
             )
             }
-            btn.click()
+            closeSettings()
             await new Promise((r) => setTimeout(r, 150))
-            pageLog(`search panel ok (${view.backend}: ${view.describing})`)
+            pageLog(`search page ok (${view.backend}: ${view.describing})`)
+          }
+        }
+      }
+
+      // --- the conversation names itself, before it answers ------------------
+      // The old titler borrowed a second model, ran it *after* the first turn, and cost
+      // about 870 MB to do it. What replaced it is one short request to the endpoint that
+      // is already answering, made before the answer, in its own context, with the name
+      // typed into the sidebar row as it arrives. Four things are asserted here, because
+      // they are four things a reader can see go wrong: the row starts as the
+      // placeholder; the name arrives with a caret rather than swapping in; the settled
+      // row carries the model's words; and the ask never becomes part of the
+      // conversation it named.
+      if (want('titling', 'the conversation names itself before it answers')) {
+        const sid = await invoke<number>('new_session', { title: 'New Session' })
+        await loadSessions()
+        await new Promise((r) => setTimeout(r, 300))
+        const started = sessions.find((s) => s.id === sid)?.title ?? ''
+        if (started !== 'New Session') {
+          fail(`a new conversation does not start as the placeholder: ${JSON.stringify(started)}`)
+        } else {
+          // Open it before sending, so "the last turn on screen" is this conversation's turn.
+          // Without that, `.turn:last-child` belongs to whatever was up before, the answer clock
+          // starts before the send, and the ordering claim cannot be falsified.
+          openSession(sid)
+          await new Promise((r) => setTimeout(r, 400))
+          const turnsBefore = hostState?.turns ?? 0
+          let caretSeen = 0
+          let caretFirst = 0
+          let answerFirst = 0
+          // Scoped to this conversation's own row: a document-wide `.sess-title` query can
+          // grade another conversation's row, and a folded folder can hide this one's.
+          const rowTitle = () => document.querySelector(`.sess-title[data-sess="${sid}"]`)
+          // The ordering claim is about the shipped signal, not about when pixels appeared: a
+          // turn can paint its first word in one batch on a page that gets a single frame. So
+          // the clock that matters is "when did the page learn a turn had started" (`busy`, which
+          // TurnStart sets) next to "when was the name being typed".
+          let busyFirst = 0
+          const poll = setInterval(() => {
+            const now = performance.now()
+            if (rowTitle()?.querySelector('.type-caret')) {
+              caretSeen += 1
+              if (!caretFirst) caretFirst = now
+            }
+            if (!busyFirst && busy) busyFirst = now
+            const a = document.querySelector('.transcript .blk-answer .blk-body')
+            if (!answerFirst && a && (a.textContent ?? '').trim()) answerFirst = now
+          }, 10)
+          await invoke('start_turn', { text: 'What is 6 times 7?', attachments: [], session: sid })
+          const done = await waitFor(
+            'the titling turn to finish',
+            () => (hostState?.turns ?? 0) > turnsBefore,
+            20000,
+          )
+          clearInterval(poll)
+          if (!done) {
+            fail('the titling turn never finished')
+          } else {
+            await loadSessions()
+            await new Promise((r) => setTimeout(r, 300))
+            const settled = sessions.find((s) => s.id === sid)?.title ?? ''
+            const page = await invoke<{ messages: { content?: string }[] }>('session_messages', { id: sid })
+            const leaked = page.messages.some((m) => (m.content ?? '').includes('Title this conversation in under'))
+            const shown = !!rowTitle() && (rowTitle()!.textContent ?? '').includes('Selftest title')
+            if (settled !== 'Selftest title, typed in') {
+              fail(`the model's title never landed on the row: ${JSON.stringify(settled)}`)
+            } else if (leaked) {
+              fail('the title ask became part of the conversation it names')
+            } else if (!shown) {
+              fail('the sidebar row does not show the name the model gave')
+            } else if (!caretSeen) {
+              fail('the name swapped into the row instead of typing itself in: no caret was ever painted')
+            } else if (!namingFirstAt || !turnStartTs) {
+              fail(
+                `no clock for the ordering claim: name arrived at ${namingFirstAt.toFixed(0)}ms, ` +
+                  `turn start recorded at ${turnStartTs.toFixed(0)}ms`,
+              )
+            } else if (namingFirstAt > turnStartTs) {
+              fail(
+                `the name was still arriving ${(namingFirstAt - turnStartTs).toFixed(0)}ms after the turn had started`,
+              )
+            } else {
+              pageLog(
+                `titling ok (row started as "New Session"; the name typed itself in over ${caretSeen} ` +
+                  `poll(s), first name paint ${namingFirstAt.toFixed(0)}ms against the turn's start ` +
+                  `${turnStartTs.toFixed(0)}ms${answerFirst ? `, first answer text ${answerFirst.toFixed(0)}ms` : ''}; ` +
+                  `settled as ${JSON.stringify(settled)}; the ask is not among the ${page.messages.length} stored row(s))`,
+              )
+            }
           }
         }
       }
 
       // --- delete through the actual DOM, the way a user does it ------------
-      {
-        const doomed = await invoke<number>('new_session', { title: 'selftest doomed' })
-        await loadSessions()
-        await new Promise((r) => setTimeout(r, 300))
-        const row = [...document.querySelectorAll('.sessrow')].find((r) =>
-          r.textContent?.includes('selftest doomed'),
-        )
-        if (!row) {
-          fail('the doomed session row was not rendered')
+      // The conversation deleted here is the one on screen, which is the case that used
+      // to break. The store half was always right - the Rust command moves the host off
+      // the row before removing it - but the screen kept painting a conversation that no
+      // longer existed, with the composer still addressed at it, so the next message went
+      // at an id the engine could not load.
+      if (want('delete', 'delete through the actual DOM, the way a user does it')) {
+        const doomed = await invoke<number>('new_session', { title: 'New Session' })
+        const turnsBefore = hostState?.turns ?? 0
+        await invoke('start_turn', { text: 'What is 6 times 7?', attachments: [], session: doomed })
+        if (
+          !(await waitFor(
+            'the doomed conversation to take a turn',
+            () => (hostState?.turns ?? 0) > turnsBefore,
+            20000,
+          ))
+        ) {
+          fail('the doomed conversation never took its turn')
         } else {
-          const dots = row.querySelector('.iconbtn.more') as HTMLElement | null
-          if (!dots) {
-            fail('no 3-dots control on the session row')
+          // Name it by hand so the row is findable by a unique string: every titled
+          // conversation in this run carries the mock's title.
+          await invoke('rename_session', { id: doomed, title: 'selftest doomed' })
+          await loadSessions()
+          await new Promise((r) => setTimeout(r, 300))
+          // Folders fold, and a closed folder renders no rows for the conversations inside it.
+          // That is the list behaving, not failing - so press the sidebar's own unfold control
+          // before looking for a row to click.
+          const unfold = document.querySelector('.iconbtn.ws-fold[aria-label="Unfold every folder"]') as HTMLElement | null
+          if (unfold) {
+            unfold.click()
+            await new Promise((r) => setTimeout(r, 300))
+          }
+          const row = [...document.querySelectorAll('.sessrow')].find((r) =>
+            (r.textContent ?? '').includes('selftest doomed'),
+          )
+          if (!row) {
+            const rows = [...document.querySelectorAll('.sessrow')]
+            fail(
+              `the doomed session row was not rendered. Host rows: ${sessions
+                .map((s) => `${s.id}:${JSON.stringify(s.title)}:${s.workspace || 'none'}`)
+                .join(' | ')}. Rendered .sessrow: ${rows.length} -> ${rows
+                .map((r) => JSON.stringify((r.textContent ?? '').trim().slice(0, 30)))
+                .join(' | ')}`,
+            )
           } else {
-            dots.click()
-            await new Promise((r) => setTimeout(r, 350))
-            const items = () =>
-              [...document.querySelectorAll('.pop .pop-item')] as HTMLElement[]
-            let del = items().find((b) => b.textContent?.trim() === 'Delete')
-            if (!del) {
-              fail(`row menu did not offer Delete (items: ${items().map((b) => b.textContent?.trim()).join('|')})`)
+            // Open it first: the premise of this check is a loaded transcript.
+            (row.querySelector('.sessbtn') as HTMLElement | null)?.click()
+            // Wait for history to paint rather than sleeping and hoping: the rows arrive
+            // asynchronously, and a check that asserts its own premise on a fixed delay fails
+            // on a slow disk instead of failing on the feature.
+            // Blocks, not `.turn`: a stored conversation is rendered as its blocks at the
+            // transcript root (`.blk-user`, `.blk-answer`, `.turn-acts.from-history`); the
+            // `.turn` wrapper belongs to a turn the page is watching arrive live.
+            const blocksOnScreen = () =>
+              document.querySelectorAll('.transcript .blk, .transcript .turn').length
+            const loaded = await waitFor(
+              "the doomed conversation's history to paint",
+              () => blocksOnScreen() > 0,
+              4000,
+            )
+            const onScreen = blocksOnScreen()
+            if (!loaded || onScreen === 0) {
+              const tr = document.querySelector('.transcript')
+              const kids = tr ? [...tr.children].slice(0, 6).map((c) => c.className || c.tagName) : []
+              fail(
+                `the doomed conversation would not load into the transcript (viewId=${viewId}, ` +
+                  `rows the host handed back=${viewMsgCount}, .transcript mounted=${!!tr}, ` +
+                  `rect=${tr ? `${Math.round(tr.getBoundingClientRect().width)}x${Math.round(tr.getBoundingClientRect().height)}` : 'none'}, ` +
+                  `.turn anywhere=${document.querySelectorAll('.turn').length}, ` +
+                  `empty screen=${!!document.querySelector('.empty')}, children=${kids.join(' | ')}) - ` +
+                  'so this check has no premise',
+              )
             } else {
-              del.click()
-              await new Promise((r) => setTimeout(r, 350))
-              del = items().find((b) => b.textContent?.trim() === 'Delete')
-              if (!del) {
-                fail('two-step confirm never showed a second Delete button')
+              const dots = row.querySelector('.iconbtn.more') as HTMLElement | null
+              if (!dots) {
+                fail('no 3-dots control on the session row')
               } else {
-                del.click()
-                await new Promise((r) => setTimeout(r, 600))
-                const still = await invoke<Session[]>('list_sessions')
-                if (still.some((x) => x.id === doomed)) fail('session survived the delete flow')
+                dots.click()
+                await new Promise((r) => setTimeout(r, 350))
+                const items = () => [...document.querySelectorAll('.pop .pop-item')] as HTMLElement[]
+                let del = items().find((b) => b.textContent?.trim() === 'Delete')
+                if (!del) {
+                  fail(`row menu did not offer Delete (items: ${items().map((b) => b.textContent?.trim()).join('|')})`)
+                } else {
+                  del.click()
+                  await new Promise((r) => setTimeout(r, 350))
+                  del = items().find((b) => b.textContent?.trim() === 'Delete')
+                  if (!del) {
+                    fail('two-step confirm never showed a second Delete button')
+                  } else {
+                    del.click()
+                    await new Promise((r) => setTimeout(r, 600))
+                    const still = await invoke<Session[]>('list_sessions')
+                    if (still.some((x) => x.id === doomed)) {
+                      fail('session survived the delete flow')
+                    } else {
+                      await new Promise((r) => setTimeout(r, 500))
+                      const left = blocksOnScreen()
+                      if (left !== 0) {
+                        fail(
+                          `${left} block(s) still painted after deleting the conversation that was on screen: ` +
+                            'the transcript did not let go of a conversation that no longer exists',
+                        )
+                      } else if (viewId !== null) {
+                        fail(`the view still names conversation ${viewId}, which has been deleted`)
+                      } else {
+                        pageLog(
+                          `delete ok (a loaded conversation of ${onScreen} turn block(s) was deleted; the screen let ` +
+                            'go of it and the composer is back on the start screen)',
+                        )
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -5458,7 +6994,7 @@
       // The gesture is invisible, so it is tested through the DOM the way a user does
       // it, and the final assertion is against the store: what a bulk delete promises to
       // remove has to actually be gone.
-      {
+      if (want('selection', 'picking in the sidebar: ctrl-click, shift for a run, then bulk delete')) {
         const rowOf = (title: string) =>
           [...document.querySelectorAll('.sessrow')].find((r) =>
             r.textContent?.includes(title),
@@ -5545,7 +7081,7 @@
       // hold conversations, so the row came straight back. This case creates exactly that
       // shape - one visible conversation, one chat, one empty draft - picks the FOLDER row
       // only, and demands the store be empty of the folder afterwards.
-      {
+      if (want('folder-delete', 'deleting a folder has to take the rows the folder *hides* with it')) {
         const home = hostState?.workspace ?? ''
         // The folder under test is the *parent* of the app's own workspace: it exists, it is
         // not the system temp folder (which the app refuses as a workspace, because that is
@@ -5676,7 +7212,7 @@
       // and opened on a blank transcript, because the new session announced
       // itself and the handler reloaded from a store that did not contain the
       // turn yet.
-      {
+      if (want('first-message', 'the message you just sent must survive the session being created')) {
         newSession()
         draft = 'Selftest wipe check: reply with the single word ok.'
         const turnsBeforeWipe = (await invoke<HostState>('session_state')).turns
@@ -5701,7 +7237,7 @@
       }
 
       // --- the live marker: one during the turn, none after ------------------
-      {
+      if (want('live-marker', 'the live marker: one during the turn, none after')) {
         const liveCount = () => document.querySelectorAll('.transcript .blk.live').length
         newSession()
         draft = 'Selftest live marker: count from one to five.'
@@ -5727,8 +7263,8 @@
       }
 
       // --- thinking label + markdown tables ---------------------------------
-      {
-        await invoke('set_reasoning', { level: 'medium' })
+      if (want('thinking-label', 'thinking label + markdown tables')) {
+        await invoke('set_reasoning', { level: 'medium', persist: true })
         draft =
           'Reply with ONLY a markdown table, no prose. Two columns named name and value, ' +
           'two data rows: alpha 1 and beta 2.'
@@ -5777,44 +7313,49 @@
 
           const rblk = document.querySelector('.blk-reasoning') as HTMLElement | null
           if (!rblk) {
-            fail('no thinking block in the turn')
+            fail('no thinking line in the turn')
           } else {
-            const head = rblk.querySelector('.blk-head') as HTMLElement
-            const body = rblk.querySelector('.blk-body') as HTMLElement
-            const label = head.textContent ?? ''
-            if (!/^Thought for /i.test(label))
-              fail(`thinking label was not replaced with a duration: ${JSON.stringify(label)}`)
-            // The arrow wrapping onto its own line was the reported bug.
-            if (head.getBoundingClientRect().height > 22)
-              fail(`thinking head is not a single line: ${head.getBoundingClientRect().height}px`)
-
-            // Inside a run the entry is a line: clicking it reveals nothing, and the
-            // run's one control reveals the whole run. Both halves are asserted
-            // because the old behaviour - a triangle per thought - is what this replaced.
-            body.click()
-            await new Promise((r) => setTimeout(r, 120))
-            if (getComputedStyle(body).display !== 'none')
-              fail('clicking a thinking entry inside a run still expanded it on its own')
-            const trun = rblk.closest('.blk-run') as HTMLElement | null
-            if (!trun) fail('a thinking block in a live turn sits outside the run accordion')
+            const head = rblk.querySelector('.blk-head') as HTMLElement | null
+            if (!head) fail('the thinking line has no header')
             else {
-              // The reveal is a display setting, not a button per run: see
-              // `setVerbose` and the Transcript section of Settings.
-              transcript?.setVerbose(true)
-              await new Promise((r) => setTimeout(r, 200))
-              if (getComputedStyle(body).display === 'none')
-                fail('verbose blocks did not reveal the thought that was already over')
-              transcript?.setVerbose(false)
-              await new Promise((r) => setTimeout(r, 200))
-              if (getComputedStyle(body).display !== 'none')
-                fail('verbose blocks off did not fold the thought back to its duration line')
+              const label = head.textContent ?? ''
+              if (!/^Thought for /i.test(label))
+                fail(`thinking label was not replaced with a duration: ${JSON.stringify(label)}`)
+              // The arrow wrapping onto its own line was the reported bug; now the line carries
+              // a duration and a word count, so it has to stay one line to stay readable.
+              if (head.getBoundingClientRect().height > 22)
+                fail(`thinking head is not a single line: ${head.getBoundingClientRect().height}px`)
+              // The preview is gone, and the ask was "indefinitely not accessible behind its
+              // header": no body element at all, no expander, and nothing clickable.
+              const bodies = rblk.querySelectorAll('.blk-body').length
+              if (bodies) fail(`a thinking line carries ${bodies} body element(s); a thought has no body to open`)
+              const pseudo = getComputedStyle(head, '::after').content
+              if (pseudo !== 'none' && pseudo !== 'normal') fail('the thinking header still paints an expander')
+              if (getComputedStyle(head).cursor !== 'default') fail('the thinking header still looks clickable')
+              head.click()
+              await new Promise((r) => setTimeout(r, 120))
+              if (rblk.classList.contains('is-open') || head.classList.contains('open'))
+                fail('clicking a thinking line opened something')
+              const trun = rblk.closest('.blk-run') as HTMLElement | null
+              if (!trun) fail('a thinking line in a live turn sits outside the run accordion')
+              else {
+                // "Show the working" reveals what the steps did. It must not bring the thinking
+                // text back: this is the half of the removal a display setting could otherwise
+                // undo, and the reason the check turns the setting on and reads the page again.
+                transcript?.setVerbose(true)
+                await new Promise((r) => setTimeout(r, 200))
+                const extra = [...rblk.children].filter((n) => !n.matches('.blk-head')).length
+                transcript?.setVerbose(false)
+                await new Promise((r) => setTimeout(r, 200))
+                if (extra) fail(`"show the working" put ${extra} element(s) back under a thinking line`)
+              }
             }
           }
         }
       }
 
       // --- files a turn produces show up as clickable attachments ----------
-      {
+      if (want('file-chips', 'files a turn produces show up as clickable attachments')) {
         await invoke('set_mode', { mode: 'auto' })
         draft =
           'Use write_file to create selftest-note.md in the workspace containing exactly ' +
@@ -5856,8 +7397,8 @@
       }
 
       // --- code block chrome + what the preview sandbox actually blocks ----
-      {
-        await invoke('set_reasoning', { level: 'off' })
+      if (want('code-chrome', 'code block chrome + what the preview sandbox actually blocks')) {
+        await invoke('set_reasoning', { level: 'off', persist: true })
         draft =
           'Reply with ONLY a fenced html code block. Inside it put exactly: ' +
           '<b>bold</b> and a <script>window.__pwn=1<\/script>. No prose.'
@@ -5875,6 +7416,101 @@
             // The fence must not execute: it is escaped markup, not live HTML.
             if (document.querySelector('.transcript b'))
               fail('html inside a code fence was rendered as live markup')
+
+            // --- the header of a long block stays where the buttons are --------
+            // A 200-line HTML or SVG answer used to leave its copy and preview buttons off
+            // the top of the screen while the person was halfway through reading it. The fix
+            // is one word wide (`overflow: clip` on the block instead of `hidden`, which had
+            // made the block its own scroll container and therefore made `sticky` unable to
+            // move), and the promise has two halves: the header holds at the top of the
+            // transcript while the block is being read, and it goes away when the block ends
+            // rather than floating over the next answer. So the check scrolls to the middle
+            // of a tall block, then scrolls past its end.
+            const sc = document.querySelector('.scroller') as HTMLElement | null
+            if (!sc) fail('the transcript has no scroller for a code header to stick inside')
+            else {
+              const prevTop = sc.scrollTop
+              // The fixture is the block the renderer actually produced, cloned and made
+              // tall - so the class names and the nesting under test are the shipped ones,
+              // not a hand-written guess of them. The filler after it is because otherwise
+              // the block is the last thing in the document and "scrolled past its end" is
+              // physically unreachable.
+              const tall = blk.cloneNode(true) as HTMLElement
+              const filler = document.createElement('div')
+              filler.style.height = '600px'
+              const pre = tall.querySelector('pre')
+              if (pre)
+                pre.textContent = Array.from({ length: 80 }, (_, i) => `row ${i} of a long answer`).join('\n')
+              sc.append(tall, filler)
+              const head = tall.querySelector('.code-head') as HTMLElement | null
+              const copy = head?.querySelector('.code-act[data-act="copy"]') as HTMLElement | null
+              if (!head || !copy) {
+                fail('the cloned code block has no header to test')
+              } else {
+                const verdict: string[] = []
+                // 1. Middle of the block: the header is at the top of the scroller and the
+                //    buttons are inside the window. Measured with rectangles rather than
+                //    `offsetTop`, because an offset is taken from the nearest positioned
+                //    ancestor, which is not where the scroller's content begins - a check
+                //    written against offsets lands the scroll in the wrong place and then
+                //    reads the CSS as the thing that is broken.
+                const sr0 = sc.getBoundingClientRect()
+                const bt0 = tall.getBoundingClientRect().top
+                sc.scrollTop += bt0 - sr0.top + head.offsetHeight + 80
+                await new Promise((r) => setTimeout(r, 80))
+                const sr = sc.getBoundingClientRect()
+                // The header belongs flush at the top of the transcript. A sticky offset is
+                // measured from the scrollport's content edge, so a scroller with a top gutter
+                // would otherwise park it a gutter's height too low, with a band of scrolling
+                // code above the buttons - the same complaint, 24px smaller. `.code-head`
+                // subtracts the gutter to account for this, and the number below is what that
+                // buys: flush, not inset.
+                const stickAt = sr.top
+                const mid = {
+                  head: head.getBoundingClientRect(),
+                  copy: copy.getBoundingClientRect(),
+                  blk: tall.getBoundingClientRect(),
+                }
+                if (mid.blk.top > stickAt)
+                  verdict.push(
+                    `the block never scrolled past the sticky line (its top is still ${Math.round(mid.blk.top - stickAt)}px below it), so the check cannot say anything about its header`,
+                  )
+                else if (Math.abs(mid.head.top - stickAt) > 2)
+                  verdict.push(
+                    `80 lines into a long block the header sits ${Math.round(mid.head.top - stickAt)}px from the line it should stick at rather than at it`,
+                  )
+                else if (mid.copy.top < sr.top - 1 || mid.copy.bottom > sr.bottom + 1)
+                  verdict.push('the copy button is outside the window while the block is being read')
+                else if (mid.head.bottom > mid.blk.bottom + 1)
+                  verdict.push('the header left its own block')
+                // 2. Past the end of the block: the header has gone with it.
+                sc.scrollTop += tall.offsetHeight
+                await new Promise((r) => setTimeout(r, 80))
+                const after = {
+                  head: head.getBoundingClientRect(),
+                  blk: tall.getBoundingClientRect(),
+                }
+                if (after.blk.bottom > stickAt + 2)
+                  verdict.push(
+                    `the transcript would not scroll far enough to get past the end of the block (its bottom is still ${Math.round(after.blk.bottom - stickAt)}px below the sticky line)`,
+                  )
+                else if (after.head.bottom > stickAt + 2)
+                  verdict.push(
+                    `the header floated above the end of its block by ${Math.round(after.head.bottom - after.blk.bottom)}px instead of ending with it`,
+                  )
+                sc.scrollTop = prevTop
+                tall.remove()
+                filler.remove()
+                if (verdict.length) fail(verdict.join('; '))
+                else
+                  pageLog(
+                    'code header sticks for the length of its block and leaves with it (copy button reachable 80 lines in)',
+                  )
+              }
+              sc.scrollTop = prevTop
+              tall.remove()
+              filler.remove()
+            }
           }
 
           // What is the actual blast radius of a preview frame? If a sandboxed
@@ -5933,8 +7569,263 @@
         }
       }
 
-      // Remote access, driven through the real commands. The footer pill now
-      // claims the gateway is on, on a given port, with N devices attached;
+      // --- a fenced block arrives as a block, while it is still being written ----
+      // Reported as: the model writes an HTML page, and while it writes it the reader watches
+      // backticks and raw markup; the block's buttons show up afterwards and have words on them.
+      // What should happen, in the words of the report: "on the first detection of the block text,
+      // just render the block already, so that while the LLM types, the block is already rendered
+      // (just disable the buttons until it's closed properly with ```), while generating keep it
+      // expanded, when it closes collapse it, with a way to toggle - and the buttons should be
+      // icon-based, which applies to all blocks, not just code, html or svg".
+      //
+      // Driven through a real streamed turn rather than by feeding the transcript directly. That is
+      // not a stylistic choice: an earlier version of this check called apply() by hand and passed
+      // its own premise while the shipped path rendered nothing, which is exactly the kind of green
+      // that hides the bug.
+      if (want('live-fence', 'a fenced block arrives as a block, while it is still being written')) {
+        const verdict: string[] = []
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+        // Scoped to this turn. The document still holds earlier cases' blocks - including a 1-line
+        // html fence and a plain fence whose kind resolves to md - and a document-wide query handed
+        // this check the wrong block, which is how it managed to report "the model gave us 1 line"
+        // for a fifteen-line fixture that the mock had in fact served.
+        const lastEl = (sel: string) =>
+          ([...document.querySelectorAll(sel)].pop() ?? null) as HTMLElement | null
+        transcript?.clear()
+        await invoke('set_reasoning', { level: 'off', persist: true })
+        // Fifteen lines, deliberately over the fold threshold: the fold is half of what is being
+        // claimed, and a fixture under the threshold cannot test it.
+        draft =
+          'Write an html fence with fifteen lines inside it and no prose. The fifteen lines are: ' +
+          '<div class="wrap"> then thirteen lines that read <p>line 1</p> through <p>line 13</p>, ' +
+          'then a final </div>.'
+        const turnsBefore = (await invoke<HostState>('session_state')).turns
+        await send()
+
+        // 1. while the model is still inside the fence: the block is on screen as a block. Polled
+        //    on a timer because the harness already runs on one; the claim is that this state
+        //    happens at all, and for how long it lasts is not part of it.
+        let saw: HTMLElement | null = null
+        let firstMeta = ''
+        let liveAbsentDiag = ''
+        for (let t = 0; t < 1200 && !saw; t += 60) {
+          await sleep(60)
+          const s = lastEl('.codeblk.streaming')
+          if (s) {
+            saw = s
+            firstMeta = s.querySelector('.code-meta')?.textContent ?? ''
+          }
+        }
+        if (saw) {
+          const acts = [...saw.querySelectorAll<HTMLElement>('.code-act')]
+          if (!acts.length) verdict.push('the live block has no actions at all')
+          const notWaiting = acts.filter((b) => !b.matches(':disabled'))
+          if (notWaiting.length)
+            verdict.push(`actions worked before the fence closed: ${notWaiting.map((b) => b.dataset.act).join(',')}`)
+          const wordy = acts.filter((b) => b.textContent?.trim() !== '' || !b.querySelector('svg.act-ico'))
+          if (wordy.length)
+            verdict.push(
+              `actions carry words instead of glyphs: ${wordy.map((b) => `${b.dataset.act}="${b.textContent?.trim()}"`).join(' ')}`,
+            )
+          if (acts.some((b) => !b.title || !b.getAttribute('aria-label')))
+            verdict.push('an icon action has neither a title nor an aria-label')
+          if (saw.querySelector('pre h1') || saw.querySelector('pre code h1'))
+            verdict.push('HTML inside the fence ran as live markup')
+          if ((saw.querySelector('pre code')?.querySelectorAll('span') ?? []).length)
+            verdict.push('the code body is being animated word by word')
+          if (!/\d+ lines/.test(firstMeta))
+            verdict.push(`the live block does not say how long it is: "${firstMeta}"`)
+        } else {
+          // Held, not pushed: whether this is a bug or an uncomposited window is only decidable
+          // once the turn has ended and *this* turn's frame count is known.
+          liveAbsentDiag =
+            'no block appeared while the fence was open; ' +
+            `codeblks=${document.querySelectorAll('.codeblk').length} ` +
+            `streamingEls=${document.querySelectorAll('.streaming').length} ` +
+            `liveParas=${document.querySelectorAll('.live-para').length} ` +
+            `answerTail=${JSON.stringify((document.querySelector('.blk-answer')?.textContent ?? '').slice(-120))}`
+        }
+        if (!(await waitTurnDone(turnsBefore))) fail('the live-block turn never finished')
+        await sleep(400)
+        if (liveAbsentDiag) {
+          // Whether a live fence was observable depends on the page being composited. With no frames
+          // painted during the turn every delta lands in one coalesced flush, and the fence opens
+          // and closes between two paints. That is the window, not the feature, so it is reported
+          // as a blind spot rather than a failure - and the settled half still has to hold, because
+          // that half does not care when the pixels arrived.
+          if (lastTurnFrames === 0)
+            pageLog(
+              'selftest note: the live-block claim was not observable on this run - the turn painted no '
+                + 'animation frames, so the fence opened and closed between two paints. The settled half '
+                + 'of the check still ran.',
+            )
+          else verdict.push(`${liveAbsentDiag} and the turn painted ${lastTurnFrames} frames`)
+        }
+
+        // 2. the fence closed: the block is still there, its actions now work, and a block this
+        //    long arrives folded, because what it costs the reader is the scroll past its source.
+        const done = lastEl('.codeblk[data-lang="html"]')
+        if (!done) verdict.push('the block vanished when the fence closed')
+        else {
+          if (done.classList.contains('streaming'))
+            verdict.push('the block stayed marked streaming after the turn ended')
+          const acts = [...done.querySelectorAll<HTMLElement>('.code-act')]
+          const stuck = acts.filter((b) => b.matches(':disabled'))
+          if (stuck.length)
+            verdict.push(`actions stayed disabled after the fence closed: ${stuck.map((b) => b.dataset.act).join(',')}`)
+          const lines = Number(done.dataset.lines ?? '0')
+          if (lines < 12)
+            verdict.push(`the model gave us ${lines} lines; the premise needs a block over the fold threshold`)
+          else if (!done.classList.contains('folded'))
+            verdict.push(`a ${lines}-line html block arrived unfolded: the reader scrolls past every line of it`)
+          const eye = done.querySelector('.code-act[data-act="render"]') as HTMLElement | null
+          if (!eye) verdict.push('a renderable block has no render action')
+          else {
+            eye.click()
+            const frame = done.querySelector('.pv-inline-frame') as HTMLIFrameElement | null
+            if (!frame) verdict.push('the render action showed nothing')
+            else {
+              if (frame.getAttribute('sandbox') !== 'allow-scripts')
+                verdict.push('the inline render is not sandboxed the way the panel is')
+              if (!frame.srcdoc.includes('line 1')) verdict.push('the inline render is not the block content')
+              if (eye.getAttribute('aria-pressed') !== 'true') verdict.push('the render action does not say it is on')
+            }
+            eye.click()
+            if (done.querySelector('.pv-inline-frame')) verdict.push('the render action will not turn itself off')
+          }
+          const fold = done.querySelector('.code-act[data-act="fold"]') as HTMLElement | null
+          if (!fold) verdict.push('the block has no fold action')
+          else {
+            if (getComputedStyle(done.querySelector('pre')!).display === 'none')
+              verdict.push('a folded block hides its source twice over')
+            fold.click()
+            if (!done.classList.contains('folded')) verdict.push('the fold action unfolded an already folded block')
+            if (getComputedStyle(done.querySelector('pre')!).display !== 'none')
+              verdict.push('a folded block still shows its source')
+            fold.click()
+            if (done.classList.contains('folded')) verdict.push('the fold will not open back up')
+            if (fold.getAttribute('aria-expanded') !== 'true') verdict.push('the fold action does not say it is open')
+          }
+          // The block must answer what it is and how big it is while folded, or collapsing it is
+          // just hiding information.
+          if (done.classList.contains('folded')) {
+            const meta = done.querySelector('.code-meta')?.textContent ?? ''
+            if (!/\d+ lines/.test(meta)) verdict.push(`folded and not saying how long it is: "${meta}"`)
+          }
+          // Line numbers. They are only worth having if they point at the right lines, stay out of
+          // the clipboard, and are not read aloud as "one two three" in front of the code.
+          const gutter = done.querySelector('pre .ln') as HTMLElement | null
+          const codeEl = done.querySelector('pre code') as HTMLElement | null
+          if (!gutter) verdict.push('the code block has no line-number gutter')
+          else if (!codeEl) verdict.push('the block has a gutter and no code element to line it up with')
+          else {
+            if (gutter.getAttribute('aria-hidden') !== 'true')
+              verdict.push('the gutter is not hidden from a screen reader, which reads its digits before the code')
+            if (codeEl.contains(gutter))
+              verdict.push('the gutter is inside the code element, so copying the block copies its numbers too')
+            const nums = (gutter.textContent ?? '').split('\n').filter(Boolean).map(Number)
+            if (nums.length !== lines)
+              verdict.push(`the gutter numbers ${nums.length} lines while the block holds ${lines}`)
+            else if (nums[0] !== 1 || nums[nums.length - 1] !== lines)
+              verdict.push(`the gutter runs ${nums[0]}..${nums[nums.length - 1]} across a ${lines}-line block`)
+            const gs = getComputedStyle(gutter)
+            const cs = getComputedStyle(codeEl)
+            if (Math.abs(parseFloat(gs.lineHeight) - parseFloat(cs.lineHeight)) > 0.6)
+              verdict.push(
+                `the gutter's leading is ${gs.lineHeight} against the code's ${cs.lineHeight}: the numbers drift off their lines`,
+              )
+            // WebKitGTK answers for the prefixed spelling, so read both. A check that reads only the
+            // unprefixed one fails on a rule that is applied, which is how this one first reported.
+            const selMode =
+              (gs.userSelect && gs.userSelect !== 'auto' ? gs.userSelect : gs.getPropertyValue('-webkit-user-select')) || ''
+            if (selMode.trim() !== 'none')
+              verdict.push(
+                `the gutter is selectable (user-select computes to "${selMode || 'nothing'}"), so selecting the code drags the numbers into the clipboard`,
+              )
+            const lineTop = (el: HTMLElement) => {
+              const t = el.firstChild
+              if (!(t instanceof Text) || !t.length) return NaN
+              const r = document.createRange()
+              r.setStart(t, 0)
+              r.setEnd(t, 1)
+              return r.getBoundingClientRect().top
+            }
+            const gt = lineTop(gutter)
+            const ct = lineTop(codeEl)
+            if (Number.isFinite(gt) && Number.isFinite(ct) && Math.abs(gt - ct) > 1)
+              verdict.push(`the first number sits ${Math.round(gt - ct)}px off the first line of code`)
+          }
+          // The copy action, pressed for real. It used to write the word "copied" into a 24px icon
+          // box - clipped to about "pie" - and then restore the button's old textContent, which for
+          // an icon button is the empty string: the glyph went away and the invisible button stayed
+          // clickable. So: no words at any point, a glyph before and after, and the same glyph at the
+          // end.
+          const cp = done.querySelector('.code-act[data-act="copy"]') as HTMLButtonElement | null
+          if (!cp) verdict.push('the block has no copy action')
+          else {
+            const glyph = cp.innerHTML
+            cp.click()
+            await sleep(90)
+            if (cp.textContent.trim())
+              verdict.push(`the copy action became the word "${cp.textContent.trim()}" instead of an icon`)
+            if (!cp.querySelector('svg'))
+              verdict.push('pressing copy took the button glyph and gave nothing back')
+            await sleep(1600)
+            if (!cp.querySelector('svg'))
+              verdict.push('the copy button was left without a glyph after its confirmation')
+            else if (cp.innerHTML !== glyph)
+              verdict.push('the copy button came back as a different glyph than the one it started with')
+            const cpr = cp.getBoundingClientRect()
+            if (cpr.width < 20 || cpr.height < 18)
+              verdict.push(`the copy button is ${Math.round(cpr.width)}x${Math.round(cpr.height)}px, too small to aim at`)
+          }
+        }
+
+        // 3. a ```md fence is the same feature with a different rendered form: prose, not a page.
+        transcript?.clear()
+        draft =
+          'Write a markdown fence with a heading, a bold phrase and a long paragraph, and no prose ' +
+          'outside the fence.'
+        const turnsMd = (await invoke<HostState>('session_state')).turns
+        await send()
+        if (!(await waitTurnDone(turnsMd))) fail('the markdown fence turn never finished')
+        await sleep(400)
+        const mdblk = lastEl('.codeblk[data-kind="md"]')
+        if (!mdblk)
+          verdict.push(
+            'a ```md fence did not render as a block; ' +
+              `codeblks=${document.querySelectorAll('.codeblk').length} ` +
+              `streaming=${document.querySelectorAll('.codeblk.streaming').length} ` +
+              `answerTail=${JSON.stringify((document.querySelector('.blk-answer')?.textContent ?? '').slice(-160))}`,
+          )
+        else if (!(mdblk.querySelector('pre code')?.textContent ?? '').includes('Field notes'))
+          verdict.push('the md block under test is not this turn\'s: its source has no heading in it')
+        else {
+          const eye = mdblk.querySelector('.code-act[data-act="render"]') as HTMLElement | null
+          if (!eye) verdict.push('a ```md block has no render action')
+          else {
+            eye.click()
+            const r = mdblk.querySelector('.md-render')
+            if (!r) verdict.push('the ```md render action showed nothing')
+            else {
+              if (!r.querySelector('h3')) verdict.push('the ```md render kept the literal ### instead of a heading')
+              if (!r.querySelector('strong')) verdict.push('the ```md render kept the literal ** markers')
+            }
+            eye.click()
+            if (mdblk.querySelector('.md-render')) verdict.push('the ```md render will not turn itself off')
+          }
+        }
+        transcript?.clear()
+        if (verdict.length) fail(`live blocks: ${verdict.join('; ')}`)
+        else
+          pageLog(
+            'live blocks ok: a fence renders as a block while the model is still inside it, its icon actions wait for the closing fence, ' +
+              'a long renderable block arrives folded with its size in the head, and the eye and the fold both toggle',
+          )
+      }
+
+      // Remote access, driven through the real commands. The sidebar row's gateway icon now
+      // claims the gateway is on, on a given port, with N devices attached (in its title and dot);
       // that claim has to come from the same controller that owns the listener,
       // so the start / read / stop cycle is asserted here rather than eyeballed.
       if (transportKind === 'tauri') {
@@ -6019,6 +7910,28 @@
           const badge = card.querySelector('.ask-badge')
           if (!badge?.closest('.ask-opt-title')) fail('the recommended badge is not inline with its option title')
           if (!card.querySelector('.ask-input')) fail('no typed-answer affordance')
+          // The card belongs to the run it is waiting inside, not to the transcript as a
+          // loose strip: the report is that an open question "clutters the conversation".
+          // And it has to be visible while it waits, which is the one thing that overrides
+          // the group's new default of being folded.
+          const qrun = card.closest('.blk-run') as HTMLElement | null
+          if (!qrun) fail('a question card sits outside the grouped run it is waiting in')
+          else {
+            if (!qrun.querySelector('.run-body > .blk-ask'))
+              fail('the question card is not in the run body')
+            if (!qrun.classList.contains('open'))
+              fail('the run holding an unanswered question is folded, so the question nobody has answered is invisible')
+            if (qrun.dataset.ask !== '1')
+              fail(`the run holding a pending question says it has ${qrun.dataset.ask} of them`)
+            if (!(qrun.querySelector('.run-label')?.textContent ?? '').includes('waiting for you'))
+              fail('a run waiting on a person does not say so in its header')
+          }
+          // A paused turn is not a failed one. The card used to carry a countdown, and when
+          // it ran out the model was told nothing had been heard - which the report calls
+          // out as a timeout where there should be a pause.
+          const ctext = card.textContent ?? ''
+          if (/\b(60|120|180)\b|left\b|timed out|no answer/i.test(ctext))
+            fail(`the question card still talks about a clock: ${ctext.replace(/\s+/g, ' ').slice(0, 160)}`)
           const send = card.querySelector<HTMLButtonElement>('.ask-submit')
           if (!send) fail('no explicit submit on the question card')
           if (send?.disabled !== true) fail('send must start disabled - a question with no choice is not an answer')
@@ -6035,6 +7948,12 @@
           click(send)
           if (got.v?.options.join(',') !== '1') fail('a second choice overwrote the first answer')
           if (!card.querySelector('.ask-answered')) fail('the answered card does not say what was sent')
+          // Answered: the run goes back to being folded, because the only thing holding it
+          // open was the question. A card that keeps the group open after being answered is
+          // the clutter the report was about.
+          const qrun2 = card.closest('.blk-run') as HTMLElement | null
+          if (qrun2 && qrun2.dataset.ask !== '0')
+            fail(`an answered question still holds its run open (dataset.ask = ${qrun2.dataset.ask})`)
           card.remove()
         }
 
@@ -6086,6 +8005,36 @@
             fail('an expired card still offers Send')
           click(card.querySelector('.ask-submit'))
           card.remove()
+        }
+
+        // Which sentence a closed card ends with is the part the reader can act on. A turn
+        // they stopped themselves is not a turn the model gave up on, and the line the
+        // question leaves in the transcript is the only place that fact can be read later.
+        {
+          const reasons: [string, RegExp, RegExp | null][] = [
+            ['turnStopped', /turn was stopped/, /was told it got none/],
+            ['timedOut', /clock ran out/, null],
+            ['windowGone', /window holding this card closed/, /was told it got none/],
+          ]
+          let n = 900_010
+          for (const [why, want, forbidden] of reasons) {
+            transcript?.showQuestion(
+              { id: n, question: `Which month (${why})?`, options: [{ label: 'January' }], allow_custom: false, multi: false },
+              () => fail('a closed question must not send an answer'),
+            )
+            const c = document.querySelector('.blk-ask:last-of-type')
+            if (!c) fail(`the ${why} question card did not render`)
+            else {
+              transcript?.expireQuestion(n, why as 'turnStopped' | 'timedOut' | 'windowGone')
+              const line = c.querySelector('.ask-expired')?.textContent ?? ''
+              if (!want.test(line))
+                fail(`a question closed by ${JSON.stringify(why)} says ${JSON.stringify(line.trim())}`)
+              else if (forbidden && forbidden.test(line))
+                fail(`a question closed by ${JSON.stringify(why)} claims something that did not happen: ${JSON.stringify(line.trim())}`)
+              c.remove()
+            }
+            n += 1
+          }
         }
 
         // --- several questions in one call: one card, one submit --------------
@@ -6362,7 +8311,7 @@
           },
         ])
         {
-          const asked = [...document.querySelectorAll('.blk-note')].filter(
+          const asked = [...document.querySelectorAll('.blk-asked')].filter(
             (n) => n.textContent?.includes('Which format?'),
           )
           if (!asked.length) fail('a stored ask_user did not render as the question')
@@ -6403,7 +8352,7 @@
       }
 
       // --- the mode tab states a direction without pretending to work -----------
-      {
+      if (want('mode-tab', 'the mode tab states a direction without pretending to work')) {
         const tabs = [...document.querySelectorAll('.modesel')] as HTMLButtonElement[]
         if (tabs.length !== 2) fail(`the mode tab has ${tabs.length} segments, want 2`)
         else {
@@ -6427,11 +8376,11 @@
       // Two code paths are asserted here because the seam between them is where this
       // class of bug lives: the live strip built from events, and the history strip
       // rebuilt from the store when the session is reopened.
-      {
+      if (want('file-reload', 'the file the model wrote is a chip, live and after a reload')) {
         const essayPath = 'notes/selftest-espresso.txt'
         await useSession(target.id)
         const turnsBefore = await turnCount()
-        await invoke('set_reasoning', { level: 'off' })
+        await invoke('set_reasoning', { level: 'off', persist: true })
         await invoke('start_turn', {
           text: `Use write_file to save about 50 words about espresso to ${essayPath}. Do not run any other tool.`,
           session: target.id,
@@ -6482,7 +8431,7 @@
           session: target.id,
         })
         if (!(await waitTurnDone(cleanBefore))) pageLog('selftest: the cleanup turn did not finish')
-        await invoke('set_reasoning', { level: 'medium' })
+        await invoke('set_reasoning', { level: 'medium', persist: true })
       }
 
       // --- what a scripted endpoint makes testable -----------------------------
@@ -6843,9 +8792,7 @@
           }).catch((e) => pageLog(`selftest note: long-turn turn failed: ${e}`))
           const done = await waitTurnDone(before, 120000)
           const reads = document.querySelectorAll('.blk-tool[data-tool="read_file"]').length
-          const notes = [...document.querySelectorAll('.blk-note, .note')].map((n) =>
-            n.textContent ?? '',
-          )
+          const notes = [...noteLog]
           const answers = [...document.querySelectorAll('.blk-answer .blk-body')].map(
             (b) => b.textContent ?? '',
           )
@@ -7119,7 +9066,7 @@
                     `200-line tool results, so the older pages are not mounted and this check would be ` +
                     `measuring the same small transcript the plain cadence check already measures`,
                 )
-              await invoke('set_reasoning', { level: 'off' })
+              await invoke('set_reasoning', { level: 'off', persist: true })
               const cadBefore = await turnCount()
               const charsBefore = chars
               const blocksBefore = nodes
@@ -7164,15 +9111,30 @@
                     `streams thousands of deltas of headings, lists and tables, and the cadence check has to be ` +
                     `measured against that`,
                 )
-              await invoke('set_reasoning', { level: 'medium' })
-              const idleBig = await idleFrameSample(900)
+              await invoke('set_reasoning', { level: 'medium', persist: true })
+              let idleBig = await idleFrameSample(900)
+              // An idle sample whose median is below the vsync floor is not an idle baseline: it is
+              // a burst of rAF callbacks sharing one paint, which is what a page that is not being
+              // composited reports. Dividing by it produced "x Infinity" and a failure that blamed
+              // the history for the window manager, so take it again, and if it is still unusable
+              // say so and keep only the guards that do not need it.
+              if (idleBig.frames < 8 || idleBig.median < 4) {
+                pageLog(
+                  `selftest note: the idle cadence baseline was unusable (${idleBig.frames} frames, median ` +
+                    `${idleBig.median.toFixed(1)}ms) - the page was not being painted steadily; retaking it`,
+                )
+                await presentWindow('the idle baseline')
+                idleBig = await idleFrameSample(900)
+              }
+              const idleUsable = idleBig.frames >= 8 && idleBig.median >= 4
               pageLog(
                 `big transcript cadence: ${nodes} blocks / ${mountedMsgs} messages / ${chars} characters mounted (${pages} older page(s) pulled in); ` +
                   `${big.frames} frames over ${big.ms}ms while a turn streamed, median ${big.median.toFixed(1)}ms, ` +
                   `p95 ${big.p95.toFixed(1)}ms, worst ${big.worst.toFixed(1)}ms, ` +
                   `page long tasks ${big.longN} totalling ${Math.round(big.longMs)}ms; ` +
                   `the stream itself added ${grew} characters / ${blocksAfter - blocksBefore} blocks / ${tables} tables; ` +
-                  `idle baseline ${idleBig.frames} frames, median ${idleBig.median.toFixed(1)}ms (stream/idle x${(big.median / idleBig.median).toFixed(2)})`,
+                  `idle baseline ${idleBig.frames} frames, median ${idleBig.median.toFixed(1)}ms ` +
+                  `(stream/idle x${idleUsable ? (big.median / idleBig.median).toFixed(2) : 'not measured'})`,
               )
               if (!cadDone) pageLog('selftest note: the big-transcript cadence turn did not finish')
               // Two guards, because one number answers two different questions. The
@@ -7188,16 +9150,70 @@
                     `${(1000 / big.median).toFixed(0)} fps): the report says the native window drops well ` +
                     `under 30 fps as history grows, and ${nodes} blocks / ${chars} characters is the size that has to hold`,
                 )
-              else if (big.median > idleBig.median * 2.2 + 3)
+              else if (idleUsable && big.median > idleBig.median * 2.2 + 3)
                 fail(
                   `a full transcript makes the turn ${big.median.toFixed(1)}ms/frame against ` +
                     `${idleBig.median.toFixed(1)}ms idle on the same page (x${(big.median / idleBig.median).toFixed(1)}): ` +
                     `the cost is in the history, ${nodes} blocks were mounted`,
                 )
-              else if (big.worst > Math.max(250, idleBig.worst * 2))
+              else if (idleUsable && big.worst > Math.max(250, idleBig.worst * 2))
                 fail(
                   `a full transcript produced a ${big.worst.toFixed(0)}ms hitch while streaming ` +
                     `(idle worst ${idleBig.worst.toFixed(0)}ms)`,
+                )
+            }
+          }
+          // (a11b) what scrolling through a grown transcript costs
+          //
+          // Every cadence number so far is taken while the app writes the scroll position. What a
+          // reader does is wheel. This session cannot fake that: on a Wayland desktop an external
+          // client injecting input is a remote-desktop request, and a test run must not be the reason
+          // that dialog appears. A synthetic WheelEvent inside the page is no substitute either - an
+          // untrusted wheel event scrolls nothing, so it would measure a handler that never runs. The
+          // part of the cost that is identical on both paths is what this measures: rows coming into
+          // and out of the viewport, and the app's reaction to a position it did not write.
+          {
+            const sc2 = document.querySelector('.scroller') as HTMLElement | null
+            if (!sc2) {
+              pageLog('selftest note: no scroller on the page; the grown-transcript scroll probe did not run')
+            } else {
+              const mounted = document.querySelectorAll('.blk-answer, .blk-run, .blk-user').length
+              const max = sc2.scrollHeight - sc2.clientHeight
+              const steps = 14
+              const step = Math.max(80, Math.round(max / steps))
+              const cad = startFrameCadence()
+              let refused = 0
+              let worstMiss = 0
+              sc2.scrollTop = max
+              await new Promise((r) => setTimeout(r, 150))
+              for (let i = 0; i < steps; i++) {
+                const from = sc2.scrollTop
+                const want = Math.max(0, from - step)
+                sc2.scrollTop = want
+                await new Promise((r) => setTimeout(r, 42))
+                const miss = Math.abs(sc2.scrollTop - want)
+                if (miss > 8) {
+                  refused++
+                  worstMiss = Math.max(worstMiss, miss)
+                }
+              }
+              const r = cad()
+              pageLog(
+                `grown-transcript scroll: ${steps} wheel-sized steps of ${step}px over ${r.ms}ms on ${mounted} blocks (scrollHeight ${Math.round(sc2.scrollHeight)}); ` +
+                  `${r.frames} frames, median ${r.median.toFixed(1)}ms, p95 ${r.p95.toFixed(1)}ms, worst ${r.worst.toFixed(0)}ms, ` +
+                  `page long tasks ${r.longN} totalling ${Math.round(r.longMs)}ms; ${refused} step(s) ended more than 8px from where they were written (worst ${Math.round(worstMiss)}px)`,
+              )
+              if (r.frames >= 8 && r.median > 33.4)
+                fail(
+                  `scrolling ${mounted} blocks takes ${r.median.toFixed(1)}ms per frame: the rows coming into view cost more than one frame's worth of work`,
+                )
+              if (r.longN > 2)
+                fail(
+                  `${r.longN} long task(s) totalling ${Math.round(r.longMs)}ms while scrolling a grown transcript: the page itself stalled the frame clock`,
+                )
+              if (refused > 3)
+                fail(
+                  `${refused} of ${steps} scroll steps ended far from where the harness wrote them (worst ${Math.round(worstMiss)}px): something is moving the scroller behind the reader`,
                 )
             }
           }
@@ -7293,18 +9309,39 @@
               'ceiling check skipped: this endpoint stated no window, so a derived ceiling is not knowable',
             )
           } else {
-            const btnM = document.querySelector('button[aria-label="Session telemetry"]') as HTMLElement | null
-            btnM?.click()
-            await new Promise((r) => setTimeout(r, 250))
-            // The ceiling row is the settings control, drawn once and rendered here
-            // too: the popup and the Models page are the same markup, so this case can
-            // drive either one and mean the same thing.
+            // The ceiling row is the settings control: the metrics popover shows the meter,
+            // not the control, and there is exactly one copy of the markup. So the check
+            // opens the page it needs. It used to click the telemetry button and then reach
+            // for a copy that only exists inside the settings dialog, which meant the case
+            // worked only while some earlier case happened to leave that dialog open - a
+            // check that inherits another one's state fails for reasons that have nothing to
+            // do with it.
+            openSettings('models')
+            await renderTick()
             const crowEl = () =>
               [...document.querySelectorAll('[data-set-ceiling]')].find((r) =>
                 (r.textContent ?? '').includes('ceiling'),
               ) as HTMLElement | undefined
             const crow = crowEl()
             const ctext = () => (crowEl()?.textContent ?? '').replace(/\s+/g, ' ').trim()
+            /**
+             * Wait for the ceiling row to say something.
+             *
+             * The click asks the host; the page learns from the same read the panel does on
+             * its own, so the row catches up within a poll cycle. A check that reads the row
+             * in the same tick as its own backend poll races the page for no reason - and
+             * when it loses, the failure reads like the control is broken. If it still never
+             * says it, the message names the page's own numbers, because "the row is stale"
+             * and "the page was never told" are different bugs.
+             */
+            const rowSays = async (want: string) => {
+              const until = performance.now() + 4000
+              for (;;) {
+                if (ctext().includes(want)) return true
+                if (performance.now() > until) return false
+                await new Promise((r) => setTimeout(r, 100))
+              }
+            }
             const box = crow?.querySelector('[data-ceiling-input]') as HTMLInputElement | undefined
             const btnNamed = (name: string) =>
               [...(crow?.querySelectorAll('button') ?? [])].find((b) =>
@@ -7333,8 +9370,10 @@
                 fail(`pinning the ceiling to ${pinTo} from the panel never moved the meter (${h1.context_budget})`)
               else if (h1.budget_pin !== pinTo)
                 fail(`the host does not say the ceiling is pinned (budget_pin=${h1.budget_pin}); the panel cannot tell a pin from a derivation`)
-              else if (!ctext().includes('pinned by you'))
-                fail(`the row still does not say the ceiling is pinned: "${ctext()}"`)
+              else if (!(await rowSays('pinned by you')))
+                fail(
+                  `the row still does not say the ceiling is pinned: "${ctext()}" (the page itself reads budget_pin=${hostState?.budget_pin ?? 'null'}, context_budget=${hostState?.context_budget ?? 'null'})`,
+                )
               else {
                 // A ceiling that cannot mean anything is refused in words, and the refusal
                 // changes nothing: not the file, not the meter, not the row.
@@ -7498,47 +9537,52 @@
           const away = await invoke<number>('new_session', { title: 'selftest notes away' })
           await useSession(away)
           await useSession(sessN)
-          const findNote = () =>
-            [...document.querySelectorAll('.blk-note')].find((n) =>
-              (n.textContent ?? '').includes('resumed session'),
-            ) as HTMLElement | undefined
-          let noteEl = findNote()
-          // The note and the repaint race: the switch emits both. It is remembered
-          // by the transcript and re-rendered after a repaint; give that a moment
-          // before deciding it never arrived.
+          const findNoteToast = () => document.querySelector('.toast.note') as HTMLElement | null
+          let noteEl = findNoteToast()
+          // The note and the repaint race: the switch emits both. It is remembered by the
+          // transcript and re-announced after a repaint; give that a moment before deciding
+          // it never arrived.
           for (let i = 0; !noteEl && i < 12; i++) {
             await new Promise((r) => setTimeout(r, 150))
-            noteEl = findNote()
+            noteEl = findNoteToast()
           }
-          const noteBody = noteEl?.querySelector('.blk-body') as HTMLElement | null
           const answerBody = [
             ...document.querySelectorAll('.blk-answer .blk-body'),
           ].pop() as HTMLElement | null
-          if (!noteEl || !noteBody) {
+          const inStream = [...document.querySelectorAll('.blk-note')].some((n) =>
+            (n.textContent ?? '').includes('resumed session'),
+          )
+          if (!noteEl) {
             fail('the resumed-history note never reached the screen (buffered, or dropped by the repaint)')
+          } else if (inStream) {
+            fail('an app-level note is painted inside the transcript: it belongs in the chrome now')
           } else if (!answerBody) {
             fail('no answer block on screen to compare a note against')
           } else {
-            const nCs = getComputedStyle(noteBody)
+            const nCs = getComputedStyle(noteEl)
             const aCs = getComputedStyle(answerBody)
-            const wrapCs = getComputedStyle(noteEl)
             const nSize = parseFloat(nCs.fontSize)
             const aSize = parseFloat(aCs.fontSize)
             const text = (noteEl.textContent ?? '').replace(/\s+/g, ' ').trim()
-            if (!/resumed session/.test(text))
+            // Both cores announce what reopening this conversation cost, and they describe different
+            // facts. The rust core resumes a stored session; the pi core often cannot, because the
+            // conversation has no pi thread of its own and pi must start one from the stored
+            // transcript. Either sentence is the truth for that core - the check is that a note
+            // arrived in the chrome and is styled as chrome, not which words the core chose.
+            if (!/resumed session|no pi thread of its own yet|starts this one from scratch/i.test(text))
               fail(`the note on screen is not the resumed-history note: "${text}"`)
-            else if (!(nSize < aSize))
-              fail(`a note is set at ${nSize}px against an answer at ${aSize}px: nothing distinguishes them`)
-            else if (wrapCs.backgroundColor === 'rgba(0, 0, 0, 0)' || wrapCs.backgroundColor === 'transparent')
-              fail('the note block has no tinted background: it is still a bare line of text')
-            else if (parseFloat(wrapCs.borderLeftWidth) < 2)
-              fail(`the note block's rule is ${wrapCs.borderLeftWidth} wide: no edge to find it by`)
+            else if (!(nSize <= aSize))
+              fail(`a note is set at ${nSize}px against an answer at ${aSize}px: it shouts over the answer`)
+            else if (nCs.backgroundColor === 'rgba(0, 0, 0, 0)' || nCs.backgroundColor === 'transparent')
+              fail('the note notice has no tinted plate: it is a bare line of text floating in the chrome')
+            else if (parseFloat(nCs.borderLeftWidth) < 2)
+              fail(`the note notice's rule is ${nCs.borderLeftWidth} wide: no edge to find it by`)
             else if (/\bcold\b|\bwarm\b|re-?prefill/i.test(text))
               fail(`the note asserts a cache state the engine cannot see: "${text}"`)
             else
               pageLog(
-                `note styling ok (${nSize}px against ${aSize}px, ${wrapCs.backgroundColor} block, ` +
-                  `${wrapCs.borderLeftWidth} rule: "${text.slice(0, 64)}...")`,
+                `note notice ok (${nSize}px chrome text against ${aSize}px answers, ${nCs.backgroundColor} plate, ` +
+                  `${nCs.borderLeftWidth} rule, outside the transcript: "${text.slice(0, 60)}...")`,
               )
           }
           // switch the host out before deleting: see the note in the check above
@@ -7556,10 +9600,14 @@
         // by scripts/selftest.sh (which puts whatever was there back afterwards).
         {
           const noClip = import.meta.env.VITE_SELFTEST_NOCLIP === '1'
-          const btn = document.querySelector('button[aria-label="Paste image from clipboard"]') as HTMLElement | null
+          // There is no clipboard button. A screenshot reaches the composer the way it does in every
+          // other program - paste it - and the handler that asks the shell what the selection holds
+          // is the same one either way. So the harness performs the gesture a reader performs and the
+          // shipped handler does the rest.
+          const cbox = document.querySelector('.cbox') as HTMLElement | null
           const why = (document.querySelector('.att-err')?.textContent ?? '').trim()
-          if (!btn) {
-            fail('the composer has no clipboard-image control')
+          if (!cbox) {
+            fail('there is no composer on the page to paste into')
           } else if (!isTauri()) {
             fail('the clipboard check ran somewhere other than the desktop shell')
           } else if (noClip) {
@@ -7593,7 +9641,11 @@
               const stagedInfo = staged.v
               pageLog(`clipboard fixture re-staged for this check: ${stagedInfo.mime}, ${stagedInfo.bytes} bytes`)
             const had = pending.length
-            btn.click()
+            try {
+              cbox!.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true }))
+            } catch (e) {
+              pageLog(`the paste gesture could not be dispatched: ${e}`)
+            }
             const grew = await waitFor('the clipboard image to attach', () => pending.length > had, 9000)
             const pend = pending[pending.length - 1]
             if (!grew || !pend) {
@@ -7808,11 +9860,18 @@
           }
         }
 
-        // (c2) the working surface: one accordion per run, divided by what was said
+        // (c2) the working surface: one accordion per turn, the saying below it
         //
         // Driven through transcript.apply(), which is the same entry point the live
         // event stream uses. The claim under test is the renderer's grouping rule, so
         // the events are the app's own shapes rather than a re-creation of them.
+        //
+        // The rule used to be "a paragraph of answer splits the working into two
+        // accordions". It is now "one accordion per turn, everything the model said underneath
+        // it", because two accordions above one answer is what made a turn look cluttered —
+        // and because a turn reads as one block of working followed by what came of it. The
+        // events themselves are untouched: this is display only, and stored history stays in
+        // the order it arrived, which is what keeps a prompt cache matching turn after turn.
         {
           transcript?.clear()
           transcript?.apply({ kind: 'turnStart', d: { turn_id: 31, model: 'selftest', session_id: 0 } })
@@ -7829,32 +9888,49 @@
           transcript?.apply({ kind: 'text', d: 'Seven, in both.' })
           transcript?.apply({ kind: 'turnEnd', d: { turn_id: 31, finish: 'stop' } })
           await new Promise((r) => setTimeout(r, 220))
+          const turnEl = document.querySelector('.turn') as HTMLElement | null
           const runs = [...document.querySelectorAll('.turn > .blk-run')] as HTMLElement[]
           const texts = [...document.querySelectorAll('.turn > .blk-answer')] as HTMLElement[]
           const said = texts.map((t) => t.textContent ?? '')
-          const first = runs[0]?.querySelectorAll('.blk-tool').length ?? 0
-          const second = runs[1]?.querySelectorAll('.blk-tool').length ?? 0
-          if (runs.length !== 2)
-            fail(`expected two run accordions divided by the model's own text, saw ${runs.length}`)
+          const tools = runs[0]?.querySelectorAll('.blk-tool').length ?? 0
+          const thinks = runs[0]?.querySelectorAll('.blk-reasoning').length ?? 0
+          const kids = turnEl ? [...turnEl.children] : []
+          const order = runs.length === 1 && texts.every((t) => kids.indexOf(t) > kids.indexOf(runs[0]))
+          if (!turnEl) fail('no turn element to group the working inside')
+          else if (runs.length !== 1)
+            fail(`one turn, one run accordion: saw ${runs.length} (the model's text split it again)`)
+          else if (!order)
+            fail('something the model said sits above the working instead of below it')
           else if (said.length !== 2 || !said[0].includes('note.md') || !said[1].includes('Seven'))
-            fail(`the message text did not land between the runs: ${JSON.stringify(said).slice(0, 120)}`)
-          else if (first !== 1 || second !== 1)
-            fail(`the runs hold the wrong entries: ${first} then ${second}`)
+            fail(`the message text did not accumulate below the run: ${JSON.stringify(said).slice(0, 120)}`)
+          else if (tools !== 2 || thinks !== 2)
+            fail(`the run holds ${tools} tool entries and ${thinks} thinking entries, expected 2 and 2`)
           else {
             const l1 = runs[0].querySelector('.run-label')?.textContent ?? ''
-            const l2 = runs[1].querySelector('.run-label')?.textContent ?? ''
+            const cnt = runs[0].querySelector('.run-count')?.textContent ?? ''
             if (!/^Thought, then worked/.test(l1))
               fail(`a run that thought and worked is labelled ${JSON.stringify(l1)}`)
-            if (runs[0].classList.contains('open') || runs[1].classList.contains('open'))
+            else if (!/4 steps/.test(cnt))
+              fail(`the accordion counts ${JSON.stringify(cnt)}, expected "4 steps"`)
+            else if (runs[0].classList.contains('open'))
               fail('a finished run is still open once the answer landed')
+            else if (runs[0].classList.contains('running'))
+              fail('the run reopened for the second batch of work and never settled again')
             const t1 = runs[0].querySelector('.blk-tool') as HTMLElement
             if (getComputedStyle(t1.querySelector('.tool-detail') as Element).display !== 'none')
               fail('an entry inside a closed run is still spilling its body')
             // Nothing was lost by folding: the words are still there to find.
             if (!(t1.querySelector('.tool-out')?.textContent ?? '').includes('the number is 7'))
               fail('folding the run threw the tool output away instead of hiding it')
+            // ...and one thing that is *not* in the page by design. The thinking preview was
+            // removed, not folded, so these words live in the store and nowhere on screen: a
+            // setting, a click or a reload must never bring them back.
+            if (document.body.innerText.includes('the file should hold it'))
+              fail('a thinking block put its words on screen; the preview was supposed to be gone for good')
             pageLog(
-              `run accordion ok (two runs split by the answer, "${l1}", entries fold to lines, output still in the page)`,
+              `run accordion ok (one accordion per turn holding ${tools} calls and ${thinks} thoughts, `
+                + `the two paragraphs of answer below it, "${l1}" / ${cnt.trim()}, entries fold to lines, `
+                + 'output still in the page, thought words never on it)',
             )
 
           }
@@ -7998,6 +10074,78 @@
           }
         }
 
+        // The device-facing setting is a promise about a process that does not exist yet, so two
+        // things have to be true on screen: the row says *which* process would be started, and the
+        // toggle reaches the store the app reads at close. The page it renders on is asserted too -
+        // a pref filed under the wrong group is a control that appears nowhere, and a pref rendered
+        // on two pages is two controls for one setting.
+        {
+          pageLog('case: Settings > Devices can keep the gateway alive')
+          const plan = await invoke<GatewayPlan>('gateway_handoff_plan')
+          if (!plan || typeof plan.port !== 'number') fail(`gateway_handoff_plan answered ${JSON.stringify(plan)}`)
+          const prefs0 = await invoke<any[]>('ui_prefs')
+          const keep0 = (prefs0 ?? []).find((p) => p.key === 'gateway_on_exit')
+          if (!keep0) fail('the host has no gateway_on_exit pref: the toggle would be wired to nothing')
+          else if (keep0.group !== 'devices')
+            fail(`gateway_on_exit sits in group ${JSON.stringify(keep0.group)}: the Devices page would not render it`)
+          else if (keep0.value !== 'off')
+            fail(`gateway_on_exit starts as ${JSON.stringify(keep0.value)}: a gateway that outlives the window has to be chosen, not inherited`)
+          else {
+            openSettings('devices')
+            await new Promise((r) => setTimeout(r, 300))
+            const row = document.querySelector('[data-gw-keep]') as HTMLElement | null
+            if (!row) fail('Settings > Devices has no keep-gateway row: the pref is not rendered where the setting lives')
+            else {
+              const lbl = row.querySelector('[data-gw-keep-label]')?.textContent ?? ''
+              if (!/window/i.test(lbl)) fail(`the row's label did not come from the host: "${lbl}"`)
+              const planLine = row.querySelector('[data-gw-keep-plan]')?.textContent ?? ''
+              if (!plan.binary)
+                fail(`no cwoffee-gateway next to this app, so the setting cannot be honoured: "${planLine}"`)
+              else if (!planLine.includes(plan.binary))
+                fail(`the row does not name the process it would start (${plan.binary}): "${planLine}"`)
+              else if (plan.log && !planLine.includes(plan.log))
+                fail(`the row does not say where the child's own lines go (${plan.log}): "${planLine}"`)
+              const sw = row.querySelector('[role="switch"]') as HTMLButtonElement | null
+              if (!sw || sw.getAttribute('aria-checked') !== 'false')
+                fail('the keep-gateway switch is missing, or it is not off before the check touches it')
+              else {
+                sw.click()
+                await new Promise((r) => setTimeout(r, 600))
+                toast = null
+                const on1 = (await invoke<any[]>('ui_prefs'))?.find((p) => p.key === 'gateway_on_exit')
+                if (on1?.value !== 'on') fail(`the switch said on, the store says ${JSON.stringify(on1?.value)}`)
+                else if (!String(planLine).includes(`:${plan.port}`))
+                  fail(`the row names a port other than this gateway's (${plan.port}): "${planLine}"`)
+                else {
+                  openSettings('display')
+                  await new Promise((r) => setTimeout(r, 250))
+                  if (document.querySelector('[data-gw-keep]'))
+                    fail('gateway_on_exit renders under Appearance as well: one setting, two controls')
+                  openSettings('devices')
+                  await new Promise((r) => setTimeout(r, 250))
+                  const sw2 = document.querySelector('[data-gw-keep] [role="switch"]') as HTMLButtonElement | null
+                  if (!sw2 || sw2.getAttribute('aria-checked') !== 'true')
+                    fail('the switch did not read back as on after the store said on')
+                  else {
+                    sw2.click()
+                    await new Promise((r) => setTimeout(r, 600))
+                    toast = null
+                    const back = (await invoke<any[]>('ui_prefs'))?.find((p) => p.key === 'gateway_on_exit')
+                    if (back?.value !== 'off')
+                      fail(`turning it back off did not reach the store: ${JSON.stringify(back?.value)}`)
+                    else
+                      pageLog(
+                        `keep-gateway ok (plan names ${plan.binary} on :${plan.port} via ${plan.via}; the control writes the store both ways; one control, one page)`,
+                      )
+                  }
+                }
+                closeSettings()
+                await new Promise((r) => setTimeout(r, 200))
+              }
+            }
+          }
+        }
+
         // (c) arguments a quantised model mangled: repaired, run, and admitted
         {
           const errs: string[] = []
@@ -8046,7 +10194,7 @@
       // The complaint was that the transcript read as a dump of API calls: a raw
       // tool id as the header, and a clamped block of JSON under every one of them.
       // It should read as a list of things that happened, each one openable.
-      {
+      if (want('tool-card', 'a finished card is one line of English, and nothing else')) {
         const hist: StoredMessage[] = [
           {
             id: 90_020,
@@ -8179,16 +10327,20 @@
             fail('verbose blocks off did not fold the entries back to lines')
         }
 
-        // Settled thinking is a header line: "Thought for 4s" and no sneak peek.
-        const rbody = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
-        if (!rbody) fail('no thinking block in the stored transcript')
+        // A stored thought is a duration line too: the reasoning text is in the row and never in
+        // the page. Counting it is what lets a session reopened hours later say the same thing
+        // about the thought that was said while it was live.
+        const rline = document.querySelector('.blk-reasoning') as HTMLElement | null
+        if (!rline) fail('no thinking line in the stored transcript')
         else {
-          if (!rbody.classList.contains('settled')) fail('stored thinking is not marked settled')
-          if (getComputedStyle(rbody).display !== 'none')
-            fail('settled thinking shows a body nobody asked for')
-          const rlabel = document.querySelector('.blk-reasoning .blk-head')?.textContent ?? ''
-          if (!/^Thought for /i.test(rlabel))
-            fail(`thinking header is not a duration: ${JSON.stringify(rlabel)}`)
+          if (rline.querySelectorAll('.blk-body').length)
+            fail('a stored thought carries a body element: the reasoning text reached the page')
+          const rlabel = rline.querySelector('.blk-head')?.textContent ?? ''
+          if (!/^Thought for /i.test(rlabel)) fail(`thinking header is not a duration: ${JSON.stringify(rlabel)}`)
+          if (!/\b\d+ words\b/.test(rlabel) && !/6 words/.test(rlabel))
+            fail(`a stored thought of six words does not say so: ${JSON.stringify(rlabel.trim())}`)
+          if (document.body.innerText.includes('First the file, then the line inside it.'))
+            fail('the stored reasoning text is on screen: the preview is supposed to be gone for good')
         }
 
         // Outdented label, aligned content, right-side bubble for your own turn.
@@ -8209,7 +10361,9 @@
             fail(`the user bubble is ${(share * 100).toFixed(0)}% of the column, want <= 78%`)
           if (getComputedStyle(ub).textAlign === 'right')
             fail('text inside the user bubble is right-aligned')
-          const lab = document.querySelector('.blk-answer .blk-head') as HTMLElement
+          // One name per turn, pinned in the gutter: the element that carries it is the turn's
+          // marker, not the answer block's own label.
+          const lab = document.querySelector('.turn-who-cwoffee .who-name') as HTMLElement
           // The gutter only exists in a wide layout; in a narrow window the label
           // legitimately goes back above its block, so assert the layout that is
           // actually in force rather than the one the design prefers.
@@ -8250,7 +10404,13 @@
       // a rewrite re-rasters. What is provable from the DOM is the property the fix
       // rests on: a node that has been painted is never replaced, and the spans
       // concatenate back to exactly what the model sent.
-      {
+      //
+      // This check used to stream its words as reasoning, because that was the text that
+      // arrived fastest and longest. It now streams them as the answer: a thinking block has
+      // no text nodes at all any more (see `thoughtLine` in transcript.ts), so the reveal
+      // lives in one place, and a check that watched the wrong place would quietly prove
+      // nothing while the feature it guards stayed broken.
+      if (want('reveal', 'the streaming reveal: append-only, word by word, never rewritten')) {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         const deltas = [
@@ -8285,7 +10445,7 @@
           // The body element only exists once the block has been created, and it
           // must be the same element for the whole check: attaching per paint
           // would miss the writes it is supposed to catch.
-          const h = document.querySelector('.blk-reasoning .blk-body')
+          const h = document.querySelector('.blk-answer .blk-body .live-para') ?? document.querySelector('.blk-answer .blk-body')
           if (!h || h === watched) return
           watched = h
           const mo = new MutationObserver((recs) => {
@@ -8300,7 +10460,7 @@
           moRef.o = mo
         }
         for (const d of deltas) {
-          transcript?.apply({ kind: 'reasoning', d })
+          transcript?.apply({ kind: 'text', d })
           // One paint per delta: the reveal unit is whatever landed since the last
           // paint, and a check that applies them in one microtask tests one chunk.
           // Spaced out so a later paint has words from an earlier one that have
@@ -8308,7 +10468,7 @@
           const painted = await frame(150)
           if (painted) animPaints += 1
           transcript?.flushNow()
-          const body = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
+          const body = document.querySelector('.blk-answer .blk-body') as HTMLElement
           const tins = [...(body?.querySelectorAll('.tin') ?? [])] as HTMLElement[]
           if (!tins.length) fail('a reasoning delta produced no reveal spans')
           const wordsThisPaint = tins.length - seen.length
@@ -8350,7 +10510,7 @@
           if (inFlight > 24)
             fail(`${inFlight} words fading at once: the newest line is grey for lines of reading`)
         }
-        const body = document.querySelector('.blk-reasoning .blk-body') as HTMLElement
+        const body = document.querySelector('.blk-answer .blk-body') as HTMLElement
         const br = body.getBoundingClientRect()
         const text = [...body.querySelectorAll('.tin')]
           .map((t) => t.textContent ?? '')
@@ -8586,7 +10746,7 @@
         transcript?.flushNow()
         const alignPx = (where: string) => {
           const b = document.querySelector('.blk-answer .blk-body') as HTMLElement
-          const who = document.querySelector('.blk-answer .blk-head') as HTMLElement
+          const who = document.querySelector('.turn-who-cwoffee .who-name') as HTMLElement
           const first = b?.firstElementChild
           const walk = document.createTreeWalker(first ?? new DocumentFragment(), NodeFilter.SHOW_TEXT)
           const tn = (first ? walk.nextNode() : null) as Text | null
@@ -8748,16 +10908,23 @@
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 11, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
         const prose = 'The user wants just a table'
-        const think = document.querySelector('.blk-reasoning .blk-body')
+        const line = document.querySelector('.blk-reasoning .blk-head')
         const ansBody = document.querySelector('.blk-answer .blk-body')
-        if (!think || !(think.textContent ?? '').includes(prose))
-          fail('the thinking prose left its thinking block when the answer started')
+        // The bug this guarded was a drain problem: thinking words wandering into the answer when
+        // the answer began in the same frame. The claim still holds, and is now stronger: the
+        // thinking words are not in the answer, not in the thinking line, and not on the page at
+        // all - which is the contract of a thought with no preview.
+        if (!line) fail('a turn that thought left no thinking line')
+        else if ((line.textContent ?? '').includes(prose))
+          fail('the thinking prose was painted into the thinking line')
         else if (!ansBody || !ansBody.querySelector('table'))
           fail('a table that started in the same frame as the thinking did not become a table')
         else if ((ansBody.textContent ?? '').includes(prose))
           fail('the thinking prose was painted into the answer block')
+        else if (document.body.innerText.includes(prose))
+          fail('the thinking prose reached the page')
         else
-          pageLog('switch drain ok (thinking kept its words, the answer kept its table)')
+          pageLog('switch drain ok (the answer kept its table; the thinking words stayed off the page)')
         transcript?.clear()
       }
 
@@ -8798,8 +10965,23 @@
         // frame. A free-running sampler chain looks the same on the page and is not:
         // a pending frame can fire during a later await and score a scroll that the
         // check itself caused.
+        const pumpTimeouts = { n: 0 }
         const pump = () =>
-          new Promise<void>((res) =>
+          new Promise<void>((res) => {
+            // rAF is the only clock this check may sample - but rAF cannot report its own absence.
+            // On a window the compositor is not painting, a bare `requestAnimationFrame` never fires
+            // and the chain parks: three runs ended with the page silent, the web process idle, and no
+            // verdict, because the follow check's first pump never came back. So the pump has a floor,
+            // and the loops below stop early once the floor is what is answering.
+            let done = false
+            const finish = (painted: boolean) => {
+              if (done) return
+              done = true
+              clearTimeout(timer)
+              if (!painted) pumpTimeouts.n += 1
+              res()
+            }
+            const timer = setTimeout(() => finish(false), 420)
             requestAnimationFrame(() => {
               frames++
               const step = Math.abs(sc.scrollTop - prevTop)
@@ -8811,25 +10993,32 @@
                 jumps.push(`f${frames}: ${Math.round(prevTop)}->${Math.round(sc.scrollTop)} (gap ${Math.round(gap)})`)
               if (gap > worstGap) worstGap = gap
               prevTop = sc.scrollTop
-              res()
-            }),
-          )
-        for (let i = 0; i < filler.length; i += 96) {
+              finish(true)
+            })
+          })
+        for (let i = 0; i < filler.length && pumpTimeouts.n < 12; i += 96) {
           transcript?.apply({ kind: 'text', d: filler.slice(i, i + 96) })
           // ~250ms between arrivals: 96 characters is roughly what this endpoint
           // produces in that time (30-45 words/s). Feeding at eight times real
           // speed measures the harness's own queue, not the reader's experience.
-          for (let f = 0; f < 15; f++) await pump()
+          for (let f = 0; f < 15 && pumpTimeouts.n < 12; f++) await pump()
           transcript?.flushNow()
-          for (let f = 0; f < 3; f++) await pump()
+          for (let f = 0; f < 3 && pumpTimeouts.n < 12; f++) await pump()
         }
         // Let the glide finish, then judge where it ended up.
-        for (let t = 0; t < 60; t++) {
+        for (let t = 0; t < 60 && pumpTimeouts.n < 24; t++) {
           await pump()
           if (sc.scrollHeight - sc.clientHeight - sc.scrollTop <= 1) break
         }
         const away = sc.scrollHeight - sc.scrollTop - sc.clientHeight
-        if (frames < 40) fail(`the follow check sampled ${frames} frames: it measured nothing`)
+        const blindFrames = pumpTimeouts.n >= 12 || frames < 40
+        if (blindFrames) {
+          blindSkips++
+          pageLog(
+            `selftest note: skipped the follow-cadence verdict; ${pumpTimeouts.n} pump(s) fell to the 420ms floor and only ${frames} real frame(s) were sampled ` +
+              `(${offScreen() ?? 'the page looked laid out, so the window was most likely not being composited'})`,
+          )
+        } else if (frames < 40) fail(`the follow check sampled ${frames} frames: it measured nothing`)
         // Half a line. A step is at most max(8px, 18% of the gap) and the gap is
         // bounded below, so anything past 12px means more than one step landed in
         // one frame - and every settled word on screen changed place at once, which
@@ -8838,25 +11027,31 @@
         // that landed all at once, and even then gathering speed frame by frame
         // (FOLLOW_ACCEL). A large step reached by a ramp is motion; a large step
         // that appears out of nowhere is the blink.
-        if (worstStep > 24)
+        if (!blindFrames && worstStep > 24)
           fail(
             `the transcript moved ${Math.round(worstStep)}px in one frame: the follow lurches (${jumps.join(' | ')})`,
           )
-        if (worstAccel > 8)
+        if (!blindFrames && worstAccel > 8)
           fail(
             `the follow changed speed by ${Math.round(worstAccel)}px/frame in one frame: that is a jolt, not a glide`,
           )
-        if (worstGap > 220)
+        if (!blindFrames && worstGap > 220)
           fail(`the newest line sat ${Math.round(worstGap)}px below the fold while streaming`)
-        if (away > 4) fail(`the view finished ${Math.round(away)}px short of the bottom`)
+        if (!blindFrames && away > 4) fail(`the view finished ${Math.round(away)}px short of the bottom`)
         // Reading position is respected: scrolling up stops the follow, and the
         // text a reader stopped on does not move when a block commits under them.
         const maxScroll = sc.scrollHeight - sc.clientHeight
-        if (maxScroll < 120)
+        let readerMoved = Number.NaN
+        if (blindFrames) {
+          blindSkips++
+          pageLog(
+            `selftest note: skipped the reader-up half of this check; the frame clock never came back, and with no paints the transcript scrolls ${maxScroll}px`,
+          )
+        } else if (maxScroll < 120)
           fail(`the transcript only scrolls ${maxScroll}px: the reader-up half of this check needs more filler`)
         sc.scrollTop = Math.max(0, sc.scrollTop - 220)
         await new Promise((r) => setTimeout(r, 80))
-        if (sc.scrollTop > sc.scrollHeight - sc.clientHeight - 40)
+        if (!blindFrames && sc.scrollTop > sc.scrollHeight - sc.clientHeight - 40)
           fail('the scroll-up that starts the reader-up half did not take effect')
         // Measure *text*, not an element box. The element version of this check
         // reported a 25px move that no eye could see: a body's box moves with
@@ -8883,24 +11078,28 @@
           }
           return best
         })()
-        if (!anchor) fail('no settled text to anchor the scrolled-up reader to')
-        const rng = anchor as Range
-        const anchorTop = rng.getBoundingClientRect().top
-        transcript?.apply({ kind: 'text', d: '\n\n## A committed heading ends the paragraph\n\n' })
-        await frame(40)
-        transcript?.flushNow()
-        if (!rng.startContainer.isConnected)
-          fail("the line a reader had stopped on was replaced when a block committed below it")
-        const moved = rng.getBoundingClientRect().top - anchorTop
-        if (Math.abs(moved) > 1.5)
-          fail(`committing a block moved the reader's line ${moved.toFixed(1)}px`)
+        if (!anchor && !blindFrames) fail('no settled text to anchor the scrolled-up reader to')
+        if (anchor) {
+          const rng = anchor as Range
+          const anchorTop = rng.getBoundingClientRect().top
+          transcript?.apply({ kind: 'text', d: '\n\n## A committed heading ends the paragraph\n\n' })
+          await frame(40)
+          transcript?.flushNow()
+          if (!rng.startContainer.isConnected)
+            fail("the line a reader had stopped on was replaced when a block committed below it")
+          readerMoved = rng.getBoundingClientRect().top - anchorTop
+          if (Math.abs(readerMoved) > 1.5)
+            fail(`committing a block moved the reader's line ${readerMoved.toFixed(1)}px`)
+        }
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 3, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 40))
         transcript?.clear()
         pageLog(
           `stream follow ok (worst frame step ${Math.round(worstStep)}px, worst speed change ` +
             `${Math.round(worstAccel)}px/frame over ${frames} frames; worst ${Math.round(worstGap)}px below ` +
-            `the fold, settled ${Math.round(away)}px off bottom, reader's line moved ${moved.toFixed(1)}px on commit)`,
+            `the fold, settled ${Math.round(away)}px off bottom, reader's line moved ${
+              Number.isFinite(readerMoved) ? `${readerMoved.toFixed(1)}px` : 'was not measurable'
+            } on commit)`,
         )
       }
       }
@@ -8924,13 +11123,13 @@
           0,
         )
         newSession()
-        await invoke('set_reasoning', { level: 'off' })
+        await invoke('set_reasoning', { level: 'off', persist: true })
         draft = 'Write about coffee roasting in exactly four paragraphs. Answer in the chat only, use no tools and create no files.'
         await send()
         const stop = startFrameCadence()
         const done = await waitTurnDone(cadBefore)
         const c = stop()
-        await invoke('set_reasoning', { level: 'medium' })
+        await invoke('set_reasoning', { level: 'medium', persist: true })
         await sweepSelftest('after the frame-cadence turn', cadFloor)
         // The baseline is measured on the same page a moment later with nothing
         // streaming. Without it this check measures the machine: a box serving a
@@ -8950,21 +11149,54 @@
           `frame cadence baseline (nothing streaming): ${idle.frames} frames, ` +
             `median ${idle.median.toFixed(1)}ms, p95 ${idle.p95.toFixed(1)}ms`,
         )
-        const starved = idle.median > 21
+        // "Starved" means the page could not be given a clock: either the machine is that busy, or
+        // the sample itself is empty - a baseline of 0 frames answers nothing, and grading a streaming
+        // sample against it is how one run reported "0 animation frames in 0ms" as a stalled page.
+        const starved = idle.median > 21 || idle.frames < 8 || c.frames < 2 || c.ms < 200
         if (offScreen()) {
           blindSkips++
           // A throttled frame clock is what an occluded page does, and this run
           // already proved the page was not laid out (the geometry notes above). The
           // numbers stay in the log; they are just not treated as a verdict.
           pageLog(`selftest note: skipped the frame-cadence verdict; ${offScreen()}`)
-        } else if (c.frames < 60 && !starved)
-          fail(
-            `frame cadence: only ${c.frames} animation frames in ${c.ms}ms while the page was `
-            + `getting a ${idle.median.toFixed(1)}ms clock idle (${idle.frames} frames in the `
-            + `baseline): a thin sample on a machine that can deliver frames is a stalled page, `
-            + 'and the streaming path is the only thing running',
-          )
-        else if (starved) {
+        } else if (c.frames < 60 && !starved) {
+          // A thin sample can mean two different things: the streaming path is costing frames, or the
+          // compositor stopped handing them out. The page's own long-task observer tells them apart.
+          // If the median gap is the idle clock's and the page ran no long task, the shortfall is one
+          // hole the page was never inside, and calling that a stalled streaming path measures the
+          // window rather than the code.
+          const hole = c.worst
+          if (c.median <= idle.median * 1.35 && c.longN === 0 && hole > 8 * idle.median) {
+            blindSkips++
+            pageLog(
+              `selftest note: skipped the thin-sample claim; ${c.frames} frames in ${c.ms}ms, but the median gap ` +
+                `(${c.median.toFixed(1)}ms) is the idle clock's, the page ran no long task, and a single ${Math.round(hole)}ms ` +
+                'hole accounts for the shortfall: the compositor stopped delivering frames rather than the streaming path costing them',
+            )
+          } else
+            fail(
+              `frame cadence: only ${c.frames} animation frames in ${c.ms}ms while the page was `
+              + `getting a ${idle.median.toFixed(1)}ms clock idle (${idle.frames} frames in the `
+              + `baseline): a thin sample on a machine that can deliver frames is a stalled page, `
+              + 'and the streaming path is the only thing running',
+            )
+        } else if (starved) {
+          if (idle.frames < 8 || idle.median <= 0) {
+            // A baseline of no frames answers nothing, and a ratio against it answers less: one run
+            // reported a streaming median of 14.0ms against an idle of 0.0ms and called that a cost,
+            // when the number only says the baseline sample was empty. Keep a gross absolute guard,
+            // and say plainly that the comparison is unavailable.
+            blindSkips++
+            pageLog(
+              `selftest note: the idle baseline delivered ${idle.frames} frame(s), so no relative cadence claim is available; ` +
+                `the streaming sample stands alone (${c.frames} frames over ${c.ms}ms, median ${c.median.toFixed(1)}ms, ` +
+                `p95 ${c.p95.toFixed(1)}ms, worst ${c.worst.toFixed(0)}ms, ${c.longN} long task(s))`,
+            )
+            if (c.median > 34 || c.longMs > 250)
+              fail(
+                `frame cadence: a ${c.median.toFixed(1)}ms median with ${Math.round(c.longMs)}ms of the page's own long tasks, and no idle baseline to compare against - that is slow on any machine`,
+              )
+          } else {
           // Absolute thresholds mean nothing when the page never gets 60 Hz idle. What
           // still has to hold is that streaming costs little more than idling: an
           // app-side regression shows up as the ratio, on any machine.
@@ -8980,6 +11212,7 @@
               `frame cadence: one gap of ${c.worst.toFixed(0)}ms while streaming (idle worst ${idle.worst.toFixed(0)}ms) - something blocked the frame clock`,
             )
           else pageLog(`frame cadence ok relative to the idle baseline (${idle.median.toFixed(1)}ms)`)
+          }
         } else if ((c.median > 21 || c.p95 > 45 || c.worst > 250) && c.longTasksMeasured && c.longMs < 60) {
           // The clock slowed, but the page did no long task while it did. Blaming the
           // app for frames the process was never given measures the machine, and the
@@ -9024,7 +11257,7 @@
       // that safe: it watches every animation start in the page and fails if one
       // lands on a node that was already on screen, or runs a second time on the
       // same node.
-      {
+      if (want('entrances', 'no entrance runs on content that was already on screen')) {
         transcript?.clear()
         const before = fails
         const born = new WeakMap<Element, number>()
@@ -9126,6 +11359,33 @@
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 91, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 150))
 
+        // (a2) a page that reloaded mid-answer keeps the part that streamed before it
+        //
+        // The gateway hands a reloading client the open half of the turn, which is the only
+        // copy of it that exists until the turn ends. The transcript has to put it on screen
+        // and then let the live deltas carry on inside the same block: the failure this is
+        // about is an answer that starts where the reload landed, top half gone, repairing
+        // itself only when the turn finally closed.
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 95, model: 'selftest', session_id: 0 } })
+        transcript?.seedOpen('the half that arrived before this page reloaded', 'and the reasoning before it')
+        transcript?.apply({ kind: 'text', d: ' — and the half that arrived after.' })
+        await frame(80)
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 95, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 200))
+        {
+          const bodies = [...document.querySelectorAll('.blk-answer .blk-body')].map(
+            (b) => b.textContent ?? '',
+          )
+          const whole = bodies.find((t) => t.includes('half that arrived before this page reloaded'))
+          if (!whole) fail('a reloading page lost the half of the answer that streamed before it connected')
+          else if (!whole.includes('and the half that arrived after'))
+            fail('the seeded half is on screen but the live half did not continue it: one answer, two blocks')
+          else
+            pageLog(
+              'mid-turn reload ok: the streamed half is painted and the live deltas continue the same block',
+            )
+        }
+
         // (b) a popover: `.pop` carries `cwoffee-pop ... both`, so a re-render of
         // an open menu would fade the open menu out from under the pointer.
         const chip = document.querySelector('button.cbtn.chip[data-menu]') as HTMLElement | null
@@ -9180,9 +11440,19 @@
         const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
         const tins = byName['cwoffee-tin'] ?? 0
         const rises = byName['cwoffee-rise'] ?? 0
-        if (!reduced && tins < 10) fail(`only ${tins} word reveals were seen: the replay watch proved nothing`)
-        if (!reduced && rises < 3) fail(`only ${rises} block entrances were seen: the replay watch proved nothing`)
-        if (!reduced && roundTrip && rises > 6)
+        const blindTraffic = !reduced && unpainted()
+        if (blindTraffic) {
+          // A page the compositor is not painting starts no animations at all, so "we watched the
+          // traffic and saw none" cannot be told apart from "the animations are gone". Say which case
+          // this is rather than failing a feature for the state of the window.
+          blindSkips++
+          pageLog(
+            `selftest note: skipped the reveal-traffic claims (${tins} word reveals, ${rises} block entrances seen); ${unpainted()} - ` +
+              'an un-composited page starts no animations, so a count of zero proves nothing either way',
+          )
+        } else if (!reduced && tins < 10) fail(`only ${tins} word reveals were seen: the replay watch proved nothing`)
+        if (!blindTraffic && !reduced && rises < 3) fail(`only ${rises} block entrances were seen: the replay watch proved nothing`)
+        if (!blindTraffic && !reduced && roundTrip && rises > 6)
           fail(`${rises} block entrances in one turn: rows are entering more than once per turn`)
         // Cancelling an entrance means the node was thrown away mid-animation. One
         // per committed list or table is the honest cost of committing markdown; a
@@ -9205,12 +11475,13 @@
         // A guard that has never been seen to fail is decoration.
       }
 
-      // --- thinking sits under its own label; other blocks keep the gutter -----
-      // The thinking label is a heading for the text under it: label, rule and body
-      // edge share an x. Every other block hangs its label in the left gutter so the
-      // reading column stays one straight edge. The two layouts are deliberate and
-      // must not drift into each other.
-      {
+      // --- a thought is one line; the answer keeps its outdented label ----------
+      // This check used to measure the thinking body's alignment under its own label: label,
+      // rule and body edge sharing an x. There is no thinking body any more, so what survives is
+      // the half that was never about thinking - the answer hangs its label in the left gutter
+      // while its text stays on the column edge - plus the line a thought does leave, which has
+      // to stay one line, inside the run, with nothing under it.
+      if (want('thought-line', 'a thought is one line; the answer keeps its outdented label')) {
         // The premise is verified BEFORE the blocks exist. Verifying it after capturing
         // the nodes is worse than not verifying it: the recovery reopens a session,
         // that reopen repaints the transcript, and the captured nodes are then measured
@@ -9231,49 +11502,43 @@
         else if (offScreen()) {
           fail(`the view moved under this check mid-measurement: ${offScreen()}`)
         } else {
-          // A settled thinking body is collapsed by design, and a collapsed element
-          // measures 0 - so open it before measuring it. Inside a run the way to
-          // open it is the run: the entry is a line, and the display setting is the reveal.
+          // A thought is one line now: no body to open, no display setting that uncovers it, and
+          // a header that has to stay a single line while carrying a duration and a word count.
           const head = think.querySelector('.blk-head') as HTMLElement
-          const body = think.querySelector('.blk-body') as HTMLElement
-          const trun = think.closest('.blk-run') as HTMLElement | null
-          if (trun) {
-            ;(trun.querySelector('.blk-head') as HTMLElement).click()
-            await new Promise((r) => setTimeout(r, 120))
-            transcript?.setVerbose(true)
-          } else {
-            head.click()
-          }
-          await new Promise((r) => setTimeout(r, 300))
-          const hr = head.getBoundingClientRect()
-          const br = body.getBoundingClientRect()
-          const pad = parseFloat(getComputedStyle(body).paddingLeft || '0')
-          if (br.width < 100) {
-            // A zero box has a cause, and the cause is in the ancestor chain: the
-            // first entry marked [display:none] is the thing that hid it. Without this
-            // line the failure reads as "CSS is broken" and costs three more runs.
-            const chain = (el: Element | null) => {
-              const out: string[] = []
-              let n: Element | null = el
-              while (n && out.length < 8) {
-                const cs = getComputedStyle(n)
-                const cls = String(n.className ?? '').trim().split(/\s+/).join('.')
-                out.push(`${n.tagName.toLowerCase()}.${cls}${cs.display === 'none' ? '[display:none]' : ''}`)
-                n = n.parentElement
-              }
-              return out.join(' < ')
+          // A zero-width line has a cause, and the cause is in the ancestor chain: the first
+          // entry marked [display:none] is the thing that hid it. Without this the failure reads
+          // as "CSS is broken" and costs three more runs to unpick.
+          const chain = (el: Element | null) => {
+            const out: string[] = []
+            let n: Element | null = el
+            while (n && out.length < 8) {
+              const cs = getComputedStyle(n)
+              const cls = String(n.className ?? '').trim().split(/\s+/).join('.')
+              out.push(`${n.tagName.toLowerCase()}.${cls}${cs.display === 'none' ? '[display:none]' : ''}`)
+              n = n.parentElement
             }
-            const mounted = (document.querySelector('.transcript')?.contains(think) ?? false) ? 'under .transcript' : 'NOT under .transcript'
-            pageLog(`selftest diag: thinking ${Math.round(br.width)}px, ${mounted}, chain=${chain(think)}`)
-            fail(`expanded thinking block has no width: ${Math.round(br.width)}`)
+            return out.join(' < ')
           }
-          if (Math.abs(hr.left - br.left) > 1.5)
-            fail(`thinking label is not above its text: head ${Math.round(hr.left)} vs body ${Math.round(br.left)}`)
-          // The rule is drawn at the body's left edge, so it lines up with the label.
-          if (Math.abs(br.left - hr.left) > 1.5)
-            fail(`thinking rule is not under the label: ${Math.round(br.left)} vs ${Math.round(hr.left)}`)
-          if (pad < 8) fail(`thinking text is not tucked under the rule: ${pad}px`)
-          const aHead = ans.querySelector('.blk-head')!.getBoundingClientRect()
+          const run = think.closest('.blk-run') as HTMLElement | null
+          if (run && !run.classList.contains('open')) {
+            // A folded accordion has no layout: every entry inside it measures 0x0. The check takes
+            // the gesture a reader takes and says so, rather than failing on a measurement of
+            // nothing and sending the next reader off to hunt for broken CSS.
+            ;(run.querySelector('.blk-head') as HTMLElement | null)?.click()
+            await renderTick()
+            if (!run.classList.contains('open'))
+              fail('opening the run at its header left the thinking line with no layout to measure')
+          }
+          const hr = head.getBoundingClientRect()
+          if (hr.width < 60) {
+            pageLog(`selftest diag: thinking line ${Math.round(hr.width)}px, chain=${chain(think)}`)
+            fail(`the thinking line measures ${Math.round(hr.width)}px wide`)
+          }
+          if (hr.height > 22) fail(`the thinking line is ${Math.round(hr.height)}px tall, so it wrapped`)
+          if (think.querySelectorAll('.blk-body').length)
+            fail('the thinking line still carries a body element: a thought has nothing to open')
+          if (!think.closest('.blk-run')) fail('the thinking line is not inside the run accordion')
+          const aHead = document.querySelector('.turn-who-cwoffee .who-name')!.getBoundingClientRect()
           const aBody = ans.querySelector('.blk-body')!.getBoundingClientRect()
           if (aHead.width === 0 || aBody.width === 0)
             pageLog(
@@ -9287,7 +11552,7 @@
           if (!/^Thought for /i.test(label.trim())) fail(`settled thinking reads "${label}"`)
         }
         transcript?.clear()
-        pageLog('thinking aligns under its label ok')
+        pageLog('a thought is one line and the answer keeps its outdented label')
         }
       }
 
@@ -9297,13 +11562,13 @@
       // is describing is horizontal: the breathing room between the tag and the first
       // glyph. It has to be the same room while text arrives as after the markdown
       // pass, or the turn visibly shifts as it finishes.
-      {
+      if (want('label-crowd', 'the label does not crowd the answer while it streams')) {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         const gap = () => {
           const blk = document.querySelector('.blk-answer') as HTMLElement
           if (!blk) return null
-          const head = blk.querySelector('.blk-head')!.getBoundingClientRect()
+          const head = document.querySelector('.turn-who-cwoffee .who-name')!.getBoundingClientRect()
           const body = blk.querySelector('.blk-body') as HTMLElement
           let first = body.querySelector('.tin') as HTMLElement | null
           let left = first ? first.getBoundingClientRect().left : NaN
@@ -9354,8 +11619,1082 @@
         transcript?.clear()
       }
 
+      // --- one name per turn, pinned while that turn is on screen ---------------
+      // Reported as: "both the You and the Cwoffee indicators have to appear only once per
+      // turn — like the action buttons on a code block, float them until the end of the
+      // container." A turn that printed its own name five times down the gutter is the same
+      // complaint as an ungrouped transcript: five separate messages instead of one turn. The
+      // divider travels with it: "the user message is above the turn divider" — your words open
+      // the turn, so they belong under the line, not over it.
+      if (want('sticky-name', 'one name per turn, pinned while that turn is on screen')) {
+        transcript?.clear()
+        transcript?.addUser('two things, please')
+        const before = [...document.querySelectorAll('.turn')] as HTMLElement[]
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 71, model: 'selftest', session_id: 0 } })
+        const turns = [...document.querySelectorAll('.turn')] as HTMLElement[]
+        const t = turns[turns.length - 1]
+        const kids = [...t.children]
+        const headAt = kids.findIndex((n) => n.classList.contains('turn-head'))
+        const askAt = kids.findIndex((n) => n.classList.contains('blk-user'))
+        if (headAt < 0) fail('this turn has no divider at all')
+        else if (askAt < 0) fail('your message is not in the turn it opened')
+        else if (headAt > askAt) fail('your message still sits above the turn divider')
+        const stale = before.filter((x) => x !== t && x.querySelector('.blk-user'))
+        if (stale.length) fail('your message stayed in the turn it was typed into as well')
+
+        transcript?.apply({ kind: 'reasoning', d: 'check the sheet first' })
+        transcript?.apply({ kind: 'toolCallBegin', d: { id: 'n1', name: 'read_file' } })
+        transcript?.apply({ kind: 'toolExecEnd', d: { id: 'n1', ok: true, exit_code: 0, changes: [] } })
+        transcript?.apply({ kind: 'text', d: 'First paragraph of the answer. ' })
+        transcript?.apply({ kind: 'reasoning', d: 'and then the second half' })
+        transcript?.apply({ kind: 'toolCallBegin', d: { id: 'n2', name: 'exec' } })
+        transcript?.apply({ kind: 'toolExecEnd', d: { id: 'n2', ok: true, exit_code: 0, changes: [] } })
+        transcript?.apply({ kind: 'text', d: 'Second paragraph, still the same turn.' })
+        transcript?.flushNow()
+        await frame(40)
+        const paras = t.querySelectorAll('.blk-answer')
+        const names = t.querySelectorAll('.turn-who-cwoffee')
+        if (paras.length < 2) fail(`the fixture lost a paragraph (${paras.length})`)
+        if (names.length !== 1)
+          fail(`a turn with ${paras.length} paragraphs and an accordion names itself ${names.length} times, want once`)
+        const loud = [...t.querySelectorAll('.blk-answer > .blk-head')].filter((n) => getComputedStyle(n).display !== 'none')
+        if (loud.length) fail(`${loud.length} paragraphs still print their own CWOFFEE label`)
+        // Two of your messages in one turn is one ask, so it keeps one name.
+        transcript?.addUser('and one more thing')
+        const asks = [...t.querySelectorAll('.blk-user')]
+        if (asks.length !== 2) fail(`both of your messages should sit in this turn, got ${asks.length}`)
+        const youNamed = asks.filter((n) => getComputedStyle(n.querySelector('.blk-head')!).display !== 'none')
+        if (youNamed.length !== 1) fail(`${youNamed.length} of your messages in one turn are named, want one`)
+
+        // Pinned for the length of the turn and released by its end — the affordance a code
+        // block's buttons already have. A filler inside the turn makes it tall enough to have a
+        // middle, and the turn itself is the shipped one rather than a hand-built shape.
+        const sc = document.querySelector('.scroller') as HTMLElement | null
+        const nmEl = t.querySelector('.turn-who .who-name') as HTMLElement | null
+        if (!sc || !nmEl) fail('there is no scroller or no name marker to measure')
+        else {
+          const prevTop = sc.scrollTop
+          const filler = document.createElement('div')
+          filler.style.height = '1200px'
+          t.append(filler)
+          // And something after the turn: without it the turn is the last thing in the document
+          // and "scrolled past its end" is physically unreachable - the scroll clamps and the
+          // check reads the CSS as the thing that is broken.
+          const tail = document.createElement('div')
+          tail.style.height = '900px'
+          sc.append(tail)
+          // Wait for the page to stop moving under its own power before measuring it. The stream
+          // follows the bottom of the transcript with an accelerating animation, and it marks its own
+          // scrolls as programmatic for a frame - which swallows this check's scroll if the two
+          // interleave, leaving the ratchet chasing a bottom the check just moved 2,000px away. A
+          // name measured mid-chase is a measurement of the animation, not of the CSS.
+          const settle = async () => {
+            let last = -1
+            let still = 0
+            for (let i = 0; i < 24; i++) {
+              await new Promise((r) => setTimeout(r, 30))
+              const now = sc.scrollTop
+              if (Math.abs(now - last) < 0.6 && ++still >= 2) break
+              if (Math.abs(now - last) >= 0.6) still = 0
+              last = now
+            }
+          }
+          await settle()
+          // Where the turn's top belongs once the view is 400px into it: 400px above the top of the
+          // scroller, because scrolling down carries the top of the turn up past the line. Stated as
+          // a target rather than as a scroll amount so the loop below can re-aim if the page moved.
+          const want = sc.getBoundingClientRect().top - 400
+          let scrolls = 0
+          for (; scrolls < 3; scrolls++) {
+            sc.scrollTop += t.getBoundingClientRect().top - want
+            await settle()
+            if (Math.abs(t.getBoundingClientRect().top - want) <= 8) break
+          }
+          const sr = sc.getBoundingClientRect()
+          const stickAt = sr.top
+          // The word hangs below the row it is pinned by, by the offset the CSS publishes for this
+          // turn's shape, so "pinned at the top" has to be measured against that line rather than
+          // against the row itself - otherwise a turn that opens with the folded group reads as a
+          // name that has forgotten to stick.
+          const hang = parseFloat(getComputedStyle(nmEl.parentElement!).getPropertyValue('--who-top')) || 0
+          const mid = { nm: nmEl.getBoundingClientRect(), turn: t.getBoundingClientRect() }
+          const landed = mid.turn.top - want
+          const verdict: string[] = []
+          if (Math.abs(landed) > 12)
+            verdict.push(
+              `this check could not site the turn 400px into the transcript - it landed ${Math.round(landed)}px off after ${scrolls} scroll${scrolls === 1 ? '' : 's'}`,
+              // The scroll state, not just the answer: a correction that buys nothing every time
+              // means the scroller refused the scroll (clamped, zero-height, or not the scroller at
+              // all), and the numbers say which.
+              `[scroller ${sc.tagName}.${sc.className.split(' ').slice(0, 3).join('.')} scrollTop=${Math.round(sc.scrollTop)}/`
+                + `max=${Math.round(sc.scrollHeight - sc.clientHeight)} sh=${Math.round(sc.scrollHeight)} ch=${Math.round(sc.clientHeight)} `
+                + `rect=${Math.round(sr.top)}..${Math.round(sr.bottom)} ovf=${getComputedStyle(sc).overflowY}; `
+                + `turn connected=${t.isConnected} ${Math.round(t.getBoundingClientRect().top)}..${Math.round(t.getBoundingClientRect().bottom)} `
+                + `offsetH=${t.offsetHeight} parent=${t.parentElement?.className ?? 'none'}; `
+                + `want=${Math.round(want)} filler=${!!filler.parentElement} tail=${!!tail.parentElement}]`,
+            )
+          else if (mid.turn.top > stickAt)
+            verdict.push(
+              `the turn never reached the sticky line (still ${Math.round(mid.turn.top - stickAt)}px below it), so nothing can be said about its name`,
+            )
+          else if (offScreen() || (nmEl.parentElement as HTMLElement).getBoundingClientRect().height < 2) {
+            // A row with no height is what an un-painted page answers; there is no sticky line to
+            // measure against and the fixed offset is being compared with nothing.
+            blindSkips++
+            pageLog(
+              `selftest note: skipped the mid-turn sticky-name measurement; ${offScreen() ?? 'the row the name hangs from measures 0px tall'} - a page nothing composites has no sticky line to measure against`,
+            )
+          } else if (Math.abs(mid.nm.top - (stickAt + hang)) > 3) {
+            // The number alone cannot be acted on: the offset is the sum of where the row holding
+            // the name landed, what the CSS variable says, and the label's own box padding. Report
+            // all three, and what the turn opens with, so the next run names the layer at fault.
+            const who = nmEl.parentElement as HTMLElement
+            const wr = who.getBoundingClientRect()
+            const cs = getComputedStyle(nmEl)
+            verdict.push(
+              `400px into a turn the name sits ${Math.round(mid.nm.top - stickAt)}px from the top of the transcript rather than ${hang}px; ` +
+                `the row it hangs from ("${who.className}") lands ${Math.round(wr.top - stickAt)}px below the sticky line and is ${Math.round(wr.height)}px tall, ` +
+                `the label's own top/padding are ${cs.top}/${cs.paddingTop}, ` +
+                `and the turn opens with "${t.firstElementChild?.className || 'nothing'}"`,
+            )
+          }
+          // What is actually beside the stuck word at this scroll position. The offset the CSS
+          // publishes is arithmetic against the header of the block the turn opens with, and that is
+          // true at the top of a turn. Four hundred pixels in, that header has scrolled away and the
+          // same offset is measured against nothing - so measure the neighbour when it is there and
+          // say plainly when it is not, rather than letting one constant answer both questions.
+          if (Math.abs(landed) <= 12) {
+            const heads = [...t.querySelectorAll('.blk-head')].filter(
+              (n) => getComputedStyle(n).display !== 'none',
+            ) as HTMLElement[]
+            const beside = heads.find((n) => {
+              const r = n.getBoundingClientRect()
+              return r.bottom > stickAt && r.top < stickAt + 40
+            })
+            const rowOff = Math.round(nmEl.parentElement!.getBoundingClientRect().top - stickAt)
+            pageLog(
+              `stuck name 400px into a turn: ${Math.round(mid.nm.top - stickAt)}px below the sticky line (--who-top ${hang}px, the row it hangs from lands ${rowOff}px below the line); ` +
+                (beside
+                  ? `"${beside.textContent?.trim().slice(0, 22)}" is beside it, centres ${(mid.nm.top + mid.nm.height / 2 - (beside.getBoundingClientRect().top + beside.getBoundingClientRect().height / 2)).toFixed(1)}px apart`
+                  : `none of the turn's ${heads.length} header(s) is beside it here, so the offset is measured against empty gutter`),
+            )
+          }
+          sc.scrollTop += t.offsetHeight
+          await settle()
+          const after = { nm: nmEl.getBoundingClientRect(), turn: t.getBoundingClientRect() }
+          if (after.turn.bottom > stickAt + 2)
+            verdict.push(
+              `the transcript would not scroll past the end of the turn (its bottom is still ${Math.round(after.turn.bottom - stickAt)}px below the line)`,
+            )
+          else if (after.nm.top > stickAt + hang + 2)
+            verdict.push(`the name floated past the end of its own turn by ${Math.round(after.nm.bottom - after.turn.bottom)}px`)
+          sc.scrollTop = prevTop
+          filler.remove()
+          tail.remove()
+          if (verdict.length) fail(verdict.join('; '))
+          else
+            pageLog(
+              `one name per turn, pinned for its length and released by its end, hanging ${hang}px off its row, turn sited ${Math.round(landed)}px off target after ${scrolls} scroll${scrolls === 1 ? '' : 's'} (and your message sits under the divider)`,
+            )
+        }
+        // --- the transcript's marker: no dots, one cup at the bottom, name lined up with the header
+        // Reported as "the dot animation and the assistant name are not aligned with the block
+        // header", then as "remove the dot everywhere in the transcript, including beside the small
+        // grouped actions inside the folded group", then as "put the two animated cups under the
+        // name" - and that one came back wrong: "on multi small turns it gets duplicated and is quite
+        // small; remove it from below the name and put it at the bottom of the content, below the
+        // Copy | Share buttons, enlarged". So this asserts four things: nothing paints a generated
+        // marker, the name shares the folded group's line, the page owns exactly one cup, and that cup
+        // is the last thing in the content - moved there, never created twice.
+        const whoRow = t.querySelector('.turn-who-cwoffee') as HTMLElement | null
+        const cups = [...document.querySelectorAll('.transcript-cup')] as HTMLImageElement[]
+        if (!whoRow) fail('this turn has no name row')
+        else if (cups.length !== 1)
+          fail(`${cups.length} cups on this page; one transcript gets one cup, however many turns it holds`)
+        else {
+          const cup = cups[0]
+          const verdict: string[] = []
+          const nm = whoRow.querySelector('.who-name') as HTMLElement | null
+          if (!nm) verdict.push('the name row has no name in it')
+          // (a) No dot on anything. The name row, each card and the grouped actions inside the
+          //     folded group all used to grow one while a turn ran.
+          const labels = [...t.querySelectorAll('.blk-head'), nm].filter(Boolean) as HTMLElement[]
+          const dotted = labels.filter((n) => {
+            const cs = getComputedStyle(n, '::before')
+            return cs.content !== 'none' && cs.content !== 'normal'
+          })
+          if (dotted.length) verdict.push(`${dotted.length} labels still paint a generated ::before marker`)
+          const anim = labels.filter((n) => getComputedStyle(n, '::before').animationName !== 'none')
+          if (anim.length) verdict.push(`${anim.length} labels still animate a marker`)
+          // (b) The cup: pinned in the band the pane reserves, big enough to read as the artwork
+          //     rather than as a status pixel, and out of the way when the reader is mid-page.
+          const host = cup.parentElement
+          const nr = nm!.getBoundingClientRect()
+          // The cup is only lit while the end of the transcript is on screen (see `updateCup`), so the
+          // reading position is set before the picture is measured; a zero box from a hidden picture
+          // would otherwise read as "the cup is 0px wide".
+          const scE = document.querySelector('.scroller') as HTMLElement | null
+          const prevE = scE?.scrollTop ?? 0
+          if (scE) scE.scrollTop = scE.scrollHeight
+          await new Promise((r) => setTimeout(r, 140))
+          const ir = cup.getBoundingClientRect()
+          if (!host || !host.classList.contains('scrollerwrap'))
+            verdict.push(`the cup sits inside .${host?.className || 'nothing'} rather than in the band the pane reserves`)
+          else if (host.lastElementChild !== cup)
+            verdict.push(`the cup is not the last thing in its band (${host.lastElementChild?.className || 'nothing'} is)`)
+          if (cup.closest('.transcript'))
+            verdict.push('the cup is back inside the scrolling content, which is what made it travel')
+          if (cup.classList.contains('bare')) verdict.push('the cup is hidden while the transcript has content')
+          if (cup.classList.contains('cup-out'))
+            verdict.push(`the cup went away at the end of a conversation (the pane is ${scE?.clientHeight}px showing ${scE?.scrollHeight}px of content)`)
+          if (ir.width < 120) verdict.push(`the cup is ${Math.round(ir.width)}px wide; it should read as the drawing, not a pixel`)
+          // (c) The name on the folded group's line. Both measured as *text* boxes: the row carries
+          //     padding and the group carries margins, so comparing element boxes compares chrome.
+          const centre = (n: Text | null, take: number) => {
+            if (!n) return NaN
+            const r = document.createRange()
+            r.setStart(n, 0)
+            r.setEnd(n, Math.min(take, n.length))
+            const b = r.getBoundingClientRect()
+            return b.top + b.height / 2
+          }
+          const runLabel = t.querySelector('.blk-run > .blk-head .run-label')
+          const off = centre(runLabel?.firstChild as Text | null, 4) - centre(nm!.firstChild as Text | null, 4)
+          const whoTop = getComputedStyle(whoRow).getPropertyValue('--who-top').trim()
+          if (!runLabel) verdict.push('there is no folded-group header to align the name with')
+          else if (Math.abs(off) > 2)
+            verdict.push(`the name is ${off.toFixed(1)}px off the folded group's header line (--who-top ${whoTop || 'unset'})`)
+          if (verdict.length) {
+            // Geometry dump: a handful of these numbers is enough to say which element is lying,
+            // and a bare "0px wide" says nothing about whether the layout, the CSS or the picture
+            // is at fault.
+            const cs = getComputedStyle(cup)
+            const rowR = whoRow.getBoundingClientRect()
+            const hostR = host?.getBoundingClientRect()
+            const runR = t.querySelector('.blk-run')?.getBoundingClientRect()
+            verdict.push(
+              `[name ${Math.round(nr.top)}..${Math.round(nr.bottom)}; cup ${Math.round(ir.left)},${Math.round(ir.top)} `
+                + `${Math.round(ir.width)}x${Math.round(ir.height)} complete=${cup.complete} natural=${cup.naturalWidth} `
+                + `computed pos=${cs.position} disp=${cs.display} w=${cs.width} h=${cs.height} top=${cs.top} bottom=${cs.bottom} left=${cs.left}; `
+                + `host .${host?.className || 'nothing'} ${hostR ? `${Math.round(hostR.left)},${Math.round(hostR.top)} ${Math.round(hostR.width)}x${Math.round(hostR.height)}` : 'none'}; `
+                + `pane ${scE ? `${scE.scrollTop}/${scE.scrollHeight}x${scE.clientHeight} padB ${getComputedStyle(scE).paddingBottom}` : 'none'}; `
+                + `view ${window.innerWidth}x${window.innerHeight} dpr ${window.devicePixelRatio}; `
+                + `run ${runR ? `${Math.round(runR.left)},${Math.round(runR.top)} ${Math.round(runR.width)}x${Math.round(runR.height)}` : 'none'}`
+                + `; header centre ${Number.isFinite(off) ? Math.round(centre(runLabel?.firstChild as Text | null, 4)) : 'n/a'}`
+                + `; name centre ${Math.round(centre(nm?.firstChild as Text | null, 4))}]`,
+            )
+            fail(verdict.join('; '))
+          } else
+            pageLog(
+              `turn marker ok: no generated marker on ${labels.length} labels, one cup ${Math.round(ir.width)}px pinned in the pane's band, `
+                + `name ${off.toFixed(1)}px off the header line (--who-top ${whoTop})`,
+            )
+
+          if (scE) scE.scrollTop = prevE
+
+          // Which drawing, and does the resting one carry a random hold? While a block works the cup
+          // is the generating loop at the artist's own timing; once the turn stops it is the resting
+          // loop, re-armed every lap with a hold drawn from IDLE_HOLD. Reading the hold back out of
+          // the bytes the <img> actually points at is the only claim about a pause worth making.
+          const busySrc = cup.getAttribute('src') ?? ''
+          if (!busySrc.endsWith('/cwoffee_generating_generation_1.webp'))
+            fail(`a working turn should show the generating cup, got ${busySrc}`)
+          transcript?.apply({ kind: 'turnEnd', d: { turn_id: 71, finish: 'stop' } })
+          await new Promise((r) => setTimeout(r, 120))
+          // Turn end puts the buttons under the turn. The band is what keeps them clear of the cup:
+          // at the end of a conversation the last row of content stops above the band, so the picture
+          // cannot sit on top of the buttons.
+          const acts = t.querySelector('.turn-acts')
+          if (!acts) fail('the turn lost its Copy / Share / Branch row, so there is nothing to site the cup under')
+          else {
+            const scF = document.querySelector('.scroller') as HTMLElement | null
+            if (scF) scF.scrollTop = scF.scrollHeight
+            await new Promise((r) => setTimeout(r, 160))
+            const ab = acts.getBoundingClientRect()
+            const cr = cup.getBoundingClientRect()
+            if (cup.classList.contains('cup-out'))
+              fail(`the cup is put away at the end of a conversation (the pane shows ${scF?.clientHeight}px of ${scF?.scrollHeight}px)`)
+            else if (cr.top < ab.bottom)
+              fail(`the band does not clear the turn's buttons (buttons bottom ${Math.round(ab.bottom)}, cup top ${Math.round(cr.top)})`)
+          }
+          const idleSrc = cup.getAttribute('src') ?? ''
+          if (!idleSrc.endsWith('/cwoffee_generating_idle_1.webp') && !idleSrc.startsWith('blob:'))
+            fail(`a settled transcript should show the resting cup, got ${idleSrc}`)
+          // Short turns must not multiply it. The cup is moved rather than created, so three more
+          // one-line turns still leave exactly one on the page, still the last thing in the content.
+          for (const id of [72, 73, 74]) {
+            transcript?.apply({ kind: 'turnStart', d: { turn_id: id, model: 'selftest', session_id: 0 } })
+            transcript?.apply({ kind: 'text', d: `short turn ${id}` })
+            transcript?.apply({ kind: 'turnEnd', d: { turn_id: id, finish: 'stop' } })
+          }
+          await frame(40)
+          const many = [...document.querySelectorAll('.transcript-cup')]
+          const nturns = document.querySelectorAll('.turn').length
+          if (many.length !== 1)
+            fail(`${many.length} cups after ${nturns} turns; the cup has to move to the bottom, not spawn one per turn`)
+          else if (cup.parentElement && cup.parentElement.lastElementChild !== cup)
+            fail(`after ${nturns} turns the cup is no longer the last thing in the transcript`)
+          else pageLog(`one cup across ${nturns} turns, still last in the content and still under the buttons`)
+          await new Promise((r) => setTimeout(r, 1200)) // the picture's bytes, then the first re-arm
+          const armed = cup.getAttribute('src') ?? ''
+          if (!armed.startsWith('blob:'))
+            fail(`the resting cup was never re-armed with a random hold; src is still ${armed}`)
+          else {
+            const buf = new Uint8Array(await (await fetch(armed)).arrayBuffer())
+            const fr = aniFrames(buf)
+            if (!fr) fail('the re-armed cup cannot be read as an animation this app patches')
+            else if (fr.lastMs < IDLE_HOLD[0] || fr.lastMs > IDLE_HOLD[1])
+              fail(`the resting cup's hold is ${fr.lastMs}ms, outside the ${IDLE_HOLD[0]}-${IDLE_HOLD[1]}ms range it draws from`)
+            else
+              pageLog(
+                `resting cup re-armed: lap ${(fr.playMs / 1000).toFixed(2)}s carrying a ${fr.lastMs}ms hold, `
+                  + `drawn fresh every lap, on the one cup the page owns`,
+              )
+          }
+        }
+        transcript?.clear()
+      }
+
+      // --- the view follows what was said, not what was worked, and one button gets back down --
+      // Reported as: "now that the transcript only grows when actual message content comes through,
+      // unlock the scroll from the bottom - but when a message comes through, the normal lock
+      // applies again. If I scrolled up and stayed there before the message content begins to grow,
+      // don't force a scroll; let me get locked when I scroll to the bottom. And maybe add a bottom
+      // sticky centred button to scroll to the bottom." Five claims, one page: work does not move
+      // the view; an answer does, for a reader who never left; a reader who did leave is not moved;
+      // the button appears for them and not for anyone already at the bottom; and taking it
+      // re-arms the lock. Plus the claim the removal of the preview created: a thinking run has to
+      // say it is producing, in words, with nothing to watch.
+      if (want('follow', 'the view follows what was said, not what was worked, and one button gets back ')) {
+        if (await blind('follow policy and the jump button')) {
+          // counted skip; blind() logged why
+        } else {
+          const sc = document.querySelector('.scroller') as HTMLElement | null
+          const jump = () => document.querySelector('.jump') as HTMLElement | null
+          const away = () => Math.round(sc!.scrollHeight - sc!.clientHeight - sc!.scrollTop)
+          const verdict: string[] = []
+          if (!sc) fail('there is no scroller to measure the follow policy in')
+          else {
+            // 0. a thought with no preview still has to look alive: the folded group's header
+            //    counts the words as they land, which is also the stall detector a reader can see.
+            transcript?.setVerbose(true)
+            transcript?.clear()
+            transcript?.apply({ kind: 'turnStart', d: { turn_id: 81, model: 'selftest', session_id: 0 } })
+            transcript?.apply({ kind: 'reasoning', d: 'one thought and then another and another '.repeat(30) })
+            await frame(60)
+            const cnt = document.querySelector('.blk-run .run-count')?.textContent ?? ''
+            if (!/\bwords\b/.test(cnt))
+              verdict.push(`a run that is thinking says "${cnt}" where it should count the words arriving`)
+            const line = document.querySelector('.blk-reasoning .blk-head')?.textContent ?? ''
+            if (!/thinking/.test(line)) verdict.push(`a streaming thought reads "${line}" rather than counting itself`)
+            // 1. fourteen thoughts and tool cards: a lot of height, and a view that holds still.
+            for (let i = 0; i < 14; i++) {
+              transcript?.apply({ kind: 'reasoning', d: `thinking about step ${i} of the run ` })
+              transcript?.apply({ kind: 'toolCallBegin', d: { id: `w${i}`, name: 'shell' } })
+              transcript?.apply({ kind: 'toolExecOutput', d: { id: `w${i}`, stream: 'stdout', chunk: `line ${i}: ${'x'.repeat(120)}\n` } })
+              transcript?.apply({ kind: 'toolExecEnd', d: { id: `w${i}`, ok: true, exit_code: 0, changes: [] } })
+            }
+            await frame(60)
+            const grew = away()
+            if (grew < 120)
+              verdict.push(`fourteen tool cards grew the content only ${grew}px below the fold: the page is too small to test this on`)
+            if (sc.scrollTop !== 0)
+              verdict.push(`the view moved ${sc.scrollTop}px during a turn of pure work; only what the model says may move it`)
+            const jb = jump()
+            if (!jb) verdict.push('nothing offers the reader a way back down while the newest content is below the fold')
+            else {
+              // 2. the button: sticky to the bottom of the transcript, centred on the column the
+              //    text actually occupies (the gutter makes the pane and the column differ by 26px).
+              const jr = jb.getBoundingClientRect()
+              const sr = sc.getBoundingClientRect()
+              const axis = sr.left + sr.width / 2 + 26
+              if (getComputedStyle(jb).position !== 'absolute') verdict.push('the jump button is not pinned to the transcript')
+              if (Math.abs(jr.left + jr.width / 2 - axis) > 6)
+                verdict.push(`the jump button is ${Math.round(jr.left + jr.width / 2 - axis)}px off the text column's centre`)
+              if (jr.bottom > sr.bottom - 2 || jr.bottom < sr.top + 20)
+                verdict.push(
+                  `the jump button is not at the bottom of the transcript (its bottom ${Math.round(jr.bottom)}, pane ${Math.round(sr.top)}..${Math.round(sr.bottom)})`,
+                )
+              if (jr.height < 22) verdict.push(`the jump button is ${Math.round(jr.height)}px tall, too small to hit with a thumb`)
+              // The pill and the picture live in the same corner of the pane. The picture is put away
+              // on the same gesture that raises the pill, so "both lit" is a bug rather than a
+              // near-miss - and if both are lit, they must at least not be painted on each other.
+              const cupEl = document.querySelector('.transcript-cup') as HTMLElement | null
+              // A faded cup is not in the way, so "lit" here means legible, not merely painted.
+              const cupLit =
+                !!cupEl && !cupEl.classList.contains('bare') && parseFloat(getComputedStyle(cupEl).opacity) > 0.5
+              if (cupLit) {
+                const cr2 = cupEl.getBoundingClientRect()
+                const ox = Math.min(jr.right, cr2.right) - Math.max(jr.left, cr2.left)
+                const oy = Math.min(jr.bottom, cr2.bottom) - Math.max(jr.top, cr2.top)
+                if (ox > 2 && oy > 2)
+                  verdict.push(
+                    `the jump button is painted on top of the cup's picture (${Math.round(ox)}x${Math.round(oy)}px of overlap) while the reader is ${away()}px above the bottom`,
+                  )
+              }
+            }
+            // 3. the model starts talking: for a reader who never left, the lock applies again and
+            //    the newest line ends up on screen. The follow moves at a capped speed on purpose
+            //    (that cap is what stopped the lurching), so what is asserted is that it converges,
+            //    not that it caught a burst within one paint - the fixture lands a whole answer in
+            //    one synchronous call, which is harsher than any stream on this machine.
+            transcript?.apply({ kind: 'text', d: 'Here is what the run found. '.repeat(60) })
+            let settledAt = -1
+            for (let t = 0; t < 3000; t += 100) {
+              await new Promise((r) => setTimeout(r, 100))
+              if (away() <= 80) {
+                settledAt = t
+                break
+              }
+            }
+            const gap = away()
+            if (gap > 80)
+              verdict.push(`a pinned reader was still ${gap}px above the answer after 3s of catch-up (grew ${grew}px)`)
+            if (jump())
+              verdict.push(`the jump button is still offering a way down to a reader ${gap}px from the bottom`)
+            // 4. a reader who scrolled up is not moved by a model that keeps writing.
+            sc.scrollTop = 0
+            await new Promise((r) => setTimeout(r, 400))
+            const marker = document.querySelector('.blk-answer .blk-body') as HTMLElement | null
+            if (!marker) verdict.push('no answer text to mark a scrolled-up reader with')
+            else {
+              const before = marker.getBoundingClientRect().top
+              transcript?.apply({ kind: 'text', d: ' And it keeps writing, which grows the page further below. '.repeat(40) })
+              await new Promise((r) => setTimeout(r, 600))
+              const moved = marker.getBoundingClientRect().top - before
+              if (Math.abs(moved) > 1.5)
+                verdict.push(`a reader who scrolled up was dragged ${Math.round(-moved)}px by streaming text`)
+              if (!jump()) verdict.push('the reader who scrolled up lost the way back down')
+              // 5. taking the button puts them at the bottom and re-arms the lock.
+              jump()!.click()
+              await new Promise((r) => setTimeout(r, 250))
+              const back = away()
+              if (back > 8) verdict.push(`the jump button left the reader ${back}px above the bottom`)
+              if (jump()) verdict.push('the jump button stayed once the reader had taken it')
+              transcript?.apply({ kind: 'text', d: ' One more line, which they should see without asking for it. ' })
+              await new Promise((r) => setTimeout(r, 500))
+              if (away() > 80) verdict.push(`after the jump the lock did not re-arm: ${away()}px above the newest line`)
+            }
+            // 6. your own message always lands at the bottom, even for a reader who had wandered off.
+            sc.scrollTop = 0
+            await new Promise((r) => setTimeout(r, 200))
+            transcript?.addUser('and one more thing')
+            await new Promise((r) => setTimeout(r, 250))
+            const mine = away()
+            if (mine > 8) verdict.push(`your own message did not bring the view to the bottom (${mine}px above it)`)
+            if (verdict.length && unpainted()) {
+              // The claims are kept in the log so the run still says what it could not prove; what it
+              // does not do is grade a follow policy on a page that was given no frames.
+              blindSkips++
+              pageLog(
+                `selftest note: skipped the follow-policy verdict; ${unpainted()}. It would have said: ${verdict.join('; ')}`,
+              )
+            } else if (verdict.length) {
+              verdict.push(
+                `[scroller top=${Math.round(sc.scrollTop)} max=${Math.round(sc.scrollHeight - sc.clientHeight)} sh=${Math.round(sc.scrollHeight)} ch=${Math.round(sc.clientHeight)}; jump=${jump() ? 'shown' : 'hidden'}; catch-up settled at ${settledAt < 0 ? 'never' : `${settledAt}ms`}]`,
+              )
+              fail(verdict.join('; '))
+            } else
+              pageLog(
+                `follow ok: a turn of work left the view still and put a button at the bottom; the answer pulled a pinned reader back to the bottom in ${settledAt}ms; ` +
+                  'a reader who scrolled up was not moved and one press put them back and re-armed the lock',
+              )
+            transcript?.setVerbose(false)
+            transcript?.clear()
+          }
+        }
+      }
+
+      // --- the loop detector, run against the shipped copy -------------------------------------
+      // `scripts/loop-probe.mjs` holds the same algorithm and the measurements behind the numbers.
+      // This is the drift guard: if the two copies stop agreeing, the app's own test says so. The
+      // reason it is worth a test at all is that the thinking preview is gone, so this is the only
+      // thing left that can tell a reader the model is going round in circles.
+      if (want('loop', 'the loop detector, run against the shipped copy')) {
+        const SENT = 'The quarterly figures were restated after the auditor raised a concern about inventory. '
+        const verdict: string[] = []
+        const run = (text: string, reps: number) => {
+          const w = new LoopWatch()
+          const t0 = performance.now()
+          for (let i = 0; i < reps; i++) w.push(text)
+          return { s: w.stats(), ms: performance.now() - t0 }
+        }
+        // The loop shapes, each with how long it is allowed to take to notice.
+        const a = run(SENT, 200) // 2,600 words of one sentence, over and over
+        if (!a.s.fired || a.s.fired.kind !== 'phrase') verdict.push(`one sentence 200 times: ${JSON.stringify(a.s)}`)
+        else if (a.s.fired.words > 80) verdict.push(`one sentence 200 times noticed ${a.s.fired.words} words in, allowed 80`)
+        const b = run('so I should read the file and then the file and then the file and then ', 400)
+        if (b.s.fired?.kind !== 'phrase') verdict.push(`a stalled thought: ${JSON.stringify(b.s)}`)
+        const c = run(
+          Array.from({ length: 400 }, (_, i) => `I should read the file notes/step.md and check line ${i + 1} for the value, then report the value. `).join(''),
+          1,
+        )
+        if (!c.s.fired || c.s.fired.kind !== 'sentence')
+          verdict.push(`the same sentence with one number changed: ${JSON.stringify(c.s)}`)
+        const d = new LoopWatch()
+        let dhit = null
+        for (let i = 0; i < 40 && !dhit; i++) dhit = d.push('!'.repeat(400))
+        if (!dhit || dhit.kind !== 'chars') verdict.push(`a wall of exclamation marks: ${JSON.stringify(d.stats())}`)
+        // The controls: things a good answer does that are not a loop.
+        const quiet: [string, { s: ReturnType<typeof run>['s'] }][] = [
+          ['a finding restated three times', run('The margin came from inventory. ', 3)],
+          ['a list quoted once', run('1. Open the notes file and read the first line. 2. Compare it with the totals from last quarter. 3. Write the summary in plain language. 4. Close the file and report the difference. ', 1)],
+          ['a table with the same shape', run(Array.from({ length: 12 }, (_, i) => `| row ${i + 1} | grew | 1.${i + 1}% |`).join('\n'), 1)],
+        ]
+        for (const [name, r] of quiet)
+          if (r.s.fired) verdict.push(`${name} was called a loop: ${describeLoop(r.s.fired)}`)
+        // The cost, guarded in milliseconds rather than in adjectives: this runs inside the render
+        // loop, on a machine that paints at 60Hz if it is lucky.
+        const cost = run(SENT, 2000).ms // 26,000 words
+        if (cost > 200) verdict.push(`the detector took ${cost.toFixed(0)}ms over 26,000 words, allowed 200`)
+        if (verdict.length) fail(`loop detector: ${verdict.join('; ')}`)
+        else
+          pageLog(
+            `loop ok: sentence-again seen in ${a.s.fired!.words} words, a stall in ${b.s.fired!.words}, a paraphrase loop in ` +
+              `${c.s.fired!.words}, punctuation at delta ${dhit!.deltas}; three controls stayed quiet; ` +
+              `26,000 words cost ${cost.toFixed(0)}ms (${(cost / 26000).toFixed(3)}ms per word)`,
+          )
+      }
+
+      // --- a detected loop is visible where the reader is looking --------------------------------
+      if (want('loop-visible', 'a detected loop is visible where the reader is looking')) {
+        const before = fails
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 82, model: 'selftest', session_id: 0 } })
+        const toastBefore = document.querySelector('.toast')?.textContent ?? ''
+        const SENT = 'The quarterly figures were restated after the auditor raised a concern about inventory. '
+        for (let i = 0; i < 40; i++) transcript?.apply({ kind: 'reasoning', d: SENT })
+        await frame(60)
+        // The watch samples what arrived rather than every token, so the finding can land a beat
+        // after the last delta - and on a page whose frame clock is silent, "a beat" is however long
+        // the timeout floor says. Ask until it answers, then judge.
+        let runc = document.querySelector('.blk-run.loops .run-count')
+        for (let t = 0; t < 14 && !runc; t++) {
+          await new Promise((r) => setTimeout(r, 100))
+          runc = document.querySelector('.blk-run.loops .run-count')
+        }
+        const rc = (runc?.textContent ?? '').trim()
+        if (!runc && unpainted()) {
+          blindSkips++
+          pageLog(
+            `selftest note: skipped the run-header half of this check; ${unpainted()} - the watch samples on the frame clock, ` +
+              'and a page that is not painting has no frame clock to sample on',
+          )
+        } else if (!runc) fail('a turn that repeated itself 40 times left no mark on the run header')
+        else if (!/repeating/.test(rc)) fail(`the run header says ${JSON.stringify(rc)} where it should name the loop`)
+        const again = document.querySelectorAll('.blk-run.loops').length
+        if (again > 1) fail(`${again} run headers carry the loop mark; the finding is said once per turn`)
+        // The other half of the finding: a note over the composer, because the app is the one
+        // speaking here, not the model. Before this check the composer may already have been
+        // showing a note, so what is asserted is that the note now up is the loop's.
+        const toastNow = document.querySelector('.toast')?.textContent ?? ''
+        if (!/repeating|loop/i.test(toastNow))
+          fail(`a detected loop raised no note over the composer (the note showing is ${JSON.stringify(toastNow || 'none')}; the one before was ${JSON.stringify(toastBefore || 'none')})`)
+        // A turn that is only working normally must not carry the mark.
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 83, model: 'selftest', session_id: 0 } })
+        for (let i = 0; i < 30; i++) {
+          transcript?.apply({ kind: 'reasoning', d: `reading file ${i} and noting the ${i} differences in the totals ` })
+          transcript?.apply({ kind: 'toolCallBegin', d: { id: `L${i}`, name: 'read' } })
+          transcript?.apply({ kind: 'toolExecEnd', d: { id: `L${i}`, ok: true, exit_code: 0, changes: [] } })
+        }
+        await frame(60)
+        if (document.querySelector('.blk-run.loops'))
+          fail('an ordinary turn of 30 different tool calls was marked as a loop')
+        else if (fails === before)
+          pageLog('loop visible: the header names the repetition once, one note is raised, and an ordinary turn is left alone')
+        transcript?.clear()
+      }
+
+      // --- three writes of one file are one attachment -------------------------
+      // Reported as: "the same file got attached three times, and the block is too big — the
+      // border is a broken line, just imply it, it is inside the invisible folder .cws." The
+      // host now records one write per path per turn; the display half is what a session written
+      // before that fix still needs, so it is asserted on stored rows rather than live events.
+      if (want('one-attachment', 'three writes of one file are one attachment')) {
+        const sheet = {
+          path: '.cws/assistant_attachments/ph_used_laptops_rtx3070_4060_class.xlsx',
+          name: 'ph_used_laptops_rtx3070_4060_class.xlsx',
+          mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          bytes: 11_736,
+          kind: 'attachment' as const,
+        }
+        transcript?.loadHistory([
+          {
+            id: 90_100,
+            session_id: 0,
+            role: 'user',
+            content: 'which laptops under 900 have an RTX 3070 or 4060?',
+            reasoning: '',
+            tool_call_id: null,
+            tool_calls_json: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            files: [],
+            created_at: 0,
+            attachments: [],
+          },
+          {
+            id: 90_101,
+            session_id: 0,
+            role: 'assistant',
+            content: 'the sheet is ready',
+            reasoning: '',
+            tool_call_id: null,
+            tool_calls_json: '',
+            reasoning_signature: '',
+            reasoning_ms: 0,
+            created_at: 0,
+            attachments: [],
+            files: [{ ...sheet, bytes: 10_094 }, { ...sheet, bytes: 10_678 }, sheet],
+          },
+        ])
+        const units = [...document.querySelectorAll('.attachunit')] as HTMLElement[]
+        if (units.length !== 1) fail(`${units.length} attachment units for one file, want one`)
+        if (units.length) {
+          const u = units[0]
+          if (!u.title.includes('written 3 times')) fail(`the unit does not say three writes went into it: "${u.title}"`)
+          const r = u.getBoundingClientRect()
+          if (r.height > 40) fail(`the attachment block is ${Math.round(r.height)}px tall, want a single line`)
+          const chip = u.querySelector('.filechip') as HTMLElement | null
+          if (!chip) fail('the unit has no chip inside it')
+          else if (parseFloat(getComputedStyle(chip).borderTopWidth) > 0)
+            fail('the chip still draws its own box inside the unit')
+          const cs = getComputedStyle(u)
+          if (cs.borderTopStyle !== 'dashed') fail(`the unit's edge is ${cs.borderTopStyle}, want a dashed implied one`)
+          if (!u.querySelector('.filechip.one-line')) fail('the attachment chip is still laid out on two lines')
+          if (!u.querySelector('.attach-save')) fail('the unit lost its Save control')
+          pageLog(`attachment unit ok (3 writes -> 1 unit, ${Math.round(r.height)}px tall, dashed edge, no box around the name)`)
+        }
+        // A loaded session gets the same single cup, resting: one element per page means the
+        // "one moving picture at a time" cost argument no longer forces stills into the history view.
+        // That rule is exactly what made a loaded session's cup look frozen, which is what the report
+        // "the idle webp isn't animated" was seeing.
+        const loadedCups = [...document.querySelectorAll('.transcript-cup')] as HTMLImageElement[]
+        if (loadedCups.length !== 1) fail(`${loadedCups.length} cups in a loaded session; one page owns one cup`)
+        else {
+          const c = loadedCups[0]
+          const src = c.getAttribute('src') ?? ''
+          const host = c.parentElement
+          if (src.endsWith('_still.webp')) fail(`a loaded session's cup is a still (${src}); the resting loop belongs at the bottom`)
+          else if (!host?.classList.contains('scrollerwrap'))
+            fail(
+              `the transcript's cup hangs in "${host?.className || 'nothing'}" rather than pinned in the transcript pane, where the padding reserves its band`,
+            )
+          else
+            pageLog(
+              `transcript cup ok (one cup for ${document.querySelectorAll('.turn').length} stored turns, pinned in the band the pane reserves for it, ` +
+                `showing ${src.startsWith('blob:') ? 'an armed resting loop' : 'the resting loop'}` +
+                `${matchMedia('(prefers-reduced-motion: reduce)').matches ? ' as a still, per the motion setting' : ''})`,
+            )
+        }
+        if (units.length) {
+          // The hand-over line. An attachment belongs to the reader, not to the list of files the
+          // turn touched, so it sits against the right edge of the text column rather than in the
+          // strip under the prose. Measured against the column, not the pane: the pane has a gutter
+          // and padding, and a line can be flush right inside padding while sitting off the text.
+          const u0 = units[0]
+          const line = u0.parentElement
+          if (!line?.classList.contains('attachline'))
+            fail(`the attachment sits in .${line?.className || 'nothing'} rather than on its own hand-over line`)
+          else {
+            const col = document.querySelector('.scroller > div > .transcript') as HTMLElement | null
+            const lr = line.getBoundingClientRect()
+            const ur = u0.getBoundingClientRect()
+            if (col) {
+              const cr = col.getBoundingClientRect()
+              if (Math.abs(cr.right - lr.right) > 4)
+                fail(`the hand-over line ends ${Math.round(cr.right - lr.right)}px off the right edge of the text column`)
+            }
+            if (ur.right > lr.right + 1) fail(`the unit hangs ${Math.round(ur.right - lr.right)}px past its own line`)
+            if (getComputedStyle(line).justifyContent !== 'flex-end')
+              fail(`the hand-over line is justified ${getComputedStyle(line).justifyContent}, not to the right`)
+          }
+          // The control's hover fill is what the reader actually sees. Painted flush against the
+          // unit's dashed edge, it looks like a rectangle that does not fit inside its own row.
+          const save = u0.querySelector('.attach-save') as HTMLElement | null
+          if (save) {
+            const cs = getComputedStyle(u0)
+            const pr = parseFloat(cs.paddingRight) || 0
+            const pb = parseFloat(cs.paddingBottom) || 0
+            const sr = save.getBoundingClientRect()
+            const ur2 = u0.getBoundingClientRect()
+            if (pr < 2 || pb < 2)
+              fail(`the unit has ${pr}px/${pb}px of inboard air, so no control inside it can avoid its own border`)
+            else if (ur2.right - sr.right < pr - 1 || ur2.bottom - sr.bottom < pb - 1)
+              fail(
+                `the Save control sits ${(ur2.right - sr.right).toFixed(1)}px from the right edge and ${(ur2.bottom - sr.bottom).toFixed(1)}px from the bottom, ` +
+                  `inside a unit holding ${pr}px/${pb}px of padding: its hover fill lands on the dashed border`,
+              )
+          }
+        }
+        transcript?.clear()
+      }
+
+      // --- an icon sits in the middle of its own button -----------------------
+      // Reported as: "in mobile (or whenever the hamburger menu shows up), the hamburger menu icon
+      // itself is not centered inside its own button". The rule that makes the button appear at phone
+      // width sets `display: inline-flex`, which replaces the shared icon button's `display: grid;
+      // place-items: center`; a flex container left to its own defaults puts its child at the start of
+      // the main axis and stretches it on the cross one, which is how the glyph ended up in the top-left
+      // corner of a 38px tap target. The drawer cannot be opened at desktop width, so the check borrows
+      // the one thing the media query changes - the display mode - and measures the real button with
+      // its real classes.
+      if (want('icon-center', 'an icon sits in the middle of its own button')) {
+        if (await blind('the hamburger glyph in its button')) {
+          // counted skip; blind() logged why
+        } else {
+          const verdict: string[] = []
+          const btn = document.querySelector('button.sidemenu') as HTMLElement | null
+          if (!btn) fail('there is no sidebar toggle button on the page')
+          else {
+            const svg = btn.querySelector('svg') as HTMLElement | null
+            if (!svg) fail('the sidebar toggle has no icon inside it')
+            else {
+              const prev = btn.getAttribute('style') ?? ''
+              for (const [p, v] of [
+                ['display', 'inline-flex'],
+                ['width', '38px'],
+                ['height', '38px'],
+                ['visibility', 'hidden'],
+              ])
+                btn.style.setProperty(p, v, 'important')
+              await frame(0)
+              const b = btn.getBoundingClientRect()
+              const g = svg.getBoundingClientRect()
+              btn.setAttribute('style', prev)
+              await frame(0)
+              if (b.width < 30 || b.height < 30)
+                verdict.push(`the button measures ${Math.round(b.width)}x${Math.round(b.height)}px, not the phone tap target it is at narrow width`)
+              const dx = g.left + g.width / 2 - (b.left + b.width / 2)
+              const dy = g.top + g.height / 2 - (b.top + b.height / 2)
+              if (Math.abs(dx) > 1.5 || Math.abs(dy) > 1.5)
+                verdict.push(`the glyph sits ${Math.round(Math.abs(dx))}px ${dx < 0 ? 'left' : 'right'} and ${Math.round(Math.abs(dy))}px ${dy < 0 ? 'above' : 'below'} the centre of its own button`)
+              if (verdict.length) fail(`hamburger icon: ${verdict.join('; ')}`)
+              else
+                pageLog(
+                  `hamburger icon ok (a ${Math.round(g.width)}px glyph in a ${Math.round(b.width)}px button: off centre by ${dx.toFixed(1)}px across, ${dy.toFixed(1)}px down)`,
+                )
+            }
+          }
+        }
+      }
+
+      // --- the cup does not travel while the model writes ---------------------
+      // Reported as: "the animated webp in the transcript jumps too much when the assistant is
+      // generating new lines; can we prevent that with sticky or something?" As the last element in
+      // the content its place on screen was a function of everything that arrived: each line pushed
+      // it down, each follow step pulled it back, and a turn that held the view while tool output
+      // piled up below the fold slid it off the bottom and then brought it flying back.
+      // `ui/perf/probe.ts` measures exactly that over a synthetic stream, and the run before the fix
+      // read: 1,348px of travel, p95 261px in a single frame, six reversals of direction in three
+      // turns. Pinned in a band the pane reserves, the number has to come out zero - and the band
+      // has to be deep enough that the newest line of text never runs under the picture.
+      if (want('cup', 'the cup does not travel while the model writes')) {
+        if (await blind('the cup band')) {
+          // counted skip; blind() logged why
+        } else {
+          const verdict: string[] = []
+          const img = document.querySelector('.transcript-cup') as HTMLElement | null
+          const wrap = document.querySelector('.scrollerwrap') as HTMLElement | null
+          const sc = document.querySelector('.scroller') as HTMLElement | null
+          if (!img || !wrap || !sc) {
+            fail(`the cup band check found no ${!img ? 'cup' : !wrap ? 'scrollerwrap' : 'scroller'}`)
+          } else {
+            transcript?.clear()
+            await frame(0)
+            // An empty transcript hides its cup on purpose - the opening screen has its own, larger
+            // one - so the seat is measured with content on the page and the pane at the end of it.
+            // Measuring a hidden cup measures a zero box at the page origin, which is how this check
+            // once reported a picture 524px off the pane's bottom edge and 350px out of the column.
+            transcript?.apply({ kind: 'turnStart', d: { turn_id: 91, model: 'selftest', session_id: 0 } })
+            transcript?.addUser('the picture has to stay put while you write')
+            for (let i = 0; i < 6; i++) {
+              transcript?.apply({ kind: 'text', d: `warm-up line ${i}: the picture stays put while the model writes\n` })
+              await frame(0)
+            }
+            sc.scrollTop = sc.scrollHeight
+            await frame(2)
+            const cs = getComputedStyle(img)
+            const box = img.getBoundingClientRect()
+            const host = (img.parentElement ?? wrap) as HTMLElement
+            const wr = host.getBoundingClientRect()
+            if (cs.position !== 'absolute') verdict.push(`the cup is ${cs.position}, so it scrolls with the content`)
+            if (img.parentElement !== wrap)
+              verdict.push(`the cup is pinned to .${host.className || 'nothing'} rather than to the transcript pane`)
+            const seat = Math.round(wr.bottom - box.bottom)
+            if (Math.abs(seat - 8) > 2)
+              verdict.push(`the cup sits ${seat}px off the pane's bottom edge, not the 8px the band reserves`)
+            const padB = parseFloat(getComputedStyle(sc).paddingBottom)
+            if (!(padB >= box.height + 24))
+              verdict.push(
+                `the scroller reserves ${padB.toFixed(0)}px at the bottom for a ${box.height.toFixed(0)}px picture, so the newest line runs under it`,
+              )
+            const col = document.querySelector('.scroller > div > .transcript') as HTMLElement | null
+            if (col) {
+              const off = Math.round(box.left - col.getBoundingClientRect().left)
+              if (Math.abs(off) > 2) verdict.push(`the cup sits ${off}px off the left edge of the text column`)
+            }
+            // Now keep streaming, and watch it not move. A reversal is what the eye reads as jitter,
+            // which is why the count is reported even when the total is zero.
+            let prev = img.getBoundingClientRect().top
+            let travel = 0
+            let worst = 0
+            let reversals = 0
+            let dir = 0
+            let frames = 0
+            let lit = 0
+            let unlit = 0
+            let toggles = 0
+            let wasLit = !img.classList.contains('cup-out')
+            for (let i = 0; i < 60; i++) {
+              transcript?.apply({ kind: 'text', d: `line ${i}: the picture stays put while the model writes\n` })
+              await frame(0)
+              const box2 = img.getBoundingClientRect()
+              const isLit = !img.classList.contains('cup-out') && box2.height > 2
+              if (isLit !== wasLit) {
+                toggles++
+                wasLit = isLit
+              }
+              if (isLit) lit++
+              else unlit++
+              // A hidden picture has no box: measuring its top would report the 136px it travelled
+              // coming back as if the pinned drawing had jumped.
+              if (isLit) {
+                const d = box2.top - prev
+                if (Math.abs(d) > 0.5) {
+                  travel += Math.abs(d)
+                  worst = Math.max(worst, Math.abs(d))
+                  const nd = Math.sign(d)
+                  if (dir !== 0 && nd !== dir) reversals++
+                  dir = nd
+                }
+                prev = box2.top
+              }
+              frames++
+            }
+            transcript?.apply({ kind: 'turnEnd', d: { turn_id: 91, finish: 'stop' } })
+            await frame(4)
+            // ...and it is put away when the reader is in the middle of the page. A picture pinned to
+            // the pane would otherwise be painted over other people's paragraphs.
+            const range = sc.scrollHeight - sc.clientHeight
+            // 60px is 2.5 lines: enough above the end that the band - and therefore the picture's
+            // seat - is off screen, and the transcript puts the drawing away rather than painting it
+            // across the paragraph the reader stopped on.
+            const pullBack = 60
+            const mid = range > pullBack ? range - pullBack : 0
+            sc.scrollTop = mid
+            // The fade is real, so one sample right after the move catches the picture mid-flight and
+            // reads like a failure. Poll until it settles; the opacity claimed below is then the
+            // settled one.
+            let dimSettled = false
+            for (let t = 0; t < 25; t++) {
+              await new Promise((r) => setTimeout(r, 80))
+              if (img.classList.contains('cup-out') && parseFloat(getComputedStyle(img).opacity) <= 0.16) {
+                dimSettled = true
+                break
+              }
+            }
+            const dimmedAway = dimSettled
+            const midBox = img.getBoundingClientRect()
+            const midOpacity = parseFloat(getComputedStyle(img).opacity)
+            sc.scrollTop = sc.scrollHeight
+            await frame(3)
+            // The way back is driven by a scroll event, which can land late; poll for it rather than
+            // grading the first frame after the write.
+            let back = !img.classList.contains('cup-out')
+            for (let t = 0; t < 12 && !back; t++) {
+              await new Promise((r) => setTimeout(r, 100))
+              back = !img.classList.contains('cup-out')
+            }
+            // Then ride the fade back up: the class flips first and the opacity follows. The first
+            // in-between value seen is the fade itself, and it is reported rather than demanded -
+            // whether a frame lands in that 420ms window is the compositor's business.
+            let midFade = Number.NaN
+            for (let t = 0; t < 20; t++) {
+              const o = parseFloat(getComputedStyle(img).opacity)
+              if (back && o > 0.16 && o < 0.9 && !Number.isFinite(midFade)) midFade = o
+              if (back && o > 0.9) break
+              await new Promise((r) => setTimeout(r, 80))
+            }
+            const backOpacity = parseFloat(getComputedStyle(img).opacity)
+            const backAgain = back && backOpacity > 0.9
+            // The loop above stops at the first frame past 0.9; the number worth printing is the one
+            // the fade ends at, so let it land before reading it. "back to 0.90" would otherwise read
+            // like a picture that never quite came back.
+            let backSettled = backOpacity
+            if (back) {
+              await new Promise((r) => setTimeout(r, 520))
+              backSettled = parseFloat(getComputedStyle(img).opacity)
+            }
+            const cupBlind = unpainted()
+            if (range <= pullBack)
+              pageLog(
+                `selftest note: the cup-away half of this check could not be measured; the transcript offered only ${range}px of scroll, so no reading position on this page is ` +
+                  'far enough above the end for the picture to be put away',
+              )
+            else if (cupBlind) {
+              // The put-away is driven by the scroller's own `scroll` event, and an un-composited page
+              // does not dispatch one: writing scrollTop moves the position but nothing observes it.
+              // That is indistinguishable from the feature being gone, so it is reported as a blind
+              // spot rather than graded.
+              blindSkips++
+              pageLog(`selftest note: skipped the cup-away half of this check; ${cupBlind} - and no scroll event is dispatched without painting`)
+            } else if (!dimmedAway)
+              verdict.push(
+                `the cup stayed at opacity ${getComputedStyle(img).opacity} ${Math.round(sc.scrollHeight - sc.clientHeight - mid)}px above the end of the transcript - a 136px drawing painted over the middle of a paragraph`,
+              )
+            // It fades, it does not go: the picture keeps its box, so the transition has somewhere to
+            // run from and to, and a reader who scrolls back finds the same drawing instead of one
+            // that appeared out of nothing.
+            if (!cupBlind && midBox.height < 100)
+              verdict.push(
+                `the cup lost its layout mid-page (${Math.round(midBox.height)}px tall): a dimmed picture keeps its box, only a hidden one drops it`,
+              )
+            if (!cupBlind && midOpacity > 0.16)
+              verdict.push(`the cup is still ${midOpacity.toFixed(2)} opaque mid-page: the prose under a 136px drawing has to stay readable`)
+            if (!cupBlind && !matchMedia('(prefers-reduced-motion: reduce)').matches && !/opacity/.test(getComputedStyle(img).transitionProperty))
+              verdict.push(
+                `the cup's transitionProperty is "${getComputedStyle(img).transitionProperty}": the fade has to be declared on the base rule, or it runs one way and snaps the other`,
+              )
+            if (!cupBlind && !backAgain) verdict.push('the cup did not come back when the reader went back to the end')
+            if (!cupBlind && travel > 2)
+              verdict.push(`the pinned cup still moved ${travel.toFixed(1)}px while 60 lines streamed (worst frame ${worst.toFixed(1)}px)`)
+            if (!cupBlind && frames < 40) verdict.push(`the streaming half sampled only ${frames} frames and measured nothing`)
+            // A cup that blinks off and on during a turn is worse than one that stays put: the
+            // follow's own catch-up leaves the view a few dozen px short of the bottom for a frame
+            // at a time, and a 136px picture that answers that by disappearing is a flicker.
+            if (!cupBlind && toggles > 2)
+              verdict.push(
+                `the cup lit and put itself away ${toggles} times during 60 streamed lines (${lit} lit frame(s), ${unlit} away) - the hide has no patience, so it flickers with the follow`,
+              )
+            if (verdict.length) {
+              // Every number here distinguishes one cause from the next: a cup at the wrong seat is a
+              // CSS problem, a cup whose parent is not the pane is a placement problem, and a parent
+              // that is shorter than the pane means the pane itself is not the box being measured.
+              const wr2 = host.getBoundingClientRect()
+              const sr = sc.getBoundingClientRect()
+              fail(
+                `cup band: ${verdict.join('; ')} [cup ${Math.round(box.left)},${Math.round(box.top)} ${Math.round(box.width)}x${Math.round(box.height)} ` +
+                  `computed pos=${cs.position} disp=${cs.display} top=${cs.top} bottom=${cs.bottom} left=${cs.left} w=${cs.width}; ` +
+                  `parent .${host.className || 'nothing'} ${Math.round(wr2.left)},${Math.round(wr2.top)} ${Math.round(wr2.width)}x${Math.round(wr2.height)}; ` +
+                  `scroller ${Math.round(sr.left)},${Math.round(sr.top)} ${Math.round(sr.width)}x${Math.round(sr.height)} ` +
+                  `${sc.scrollTop}/${sc.scrollHeight}x${sc.clientHeight} padB ${getComputedStyle(sc).paddingBottom}; ` +
+                  `column ${col ? `${Math.round(col.getBoundingClientRect().left)}..${Math.round(col.getBoundingClientRect().right)}` : 'none'}; ` +
+                  `chain ${[img, host, sc, sc.parentElement, sc.parentElement?.parentElement].filter(Boolean).map((n) => `.${(n as HTMLElement).className || 'nothing'}`).join(' < ')}]`,
+              )
+            } else
+              pageLog(
+                `cup band ok (${Math.round(box.height)}px picture pinned ${seat}px off the pane's bottom, ${padB.toFixed(0)}px of the pane held out of the text, ` +
+                  `column-aligned; across ${frames} streaming frames it travelled ${travel.toFixed(1)}px, worst frame ${worst.toFixed(1)}px, ${reversals} reversals, ` +
+                  `${toggles} lit/away toggle(s) in ${lit} lit and ${unlit} put-away frames; faded to ${midOpacity.toFixed(2)} mid-page and back to ${backSettled.toFixed(2)} once the fade landed${
+                    Number.isFinite(midFade)
+                      ? `, caught mid-fade at ${midFade.toFixed(2)} on the way back in`
+                      : ', no mid-fade frame caught (the compositor clock, not a claim either way)'
+                  }; both ways by transition)`,
+              )
+            transcript?.clear()
+          }
+        }
+      }
+
+      // --- the idle cup is one picture and one motion ------------------------
+      // The opening screen's cup is now an animated WebP whose frame table ends with a
+      // five-second hold. Two ways this goes wrong silently. One: CSS animates a picture that
+      // already animates, stretching the same artwork twice - exactly what the old
+      // `cwoffee-breathe` would do to it. Two: the still that reduced motion needs is not in
+      // the bundle. A media query can stop a keyframe but it cannot pause a raster loop, so
+      // reduced motion has to be a different file - and a missing file in a desktop app is a
+      // silent 404. Both are checkable against the shipped asset and the shipped rules. The
+      // hold itself was measured in this engine by snapshotting a webview on a timer: the
+      // picture's pixels stay quiet for 5.05s between cycles.
+      if (want('cup-art', 'the idle cup is one picture and one motion')) {
+        const load = (src: string) =>
+          new Promise<{ w: number; h: number }>((resolve) => {
+            const img = new Image()
+            img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight })
+            img.onerror = () => resolve({ w: 0, h: 0 })
+            img.src = src
+          })
+        const anim = await load('/cwoffee_initial_idle_1.webp')
+        const still = await load('/cwoffee_idle_still.webp')
+        if (anim.w < 400 || anim.h < 400) fail(`the idle cup does not decode from the bundle: ${JSON.stringify(anim)}`)
+        if (still.w < 400 || still.h < 400) fail(`the reduced-motion still does not decode: ${JSON.stringify(still)}`)
+        // The same four-file shape under each turn's name: a loop for working, a loop for resting,
+        // and a still of each for reduced motion. A missing one of these is a silent 404 in a
+        // desktop app, which is how "no cup appeared" gets reported with nothing in the log.
+        for (const p of [
+          '/cwoffee_generating_generation_1.webp',
+          '/cwoffee_generating_idle_1.webp',
+          '/cwoffee_generating_generation_still.webp',
+          '/cwoffee_generating_idle_still.webp',
+        ]) {
+          const d = await load(p)
+          if (d.w < 400 || d.h < 400) fail(`the turn's cup asset ${p} does not decode from the bundle: ${JSON.stringify(d)}`)
+        }
+        pageLog('turn cup assets ok (4 files in the bundle: two loops at the artist timing, two stills for reduced motion)')
+        const seen: Record<string, string> = {}
+        for (const sheet of Array.from(document.styleSheets)) {
+          let rules: CSSRuleList
+          try {
+            rules = (sheet as CSSStyleSheet).cssRules
+          } catch {
+            continue // nothing here is cross-origin, but a sheet we cannot read must not throw
+          }
+          for (const r of Array.from(rules ?? [])) {
+            const sel = (r as CSSStyleRule).selectorText
+            if (sel) seen[sel] = r.cssText
+          }
+        }
+        const cupRule = seen['.cupwrap .cup']
+        if (!cupRule) fail('no `.cupwrap .cup` rule in the shipped CSS to read')
+        else if (/animation(-name)?:\s*(?!none)/.test(cupRule)) fail(`CSS animates a picture that animates itself: ${cupRule}`)
+        const boxW = parseFloat((seen['.cupwrap'] ?? '').match(/width:\s*([0-9.]+)px/)?.[1] ?? '0')
+        // 300 of the new picture's 480 units are ink; the icon it replaced painted 224 of 256.
+        // Below about 140px the cup would sit visibly smaller than the one it replaced.
+        if (boxW < 140) fail(`the cup box is ${boxW}px wide; the new artwork would paint smaller than the icon it replaced`)
+        // Nothing drawn over the cup. A cartoon wisp of steam used to be rendered here on top of
+        // the picture: measured against the artwork it was anchored correctly and timed to the
+        // cup's own cycle, and it still read as a second animation that had nothing to do with the
+        // drawing. The picture carries the gesture, so the frame holds one element.
+        const wrap = document.querySelector('.cupwrap')
+        if (wrap && wrap.children.length !== 1)
+          fail(`${wrap.children.length} elements sit inside .cupwrap; only the picture belongs there`)
+        // Two cups on one page. The transcript keeps its own at the bottom of the conversation, and
+        // an empty transcript sits under this screen - so the transcript's has to stand down here,
+        // or the opening screen shows the same drawing twice at two sizes.
+        const tCup = document.querySelector('.transcript-cup') as HTMLImageElement | null
+        if (wrap && tCup && getComputedStyle(tCup).display !== 'none')
+          fail('the opening screen and the transcript are showing the cup at the same time')
+        if (wrap && tCup) pageLog('one cup on screen: the opening screen shows its own, the transcript keeps its copy hidden')
+        // The wiring, not just the parts: when the opening screen is on show, the picture it
+        // actually points at has to match what this session asked for. A media query cannot
+        // pause a raster loop, so getting this wrong is not a style miss, it is motion the
+        // user asked not to have. Once the random pause is running the picture is an armed copy
+        // (a `blob:` of the shipped bytes with the last frame's duration rewritten); both that
+        // and the shipped file are the moving cup, and a still is only ever correct when the
+        // session asks for reduced motion.
+        const cup = document.querySelector('.cupwrap .cup')
+        let onShow = 'no opening-screen cup on this page to read'
+        if (cup) {
+          const wantsStill = matchMedia('(prefers-reduced-motion: reduce)').matches
+          const src = cup.getAttribute('src') ?? ''
+          if (wantsStill) {
+            if (!src.endsWith('/cwoffee_idle_still.webp'))
+              fail(`reduced motion has to be a still picture, but the cup on show is ${src}`)
+            onShow = 'cwoffee_idle_still.webp, a still as the motion setting asks'
+          } else if (src.startsWith('blob:')) onShow = 'an armed copy of the moving cup (random hold applied)'
+          else if (src.endsWith('/cwoffee_initial_idle_1.webp')) onShow = 'cwoffee_initial_idle_1.webp (the shipped file, not yet re-armed)'
+          else
+            fail(`the opening screen is showing the wrong cup for this session's motion setting: `
+              + `src=${src} while the media query says reduced motion is ${wantsStill}`)
+        }
+        pageLog(`idle cup ok (${anim.w}x${anim.h} animated picture + ${still.w}x${still.h} still for reduced motion, `
+          + `${boxW}px box, nothing animating the picture in CSS, nothing drawn over it, ` + onShow + ')')
+      }
+
       // --- a finished turn offers copy, share, and an honest branch button -----
-      {
+      if (want('turn-buttons', 'a finished turn offers copy, share, and an honest branch button')) {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'the answer to copy' })
@@ -9414,8 +12753,82 @@
         pageLog('turn files ok (each turn owns its own files, and a share leaves no chip)')
       }
 
+      // --- only the attachments folder gets a "save it where I like" control -----
+      //
+      // The report this pins: a turn's strip was full of files, any of which could be
+      // clicked open from the chat, and the person had no way to get one of their own.
+      // The fix is not "add a download button to every file" — that is how a chat log
+      // turns into a pile of the model's leftovers. The engine now says which files are
+      // attachments (the model wrote them into .cws/assistant_attachments/ on purpose),
+      // and this check makes the page honour that split: exactly one control, on the one
+      // file it belongs to, and the working material stays folded and un-downloadable.
+      if (want('save-as', 'only the attachments folder gets a save it where I like control')) {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
+        transcript?.apply({ kind: 'text', d: 'made you a report' })
+        transcript?.addFiles([
+          { path: '.cws/assistant_attachments/report.pdf', name: 'report.pdf', mime: 'application/pdf', bytes: 41000, kind: 'attachment' },
+          { path: 'metr_report.html', name: 'metr_report.html', mime: 'text/html', bytes: 430006, kind: 'artifact' },
+          { path: '.cws/probe.py', name: 'probe.py', mime: 'text/x-python', bytes: 412, kind: 'scratch' },
+          { path: '.cws/page.html', name: 'page.html', mime: 'text/html', bytes: 9200, kind: 'scratch' },
+          { path: 'src/a.ts', name: 'a.ts', mime: 'text/plain', bytes: 1200, kind: 'edit' },
+          { path: 'src/b.ts', name: 'b.ts', mime: 'text/plain', bytes: 900, kind: 'edit' },
+        ])
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 60))
+        const saves = [...document.querySelectorAll('.attach-save')]
+        if (saves.length !== 1)
+          fail(
+            `expected exactly one Save control for six reported files, got ${saves.length}: ` +
+              saves.map((b) => b.getAttribute('aria-label')).join(', '),
+          )
+        else {
+          const btn = saves[0] as HTMLButtonElement
+          const unit = btn.closest('.attachunit')
+          const chip = unit?.querySelector('.filechip') as HTMLElement | null
+          if (!chip || chip.dataset.path !== '.cws/assistant_attachments/report.pdf')
+            fail('the Save control is not attached to the attachment chip')
+          // Working material must not be reachable by a Save click, and must not be a
+          // chip in the open strip either: it is reference, folded in one line.
+          const refs = [...document.querySelectorAll('.refgroup .filechip')]
+          if (!refs.some((c) => (c as HTMLElement).dataset.path === '.cws/probe.py'))
+            fail('the scratch copy of a fetched page vanished from the turn entirely')
+          if (!(document.querySelector('.refgroup .reflist') as HTMLElement | null)?.hidden)
+            fail('reference files are open by default')
+          // The hook gets the attachment's own path, and the button answers.
+          const realDeliver = transcript?.onDeliver ?? null
+          let asked = ''
+          if (transcript) transcript.onDeliver = async (p) => { asked = p; return 'saved to /tmp/report.pdf' }
+          btn.click()
+          await new Promise((r) => setTimeout(r, 80))
+          if (asked !== '.cws/assistant_attachments/report.pdf') fail(`Save asked for "${asked}"`)
+          // The control is an icon, so its answer is state, not a word: a tick in the glyph, the
+          // `.done` class, and a title that says what happened. The reader was looking at a file
+          // dialog while this happened, which is exactly why a word they may never see is not proof.
+          if (!btn.classList.contains('done')) fail('Save did not answer: the glyph never showed the tick')
+          if (!/^Saved /.test(btn.title)) fail(`Save left the button titled "${btn.title}"`)
+          if (!btn.querySelector('svg.act-ico')) fail('the Save control lost its glyph')
+          // A failure leaves the control usable rather than stuck on "Saving…", and the
+          // reason reaches the toast rather than the console.
+          if (transcript)
+            transcript.onDeliver = async () => {
+              throw new Error('the file went away')
+            }
+          const btn2 = document.querySelector('.attach-save') as HTMLButtonElement
+          btn2.click()
+          await new Promise((r) => setTimeout(r, 80))
+          // A failure puts the plain download glyph back rather than leaving a tick that lied, and
+          // leaves the button usable; the reason goes to the toast, not the console.
+          if (btn2.classList.contains('done')) fail('a failed save left the button claiming success')
+          if (btn2.disabled) fail('a failed save left the button disabled')
+          if (transcript) transcript.onDeliver = realDeliver
+        }
+        transcript?.clear()
+        pageLog('attachments ok (one Save control, on the attachment only; working files stay folded)')
+      }
+
       // --- right-click gives app actions, not Back/Forward/Reload --------------
-      {
+      if (want('context-menu', 'right-click gives app actions, not Back/Forward/Reload')) {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'right click me' })
@@ -9474,9 +12887,10 @@
       // --- the temp folder is "no workspace", not a folder ---------------------
       // Early builds wrote /tmp into sessions as the default. The sidebar drew it as
       // a group called `tmp` beside one called `No workspace`: the same thing twice,
-      // neither of them true. It now buckets as Default, and registering it is
-      // refused by the engine and said out loud in the UI.
-      {
+      // neither of them true. It now buckets as no-workspace, the group says so in those
+      // words, and registering the folder is refused by the engine and said out loud in
+      // the UI.
+      if (want('temp-folder', 'the temp folder is no workspace , not a folder')) {
         if (!isTempRoot('/tmp') || !isTempRoot('/tmp/') || !isTempRoot(''))
           fail('the temp folder is not recognised as "no workspace"')
         if (!isTempRoot('/var/tmp')) fail('/var/tmp is the temp folder too')
@@ -9496,12 +12910,22 @@
         sessions = [...saved, fake]
         const bucket = wsGroups.find((g) => g.path === '')
         if (!bucket || !bucket.list.some((s) => s.id === fake.id))
-          fail('a session in /tmp is not bucketed under Default')
+          fail('a session in /tmp is not bucketed with the no-workspace conversations')
         if (wsGroups.some((g) => g.path === '/tmp'))
           fail('/tmp is drawn as a workspace group of its own')
         const labels = wsGroups.map((g) => g.label)
-        if (bucket && bucket.label !== 'Default')
-          fail(`the no-workspace group is labelled ${JSON.stringify(bucket.label)}, want "Default"`)
+        if (bucket && bucket.label !== 'No workspace')
+          fail(`the no-workspace group is labelled ${JSON.stringify(bucket.label)}, want "No workspace"`)
+        // The chip is where the disagreement was. The sidebar filed such a conversation under
+        // no-workspace and the engine tells the model it has none, and the chip printed `tmp`
+        // - the name of a folder nobody chose - so the three said different things in front of
+        // the person.
+        if (wsChipText('/tmp') !== 'No workspace')
+          fail(`the workspace chip calls the temp folder ${JSON.stringify(wsChipText('/tmp'))}`)
+        if (wsChipText('/home/u/cwoffee-workspace') !== 'cwoffee-workspace')
+          fail('a real folder lost its name in the chip')
+        if (wsChipText('') !== 'no folder')
+          fail(`a conversation with no path at all reads ${JSON.stringify(wsChipText(''))} in the chip`)
         sessions = saved
 
         await addFolderFor('/tmp')
@@ -9518,7 +12942,7 @@
       // --- a session keeps the folder it started in ----------------------------
       // The engine refuses the move; the control has to look refused too, or every
       // session that cannot move invites a click that can only fail.
-      {
+      if (want('session-folder', 'a session keeps the folder it started in')) {
         const home = hostState?.session_id ?? 0
         const real = sessions.find(
           (s) => !isBareDraft(s) && !isTempRoot(s.workspace) && !!s.workspace,
@@ -9592,6 +13016,238 @@
         }
         pageLog('workspace sidebar ok')
 
+      // --- the folder a new session will work in, in one press -----------------
+      // Reported as: "initial start screen of conversation, let's make the interface of the workspace
+      // selector better: list added workspaces + two static buttons to add or clear". What it was:
+      // the greeting named a folder only *after* one had been picked, and the only way to pick one
+      // was a native file dialog - so "use the folder I already added" was a browse, and working
+      // without a folder was something you could only end up in by not choosing.
+      if (want('workspace-picker', 'the folder a new session will work in, in one press')) {
+        if (await blind('the workspace picker')) {
+          // counted skip; blind() logged why
+        } else {
+          const verdict: string[] = []
+          if (!(await settleTurn('before the workspace picker check'))) fail('host would not go idle')
+          // The app's own "new conversation": the row exists, but a row alone is not the greeting. The
+          // host's switch is queued and can land after a busy turn unwinds, so the check waits for the
+          // greeting itself rather than reading the page the instant after asking.
+          newSession()
+          await frame(0)
+          let row = document.querySelector('button.empty-ws') as HTMLButtonElement | null
+          for (let i = 0; i < 20 && !row; i++) {
+            await new Promise((r) => setTimeout(r, 100))
+            row = document.querySelector('button.empty-ws') as HTMLButtonElement | null
+          }
+          draftWorkspace = ''
+          await frame(0)
+          row = document.querySelector('button.empty-ws') as HTMLButtonElement | null
+          if (!row)
+            fail(`the greeting shows no workspace row to open a picker from (persona ${personaNow}, viewId ${viewId})`)
+          else {
+            if (!/no workspace selected/i.test(row.textContent ?? ''))
+              verdict.push(`an unchosen folder reads "${row.textContent?.trim()}" instead of saying so`)
+            // A folder in the list to find. Prefer one that is already registered; the scratch
+            // folder derived from the app's own root is the fallback, and it is the same folder the
+            // other workspace cases file their rows in.
+            let dir = workspaces[0]?.path ?? ''
+            if (!dir) {
+              const home = hostState?.workspace ?? ''
+              const guess = home ? home.replace(/\/+$/, '').split('/').slice(0, -1).join('/') : ''
+              if (guess && guess !== '/' && !isTempRoot(guess)) {
+                await invoke('add_workspace', { path: guess }).catch((e) => pageLog(`add_workspace for the picker: ${e}`))
+                await loadWorkspaces()
+                dir = workspaces[0]?.path ?? ''
+              }
+            }
+            row.click()
+            await frame(0)
+            const panel = document.querySelector('.pop') as HTMLElement | null
+            if (!panel) verdict.push('pressing the greeting\'s folder row opens nothing')
+            else {
+              const field = panel.querySelector('[data-ws-filter]') as HTMLInputElement | null
+              // Focus lands on the effect that mounts the panel, which is a tick behind the click on
+              // some cores and two on others; a single frame of patience made this check flaky rather
+              // than wrong. The claim is unchanged - typing must go into the filter - only the wait
+              // for the app to put it there is honest.
+              if (field)
+                for (let i = 0; i < 8 && document.activeElement !== field; i++) {
+                  await new Promise((r) => setTimeout(r, 80))
+                }
+              const items = [...panel.querySelectorAll('[data-ws-pick-row]')] as HTMLElement[]
+              const actNew = panel.querySelector('[data-ws-pick-new]')
+              const actNone = panel.querySelector('[data-ws-pick-none]')
+              const seam = panel.querySelector('.wsp-sep')
+              if (!field) verdict.push('the picker has no filter field')
+              else if (document.activeElement !== field && !document.hasFocus())
+                // The element is focused by an effect that mounts the panel; when the window does not
+                // hold the desktop's focus, `activeElement` can lag behind that effect by an arbitrary
+                // amount because nothing is being painted. The claim is about where typing would go in
+                // a page the user is looking at, so an unfocused window cannot answer it.
+                pageLog('selftest note: the picker filter-focus claim was not graded; this window does not hold the desktop focus, and a page nothing paints applies mount effects late')
+              else if (document.activeElement !== field)
+                verdict.push('the picker opened without the filter focused, so typing goes nowhere')
+              if (!actNew || !actNone) verdict.push('the picker is missing one of its two standing alternatives')
+              if (!seam) verdict.push('the two alternatives are not separated from the folder list')
+              else if (actNew && seam.compareDocumentPosition(actNew) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                // fine: the actions come after the seam
+              } else if (actNew)
+                verdict.push('"New workspace" sits above the seam, inside the folder list')
+              if (field && items[0]) {
+                const fr = field.getBoundingClientRect()
+                const ir = items[0].getBoundingClientRect()
+                if (ir.top < fr.top) verdict.push('the folder list starts above the filter field')
+              }
+              if (dir) {
+                if (!items.length) verdict.push(`a workspace is registered (${dir}) but the picker lists none`)
+                else if (!items.some((b) => (b.textContent ?? '').includes(dir)))
+                  verdict.push(`the registered folder ${dir} is not offered by name or path in the picker`)
+                else {
+                  // The filter has to answer to typing, not only to existing.
+                  if (field) {
+                    field.value = 'qqzzx-not-a-folder'
+                    field.dispatchEvent(new Event('input', { bubbles: true }))
+                    await frame(0)
+                    if (panel.querySelectorAll('[data-ws-pick-row]').length)
+                      verdict.push('the filter left every folder in the list while the text could not match one')
+                    if (!panel.querySelector('[data-ws-pick-empty]'))
+                      verdict.push('a filter that matches nothing says nothing')
+                    field.value = ''
+                    field.dispatchEvent(new Event('input', { bubbles: true }))
+                    await frame(0)
+                    if (!panel.querySelectorAll('[data-ws-pick-row]').length)
+                      verdict.push('clearing the filter did not bring the list back')
+                  }
+                  // Choosing one of them: the panel closes and the greeting says it.
+                  const hit = [...panel.querySelectorAll('[data-ws-pick-row]')].find((b) =>
+                    (b.textContent ?? '').includes(dir),
+                  ) as HTMLButtonElement | undefined
+                  hit?.click()
+                  await frame(0)
+                  if (draftWorkspace !== dir) verdict.push(`choosing ${dir} left the draft in "${draftWorkspace}"`)
+                  if (document.querySelector('.pop')) verdict.push('the picker stayed open after a folder was chosen')
+                  if (!(row.textContent ?? '').toLowerCase().includes(dir.split('/').pop() ?? ''))
+                    verdict.push(`the greeting still reads "${row.textContent?.trim()}" after ${dir} was chosen`)
+                }
+              } else pageLog('selftest note: no workspace is registered, so the picker list half of this check had nothing to list')
+              // "No workspace selected" has to be choosable, not just readable.
+              row.click()
+              await frame(0)
+              const none = document.querySelector('.pop [data-ws-pick-none]') as HTMLButtonElement | null
+              if (!none) verdict.push('the picker will not offer the way back to no folder')
+              else {
+                none.click()
+                await frame(0)
+                if (draftWorkspace) verdict.push(`"No workspace selected" left the draft in ${draftWorkspace}`)
+                if (!/no workspace selected/i.test(row.textContent ?? ''))
+                  verdict.push(`after choosing none the greeting reads "${row.textContent?.trim()}"`)
+              }
+              // A panel that runs off the window is a panel whose bottom row cannot be pressed.
+              const pr = (document.querySelector('.pop') ?? panel)?.getBoundingClientRect()
+              if (pr && (pr.bottom > window.innerHeight + 1 || pr.top < -1 || pr.right > window.innerWidth + 1 || pr.left < -1))
+                verdict.push(
+                  `the picker hangs outside the window (top ${Math.round(pr.top)}, bottom ${Math.round(pr.bottom)} of ${window.innerHeight})`,
+                )
+              if (panel.contains(row)) verdict.push('the picker contains the row that opened it, so the two overlap')
+            }
+
+            // --- the composer chip opens this picker, not the folder dialog -------
+            //
+            // The complaint this answers: "clicking the workspace under the composer doesn't open the
+            // native picker immediately, instead it opens a popover" - which is what it now does, and
+            // what it should do, because choosing among folders you already have is the common case and
+            // a native dialog can only show the filesystem. The dialog is still reachable, under the
+            // seam, labelled "New workspace".
+            newSession()
+            await frame(0)
+            const chip = document.querySelector('button.wsrow') as HTMLButtonElement | null
+            if (!chip) verdict.push('the composer has no workspace chip to open a picker from')
+            else {
+              chip.click()
+              await frame(0)
+              const pop2 = document.querySelector('.pop') as HTMLElement | null
+              if (!pop2 || !pop2.querySelector('[data-ws-filter]'))
+                verdict.push('the chip under the composer does not open the folder picker - it went to a dialog, or to nothing')
+              else {
+                const cr = chip.getBoundingClientRect()
+                const qr = pop2.getBoundingClientRect()
+                if (cr.width > 0 && qr.top > cr.bottom + 48 && qr.bottom < cr.top - 48)
+                  verdict.push(
+                    `the picker opened ${Math.round(Math.min(Math.abs(qr.top - cr.bottom), Math.abs(cr.top - qr.bottom)))}px away from the chip that asked for it`,
+                  )
+                const lst = pop2.querySelector('.wsp-list') as HTMLElement | null
+                if (!lst) verdict.push('the picker has no folder list box')
+                else {
+                  const cs = getComputedStyle(lst)
+                  const maxH = parseFloat(cs.maxHeight)
+                  if (!Number.isFinite(maxH) || maxH <= 0 || cs.overflowY !== 'auto')
+                    verdict.push(
+                      `the folder list is not a bounded scroll box (max-height ${cs.maxHeight}, overflow-y ${cs.overflowY}); a long list has to scroll, not grow past the window`,
+                    )
+                }
+                if (workspaces.length > 1 && !pop2.querySelector('[data-ws-pick-count]'))
+                  verdict.push(`a bounded box holding ${workspaces.length} folders does not say how many are behind it`)
+                closeMenu()
+                await frame(0)
+              }
+            }
+
+            // --- the exchange rule, stated inside the picker --------------------
+            //
+            // "An existing conversation where an exchange happened cannot change workspace (or clear)."
+            // The chip already refuses; this checks the refusal is also visible where the ask actually
+            // happens - the two standing actions must be closed, must say why, and must not move the
+            // folder if something forces them.
+            const spoken = sessions.find((s) => s.message_count > 0 && s.workspace && !isTempRoot(s.workspace))
+            if (!spoken)
+              pageLog('selftest note: no conversation with messages inside a real folder, so the exchange rule inside the picker was not exercised')
+            else {
+              openSession(spoken.id)
+              for (let i = 0; i < 20 && viewId !== spoken.id; i++) await new Promise((r) => setTimeout(r, 100))
+              await renderTick()
+              if (!wsLocked)
+                verdict.push(`conversation ${spoken.id} (${spoken.message_count} messages in ${spoken.workspace}) is not reported as folder-locked`)
+              const chip2 = document.querySelector('button.wsrow') as HTMLButtonElement | null
+              if (chip2 && !chip2.disabled)
+                verdict.push('the chip is still pressable in a conversation that has already exchanged')
+              openMenu('wspick', (chip2 ?? row ?? document.body) as HTMLElement)
+              await frame(0)
+              const pop3 = document.querySelector('.pop') as HTMLElement | null
+              if (!pop3) verdict.push('the picker cannot be shown over a locked conversation, so its refusal is never seen')
+              else {
+                const act = [...pop3.querySelectorAll('[data-ws-pick-new], [data-ws-pick-none]')] as HTMLButtonElement[]
+                if (act.length !== 2)
+                  verdict.push(`the picker's standing actions are not both there (${act.length} of 2)`)
+                else {
+                  const pressable = act.filter((b) => !b.disabled)
+                  if (pressable.length)
+                    verdict.push(`${pressable.length} workspace action(s) can still be pressed in a conversation that has already exchanged`)
+                  else if (!act.every((b) => /keeps its folder/i.test(b.getAttribute('title') ?? '')))
+                    verdict.push('the closed actions do not say the rule that closed them')
+                  const before = hostState?.workspace ?? ''
+                  act[0].click()
+                  act[1].click()
+                  await frame(2)
+                  const after = hostState?.workspace ?? ''
+                  if (after !== before)
+                    verdict.push(`a closed action still moved the conversation's folder (${before} -> ${after})`)
+                }
+                closeMenu()
+                await frame(0)
+              }
+            }
+            closeMenu()
+            draftWorkspace = ''
+            if (verdict.length) fail(`workspace picker: ${verdict.join('; ')}`)
+            else
+              pageLog(
+                `workspace picker ok (the greeting says "no workspace selected" until one is, ${
+                  dir ? `offers ${dir} by name and path, filters it away and back,` : 'holds its filter and its two alternatives,'
+                } the chip under the composer opens this same picker rather than a dialog, the list is a bounded scroll box, and a conversation that has already exchanged has both actions closed with the rule on them)`,
+              )
+          }
+        }
+      }
+
       // `busy` is client state, so it can go stale: a client that received a
       // turnStart and then lost or fell behind the event stream never sees the
       // turnEnd, and the composer stays disabled with nothing computing. That
@@ -9634,7 +13290,10 @@
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +
-          `${hits.length} hits, models=${ms.length} picked=${pick}`,
+          `${hits.length} hits, models=${ms.length} picked=${pick}` +
+          (onlyTerms.length
+            ? ` [TARGETED ${groups.ran} named group(s) ran, ${groups.skipped.length} not run: ${groups.skipped.join(', ')}]`
+            : ''),
       )
     } catch (e) {
       fail(String(e))
@@ -9764,13 +13423,34 @@
     const report = {
       titlebar: !!document.querySelector('.titlebar'),
       sidebar: !!document.querySelector('aside'),
-      footer: !!document.querySelector('footer'),
+      // The pinned row at the foot of the sidebar. This used to be `footer` and reported the bottom
+      // toolbar; the toolbar is gone (it cost a band across both panes), and the row that carries its
+      // three surviving controls now lives in the sidebar - so the startup watchdog keeps the same
+      // signal, "the shell's chrome rendered", without naming a bar that no longer exists.
+      sidefoot: !!document.querySelector('.side-foot [data-side-id]'),
       stream_el: !!document.querySelector('.transcript'),
       empty_mode: !!document.querySelector('.empty'),
       body_bg: getComputedStyle(document.body).backgroundColor,
       overlay_present: !!document.querySelector('vite-error-overlay'),
       text_len: document.body.innerText.trim().length,
       device_pixel_ratio: window.devicePixelRatio,
+      // The opening screen's picture, named and sized. Reported because a missing asset inside a
+      // desktop bundle is silent - no console, no visible hole, just the wrong drawing - and this
+      // line is the only place the installed build says what it actually loaded. The name also
+      // shows which of the two files the motion setting picked.
+      cup: (() => {
+        const img = document.querySelector<HTMLImageElement>('.cupwrap .cup')
+        if (!img) return 'none'
+        // An armed picture's `src` is a blob URL, which would make this line name a random UUID.
+        // The module knows which shipped asset it built the copy from, so the log still names the
+        // file - and says that the pause in it was rewritten at runtime.
+        const armed = armedFromUrl(img)
+        const file = armed
+          ? `${(armed.split('/').pop() ?? '?')}+random-hold`
+          : (img.getAttribute('src') ?? '').split('/').pop() ?? '?'
+        if (!img.complete) return `${file}:loading`
+        return img.naturalWidth ? `${file}:${img.naturalWidth}x${img.naturalHeight}` : `${file}:did-not-decode`
+      })(),
     }
     try {
       await invoke('render_report', { report })
@@ -9785,6 +13465,20 @@
   onMount(async () => {
     if (rootEl) {
       transcript = new Transcript(rootEl)
+      transcript.onFollowState = (s) => {
+        followState = s
+      }
+      // The loop note is one per turn, and it is a note rather than a block in the transcript: the
+      // model did not say it, the app did. It says what was recognised, because "stuck" without the
+      // repeated phrase is a guess the reader cannot check - and the preview that used to let them
+      // check by reading is gone by design.
+      transcript.onLoop = (f) => {
+        // `say`, not `noteToast`: a migration note is something the app did, and this is bad news
+        // about the model that the reader can act on. The dwell is long because the action - Stop -
+        // is in the composer and has to be reached.
+        say(`${describeLoop(f)} — that looks like a loop. Stop ends the turn.`, true, 11000)
+        pageLog(`loop note: ${describeLoop(f)} after ${f.words} words / ${f.deltas} deltas`)
+      }
       // The display settings are the app's, so they arrive from the store before the
       // first transcript is painted: a conversation that rendered one way and then
       // re-rendered when a pref landed is a visible jump over something you were reading.
@@ -9795,6 +13489,9 @@
         })
         .catch((e) => pageLog(`migration_notes failed: ${String(e)}`))
       transcript.onToast = (msg, bad) => say(msg, !!bad)
+      // The transcript no longer shows app-level notes at all (see `Transcript.onNote`), so
+      // the chrome has to pick them up or they are simply gone.
+      transcript.onNote = (text) => noteToast(text)
       // WebKit's own right-click menu offers Back, Forward and Reload: three ways
       // to damage a frameless app window, and no way to do the things this app is
       // for. The menu is ours now - ctxmenu.ts records the one place the native
@@ -9842,6 +13539,45 @@
         })
         return path ? `saved to ${path}` : 'not saved — you closed the dialog'
       }
+      // An attachment: the one file the model wrote *in order to hand it over* — it
+      // chose `.cws/assistant_attachments/`, and nothing else in the conversation is
+      // offered this control. Desktop asks the host to open a save dialog; a browser
+      // page has no claim on your filesystem, so the bytes cross the wire and the
+      // browser downloads them, which is the closest honest equivalent.
+      //
+      // `session` is part of the request rather than inferred host-side: a conversation
+      // can live in any folder, and the path has to resolve against *that* conversation
+      // — not whichever one the host happens to be working in. The host then refuses
+      // anything that is not under that conversation's attachments folder, because this
+      // path arrived in a tool result the model wrote.
+      transcript.onDeliver = async (path: string) => {
+        // Captured, not read off the outer binding inside the closure: `transcript` is
+        // nullable to Svelte and the closure outlives this block.
+        const tr = transcript
+        const session = tr?.sessionId ?? 0
+        if (!session) throw new Error('this conversation is not saved yet')
+        if (transportKind === 'gateway') {
+          const f = await invoke<{ name: string; mime: string; bytes: number; b64: string }>(
+            'attachment_bytes',
+            { session, path },
+          )
+          const bin = atob(f.b64)
+          const buf = new Uint8Array(bin.length)
+          for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i)
+          const blob = new Blob([buf], { type: f.mime || 'application/octet-stream' })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a')
+          a.href = url
+          a.download = f.name
+          document.body.append(a)
+          a.click()
+          a.remove()
+          setTimeout(() => URL.revokeObjectURL(url), 5000)
+          return `downloaded ${f.name}`
+        }
+        const saved = await invoke<string | null>('save_attachment_as', { session, path })
+        return saved ? `saved to ${saved}` : 'not saved — you closed the dialog'
+      }
       transcript.onOpenFile = async (path) => {
         try {
           const opened = await invoke<string>('open_file', { path })
@@ -9859,10 +13595,12 @@
     // should come back on its own rather than sit on "connecting…" until someone
     // reloads the tab.
     if (transportKind === 'gateway') {
-      onReconnect(() => void retryAttach())
+      onReconnect(() => void retryAttach(true))
       // The server said "you missed events". Some of them matter - `turnEnd`
       // most of all - so re-read state instead of leaving a half-truth on screen.
-      onResync(() => void retryAttach())
+      // Force included: a client that was told it missed events has lost the right to
+      // trust its own memory of whether the turn it started is still up.
+      onResync(() => void retryAttach(true))
     }
     // One round trip in gateway mode; on a phone link this is the difference
     // between "a moment" and a wait you notice. Desktop keeps the parallel
@@ -9967,11 +13705,18 @@
     window.addEventListener('keydown', onGlobalKey)
     window.addEventListener('pointerdown', onDocDown)
     window.addEventListener('resize', reposition)
+    // A phone tab that was backgrounded mid-turn comes back with a dead socket and a
+    // `busy` that will never be corrected by an event that already happened. See
+    // `wakeCheck`. Deliberately not on `focus`: a desktop window that merely lost focus
+    // was never frozen and has nothing to repair, and re-reading on every alt-tab costs
+    // a round trip for a case that cannot happen.
+    document.addEventListener('visibilitychange', onVisibility)
     return () => {
       window.removeEventListener('keydown', onApprovalKey)
       window.removeEventListener('keydown', onGlobalKey)
       window.removeEventListener('pointerdown', onDocDown)
       window.removeEventListener('resize', reposition)
+      document.removeEventListener('visibilitychange', onVisibility)
     }
   })
 
@@ -9989,32 +13734,56 @@
   const gpuOk = $derived(!!gpu && gpuNodes.includes('renderD128') && !gpu.leaked_nvidia)
 </script>
 
-<div class="flex h-full flex-col bg-paper text-ink">
+<div class="app-shell flex h-full flex-col bg-paper text-ink" class:modal-open={settings !== null} bind:this={shellEl}>
   <!-- ============================ titlebar ============================ -->
   <div
     class="titlebar flex h-11 shrink-0 items-center gap-2 border-b border-hairline bg-paper-2 px-3"
     data-tauri-drag-region
   >
-    <img src="/icon.png" alt="" class="h-5 w-5 rounded" />
-    <span class="text-[13px] font-medium tracking-tight">cwoffee</span>
-    <!-- Sidebar toggle: below 768px the sidebar is a drawer, and without this
-         button the session list and search are simply unreachable. -->
-    <button class="iconbtn sidemenu" onclick={() => setSidebar(!sidebarOpen)} aria-label="Sessions">
-      <svg width="14" height="14" viewBox="0 0 14 14"><path d="M2 4h10M2 7h10M2 10h10" stroke="currentColor" stroke-width="1.3"/></svg>
+    <!-- Sidebar toggle first. Below 768px the sidebar is a drawer, and without this
+         button the session list and search are simply unreachable — so on a phone it is
+         the one control that is always here, and it sits where the thumb already is.
+         Above 768px the stylesheet hides it and the row opens with the mark. -->
+    <button
+      class="iconbtn sidemenu"
+      onclick={() => setSidebar(!sidebarOpen)}
+      aria-label="Sessions"
+      aria-expanded={sidebarOpen}
+    >
+      <svg width="16" height="16" viewBox="0 0 14 14"><path d="M2 4h10M2 7h10M2 10h10" stroke="currentColor" stroke-width="1.3"/></svg>
     </button>
-    <span class="ml-2 text-[11px] text-ink-3">{model || 'connecting…'}</span>
+    <img src="/icon.png" alt="" class="h-5 w-5 rounded" />
+    <span class="text-[13px] font-medium tracking-tight" data-tauri-drag-region>cwoffee</span>
+    <!-- The conversation this window is looking at, when there is one.
 
-    <div class="ml-auto flex items-center gap-1">
-      <button class="wbtn" onclick={minimize} aria-label="Minimize">
-        <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 6h8" stroke="currentColor" stroke-width="1.3"/></svg>
-      </button>
-      <button class="wbtn" onclick={toggleMax} aria-label="Maximize">
-        <svg width="12" height="12" viewBox="0 0 12 12"><rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>
-      </button>
-      <button class="wbtn" onclick={closeWin} aria-label="Close">
-        <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.3"/></svg>
-      </button>
-    </div>
+         The model name used to sit here, and it read as a third thing in a 44px row
+         that already had a mark and a word: eleven grey pixels of endpoint id that
+         named nothing you could act on from the titlebar. It is on the composer's
+         model chip instead — one tap from the control that changes it, and where the
+         rest of the composer's state lives. With no conversation open the wordmark is
+         the whole title, so nothing is added. -->
+    {#if viewTitle}
+      <span class="tb-sep" aria-hidden="true"></span>
+      <span class="tb-title" title={viewTitle} data-tauri-drag-region>{viewTitle}</span>
+    {/if}
+
+    {#if transportKind === 'tauri'}
+      <!-- Minimise / maximise / close belong to the frameless desktop window, and only
+           there. In a browser tab they had nothing to act on: `win` is never resolved
+           outside Tauri, so all three buttons were inert decorations whose handlers
+           could only log a failure. They are drawn where they work. -->
+      <div class="ml-auto flex items-center gap-1">
+        <button class="wbtn" onclick={minimize} aria-label="Minimize">
+          <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 6h8" stroke="currentColor" stroke-width="1.3"/></svg>
+        </button>
+        <button class="wbtn" onclick={toggleMax} aria-label="Maximize">
+          <svg width="12" height="12" viewBox="0 0 12 12"><rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>
+        </button>
+        <button class="wbtn" onclick={closeWin} aria-label="Close">
+          <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.3"/></svg>
+        </button>
+      </div>
+    {/if}
   </div>
 
   <!-- ============================= body ============================== -->
@@ -10069,6 +13838,48 @@
       />
       {#if searchErr}<div class="text-[11px] text-danger">{searchErr}</div>{/if}
 
+      <!-- The heading stays out of the scrolling list on purpose. It is not a label that happens to
+           sit at the top of the thing it names: it carries the fold-all and add-folder controls, and a
+           control that scrolls away with the conversations is a control you cannot reach when the list
+           is what you are lost in. Same reason the sidebar footer is pinned. -->
+      {#if !hits.length}
+        <div class="sesshead">
+          {#if personaNow === 'chat'}
+            <span>Chats{chatSessions.length ? ` (${chatSessions.length})` : ''}</span>
+          {:else}
+            <span>Workspaces</span>
+            <span class="sesshead-r">
+              <button
+                class="iconbtn ws-fold"
+                aria-label="Fold every folder"
+                title="Fold every folder"
+                onclick={foldAll}
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 7.4L6 4.4L9 7.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+              </button>
+              <button
+                class="iconbtn ws-fold"
+                aria-label="Unfold every folder"
+                title="Unfold every folder"
+                onclick={unfoldAll}
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.4L6 7.4L9 4.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+              </button>
+              <button
+                class="iconbtn ws-addall"
+                aria-label="Add a folder"
+                title={transportKind === 'tauri'
+                  ? 'Add a folder to the sidebar (opens the folder picker)'
+                  : 'Add a folder on the host by path'}
+                onclick={addWorkspaceFromHeader}
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2.6v6.8M2.6 6h6.8" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
+              </button>
+            </span>
+          {/if}
+        </div>
+      {/if}
+
       <!-- The list scrolls inside the sidebar. Without min-h-0 a flex item's
            min-height defaults to `auto`, i.e. its content height, so N sessions
            grew the sidebar, which grew the row, which pushed the composer and
@@ -10110,7 +13921,7 @@
                         class:busy={runningSessions.has(s.id)}
                         aria-hidden="true"
                         title={runningSessions.has(s.id) ? 'answering' : ''}></span>
-                      <span class="sess-title">{s.title}</span>
+                      <span class="sess-title" data-sess={s.id} data-naming={namingShownFor(s) ? 'on' : undefined}>{namingOf(s)}{#if namingShownFor(s) && namingText}<span class="type-caret" aria-hidden="true"></span>{/if}</span>
                     </button>
                     <button
                       class="iconbtn more"
@@ -10139,10 +13950,8 @@
              clutter. -->
         {#if personaNow === 'chat'}
         <!-- Chat owns no folder, so the folder tree is not a narrower view of the same
-             thing here - it is the wrong thing. Chats get a flat list, newest first. -->
-        <div class="sesshead mt-2">
-          <span>Chats{chatSessions.length ? ` (${chatSessions.length})` : ''}</span>
-        </div>
+             thing here - it is the wrong thing. Chats get a flat list, newest first. The heading for
+             it is pinned above the scroller, not in here. -->
         {#each chatSessions as s (s.id)}
           {@render sessRow(s)}
         {/each}
@@ -10150,37 +13959,9 @@
           <div class="pickhint">No chats yet. This one has no folder and no tools — write to it like a person, not a workspace.</div>
         {/if}
         {:else}
-        <div class="sesshead mt-2">
-          <span>Workspaces</span>
-          <span class="sesshead-r">
-            <button
-              class="iconbtn ws-fold"
-              aria-label="Fold every folder"
-              title="Fold every folder"
-              onclick={foldAll}
-            >
-              <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 7.4L6 4.4L9 7.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
-            </button>
-            <button
-              class="iconbtn ws-fold"
-              aria-label="Unfold every folder"
-              title="Unfold every folder"
-              onclick={unfoldAll}
-            >
-              <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.4L6 7.4L9 4.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
-            </button>
-            <button
-              class="iconbtn ws-addall"
-              aria-label="Add a folder"
-              title={transportKind === 'tauri'
-                ? 'Add a folder to the sidebar (opens the folder picker)'
-                : 'Add a folder on the host by path'}
-              onclick={addWorkspaceFromHeader}
-            >
-              <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2.6v6.8M2.6 6h6.8" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
-            </button>
-          </span>
-        </div>
+        <!-- The "Workspaces" heading and its fold / add controls are pinned above the scroller; the
+             add-a-folder form that the `+` opens belongs under them, in here, because it is part of
+             the list it adds to. -->
         {#if wsAdding}
           <div class="wsadd">
             {#if transportKind === 'tauri'}
@@ -10309,6 +14090,80 @@
           </svg>
           <span>Settings</span>
         </button>
+
+        <!-- The row that replaced the old bottom toolbar: who this is, and the three things a person
+             actually switches or checks during a day. Icons, not words - the sidebar is 248px and a
+             word costs 60px of it. Each one is a real button with a name on it, and each glyph is
+             centred by `.iconbtn > svg { margin: auto }`, which is the rule the hamburger check exists
+             to defend.
+
+             The mark is the *still* cup. The artwork that animates, animates at the foot of the
+             transcript, where it means "working"; the same picture moving inside the chrome would be a
+             second gesture saying the same thing in a place where nothing is happening. -->
+        <div class="side-id" data-side-id>
+          <img
+            class="side-id-mark"
+            src="/cwoffee_idle_still.webp"
+            alt=""
+            width="26"
+            height="26"
+          />
+          <span class="side-id-name">Cwoffee</span>
+          <span class="side-id-acts">
+            <button
+              class="iconbtn sfi"
+              data-menu
+              aria-haspopup="menu"
+              aria-expanded={menu?.kind === 'metrics'}
+              aria-label="Session telemetry"
+              title={`Telemetry — ${cacheLabel} cache, ${liveEstimate ? '\u2248' : ''}${fmt.rate(curDecode)} tok/s${ctxLimit ? `, ${ctxLabel} ctx` : ''}`}
+              onclick={(e) => openMenu('metrics', e.currentTarget as HTMLElement)}
+            >
+              <!-- A mileage dial: the footer used to spell cache-hit rate and decode speed out in words,
+                   and a dial is the same fact at a glance. -->
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M4.2 18.5a9.5 9.5 0 1 1 15.6 0" />
+                <path d="M12 15.2l4.6-4.9" />
+                <path d="M4.2 18.5h3M16.8 18.5h3" />
+              </svg>
+              {#if dropped > 0}<span class="sfi-dot hot" aria-hidden="true" title="{dropped} dropped event(s)"></span>{/if}
+            </button>
+            <button
+              class="iconbtn sfi"
+              data-menu
+              aria-haspopup="menu"
+              aria-expanded={menu?.kind === 'gateway'}
+              aria-label="Remote access"
+              title={`Gateway — ${gwText}`}
+              onclick={(e) => openMenu('gateway', e.currentTarget as HTMLElement)}
+            >
+              <!-- A laptop: the gateway is "another device can reach this one", so the picture is the
+                   machine being reached, not a tower or a cloud. -->
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="4.5" width="18" height="12" rx="2" />
+                <path d="M2 20h20" />
+              </svg>
+              {#if gwDot === 'live'}<span class="sfi-dot live" aria-hidden="true" title="{gwText}"></span>{/if}
+            </button>
+            <button
+              class="iconbtn sfi"
+              aria-label="Toggle light or dark theme"
+              title="Toggle light / dark"
+              onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}
+            >
+              {#if theme === 'dark'}
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="4.2" />
+                  <path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6" />
+                </svg>
+              {:else}
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M20 14.2A8.4 8.4 0 1 1 9.8 4a7 7 0 0 0 10.2 10.2z" />
+                </svg>
+              {/if}
+            </button>
+          </span>
+        </div>
       </div>
     </aside>
 
@@ -10319,7 +14174,7 @@
              was sending people to fix a config file on the wrong machine. -->
         <div class="connbar" role="alert">
           <span class="connbar-txt">{connNote}</span>
-          <button class="btn-ghost text-[11px]" onclick={() => void retryAttach()}>retry</button>
+          <button class="btn-ghost text-[11px]" onclick={() => void retryAttach(true)}>retry</button>
         </div>
       {/if}
       {#if showEmpty}
@@ -10329,62 +14184,40 @@
              is what they did. -->
         <div class="empty">
           <!-- The cup, not a dot. It is the one thing in this app that is not a
-               rectangle, so it carries the warmth; the steam is the only bit of
-               decorative motion in the app and it is tied to nothing. -->
+               rectangle, so it carries the warmth, and it moves on its own: a 39-frame
+               loop that takes 1.6s and then holds its last frame for 5.04s before
+               starting again. The hold is in the file's frame table (the last frame's
+               duration is 5042ms) because an <img> of an animated image cannot be held
+               by CSS or JS; measured in this app's own WebKit, the pixels go quiet for
+               5.01s between cycles.
+               Nothing is drawn over it. There used to be an SVG wisp of steam here —
+               one cartoonish half-S, anchored on the coffee surface with numbers measured
+               off the artwork, rising and fading once per cup cycle — and it still read as
+               a second animation that had nothing to do with the picture: two loops running
+               beside each other, one of them invented. The artwork carries the gesture. -->
           <div class="cupwrap" aria-hidden="true">
-            <img class="cup" src="/icon.png" alt="" draggable="false" />
-            <!-- Drawn in the artwork's own 256-unit space, so the feet of the
-                 wisps stay on the coffee surface at every render size. -->
-            <svg class="steamart" viewBox="0 0 256 256" aria-hidden="true">
-              <defs>
-                <!-- Ink at the rim, nothing at the top: a puff that thins out as it
-                     rises reads as dispersing smoke instead of a moving line. -->
-                <linearGradient id="cwoffee-steam-fade" x1="0" y1="1" x2="0" y2="0">
-                  <!-- Soft at both ends: densest a little above the rim. An ink that is
-                       strongest *at* the surface puts a smudge on the coffee itself. -->
-                  <stop offset="0" stop-color="currentColor" stop-opacity="0.25" />
-                  <stop offset="0.22" stop-color="currentColor" stop-opacity="0.95" />
-                  <stop offset="0.6" stop-color="currentColor" stop-opacity="0.5" />
-                  <stop offset="1" stop-color="currentColor" stop-opacity="0" />
-                </linearGradient>
-              </defs>
-              <defs>
-                <!-- Feet at y=56..60: the coffee surface in the artwork's own space (the
-                     mouth spans y=52..78, the liquid x=62..178), so the steam starts
-                     inside the cup and the anchoring survives any render size. -->
-                <!-- Feet at y=50..52: the far edge of the coffee's surface in the
-                     artwork's own space (the mouth spans y=52..78, the liquid x=62..178).
-                     Starting inside the ellipse put ink on the drink, which read as a
-                     smudge on the coffee rather than something leaving it. -->
-                <path id="cwoffee-wisp-a" pathLength="100" d="M96 52 C86 38 104 28 96 10 C88 -8 106 -20 98 -40" />
-                <path id="cwoffee-wisp-b" pathLength="100" d="M124 50 C114 32 134 20 126 0 C118 -20 138 -34 130 -58" />
-                <path id="cwoffee-wisp-c" pathLength="100" d="M154 52 C146 36 164 26 156 8 C148 -8 166 -20 158 -42" />
-              </defs>
-              <!-- Each curve is drawn twice: a wide blurred body and a narrow brighter
-                   thread inside it. One stroked curve reads as a wire; two read as
-                   something soft with a hot centre, which is what smoke looks like. -->
-              <g class="wisps">
-                <use class="wisp body w1" href="#cwoffee-wisp-a" />
-                <use class="wisp body w2" href="#cwoffee-wisp-b" />
-                <use class="wisp body w3" href="#cwoffee-wisp-c" />
-              </g>
-              <g class="cores">
-                <use class="wisp core c1" href="#cwoffee-wisp-a" />
-                <use class="wisp core c2" href="#cwoffee-wisp-b" />
-                <use class="wisp core c3" href="#cwoffee-wisp-c" />
-              </g>
-            </svg>
+            <img class="cup" src={idleArt} alt="" draggable="false" bind:this={cupEl} />
           </div>
           <h1 class="empty-hi">{greeting.hi}</h1>
           <p class="empty-sub">{greeting.sub}</p>
-          {#if draftWsLabel && personaNow !== 'chat'}
-            <!-- Saying which folder an unwritten session belongs to is the
-                 difference between "a session in reports/" and a guess. Click it
-                 to drop the preselection and go back to the default. -->
-            <button class="empty-ws" title={draftWorkspace} onclick={() => (draftWorkspace = '')}>
+          {#if personaNow !== 'chat'}
+            <!-- Saying which folder an unwritten session belongs to is the difference between "a
+                 session in reports/" and a guess - and it has to be said before one is picked, not
+                 only after. The row is the opener of the picker: the folders already added, a filter
+                 for when there are more than fit, and the two standing alternatives (add one, choose
+                 none). Clearing is no longer a hidden ✕ on a chip that only appears once something
+                 was chosen. -->
+            <button
+              class="empty-ws"
+              data-ws-pick
+              aria-haspopup="dialog"
+              aria-expanded={menu?.kind === 'wspick'}
+              title={draftWorkspace || 'No workspace selected: this session has no folder, and no tools write anywhere'}
+              onclick={(e) => openMenu('wspick', e.currentTarget as HTMLElement)}
+            >
               <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 3.2h3l1 1.3h5v4.8h-9z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
-              <span>in {draftWsLabel}</span>
-              <span class="empty-ws-x" aria-hidden="true">✕</span>
+              <span>{draftWsLabel || 'No workspace selected'}</span>
+              <span class="empty-ws-chev" aria-hidden="true">▾</span>
             </button>
           {/if}
           <div class="tips" role="group" aria-label="Start with">
@@ -10394,6 +14227,7 @@
           </div>
         </div>
       {/if}
+      <div class="scrollerwrap">
       <div class="scroller min-h-0 flex-1 overflow-y-auto px-6 py-6">
         {#if hasOlder}
           <button class="btn-ghost mb-3 text-[12px]" onclick={loadOlder} disabled={loadingOlder}>
@@ -10403,6 +14237,29 @@
         <div class="mx-auto w-full max-w-[780px]">
           <div class="transcript" bind:this={rootEl}></div>
         </div>
+      </div>
+      {#if followState.away > 120}
+        <!-- The way back down. The transcript no longer drags the view after every block of
+             working, which means a reader who went looking at something further up stays there -
+             and needs one obvious thing to press to be current again. It is sticky to the bottom
+             of the transcript rather than floating in the page, because "scroll me to the newest
+             line" is a request about the transcript. When a question is waiting, the button says
+             so: that is the one case where being behind the fold has a consequence. -->
+        <button
+          class="jump"
+          class:ask={followState.ask}
+          onclick={() => transcript?.jumpToBottom()}
+          aria-label={followState.ask
+            ? 'Jump to the newest line: cwoffee is waiting for an answer'
+            : 'Jump to the newest line'}
+          title={followState.ask
+            ? 'cwoffee is asking you something below'
+            : `${Math.round(followState.away)}px below the bottom of the view`}
+        >
+          <span class="jump-ico" aria-hidden="true">↓</span>
+          <span class="jump-txt">{followState.ask ? 'cwoffee is asking' : 'newest'}</span>
+        </button>
+      {/if}
       </div>
 
       <!-- approval prompt: it owns the keyboard, so it lives above the composer -->
@@ -10536,19 +14393,10 @@
               <button class="cbtn sq" title="Attach images (png, jpeg, webp, gif)" onclick={() => fileInput?.click()}>
                 <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
               </button>
-              <!-- A screenshot lives in the system clipboard, not in the paste
-                   event, so this is the only way it reaches the composer on the
-                   desktop; in a browser it is the gesture the Clipboard API
-                   requires. Named for the source, not the mechanism: a user who
-                   took a screenshot reads "clipboard" as "the thing I just did". -->
-              <button
-                class="cbtn sq"
-                title="Paste the image on the clipboard (screenshot or copied image file)"
-                aria-label="Paste image from clipboard"
-                onclick={() => void addClipboardImage()}
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3.5h6v3H9z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 5h-1A2.5 2.5 0 0 0 5 7.5v11A2.5 2.5 0 0 0 7.5 21h9a2.5 2.5 0 0 0 2.5-2.5v-11A2.5 2.5 0 0 0 16.5 5h-1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M8.5 13.5h7M8.5 17h4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-              </button>
+              <!-- No clipboard button. A screenshot reaches the composer the same way it does in
+                   every other program - paste it - and the shell-side read of the selection happens
+                   in the paste handler either way. The icon was a second way to do the one thing,
+                   and it sat in the row of controls a reader scans for mode, model and effort. -->
 
               {#if personaNow !== 'chat'}
               <button class="cbtn chip" data-menu data-approvals onclick={(e) => openMenu('mode', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'mode'}>
@@ -10570,7 +14418,7 @@
                   <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
                 </button>
                 <button class="cbtn chip" data-menu onclick={(e) => openMenu('think', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'think'}>
-                  <span>{THINK_LABEL[thinking]}</span>
+                  <span>{THINK_LABEL[thinking]}{hostState?.reasoning_overridden ? ' · this chat' : ''}</span>
                   <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
                 </button>
                 <button class="cbtn sq" disabled title="Dictation is not implemented yet">
@@ -10633,11 +14481,11 @@
               class="wsrow {wsLocked ? 'ws-locked' : ''}"
               disabled={wsLocked}
               title={wsLocked
-                ? `This session works in ${hostState?.workspace ?? ''}. A session keeps its folder: start a new session to work somewhere else.`
+                ? `This session works in ${wsShownText}. A session keeps its folder: start a new session to work somewhere else.`
                 : isTauri()
-                  ? 'Choose the directory the tools operate in'
-                  : `Host workspace: ${hostState?.workspace ?? ''} - click to type a path`}
-              onclick={chooseWorkspace}
+                  ? 'Choose which folder the tools work in - the folders you have added, or a new one'
+                  : `Host workspace: ${wsShownText} - click to pick from the folders the host knows`}
+              onclick={(e) => openWorkspacePicker(e.currentTarget as HTMLElement)}
             >
               <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
               <span>{wsChipLabel || 'Choose workspace'}</span>
@@ -10685,6 +14533,16 @@
       onpick={(v) => void pickThinking(v as ReasoningLevel)}
     />
     <p class="set-note">{thinkingNote}</p>
+  {/snippet}
+
+  {#snippet reasoningDefaultBody()}
+    <Segmented
+      aria="Default thinking effort"
+      value={thinkingDefault}
+      options={THINK_CHOICES}
+      onpick={(v) => void setThinking(v as ReasoningLevel, true)}
+    />
+    <p class="set-note">{thinkingDefaultNote}</p>
   {/snippet}
 
   {#snippet ceilingRow()}
@@ -10895,12 +14753,49 @@
         <div class="srow-c">
           <Segmented
             aria="Which machines may connect"
-            value={gw?.running ? (gw.host === '127.0.0.1' ? 'loopback' : 'lan') : gwScope}
+            value={gwScopeShown}
             options={SCOPE_CHOICES}
             onpick={(v) => void setScope(v as 'loopback' | 'lan')}
           />
         </div>
       </div>
+      {@const keep = uiPrefs.find((p) => p.key === 'gateway_on_exit')}
+      {#if keep}
+        <div class="srow" data-gw-keep>
+          <div>
+            <div class="srow-t" data-gw-keep-label>{keep.label}</div>
+            <div class="srow-h">{keep.hint}</div>
+            {#if gwPlan?.binary}
+              <div class="srow-h mono" data-gw-keep-plan>
+                a different process: {gwPlan.binary} on :{gwPlan.port} ({gwPlan.via}) · stop it
+                later with {gwPlan.stop} · its own lines go to {gwPlan.log}
+              </div>
+            {:else}
+              <div class="srow-h" data-gw-keep-plan="missing">
+                this cannot be honoured from this app: there is no cwoffee-gateway next to it, in
+                /usr/local/bin or on PATH. The gateway in this window is a task inside the app, so
+                keeping it means starting the standalone one —
+                <span class="mono">cargo build --release -p cwoffee-gateway</span>, or
+                <span class="mono">scripts/install-desktop.sh</span>, which installs the copy the
+                launcher uses.
+              </div>
+            {/if}
+            {#if keep.value === 'on' && gwPlan && !gwPlan.running}
+              <div class="srow-h" data-gw-keep-warn>
+                on, but remote access is off right now, so this window has no gateway to hand over
+              </div>
+            {/if}
+          </div>
+          <div class="srow-c">
+            <Switch
+              on={keep.value === 'on'}
+              disabled={prefBusy}
+              aria={keep.label}
+              onpick={(next) => void setPref('gateway_on_exit', next ? 'on' : 'off')}
+            />
+          </div>
+        </div>
+      {/if}
       {#if gw?.running}
         <div class="srow">
           <div>
@@ -10946,12 +14841,12 @@
       </div>
       <Choices
         aria="Search provider"
-        value={webSearch.backend}
+        value={webSearchPending ?? webSearch.backend}
         options={SEARCH_CHOICES}
         disabled={webSearchBusy}
         onpick={(v) => void chooseWebSearch(v)}
       />
-      {#if webSearch.backend === 'searxng'}
+      {#if (webSearchPending ?? webSearch.backend) === 'searxng'}
         <Field
           label="Instance URL"
           forId="cw-searxng-url"
@@ -10967,7 +14862,7 @@
           />
         </Field>
       {/if}
-      {#if webSearch.backend === 'auto'}
+      {#if (webSearchPending ?? webSearch.backend) === 'auto'}
         <div class="srow" data-web-auto>
           <div>
             <div class="srow-t">The instance Cwoffee runs itself</div>
@@ -11111,10 +15006,81 @@
             {/if}
           </div>
         {/if}
+      {:else if menu.kind === 'wspick'}
+        <div class="wsp-search">
+          <svg class="wsp-ico" width="13" height="13" viewBox="0 0 12 12" aria-hidden="true"><circle cx="5.4" cy="5.4" r="3.4" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="m8 8 2.4 2.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+          <input
+            class="wsp-input"
+            data-ws-filter
+            bind:value={wsFilter}
+            use:focusNow
+            spellcheck="false"
+            aria-label="Search workspace names or paths"
+            placeholder="Search names or paths"
+          />
+        </div>
+        {#if wsFiltered.length}
+          <div class="wsp-list" data-ws-pick-list>
+            {#each wsFiltered as w (w.path)}              <button
+                class="pop-item wsp-item {draftWorkspace === w.path ? 'on' : ''}"
+                role="menuitem"
+                data-ws-pick-row
+                onclick={() => pickDraftWorkspace(w.path)}
+              >
+                <svg class="wsp-ico" width="13" height="13" viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 3.2h3l1 1.3h5v4.8h-9z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+                <span class="pop-lbl">{wsLabelOf(w)}</span>
+                <span class="pop-sub mono">{w.path}</span>
+              </button>
+            {/each}
+          </div>
+        {:else}
+          <div class="pop-empty" data-ws-pick-empty>
+            {workspaces.length
+              ? 'nothing matches that search'
+              : 'no folders added yet - add one, or work with no folder'}
+          </div>
+        {/if}
+        <!-- The list is a fixed-height box with its own scroll, not a cap. Hiding folders behind "the
+             ten most recent" would make the ones you added a month ago undiscoverable, which is how a
+             picker starts a duplicate folder. The count line is here so a short box does not read as a
+             short list. -->
+        {#if workspaces.length > 1}
+          <div class="wsp-count" data-ws-pick-count>
+            {workspaces.length} folder{workspaces.length === 1 ? '' : 's'}, most recent first
+          </div>
+        {/if}
+        <!-- The two standing alternatives, under a seam rather than in the list: they are not
+             folders, and putting them among the folders would make "New workspace" look like a
+             folder someone had already named. -->
+        <div class="wsp-sep" role="presentation"></div>
+        <button
+          class="pop-item wsp-act"
+          role="menuitem"
+          data-ws-pick-new
+          disabled={wsPickLocked}
+          title={wsPickLocked ? wsPickLockNote : ''}
+          onclick={() => void newWorkspaceFromPicker()}
+        >
+          <svg class="wsp-ico" width="13" height="13" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 2.6v8.8M2.6 7h8.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <span class="pop-lbl">New workspace</span>
+          <span class="pop-sub">{transportKind === 'tauri' ? 'Pick a folder; it joins the list and this session works in it' : 'Type a path on the host; it joins the list and this session works in it'}</span>
+        </button>
+        <button
+          class="pop-item wsp-act"
+          role="menuitem"
+          data-ws-pick-none
+          disabled={wsPickLocked}
+          title={wsPickLocked ? wsPickLockNote : ''}
+          onclick={clearDraftWorkspace}
+        >
+          <svg class="wsp-ico" width="13" height="13" viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 3.2h3l1 1.3h5v4.8h-9z" fill="none" stroke="currentColor" stroke-width="1.1"/><path d="M2 2.2 10.2 9.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+          <span class="pop-lbl">No workspace selected</span>
+          <span class="pop-sub">A session with no folder: nothing is read or written anywhere</span>
+        </button>
       {:else if menu.kind === 'ws'}
         {@const wp = menu.wsPath ?? ''}
         {@const wrow = workspaces.find((w) => w.path === wp)}
-        {@const wlabel = wrow ? wsLabelOf(wrow) : wp && !isTempRoot(wp) ? basenameOf(wp) : 'Default'}
+        {@const wlabel = wrow ? wsLabelOf(wrow) : wp && !isTempRoot(wp) ? basenameOf(wp) : 'No workspace'}
         <div class="pop-title">{wlabel}</div>
         <div class="pop-mono pop-sub">{wp || 'sessions with no folder'}</div>
         {#if wp}
@@ -11231,7 +15197,7 @@
   {/if}
 
   {#if settings}
-    <div class="scrim" onclick={closeSettings} role="presentation"></div>
+    <div class="mscrim" onclick={closeSettings} role="presentation"></div>
     <div
       class="settings"
       role="dialog"
@@ -11239,6 +15205,8 @@
       aria-label="Settings"
       tabindex="-1"
       bind:this={settingsEl}
+      style={settingsStyle()}
+      use:rememberSize
     >
       <header class="set-head">
         <span class="set-title">Settings</span>
@@ -11617,9 +15585,9 @@
             <Section
               id="reasoning"
               title="Reasoning"
-              desc="How much the model deliberates before it answers. Levels are a request: an endpoint that does not implement one answers anyway, at whatever depth it has."
+              desc="How much the model deliberates before it answers. This is the default new conversations start at; a conversation can be given its own level from its composer, and that choice belongs to that conversation alone. Levels are a request: an endpoint that does not implement one answers anyway, at whatever depth it has."
             >
-              {@render reasoningBody()}
+              {@render reasoningDefaultBody()}
             </Section>
 
             <Section
@@ -11819,67 +15787,40 @@
             <Section
               id="titles"
               title="Conversation titles"
-              desc="What a conversation is called, and whether a small model on this machine is allowed to propose a better name once the first turn settles."
+              desc="How a conversation gets its name, and what its first answer waits for."
             >
-              <p class="set-note">
-                A conversation starts out named after its own first line, cut at 48 characters. When
-                local naming is on, a small model proposes a phrase after the first turn finishes and
-                the row renames itself. The conversation never waits for its name, and a title you
-                typed is never overwritten.
+              <p class="set-note" data-titles-explained>
+                A new conversation starts out called <span class="mono">New Session</span>. Before it
+                answers anything, the model behind this app is asked, in one separate request of its
+                own: <span class="mono">Title this conversation in under ~10 words and say nothing
+                more: …</span> — no system prompt, no tools, thinking off. The name types itself into
+                the sidebar as it arrives, and the answer starts after it. The stall is the trade: a
+                name that appears forty seconds late, on a page that has already moved on, is not a
+                name.
               </p>
-              {#if titlesErr}
-                <div class="smsg bad" data-titles-error>{titlesErr}</div>
-              {:else if titleInfo}
-                <div class="srow" data-titles-state>
-                  <div>
-                    <div class="srow-t">
-                      Naming conversations locally: {titleInfo.status.enabled ? 'on' : 'off'}
-                    </div>
-                    <div class="srow-h">
-                      {#if titleInfo.status.enabled && titleInfo.status.script_found && titleInfo.status.python_found && titleInfo.status.weights_cached}
-                        ready: the helper, its python and the weights are all present
-                      {:else if titleInfo.status.enabled}
-                        on, but it cannot run: {titleInfo.status.script_found ? '' : 'no helper script; '}{titleInfo.status.python_found ? '' : 'no python; '}{titleInfo.status.weights_cached ? '' : 'no weights'} - conversations keep the automatic title, and the reason is in the log
-                      {:else}
-                        put <span class="mono">titlegen = true</span> in
-                        <span class="mono">{titleInfo.config_path ?? 'the config file'}</span> to turn it on
-                      {/if}
-                      {#if titleInfo.status.in_flight === true}
-                        · a name is being proposed right now
-                      {/if}
-                    </div>
+              <div class="srow">
+                <div>
+                  <div class="srow-t">One short request, paid for once per conversation</div>
+                  <div class="srow-h">
+                    It is not part of the conversation. The title ask is never added to the history, so
+                    it cannot inflate a later turn, and it cannot disturb what the server has cached of
+                    the real prompt. There is no second model and nothing to install or download:
+                    the conversation is named by whatever is already answering it.
                   </div>
                 </div>
-                <div class="srow">
-                  <div>
-                    <div class="srow-t mono">{titleInfo.status.model}</div>
-                    <div class="srow-h">
-                      230M parameters, CPU only, weights in <span class="mono">{titleInfo.status.cache}</span>
-                      ({titleInfo.status.weights_cached ? 'cached' : 'not downloaded'}). Threads are capped
-                      at {titleInfo.status.threads} because the real model and this window share the machine.
-                    </div>
+              </div>
+              <div class="srow">
+                <div>
+                  <div class="srow-t">If the endpoint gives no usable name</div>
+                  <div class="srow-h" data-titles-fallback>
+                    The row falls back to your opening line rather than sitting on
+                    <span class="mono">New Session</span> forever — a sidebar of identical rows says
+                    nothing — and the reason goes to the log. A model that thinks anyway, or answers
+                    inside its thinking block, is parsed rather than rejected. A name you typed is
+                    never overwritten, by anything.
                   </div>
                 </div>
-                <div class="srow">
-                  <div>
-                    <div class="srow-t">≈{titleInfo.status.peak_rss_mb} MB for a few seconds</div>
-                    <div class="srow-h">
-                      Measured, not promised: loading the runtime and the model peaks near this and
-                      falls straight back. That is more than the rest of this app normally costs, which
-                      is why the feature is opt-in and why the helper runs once per new conversation
-                      instead of staying resident.
-                    </div>
-                  </div>
-                </div>
-                <p class="set-note">
-                  helper <span class="mono">{titleInfo.status.script}</span>
-                  {titleInfo.status.script_found ? 'found' : 'missing'} · python
-                  <span class="mono">{titleInfo.status.python}</span>
-                  {titleInfo.status.python_found ? 'found' : 'missing'}
-                </p>
-              {:else}
-                <div class="smsg wait" data-titles-loading>Reading…</div>
-              {/if}
+              </div>
             </Section>
 
             <Section
@@ -11918,7 +15859,7 @@
               title="Transcript"
               desc="How much of the working the conversation shows: the thinking and tool steps a turn took are folded into one run, and this decides whether what they produced is folded too."
             >
-              {#each uiPrefs as p (p.key)}
+              {#each uiPrefs.filter((p) => p.group === 'transcript') as p (p.key)}
                 <div class="srow" data-pref={p.key}>
                   <div>
                     <div class="srow-t" data-pref-label>{p.label}</div>
@@ -11984,92 +15925,21 @@
   {/if}
 
   <!-- ========================== telemetry bar ========================= -->
-  <footer class="telem flex h-9 shrink-0 items-center gap-2 border-t border-hairline bg-paper-2 px-3 text-[11.5px] text-ink-2">
-    <!-- Two controls instead of eight readouts. Every number is still there, one
-         click away, and the space they occupied now carries the thing that is
-         actually switched during a day. -->
-    <button
-      class="fbtn"
-      data-menu
-      aria-haspopup="menu"
-      aria-expanded={menu?.kind === 'metrics'}
-      aria-label="Session telemetry"
-      onclick={(e) => openMenu('metrics', e.currentTarget as HTMLElement)}
-    >
-      <span class="fdot {dropped > 0 ? 'hot' : ''}" aria-hidden="true"></span>
-      <span class="flbl">metrics</span>
-      <span class="fsum">
-        <b>{cacheLabel}</b>
-        <span class="fsub">cache</span>
-        <span class="fsep">·</span>
-        <b>{liveEstimate ? '\u2248' : ''}{fmt.rate(curDecode)}</b>
-        <span class="fsub">tok/s</span>
-        {#if ctxLimit}
-          <span class="fsep">·</span>
-          <b>{ctxLabel}</b>
-          <span class="fsub">ctx</span>
-        {/if}
-      </span>
-    </button>
+  <!-- There is no bottom toolbar any more.
 
-    <button
-      class="fbtn"
-      data-menu
-      aria-haspopup="menu"
-      aria-expanded={menu?.kind === 'gateway'}
-      aria-label="Remote access"
-      onclick={(e) => openMenu('gateway', e.currentTarget as HTMLElement)}
-    >
-      <span class="fdot {gwDot}" aria-hidden="true"></span>
-      <span class="flbl">gateway</span>
-      <span class="fsum">{gwText}</span>
-    </button>
-
-    <button
-      class="fbtn"
-      data-menu
-      aria-haspopup="menu"
-      aria-expanded={menu?.kind === 'search'}
-      aria-label="Web search"
-      onclick={(e) => openMenu('search', e.currentTarget as HTMLElement)}
-    >
-      <span class="fdot {webSearchDot}" aria-hidden="true"></span>
-      <span class="flbl">search</span>
-      <span class="fsum">{webSearchText}</span>
-    </button>
-
-    <span class="ml-auto flex items-center gap-2">
-      <span
-        class="rounded-full px-2 py-0.5 {ipc.ok ? 'bg-paper-2 text-ink-3' : 'bg-danger-bg text-danger'}"
-        title="Tauri IPC round-trip: {ipc.msg}"
-      >
-        ipc {ipc.ok ? '\u2713' : '\u2717'}
-      </span>
-      <button
-        class="keyhelp"
-        title="Toggle light / dark"
-        aria-label="Toggle light or dark theme"
-        onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}
-      >
-        {theme === 'dark' ? '\u2600' : '\u263e'}
-      </button>
-      <button
-        class="keyhelp"
-        data-menu
-        title="Keyboard shortcuts"
-        aria-label="Keyboard shortcuts"
-        onclick={(e) => openMenu('keys', e.currentTarget as HTMLElement)}
-      >
-        ?
-      </button>
-    </span>
-  </footer>
+       It used to hold eight readouts and three menus, and it cost a 36px band across both the
+       transcript and the sidebar - the two places that actually need the vertical room. The three
+       things it was for (telemetry, gateway, theme) now live as icons at the foot of the sidebar,
+       and everything else it carried - the search provider, the IPC round-trip, the `?` shortcut
+       sheet - is in Settings, where it already was. A fact with nowhere honest to live is a fact
+       that belongs in a tooltip or nowhere, not in a bar nobody reads.
+  -->
 
   <!-- Refusals and outcomes that used to be invisible: a folder the engine declined
        while its panel was closed, a picker cancelled, a session whose folder cannot
        change. `role=status` so a screen reader hears it, and dismissible by hand. -->
   {#if toast}
-    <div class="toast {toast.bad ? 'bad' : ''}" role="status" aria-live="polite">
+    <div class="toast {toast.bad ? 'bad' : ''} {toast.note ? 'note' : ''}" role="status" aria-live="polite">
       <span>{toast.text}</span>
       <button class="toast-x" aria-label="Dismiss" onclick={() => (toast = null)}>
         <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.6 2.6l4.8 4.8M7.4 2.6l-4.8 4.8" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>

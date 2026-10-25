@@ -29,31 +29,68 @@ fn help() -> &'static str {
     "\
 cwoffee-gateway - serve the cwoffee UI and engine over HTTP
 
+  --config PATH      config file (default ~/.config/cwoffee/config.toml, like the app)
   --host ADDR        bind address (default 127.0.0.1; anything else needs --token)
   --port N           port (default 8099)
-  --token T          grants watch AND drive; required unless binding to loopback
-  --watch-token T    optional; grants read only
+  --token T          grants watch AND drive; required unless binding to loopback.
+                     Unset falls back to CWOFFEE_GATEWAY_TOKEN, then the token file the
+                     desktop app writes next to its config — the hand-off at window close
+                     relies on that, because a token in argv is readable in `ps`.
+  --watch-token T    optional; grants read only (same fallbacks, CWOFFEE_GATEWAY_WATCH_TOKEN)
   --dist PATH        built frontend (default <repo>/ui/dist)
   --url URL          endpoint base, e.g. http://127.0.0.1:8090/v1
   --model ID         model id (empty asks the endpoint)
   --workspace PATH   where tools operate
   --db PATH          session database
   --mode ask|session|auto
-  --core rust|pi     engine behind the gateway (default rust; pi = `pi --mode rpc`)
+  --core rust|pi     engine behind the gateway (default rust, or CWOFFEE_CORE; pi = `pi --mode rpc`)
   --persona cowork|chat
                      cowork = tools + workspace (default). chat = the model with nothing
                      mounted: no tools, no folder, one line of system prompt
-  --pi PATH          pi binary for --core pi (default: whatever PATH resolves)
+  --pi PATH          pi binary for --core pi (default: CWOFFEE_PI, then whatever PATH resolves)
   --pi-version V     refuse a pi that is not exactly this version (default pinned)
   --any-pi           skip the version handshake; development only
   --pi-ext PATH      extension to mount for --core pi (repeatable; this is where
-                     the Rust tool shims hang off pi)
+                     the Rust tool shims hang off pi; falls back to CWOFFEE_PI_EXT)
   --pi-tools LIST    pi --tools entries (default -read,-bash,-edit,-write: pi's own
-                     coding tools stay off, ours come in as extensions)
-  --pi-agent-dir PATH  pi config home (default <state>/cwoffee/pi)
+                     coding tools stay off, ours come in as extensions; falls back to
+                     CWOFFEE_PI_TOOLS)
+  --pi-agent-dir PATH  pi config home (default CWOFFEE_PI_AGENT_DIR, else <state>/cwoffee/pi)
+  --pi-session-dir PATH  where pi files its conversations (default CWOFFEE_PI_SESSION_DIR,
+                     else <agent dir>/sessions)
   --pi-idle-reap SECS  close an idle pi process after this (default 600)
   -h, --help
 "
+}
+
+/// A token, in the order the desktop app uses: flag, then environment, then the file written
+/// next to the config when someone turned remote access on.
+///
+/// The fallback is not a convenience. A token in argv is visible to every process on the
+/// machine through `ps`, so the hand-off at window close passes none — it starts a gateway with
+/// the same environment and lets it read the same file.
+fn token_from(flag: Option<String>, env: &str, file: &std::path::Path) -> Option<String> {
+    flag.filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var(env).ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| std::fs::read_to_string(file).ok().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+/// Where the desktop app keeps the gateway token (`gateway_ctl::token_path`). One name, one
+/// place: two definitions of "where the secret lives" is how a phone ends up with a gateway the
+/// app says nothing about.
+fn token_file(name: &str) -> std::path::PathBuf {
+    cwoffee_engine::config::Config::default_path()
+        .parent()
+        .map(|p| p.join(name))
+        .unwrap_or_else(|| std::path::PathBuf::from(name))
+}
+
+/// A value the desktop app reads from the environment, so a gateway started from the same
+/// launcher resolves the same paths it does. Flags still win: an explicit flag is a decision,
+/// an inherited variable is context.
+fn env_nonempty(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|s| !s.trim().is_empty())
 }
 
 #[tokio::main]
@@ -88,11 +125,21 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "8099".into())
         .parse()
         .map_err(|e| anyhow::anyhow!("bad --port: {e}"))?;
-    let drive_token = get("--token", None);
-    let watch_token = get("--watch-token", None);
+    let drive_token = token_from(
+        get("--token", None),
+        "CWOFFEE_GATEWAY_TOKEN",
+        &token_file("gateway.token"),
+    );
+    let watch_token = token_from(
+        get("--watch-token", None),
+        "CWOFFEE_GATEWAY_WATCH_TOKEN",
+        &token_file("gateway.watch.token"),
+    );
 
     // Reuse the same config file and precedence as the desktop app and the TUI.
-    let (mut appcfg, loaded) = Config::load(None).map_err(anyhow::Error::msg)?;
+    let (mut appcfg, loaded) =
+        Config::load(get("--config", None).as_deref().map(std::path::Path::new))
+            .map_err(anyhow::Error::msg)?;
     // Same file the desktop panel writes: one config, whichever shell changed it.
     let config_path = loaded.unwrap_or_else(Config::default_path);
     appcfg.apply_env();
@@ -198,7 +245,12 @@ async fn main() -> anyhow::Result<()> {
     // the gateway already consumes. Move 0 is what makes this a construction choice
     // instead of a rewrite: nothing below this point knows, or can tell, which core it
     // is serving — which is exactly the claim the smoke test has to prove.
-    let core = get("--core", None).unwrap_or_else(|| "rust".into());
+    // The core is the one decision a launcher carries, so read it the way the desktop app
+    // does when no flag names it: a gateway started by that launcher must not silently serve a
+    // different engine than the window it replaced.
+    let core = get("--core", None)
+        .or_else(|| env_nonempty("CWOFFEE_CORE"))
+        .unwrap_or_else(|| "rust".into());
     if persona == cwoffee_engine::host::Persona::Chat && core != "pi" {
         eprintln!(
             "[cwoffee] persona: chat is not available on the rust core — that core is the coworker prompt, \
@@ -223,8 +275,13 @@ async fn main() -> anyhow::Result<()> {
                  by provider+model and does not adopt the endpoint's first"
             );
         }
-        let pi_bin = PathBuf::from(get("--pi", None).unwrap_or_else(|| "pi".into()));
+        let pi_bin = PathBuf::from(
+            get("--pi", None)
+                .or_else(|| env_nonempty("CWOFFEE_PI"))
+                .unwrap_or_else(|| "pi".into()),
+        );
         let agent_dir = get("--pi-agent-dir", None)
+            .or_else(|| env_nonempty("CWOFFEE_PI_AGENT_DIR"))
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 let base = std::env::var("XDG_STATE_HOME")
@@ -238,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
                 base.join("cwoffee").join("pi")
             });
         let session_dir = get("--pi-session-dir", None)
+            .or_else(|| env_nonempty("CWOFFEE_PI_SESSION_DIR"))
             .map(PathBuf::from)
             .unwrap_or_else(|| agent_dir.join("sessions"));
         std::fs::create_dir_all(&session_dir)?;
@@ -255,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
                 None
             }
         };
-        let models =
+        let (models, mounted) =
             cwoffee_bridge::mount::write_dev_provider(
                 &agent_dir,
                 PI_PROVIDER,
@@ -263,13 +321,37 @@ async fn main() -> anyhow::Result<()> {
                 &configured_model,
                 &key,
                 cwoffee_bridge::mount::pi_api_for_kind(&appcfg.provider.kind),
+                &appcfg.provider.kind,
                 window,
+                // The levels this endpoint said it takes. Without them pi clamps every
+                // reasoning request to off - see `mount::reasoning_decl`.
+                &appcfg
+                    .models
+                    .get(&configured_model)
+                    .map(|r| r.efforts.clone())
+                    .unwrap_or_default(),
             )?;
-        println!(
-            "[cwoffee/pi] provider {PI_PROVIDER} -> {} (written to {})",
-            appcfg.provider.base_url,
-            models.display()
-        );        // Same on the browser/phone shell: an endpoint the model screen registered has to be
+        // The line says what happened rather than what was intended: an entry left pointing
+        // at another endpoint is a conversation that ends with nothing on screen, and a boot
+        // log that says "written" in that state sends people looking at the wrong thing.
+        match &mounted {
+            cwoffee_bridge::mount::MountOutcome::Written => println!(
+                "[cwoffee/pi] provider {PI_PROVIDER} -> {} (written to {})",
+                appcfg.provider.base_url,
+                models.display()
+            ),
+            cwoffee_bridge::mount::MountOutcome::Replaced { previous } => println!(
+                "[cwoffee/pi] provider {PI_PROVIDER} -> {} (replaced the entry pointing at {previous}, \
+                 which did not list {configured_model})",
+                appcfg.provider.base_url
+            ),
+            cwoffee_bridge::mount::MountOutcome::Foreign { base_url } => println!(
+                "[cwoffee/pi] provider {PI_PROVIDER} left as found: {base_url} lists {configured_model}, \
+                 so that is where its requests go — not {} from cwoffee's config",
+                appcfg.provider.base_url
+            ),
+        }
+        // Same on the browser/phone shell: an endpoint the model screen registered has to be
         // in pi's file, or picking one of its models fails on the far side of the wire.
         let cfg_path = cwoffee_engine::config::Config::default_path();
         match cwoffee_bridge::mount::mount_provider_rows(&agent_dir, &cfg_path) {
@@ -312,17 +394,32 @@ async fn main() -> anyhow::Result<()> {
                 cwoffee_bridge::mount::context_budget(cfg.context_budget, None)
             ),
         }
-        let exts = cwoffee_bridge::mount::mount_extensions(
-            &agent_dir,
-            &pi_bin,
-            &many("--pi-ext").into_iter().map(PathBuf::from).collect::<Vec<_>>(),
-        )?;
+        let ext_srcs: Vec<PathBuf> = {
+            let flagged = many("--pi-ext");
+            let list = if !flagged.is_empty() {
+                flagged
+            } else {
+                env_nonempty("CWOFFEE_PI_EXT")
+                    .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default()
+            };
+            list.into_iter().map(PathBuf::from).collect()
+        };
+        if ext_srcs.is_empty() {
+            eprintln!(
+                "[cwoffee/pi] no tool extension mounted (--pi-ext / CWOFFEE_PI_EXT): the model will \
+                 be told \"tool not found\" for every tool it tries to use"
+            );
+        }
+        let exts = cwoffee_bridge::mount::mount_extensions(&agent_dir, &pi_bin, &ext_srcs)?;
         let ext_count = exts.len();
         // The product rule, stated as a default rather than left to drift: pi's own
         // `read`/`bash`/`edit`/`write` stay off, because the tools that matter here are
         // cwoffee's and the guardrails live with them. The flag exists to add ours, not
         // to remove the minus signs by omission.
-        let tools = match get("--pi-tools", None) {
+        let tools = match get("--pi-tools", None)
+            .or_else(|| env_nonempty("CWOFFEE_PI_TOOLS"))
+        {
             Some(v) => v
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -519,4 +616,55 @@ async fn main() -> anyhow::Result<()> {
     });
 
     cwoffee_gateway::serve(gw, handle).await.map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hand-off at window close passes no token on the command line at all. That is only
+    /// safe because these fallbacks exist — and an explicit flag still wins, because a flag is
+    /// a decision and an inherited variable is context.
+    #[test]
+    fn a_flag_token_beats_the_environment_and_the_file() {
+        std::env::set_var("CWOFFEE_TEST_GATEWAY_TOKEN", "from-env");
+        let missing = PathBuf::from("/nonexistent/cwoffee-token");
+        let t = token_from(Some("from-flag".into()), "CWOFFEE_TEST_GATEWAY_TOKEN", &missing);
+        assert_eq!(t.as_deref(), Some("from-flag"));
+        let t2 = token_from(None, "CWOFFEE_TEST_GATEWAY_TOKEN", &missing);
+        assert_eq!(t2.as_deref(), Some("from-env"), "the environment is the launcher's voice");
+        std::env::remove_var("CWOFFEE_TEST_GATEWAY_TOKEN");
+    }
+
+    #[test]
+    fn a_token_file_is_read_and_trimmed() {
+        let dir = std::env::temp_dir().join(format!("cw-gw-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("gateway.token");
+        std::fs::write(&p, "  written-by-the-app  \n").unwrap();
+        let t = token_from(None, "CWOFFEE_TEST_GATEWAY_TOKEN_ABSENT", &p);
+        assert_eq!(t.as_deref(), Some("written-by-the-app"), "the trailing newline came with it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty variable is not a token. It used to count as one, which let a LAN bind through
+    /// while authenticating nothing.
+    #[test]
+    fn an_empty_value_is_absent_not_a_token() {
+        std::env::set_var("CWOFFEE_TEST_EMPTY_TOKEN", "   ");
+        assert_eq!(
+            token_from(None, "CWOFFEE_TEST_EMPTY_TOKEN", &PathBuf::from("/nonexistent/x")),
+            None
+        );
+        assert!(env_nonempty("CWOFFEE_TEST_EMPTY_TOKEN").is_none());
+        std::env::remove_var("CWOFFEE_TEST_EMPTY_TOKEN");
+    }
+
+    #[test]
+    fn the_token_file_sits_next_to_the_config() {
+        // Same place gateway_ctl writes it. Two answers to "where is the secret" is how a
+        // phone gets a gateway the desktop says nothing about.
+        let p = token_file("gateway.token");
+        assert!(p.ends_with("cwoffee/gateway.token"), "{}", p.display());
+    }
 }

@@ -153,6 +153,24 @@ body {
   background: color-mix(in srgb, var(--color-ink) 8%, transparent);
   color: var(--color-ink);
 }
+/* The titlebar's second half: which conversation this window is looking at. It
+   shares the row with the mark and the drawer toggle, so it takes what is left and
+   ellipsises rather than pushing them out — on a phone the row is 380px wide and a
+   session title is often longer than that. */
+.tb-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  background: var(--color-hairline);
+}
+.tb-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--color-ink-2);
+}
 
 /* ---------------------------------------------------------------------------
    Streaming surface.
@@ -166,18 +184,6 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   margin: 0;
-}
-
-.caret {
-  display: inline-block;
-  width: 7px;
-  height: 1.05em;
-  vertical-align: -0.16em;
-  background: var(--color-shell-deep);
-  animation: blink 1s steps(1, end) infinite;
-}
-@keyframes blink {
-  50% { opacity: 0; }
 }
 
 /* hairline card */
@@ -210,7 +216,93 @@ body {
    answer, thinking, tool card, your own message - shares one left edge. Written
    after the Tailwind import on purpose: same specificity as `px-6`, later in the
    file, so it wins without an `!important`. */
+.scrollerwrap {
+  /* The positioning context for the transcript's jump button. It is the flex child that
+     `main` used to give the scroller directly, so the layout is the same with one more box
+     around it: `min-h-0` and `flex-1` have to live here now as well, or the scroller grows
+     past the pane and nothing scrolls. */
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  /**
+   * The band the conversation's cup sits in, and the reason the scroller has a deep bottom
+   * padding. The picture is pinned inside this band rather than appended to the end of the
+   * content, and the band is empty of text by construction: the newest line stops above the
+   * drawing instead of sliding under it. Sized from the artwork itself - 8px of air against the
+   * pane's bottom edge, 136px of picture, and 24px of clearance above it - because a band the
+   * picture does not fit is a band that will show the picture overlapping someone's sentence.
+   *
+   * `--cup-left` is the left edge of the 780px text column: the scroller pads 80px on the left
+   * and 28px on the right, so at full width the column starts at `pane centre - 390 + 26`, and
+   * below that the column is as wide as the padding box and starts at the gutter.
+   */
+  --cup-band: 168px;
+  --cup-left: max(80px, calc(50% - 364px));
+}
+/* The way back down: sticky to the bottom of the transcript, centred on the column the text
+   actually occupies. The transcript is padded 80px on the left (the gutter that holds the
+   labels) and 28px on the right, so the column's axis sits 26px right of the pane's centre -
+   centring the button on the pane instead would put it visibly off the text.
+
+   It appears when the newest line is more than ~5 lines below the fold. That threshold, and
+   not `!pinned`, is the right test: the transcript now lets a reader sit above the newest
+   content on purpose, so "there is more below" is a fact about distance rather than about
+   intent, and a button that appeared at 3px below would flicker for the length of a paragraph. */
+.jump {
+  position: absolute;
+  /* The thumb's corner. The cup is put away whenever this pill is up, so nothing is drawn here to
+     clear out of the way: an earlier rule lifted the pill a whole band's height above the pane to
+     dodge the picture, which left it floating in the middle of the text it was offering to leave. */
+  bottom: 20px;
+  left: calc(50% + 26px);
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--color-hairline-2);
+  background: var(--color-paper);
+  color: var(--color-ink-2);
+  font-size: 11.5px;
+  line-height: 1;
+  cursor: pointer;
+  z-index: 4;
+  box-shadow: 0 6px 18px rgb(40 30 20 / 12%);
+  transition: background var(--d2) var(--ease), border-color var(--d2) var(--ease);
+}
+.jump:hover {
+  background: var(--color-raise);
+}
+.jump-ico {
+  font-size: 13px;
+  line-height: 1;
+}
+/* A question waiting for an answer is worth colour: "newest" is a convenience and
+   "cwoffee is asking" is a turn that cannot proceed. */
+.jump.ask {
+  border-color: var(--color-shell-deep);
+  background: var(--color-warn-bg);
+  color: var(--color-warn);
+  font-weight: 600;
+}
+@media (prefers-reduced-motion: reduce) {
+  .jump { transition: none; }
+}
 .scroller {
+  /* The gutter is a variable rather than a magic number because the sticky header of a
+     long code block has to know it. A sticky offset is measured against the scrollport's
+     *content* edge, so a 24px top padding would park that header 24px below the top of the
+     transcript and leave 24px of code scrolling past above the copy and preview buttons —
+     a smaller version of the very thing the sticky header exists to fix. `.code-head`
+     subtracts this value to sit flush instead. */
+  --scroller-pad-top: 24px;
+  padding-top: var(--scroller-pad-top);
+  /* The band at the bottom belongs to the cup; see `.scrollerwrap`. It replaces the 24px that
+     `py-6` would give, and it is written after the Tailwind import so it wins on order rather
+     than on `!important`. */
+  padding-bottom: var(--cup-band, 168px);
   padding-left: 80px;
   padding-right: 28px;
 }
@@ -257,59 +349,189 @@ body {
     padding-left: 24px;
     padding-right: 16px;
   }
+  /* No gutter to hang the label in, and no column margin to hang the cup in either. */
+  .scrollerwrap {
+    --cup-left: 24px;
+  }
   .blk > .blk-head {
     position: static;
     width: auto;
     display: block;
     margin-bottom: 2px;
   }
-}
-/* The block that is currently producing output carries a live marker in its
-   label column: one pulsing dot, on one block, removed at turn end. A spinner
-   per message reads as noise; nothing at all reads as "is it working?". */
-.blk.live .blk-head::before {
-  content: '';
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  margin-right: 5px;
-  border-radius: 50%;
-  background: var(--color-shell-deep);
-  vertical-align: middle;
-  animation: cwoffee-live 1.9s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
-/* Deliberately shallow and slow. This is a "still working" tell sitting next to a
-   paragraph of moving text; a 1.15s pulse swinging from 0.3 to 1.0 opacity in the
-   same visual field reads as a flicker, which is exactly what it was reported as. */
-@keyframes cwoffee-live {
-  0%, 100% { transform: scale(0.82); opacity: 0.4; }
-  50%      { transform: scale(1);    opacity: 0.9; }
-}
-/* The marker must not join the label's line box. `.blk > .blk-head` is 58px wide,
-   right-aligned and nowrap; an 11px dot pushed to 64px makes the line *wider than
-   its own box*, and `text-align` has no effect on a line that overflows - the text
-   falls back to the start edge and runs into the content column. So while a turn
-   ran, "CWOFFEE" sat against the answer's first word with no gutter at all, and
-   the margin reappeared the moment the dot did: the label was being re-laid-out by
-   its own decoration. Absolutely positioned, it hangs in the gutter and the label
-   text never moves. Reasoning leads with the marker instead (its head is a static
-   full-width line), so it is put back inline there. */
-.blk.live > .blk-head::before {
-  position: absolute;
-  left: -11px;
-  top: 4px;
-  margin-right: 0;
-}
-/* Reasoning sits outside the label grid, so its marker leads the line. */
-.blk-reasoning.live .blk-head::before { position: static; margin-right: 6px; }
-
-@media (prefers-reduced-motion: reduce) {
-  .blk.live .blk-head::before {
-    animation: none;
-    opacity: 0.75;
-    transform: none;
+  .turn-who {
+    height: auto;
+    margin-bottom: 0;
+  }
+  .turn-who > .who-name {
+    position: static;
+    display: block;
+    width: auto;
+    text-align: left;
   }
 }
+
+/* ---- one name per turn ------------------------------------------------------
+   A turn says who is speaking once, and the name stays pinned while that speaker's
+   text is on screen. Every block used to repeat "CWOFFEE" down the left edge: a turn
+   with an accordion and four paragraphs of answer said it five times, and the gutter
+   became a column of identical words. Repeating it is noise; dropping it would leave a
+   long turn unlabelled. So it borrows `.code-head`'s trick — a row pinned to the
+   transcript's own scroller and bounded by the turn it belongs to, so it releases the
+   moment the turn ends rather than floating over the next one.
+
+   The row itself is zero-height and the word hangs in the gutter where the block labels
+   already live, so a name costs no vertical space and never nudges the text column. The
+   negative margin pays back the 12px gap `.turn` gives each of its flex children. */
+.turn-who {
+  position: sticky;
+  top: calc(-1 * var(--scroller-pad-top, 0px));
+  z-index: 4;
+  height: 0;
+  margin-bottom: -12px;
+  align-self: flex-start;
+  pointer-events: none;
+}
+.turn-who {
+  position: sticky;
+  top: calc(-1 * var(--scroller-pad-top, 0px));
+  z-index: 4;
+  height: 0;
+  margin-bottom: -12px;
+  align-self: flex-start;
+  pointer-events: none;
+  /* Published on the row, not on the name, because both of the row's absolutely positioned
+     children hang off this same offset: the word, and the cup under it. */
+  --who-top: 2px;
+}
+.turn-who > .who-name {
+  position: absolute;
+  /* Same box the per-block labels occupy, so the gutter between a name and the first glyph of
+     the sentence beside it is one number in one place, not two that can drift apart. */
+  left: -66px;
+  /* The name has to sit on the same line as whatever header is beside it, so its offset is
+     arithmetic against that header's own top offset rather than a number that drifts when a type
+     size changes. `--who-top` is published per case below: 2px against a block whose head starts at
+     the top of the turn, 13px against the folded group (measured - see the check's log line, which
+     reports the gap in text centres rather than trusting this number). The line-height is stated
+     here because that arithmetic assumes the name and the header share a line box: at the same 11px
+     their ink centres then coincide. */
+  top: var(--who-top);
+  padding-top: 3px;
+  line-height: 16px;
+  width: 58px;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  text-align: right;
+  white-space: nowrap;
+  color: var(--color-ink-3);
+}
+/* The folded group is the turn's first block, so its bottom margin is the gap between the working
+   and the saying. 14px rather than the default 12px of a bare `.blk-run`: the two things it
+   separates are the two halves of the turn, and they want a beat of their own. */
+.turn > .blk-run {
+  margin-bottom: 14px;
+}
+/* A turn that opens with the folded group: the row to line up with is that group's header, which
+   starts 12px lower. The live shape (`.turn-who` inside a `.turn`) and the stored one (a direct
+   child of `.transcript`) are both named, because the two containers space their children
+   differently and only the run block's own margin is the same in both. */
+.turn:has(> .turn-who-cwoffee + .blk-run) > .turn-who-cwoffee,
+.transcript:has(> .turn-who-cwoffee + .blk-run) > .turn-who-cwoffee {
+  /* 13px, measured in this engine against the shipped accordion header: at 2px the name sat 11px
+     above the header's line, at 23px it sat 10px below it, so the line they share is 13px. The
+     block's own 12px top margin is most of that; the rest is the header row's padding and the
+     leading difference between a 600-weight header and the label. */
+  --who-top: 13px;
+}
+/* The transcript's cup: one element per page, kept at the end of the content by the transcript
+   itself (`placeCup`), so it always sits under the newest thing said - and under the Copy /
+   Share / Branch row, because that row is part of the turn and this is part of the page.
+
+   It used to hang in the gutter under each turn's name, and two things came of that: a session of
+   short turns turned into a column of cups, one per turn, which is the turn-per-label mistake the
+   name had already had; and a picture small enough to fit a 58px gutter is too small to read as a
+   drawing. Here it can be nearly the size of the one on the opening screen - 300 of this artwork's
+   480 units are ink, so 136px paints a cup about 85px wide, just under the 152px opening-screen box
+   and the same drawing at the same scale.
+
+   The page-wide `img, video { max-width: 100% }` reset is deliberately not lifted here: in flow
+   inside the transcript it has room, and it was only ever a problem for a picture hung off the
+   zero-wide name row, where 100% of the containing block is 0px and the image vanishes while its
+   height goes unhurt. */
+.transcript-cup {
+  /**
+   * Pinned to the bottom band of the transcript pane, not the last element in the content.
+   *
+   * As the last thing in the page, the picture's position on screen was a function of everything
+   * that arrived: each new line pushed it down, each follow step pulled it back, and a turn that
+   * held the view while tool output piled up below the fold slid it off the bottom entirely and
+   * then brought it flying back. Measured in `ui/perf/probe.ts` over three streamed turns: 1,348px
+   * of travel, 261px in a single frame at p95, six reversals of direction. Reversals are what the
+   * eye reads as jitter, and this is a 136px drawing.
+   *
+   * Pinned, it cannot move: the band is reserved by the scroller's padding, so at the end of the
+   * content there is nothing under it to overlap. Away from the end there is, which is what
+   * `.cup-out` is for - the picture is put away rather than painted over someone's paragraph.
+   */
+  position: absolute;
+  bottom: 8px;
+  left: var(--cup-left);
+  display: block;
+  width: 136px;
+  height: 136px;
+  margin: 0;
+  filter: drop-shadow(0 6px 14px rgb(120 90 40 / 14%));
+  pointer-events: none;
+  z-index: 2;
+  /* The fade is declared on the base rule so it runs in both directions. On the class that turns it
+     off there would be a transition one way and a snap the other, which is what the reader notices.
+     No fill-mode keyword here: `both` belongs to animations, and a transition shorthand carrying it is
+     invalid - the whole declaration is dropped, the cup snaps after all, and the computed
+     transition-property reads `all`, which is how the app's own check caught this. */
+  transition: opacity 0.42s var(--ease);
+}
+/* No conversation, no cup: the opening screen already shows the same artwork, larger. */
+.transcript-cup.bare {
+  display: none;
+}
+/* The end of the transcript is off screen, so the band is off screen, and the picture in it is dimmed
+   rather than removed: the reader is in the middle of a paragraph and a 136px drawing across it is
+   damage, but a drawing that vanishes and reappears as the follow's catch-up breathes is a blink, and
+   the one thing the picture says - "this page is alive, or it is resting" - is said by its presence.
+   At 0.1 it is a watermark: the prose under it stays coherent, and the artwork is still recognisable
+   as the same drawing rather than a grey smudge. It is never painted *over* the prose at full
+   strength: that is what the 24px threshold decides.
+
+   `pointer-events: none` holds in both states, so a faint cup can never swallow a click meant for a
+   word underneath it. */
+.transcript-cup.cup-out {
+  opacity: 0.1;
+}
+/* Nothing else marks a live turn. The pulsing dot that used to sit beside the name, beside each
+   card, and beside the small grouped actions inside the folded group is gone: one picture under
+   the name says "working" and "resting" in its own drawing, and a turn can no longer grow two
+   markers at once. `.live` stays on the name row - it is the state the transcript reads to pick
+   which picture to show.
+
+   In a stored transcript the marker's container is `.transcript` itself, whose children sit
+   14px apart rather than a turn's 12. Pay back the gap that actually applies, or every stored
+   turn gains 2px between a name and the first thing under it. */
+.transcript > .turn-who {
+  margin-bottom: -14px;
+}
+/* The answer's own label goes away — the turn's pinned name replaced it. The element
+   stays: it is where the live marker and any future per-block label still hang, and
+   removing it from the DOM would be a change to the transcript's shape for a styling
+   decision. */
+.blk-answer > .blk-head {
+  display: none;
+}
+/* No live marker here either. A block that was producing output used to grow a pulsing dot in its
+   label column, and a reasoning block led with one inline; both are replaced by the cup under the
+   turn's name, so a working transcript and a settled one differ by which drawing shows, not by how
+   much of the page moves. */
 
 .blk-body {
   font-size: 14px;
@@ -345,95 +567,78 @@ body {
 }
 .blk-user > .blk-head {
   /* The bubble is right-aligned; a label parked in the *left* gutter is anchored
-     to nothing. Put it above the bubble, sharing its right edge. */
-  position: static;
+     to nothing. Put it above the bubble, sharing its right edge — and pin it there
+     while the bubble is being read, the same affordance the turn's name for cwoffee
+     gets in the gutter. A long message you are still reading should not go unnamed.
+     The paper band is what makes the pin readable: without it the label sits on top
+     of the bubble's own first lines as they slide under it. */
+  position: sticky;
+  top: calc(-1 * var(--scroller-pad-top, 0px));
+  z-index: 4;
   width: auto;
+  /* Same measure as the bubble below it, so the band that makes the pinned label readable
+     is the bubble's width and not a stripe across the whole transcript. */
+  max-width: min(74%, 620px);
+  margin-left: auto;
   display: block;
   text-align: right;
-  margin: 0 2px 4px 0;
+  margin-right: 2px;
+  margin-bottom: 4px;
+  background: var(--color-paper);
+  padding: 1px 2px 2px;
+}
+/* Two of your messages in one turn (a follow-up typed while the turn was still open)
+   is one ask, so it gets one name: the later one carries it. */
+.blk-user.nameless > .blk-head {
+  display: none;
 }
 .blk-user .blk-who { color: var(--color-shell-deep); font-weight: 600; }
 .blk-user .blk-body { color: var(--color-ink); font-weight: 450; }
 .blk-answer .blk-body { color: var(--color-ink); }
-.blk-reasoning .blk-body {
-  color: var(--color-ink-3);
-  font-style: italic;
-  font-size: 13px;
-  line-height: 1.55;
-  position: relative;
-  /* Thinking is the one block that slides under its own label rather than
-     hanging out to the left gutter: the label reads as a heading for the text
-     below it, and the rule below starts at the label's edge. */
-  padding-left: 15px;
-}
-.blk-reasoning .blk-body::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 1px;
-  bottom: 1px;
-  width: 2px;
-  border-radius: 2px;
-  background: var(--color-hairline-2);
-}
+/* A thought is one line, and that is the whole block.
 
-/* Thinking is clamped to three lines by default. A mask fade, not a scrollbar:
-   a scrollbar inside a 3-line box invites a scroll gesture inside a scrolling
-   transcript. While the model is thinking the box is pinned to its tail (the
-   newest line is the interesting one); once the turn settles it returns to the
-   start, which is where a reader scanning a finished block expects to begin. */
-.blk-reasoning .blk-body.settled:not(.expanded) {
-  /* Settled thinking is a header line and nothing else: "Thought for 12s ›", with
-     the body one click away. The old 3-line sneak peek made every finished turn
-     look half-folded. */
-  display: none;
-}
-/* While it is still thinking the peek stays: a block that says "thinking" with
-   nothing under it looks stuck, and watching a model work is the point. */
-.blk-reasoning .blk-body:not(.settled):not(.expanded) {
-  max-height: 4.65em; /* 3 * 1.55 */
-  overflow: hidden;
-  -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
-  mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
-}
-.blk-reasoning .blk-body.expanded {
-  /* A number, not `none`: max-height cannot interpolate to none, so the
-     expansion would jump. 2400px is above any real thinking block, and the
-     curve front-loads the growth so the visible part still lands in ~200ms. */
-  max-height: 2400px;
-  -webkit-mask-image: none;
-  mask-image: none;
-}
-.blk-reasoning .blk-body, .blk-tool .tool-detail {
-  transition: max-height var(--d3) var(--ease);
-}
-/* Reasoning keeps its own layout rather than the shared label gutter: the head is a
-   full-width line above the body, so the label can be any length and the arrow
-   stays inline. Sentence case, because it is a sentence and not a tag. */
+   There is no thinking body in the document at all, so there is nothing here to clamp, mask,
+   expand or keep scrolled. What used to be here - a three-line peek pinned to the tail of a
+   growing block - was the most expensive thing a long turn did on this hardware: every streamed
+   delta wrote a text node into a box with `overflow: auto`, and the renderer answered by
+   re-wrapping the whole block and re-clipping it, several times per token. On a 4.5k-word thought
+   that cost 500-650ms of layout per paint here, and it is why the transcript crawled after a long
+   build.
+
+   So the reasoning text never reaches the DOM. The words are still collected for the store, for
+   branches and for the model's cache - nothing about the record changed, which is what keeps the
+   prompt cache intact. Only the picture of it is gone, replaced by "Thought for 47s · 1.4k words"
+   and, in the accordion, by the entry list. `show the working` reveals the tools and the outputs;
+   it does not put the thinking text back.
+
+   The one thing the preview was genuinely good at - telling you the model was producing rather
+   than stalled, rather than merely saying "thinking" for forty seconds - moved to a number that
+   climbs while it streams (`thinking · 1.4k words`), and to the loop detector in `lib/loop.ts`
+   when the producing has gone round in circles. */
 .blk-reasoning {
   display: block;
-  cursor: pointer;
 }
-.blk-reasoning.is-open { cursor: default; }
 .blk-reasoning .blk-head {
   position: static;
   width: auto;
   text-align: left;
   text-transform: none;
   font-size: 12px;
+  font-style: italic;
   letter-spacing: 0;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding-top: 0;
-  margin-bottom: 4px;
-  cursor: pointer;
+  margin-bottom: 0;
+  /* Not a control, and it must not look like one: no pointer, no expander arrow. A line that
+     cannot be opened and still invites the click is the affordance lie this block used to tell. */
+  cursor: default;
   user-select: none;
+  color: var(--color-ink-3);
 }
-.blk-reasoning .blk-head::after {
-  content: ' \25B8';
-  opacity: 0.6;
-}
-.blk-reasoning .blk-head.open::after {
-  content: ' \25BE';
+.blk-reasoning .blk-head.streaming {
+  color: var(--color-shell-deep);
 }
 .blk-warn .blk-body { color: var(--color-warn); }
 .blk-fail .blk-body { color: var(--color-danger); }
@@ -443,22 +648,26 @@ body {
    answer, and a full-size body line of them reads like one. The tint and the
    left rule make them scannable; the smaller face makes them cheap to skip.
    max-width keeps a long note from becoming a full-measure paragraph. */
-.blk-note {
+/* A question the agent asked and the answer that was given, reloaded from storage.
+   Not a note: notes are the app talking about itself and they left the transcript.
+   This exchange is part of what was said, so it stays in the stream — quietly, and
+   with the question and answer distinguishable without reading both. */
+.blk-asked {
   margin: 4px 0 6px;
   padding: 5px 10px 5px 12px;
-  background: var(--color-note-bg);
-  border: 1px solid var(--color-note-hairline);
-  border-left: 2px solid var(--color-note);
+  background: var(--color-paper-2);
+  border: 1px solid var(--color-hairline);
+  border-left: 2px solid var(--color-shell);
   border-radius: 8px;
 }
-.blk-note .blk-body {
+.blk-asked .blk-body {
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--color-ink-2);
   max-width: 78ch;
 }
-.blk-note .blk-body strong {
-  color: var(--color-note);
+.blk-asked .blk-body strong {
+  color: var(--color-ink);
   font-weight: 600;
 }
 
@@ -1077,6 +1286,34 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* A conversation typing its own name. A caret rather than a spinner, because what is
+   happening is a word being written: the name arrives token by token from the engine
+   (`titleDelta`) and the row is only renamed in the store when it is final.
+
+   The caret is drawn by the row, not by an animation on the text, so a name that
+   settles mid-word never jumps. Under reduced motion it stops blinking and simply
+   stands: it still has to say "this name is arriving", and a static bar says that
+   without moving. */
+.sess-title .type-caret {
+  display: inline-block;
+  width: 1.5px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--color-ink-3);
+  animation: typecaret 1s steps(1, end) infinite;
+}
+@keyframes typecaret {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sess-title .type-caret {
+    animation: none;
+    opacity: 0.8;
+  }
+}
 .sess-n {
   font-size: 10.5px;
   color: var(--color-ink-3);
@@ -1161,6 +1398,14 @@ body {
   font-size: 12px;
   color: var(--color-ink-3);
 }
+/* An icon centred by itself rather than by whatever display value a later rule happens to set.
+   `margin: auto` centres a box in grid, flex and inline-flex alike, so a rule that changes the
+   display mode - which is how the mobile hamburger appears at all - cannot move the glyph into a
+   corner of the button on the way. */
+.iconbtn > svg,
+.iconbtn > img {
+  margin: auto;
+}
 .iconbtn:hover { background: var(--color-hairline); color: var(--color-ink); }
 .iconbtn.wide { width: auto; padding: 0 7px; font-size: 11px; }
 
@@ -1181,6 +1426,71 @@ body {
   flex: none;
   padding-top: 6px;
   border-top: 1px solid var(--color-hairline);
+}
+
+/* ---- the identity row that replaced the bottom toolbar -------------------- */
+/* One line: the mark, the name, and three icons pushed to the right edge. The seam above it is dashed
+   rather than solid because the row is a *place*, not a container - it groups, it does not enclose. */
+.side-id {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 6px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--color-hairline);
+  min-width: 0;
+}
+.side-id-mark {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  object-fit: contain;
+  /* The artwork's own ink does the shaping; a solid disc behind it would be a plate under a cup. */
+  filter: drop-shadow(0 1px 2px rgb(120 90 40 / 18%));
+}
+.side-id-name {
+  font-weight: 550;
+  font-size: 12.5px;
+  color: var(--color-ink);
+  letter-spacing: 0.01em;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.side-id-acts {
+  margin-left: auto;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.sfi {
+  position: relative;
+  /* A thumb, not a hair: the phone-width check fails a control under 28px tall, and the row is
+     exactly the place where a control that shrinks is a control you miss. */
+  width: 30px;
+  height: 28px;
+}
+/* The state the old bar spelled out in words (gateway live, an event dropped) survives as a dot on the
+   glyph: fewer pixels, same "do I need to look at this" answer. */
+.sfi-dot {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.sfi-dot.live {
+  background: var(--color-ok);
+  box-shadow: 0 0 0 2px var(--color-ok-bg);
+}
+.sfi-dot.hot {
+  background: var(--color-warn);
+  box-shadow: 0 0 0 2px var(--color-warn-bg);
 }
 .side-item {
   display: flex;
@@ -1207,6 +1517,11 @@ body {
   display: none;
 }
 
+/* The sidebar drawer's dim. Two things about its number are load-bearing:
+   it must stay BELOW `.sidebar` (40), because a dim that covers the open drawer
+   eats every tap meant for a session row; and it must not share its name with the
+   settings overlay's dim, which is `.mscrim` further down precisely because it has
+   to sit above everything. */
 .scrim {
   position: absolute;
   inset: 0;
@@ -1227,10 +1542,27 @@ body {
   opacity: 1;
   pointer-events: auto;
 }
+/* Above 768px there is no drawer, so there is nothing to dim - and this layer is not
+   harmless there. It spans the whole window and is positioned, while a docked sidebar is
+   a plain flex item with no z-index to answer it, so a dim left mounted (Ctrl+B used to
+   do exactly that) painted over the session list and swallowed the taps meant for it. */
+@media (min-width: 768px) {
+  .scrim {
+    display: none;
+  }
+}
 
 @media (max-width: 767px) {
+  /* Fixed, not absolute. An absolutely positioned drawer is anchored to the
+     initial containing block, and a mobile browser moves that: with the keyboard
+     open, or after the URL bar hides and the visual viewport pans, the drawer and
+     its dim drift off the pixels you are looking at. You can see the row and miss
+     it. Fixed anchors both to the window you are actually touching. */
+  .scrim {
+    position: fixed;
+  }
   .sidebar {
-    position: absolute;
+    position: fixed;
     z-index: 40;
     top: 2.75rem;      /* below the titlebar */
     bottom: 0;
@@ -1268,6 +1600,8 @@ body {
   }
   .sidebar.open {
     transform: translateX(0);
+    /* Scrolling the session list must not scroll the page behind the drawer. */
+    overscroll-behavior: contain;
   }
   @media (prefers-reduced-motion: reduce) {
     .sidebar,
@@ -1277,23 +1611,95 @@ body {
   }
   .sidemenu {
     display: inline-flex;
+    /* `inline-flex` replaces the `grid; place-items: center` the shared icon-button rule uses, and
+       a flex container without these two lines puts its child at the start of the main axis and
+       stretches it on the cross axis: the hamburger sat in the top-left corner of a 38px button.
+       The drawing is centred inside its own viewBox, so the corner was entirely this rule's work. */
+    align-items: center;
+    justify-content: center;
   }
-  /* Keep the status that matters on a small screen; drop the diagnostics. */
-  .telem .telem-extra {
-    display: none;
-  }
-  .telem {
-    gap: 10px;
-    padding-left: 10px;
-    padding-right: 10px;
-  }
-  /* Tap targets: 11px text with a 20px hit area is unusable with thumbs. */
+  /* Tap targets for the status bar come from its own container query below, not from
+     the viewport: the bar is what has to fit, and a narrow desktop window needs the same
+     answer a phone does. */
+  /* Tap targets: 11px text with a 20px hit area is unusable with thumbs. The
+     desktop sizes (24-28px) were set for a mouse; on a phone the same rows are a
+     third of the recommended minimum, which is what "I tap and nothing happens"
+     usually means before it means anything about the code. */
   .composer textarea {
     font-size: 16px;   /* <16px triggers zoom-on-focus on iOS */
   }
   .pill {
     padding-top: 6px;
     padding-bottom: 6px;
+  }
+  .sidebar .pill {
+    min-height: 38px;
+  }
+  .sessrow {
+    height: 42px;
+    padding: 0 5px;
+  }
+  .sessbtn {
+    height: 42px;
+    font-size: 13.5px;
+  }
+  .side-item {
+    height: 38px;
+    font-size: 13.5px;
+  }
+  .iconbtn {
+    width: 34px;
+    height: 34px;
+  }
+  .iconbtn.wide { width: auto; padding: 0 9px; }
+  /* There is no hover on a touch screen, so an affordance that fades itself in on
+     hover is an affordance that never appears. */
+  .iconbtn.more {
+    opacity: 1;
+  }
+  .sidemenu {
+    width: 38px;
+    height: 38px;
+  }
+  .newbtn {
+    width: 38px;
+    height: 38px;
+  }
+  .modesel {
+    padding-top: 9px;
+    padding-bottom: 9px;
+    font-size: 13px;
+  }
+  .cbtn {
+    height: 36px;
+  }
+  .cbtn.sq {
+    width: 36px;
+  }
+  .cbtn.go {
+    width: 42px;
+    height: 38px;
+  }
+  .wsrow {
+    min-height: 38px;
+    padding: 6px;
+  }
+  .ws-input {
+    min-height: 38px;
+  }
+  .run-out,
+  .refhead,
+  .msg-act,
+  .tact,
+  .ws-act {
+    min-height: 30px;
+  }
+  /* No double-tap-to-zoom anywhere a tap is a control: the browser's 300ms
+     "maybe this is a double tap" pause is the reason a fast tap on a session row
+     reads as a tap that did nothing. */
+  button, a, input, textarea, select, summary, label,
+  .sessrow, .wsrow, .pop-item, .ctx-item, .msg-act, .tact {
+    touch-action: manipulation;
   }
 }
 
@@ -1369,20 +1775,6 @@ body {
   border-radius: 6px;
   padding: 2px 6px;
 }
-
-/* ---- keyboard help ------------------------------------------------------ */
-.keyhelp {
-  border: 1px solid var(--color-hairline);
-  background: transparent;
-  color: var(--color-ink-3);
-  border-radius: 50%;
-  width: 18px;
-  height: 18px;
-  line-height: 1;
-  font-size: 11px;
-  cursor: pointer;
-}
-.keyhelp:hover { color: var(--color-ink); border-color: var(--color-shell); }
 /* Not a menu item: nothing to click, it is a two-column reference row. */
 .pop-item.static { cursor: default; }
 .pop-item.static:hover { background: transparent; }
@@ -1425,10 +1817,16 @@ body {
 }
 
 /* ---- sidebar selection ------------------------------------------------- */
+/* Pinned, not scrolled: this row is a sidebar column child that sits *above* the scrolling list, so
+   the heading and its fold / add controls stay reachable however long the conversation list gets. A
+   sticky header inside the scroller was the other option and was not taken: it needs an opaque
+   backdrop, and the sidebar is painted with a gradient, so the band would not match what it covers. */
 .sesshead {
   display: flex;
+  flex: none;
   align-items: center;
   justify-content: space-between;
+  margin: 6px 0 1px;
   padding: 0 4px;
   font-size: 11px;
   letter-spacing: 0.03em;
@@ -1606,11 +2004,124 @@ body {
   border-style: solid;
   border-color: var(--color-shell);
 }
-.empty-ws-x {
+.empty-ws-chev {
   color: var(--color-ink-3);
-  font-size: 11px;
+  font-size: 10px;
+  line-height: 1;
 }
 
+/* The workspace picker: the folders already added, a filter for when there are more than fit in
+   one glance, and under a seam the two things that are not folders - add one, choose none. The
+   field sticks to the top of the panel because the panel itself scrolls: a filter that scrolls out
+   of sight is a filter that cannot be edited while the list is being read. */
+.wsp-search {
+  position: sticky;
+  top: -6px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 2px 2px 6px;
+  padding: 5px 9px;
+  border-radius: 9px;
+  border: 1px solid var(--color-hairline);
+  background: var(--color-paper-2);
+}
+.wsp-search:focus-within {
+  border-color: var(--color-shell);
+  background: var(--color-paper);
+}
+.wsp-ico {
+  flex: none;
+  color: var(--color-ink-3);
+}
+.wsp-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  font-size: 12.5px;
+  color: var(--color-ink);
+}
+.wsp-input:focus {
+  outline: none;
+}
+.wsp-input::placeholder {
+  color: var(--color-ink-4);
+}
+.wsp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* A fixed-height box with its own scroll. The alternative - show the ten most recent and drop the
+     rest - hides the folder you added in August, and a hidden folder is a folder someone adds again
+     under a new name. The height is bounded so the popover cannot grow past the window it opened in. */
+  max-height: 264px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* A short box must not read as a short list: this line is the difference between "there are three
+   folders" and "there are eleven and you are seeing the top of them". */
+.wsp-count {
+  padding: 4px 8px 2px;
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--color-ink-4);
+}
+/* The exchange rule, made visible: a closed row is dimmed and its title says why. It is still a row,
+   not a gap, because the ask is still a thing the app can do - just not for this conversation. */
+.wsp-act:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.wsp-act:disabled:hover {
+  background: none;
+}
+.wsp-item,
+.wsp-act {
+  grid-template-columns: 15px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 9px;
+  row-gap: 1px;
+  padding: 6px 8px;
+}
+.wsp-item .wsp-ico,
+.wsp-act .wsp-ico {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: center;
+}
+.wsp-item .pop-lbl,
+.wsp-act .pop-lbl {
+  grid-column: 2;
+  grid-row: 1;
+}
+.wsp-item .pop-sub,
+.wsp-act .pop-sub {
+  grid-column: 2;
+  grid-row: 2;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--color-ink-4);
+}
+.wsp-item .pop-sub.mono {
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wsp-item.on::after,
+.wsp-act.on::after {
+  grid-column: 3;
+}
+/* The seam says the two actions below it belong to the panel, not to the list above: in the list
+   every row is a folder with a name, and "New workspace" is not a folder someone named. */
+.wsp-sep {
+  height: 0;
+  margin: 7px 4px 5px;
+  border-top: 1px dashed var(--color-hairline-2);
+}
 /* Mode tabs. Deliberately not wired to anything yet - it states where the app is
    going (a coworking surface vs a plain chat) without pretending the second one
    exists. The thumb is one element that slides, not two buttons that swap
@@ -1803,6 +2314,112 @@ body {
   gap: 8px;
   margin: 10px 0 4px 62px;
 }
+/* An attachment — the one file the model wrote in order to hand it over — keeps its
+   Save control against the chip instead of floating in the strip. A loose "Save" reads
+   as a Save for whichever chip happens to be nearest, and in a row that also holds
+   working files that is a different file. The joined pair is deliberate: one object,
+   two acts (open it where it sits / copy it where you choose).
+
+   One line, and one dashed edge. The chip used to draw its own solid box inside the unit's
+   box, which made a 44px block out of a filename and — because the file sits in `.cws`, a
+   folder no file manager, terminal listing or screenshot shows — drew a container nobody can
+   see. A dashed hairline says what is true: this is a grouping, not a place. */
+.attachline {
+  /**
+   * The hand-over line, against the right edge of the text column.
+   *
+   * Two kinds of file, two positions. The working strip under the prose is left-aligned because it
+   * is a record of what the turn touched, in the order it touched it. An attachment is a thing the
+   * model wrote *to give you*, so it sits on its own line at the right edge, where the eye finds it
+   * on the way out of the paragraph instead of in the middle of the file list. Right alignment is
+   * also what the Save control asks for: the action is away from the prose, toward the margin.
+   */
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  margin: 10px 0 0 0;
+}
+.attachline + .filestrip {
+  margin-top: 6px;
+}
+.attachunit {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  /* 2px of inboard air, so the control's hover square has somewhere to be painted that is not on
+     top of the dashed edge. Without it the hover fill is a rectangle the exact height of the unit
+     and it reads as the whole right end of the chip lighting up. */
+  padding: 2px;
+  border: 1px dashed var(--color-hairline-2);
+  border-radius: 8px;
+}
+.attachunit .filechip {
+  border: 0;
+  background: transparent;
+  padding: 3px 6px 3px 6px;
+  max-width: 260px;
+  border-radius: 7px 0 0 7px;
+  /* The seam between the file and the act that hands it over lives on the chip, not on the button:
+     the button's own box is now a small square that does not reach the unit's edges. */
+  border-right: 1px dashed var(--color-hairline-2);
+}
+.attachunit .filechip:hover {
+  background: var(--color-tint);
+}
+.attach-save {
+  /**
+   * The one control on an attachment row, drawn as a glyph rather than a word.
+   *
+   * The row is a single line and the filename is the thing that must survive at full size; "Save"
+   * next to it used to cost 40px of name. The dashed seam stays, because it is what says the action
+   * belongs to this file and not to the row in general. What it does and what just happened live in
+   * `title` and `aria-label`.
+   *
+   * A fixed square, inset inside the unit, rather than a box that fills the unit's height: the hover
+   * fill is what the reader sees, and a fill that is flush with the dashed border makes the border
+   * look like it is being overdrawn by a rectangle that does not fit.
+   */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-ink-2);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.attach-save:hover {
+  background: var(--color-tint);
+  color: var(--color-ink);
+}
+.attach-save:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+/* Proof that the save happened, without a word: the file dialog already took the reader's eye off
+   this row, so the glyph has to be the answer. */
+.attach-save.done {
+  color: var(--color-ok);
+}
+/* One line for the delivered file: name and size side by side. The mime type of a file the
+   model just described to you is not information; the size is what you weigh before copying it
+   somewhere of your own. */
+.filechip.one-line .file-meta {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 6px;
+}
+.filechip.one-line .file-sub {
+  font-size: 11px;
+  white-space: nowrap;
+}
 /* "the model wrote 38 files": one pill, expandable, every path inside it still a
    chip you can open. Sits in the same row as the artifact chips so a turn that
    produced both a deliverable and a codebase change shows the deliverable first
@@ -1905,9 +2522,28 @@ body {
   border: 1px solid var(--color-hairline);
   border-radius: 9px;
   background: var(--color-paper-2);
-  overflow: hidden;
+  /**
+   * `clip`, not `hidden` — and that single word is the whole feature.
+   *
+   * `overflow: hidden` makes this box the nearest scroll container, and a sticky child
+   * measured against a box that can never scroll never moves: the header sat at the top of
+   * the block, scrolled away with it, and a 200-line HTML or SVG answer left the copy and
+   * preview buttons off the top of the screen while the person was halfway through reading
+   * the code. `clip` cuts the rounded corners off a long block exactly as `hidden` did
+   * without claiming the scrollport, so the header inside it can stick to the real one.
+   */
+  overflow: clip;
 }
 .code-head {
+  /* The actions stay reachable for as long as the block is being read. The header is stuck
+     to the transcript's own scroller and constrained by the block it belongs to, so it
+     stops the moment the block ends - it does not float over the next answer. The negative
+     offset is the scroller's top gutter (see `.scroller`): sticky is measured from the
+     content edge, and without it the header would hang 24px too low with a band of moving
+     code above it. */
+  position: sticky;
+  top: calc(-1 * var(--scroller-pad-top, 0px));
+  z-index: 3;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1921,24 +2557,99 @@ body {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--color-ink-4);
+  flex: none;
 }
-.code-acts { display: flex; gap: 6px; flex: none; }
+/* How big the block is, which is the question a folded block otherwise refuses to answer. */
+.code-meta {
+  flex: 1;
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--color-ink-4);
+  padding-right: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.code-acts { display: flex; gap: 3px; flex: none; }
 .code-act {
-  font-size: 11px;
-  padding: 3px 8px;
+  /**
+   * An icon, not a word, on every block.
+   *
+   * The row is 22px tall and shares it with the language tag; four words in four languages do not
+   * fit, and the code the row belongs to is what the reader actually came to look at. The name of
+   * each action lives in `title` and `aria-label`, which is where a name costs no pixels and stays
+   * reachable to a screen reader. The hit area stays a real 24x22 box rather than the glyph.
+   */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 22px;
+  padding: 0;
   border-radius: 6px;
-  border: 1px solid var(--color-hairline);
+  border: 1px solid transparent;
   background: transparent;
-  color: var(--color-ink-3);
+  color: var(--color-ink-4);
   cursor: pointer;
 }
-.code-act:hover { color: var(--color-ink); border-color: var(--color-shell); }
+.code-act:hover { color: var(--color-ink); background: var(--color-paper-2); border-color: var(--color-hairline); }
 .code-act.done { color: var(--color-ok); border-color: var(--color-ok); }
+/* The render button says which state it left the block in, so the block can be read at a glance. */
+.code-act[aria-pressed='true'] { color: var(--color-ink); background: var(--color-paper-2); border-color: var(--color-shell); }
+/* A fence that has not closed has no working actions. They are drawn in place so the block never
+   changes shape when they come good, and they are visibly waiting rather than missing. */
+.code-act:disabled { color: var(--color-ink-4); opacity: 0.42; cursor: default; }
+.code-act:disabled:hover { background: transparent; border-color: transparent; color: var(--color-ink-4); }
+.act-ico { display: block; }
+.code-fold .act-ico { transition: transform 160ms ease; }
+@media (prefers-reduced-motion: reduce) {
+  .code-fold .act-ico { transition: none; }
+}
+/* A folded block hides its source and keeps its head: the language, the size, and the way back. */
+.codeblk.folded pre { display: none; }
+.codeblk.folded .code-head { border-bottom: 0; }
+.codeblk.folded .code-fold .act-ico { transform: rotate(-90deg); }
+.codeblk.streaming .code-head { border-bottom: 1px solid var(--color-hairline); }
+.codeblk.streaming { border-style: dashed; }
 .codeblk pre {
   margin: 0;
   border: 0;
   border-radius: 0;
   background: transparent;
+  /* The block is a row: the numbers on the left, the code on the right, and the horizontal scroll
+     lives on the code alone. If the `pre` were the scroll container, the gutter would slide out of
+     sight at the same moment the reader wanted to know which line they had scrolled to. */
+  display: flex;
+  align-items: stretch;
+  padding: 0;
+  overflow: clip;
+}
+.codeblk pre .ln {
+  flex: none;
+  padding: 10px 9px 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  text-align: right;
+  white-space: pre;
+  color: var(--color-ink-4);
+  background: var(--color-paper-3);
+  border-right: 1px solid var(--color-hairline);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* A fence that has opened but holds no code yet has nothing to number. Drawn empty, the gutter is a
+   strip of colour with a rule down its side, which reads as a column that lost its content. */
+.codeblk pre .ln:empty {
+  display: none;
+}
+.codeblk pre code {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
 }
 .pv-inline {
   display: block;
@@ -1948,6 +2659,27 @@ body {
   border-top: 1px solid var(--color-hairline);
   background: var(--color-paper);
 }
+/* A rendered HTML block, in the block. The frame is the safety boundary and the height is a
+   reading height rather than the document's real height: an inline preview that is 4000px tall
+   recreates the scroll it was meant to save. */
+.pv-inline-frame {
+  display: block;
+  width: 100%;
+  height: 340px;
+  padding: 0;
+  border: 0;
+  border-top: 1px solid var(--color-hairline);
+  background: #fff;
+}
+/* A ```md block read as prose instead of as source. Same renderer as the answer itself, so the
+   typography matches the paragraph above it. */
+.md-render {
+  padding: 12px 14px 13px;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.md-render > :first-child { margin-top: 0; }
+.md-render > :last-child { margin-bottom: 0; }
 
 /* ---- preview panel -------------------------------------------------------- */
 .pv {
@@ -2005,8 +2737,9 @@ body {
 /* ================================================================ motion ==
    One curve and three durations, used everywhere. Purposeful motion has a job:
    it says where a thing came from and whether a state change was the one you
-   asked for. Nothing here loops except the cup's steam, and nothing here moves
-   more than 6px.
+   asked for. Nothing in CSS loops any more: the only looping thing on screen is the cup,
+   and its motion lives inside its own picture file rather than here, because an animated
+   image cannot be styled or frozen (see `.cupwrap .cup`). Nothing here moves more than 6px.
 
    A note on the streaming reveal (.tin): each word is one span, appended once,
    animated once, never rewritten. Each markdown block is closed in place when its
@@ -2528,7 +3261,7 @@ body {
    where the line structure is the content: lists, tables, quotes, code. */
 .live-para { white-space: normal; }
 .live-para.fenced { white-space: pre-wrap; }
-.blk-reasoning .blk-body.streaming { white-space: pre-wrap; }
+/* No reasoning rule here any more: a streamed thought has no body element to wrap. */
 
 /* Only blocks created during a live turn ease in. Stored transcripts are
    rendered outside .turn, so opening an old session does not play 40 entrances
@@ -2560,46 +3293,6 @@ body {
 /* Anything that appears because you did something fades in rather than
    snapping in: the row you just created, the chip you just attached. */
 .filechip { animation: cwoffee-fade var(--d2) var(--ease-out) both; }
-
-/* ------------------------------------------------------- footer controls -- */
-.fbtn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 22px;
-  padding: 0 8px;
-  border: 1px solid transparent;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--color-ink-2);
-  font-size: 11.5px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.fbtn:hover { background: var(--color-tint); color: var(--color-ink); }
-.fbtn[aria-expanded='true'] {
-  background: var(--color-paper);
-  border-color: var(--color-hairline-2);
-  color: var(--color-ink);
-  box-shadow: 0 1px 0 rgb(0 0 0 / 4%);
-}
-.fbtn .flbl { font-weight: 600; letter-spacing: 0.01em; }
-.fbtn .fsum { color: var(--color-ink-3); font-variant-numeric: tabular-nums; }
-.fbtn .fsum b { color: var(--color-ink); font-weight: 600; }
-.fbtn .fsub { font-size: 10.5px; }
-.fbtn .fsep { margin: 0 3px; color: var(--color-hairline-2); }
-
-/* A dot that means something: green only when something is actually attached
-   or arriving, amber when the frame budget was missed, grey when idle. */
-.fdot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--color-hairline-2);
-  flex: none;
-}
-.fdot.live { background: var(--color-ok); box-shadow: 0 0 0 2px var(--color-ok-bg); }
-.fdot.hot { background: var(--color-warn); box-shadow: 0 0 0 2px var(--color-warn-bg); }
 
 /* ------------------------------------------------------ metrics popover -- */
 .pop.pop-wide { min-width: 340px; max-height: min(74vh, 520px); }
@@ -2705,94 +3398,28 @@ body {
 
 /* ------------------------------------------------------ empty session --- */
 /* The cup is the app's face, so the empty screen uses it at a size where the
-   hand-drawn face actually reads. Steam is drawn rather than baked into the
-   PNG so it can move, and it is the only looping animation in the app. */
+   hand-drawn face actually reads. Its picture animates itself, and nothing is drawn on
+   top of it: the drawing already carries the gesture. */
 .cupwrap {
   position: relative;
-  width: 108px;
-  height: 108px;
+  /* The idle artwork is 480 units square and its ink occupies 300x273 of that; the still
+     icon it replaces was 256 square with 224x204 of ink. At a 108px box the new cup painted
+     about 67px wide where the old one painted about 94, so the box went to 152px to land back
+     on the size it has always been: 152 x 300/480 = 95px. That arithmetic, not taste. */
+  width: 152px;
+  height: 152px;
   margin-bottom: 4px;
-  animation: cwoffee-bob 5.5s var(--ease) infinite;
 }
 .cupwrap .cup {
-  width: 108px;
-  height: 108px;
+  width: 100%;
+  height: 100%;
   display: block;
-  /* The PNG is rendered at 8 sizes; at this size the 128px variant is used. */
-  image-rendering: auto;
   filter: drop-shadow(0 6px 14px rgb(120 90 40 / 14%));
+  /* Deliberately no motion here. The picture is an animated WebP that already breathes; the
+     `cwoffee-breathe` scaleY this rule used to carry stretched the same artwork a second time,
+     and the two reads fought. A raster loop cannot be frozen by CSS either, so reduced motion
+     is handled by loading a different file (`idleArt` in App.svelte), not by styling this one. */
 }
-/* Steam, drawn rather than stacked. The old version was three capsules placed
-   above the *box* - measured, their bottoms landed ~30px clear of the rim, so
-   they read as stray dashes rather than something leaving the coffee. These are
-   three S-curves whose feet are on the coffee surface itself: the artwork's mouth
-   spans y=48..78 of a 256-unit box and the liquid x=62..178, so the paths start
-   at y=58 and x=90/124/156 in that same space, and `viewBox` keeps them anchored
-   no matter what size the cup is rendered at. A short dash then travels up each
-   curve, which is what makes it read as rising rather than blinking. */
-.steamart {
-  position: absolute;
-  inset: 0;
-  width: 108px;
-  height: 108px;
-  /* The wisps are allowed to leave the artwork box - steam does. */
-  overflow: visible;
-  pointer-events: none;
-  /* Mid-grey, not the lightest ink: a wisp at 30% of near-white on cream paper is
-     invisible, which is the difference between "steam" and "nothing there". */
-  color: var(--color-ink-2);
-}
-/* Soft, static blur on the group: one raster, not an animated filter, and it is
-   what stops three stroked curves from reading as three solid wires. */
-/* Two passes over the same three curves: a wide blurred body and a narrow, barely
-   blurred thread inside it. A single stroked curve reads as a wire no matter how it
-   is animated; a soft wide shape with a brighter centre reads as smoke. */
-.wisps {
-  filter: blur(2.2px);
-  animation: cwoffee-sway 5.6s ease-in-out infinite alternate;
-}
-.cores {
-  filter: blur(0.6px);
-  animation: cwoffee-sway 5.6s ease-in-out infinite alternate;
-}
-@keyframes cwoffee-sway {
-  from { transform: translateX(-2px); }
-  to { transform: translateX(3px); }
-}
-.wisp {
-  fill: none;
-  stroke: url(#cwoffee-steam-fade);
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  opacity: 0;
-  /* pathLength is normalised to 100 on each path, so one set of dash maths drives
-     three curves of different lengths. 34 units of ink on a 100-unit path is a
-     puff, not a dash. */
-  stroke-dasharray: 34 100;
-  animation: cwoffee-wisp 4.2s var(--ease) infinite;
-}
-.w1, .c1 { animation-delay: 0s; }
-.w2, .c2 { animation-delay: 1.4s; }
-.w3, .c3 { animation-delay: 2.8s; }
-.w1 { stroke-width: 15; }
-.w2 { stroke-width: 19; }
-.w3 { stroke-width: 14; }
-.c1 { stroke-width: 6; }
-.c2 { stroke-width: 7.5; }
-.c3 { stroke-width: 5.5; }
-@keyframes cwoffee-wisp {
-  /* Falling offsets move the puff up the path, rim to air. The gradient already
-     fades it out toward the head, so the opacity curve only has to bring it in. */
-  0%   { stroke-dashoffset: 34;  opacity: 0; }
-  12%  { opacity: 1; }
-  55%  { opacity: 0.72; }
-  100% { stroke-dashoffset: -66; opacity: 0; }
-}
-@keyframes cwoffee-bob {
-  0%, 100% { transform: translateY(0) rotate(0deg); }
-  50%      { transform: translateY(-4px) rotate(-1.2deg); }
-}
-
 /* Rounded stack where the platform has one. No webfont: a 40 KB download that
    blocks the first paint costs more than the type is worth, and on Linux this
    falls back to the UI face, which is already the app's voice. */
@@ -2845,12 +3472,12 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .pop, .filechip, .tin, .turn > * { animation: none; }
-  .blk-reasoning .blk-body, .blk-tool .tool-detail { transition: none; }
+  .blk-tool .tool-detail { transition: none; }
   .pop-item, .btn-go, .btn-ghost, .btn-bad, .keyhelp, .fbtn, .tip, .filechip,
   .sessrow, .wsrow, .cbtn, .att-x, .ssw i, .mbar i { transition: none; }
-  .cupwrap, .wisp, .wisps, .cores { animation: none; }
-  /* Frozen mid-rise rather than switched off: the cup still reads as hot. */
-  .wisp { opacity: 0.45; stroke-dashoffset: -24; }
+  /* Nothing here loops any more. The cup's motion is inside its picture file, and the
+     reduced-motion case loads a still of it instead (see `idleArt`); the drawn wisp of steam
+     that used to sit on top of the cup is gone, so this block has nothing left to freeze. */
   .ssw i, .mbar i { transition: none; }
 }
 
@@ -2878,9 +3505,32 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 
 /* The footer shows numbers that change several times a second. Proportional figures
    make every update nudge its neighbours, which registers as a flicker in the corner
-   of the eye - and it is the one thing on screen moving for a reason other than text. */
-.telem, .telem b, .pop-metrics, .fsum {
-  font-variant-numeric: tabular-nums;
+
+/* ---- the status bar, at the width it actually has ------------------------
+   The report: "the footer items are too tiny and too long — on my phone the theme
+   and help buttons are off-screen". Both halves have one cause. The bar is a nowrap
+   row of three status pills, a diagnostic and two 18px round buttons, and nothing in
+   it can shrink; at 360px the row is simply wider than the window, and what falls off
+   the right edge is whatever was added last — the theme toggle and the keyboard help.
+
+   So the rules hang off the bar's own width rather than the viewport's. That is not
+   tidiness: a 700px-wide desktop window has the same problem as a phone and, keyed to
+   `max-width: 767px` of viewport, got none of the fix. A container query asks the only
+   question that matters — how wide is this row? — and it is also the only way the
+   self-test can prove the rule, by narrowing the bar in place rather than by hoping
+   the test window happens to be a phone.
+
+@container (max-width: 660px) {
+  /* A taller row and real tap targets: the desktop sizes (22px pills, 18px round
+     buttons, 11.5px text) were set for a mouse, and a thumb lands on about half of
+     each. The two status pills whose whole summary is an address or a port drop it —
+     their popover carries the detail — while the metrics pill keeps its numbers,
+     because those are the reason that one exists, and ellipsises instead of pushing
+}
+
+@container (max-width: 470px) {
+  /* Narrow enough that even the short labels cost too much. The gateway and search
+     pills keep their dot — live, off, or refusing is the only fact worth the space —
 }
 
 /* A refusal the user can see. It sits above the footer rather than in the panel
@@ -2908,6 +3558,17 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   animation: cwoffee-rise var(--d3) var(--ease-out) both;
 }
 .toast.bad { border-left-color: var(--color-warn); }
+/* An app-level note: a migration, a compaction, an endpoint with no window set. These
+   used to be blue lines inside the transcript, which is what made the transcript read as
+   cluttered. They get the same tint here, where they can be dismissed, and a smaller face
+   than a refusal: nobody has to act on them. */
+.toast.note {
+  background: var(--color-note-bg);
+  border-color: var(--color-note-hairline);
+  border-left: 3px solid var(--color-note);
+  font-size: 11.5px;
+  color: var(--color-ink-2);
+}
 .toast-x {
   display: inline-flex;
   align-items: center;
@@ -2966,12 +3627,39 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   --ring: 0 0 0 2px color-mix(in srgb, var(--color-shell) 62%, transparent);
 }
 
-.scrim {
+/* The settings overlay's dim — deliberately NOT the `.scrim` the sidebar drawer
+   dims with. This rule used to carry that name, and being later in the file at the
+   same specificity it won the cascade for `position` and `z-index`: the drawer's dim
+   became `fixed` at z-index 70, i.e. above the drawer itself (40). Every touch on an
+   open drawer therefore landed on the dim, whose only job is to close it — which is
+   the report: "on a phone the sidebar's contents are unclickable; I tap and it just
+   hides. I have to zoom the page out until the sidebar is docked to use it."
+   Two different layers, two names. */
+.mscrim {
   position: fixed;
   inset: 0;
   z-index: 70;
-  background: rgba(0, 0, 0, 0.26);
+  /**
+   * Darkened *and* blurred, for one reason: the report was that the toolbar behind the
+   * dialog read as live — "I can click metrics through the settings screen". At 26% black
+   * the footer is still bright enough to look like part of the app, and a click there is
+   * spent closing the dialog rather than doing what was aimed at. A dim you believe is a
+   * wall is the affordance; both effects together say it without depending on either one
+   * being supported (an unsupported `backdrop-filter` is dropped, and the darkening stands).
+   */
+  background: rgba(14, 12, 10, 0.52);
+  -webkit-backdrop-filter: blur(3px) saturate(0.86);
+  backdrop-filter: blur(3px) saturate(0.86);
   animation: cwoffee-fade var(--d2) var(--ease-out);
+}
+
+/* While the settings dialog is open, the app behind it is not a place you can act in.
+   `inert` on the chrome stops clicks, taps, focus and keyboard traversal; this is the
+   same rule for engines that do not implement `inert`, so the guarantee does not depend
+   on a version check. The dialog and its own dim are excluded by name: the dim is the
+   thing you click to get out. */
+.app-shell.modal-open > *:not(.mscrim):not(.settings) {
+  pointer-events: none;
 }
 
 .settings {
@@ -2986,8 +3674,28 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   transform: translate(-50%, -50%);
   display: flex;
   flex-direction: column;
+  /**
+   * A definite opening size, and a frame the person can change.
+   *
+   * Two separate complaints. It was `max-height`, so the size the dialog opened at was
+   * whatever the current page happened to need: "About" collapsed it, "Models" grew it, and
+   * every page change moved the frame — and the controls — out from under the pointer. A
+   * fixed `width`/`height` makes the opening size one number that does not depend on which
+   * page was clicked into. And it could not be resized at all, so a long model row on a
+   * 900px-tall screen was a scroll fight: `resize: both` hands the size over, and the size
+   * reached is remembered for the next opening (see `settingsRes` in App.svelte).
+   *
+   * `overflow: hidden` is what makes `resize` work at all (a resizable box has to clip),
+   * and the page inside still scrolls on its own.
+   */
   width: min(1010px, calc(100vw - 32px));
-  max-height: min(740px, calc(100vh - 44px));
+  height: min(740px, calc(100vh - 44px));
+  min-width: min(430px, calc(100vw - 24px));
+  min-height: min(300px, calc(100vh - 32px));
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  resize: both;
+  overflow: hidden;
   border: 1px solid var(--color-hairline);
   border-radius: 14px;
   background: var(--color-paper);
@@ -3063,27 +3771,33 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 }
 .set-nav:hover { background: var(--color-paper-2); color: var(--color-ink); }
 .set-nav:focus-visible { outline: none; box-shadow: var(--ring); }
+/* The rail is a list of tabs, and the app moves focus into it itself (a deep link, a section jump).
+   `:focus-visible` deliberately does not match focus that did not come from a key press, which leaves
+   those paths with no mark at all - a keyboard user cannot see where the app put them. On a single
+   column of tabs a ring that also survives a mouse click costs nothing and is the only ring the app
+   can prove it has. Declared after `.set-nav.on`, whose own fill would otherwise swallow it. */
+.set-nav:focus { outline: none; box-shadow: var(--ring); }
 .set-nav.on {
   background: var(--color-paper-2);
   color: var(--color-ink);
-  font-weight: 600;
-  /* One 2px mark in the accent hue says which page is on without a filled
-     block, which would make the rail louder than the page it labels. */
-  box-shadow: inset 2px 0 0 var(--color-shell);
+  font-weight: 550;
+  /* No accent mark. The fill and the weight already say which page is on, and a coloured bar next
+     to it is a second answer to a question the rail only needs to answer once - which is the
+     difference between a rail that reads as quiet and one that reads as designed. */
 }
 .set-nav-ic { flex: none; color: var(--color-ink-3); }
-.set-nav.on .set-nav-ic { color: var(--color-shell); }
+.set-nav.on .set-nav-ic { color: var(--color-ink-2); }
 .set-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* --- body: page header, then sections ----------------------------------- */
 .set-body {
-  padding: 16px 20px 22px;
+  padding: 22px 26px 30px;
   overflow-y: auto;
   scroll-behavior: smooth;
 }
 .spage-title {
   margin: 0;
-  font-size: 20px;
+  font-size: 21px;
   font-weight: 600;
   letter-spacing: -0.015em;
   color: var(--color-ink);
@@ -3098,32 +3812,55 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 
 .ssect {
   margin-top: var(--sect-gap);
-  padding-top: 16px;
-  border-top: 1px solid var(--color-hairline);
   outline: none;
 }
 .ssect-head {
   display: flex;
   align-items: flex-start;
   gap: 14px;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 .ssect-hh { min-width: 0; flex: 1; }
 .ssect-h {
   margin: 0;
-  font-size: 13.5px;
-  font-weight: 600;
-  color: var(--color-ink);
+  /* A label for the group below it, not a heading to read. The page already has one title; a second
+     bold line per group is what makes a long settings page feel like a list of announcements. */
+  font-size: 12px;
+  font-weight: 550;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--color-ink-3);
 }
 .ssect-d {
-  margin: 3px 0 0;
+  margin: 4px 0 0;
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-ink-2);
   max-width: 68ch;
+  text-transform: none;
+  letter-spacing: 0;
 }
 .ssect-acts { display: flex; gap: 7px; flex: none; }
-.ssect-b { display: flex; flex-direction: column; gap: var(--row-gap); }
+/**
+ * The rows of a group sit in one panel, and the seams between them belong to the panel: dashed, so a
+ * separator reads as "these are siblings" rather than "two boxes". The air comes from the rows' own
+ * padding rather than from a gap, because a gap and a separator measure the same distance twice and
+ * the page ends up twice as long as the content needs.
+ */
+.ssect-b {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 3px 16px 6px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 14px;
+  background: var(--color-paper);
+}
+.ssect-b > :not(.srow) {
+  /* Not everything under a group is a row: a field grid, a list of providers, a refusal line. They
+     keep their own breathing room rather than inheriting a row's seam. */
+  margin: 11px 0;
+}
 
 /* A deep link lands somewhere; the section it named says so for a moment
    rather than leaving the reader to guess whether the link worked. */
@@ -3140,11 +3877,13 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px 18px;
-  padding: 11px 0;
-  border-top: 1px solid var(--color-hairline);
+  gap: 10px 24px;
+  padding: 13px 0;
+  /* Dashed, and only between rows: inside one panel a solid rule reads as the edge of a box, which
+     is a claim that the two halves are different things. */
+  border-top: 1px dashed var(--color-hairline);
 }
-.srow:first-child { border-top: 0; padding-top: 0; }
+.srow:first-child { border-top: 0; padding-top: 11px; }
 .srow-t { font-size: 13px; color: var(--color-ink); }
 .srow-h {
   margin-top: 3px;
@@ -3300,6 +4039,15 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   border: 1px solid var(--color-hairline);
   border-radius: 10px;
   background: var(--color-paper-2);
+}
+/* A dial is not a ruler. Inside a section the body is a column, and a column stretches its
+   children, which turned a five-choice control into a track the width of the page with the choices
+   parked at the left end of it - most of the "track" was empty. The choices are the control: the
+   track hugs them, and sits against the right edge of the panel, where the settings rows keep the
+   things you act on. */
+.ssect-b .sseg {
+  align-self: flex-end;
+  width: fit-content;
 }
 .sseg-b {
   min-height: 26px;
@@ -3563,6 +4311,27 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   font-weight: 450;
   font-size: 12px;
   color: var(--color-shell);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The run header holds a sentence, a count, and an arrow, in a row that has to fit a narrow pane.
+   The sentence is the part that must not push the arrow out of sight, so the text children clip
+   and the pseudo-element arrow - which is not a child - keeps its place. */
+.blk-run > .blk-head > span:not(.run-out) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A detected loop is the one count a reader acts on, so it is the one count that gets colour. The
+   phrase quoted here is kept short; the note over the composer carries the whole finding. */
+.blk-run.loops .run-count {
+  color: var(--color-warn);
+  font-weight: 600;
 }
 .run-out {
   margin-left: auto;
@@ -3594,27 +4363,11 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 .run-body > .blk > .blk-head {
   font-weight: 500;
 }
-/* A finished thought inside a run is its duration line. The text underneath is
-   the run's to reveal, not each block's to negotiate. */
-.run-body .blk-reasoning .blk-body {
-  display: none;
-}
-/* The thought that is happening right now shows itself: a header sitting still
-   for forty seconds on a local model reads as a hang, and it is the one moment
-   where the moving text is the point. */
-.run-body .blk-reasoning .blk-body.streaming {
-  display: block;
-  max-height: 8.4em;
-  overflow: hidden;
-  -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
-  mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
-}
-.blk-run.show-out .run-body .blk-reasoning .blk-body {
-  display: block;
-  max-height: 320px;
-  overflow: auto;
-  -webkit-mask-image: none;
-  mask-image: none;
+/* A finished thought inside a run is its duration line, and that is the whole entry: the run's
+   `show outputs` reveals the tools and what came out of them, and never puts the thinking text
+   back, because the text is not in the document. */
+.run-body > .blk-reasoning {
+  margin: 2px 0;
 }
 .blk-run.show-out .run-body .blk-tool:not(.is-open) .tool-detail {
   display: block;

@@ -21,6 +21,10 @@
  *    without us having to parse or sanitise the SVG at all.
  */
 
+// The markdown renderer, for a ```md block that wants to be read as prose rather than as source.
+// One direction only: markdown.ts knows nothing about previews, so this import cannot cycle.
+import { renderMarkdown } from './markdown'
+
 // Must land inside the first 1024 bytes of the document, hence prepended.
 // default-src 'none' kills fetch/XHR/WebSocket/form posts; the rest re-enables
 // only what a static-ish preview needs to look right.
@@ -114,6 +118,56 @@ export function openPreview(kind: 'html' | 'svg', source: string): void {
 
   panelEl = root
   document.body.append(root)
+}
+
+/**
+ * The rendered form of a fenced block, inside the block itself.
+ *
+ * The panel answers the same question at panel size; this answers it where the reader already is,
+ * which is what makes a folded block worth folding: the model wrote two hundred lines of markup,
+ * and what the reader wants is the page those lines make, not the lines.
+ *
+ * The safety story is the panel's, unchanged. HTML goes into a sandboxed frame with no
+ * `allow-same-origin` and the same strict CSP, so it can reach neither the app nor the network;
+ * SVG is loaded as an image, which runs no scripts by definition; markdown goes through the
+ * renderer that escapes everything it was not asked to interpret.
+ *
+ * Returns true when the rendered view is now showing, false when it was just turned off, so the
+ * button that called this can say which state it left the block in.
+ */
+export function inlineRender(blk: HTMLElement, source: string): boolean {
+  const kind = blk.dataset.kind ?? 'code'
+  const existing = blk.querySelector('.pv-inline')
+  if (existing) {
+    existing.remove()
+    blk.classList.remove('has-inline')
+    return false
+  }
+  if (kind === 'svg') {
+    inlineSvg(blk, source)
+    return true
+  }
+  if (kind === 'html') {
+    const f = document.createElement('iframe')
+    f.className = 'pv-inline pv-inline-frame'
+    f.setAttribute('sandbox', 'allow-scripts')
+    f.srcdoc = CSP_META + source
+    f.title = 'Rendered HTML'
+    blk.append(f)
+    blk.classList.add('has-inline')
+    return true
+  }
+  if (kind === 'md') {
+    const d = document.createElement('div')
+    d.className = 'pv-inline md-render'
+    // renderMarkdown escapes text and only produces the tags it knows about; this is the same
+    // renderer the answer text itself goes through.
+    d.innerHTML = renderMarkdown(source)
+    blk.append(d)
+    blk.classList.add('has-inline')
+    return true
+  }
+  return false
 }
 
 /**

@@ -11,6 +11,7 @@
  *   client -> { type: 'auth', token }
  *   client -> { id, cmd, args }
  *   server -> { type: 'hello' | 'auth_ok' | 'auth_fail' | 'ready' }
+ *   server -> { type: 'beat' }            every 25s; a data frame, so its arrival is proof
  *   server -> { id, ok, data?, error? }
  *   server -> { type: 'event', d: EngineEvent }
  */
@@ -77,6 +78,18 @@ let reconnectedCb: (() => void) | null = null
 let resyncCb: (() => void) | null = null
 let everConnected = false
 let timeouts = 0
+/**
+ * Wall clock of the last frame this socket delivered.
+ *
+ * The gateway pings every 25s (crates/gateway/src/lib.rs), so a live connection answers
+ * the browser at least that often and silence is a test the socket can actually be put
+ * through. A phone tab that was backgrounded mid-turn comes back to a WebSocket whose
+ * `readyState` still says OPEN and whose peer was reaped minutes ago: the page was
+ * frozen, the browser was never told the connection died, and every call then hangs for
+ * its whole timeout. That is the report: "on the phone nothing is interactive, especially
+ * the composer; I have to refresh. It happens after I minimise the browser and come back."
+ */
+let lastFrameAt = 0
 // The in-flight handshake, shared. Without this, two concurrent callers both
 // called connect(); the second saw readyState CONNECTING and resolved early, then
 // `ws.send()` fired on a socket that was not open yet - the RPC was silently
@@ -132,10 +145,12 @@ function connect(): Promise<void> {
 
     sock.onopen = () => {
       backoff = 500
+      lastFrameAt = Date.now()
       sock.send(JSON.stringify({ type: 'auth', token: readToken() }))
     }
 
     sock.onmessage = (m) => {
+      lastFrameAt = Date.now()
       let v: any
       try {
         v = JSON.parse(String(m.data))
@@ -182,6 +197,11 @@ function connect(): Promise<void> {
           pageLog(`gateway asked to resync (missed ${v?.d?.missed ?? '?'} event(s))`)
           resyncCb?.()
           break
+        case 'beat':
+          // The gateway's heartbeat. Nothing to act on: the timestamp taken at the top
+          // of this handler is the entire point, and it is what lets `revalidateSocket`
+          // tell a live idle connection from a half-open one.
+          break
         case 'event':
           // Engine events are pushed, not polled. The transcript already batches
           // text by requestAnimationFrame, so nothing here needs throttling.
@@ -203,9 +223,17 @@ function connect(): Promise<void> {
     }
 
     sock.onclose = () => {
-      ws = null
-      role = null
-      connecting = null
+      // Only the socket that is current gets to clear the module's view of it. A stale
+      // close event - the one a revalidated half-open socket sends after its
+      // replacement is already connecting - used to null the *new* socket and drop the
+      // stored handshake promise, which is how one dropped connection turned into two
+      // clients of the same gateway, each painting over the other.
+      const current = ws === sock
+      if (current) {
+        ws = null
+        role = null
+        connecting = null
+      }
       failAll('gateway connection closed')
       // If the socket dies before auth_ok, the connect promise has to settle.
       // It used not to: `await connect()` then hung forever, loadModels() never
@@ -298,6 +326,55 @@ export async function invoke<T = unknown>(
 /** Which capability the current socket has, for disabling controls in the UI. */
 export function gatewayRole(): 'drive' | 'watch' | null {
   return isTauri ? 'drive' : role
+}
+
+/**
+ * Put the socket through a check the page can afford to make the moment it is
+ * looked at again, and reconnect if it fails it.
+ *
+ * `readyState === OPEN` is not evidence that a connection is alive; it is evidence
+ * that this side has not been told otherwise. A backgrounded phone tab is frozen, the
+ * gateway reaps the peer, and the socket is never reported closed. The gateway pings
+ * every 25 seconds, so a socket that has delivered no frame for more than twice that
+ * is a socket that is lying: close it, and let `onclose` do what it already knows how
+ * to do.
+ *
+ * Returns how long the socket has been silent, so the caller can say which of the two
+ * it is looking at: a connection that survived the sleep, or one that did not.
+ */
+export function revalidateSocket(): { alive: boolean; silentMs: number } {
+  if (isTauri) return { alive: true, silentMs: 0 }
+  const silentMs = lastFrameAt ? Date.now() - lastFrameAt : Number.POSITIVE_INFINITY
+  if (!ws) {
+    // No socket at all. Nothing can race this: there is no close event pending.
+    connect().catch(() => {})
+    return { alive: false, silentMs }
+  }
+  if (ws.readyState === WebSocket.OPEN && silentMs <= 60_000) return { alive: true, silentMs }
+  pageLog(
+    `socket silent for ${Number.isFinite(silentMs) ? Math.round(silentMs / 1000) + 's' : 'its whole life'}: dropping it rather than trusting readyState`,
+  )
+  try {
+    ws.close()
+  } catch {
+    /* already gone */
+  }
+  ws = null
+  connecting = null
+  // Anything waiting on that socket finds out now instead of after its own 20s
+  // timeout: a call parked on a half-open connection is the app looking frozen.
+  failAll('gateway connection dropped as stale')
+  // Arm the retry through the same single-slot timer `onclose` uses, so the close
+  // event that follows cannot schedule a second attempt. `onclose` owns this in the
+  // ordinary case; here the connection may be a half-open lie whose close event never
+  // arrives at all, and waiting for it is what made the phone look frozen.
+  if (wantSocket && reconnect == null) {
+    reconnect = setTimeout(() => {
+      reconnect = null
+      connect().catch(() => {})
+    }, 200)
+  }
+  return { alive: false, silentMs }
 }
 
 /** Register a callback fired after the socket reconnects (not on first connect). */

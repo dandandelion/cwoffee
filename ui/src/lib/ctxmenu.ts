@@ -188,6 +188,15 @@ export function installContextMenu(h: CtxHooks): () => void {
     if (!t) return
     // Fields keep the native menu; see the note at the top of this file.
     if (t.closest('textarea, input, [contenteditable]')) return
+    // A modal dialog owns the screen while it is open. This app's menu is built from the
+    // transcript behind it — Quote, Copy, Open file — so a menu opened from inside the
+    // settings panel would offer actions on something the dialog deliberately put out of
+    // reach. The native menu is still suppressed: Back/Reload is the worst thing a stray
+    // right-click can do, dialog or no dialog.
+    if (t.closest('[role="dialog"][aria-modal="true"]')) {
+      e.preventDefault()
+      return
+    }
     const items = itemsFor(t, h)
     if (!items.length) {
       // Nothing meaningful to offer is still a reason to suppress Back/Reload:

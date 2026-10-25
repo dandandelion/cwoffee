@@ -234,6 +234,7 @@ Tool use:
 - Emit exactly one JSON object per tool call.
 - If you cannot do something, say so plainly rather than inventing an answer.
 - A file you want for yourself — a reference download, a fetched dataset, a script to run, a scratch dump — belongs under `.cws/` in the workspace, not among the person's files. Write into the folder proper only for the file they asked you for.
+- A file you are handing over rather than leaving in their folder: pass `"place": "attach"`, which writes it under `.cws/assistant_attachments/`. Only files there are attached to the turn, so a probe file or a scaffold is never presented as a deliverable.
 
 {environment}"#
     )

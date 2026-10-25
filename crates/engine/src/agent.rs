@@ -353,6 +353,14 @@ impl Agent {
         self.cfg.model.clone()
     }
 
+    /// The endpoint this agent answers through. Exposed for the one thing that is
+    /// not a conversation: naming one. The titler has to ask the *same* endpoint,
+    /// with the same auth and the same chat-template knobs, or a title could be
+    /// produced by a model that never answered the question it is naming.
+    pub fn provider(&self) -> &dyn Provider {
+        self.provider.as_ref()
+    }
+
     pub fn set_reasoning(&mut self, r: crate::provider::Reasoning) {
         // The prompt carries a line for the top levels, so a level change also
         // rewrites the system message. Doing both here is the point: a request
@@ -678,6 +686,28 @@ impl Agent {
             // zero through the whole of a long first turn.
             let t0 = Instant::now();
             let mut first_delta: Option<Instant> = None;
+            // Generation time, not wall time - and this is the whole reason the
+            // footer used to read ~20 tok/s for an engine doing ~60.
+            //
+            // The rate the reader sees mid-turn is generated tokens divided by
+            // the window they were generated in. When that window is "since the
+            // first delta of the turn", a turn with tool calls charges the sandbox
+            // run and the next round's prefill to the model's typing speed, and a
+            // long turn looks pathologically slow. So the window is the sum of the
+            // gaps *between* text/reasoning deltas, each gap capped:
+            //
+            //   500 ms is the ceiling because a decoder has to fall under 2 tok/s
+            //   before a legitimate inter-token gap reaches it, while every real
+            //   round-trip boundary - tool execution, then the next request's
+            //   prefill - is multiples of a second. The cap only costs accuracy on
+            //   a server slow enough that its decode rate is not the interesting
+            //   number about it.
+            //
+            // TTFT stays the honest wall-clock number it already is, and the
+            // server's own `server_decode_tps` stays a separate column.
+            const GEN_GAP_CAP_MS: u64 = 500;
+            let mut gen_ms: u64 = 0;
+            let mut last_delta_at: Option<Instant> = None;
             let mut chars_out: u64 = 0;
             let mut last_stats = Instant::now();
             let mut thinking_now = false;
@@ -728,6 +758,11 @@ impl Agent {
                 if just_text_or_reasoning {
                     let first = first_delta.is_none();
                     let fd = first_delta.get_or_insert_with(Instant::now);
+                    let now = Instant::now();
+                    if let Some(prev) = last_delta_at {
+                        gen_ms += now.duration_since(prev).as_millis().min(GEN_GAP_CAP_MS as u128) as u64;
+                    }
+                    last_delta_at = Some(now);
                     // The first delta goes out immediately: TTFT is the number the
                     // user is waiting for, and waiting another 400ms to say so is
                     // exactly the "it measures nothing" complaint.
@@ -739,7 +774,7 @@ impl Agent {
                             thinking: thinking_now,
                             ..Default::default()
                         };
-                        st.derive(fd.elapsed().as_millis() as u64);
+                        st.derive(gen_ms);
                         let _ = out2.send(EngineEvent::TurnStats(st));
                     }
                 }
@@ -2281,5 +2316,75 @@ mod tests {
             .filter(|m| m.contains("resume warmth"))
             .collect();
         assert_eq!(warmth.len(), 1, "warmth narrated {} times for one resume", warmth.len());
+    }
+
+    /// The decode rate the reader sees mid-turn must not be charged for the time
+    /// the model was not writing. This stream emits 20 deltas, sits for 1.5 s —
+    /// which is what a tool run plus the next round's prefill looks like from the
+    /// delta loop's vantage point — and emits 20 more. Over wall time that turn
+    /// decodes at ~28 tok/s; over generation time, ~84. The number we publish is
+    /// the second one, because the first one is the sandbox's speed wearing the
+    /// model's face.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_decode_window_is_generation_time_not_wall_time() {
+        struct Paced;
+        #[async_trait]
+        impl Provider for Paced {
+            fn id(&self) -> &str { "paced" }
+            fn label(&self) -> &str { "paced" }
+            async fn stream(&self, _req: &ChatRequest, sink: &DeltaSink) -> Result<(), ProviderError> {
+                for _ in 0..20 {
+                    sink.send(Delta::Text("abcdefgh".into())).ok();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                for _ in 0..20 {
+                    sink.send(Delta::Text("abcdefgh".into())).ok();
+                }
+                sink.send(Delta::Done(FinishReason::Stop)).ok();
+                Ok(())
+            }
+            fn wants_reasoning(&self) -> bool { false }
+        }
+
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            std::sync::Arc::new(Paced),
+            Registry::new(),
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            AgentConfig::default(),
+            ToolCtx::default(),
+        );
+        agent.run_turn("go", vec![], &etx, 7).await;
+        drop(etx);
+
+        let mut last: Option<crate::telemetry::TurnStats> = None;
+        while let Ok(e) = erx.try_recv() {
+            if let EngineEvent::TurnStats(s) = e {
+                last = Some(s);
+            }
+        }
+        let s = last.expect("a turn that streamed 40 deltas must publish at least one TurnStats");
+        assert!(s.chars >= 160, "the stream did not run: {s:?}");
+        // 1500 ms of sitting must not enter the window. The cap admits at most
+        // 500 ms of the pause between the two bursts, and the bursts themselves
+        // are instantaneous here, so the honest window is about half a second.
+        assert!(
+            s.streaming_ms > 0 && s.streaming_ms <= 900,
+            "the decode window counted the pause: {} ms of window for a turn whose \
+             model sat idle for 1500 ms of it (chars {}, est {} tokens)",
+            s.streaming_ms,
+            s.chars,
+            s.est_tokens
+        );
+        // The broken number is ~28 tok/s; the honest one is ~84.
+        assert!(
+            s.est_decode_tps > 60.0,
+            "decode reads {:.1} tok/s, which is the wall-clock number: {} ms of window \
+             for {} est tokens",
+            s.est_decode_tps,
+            s.streaming_ms,
+            s.est_tokens
+        );
     }
 }

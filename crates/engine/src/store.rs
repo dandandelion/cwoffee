@@ -180,6 +180,12 @@ impl Store {
     fn setup(conn: Connection) -> Result<Self, StoreError> {
         // WAL: the sidebar reads while the agent writes.
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Wait for the write lock rather than failing on it. There is a moment where two
+        // Cwoffees legitimately hold this file at once: closing the window while "keep devices
+        // working" is on starts the standalone gateway, and that process opens the same store a
+        // few hundred milliseconds before the window finishes letting go. A busy error there is a
+        // gateway that dies at boot, which is indistinguishable from a setting that was ignored.
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
@@ -488,19 +494,13 @@ impl Store {
         )?;
         let id = conn.last_insert_rowid();
 
-        // Name the session after its first question. The WHERE clause makes this
-        // a no-op once a session has a real title (or a manual one), so rename
-        // still wins, and it costs one cheap statement per user message.
-        if matches!(m.role, Role::User) {
-            let t = derive_title(&m.content);
-            if !t.is_empty() {
-                conn.execute(
-                    "UPDATE sessions SET title = ?2, updated_at = ?3
-                      WHERE id = ?1 AND title = 'new session'",
-                    params![session_id, t, now],
-                )?;
-            }
-        }
+        // Naming is not done here any more. This used to cut the opening line into
+        // the title the moment it was stored, which meant a conversation was named
+        // before it had been understood - and it put words on the row that the
+        // reader watched change under an animation that was trying to type something
+        // else. `crate::titling` asks the model for a name, in its own context,
+        // before the first answer; the placeholder survives until that answer or its
+        // fallback arrives.
 
         conn.execute(
             "INSERT INTO messages_fts (rowid, content, session_id, message_id, role)
@@ -906,11 +906,20 @@ fn fts_escape(q: &str) -> String {
 fn title_or_default(t: &str) -> String {
     let t = t.trim();
     if t.is_empty() {
-        "new session".to_string()
+        UNTITLED.to_string()
     } else {
         t.to_string()
     }
 }
+
+/// The name a conversation carries until the model names it.
+///
+/// This is the one placeholder the app promises: the row exists, it says "New
+/// Session", and the titler (`crate::titling`) replaces it with the model's own
+/// words before the first answer streams. Anything that asks "has this
+/// conversation been named yet?" compares against this, and against the legacy
+/// spellings older databases carry, rather than inventing its own guess.
+pub const UNTITLED: &str = "New Session";
 
 /// Metadata for the transcript, without dragging base64 across IPC.
 fn attach_meta(conn: &Connection, msgs: &mut [StoredMessage]) -> Result<(), StoreError> {
@@ -1438,11 +1447,18 @@ mod tests {
         assert_eq!(n, 0, "orphaned blobs would outlive the session that owns them");
     }
 
+        /// Naming is the titler's job now, not the store's.
+    ///
+    /// This used to cut the opening line into the title the moment the first message
+    /// was stored. That is gone on purpose: a row is created as "New Session",
+    /// `crate::titling` asks the model for a name in its own context before the first
+    /// answer, and the name then arrives once, animated, from the engine - rather than
+    /// silently from a write path the reader never sees.
     #[test]
-    fn a_session_names_itself_after_its_first_question() {
+    fn a_new_row_keeps_its_placeholder_until_someone_names_it() {
         let s = store();
         let id = s.create_session("", "/w", "m").unwrap();
-        assert_eq!(s.session(id).unwrap().unwrap().title, "new session");
+        assert_eq!(s.session(id).unwrap().unwrap().title, UNTITLED);
 
         let msg = Message {
             role: Role::User,
@@ -1450,20 +1466,19 @@ mod tests {
             ..Default::default()
         };
         s.append_message(id, &msg).unwrap();
-        let title = s.session(id).unwrap().unwrap().title;
-        assert_eq!(title, "can you make me a styled excel sheet please");
+        assert_eq!(
+            s.session(id).unwrap().unwrap().title,
+            UNTITLED,
+            "storing the first message must not rename the row behind the titler's back"
+        );
 
-        // Later messages must not rename the session.
-        s.append_message(id, &Message { role: Role::User, content: "second question".into(), ..Default::default() })
-            .unwrap();
-        assert_eq!(s.session(id).unwrap().unwrap().title, title);
-
-        // A manual rename outranks the derived one, permanently.
+        // A rename is the only way a row's name changes, and it sticks.
         s.rename_session(id, "quarterly numbers").unwrap();
-        let other = s.create_session("", "/w", "m").unwrap();
-        s.append_message(other, &Message { role: Role::User, content: "hello there".into(), ..Default::default() })
-            .unwrap();
-        assert_eq!(s.session(other).unwrap().unwrap().title, "hello there");
+        s.append_message(
+            id,
+            &Message { role: Role::User, content: "second question".into(), ..Default::default() },
+        )
+        .unwrap();
         assert_eq!(s.session(id).unwrap().unwrap().title, "quarterly numbers");
     }
 
@@ -1546,13 +1561,13 @@ mod tests {
         let a = s.create_session("", "/w", "m").unwrap();
         let b = s.create_session("   ", "/w", "m").unwrap();
         let c = s.create_session("real title", "/w", "m").unwrap();
-        assert_eq!(s.session(a).unwrap().unwrap().title, "new session");
-        assert_eq!(s.session(b).unwrap().unwrap().title, "new session");
+        assert_eq!(s.session(a).unwrap().unwrap().title, UNTITLED);
+        assert_eq!(s.session(b).unwrap().unwrap().title, UNTITLED);
         assert_eq!(s.session(c).unwrap().unwrap().title, "real title");
 
         // Renaming to blank must not blank the row out of usefulness either.
         s.rename_session(c, "").unwrap();
-        assert_eq!(s.session(c).unwrap().unwrap().title, "new session");
+        assert_eq!(s.session(c).unwrap().unwrap().title, UNTITLED);
     }
 
     #[test]
@@ -1980,5 +1995,34 @@ mod tests {
         s.append_message(id, &Message::user("这是一个关于性能的问题")).unwrap();
         let h = s.history(id).unwrap();
         assert_eq!(h[0].content, "这是一个关于性能的问题");
+    }
+
+    /// The hand-off at window close has two processes on one file for a few hundred
+    /// milliseconds: the window that is closing, and the standalone gateway it started. With no
+    /// busy timeout the newcomer's first write is SQLITE_BUSY and it exits at boot, so the
+    /// setting reads as "did not work" rather than as a lock it should have waited out.
+    #[test]
+    fn two_stores_on_one_file_wait_instead_of_failing() {
+        let dir = std::env::temp_dir().join(format!("cw-store-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.db");
+        let a = Store::open(&path).unwrap();
+        let b = Store::open(&path).unwrap();
+        let timeout: i64 = b
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(timeout >= 5000, "busy_timeout was {timeout} ms; a hand-off will race");
+        let sa = a.create_session("closing window", "/tmp/ws", "m").unwrap();
+        let sb = b.create_session("starting gateway", "/tmp/ws", "m").unwrap();
+        assert_ne!(sa, sb, "one of the two writes was lost");
+        a.append_message(sa, &Message::user("from the window")).unwrap();
+        b.append_message(sb, &Message::user("from the gateway")).unwrap();
+        assert_eq!(b.history(sa).unwrap().len(), 1, "the other process's write is not visible");
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

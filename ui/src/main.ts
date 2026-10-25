@@ -10,7 +10,14 @@ window.addEventListener('error', (e) => {
   pageLog(`UNCAUGHT: ${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`)
 })
 window.addEventListener('unhandledrejection', (e) => {
-  pageLog(`REJECTION: ${String((e as PromiseRejectionEvent).reason)}`)
+  // The script watching this run greps for `UNCAUGHT:` to decide "the harness itself died",
+  // and a rejected await inside the async check chain is exactly that - it kills the chain
+  // mid-way. It used to be logged under its own word, which the script did not look for, so a
+  // rejection cost whoever was waiting the whole board clock to learn what the log had said
+  // three minutes earlier. Same marker, different word inside it.
+  const r = (e as PromiseRejectionEvent).reason
+  const where = r instanceof Error ? ` @ ${(r.stack ?? '').split('\n')[1]?.trim() ?? 'no stack'}` : ''
+  pageLog(`UNCAUGHT: rejection: ${r instanceof Error ? r.message : String(r)}${where}`)
 })
 
 // Which bundle this is, named in the log before anything else decides to do

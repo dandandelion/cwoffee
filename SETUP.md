@@ -2,6 +2,13 @@
 
 Status as of 2026-10-01. Machine: Fedora 44 Workstation, x86_64, 20 cores, 62 GB RAM.
 
+**This file is the record of one machine. [`../setup.sh`](../setup.sh) is the check that runs on
+yours.** It probes the same pkg-config modules and command-line tools listed below, prints them in
+one table with the package that provides each one, and can install what is missing (`--deps`, after
+asking). It then builds the UI and the release binaries; `--tests`, `--board` and `--desktop` add
+the suites, the page board on both cores, and a launcher that is verified by launching it. If a
+number in this file disagrees with what `./setup.sh` prints, believe `./setup.sh`.
+
 ## ✅ Installed (done for you, no sudo)
 
 | What | Version | How |

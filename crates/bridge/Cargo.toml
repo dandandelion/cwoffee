@@ -35,3 +35,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# The bridge's own settings tests read back the file they wrote. `toml` is not a runtime
+# dependency of this crate — the engine owns config parsing — but a test that only greps for
+# the line it wrote cannot catch the failure it exists to catch: an edited file the next boot
+# cannot open.
+toml = { workspace = true }

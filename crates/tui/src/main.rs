@@ -122,6 +122,11 @@ impl App {
                     )));
                 }
             }
+            // The name arriving, one paint per token. The TUI has no conversation row to
+            // type into, and the settled name arrives right behind this as
+            // `SessionChanged`, which is already narrated. So: deliberately silent here,
+            // and listed rather than swallowed by a wildcard so the protocol stays auditable.
+            EngineEvent::TitleDelta { .. } => {}
             EngineEvent::SessionChanged { session_id, title } => {
                 self.items.push(Item::Note(format!(
                     "── session {session_id}{} ──",
@@ -206,7 +211,7 @@ impl App {
             // cancelled with the question parked. The prompt on screen cannot be
             // answered any more, so drop it. Holding the sender would leave a
             // key handler that sends into a closed channel.
-            EngineEvent::QuestionExpired { id } => {
+            EngineEvent::QuestionExpired { id, .. } => {
                 if self.pending_q.as_ref().is_some_and(|(q, _)| q.id == id) {
                     self.pending_q = None;
                     self.items
@@ -646,7 +651,7 @@ fn handle_key(k: KeyEvent, app: &mut App, host: &SessionHost) {
                     Reasoning::High => Reasoning::XHigh,
                     Reasoning::XHigh => Reasoning::Off,
                 };
-                host.send(HostCmd::SetReasoning { reasoning: app.reasoning });
+                host.send(HostCmd::SetReasoning { reasoning: app.reasoning, persist: false });
             }
             KeyCode::Char('u') => app.input.clear(),
             KeyCode::Char('l') => app.items.clear(),

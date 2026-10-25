@@ -24,6 +24,9 @@ pub struct UiPref {
     pub label: &'static str,
     /// One line on what changing it changes, so the person does not have to try it.
     pub hint: &'static str,
+    /// Which settings page renders it. A pref with no page is a control that exists
+    /// nowhere, and a pref rendered on two pages is two controls for one setting.
+    pub group: &'static str,
     pub default: &'static str,
     /// The whole vocabulary of values. A toggle is two of them.
     pub values: &'static [&'static str],
@@ -35,6 +38,17 @@ pub const UI_PREFS: &[UiPref] = &[
         label: "Show what each step did",
         hint: "On leaves a run's thinking and tool calls open, with their output under each line. \
                Off folds them to one line each, which is what most turns are worth.",
+        group: "transcript",
+        default: "off",
+        values: &["off", "on"],
+    },
+    UiPref {
+        key: "gateway_on_exit",
+        label: "Keep devices working after this window closes",
+        hint: "On hands the port to `cwoffee-gateway` — the same gateway as a separate process — when \
+               the last window closes, so a phone stays connected with this app gone. Off stops the \
+               gateway with the window.",
+        group: "devices",
         default: "off",
         values: &["off", "on"],
     },
@@ -54,6 +68,7 @@ pub struct UiPrefView {
     pub key: &'static str,
     pub label: &'static str,
     pub hint: &'static str,
+    pub group: &'static str,
     pub value: String,
     pub default: &'static str,
     pub is_default: bool,
@@ -69,6 +84,7 @@ pub fn view(store: &dyn StoreOps) -> Result<Vec<UiPrefView>, String> {
             key: p.key,
             label: p.label,
             hint: p.hint,
+            group: p.group,
             is_default: stored.is_none(),
             default: p.default,
             value,
@@ -164,9 +180,22 @@ mod tests {
     /// stays as short as the app's ability to honour it.
     #[test]
     fn every_listed_pref_is_one_the_app_actually_reads() {
-        // verbose_blocks is read by the transcript (ui/src/lib/transcript.ts, setVerbose)
-        // and by nothing else; adding an entry here means wiring it there too.
-        assert_eq!(UI_PREFS.len(), 1, "a new pref has to be wired in the UI as well");
+        // verbose_blocks is read by the transcript (ui/src/lib/transcript.ts, setVerbose);
+        // gateway_on_exit is read by the window's close path (crates/tauri-app/src/main.rs,
+        // which calls gateway_ctl::handoff before the last window goes away). An entry here
+        // without a reader on the other side is a switch wired to nothing.
+        assert_eq!(UI_PREFS.len(), 2, "a new pref has to be wired in the app as well");
+        // And a group is a settings page: `ui/src/App.svelte` renders `transcript` under
+        // Appearance and `devices` under Devices. A third group name would be a pref no
+        // screen shows.
+        for p in UI_PREFS {
+            assert!(
+                matches!(p.group, "transcript" | "devices"),
+                "{}: group {:?} is not a page any settings screen renders",
+                p.key,
+                p.group
+            );
+        }
     }
 
     #[test]

@@ -272,39 +272,168 @@ function renderTable(header: string, delim: string, rows: string[]): string {
 }
 
 /**
+ * The icons the block actions are drawn from.
+ *
+ * Text buttons on every block cost two things: horizontal room the code wants back, and a label in
+ * every language the interface speaks. A 14px glyph with a real `title` and `aria-label` costs
+ * neither, and the row stays legible at the width a narrow window leaves. Drawn inline rather than
+ * loaded, because an icon that needs a font or an emoji is an icon that renders as a box on the
+ * machine that was too slow to load it.
+ */
+const CODE_ICONS: Record<string, string> = {
+  copy: '<rect x="5.6" y="5.6" width="7.6" height="7.6" rx="1.3"/><path d="M10.4 3.4V3a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v5.4a1 1 0 0 0 1 1h.4"/>',
+  eye: '<path d="M1.9 8S4.1 4.6 8 4.6 14.1 8 14.1 8 11.9 11.4 8 11.4 1.9 8 1.9 8z"/><circle cx="8" cy="8" r="1.6"/>',
+  panel: '<path d="M9.8 2.9h3.3v3.3"/><path d="M13.1 2.9 8.4 7.6"/><path d="M11.4 10.6V12A1.2 1.2 0 0 1 10.2 13.2H4A1.2 1.2 0 0 1 2.8 12V6a1.2 1.2 0 0 1 1.2-1.2h1.4"/>',
+  chev: '<path d="M4.6 6.4 8 9.9l3.4-3.5"/>',
+  download: '<path d="M8 2.9v6.6"/><path d="M5.2 6.9 8 9.7l2.8-2.8"/><path d="M3.2 11.4v1.1a1.4 1.4 0 0 0 1.4 1.4h6.8a1.4 1.4 0 0 0 1.4-1.4v-1.1"/>',
+  check: '<path d="M3.6 8.6 6.6 11.6 12.4 5.2"/>',
+}
+
+export function actIcon(name: string, size = 14): string {
+  const d = CODE_ICONS[name] ?? ''
+  return (
+    `<svg class="act-ico" width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" stroke="currentColor" ` +
+    `stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`
+  )
+}
+
+/** What a fenced block can be shown as, by language tag. */
+export function blockKind(lang: string): 'html' | 'svg' | 'md' | 'code' {
+  const l = (lang || '').toLowerCase()
+  if (l === 'html' || l === 'htm') return 'html'
+  if (l === 'svg') return 'svg'
+  if (l === 'md' || l === 'markdown' || l === 'text' || l === 'txt' || l === '') return 'md'
+  return 'code'
+}
+
+/**
+ * The head row of a fenced block: the language, how long it is, and the actions.
+ *
+ * `open` is the state while the model is still inside the fence. The buttons are there - so the
+ * block does not change shape when they arrive - but disabled, because copying half an HTML
+ * document or rendering an unclosed `<div>` is not a thing a reader should be offered. Every label
+ * is a `title`, never a word in the row.
+ */
+export function codeHeadHtml(lang: string, open: boolean, lines = 0, folded = false): string {
+  const kind = blockKind(lang)
+  const acts: string[] = []
+  const dis = open ? ' disabled' : ''
+  const wait = open ? ' - still being written' : ''
+  acts.push(
+    `<button class="code-act" data-act="copy" type="button"${dis} title="Copy the code${wait}" aria-label="Copy the code">${actIcon('copy')}</button>`,
+  )
+  if (kind !== 'code')
+    acts.push(
+      `<button class="code-act" data-act="render" type="button"${dis} title="Show the rendered block${wait}" aria-label="Show the rendered block" aria-pressed="false">${actIcon('eye')}</button>`,
+    )
+  if (kind === 'html' || kind === 'svg')
+    acts.push(
+      `<button class="code-act" data-act="preview" type="button"${dis} title="Open in a panel${wait}" aria-label="Open in a panel">${actIcon('panel')}</button>`,
+    )
+  acts.push(
+    `<button class="code-act code-fold" data-act="fold" type="button"${open ? ' disabled' : ''} title="${
+      folded ? 'Expand this block' : 'Collapse this block'
+    }" aria-label="Collapse this block" aria-expanded="${folded ? 'false' : 'true'}">${actIcon('chev')}</button>`,
+  )
+  return (
+    `<div class="code-head"><span class="code-lang">${escapeHtml(lang || 'text')}</span>` +
+    `<span class="code-meta">${lines > 0 ? `${lines} lines` : ''}</span>` +
+    `<span class="code-acts">${acts.join('')}</span></div>`
+  )
+}
+
+/**
+ * Whether a finished block of this kind arrives folded. Said once, in one place, because two
+ * copies of the rule drift: the parser uses it when it renders a closed fence, and the live paint
+ * uses it when a fence closes on a block that is already on screen.
+ */
+export function foldsWhenClosed(kind: string, lines: number): boolean {
+  return kind !== 'code' && lines >= FOLD_AT
+}
+
+/**
+ * How long a block has to be before it arrives folded.
+ *
+ * Measured against the reader's complaint, not against taste: the cost of a block is the distance
+ * they scroll past it to reach the sentence that follows, and twelve lines of markup is about a
+ * third of the viewport on this screen. Blocks under that stay open - folding three lines of HTML
+ * trades a scroll for two clicks, and the second half of that trade is the annoying part.
+ *
+ * Only the kinds that can be *shown* fold themselves: the source of a page is worth hiding once it
+ * is long, because the reader can press the eye and read the page instead. A 40-line Rust function
+ * has no rendered form to read instead, so it keeps its source in view.
+ */
+const FOLD_AT = 12
+
+/**
  * Fenced code becomes a titled block with actions, not a bare <pre>.
  *
  * The source lives in the <code> textContent and is read back at click time.
  * Duplicating it into a data attribute would double the DOM for every block and
  * mean two copies that can disagree.
  *
- * Only html and svg get preview actions. Every other language would need its
- * own sandbox story, and "we can preview it" is a promise the renderer cannot
- * keep for, say, a C++ file.
+ * Only html, svg and markdown-ish blocks get a render action, and only html and svg get the panel
+ * one. Every other language would need its own sandbox story, and "we can preview it" is a promise
+ * the renderer cannot keep for a C++ file. The fold action is on every block, and a long enough
+ * renderable block arrives folded by the same rule that decides what a reader is being asked to
+ * scroll past.
  */
-function codeBlock(langRaw: string, escapedCode: string): string {
+function codeBlock(langRaw: string, escapedCode: string, open = false): string {
   const lang = (langRaw || '').toLowerCase()
   const safe = /^[a-z0-9+-]*$/.test(lang) ? lang : ''
-  const acts: string[] = [
-    '<button class="code-act" data-act="copy" type="button" title="Copy code">copy</button>',
-  ]
-  if (safe === 'html') {
-    acts.push(
-      '<button class="code-act" data-act="preview" type="button" title="Preview in a panel">preview</button>',
-    )
-  } else if (safe === 'svg') {
-    acts.push(
-      '<button class="code-act" data-act="inline" type="button" title="Toggle inline preview">inline</button>',
-      '<button class="code-act" data-act="preview" type="button" title="Preview in a panel">preview</button>',
-    )
-  }
+  const kind = blockKind(safe)
+  const lines = escapedCode ? escapedCode.split('\n').length : 0
+  // An open fence never folds: a block that is still being written is the one thing the reader is
+  // watching grow, and hiding it would be the feature working against itself.
+  const folded = !open && foldsWhenClosed(kind, lines)
   return (
-    `<div class="codeblk" data-lang="${safe}">\n` +
-    `<div class="code-head"><span class="code-lang">${escapeHtml(safe || 'text')}</span>` +
-    `<span class="code-acts">${acts.join('')}</span></div>\n` +
-    `<pre><code${safe ? ` class="lang-${safe}"` : ''}>${escapedCode}</code></pre>\n` +
+    `<div class="codeblk${folded ? ' folded' : ''}${open ? ' streaming' : ''}" data-lang="${safe}" data-kind="${kind}" data-lines="${lines}">\n` +
+    codeHeadHtml(safe, open, lines, folded) +
+    `\n<pre>${lineGutterHtml(lines)}<code${safe ? ` class="lang-${safe}"` : ''}>${escapedCode}</code></pre>\n` +
     `</div>`
   )
+}
+
+/**
+ * The line numbers a code block is read against, as the text inside its gutter.
+ *
+ * One text node of digits, not a node per line: a 200-line file would otherwise pay 200 extra boxes
+ * on top of the 200 lines they number, and the reader pays that in layout on every scroll past the
+ * block. The numbers sit *beside* the `<code>` rather than inside it, so selecting the code copies
+ * the code, and they are `aria-hidden`, so a screen reader is not read "1 2 3" between the code and
+ * its meaning.
+ */
+export function lineNumbers(lines: number): string {
+  let s = ''
+  for (let n = 1; n <= lines; n++) s += n > 1 ? `\n${n}` : `${n}`
+  return s
+}
+
+export function lineGutterHtml(lines: number): string {
+  return `<span class="ln" aria-hidden="true">${lineNumbers(lines)}</span>`
+}
+
+/** What to append to a live gutter when the block grows from `from` lines to `to` lines. */
+export function lineGutterDelta(from: number, to: number): string {
+  let s = ''
+  for (let n = from + 1; n <= to; n++) s += (n === from + 1 && from === 0 ? '' : '\n') + n
+  return s
+}
+
+/**
+ * Does this block *begin* a code fence, and with what language tag?
+ *
+ * The live paint asks this when it is deciding what element a new block is born as: the moment the
+ * model types the opening backticks, the block is on screen as a block - head, actions and all -
+ * and the code streams into it. `firstBlockEnd` still refuses to *commit* it until the fence
+ * closes, which is the other half of the rule: rendering early is a display choice, committing
+ * early would re-parse text that is still arriving.
+ */
+export function fenceStart(head: string): { lang: string } | null {
+  const m = /^ {0,3}(```|~~~)\s*([a-z0-9+-]*)?/i.exec(head)
+  if (!m) return null
+  const lang = (m[2] ?? '').toLowerCase()
+  return { lang: /^[a-z0-9+-]*$/.test(lang) ? lang : '' }
 }
 
 /**
@@ -655,7 +784,9 @@ export function renderMarkdown(src: string): string {
     // unterminated fence: still render as code rather than swallowing the text.
     // The model stops mid-block more often than markdown documents suggest, and
     // swallowing the remainder loses content the user can still read.
-    html.push(codeBlock(codeLang, code.join('\n')))
+    // `open` is the honest state: the fence never closed, so the actions stay
+    // disabled - copying or rendering half a document is not something to offer.
+    html.push(codeBlock(codeLang, code.join('\n'), true))
   }
   flushPara()
   closeList()

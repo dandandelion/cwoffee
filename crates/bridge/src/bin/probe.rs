@@ -96,9 +96,9 @@ async fn run() -> anyhow::Result<()> {
     if !flag("--keep-models") {
         // The mock endpoint speaks the OpenAI wire, which is what pi's `openai-completions`
         // api means; a real endpoint's kind comes from cwoffee's config instead.
-        let path =
-            cwoffee_bridge::mount::write_dev_provider(&agent_dir, &provider, &url, &model, "mock", "openai-completions", None)?;
-        eprintln!("[probe] wrote {provider} -> {url} in {}", path.display());
+        let (path, wrote) =
+            cwoffee_bridge::mount::write_dev_provider(&agent_dir, &provider, &url, &model, "mock", "openai-completions", "llama.cpp", None, &[])?;
+        eprintln!("[probe] {wrote:?}: {provider} -> {url} in {}", path.display());
     }
 
     // Extensions are copied into the isolated agent dir and pi's own
@@ -139,7 +139,10 @@ async fn run() -> anyhow::Result<()> {
         mode: ApprovalMode::Ask,
         reasoning: Reasoning::Off,
         approval_timeout: Duration::from_secs(approval_timeout),
-        question_timeout: Duration::from_secs(30),
+        // A probe is a caller that can only answer by script, so it puts its own clock on
+        // the card rather than parking forever. That is the caller's choice, not a default:
+        // the product leaves this `None` and the card stays open until a person answers.
+        question_timeout: Some(Duration::from_secs(30)),
         idle_reap: Duration::from_secs(idle_reap),
         context_budget: 8_000,
         budget_pin: Some(8_000),
@@ -207,7 +210,13 @@ async fn run() -> anyhow::Result<()> {
                             EngineEvent::SessionChanged { session_id, title } => {
                                 println!("[session] {session_id} {:?}", title);
                             }
-                            EngineEvent::QuestionExpired { id } => println!("\n[question {id} closed without an answer]"),
+                            // A conversation naming itself: worth seeing in a probe run,
+                            // because the whole point of the pass is that the name lands
+                            // before the answer, and the order is what this proves.
+                            EngineEvent::TitleDelta { session_id, text, done } => {
+                                println!("[title] {session_id} {:?}{}", text, if done { " (final)" } else { "" });
+                            }
+                            EngineEvent::QuestionExpired { id, .. } => println!("\n[question {id} closed without an answer]"),
                             EngineEvent::QuestionAnswered { id } => println!("[question {id} answered]"),
                             _ => {}
                         }
@@ -368,18 +377,6 @@ async fn run() -> anyhow::Result<()> {
 
 /// Walk up from the installed `pi` binary looking for the package it came from.
 
-fn which(name: &str) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("PATH") {
-        for p in path.split(':') {
-            let cand = PathBuf::from(p).join(name);
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    None
-}
-
 fn trim(s: &str) -> String {
     let one = s.replace('\n', " ");
     if one.chars().count() > 90 {
@@ -395,6 +392,7 @@ fn trim(s: &str) -> String {
 fn kind_name(e: &EngineEvent) -> String {
     match e {
         EngineEvent::SessionChanged { .. } => "sessionChanged",
+        EngineEvent::TitleDelta { .. } => "titleDelta",
         EngineEvent::TurnStart { .. } => "turnStart",
         EngineEvent::Text(_) => "text",
         EngineEvent::Reasoning(_) => "reasoning",

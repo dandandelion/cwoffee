@@ -163,6 +163,10 @@ pub enum FileKind {
     /// the same reason. Opening it is still one click; it is just not presented as
     /// something the person asked for.
     Scratch,
+    /// A file the model wrote into `.cws/assistant_attachments/` in order to hand it
+    /// over. This is the only kind the transcript attaches: the folder *is* the decision,
+    /// so a probe file or a scaffold cannot become a deliverable just by being written.
+    Attachment,
     /// A row stored before the distinction existed. Rendered as it always was:
     /// guessing a category for data that never carried one would be inventing
     /// a fact about a turn we no longer have.
@@ -185,12 +189,32 @@ const ARTIFACT_EXTS: &[&str] = &[
 /// tell them apart either. What the tool *can* say, and does, is that a
 /// downloaded file is a deliverable whatever its name.
 pub fn kind_for(path: &std::path::Path) -> FileKind {
-    // Placement outranks extension. Anything that lives under `.cws` is the model's
-    // own working material — a fetched PDF, a scratch script, a dump it parsed — and
-    // presenting it as a deliverable would put the model's leftovers in the same strip
-    // as the file the person asked for. This is the path fact behind the placement
-    // decision the tools make, so a scaffolding file written by `write_file` gets the
-    // same treatment as one placed by `download_file`.
+    // Placement outranks extension, and the attachments folder outranks `.cws` itself:
+    // `.cws/assistant_attachments/x.html` sits inside the scratch folder, but it is the
+    // one thing in there that was meant to reach the person.
+    //
+    // The check is "`.cws/` immediately followed by `assistant_attachments/`", not "any
+    // component named that": a repository folder someone else named
+    // `src/assistant_attachments/` is not this app's attachments folder, and treating it
+    // as one would let a directory of source files be presented as hand-over material.
+    // Components are matched in pairs because `from_path` hands this function the
+    // absolute path, so the prefix is not the start of the string.
+    let mut previous: Option<std::ffi::OsString> = None;
+    let attached = path.components().any(|c| {
+        let here = c.as_os_str();
+        let pair = here == scratch::ATTACH_DIR
+            && previous.as_deref() == Some(std::ffi::OsStr::new(scratch::SCRATCH_DIR));
+        previous = Some(here.to_os_string());
+        pair
+    });
+    if attached {
+        return FileKind::Attachment;
+    }
+    // Anything else under `.cws` is the model's own working material — a fetched PDF, a
+    // scratch script, a dump it parsed — and presenting it as a deliverable would put the
+    // model's leftovers in the same strip as the file the person asked for. This is the
+    // path fact behind the placement decision the tools make, so a scaffolding file
+    // written by `write_file` gets the same treatment as one placed by `download_file`.
     if path
         .components()
         .any(|c| c.as_os_str() == crate::tools::scratch::SCRATCH_DIR)
@@ -777,8 +801,18 @@ mod cfg_tests {
         // pushes past this, the honest move is to say what it costs (as the message below
         // does) rather than grow the ceiling silently. The lean total printed below is what
         // discovery pays back: declaring two of these tools instead of thirteen.
+        //
+        // 13,700 now, up from 13,200: the attachments rule adds a `place` field to three
+        // writers. Measured with the same metric as this test (`--nocapture`, this tree
+        // with and without the change): the block went 13,081 -> 13,634 B, of which
+        // `write_file` 645 -> 922, `write_xlsx` 727 -> 940 and `download_file` 1,189 ->
+        // 1,252 — 553 B in total. What it buys is the fact the transcript depends on: an
+        // attachment is a folder the model chose to write into, not a guess from an
+        // extension, so scaffolding can no longer be presented as a deliverable. Full mode
+        // only — none of the three is declared in lean mode, and the lean figure below is
+        // unchanged at 1,462 B for two tools.
         assert!(
-            total < 13_200,
+            total < 13_700,
             "the whole tool block is {total} bytes across {} tools: a description longer than this is a per-turn tax on every session",
             each.len()
         );
@@ -825,6 +859,60 @@ mod cfg_tests {
         let g = OutputFile::from_path(&dir, &dir.join("handler.rs"));
         assert_eq!(g.kind, FileKind::Edit, "a written source file is a change");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The attachments folder is the whole rule for what the transcript may attach.
+    ///
+    /// The report: a turn showed chips for probe files and scaffolding — 150 kB of
+    /// things nobody asked for — because the transcript classified by extension alone,
+    /// and an extension cannot tell "handing this over" from "needed it on the way".
+    /// This test is the fact the UI then relies on.
+    #[test]
+    fn only_the_attachments_folder_makes_a_file_an_attachment() {
+        use std::path::Path;
+        assert_eq!(
+            kind_for(Path::new(".cws/assistant_attachments/report.html")),
+            FileKind::Attachment,
+            "a file written to hand over is an attachment whatever it is named"
+        );
+        // Including a name that would otherwise be scratch material: the folder is the
+        // decision, not the extension.
+        assert_eq!(
+            kind_for(Path::new(".cws/assistant_attachments/helper.py")),
+            FileKind::Attachment,
+            "the attachments folder outranks the extension"
+        );
+        assert_eq!(
+            kind_for(Path::new(".cws/report.pdf")),
+            FileKind::Scratch,
+            "a scratch PDF is not an attachment"
+        );
+        assert_eq!(
+            kind_for(Path::new(".cws/assistant_attachments/tables/x.xlsx")),
+            FileKind::Attachment,
+            "subfolders of the attachments folder are still attachments"
+        );
+        // A folder that merely has the right name elsewhere in the tree is not it, and
+        // neither is one whose `.cws/` prefix is missing.
+        assert_eq!(
+            kind_for(Path::new("src/assistant_attachments/x.rs")),
+            FileKind::Edit,
+            "the attachments rule is about the scratch folder, not any folder named that"
+        );
+        assert_eq!(
+            kind_for(std::path::Path::new("/home/u/proj/.cws/assistant_attachments/x.rs")),
+            FileKind::Attachment,
+            "from_path passes an absolute path, so the pair must be found anywhere in it"
+        );
+        let wire = serde_json::to_string(&OutputFile {
+            path: ".cws/assistant_attachments/x.html".into(),
+            name: "x.html".into(),
+            mime: "text/html".into(),
+            bytes: 1,
+            kind: FileKind::Attachment,
+        })
+        .unwrap();
+        assert!(wire.contains("\"kind\":\"attachment\""), "wire form: {wire}");
     }
 
     /// Old rows have no kind. Defaulting them to Artifact or Edit would invent a
