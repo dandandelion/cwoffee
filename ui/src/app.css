@@ -1816,6 +1816,14 @@ body {
   }
   .sidebar {
     position: fixed;
+    /* A docked sidebar paints nothing: the window's single surface shows through it, which is the
+       point of having one desk. A drawer is a different animal — it slides *over* the conversation,
+       so with no surface of its own the greeting and the composer show through the session list.
+       That is what the narrow-window report was, and the only reason it did not happen before is
+       that the aside used to carry an inline wash gradient which the one-surface change deleted.
+       `--color-pane` is the desk tone, so the drawer keeps the relationship the docked sidebar has
+       always had: one notch under the paper it covers, with its own shadow down the right edge. */
+    background: var(--color-pane);
     z-index: 40;
     top: 2.75rem;      /* below the titlebar */
     bottom: 0;
@@ -2365,7 +2373,8 @@ body {
 /* Pinned, not scrolled: this row is a sidebar column child that sits *above* the scrolling list, so
    the heading and its fold / add controls stay reachable however long the conversation list gets. A
    sticky header inside the scroller was the other option and was not taken: it needs an opaque
-   backdrop, and the sidebar is painted with a gradient, so the band would not match what it covers. */
+   backdrop, and a docked sidebar paints no surface of its own — it sits on the window's — so the
+   band would not match what it scrolls over. */
 .sesshead {
   display: flex;
   flex: none;

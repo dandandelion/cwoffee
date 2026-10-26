@@ -1066,3 +1066,40 @@ installed (--core pi), launch check OK:
    app's own shell, and the check moved with it or it would have been lying in both directions.
 5. **When a control's two halves merge, the checks that named each half have to name the state
    instead.** "Press the unfold button" became "press the fold control until the list is open".
+
+
+## R-bis. What the one-surface change broke, six minutes after it shipped
+
+The screenshot: at a narrow window the sidebar drawer was see-through — the greeting, the tips and
+the composer readable *through* the session list.
+
+The drawer never had its own surface. Below 768px the aside is a fixed overlay, and its only paint
+came from an inline `style="background: linear-gradient(…)"` on the element, which the one-surface
+change deleted along with the three `--color-wash-*` tokens. Docked, that deletion is the whole
+point: the window's desk shows through and there is no second tone. Overlaying, it is a hole — the
+drawer slides over the conversation, and with nothing painted the conversation shows through.
+
+The fix is one declaration in the narrow-width block, on the same principle the docked column has
+always had — one notch under the paper it sits on:
+
+```css
+.sidebar { /* @media (max-width: 767px) */
+  background: var(--color-pane);
+}
+```
+
+The new `drawer` group holds both halves of the invariant, because the two halves point in opposite
+directions and either can be broken alone: the docked sidebar must paint *nothing* (so the window's
+surface shows through), and the narrow-width rule must give the drawer a surface that *resolves* to
+an opaque colour. Resolving matters: the check sets the declaration on a throwaway element and reads
+the computed colour, because `var(--color-pane)` is only an opaque paint if the token says so — a
+check that stopped at the string would pass on `var(--color-glass)`.
+
+```
+drawer surface ok (docked sidebar paints nothing and the window's surface shows through;
+the narrow-width rule gives it var(--color-pane) → rgb(242, 239, 231))
+```
+
+Lesson: **when you delete a surface, ask what was overlaying something.** "Everything sits on one
+background" is true of a docked column and false of a drawer, and the stylesheet says which one a
+rule belongs to while the markup that carried the paint did not.

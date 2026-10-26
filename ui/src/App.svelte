@@ -14620,6 +14620,65 @@
         }
       }
 
+      // --- the drawer is a surface, not a window into what it covers -----------------
+      //
+      // A docked sidebar paints nothing on purpose: the window has one surface and it shows
+      // through. A drawer slides *over* the conversation, so the same transparency put the greeting
+      // and the composer behind the session list at narrow widths — see-through rows, and the
+      // transcript readable through them. The claim reads the shipped stylesheet rather than
+      // trusting a class name, and then resolves the value it finds, because "declared" and
+      // "opaque" are not the same fact.
+      if (want('drawer', 'the sidebar drawer is a surface of its own at narrow widths, while the docked one stays transparent')) {
+        const aside = document.querySelector('aside.sidebar')
+        if (!aside) fail('there is no sidebar to measure')
+        else {
+          const verdict: string[] = []
+          const docked = getComputedStyle(aside)
+          if (window.innerWidth >= 768 && docked.backgroundColor !== 'rgba(0, 0, 0, 0)')
+            verdict.push(
+              `at ${window.innerWidth}px the docked sidebar paints ${docked.backgroundColor}; the window's own surface is supposed to show through it`,
+            )
+          let drawerDecl = ''
+          for (const sheet of Array.from(document.styleSheets)) {
+            let rules: CSSRuleList | undefined
+            try {
+              rules = (sheet as CSSStyleSheet).cssRules
+            } catch {
+              continue // a sheet this page cannot read must not end the run
+            }
+            for (const r of Array.from(rules ?? [])) {
+              if (!(r instanceof CSSMediaRule) || !/max-width/.test(r.conditionText ?? '')) continue
+              for (const inner of Array.from(r.cssRules)) {
+                const sel = (inner as CSSStyleRule).selectorText
+                if (sel === '.sidebar') {
+                  const m = inner.cssText.match(/background(?:-color)?:\s*([^;]+)/)
+                  if (m) drawerDecl = m[1].trim()
+                }
+              }
+            }
+          }
+          if (!drawerDecl) verdict.push('no narrow-width rule gives the sidebar drawer a surface, so the conversation shows through the session list')
+          else {
+            // Resolve the declaration the way the browser would: "var(--color-pane)" is only an
+            // opaque colour once the token resolves to one, and a check that stops at the string
+            // would pass on `var(--color-glass)`.
+            const probe = document.createElement('div')
+            probe.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;'
+            probe.style.background = drawerDecl
+            document.body.appendChild(probe)
+            const resolved = getComputedStyle(probe).backgroundColor
+            probe.remove()
+            if (drawerDecl === 'none' || /transparent/.test(drawerDecl) || resolved === 'rgba(0, 0, 0, 0)')
+              verdict.push(`the drawer rule gives the sidebar no surface to paint (${drawerDecl} → ${resolved})`)
+            if (verdict.length) fail(verdict.join('; '))
+            pageLog(
+              `drawer surface ok (docked sidebar paints nothing and the window's surface shows through; ` +
+                `the narrow-width rule gives it ${drawerDecl} → ${resolved})`,
+            )
+          }
+        }
+      }
+
       // --- notes land where the person said, and the choice is the host's -------------
       //
       // The setting is a host pref, not this window's: a phone and a desktop put the same word in
