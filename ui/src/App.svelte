@@ -1322,6 +1322,14 @@
     return !wsCollapsed.has(path)
   }
 
+  /** Which way the sidebar's one fold control should go.
+   *
+   *  Two buttons ("fold all", "unfold all") asked the person to work out the state of six folders
+   *  before pressing the right one, and one of the two was always inert. The control takes the side
+   *  of the list it is looking at: as long as anything is open it folds, and only when the list is
+   *  shut does it open. */
+  const anyWsOpen = $derived(wsGroups.some((g) => !wsCollapsed.has(g.path)))
+
   function expandWs(path: string) {
     const next = new Set(wsCollapsed)
     next.delete(path)
@@ -7476,9 +7484,11 @@
           // Folders fold, and a closed folder renders no rows for the conversations inside it.
           // That is the list behaving, not failing - so press the sidebar's own unfold control
           // before looking for a row to click.
-          const unfold = document.querySelector('.iconbtn.ws-fold[aria-label="Unfold every folder"]') as HTMLElement | null
-          if (unfold) {
-            unfold.click()
+          // One control does both halves now, and which half it is depends on the list, so press it
+          // until the list is open rather than naming a button that no longer exists.
+          const foldBtn = document.querySelector('.iconbtn.ws-fold[data-fold-all]') as HTMLElement | null
+          for (let i = 0; foldBtn && i < 3 && foldBtn.getAttribute('aria-label') === 'Unfold every folder'; i++) {
+            foldBtn.click()
             await new Promise((r) => setTimeout(r, 300))
           }
           const row = [...document.querySelectorAll('.sessrow')].find((r) =>
@@ -14372,8 +14382,16 @@
           const insetR = Math.round(mr.right - cr.right)
           if (insetL < 6 || insetR < 6 || Math.abs(insetL - insetR) > 2)
             verdict.push(`the card is not guttered inside the pane (left ${insetL}px, right ${insetR}px)`)
-          if (getComputedStyle(main).backgroundColor === getComputedStyle(card).backgroundColor)
-            verdict.push('the card and the pane paint the same tone, so there is no edge to read')
+          // The edge is tone, and tone belongs to the *window* now: the shell carries one surface
+          // and `main` is transparent over it. Comparing the card with `main` would let a build
+          // that painted nothing pass, so the comparison is card against what the window paints.
+          const shellEl0 = document.querySelector('.app-shell')
+          const shCS = shellEl0 ? getComputedStyle(shellEl0) : null
+          const desk = shCS && shCS.backgroundImage !== 'none' ? shCS.backgroundImage : (shCS?.backgroundColor ?? '')
+          if (!desk || desk === 'rgba(0, 0, 0, 0)')
+            verdict.push('the window paints no surface for the card to sit on')
+          else if (desk === getComputedStyle(card).backgroundColor)
+            verdict.push('the card and the surface behind it paint the same tone, so there is no edge to read')
           if (!(xr.bottom <= cr.bottom && cr.bottom - xr.bottom >= 4))
             verdict.push(
               `the composer is not inside the card's bottom edge (${Math.round(cr.bottom - xr.bottom)}px of card below it)`,
@@ -14400,6 +14418,28 @@
               verdict.push('the greeting is not inside the card on the opening screen')
             if (!document.querySelector('.panecard .cbox'))
               verdict.push('the composer is not inside the card on the opening screen')
+
+            // The greeting and the composer are one subject, so they sit as one group. The
+            // transcript's box is `flex: 1`, and it kept swallowing the middle of the card even
+            // while hidden — which is the hole the report was about: cup at the top of the card,
+            // composer at the bottom, nothing between them worth looking at.
+            const greet = document.querySelector('.panecard .empty')
+            const cbox2 = document.querySelector('.panecard .cbox')
+            if (greet && cbox2) {
+              const gr = greet.getBoundingClientRect()
+              const xr2 = cbox2.getBoundingClientRect()
+              const gap = Math.round(xr2.top - gr.bottom)
+              const midCard = (r2.top + r2.bottom) / 2
+              const midPair = (gr.top + xr2.bottom) / 2
+              const off = Math.round(Math.abs(midPair - midCard))
+              if (gap < 0) verdict.push(`the greeting sits on top of the composer (${gap}px of overlap)`)
+              if (gap > 90) verdict.push(`the greeting and the composer are ${gap}px apart, so they are two things, not one`)
+              if (off > 90) verdict.push(`the pair is ${off}px off the middle of the card`)
+              pageLog(
+                `opening screen ok (greeting and composer ${gap}px apart, the pair ${off}px off the card's middle, ` +
+                  `the pair spans ${Math.round(xr2.bottom - gr.top)}px of a ${Math.round(r2.height)}px card)`,
+              )
+            }
           }
           if (wasView !== null) openSession(wasView)
           await new Promise((r) => setTimeout(r, 200))
@@ -14407,6 +14447,175 @@
           pageLog(
             `card ok (one surface ${openBox} inside a ${Math.round(mr.width)}px pane, holding conversation + composer + ` +
               `folder row; ${insetL}px of gutter; the same card on the opening screen at ${emptyBox})`,
+          )
+        }
+      }
+
+      // --- the fold controls: one for the list, one per folder, and where the arrow sits
+      //
+      // Two header buttons (fold all, unfold all) asked the person to work out the state of six
+      // folders before pressing the right one, and one of the two was always inert; the arrow that
+      // said how one folder was arranged sat in the middle of the row, between the count and the
+      // actions. The claims are therefore about which control exists, which way it says it will go,
+      // and where it sits in the row's reading order.
+      if (want('sidebar-fold', 'folding the list is one control that says which way it goes, and each folder’s arrow is the last thing on its row')) {
+        if (personaNow === 'chat') {
+          pageLog('selftest note: the fold controls were not claimed — this persona draws a flat list of chats, there are no folders to fold')
+        } else if (!wsGroups.length) {
+          pageLog('selftest note: the fold controls were not claimed — this run has no folder rows to fold')
+        } else {
+          const verdict: string[] = []
+          // A group that folds the person's list puts it back, passed or not: every later check
+          // that looks for a row is reading whatever this leaves open.
+          const snapshot = [...wsCollapsed]
+          try {
+            unfoldAll()
+            await new Promise((r) => setTimeout(r, 300))
+            const path = wsGroups[0].path
+            const rowFor = (p: string) =>
+              ([...document.querySelectorAll('.wsrow')] as HTMLElement[]).find((el) => {
+                const t = el.querySelector('.ws-name')?.getAttribute('title')
+                return (t ?? '') === p || (t ?? '').endsWith(p)
+              }) ?? null
+            const head = [...document.querySelectorAll('.sesshead button.ws-fold')] as HTMLElement[]
+            if (head.length !== 1)
+              verdict.push(`the heading carries ${head.length} fold controls — one control does both halves now`)
+            else {
+              const b = head[0]
+              if (b.getAttribute('aria-label') !== 'Fold every folder')
+                verdict.push(`with folders open the single control offers ${JSON.stringify(b.getAttribute('aria-label'))}`)
+              const minus = !!b.querySelector('[data-fold-sign="minus"]')
+              const plus = !!b.querySelector('[data-fold-sign="plus"]')
+              if (!minus || plus) verdict.push('the front square of the mark is not signed − while anything is open')
+              if (!b.querySelector('rect')) verdict.push('the mark is not two sheets stacked — it does not say it acts on the whole list')
+            }
+            const row = rowFor(path)
+            if (!row) verdict.push(`no folder row was found for ${JSON.stringify(path)} to measure the arrow against`)
+            else {
+              const chev = row.querySelector('button[data-ws-fold]') as HTMLElement | null
+              const more = row.querySelector('button[data-menu]') as HTMLElement | null
+              const plus2 = row.querySelector('button[aria-label^="New session in"]') as HTMLElement | null
+              if (!chev) verdict.push('the folder row carries no fold control of its own')
+              else {
+                if (chev.getAttribute('aria-expanded') !== 'true')
+                  verdict.push('the folder is open and its arrow says otherwise')
+                if (!more) verdict.push('the folder row has no actions button to sit left of the arrow')
+                else if (chev.getBoundingClientRect().left < more.getBoundingClientRect().right - 1)
+                  verdict.push(
+                    `the arrow is not right of the actions (arrow starts at ${Math.round(
+                      chev.getBoundingClientRect().left,
+                    )}, actions end at ${Math.round(more.getBoundingClientRect().right)})`,
+                  )
+                // The last *thing you can press* on the row has to be the arrow — which is what
+                // "rightmost" means when a disabled control can still sit at the edge.
+                const pressables = [...row.querySelectorAll('button')]
+                  .map((el) => ({ el, r: el.getBoundingClientRect() }))
+                  .filter((x) => !x.el.hasAttribute('disabled') && x.r.width > 0)
+                const last = pressables.sort((a, b) => b.r.right - a.r.right)[0]
+                if (last && last.el !== chev)
+                  verdict.push(
+                    `the arrow is not the last control on the row (${
+                      last.el.getAttribute('aria-label') ?? last.el.className
+                    } is)`,
+                  )
+                if (plus2 && plus2.getBoundingClientRect().right > chev.getBoundingClientRect().left)
+                  verdict.push('the new-session button sits right of the arrow')
+                // The arrow works: pressing it folds this folder and nothing else.
+                const others = wsGroups.filter((g) => g.path !== path).map((g) => g.path)
+                chev.click()
+                await new Promise((r) => setTimeout(r, 300))
+                if (!wsCollapsed.has(path)) verdict.push('pressing the arrow did not fold that folder')
+                if (others.some((p) => wsCollapsed.has(p)))
+                  verdict.push('pressing one folder’s arrow folded other folders too')
+                const row2 = rowFor(path)
+                if (row2 && (row2.querySelector('button[data-ws-fold]')?.getAttribute('aria-expanded') ?? '') !== 'false')
+                  verdict.push('the folded folder’s arrow does not say it is folded')
+                // And neither did the label: the row is the thumb target.
+                ;(row2?.querySelector('.wsbtn') as HTMLElement | null)?.click()
+                await new Promise((r) => setTimeout(r, 300))
+                if (wsCollapsed.has(path))
+                  verdict.push('clicking the folder’s own label no longer folds it — the row stopped being the target')
+              }
+            }
+            // Now shut the whole list: the one control has to change its mind, its word and its sign.
+            foldAll()
+            await new Promise((r) => setTimeout(r, 300))
+            const closedN = document.querySelectorAll('.wsgrp.closed').length
+            const groupsN = document.querySelectorAll('.wsgrp').length
+            if (closedN !== groupsN) verdict.push(`${groupsN - closedN} folder(s) stayed open after the header control folded them`)
+            const b2 = head[0]
+            if (b2) {
+              if (b2.getAttribute('aria-label') !== 'Unfold every folder')
+                verdict.push(`with the list shut the control offers ${JSON.stringify(b2.getAttribute('aria-label'))}`)
+              if (!b2.querySelector('[data-fold-sign="plus"]'))
+                verdict.push('the mark is still signed − when the button is about to open everything')
+              b2.click()
+              await new Promise((r) => setTimeout(r, 300))
+              if (wsCollapsed.size) verdict.push('pressing the unfolded control left folders shut')
+              if (!document.querySelector('.sessrow'))
+                verdict.push('nothing unfolded: the list shows no conversation rows at all')
+            }
+            if (verdict.length) fail(verdict.join('; '))
+            pageLog(
+              `fold controls ok (one header button, signed − open and + shut; the arrow is the last thing on a ` +
+                `folder row and folds that folder alone; the label still folds too; ${groupsN} folder row(s))`,
+            )
+          } finally {
+            wsCollapsed = new Set(snapshot)
+            saveWsCollapsed()
+            await new Promise((r) => setTimeout(r, 200))
+          }
+        }
+      }
+
+      // --- one surface for the whole window ----------------------------------------
+      //
+      // Three tones made one container read as three: `paper-2` across the top, a cream-to-olive
+      // wash down the left, `pane` behind the card. The claims are that the window paints one
+      // surface, that nothing inside it paints another, that the card is still a step up in tone
+      // (that is what a card is), and that the desktop shell — and only the desktop shell — draws
+      // its own rounded, hairlined edge, including while a dim covers the window: a full-bleed
+      // rectangle that ignores the radius puts four square notches back on a rounded window.
+      if (want('desk', 'the titlebar, the sidebar and the band behind the card are one surface, and the card is the only step in tone')) {
+        const verdict: string[] = []
+        const shell = document.querySelector('.app-shell') as HTMLElement | null
+        const bar = document.querySelector('.titlebar') as HTMLElement | null
+        const side = document.querySelector('aside.sidebar') as HTMLElement | null
+        const card = document.querySelector('.panecard') as HTMLElement | null
+        if (!shell || !bar || !side || !card)
+          fail(
+            `the surface check found no ${!shell ? '.app-shell' : !bar ? 'titlebar' : !side ? 'sidebar' : 'card'}`,
+          )
+        else {
+          for (const [name, el] of [
+            ['the titlebar', bar],
+            ['the sidebar', side],
+          ] as const) {
+            const cs = getComputedStyle(el)
+            if (cs.backgroundImage !== 'none') verdict.push(`${name} paints its own gradient`)
+            if (cs.backgroundColor !== 'rgba(0, 0, 0, 0)')
+              verdict.push(`${name} paints ${cs.backgroundColor} instead of letting the window’s surface show through`)
+            if (parseFloat(cs.borderBottomWidth) > 0 || parseFloat(cs.borderRightWidth) > 0)
+              verdict.push(`${name} still draws a divider`)
+          }
+          const scs = getComputedStyle(shell)
+          const desk = scs.backgroundImage !== 'none' ? scs.backgroundImage : scs.backgroundColor
+          if (!desk || desk === 'rgba(0, 0, 0, 0)' || desk === 'none')
+            verdict.push('the window paints no surface at all')
+          const paper = getComputedStyle(card).backgroundColor
+          if (paper === 'rgba(0, 0, 0, 0)') verdict.push('the card has no surface of its own')
+          else if (desk && paper === desk) verdict.push('the card and the window paint the same tone: the card is not a step up')
+          // The page has to paint behind the app. That is not a style preference: the window is
+          // frameless, and a webview made see-through on this WebKitGTK/GNOME session stopped
+          // painting the shell's own surface, so the desktop and the windows behind it showed
+          // through the app and the screen flashed. If anyone re-lands a transparent window, this
+          // is the claim that says what it broke, in the run that breaks it.
+          const pageBG = getComputedStyle(document.body).backgroundColor
+          if (pageBG === 'rgba(0, 0, 0, 0)')
+            verdict.push('the page paints nothing behind the app, so the window is see-through and whatever is behind it shows through')
+          pageLog(
+            `window surface ok (one desk under the titlebar, the sidebar and the band around the card; the card is ` +
+              `the only step up in tone; no divider between the parts; the page paints opaque behind the app)`,
           )
         }
       }
@@ -15208,6 +15417,15 @@
       stream_el: !!document.querySelector('.transcript'),
       empty_mode: !!document.querySelector('.empty'),
       body_bg: getComputedStyle(document.body).backgroundColor,
+      /** The app's own surface, which is what proves the webview painted now that the desktop
+          window is transparent at its corners. A gradient counts as painted even though its
+          `background-color` is empty, so the two are folded into one word here rather than making
+          the Rust side guess what a colour string means. */
+      desk_bg: (() => {
+        const cs = getComputedStyle(shellEl ?? document.body)
+        if (cs.backgroundImage && cs.backgroundImage !== 'none') return 'gradient'
+        return cs.backgroundColor
+      })(),
       overlay_present: !!document.querySelector('vite-error-overlay'),
       text_len: document.body.innerText.trim().length,
       device_pixel_ratio: window.devicePixelRatio,
@@ -15530,10 +15748,17 @@
   }
 </script>
 
-<div class="app-shell flex h-full flex-col bg-paper text-ink" class:modal-open={settings !== null} bind:this={shellEl}>
+<!-- The surface is in the stylesheet now (`.app-shell`): one desk colour for the whole window —
+     titlebar, sidebar and the band around the card — so the card is the only step in tone on the
+     screen, and no divider is needed anywhere to tell the parts apart. -->
+<div
+    class="app-shell flex h-full flex-col text-ink"
+    class:modal-open={settings !== null}
+    bind:this={shellEl}
+  >
   <!-- ============================ titlebar ============================ -->
   <div
-    class="titlebar flex h-11 shrink-0 items-center gap-2 bg-paper-2 px-3"
+    class="titlebar flex h-11 shrink-0 items-center gap-2 px-3"
     data-tauri-drag-region
   >
     <!-- Sidebar toggle first. Below 768px the sidebar is a drawer, and without this
@@ -15598,7 +15823,6 @@
       class="sidebar w-[248px] shrink-0 flex-col gap-1.5 p-2.5 min-h-0"
       class:open={sidebarOpen}
       class:animating={sidebarAnimating}
-      style="background: linear-gradient(160deg, var(--color-wash-1), var(--color-wash-2) 55%, var(--color-wash-3));"
     >
       <!-- A tab strip, not a headline button. New session keeps a key on the shortcut, a `+`
            here, and the `+` on each workspace row.
@@ -15665,21 +15889,28 @@
           {:else}
             <span>Workspaces</span>
             <span class="sesshead-r">
+              <!-- One control for the whole list, and it says which way it will go. The mark is two
+                   sheets stacked — the stack is the scope, it acts on every folder — and the square
+                   in front carries the sign of the action: − while anything is open, + once the list
+                   is shut. A chevron would have said "there is more", which is a fact about the
+                   list rather than a promise about the press. -->
               <button
                 class="iconbtn ws-fold"
-                aria-label="Fold every folder"
-                title="Fold every folder"
-                onclick={foldAll}
+                data-fold-all
+                aria-label={anyWsOpen ? 'Fold every folder' : 'Unfold every folder'}
+                title={anyWsOpen
+                  ? 'Fold every folder — the same button opens them again when nothing is open'
+                  : 'Unfold every folder'}
+                onclick={() => (anyWsOpen ? foldAll() : unfoldAll())}
               >
-                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 7.4L6 4.4L9 7.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
-              </button>
-              <button
-                class="iconbtn ws-fold"
-                aria-label="Unfold every folder"
-                title="Unfold every folder"
-                onclick={unfoldAll}
-              >
-                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.4L6 7.4L9 4.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+                <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+                  <path d="M2.9 4.5V2.7h5v4.6" stroke="currentColor" stroke-width="1.25" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+                  <rect x="3.5" y="3.9" width="6.2" height="6" rx="1.5" stroke="currentColor" stroke-width="1.25" fill="none"/>
+                  <path data-fold-sign="minus" d="M5 6.9h3.2" stroke="currentColor" stroke-width="1.25" fill="none" stroke-linecap="round"/>
+                  {#if !anyWsOpen}
+                    <path data-fold-sign="plus" d="M6.6 5.3v3.2" stroke="currentColor" stroke-width="1.25" fill="none" stroke-linecap="round"/>
+                  {/if}
+                </svg>
               </button>
               <button
                 class="iconbtn ws-addall"
@@ -15835,11 +16066,9 @@
                        coloured thing. Uncoloured rows keep the quiet ink: colour is a choice the
                        person made about some folders, not decoration sprayed over all of them.
 
-                       The chevron used to sit here, at the left. It has moved to the right end of
-                       the label: a leading glyph should say what the row *is*, and the fold state of
-                       a folder is not what a folder is. It stays inside this button — folding a
-                       folder is a navigation act and needs a target a thumb can hit — pushed to the
-                       end of the run by `margin-left: auto`, so the whole label is still the target. -->
+                       The chevron used to sit here, at the left. It has moved to the far right of
+                       the row, past the actions: a leading glyph should say what the row *is*, and a
+                       folder's fold state is not what a folder is. -->
                   <svg
                     class="ws-folder"
                     width="14"
@@ -15852,9 +16081,6 @@
                   </svg>
                   <span class="ws-name" title={g.path}>{g.label}</span>
                   <span class="ws-n">{g.list.length}</span>
-                  <svg class="ws-chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-                    <path d={open ? 'M2 3.5L5 6.5L8 3.5' : 'M3.5 2L6.5 5L3.5 8'} stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>
-                  </svg>
                 </button>
                 {#if g.path}
                   <button
@@ -15873,6 +16099,29 @@
                   onclick={(e) => openMenu('ws', e.currentTarget as HTMLElement, undefined, g.path)}
                 >
                   <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="2.6" cy="6" r="1.05" fill="currentColor"/><circle cx="6" cy="6" r="1.05" fill="currentColor"/><circle cx="9.4" cy="6" r="1.05" fill="currentColor"/></svg>
+                </button>
+                <!-- How this one folder is arranged, at the very right end of the row. The order is
+                     the order a row gets read: what it is (folder), what it holds (the count), what
+                     you can do to it (new session, actions), and only then its fold state — which is
+                     the least actionable thing on the line and used to sit in the most prominent
+                     place it has, at the head. It is a control in its own right now, so it names
+                     itself for a screen reader; the label still folds as well, because the row is the
+                     thumb target and folding a folder is a navigation act. -->
+                <button
+                  class="iconbtn ws-chevbtn"
+                  data-ws-fold
+                  aria-expanded={open}
+                  aria-label={`${open ? 'Fold' : 'Unfold'} ${g.label}`}
+                  title={`${open ? 'Fold' : 'Unfold'} ${g.label}`}
+                  disabled={picking}
+                  onclick={(e) => {
+                    e.stopPropagation()
+                    toggleWs(g.path)
+                  }}
+                >
+                  <svg class="ws-chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+                    <path d={open ? 'M2 3.5L5 6.5L8 3.5' : 'M3.5 2L6.5 5L3.5 8'} stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+                  </svg>
                 </button>
               {/if}
             </div>
@@ -16012,7 +16261,7 @@
     </aside>
 
     <!-- main -->
-    <main class="bg-pane flex min-w-0 flex-1 flex-col min-h-0" class:empty-mode={showEmpty}>
+    <main class="flex min-w-0 flex-1 flex-col min-h-0" class:empty-mode={showEmpty}>
       {#if connNote}
         <!-- Rendered, not logged: a phone cannot open a console, and "no model"
              was sending people to fix a config file on the wrong machine. -->

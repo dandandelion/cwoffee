@@ -909,3 +909,160 @@ wire-names: OK (unchanged: three desktop/gateway-only verbs reported as notes)
    of a turn; the check has to keep its own.
 6. **A counter that describes a page can be as stale as the page.** The sidebar's `message_count`
    does not know about the conversation this send just created.
+
+---
+
+# Batch five — the arrow moves to the end of the row, the header learns one fold button, and the window becomes one surface (twice; one of those attempts broke it)
+
+## O. The folder row's reading order
+
+The arrow that says how a folder is arranged was at the right end of the *label*, which put it
+between the conversation count and the row's actions — so the last thing a row offered was neither
+the last thing you press nor the least actionable thing it says. Now the row reads in the order it
+gets read: folder, name, count, then the actions (`+`, `⋯`), then the fold state, last.
+
+The arrow also stopped being a mark inside the label button and became a control in its own right —
+it names itself (`Fold cwoffee-workspace` / `Unfold cwoffee-workspace`) and reports
+`aria-expanded`, which a decorative `<svg>` inside someone else's button cannot do. The label still
+folds on click, because the row is the thumb target and folding a folder is a navigation act; in
+selection mode the arrow stays in place so the row does not change shape mid-pick, and does nothing
+(`disabled`).
+
+## P. One fold button, and it says which way it will go
+
+The `Workspaces` heading carried three buttons: fold all, unfold all, add a folder. Two of them were
+a question about the state of six folders — one of the two was always inert, and both were chevrons
+pointing at nothing in particular.
+
+One button now, and it takes the side of the list it is looking at: while anything is open it folds,
+and only once the list is shut does it open.
+
+```ts
+const anyWsOpen = $derived(wsGroups.some((g) => !wsCollapsed.has(g.path)))
+```
+
+The mark is two sheets stacked — the stack is the scope, it acts on every folder — and the square in
+front carries the sign of the action: `−` while it is about to fold, `+` once it is about to unfold.
+A chevron would have said "there is more", which is a fact about the list rather than a promise
+about the press.
+
+The `delete` check had been clicking `.iconbtn.ws-fold[aria-label="Unfold every folder"]`. That
+selector describes a button that no longer exists, and worse, it names the half rather than the
+control — so it now presses the one button *until the list is open*, which is what the check
+actually needs and what survives the next change to the control.
+
+## Q. The opening screen's "pair" was two things
+
+Last batch's card was supposed to centre the greeting and the composer as one subject. It did not,
+and the CSS believed it had: `.empty-mode .panecard { justify-content: center }` was centring a
+column whose middle was occupied by the transcript's box, which is `flex: 1` and keeps swallowing
+the free space even while the transcript inside it is `display: none`. Cup at the top of the card,
+composer at the bottom, 600px of nothing in between.
+
+```css
+/* The wrap has to go as well. It is `flex: 1`, so it keeps swallowing the free space even when
+   the thing inside it is hidden … */
+.empty-mode .scrollerwrap { display: none; }
+```
+
+Hidden, not unmounted — the renderer holds a reference to its root node.
+
+The new claim measures the pair rather than admiring it:
+
+```
+opening screen ok (greeting and composer 32px apart, the pair 24px off the card's middle,
+the pair spans 608px of a 709px card)
+```
+
+## R. One surface across the window — and two attempts that cost more than they gave
+
+The ask: the titlebar, the sidebar and the band behind the card should be one colour, with no
+dividers, and the whole window should get rounded corners and a hairline.
+
+The first half shipped. The window used to be three tones — `paper-2` across the top, a
+cream-to-olive wash down the left, `pane` behind the card — which is what made one container read as
+three containers with lines between them even in the places where the line had already been deleted.
+Now `.app-shell` carries the surface and everything inside it is transparent; the sidebar's inline
+gradient and its three `--color-wash-*` tokens are gone; `main` lost its `bg-pane`; the titlebar lost
+its `bg-paper-2`. The card stays `paper`, and it is now the only step in tone on the screen — which
+is the entire job of a card.
+
+The gradient was tried, because the ask said to try it. Measured, on the same page in the same run:
+
+| desk | big transcript, median frame | frame cadence, median |
+| --- | --- | --- |
+| gradient on the shell box | 43–46 ms | 34–36 ms |
+| gradient on a fixed layer behind the content | (see below) | — |
+| flat `--color-pane` | 18–30 ms | 12–23 ms |
+
+A scrolled transcript repaints the surface behind it, and a gradient is not a free fill. The flat
+colour is what holds. (Removing the sidebar's wash gradient also *recovered* frame time: the
+big-transcript median is now 18ms, better than the 24–25ms this batch started at.)
+
+The second half did not ship, and the reason is in the stylesheet where someone would next try it:
+`"transparent": true` in `tauri.conf.json`, a 14px radius and an inset hairline on `.app-shell`, and
+a page made transparent behind it, made the webview stop painting the shell's own surface on this
+WebKitGTK/GNOME session. The app went part translucent: the terminal behind it showed through the
+desk, the settings dialog floated over someone else's window text, and the screen flashed as the
+compositor decided what to keep. That is the report that ended the experiment. A frameless window on
+Linux is a rectangle the compositor clips; corners would have to come from the window manager or a
+real CSD implementation, not from making the page see-through. The modernising is done with tone
+instead: one surface, no dividers, a rounded card.
+
+Three things were kept from the failed attempt, because they were good independent of the rounding:
+
+- `desk_bg` is now part of the startup render report, and the watchdog's "did the webview paint?"
+  test reads the app's own surface instead of `document.body`. The old test treated
+  `rgba(0, 0, 0, 0)` as the symptom of a blank window, which is exactly what a *correctly*
+  transparent window looks like — so the signal was about to become a lie either way.
+  `a_transparent_body_with_a_painted_shell_is_not_a_blank_window` keeps it honest.
+- The `panecard` check had been comparing the card's tone with `main`'s, which is transparent now:
+  a build that painted nothing would have passed. It compares the card with what the window paints.
+- The `desk` check asserts the page paints an opaque surface behind the app, with the flashing bug
+  written into the comment. If anyone re-lands a transparent window, the run says what it broke.
+
+## What this batch changed
+
+- Folder row: the fold arrow is a named control at the far right, past the actions; the label still
+  folds; the arrow is disabled during selection.
+- Heading: one fold control, signed `−` open / `+` shut, two stacked sheets; `delete` presses it
+  until the list is open instead of naming a button.
+- Opening screen: the transcript's box leaves the flex flow, so the greeting and composer centre as
+  the pair the CSS always claimed they were.
+- Window: one surface (`.app-shell` carries `--color-pane`); titlebar, sidebar and `main` no longer
+  paint their own; the three `--color-wash-*` tokens are deleted; no divider anywhere.
+- Startup render report: `desk=` added, and the "painted?" test moved to the shell.
+
+## Full pass, both cores
+
+```
+rust core: SELFTEST ok — 73 claims, including
+  fold controls ok (one header button, signed − open and + shut; the arrow is the last thing on a
+    folder row and folds that folder alone; the label still folds too; 2 folder row(s))
+  window surface ok (one desk under the titlebar, the sidebar and the band around the card; the card
+    is the only step up in tone; no divider between the parts; the page paints opaque behind the app)
+  opening screen ok (greeting and composer 32px apart, the pair 24px off the card's middle, the pair
+    spans 608px of a 709px card)
+  big transcript cadence: 168 blocks / 635096 characters; median 18.0ms, p95 44.0ms
+pi core:   SELFTEST ok — 76 claims, same three groups
+cargo test --workspace: 0 failing (app 25, engine 519, gateway 38, bridge 35, pi fixtures 16, mock 10)
+svelte-check: 0 errors, 0 warnings · vite build: built · wire-names: OK
+installed (--core pi), launch check OK:
+  render OK: … bg=rgb(253, 252, 249) desk=rgb(242, 239, 231) …
+```
+
+## Lessons
+
+1. **A flex child does not stop eating space because its child is hidden.** `display: none` on the
+   transcript left its `flex: 1` wrap taking the middle of the card, and the centring rule that
+   looked correct was centring a column with a hole in it.
+2. **Measure the gradient before shipping the gradient.** It was asked for, it looked fine in a
+   screenshot, and it cost ~15ms a frame on a large transcript. Numbers ended the argument.
+3. **A transparent window is not a corner radius.** On this WebKitGTK/GNOME session it removed the
+   webview's own paint: the app went translucent and the desktop showed through. The failed attempt
+   is written in the stylesheet where it would be attempted again, with what it did and what it cost.
+4. **A watchdog signal has to describe the thing it claims.** `body` being empty stopped meaning
+   "nothing painted" the moment the window was allowed to be transparent — the surface moved to the
+   app's own shell, and the check moved with it or it would have been lying in both directions.
+5. **When a control's two halves merge, the checks that named each half have to name the state
+   instead.** "Press the unfold button" became "press the fold control until the list is open".

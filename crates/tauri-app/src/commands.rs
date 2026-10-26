@@ -1318,6 +1318,14 @@ pub struct RenderReport {
     /// trains you to ignore the line.
     pub empty_mode: bool,
     pub body_bg: String,
+    /// The app's own surface — `.app-shell`, which carries the desk colour or gradient the whole
+    /// window sits on. This is the painted-surface signal now: the desktop window is deliberately
+    /// transparent at its corners (a frameless window rounds against the desktop, not against a
+    /// page), so an empty body background is what a correctly painted window looks like and can no
+    /// longer carry the check. Defaulted so an older UI bundle still parses — and an older bundle
+    /// reports nothing here, which is exactly when this line should say SUSPECT.
+    #[serde(default)]
+    pub desk_bg: String,
     pub overlay_present: bool,
     pub text_len: usize,
     pub device_pixel_ratio: f64,
@@ -1333,14 +1341,9 @@ pub fn render_report(state: tauri::State<'_, AppState>, report: RenderReport) {
     // The watchdog in main.rs keys off this; without it a blank window looks
     // healthy from every outside signal.
     state.rendered.store(true, std::sync::atomic::Ordering::SeqCst);
-    let sane = report.titlebar
-        && report.sidefoot
-        && !report.overlay_present
-        && report.text_len > 0
-        && report.body_bg != "rgba(0, 0, 0, 0)"
-        && report.body_bg != "rgb(0, 0, 0)";
+    let sane = render_is_sane(&report);
     eprintln!(
-        "[cwoffee] render {}: titlebar={} sidebar={} sidefoot={} stream={} empty={} overlay={} text={} bg={} dpr={:.2} cup={}",
+        "[cwoffee] render {}: titlebar={} sidebar={} sidefoot={} stream={} empty={} overlay={} text={} bg={} desk={} dpr={:.2} cup={}",
         if sane { "OK" } else { "SUSPECT" },
         report.titlebar,
         report.sidebar,
@@ -1350,14 +1353,31 @@ pub fn render_report(state: tauri::State<'_, AppState>, report: RenderReport) {
         report.overlay_present,
         report.text_len,
         report.body_bg,
+        report.desk_bg,
         report.device_pixel_ratio,
         report.cup,
     );
 }
 
+/// Does this report describe a window that actually painted something?
+///
+/// The surface test is on the app's own shell, not on `document.body`: the desktop window is
+/// transparent at the corners now, so a hollow body background is the correct state and a webview
+/// that painted nothing is a hollow *shell*. Black still counts as a failure, because the desk is
+/// never pure black in either theme.
+fn render_is_sane(r: &RenderReport) -> bool {
+    fn hollow(s: &str) -> bool {
+        let s = s.trim();
+        s.is_empty() || s == "none" || s == "rgba(0, 0, 0, 0)" || s == "rgb(0, 0, 0)"
+    }
+    r.titlebar && r.sidefoot && !r.overlay_present && r.text_len > 0 && !hollow(&r.desk_bg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::picked_to_path;
+    use super::render_is_sane;
+    use super::RenderReport;
     use std::path::PathBuf;
     use tauri_plugin_dialog::FilePath;
 
@@ -1366,6 +1386,30 @@ mod tests {
     /// whole bug: a folder the user had just picked became `file:///home/...`,
     /// which is not a directory, so the engine refused it and the workspace
     /// control snapped back to whatever the config said.
+    /// The window is transparent at the corners now, and the launch check used to read a hollow
+    /// body background as "the webview never painted". It must not: the shell is the surface.
+    #[test]
+    fn a_transparent_body_with_a_painted_shell_is_not_a_blank_window() {
+        let mut r = RenderReport {
+            titlebar: true,
+            sidebar: true,
+            sidefoot: true,
+            stream_el: true,
+            empty_mode: false,
+            body_bg: "rgba(0, 0, 0, 0)".into(),
+            desk_bg: "gradient".into(),
+            overlay_present: false,
+            text_len: 3_505,
+            device_pixel_ratio: 2.0,
+            cup: "cup.webp:480x480".into(),
+        };
+        assert!(render_is_sane(&r), "a rounded window has an empty body");
+        r.desk_bg = "rgba(0, 0, 0, 0)".into();
+        assert!(!render_is_sane(&r), "a shell that painted nothing is still blank");
+        r.desk_bg = "rgb(0, 0, 0)".into();
+        assert!(!render_is_sane(&r), "and a black shell is the old symptom, not a theme");
+    }
+
     #[test]
     fn a_portal_url_becomes_a_real_path() {
         let u = url::Url::parse("file:///home/dandandelion/Downloads").unwrap();

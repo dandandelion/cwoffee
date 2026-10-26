@@ -26,10 +26,6 @@
   --color-hairline: #e8e5dd;
   --color-hairline-2: #dcd8ce;
 
-  /* sidebar wash: cream -> pale olive, like the mock */
-  --color-wash-1: #f4f1e4;
-  --color-wash-2: #eef0e6;
-  --color-wash-3: #e9eee9;
 
   /* ink */
   --color-ink: #2b2a27;
@@ -86,9 +82,6 @@
   --color-hairline: #35332d;
   --color-hairline-2: #4a473f;
 
-  --color-wash-1: #232118;
-  --color-wash-2: #24271e;
-  --color-wash-3: #22271f;
 
   --color-ink: #e9e6de;
   --color-ink-2: #b4b0a6;
@@ -131,6 +124,33 @@ body {
    the telemetry bar below the bottom of the window. */
 #app {
   height: 100%;
+}
+
+/* One surface for the whole window.
+   The titlebar used to be `paper-2`, the sidebar a cream-to-olive wash, and the band around the
+   card `pane`: three tones, which is what made one container read as three containers with lines
+   between them even where the line had been deleted. Now the shell carries the surface and
+   everything inside it is transparent — one beige, one charcoal. The card stays `paper`: it is the
+   only step in tone on the screen, which is the entire job of a card.
+
+   Two things were tried here, measured, and put back, and the numbers are written down so nobody
+   spends an afternoon re-landing them:
+
+   * A soft gradient on this box. Median frame time on a 635KB transcript went from 30ms to
+     43-46ms — a scrolled transcript repaints the surface behind it, and a gradient is not a free
+     fill. Moving it to a fixed layer behind the content recovered most of it, and cost the app its
+     paint instead (below). The flat colour is what holds.
+   * Rounding the window: `"transparent": true` in tauri.conf.json, a 14px radius and an inset
+     hairline on this box, and a transparent page behind it. On this WebKitGTK/GNOME session the
+     webview stopped painting the shell's own surface: the app went part translucent, the windows
+     behind it showed through, and the screen flashed as the compositor decided what to keep. That
+     is the report this came out of. A frameless window on Linux is a rectangle the compositor
+     clips; rounded corners would have to come from the window manager or a real CSD implementation,
+     not from making the page see-through. So the window stays opaque and square, and the modernising
+     is done with tone instead: one surface, no dividers, and a rounded card that reads as one object.
+*/
+.app-shell {
+  background: var(--color-pane);
 }
 
 /* Mobile browsers resize the viewport as the URL bar hides and shows, so 100%
@@ -2407,11 +2427,26 @@ body {
 .ws-chev {
   flex: none;
   color: var(--color-ink-3);
-  /* The fold control sits at the end of the label run now, not the start: the leading position
-     belongs to the folder. `auto` rather than a fixed margin, because the name is what shrinks — a
-     long name takes the space and the chevron ends up flush after the count, which is still the right
-     end of the row. */
-  margin-left: auto;
+}
+/* The fold state of one folder, at the far right of the row — past the actions, because a row is
+   read as what it is, what it holds, what you can do to it, and only then how it is arranged. It
+   carries the quiet weight of the other row controls and lifts to full ink when the row is
+   attended to or when the folder is shut (a shut folder is the state worth seeing). */
+.ws-chevbtn {
+  flex: none;
+  opacity: 0.45;
+}
+.wsrow:hover .ws-chevbtn,
+.wsrow:focus-within .ws-chevbtn,
+.ws-chevbtn:focus-visible,
+.wsgrp.closed > .wsrow .ws-chevbtn {
+  opacity: 1;
+}
+/* Selection mode is about picking whole folders, not arranging them; the fold control stays
+   visible so the row does not change shape mid-pick, and does nothing. */
+.ws-chevbtn:disabled {
+  opacity: 0.18;
+  cursor: default;
 }
 .wsgrp.closed > .wsrow .ws-chev {
   color: var(--color-ink-2);
@@ -2822,6 +2857,11 @@ body {
 /* Hidden, not unmounted: the transcript renderer holds a reference to its root
    node, and an {#if} would destroy the very element it keeps writing into. */
 .empty-mode .scroller { display: none; }
+/* The wrap has to go as well. It is `flex: 1`, so it keeps swallowing the free space even when
+   the thing inside it is hidden — which is what left the greeting pinned to the top of the card
+   and the composer at the bottom of it, with a hole between them, while the centring rule believed
+   it was centring a pair. */
+.empty-mode .scrollerwrap { display: none; }
 .empty {
   display: flex;
   flex-direction: column;
