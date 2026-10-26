@@ -15,6 +15,14 @@
      other way in each theme - deeper cream on a near-white screen, paler ink on
      a near-black one - because "lighter" is not a direction both themes share. */
   --color-raise: #f3f0e6;
+  /* The surface the conversation card sits on. The reading surface itself stays
+     `paper` — every text-on-background relationship that has been tuned against it
+     keeps holding — and it is the surround that steps down one notch, so the card
+     reads as a card without a line being drawn around it. That trade is the whole
+     reason this token exists rather than the card being tinted: a tinted card would
+     change what every answer, code block and table looks like, and none of those
+     colours were chosen against a cream ground. */
+  --color-pane: #f2efe7;
   --color-hairline: #e8e5dd;
   --color-hairline-2: #dcd8ce;
 
@@ -71,6 +79,10 @@
   --color-paper: #1e1d1b;
   --color-paper-2: #26241f;
   --color-raise: #2c2a24;
+  /* One notch *deeper* than the card. In a dark theme the reading surface is the light
+     thing already; lifting the surround would put a glow behind the text column and make
+     the page feel backlit. */
+  --color-pane: #191816;
   --color-hairline: #35332d;
   --color-hairline-2: #4a473f;
 
@@ -233,12 +245,14 @@ body {
    * pane's bottom edge, 136px of picture, and 24px of clearance above it - because a band the
    * picture does not fit is a band that will show the picture overlapping someone's sentence.
    *
-   * `--cup-left` is the left edge of the 780px text column: the scroller pads 80px on the left
-   * and 28px on the right, so at full width the column starts at `pane centre - 390 + 26`, and
-   * below that the column is as wide as the padding box and starts at the gutter.
+   * `--cup-left` is the left edge of the 780px text column: the card gutter puts 16px between the
+   * pane and the scroller, the scroller pads 80px on the left and 28px on the right, so at full
+   * width the column starts at `pane centre - 390 + 26` (the gutter cancels: it takes the same
+   * 16px off both sides, so the centre does not move), and below that the column is as wide as the
+   * padding box and starts at the gutter plus the gutter.
    */
   --cup-band: 168px;
-  --cup-left: max(80px, calc(50% - 364px));
+  --cup-left: max(96px, calc(50% - 364px));
 }
 /* The way back down: sticky to the bottom of the transcript, centred on the column the text
    actually occupies. The transcript is padded 80px on the left (the gutter that holds the
@@ -291,6 +305,14 @@ body {
   .jump { transition: none; }
 }
 .scroller {
+  /* The conversation on a surface of its own: the same paper the text has always been read on,
+     rounded, and separated from the pane by tone alone. No ring and no shadow — measured in this
+     app's own check, an inset ring on a surface this size costs frames: a full transcript streamed
+     at 32.0ms/frame against 13.0ms idle on the same page, because the ring is repainted with every
+     line that scrolls past under it. The pane sitting one notch under the paper is what makes the
+     edge, which is also how the reference does it. */
+  background: var(--color-paper);
+  border-radius: 16px;
   /* The gutter is a variable rather than a magic number because the sticky header of a
      long code block has to know it. A sticky offset is measured against the scrollport's
      *content* edge, so a 24px top padding would park that header 24px below the top of the
@@ -349,9 +371,10 @@ body {
     padding-left: 24px;
     padding-right: 16px;
   }
-  /* No gutter to hang the label in, and no column margin to hang the cup in either. */
+  /* No gutter to hang the label in, and no column margin to hang the cup in either. The 16px of
+     card gutter is still there, so the column starts 16px further in than the scroller's padding. */
   .scrollerwrap {
-    --cup-left: 24px;
+    --cup-left: 40px;
   }
   .blk > .blk-head {
     position: static;
@@ -594,6 +617,84 @@ body {
 }
 .blk-user .blk-who { color: var(--color-shell-deep); font-weight: 600; }
 .blk-user .blk-body { color: var(--color-ink); font-weight: 450; }
+
+/* ---- what you can do with your own message -----------------------------
+   Same quiet row as the one under a finished turn, right-aligned because the
+   bubble it belongs to is right-aligned. Always reachable rather than on hover,
+   for the same reason: a control you find by hovering is a control a phone does
+   not have. */
+.user-acts {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+  margin: 2px 0 0;
+}
+
+/* ---- correcting your own words, in place -------------------------------
+   The bubble is put away while its text is being rewritten, so there is one
+   version of the message on screen at a time — the record only ever holds one,
+   and showing both invites reading the old one as still true.
+
+   The note between the field and the buttons is not decoration: the two buttons
+   do measurably different things to the conversation, and the difference is not
+   guessable from their labels. */
+.blk-user.editing > .blk-body,
+.blk-user.editing > .user-acts {
+  display: none;
+}
+.user-edit {
+  margin-left: auto;
+  max-width: min(74%, 620px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.user-edit-ta {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 72px;
+  padding: 9px 13px;
+  border-radius: 12px;
+  border: 1px solid var(--color-hairline-2);
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  font: inherit;
+  font-weight: 450;
+  line-height: 1.5;
+}
+.user-edit-ta:focus-visible { outline: 2px solid var(--color-shell); outline-offset: 1px; }
+.user-edit-note {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-ink-3);
+  max-width: 62ch;
+}
+.user-edit-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.ue-act {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--color-hairline-2);
+  background: none;
+  color: var(--color-ink-2);
+  cursor: pointer;
+  transition: background var(--d1) var(--ease), color var(--d1) var(--ease),
+    border-color var(--d1) var(--ease);
+}
+.ue-act:hover:not(:disabled) { background: var(--color-tint); color: var(--color-ink); }
+.ue-act:disabled { opacity: 0.55; cursor: default; }
+/* The ask that drops the rest of the conversation is the one that needs a steadier
+   hand, so it gets the weight; Save stays plain, because it is the safe one. */
+.ue-act.again { border-color: var(--color-shell); color: var(--color-shell-deep); }
+.ue-act.cancel { border-color: transparent; color: var(--color-ink-3); }
+
 .blk-answer .blk-body { color: var(--color-ink); }
 /* A thought is one line, and that is the whole block.
 
@@ -1057,6 +1158,53 @@ body {
    never flashes at a guessed coordinate. */
 .pop.measuring { visibility: hidden; }
 .pop-empty { padding: 6px 8px; font-size: 12px; color: var(--color-ink-3); }
+/* The colour row inside a folder's menu: a label, a line about what it does, and the swatches
+   themselves under both — the grid pins `.pop-lbl` to row 1 and `.pop-sub` to row 2, so the control
+   claims row 3 across both columns instead of fighting the pinned rows. */
+.pop-colors {
+  row-gap: 5px;
+}
+.pop-colors .swatchrow {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 3px;
+}
+.swatch {
+  width: 21px;
+  height: 21px;
+  padding: 0;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 6px;
+  /* The swatch is the colour, not a picture of it: same value the folder mark will get, so picking
+     one is a preview of the row it belongs to. */
+  background: var(--sw, transparent);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-paper);
+}
+.swatch.none {
+  background: var(--color-paper);
+  color: var(--color-ink-3);
+}
+.swatch .sw-check {
+  opacity: 0;
+}
+.swatch.on {
+  border-color: var(--color-shell-deep);
+  box-shadow: inset 0 0 0 1px var(--color-shell-deep);
+}
+.swatch.on .sw-check {
+  opacity: 1;
+}
+.swatch:focus-visible {
+  outline: 2px solid var(--color-shell-deep);
+  outline-offset: 1px;
+}
 
 /* workspace row under the card */
 .wsrow {
@@ -1492,6 +1640,53 @@ body {
   background: var(--color-warn);
   box-shadow: 0 0 0 2px var(--color-warn-bg);
 }
+/* ---- the theme glyph turns; it does not swap --------------------------------
+   The button used to hold one `<svg>` chosen by `{#if theme}`, so the change was a DOM
+   replacement: the moon vanished and a sun appeared, same frame, full opacity. The request was
+   to animate that toggle, and the honest way to animate a swap is to have both things present
+   and let one leave while the other arrives. Stacked absolute spans, and the state lives on
+   `[data-theme]` — the same attribute the palette reads — so the glyph and the colours cannot
+   end up describing two different themes.
+
+   The base rule is the light state, because that is what `:root` is before anything is read
+   from storage; a rule set that only matched `[data-theme='light']` would show two glyphs for
+   the frame before the app applies the saved theme.
+   Rotation plus scale is the gesture: it reads as a dial being turned rather than as a picture
+   fading.
+   -------------------------------------------------------------------------- */
+.thm .thm-ic {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  transition:
+    opacity var(--d1) var(--ease),
+    transform var(--d3) var(--ease);
+}
+/* The glyph stays centred by the rule every other icon in this row uses - `margin: auto` in a
+   grid box - so wrapping it cannot move it. */
+.thm .thm-ic > svg {
+  margin: auto;
+}
+.thm .thm-sun {
+  opacity: 0;
+  transform: rotate(72deg) scale(0.5);
+}
+.thm .thm-moon {
+  opacity: 1;
+  transform: none;
+}
+/* Dark asks for the sun: the glyph is what the button will change *to*, which is how it read
+   before and how it reads now. */
+[data-theme='dark'] .thm-sun {
+  opacity: 1;
+  transform: none;
+}
+[data-theme='dark'] .thm-moon {
+  opacity: 0;
+  transform: rotate(-72deg) scale(0.5);
+}
 .side-item {
   display: flex;
   align-items: center;
@@ -1763,17 +1958,309 @@ body {
 }
 .att-x:hover { color: var(--color-danger); }
 .att-err { font-size: 11px; color: var(--color-danger); }
+/* "The file is fine, and this model cannot see it." Different from an error, so it borrows the
+   warning palette rather than the refusal one — a person reading red assumes nothing was attached,
+   which is the opposite of what happened. */
+.att-warn { font-size: 11px; color: var(--color-warn); }
 
-/* Transcript placeholder for an attachment. Deliberately not a thumbnail:
-   history pages carry metadata only, so a thumbnail here would vanish on
-   reopen and make the transcript look lossy. */
-.attlist { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+/*
+ * The composer's one tool decision in Chat mode: whether this conversation may reach the web.
+ *
+ * It is drawn as a switch rather than a badge because it *is* one — the grant decides what the model
+ * process is mounted with, and it belongs to the conversation rather than to the window. The "on"/
+ * "off" word is set in type rather than left to colour alone: a coloured dot is invisible in a
+ * screenshot with the colour profile mangled, and it is unreadable to anyone for whom the two
+ * colours are not distinguishable.
+ */
+.cbtn.chip.web .web-state {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--color-ink-3);
+}
+.cbtn.chip.web[aria-pressed='true'] {
+  background: var(--color-tint);
+  color: var(--color-ink);
+}
+.cbtn.chip.web[aria-pressed='true'] .web-state {
+  color: var(--color-shell-deep);
+  font-weight: 600;
+}
+.cbtn.chip.web:disabled { opacity: 0.55; }
+
+/* A model chip with nothing behind it. The word "no model" is the sentence; this is the mark that
+   makes it findable while scanning the row of chips. */
+.cbtn.chip.need {
+  color: var(--color-warn);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warn) 38%, transparent);
+}
+
+/* One sentence of explanation, under the row of controls it explains. It is not a toast: the control
+   it is about is still on screen, and the reason for a refusal is worth re-reading. */
+.ctl-note {
+  margin-top: 5px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-ink-2);
+}
+
+/*
+ * About: values, not controls.
+ *
+ * The rows share the settings screens' row shape so the page reads as part of the same screen, but
+ * the value side is monospaced and allowed to break: a path is data someone may copy, and a path
+ * silently elided in the middle is a path nobody can type back in.
+ */
+.about-v {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+  text-align: right;
+  word-break: break-all;
+  user-select: text;
+}
+
+/*
+ * First run: the endpoint and the model, asked for in one place.
+ *
+ * This is a dialog rather than a tour because a tour cannot do the thing: the app has no model to
+ * answer with, and the only useful next action is naming a server. It borrows the settings panel's
+ * centring (`inset: 0; margin: auto`) rather than a transform-based centre, for the reason that fix
+ * exists — an entrance animation that fights a `translate(-50%, -50%)` opens in a corner.
+ */
+.setup-scrim {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--color-ink) 34%, transparent);
+  z-index: 60;
+}
+.setup {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(660px, calc(100vw - 48px));
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+  background: var(--color-paper);
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 14px;
+  padding: 16px 18px;
+  z-index: 61;
+  box-shadow: 0 18px 46px color-mix(in srgb, var(--color-ink) 26%, transparent);
+  animation: cwoffee-pop 140ms ease-out;
+}
+.setup-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.setup-t {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--color-ink);
+}
+.setup-d {
+  margin: 5px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+  max-width: 46ch;
+}
+.setup-x {
+  margin-left: auto;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  color: var(--color-ink-3);
+}
+.setup-x:hover { background: var(--color-paper-2); color: var(--color-ink); }
+.setup-step {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-hairline);
+}
+.setup-lab {
+  font-size: 11.5px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.075em;
+  color: var(--color-ink);
+  margin-bottom: 10px;
+}
+.setup-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 220px);
+  gap: 10px 14px;
+}
+.setup-grid > :first-child { grid-column: 1 / -1; }
+.setup-acts {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.setup-models {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow: auto;
+}
+.setup-model {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--color-hairline);
+  background: var(--color-paper-2);
+}
+.setup-model:hover { border-color: var(--color-hairline-2); background: var(--color-tint); }
+.setup-mid {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--color-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.setup-mmeta {
+  margin-left: auto;
+  flex: none;
+  font-size: 11px;
+  color: var(--color-ink-3);
+}
+.setup-msg {
+  margin: 12px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+  word-break: break-word;
+}
+.setup-msg.bad { color: var(--color-danger); }
+.setup-foot {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-hairline);
+}
+.setup-foot .set-btn.plain:last-child { margin-left: auto; }
+@media (prefers-reduced-motion: reduce) {
+  .setup { animation: none; }
+}
+@media (max-width: 720px) {
+  .setup-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/*
+ * What your own message carried, drawn where the message is.
+ *
+ * This used to be a dashed 11px pill in muted ink, and it produced a complaint worth keeping:
+ * "pasting an image seems like the file is attached, but when you send, there's no indication that
+ * it got sent". The composer had shown a thumbnail of that exact picture seconds earlier, so the
+ * message arriving with nothing but a caption read like the picture had been dropped. Same chip
+ * shape as the composer's, minus the remove control: nothing here is removable, it is a record.
+ */
+.attlist { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.tatt {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px 5px 5px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 9px;
+  background: var(--color-paper-2);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  max-width: 260px;
+  text-align: left;
+}
+.tatt:hover { border-color: var(--color-hairline-2); background: var(--color-hairline); }
+.tatt:focus-visible { outline: 2px solid var(--color-shell-deep); outline-offset: 1px; }
+.tatt img {
+  width: 44px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: 6px;
+  flex: none;
+  border: 1px solid var(--color-hairline);
+  background: var(--color-paper);
+}
+/* No payload yet: the square says what a click brings instead of showing a broken frame. */
+.tatt-ph {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--color-hairline-2);
+  border-radius: 6px;
+  color: var(--color-ink-3);
+  background: var(--color-paper);
+}
+.tatt-meta { font-size: 11.5px; color: var(--color-ink-2); min-width: 0; overflow-wrap: anywhere; }
 .atttag {
   font-size: 11px;
   color: var(--color-ink-3);
   border: 1px dashed var(--color-hairline);
   border-radius: 6px;
   padding: 2px 6px;
+}
+
+/* A sent picture at reading size. Sits above the settings scrim on purpose: the picture is what a
+   person is looking at, and a settings panel left open underneath should still be there when it is
+   dismissed. */
+.picview-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 96;
+  background: rgba(24, 22, 18, 0.42);
+}
+.picview {
+  position: fixed;
+  inset: 0;
+  z-index: 97;
+  margin: auto;
+  width: min(92vw, 1100px);
+  height: min(88vh, 900px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 14px;
+  background: var(--color-paper);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.28);
+  animation: cwoffee-pop var(--d2) var(--ease-out);
+}
+.picview-head { display: flex; align-items: center; gap: 10px; }
+.picview-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picview-size { font-size: 11.5px; color: var(--color-ink-3); flex: none; }
+.picview-x {
+  margin-left: auto;
+  border: 1px solid var(--color-hairline);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-ink-2);
+  font-size: 16px;
+  line-height: 1;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+.picview-img {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  object-fit: contain;
+  border-radius: 9px;
+  background: var(--color-paper-2);
 }
 /* Not a menu item: nothing to click, it is a two-column reference row. */
 .pop-item.static { cursor: default; }
@@ -1871,9 +2358,25 @@ body {
   font-size: 12.5px;
   text-align: left;
 }
+/* The folder's own mark, at the head of the row. Uncoloured rows keep the quiet ink — a colour is a
+   choice the person made about some folders, not a coat of paint over all of them. The colour arrives
+   as an inline `color`, and the SVG fills itself with the same value at 18%: one value drives both
+   the outline and the wash, so a chosen colour cannot half-apply. */
+.ws-folder {
+  flex: none;
+  color: var(--color-ink-3);
+}
 .ws-chev {
   flex: none;
   color: var(--color-ink-3);
+  /* The fold control sits at the end of the label run now, not the start: the leading position
+     belongs to the folder. `auto` rather than a fixed margin, because the name is what shrinks — a
+     long name takes the space and the chevron ends up flush after the count, which is still the right
+     end of the row. */
+  margin-left: auto;
+}
+.wsgrp.closed > .wsrow .ws-chev {
+  color: var(--color-ink-2);
 }
 .ws-name {
   min-width: 0;
@@ -2158,8 +2661,23 @@ body {
   font-size: 12px;
   font-weight: 550;
   color: var(--color-ink-2);
+  /* The glyph and the word are one unit: centred together, so the sliding pill behind them stays
+     the same width it had for the word alone rather than growing and shifting the strip. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
   transition: color var(--d1) var(--ease-out);
 }
+.modesel > .mode-ic {
+  flex: none;
+  /* A control's state should not be carried by the drawing alone, and here it is not: the label is
+     still there. So the glyph sits a shade under the word's own colour and the pair reads as one
+     thing rather than an icon competing with a label. */
+  opacity: 0.78;
+}
+.modesel[aria-selected='true'] > .mode-ic { opacity: 1; }
 .modesel[aria-selected='true'] { color: var(--color-paper); }
 .newbtn {
   display: inline-flex;
@@ -3350,6 +3868,7 @@ body {
 .mbar-row .mval .ctxtrim { display: block; font-size: 10px; color: var(--color-ink-3); }
 .mgrid {
   display: grid;
+  /* Two columns is the whole panel now: decode/s session avg, prefill/s session avg. */
   grid-template-columns: 1fr 1fr;
   gap: 1px;
   margin: 6px 0 0;
@@ -3373,15 +3892,11 @@ body {
 }
 .mcell b small { font-size: 10px; font-weight: 500; color: var(--color-ink-3); margin-left: 2px; }
 .mcell span { font-size: 10.5px; color: var(--color-ink-3); letter-spacing: 0.01em; }
-.mfoot {
-  display: flex;
-  gap: 8px;
-  align-items: baseline;
-  padding: 6px 8px 2px;
-  font-size: 11px;
-}
-.mfoot-lbl { color: var(--color-ink-3); text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; }
-.mfoot-v { color: var(--color-ink-2); }
+/* Two cells, not ten: see `sessionReadouts` in App.svelte for what was dropped and why. The
+   render/host rows that used to sit under this grid went with them — the frame ledger and the
+   GPU node list are in the app's own log, where the person hunting a stalled compositor or a
+   leaked driver reads them. A number on the screen nobody can act on is one more thing to read,
+   not one more chance to fix. */
 
 /* ----------------------------------------------------- gateway popover -- */
 .pop-item:disabled { opacity: 0.55; cursor: default; }
@@ -3475,6 +3990,9 @@ body {
   .blk-tool .tool-detail { transition: none; }
   .pop-item, .btn-go, .btn-ghost, .btn-bad, .keyhelp, .fbtn, .tip, .filechip,
   .sessrow, .wsrow, .cbtn, .att-x, .ssw i, .mbar i { transition: none; }
+  /* A reduced-motion reader still gets the *state* — one glyph lit, the other out — without the
+     turn. Opacity is not motion; the rotation is. */
+  .thm .thm-ic { transition: none; transform: none; }
   /* Nothing here loops any more. The cup's motion is inside its picture file, and the
      reduced-motion case loads a still of it instead (see `idleArt`); the drawn wisp of steam
      that used to sit on top of the cup is gone, so this block has nothing left to freeze. */
@@ -3666,12 +4184,28 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   /* The dialog container is focused so a keyboard user starts inside it, which makes
      the user agent paint its own ring around the whole panel. That ring is not an
      affordance - the affordances are the controls inside, which have their own focus
-     styles - so it is dropped here rather than styled into something louder. */
+     styles - so it is dropped here rather than styled into something louder.
+     */
   position: fixed;
   z-index: 71;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
+  /**
+   * Centred without a transform, on purpose.
+   *
+   * This used to be `left: 50%; top: 50%; transform: translate(-50%, -50%)`, and the panel opened
+   * in the bottom-right corner of the screen and then jumped to the middle. Both halves are true:
+   * the entrance animation (`cwoffee-pop`) animates `transform`, and an animation owns the property
+   * it animates for its whole length - so for 200ms the centring translation did not exist and the
+   * panel's *top-left corner* sat at 50%/50%, which is the bottom-right quadrant. The report was
+   * literally about that: "opening settings initially opens it in the bottom right corner, not
+   * centered, which looks weird".
+   *
+   * `inset: 0; margin: auto` centres a box that has a definite width and height without touching
+   * `transform` at all, so the entrance animation and the position cannot disagree, and a frame the
+   * person resizes stays where they left it. The two mechanisms that could each centre it are one
+   * mechanism now, which is the only way this stays fixed when someone next animates the dialog.
+   */
+  inset: 0;
+  margin: auto;
   display: flex;
   flex-direction: column;
   /**
@@ -3818,21 +4352,25 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   display: flex;
   align-items: flex-start;
   gap: 14px;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 .ssect-hh { min-width: 0; flex: 1; }
 .ssect-h {
   margin: 0;
-  /* A label for the group below it, not a heading to read. The page already has one title; a second
-     bold line per group is what makes a long settings page feel like a list of announcements. */
+  /* A label for the group below it — but a label you can find. It was set as small, thin, wide-
+     tracked uppercase in the lightest ink in the palette, which is the weakest combination the
+     palette offers: on a page this long the eye reads a wall of body text and never lands on the
+     one line that tells it where a group starts. Same size and same uppercase (it is still a marker,
+     not a heading to read), but the ink of the rows themselves and a firmer weight, so the hierarchy
+     is: page title, group, row, note — in that order, by weight and darkness. */
   font-size: 12px;
-  font-weight: 550;
-  letter-spacing: 0.03em;
+  font-weight: 650;
+  letter-spacing: 0.075em;
   text-transform: uppercase;
-  color: var(--color-ink-3);
+  color: var(--color-ink);
 }
 .ssect-d {
-  margin: 4px 0 0;
+  margin: 5px 0 0;
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-ink-2);
@@ -3893,6 +4431,46 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   max-width: 62ch;
 }
 .srow-c { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* --- key caps ------------------------------------------------------------ */
+/* The Help page names keys, and a key deserves to look like the thing on the keyboard. Drawn as
+   caps for the same reason a monospace font is not enough: in `Ctrl K` nothing says which
+   characters are the key and which are prose, and in `↑ ↓ Navigate` the arrows are the keys.
+   Caps sit on the row's baseline as a group; the hairline is the same one the panels use, and the
+   bottom border is a shade heavier so a cap reads as a key that could be pressed, not a chip that
+   says "selected". */
+.kbdrow {
+  gap: 5px;
+}
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  min-height: 22px;
+  padding: 0 6px;
+  border: 1px solid var(--color-hairline);
+  border-bottom-color: color-mix(in srgb, var(--color-hairline) 55%, var(--color-ink-3));
+  border-radius: 6px;
+  background: var(--color-paper-2);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-paper) 70%, white);
+  color: var(--color-ink);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1;
+  white-space: nowrap;
+}
+/* An arrow or a return sign is a picture of a key, not a letter: it gets a touch more room and no
+   letter-spacing, so it reads as the glyph rather than as a character in a word. */
+.kbd.glyph {
+  font-size: 12.5px;
+  padding: 0 5px;
+}
+.kbd-sep {
+  color: var(--color-ink-3);
+  font-size: 11.5px;
+  margin: 0 1px;
+}
 
 /* --- fields ------------------------------------------------------------- */
 .sfld-grid {

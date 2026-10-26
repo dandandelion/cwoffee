@@ -10,7 +10,6 @@
     ApprovalAnswer,
     EngineEvent,
     ExecStream,
-    GpuReport,
     HostState,
     ModelInfo,
     QuestionRequested,
@@ -22,6 +21,7 @@
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
   import { Transcript, linkProbe, subjectFor, riskHeadline } from './lib/transcript'
+  import type { AttachmentView } from './lib/transcript'
   import { describeLoop, LoopWatch } from './lib/loop'
   import { LoopHold, IDLE_HOLD, aniFrames, armedFromUrl } from './lib/anipause'
   import { installContextMenu } from './lib/ctxmenu'
@@ -175,7 +175,7 @@
   // toolkit's own chrome, which cannot be themed, and they look nothing like the
   // rest of the app.
   type MenuKind =
-    | 'mode' | 'model' | 'think' | 'row' | 'keys' | 'metrics' | 'gateway' | 'ws' | 'wspick' | 'search' | 'tools' | 'naming' | 'display'
+    | 'mode' | 'model' | 'think' | 'row' | 'metrics' | 'gateway' | 'ws' | 'wspick' | 'search' | 'tools' | 'naming' | 'display'
 
   /** Mirror of the desktop's GatewayStatus. Not reachable over the gateway
       itself: the payload carries the token inside ready-to-open URLs. */
@@ -275,10 +275,12 @@
      next to the controls it describes, not in a caption under a nav label.
 
      `title`/`desc` are what the page header shows; `label` is what the rail shows.
-     Appearance and shortcuts share a page because both are facts about this window
-     rather than about the model or the conversation, and neither carries enough to
-     stand beside the other four. */
-  type SetPage = 'models' | 'workspace' | 'devices' | 'conversation' | 'appearance'
+     Appearance and Help each carry what is *about this window* rather than about the model or the
+     conversation: the palette and the working the transcript shows, and the keys it answers. The
+     keys got their own entry rather than staying a tail on Appearance because a person looking for
+     "what are the shortcuts" scans for a word they would say out loud, and "Appearance" is not it.
+     */
+  type SetPage = 'models' | 'workspace' | 'devices' | 'conversation' | 'appearance' | 'help' | 'about'
   const SET_PAGES: { kind: SetPage; label: string; title: string; desc: string; icon: string }[] = [
     {
       kind: 'models',
@@ -311,9 +313,27 @@
     {
       kind: 'appearance',
       label: 'Appearance',
-      title: 'Appearance & shortcuts',
-      desc: 'How much of the working the transcript shows, the palette of this window, and the keys it answers.',
+      title: 'Appearance',
+      desc: 'How much of the working the transcript shows, and the palette of the window you are looking at.',
       icon: 'M2.5 5h11M2.5 8h11M2.5 11h6M11 5a1.5 1.5 0 1 0 0-.01M7 8a1.5 1.5 0 1 0 0-.01M12 11a1.5 1.5 0 1 0 0-.01',
+    },
+    {
+      kind: 'help',
+      label: 'Help',
+      title: 'Help',
+      desc: 'The keys this app answers, and what each one does. They are the same in the desktop window and in a browser attached to it.',
+      // A life buoy: ring, hole, and the four grip seams. It is the one mark that reads as "help"
+      // without a question mark, which every other app has already spent.
+      icon: 'M8 2a6 6 0 1 0 0 12A6 6 0 0 0 8 2M8 5.6a2.4 2.4 0 1 0 0 4.8A2.4 2.4 0 0 0 8 5.6M4.4 4.4l2.2 2.2M11.6 4.4l-2.2 2.2M4.4 11.6l2.2-2.2M11.6 11.6l-2.2-2.2',
+    },
+    {
+      kind: 'about',
+      label: 'About',
+      title: 'About',
+      desc: 'What this build is, which engine answers, and where your conversations, settings and files are kept — the facts a bug report needs.',
+      // A mark in a ring. Deliberately not the life buoy Help uses: two circles with something
+      // inside them read as the same object at sidebar size, a foot apart.
+      icon: 'M8 2a6 6 0 1 0 0 12A6 6 0 0 0 8 2M8 7.1v3.9M8 4.8v.02',
     },
   ]
 
@@ -355,8 +375,14 @@
     display: ['appearance', 'transcript'],
     transcript: ['appearance', 'transcript'],
     theme: ['appearance', 'theme'],
-    keys: ['appearance', 'shortcuts'],
-    shortcuts: ['appearance', 'shortcuts'],
+    help: ['help', 'shortcuts'],
+    keys: ['help', 'shortcuts'],
+    shortcuts: ['help', 'shortcuts'],
+    about: ['about', 'info'],
+    paths: ['about', 'files'],
+    files: ['about', 'files'],
+    versions: ['about', 'info'],
+    build: ['about', 'info'],
   }
   // The tool list is read from the engine, never typed here: the description a tool
   // carries is the same text the model is handed, so a UI-side copy is a second copy of
@@ -668,7 +694,9 @@
       })
       probed = out ?? []
       pvMsg = probed.length
-        ? `${probed.length} model(s) answered. Add the endpoint and they come with it.`
+        ? setupOpen
+          ? `${probed.length} model(s) answered. Pick the one to answer with.`
+          : `${probed.length} model(s) answered. Add the endpoint and they come with it.`
         : 'the endpoint answered but named no models'
       pvBad = probed.length === 0
     } catch (e) {
@@ -860,6 +888,7 @@
     }
     if (page === 'devices') void loadGateway()
     if (page === 'conversation') void refreshState()
+    if (page === 'about') void loadAbout()
   }
 
   /** Which folder rows are open on the Workspace page. Opening one is the moment to
@@ -884,15 +913,53 @@
   let unread = $state<Set<number>>(new Set())
   let seenCounts: Record<number, number> = {}
   const MODES = ['ask', 'session', 'auto'] as const
-  const SHORTCUTS = [
-    { keys: 'Ctrl K', label: 'Focus the composer' },
-    { keys: 'Ctrl Enter', label: 'Send' },
-    { keys: 'Ctrl N', label: 'New session' },
-    { keys: 'Ctrl B', label: 'Toggle sidebar' },
-    { keys: 'Alt 1-9', label: 'Open session by position' },
-    { keys: 'Enter', label: 'Send (Shift+Enter newline)' },
-    { keys: 'y / a / n', label: 'Approve / allow session / deny' },
-    { keys: 'Esc', label: 'Close a menu' },
+  /**
+   * The keys this app answers, written the way they are read: the action, then the caps that do
+   * it. Caps with nothing between them are one chord (hold them together); a `/` between caps means
+   * any one of them answers. `hint` carries what the label cannot: when the key applies, and what it
+   * deliberately does not do.
+   *
+   * `keys` is a list rather than one string because the screen draws each key as a key. A chord set
+   * in mono — "Ctrl K" — reads as a word, and nothing on the page then says which characters are
+   * keys and which are the sentence's own text. The arrows and the return sign are drawn as glyphs
+   * for the same reason: on a keyboard those characters *are* the key.
+   */
+  const SHORTCUTS: { label: string; keys: string[]; sep?: string; hint?: string }[] = [
+    { label: 'Focus the composer', keys: ['Ctrl', 'K'] },
+    { label: 'Send what is typed', keys: ['Ctrl', 'Enter'] },
+    {
+      label: 'Send, while typing in the composer',
+      keys: ['↵'],
+      hint: 'Shift+Enter makes a newline instead.',
+    },
+    { label: 'Start a new conversation', keys: ['Ctrl', 'N'] },
+    { label: 'Show or hide the sidebar', keys: ['Ctrl', 'B'] },
+    {
+      label: 'Open a conversation by its place in the list',
+      keys: ['Alt', '1-9'],
+      hint: 'Counted from the top, and only the first nine have a key.',
+    },
+    {
+      label: 'Answer an approval card',
+      keys: ['y', 'a', 'n'],
+      sep: '/',
+      hint: 'Run it once / allow this for the rest of the conversation / refuse.',
+    },
+    {
+      label: 'Back out one layer',
+      keys: ['Esc'],
+      hint: 'Picking conversations first, then an open menu, then the settings screen.',
+    },
+    {
+      label: 'Move between the choices in a control',
+      keys: ['↑', '↓'],
+      hint: 'In a dropdown. ← and → move a segmented dial one step.',
+    },
+    {
+      label: 'Open a dropdown, then choose what is highlighted',
+      keys: ['↵'],
+      hint: 'Space opens it too.',
+    },
   ]
 
   const THINKS = ['off', 'low', 'medium', 'high', 'xhigh'] as const
@@ -1062,7 +1129,56 @@
     return w.label || basenameOf(w.path)
   }
 
-  type WsGroup = { path: string; label: string; list: Session[] }
+  /**
+   * The colours a folder can be given, and the only colours it can be given.
+   *
+   * Preconfigured rather than a colour picker because the job is telling two rows apart at a glance,
+   * not reproducing a brand: a free picker produces six shades of the same blue that are harder to
+   * tell apart than six named ones, and it invites values that are unreadable against one of the two
+   * themes. These six sit at a middle lightness so the same value reads on the light wash and on the
+   * dark one; a seventh hue would not add discrimination, it would add a menu row.
+   */
+  const WS_COLORS: { hex: string; name: string }[] = [
+    { hex: '#c08a2e', name: 'amber' },
+    { hex: '#c2664f', name: 'clay' },
+    { hex: '#3f9a72', name: 'sage' },
+    { hex: '#4f86c6', name: 'slate' },
+    { hex: '#a86bc0', name: 'plum' },
+    { hex: '#8f9a3c', name: 'olive' },
+  ]
+
+  /**
+   * A colour from the record, filtered for the one place it gets drawn.
+   *
+   * The store refuses anything that is not `#rrggbb`, so a value written through this app is already
+   * safe. This is the other half: the row may instead have come from a gateway built before that
+   * check, or from a database someone edited by hand, and the consumer interpolates it into a
+   * `style` attribute. A guard at the door that the value arrives through is worth one function.
+   */
+  function safeColor(c: string | undefined | null): string {
+    return typeof c === 'string' && /^#[0-9a-f]{6}$/.test(c.toLowerCase()) ? c.toLowerCase() : ''
+  }
+
+  function wsColorOf(path: string): string {
+    if (!path) return ''
+    return safeColor(workspaces.find((w) => w.path === path)?.color)
+  }
+
+  /** Colour (or un-colour) a folder. `color` is empty to clear it. */
+  async function setWsColor(path: string, color: string) {
+    if (!path) return // the "No workspace" bucket is not a folder and gets no mark
+    const want = safeColor(color) // what we ask for is what we will accept back
+    try {
+      await invoke('set_workspace_color', { path, color: want })
+      await loadWorkspaces()
+    } catch (e) {
+      // A watch-only connection is refused here, and the row keeps the colour it already had:
+      // repainting it locally would leave a phone seeing one list and the desktop another.
+      wsAddErr = cleanErr(e)
+    }
+  }
+
+  type WsGroup = { path: string; label: string; color: string; list: Session[] }
 
   /// `new_session` reserves a row before anything has been said in it, so that a
   /// `+` click has somewhere to write the first message. A row like that is not a
@@ -1095,7 +1211,12 @@
       // build used to write it as the default. Its sessions are already in the
       // Default bucket.
       if (isTempRoot(w.path)) continue
-      out.push({ path: w.path, label: wsLabelOf(w), list: byPath.get(w.path) ?? [] })
+      out.push({
+        path: w.path,
+        label: wsLabelOf(w),
+        color: safeColor(w.color),
+        list: byPath.get(w.path) ?? [],
+      })
       seen.add(w.path)
     }
     // A session in a folder that is not on the list still has to be reachable.
@@ -1107,7 +1228,9 @@
       // given a folder read as if they had been given the app's chosen one. The chip, the
       // row menu, the model's own environment block and this header now all say the same
       // three words.
-      out.push({ path, label: path ? basenameOf(path) : 'No workspace', list })
+      // A folder that is only on the list because conversations live in it has no row of its own,
+      // so it has no colour either — colouring it is what creates the row (see `setWsColor`).
+      out.push({ path, label: path ? basenameOf(path) : 'No workspace', color: '', list })
       seen.add(path)
     }
     return out
@@ -1832,7 +1955,6 @@
     }
   }
 
-  let gpu = $state<GpuReport | null>(null)
   // IPC health is reported through render_report and the console. An empty catch here once hid a CSP
   // misconfiguration that killed every invoke, and every other gate still passed.
   let ipc = $state<{ ok: boolean; msg: string }>({ ok: false, msg: 'not tried' })
@@ -1842,18 +1964,21 @@
   let connNote = $state('')
 
   // ---- telemetry ----------------------------------------------------------
-  const rolling = new Rolling(10)
+  /** How many turns the session averages run over. Turn 1 is a cold cache and skews a
+      lifetime mean, so the window is recent turns only — and the panel says so, which is the
+      only reason the number in it is worth reading. */
+  const ROLLING_TURNS = 10
+  const rolling = new Rolling(ROLLING_TURNS)
+  // The live decode rate survives only where it is a glance, not a panel: the telemetry icon in
+  // the sidebar footer puts it in its `title`, with the ≈ marker when it is character-derived.
   let curDecode = $state(0)
   let avgDecode = $state(0)
-  let curPrefill = $state(0)
   let avgPrefill = $state(0)
   let cacheHit = $state(0)
   let cachedTokens = $state(0)
   let promptTokens = $state(0)
-  let specPct = $state(0)
-  let ttft = $state(0)
-  // True while the decode figure is a character-derived estimate rather than the
-  // server's own count. Labelling it is the difference between a live bar and a
+  // True while the decode figure in the sidebar's title is a character-derived estimate rather
+  // than the server's own count. Labelling it is the difference between a live bar and a
   // lying one.
   let liveEstimate = $state(false)
   let thinkingLive = $state(false)
@@ -1869,14 +1994,7 @@
   // The footer used to spell every number out and still not answer "how much
   // context is left". One button opens the whole readout; the space it frees
   // carries the thing people actually toggle.
-  let lastUsage = $state<{
-    prompt: number
-    cached: number
-    completion: number
-    ttft: number
-    draftN: number
-    draftOk: number
-  } | null>(null)
+  let lastUsage = $state<{ prompt: number; completion: number } | null>(null)
   let turnMs = $state(0)
   let turnStartTs = 0
   /** Context ceiling as the endpoint states it. null means it never said. */
@@ -2188,6 +2306,19 @@
   /** Quick-start chips. The tools are the product and an empty box does not
       teach them, so each chip puts a real request in the composer instead of
       describing a feature. */
+  /**
+   * The starting points on the greeting screen, per mode.
+   *
+   * They are two lists because a suggestion is a promise. "Summarise my workspace" is an excellent
+   * idea in Cowork, where the app has a folder and eleven tools, and a broken one in Chat, where the
+   * system prompt tells the model it has neither - so the person presses a card, gets an apology, and
+   * learns that the app does not know what mode it is in. The Chat list is things a model can do with
+   * nothing but what the person typed, and the trailing space on three of them is where the pasted
+   * text or the question goes.
+   *
+   * `chatTips` takes the Web chip too: "look it up" is a tool claim, and offering it with Web off is
+   * the same lie in a smaller font.
+   */
   const TIPS: { label: string; text: string }[] = [
     {
       label: 'summarise my workspace',
@@ -2206,6 +2337,32 @@
       text: 'Research this, cite the sources you used, and save it as a document: ',
     },
   ]
+
+  const CHAT_TIPS: { label: string; text: string }[] = [
+    {
+      label: 'explain this',
+      text: 'Explain what this does, in plain language, and flag anything risky about it: ',
+    },
+    {
+      label: 'draft a reply',
+      text: 'Draft a short, direct reply to this. Keep it in my voice, no preamble: ',
+    },
+    {
+      label: 'weigh two options',
+      text: "I'm choosing between these two. Give me the trade-offs in a few lines, then pick one and say why: ",
+    },
+    {
+      label: 'summarise what I paste',
+      text: 'Summarise the text below: the points first, then anything important it leaves out. ',
+    },
+  ]
+
+  /** A Chat conversation with Web switched on can search and fetch (see `webNow`), so one card may
+      promise looking something up. With it off, that card would be a tool claim the prompt forbids. */
+  const CHAT_TIPS_WEB: { label: string; text: string } = {
+    label: 'look it up and cite',
+    text: 'Search for this, then answer with the sources you used: ',
+  }
 
   function seedTip(text: string) {
     draft = text
@@ -2581,7 +2738,6 @@
         // Clear the previous turn's numbers. Leaving them up is how a bar reads
         // as "measuring" while nothing has arrived yet for this turn.
         curDecode = 0
-        ttft = 0
         liveEstimate = false
         thinkingLive = false
         frames = 0
@@ -2648,7 +2804,6 @@
         // so without these the bar sits at em-dashes through the whole of a long
         // first turn - which is exactly when it is being looked at.
         const st = ev.d
-        if (st.ttft_ms > 0) ttft = st.ttft_ms
         if (st.est_decode_tps > 0) curDecode = st.est_decode_tps
         liveEstimate = true
         thinkingLive = st.thinking
@@ -2660,21 +2815,18 @@
         // The server has spoken: stop labelling the rate as an estimate.
         liveEstimate = false
         thinkingLive = false
-        curPrefill = s.effectivePrefillTps
+        // Only the two averages the panel shows are kept. The per-turn prefill, the
+        // speculative accept rate and the first-token time are still logged two lines below —
+        // they are the numbers the board quotes when a turn is slow — they just no longer have
+        // a place on the screen, so they no longer hold state to hold them.
         avgPrefill = rolling.avgRawPrefillTps()
         avgDecode = rolling.avgDecodeTps()
         cacheHit = s.cacheHitPct
         cachedTokens = ev.d.cached_tokens
         promptTokens = ev.d.prompt_tokens
-        specPct = s.specAcceptPct
-        ttft = ev.d.ttft_ms
         lastUsage = {
           prompt: ev.d.prompt_tokens,
-          cached: ev.d.cached_tokens,
           completion: ev.d.completion_tokens,
-          ttft: ev.d.ttft_ms,
-          draftN: ev.d.draft_n,
-          draftOk: ev.d.draft_accepted,
         }
         if (turnStartTs) turnMs = Math.round(performance.now() - turnStartTs)
         // Kept for the self-test: a turn that does not finish can be a hang or a
@@ -2754,6 +2906,72 @@
 
   type Pending = { name: string; mime: string; bytes: number; b64: string; url: string }
   let pending = $state<Pending[]>([])
+  // A picture the reader asked to see, blown up. Not a refusal and not a notice — the two attachment
+  // lines below are about whether a file was accepted, and this is about what a message that was
+  // accepted actually held.
+  let picView = $state<{ name: string; mime: string; url: string; bytes: number } | null>(null)
+  // "The file is fine and this model cannot see it." Kept apart from `attachErr` on purpose: a
+  // refusal stops the attachment, this one lets it through and says what will happen.
+  let attachWarn = $state('')
+
+  /**
+   * Would the model on this conversation take the picture it is being handed?
+   *
+   * Only answer when the endpoint has actually said. `input_modalities` empty means the server never
+   * told us, and a warning invented from nothing is the sort of thing that trains people to ignore
+   * warnings. When it did say "text", the answer is not that the file is bad — it is that the
+   * picture will travel and be ignored, which on the pi core happens by pi omitting the image blocks
+   * without a word. Silence there reads as "the app lost my image", which is what this line exists
+   * to stop being true.
+   */
+  function visionNote(): string {
+    const id = hostState?.model ?? ''
+    if (!id) return ''
+    const m = models.find((x) => x.id === id)
+    if (!m || !(m.input_modalities?.length)) return ''
+    if (m.input_modalities.includes('image')) return ''
+    return `${m.id} is marked as text-only: it will answer without seeing this picture. ` +
+      'If that is wrong, set it under Settings \u203a Models.'
+  }
+
+  /**
+   * An attachment chip was pressed. Show the picture, fetching the one row's payload if this window
+   * does not hold it.
+   *
+   * The transcript page deliberately carries name and size only — a conversation read that pulled
+   * every attached megabyte would be a slower app for pictures nobody is looking at — so the fetch
+   * is on demand, for the one picture being asked about, and the chip is updated so it never asks
+   * again.
+   */
+  async function openAttachment(v: AttachmentView) {
+    if (v.meta.url) {
+      picView = { name: v.meta.name ?? v.meta.mime, mime: v.meta.mime, url: v.meta.url, bytes: v.meta.bytes }
+      return
+    }
+    if (v.msgId === null) {
+      say('this window no longer holds the bytes for that picture', true)
+      return
+    }
+    try {
+      const list = await invoke<{ mime: string; data_b64: string; name?: string }[]>('message_attachments', {
+        message_id: v.msgId,
+      })
+      const a = list?.[v.index]
+      if (!a) {
+        say(`that message no longer holds a ${v.meta.name ?? 'picture'}`, true)
+        return
+      }
+      const url = `data:${a.mime};base64,${a.data_b64}`
+      // Remember it where it was pressed. A second click on the same chip should be free, and a chip
+      // with the picture in it answers its own question.
+      transcript?.rememberAttachment(v.msgId, v.index, url)
+      v.meta.url = url
+      picView = { name: a.name ?? v.meta.name ?? v.meta.mime, mime: a.mime, url, bytes: a.data_b64.length * 3 / 4 }
+    } catch (e) {
+      say(`could not open that picture: ${cleanErr(e)}`, true)
+    }
+  }
+
   let fileInput = $state<HTMLInputElement | null>(null)
   let composerEl = $state<HTMLTextAreaElement | null>(null)
   let dropping = $state(false)
@@ -2830,6 +3048,7 @@
     if (transportKind === 'gateway' && (await bootstrapGateway(force))) return
     await Promise.all([refreshState(force), loadSessions(), loadModels()])
     await adoptHostSession()
+    void checkSetup()
   }
 
   /**
@@ -3202,6 +3421,7 @@
     // A data: URL stands in for the blob URL a File would have produced. The
     // payload is already in memory; making a blob out of it would copy it again.
     pending = [...pending, { name, mime, bytes, b64, url: `data:${mime};base64,${b64}` }]
+    attachWarn = visionNote()
     return true
   }
 
@@ -3324,6 +3544,7 @@
           ...pending,
           { name: f.name, mime: f.type, bytes: f.size, b64, url: URL.createObjectURL(f) },
         ]
+        attachWarn = visionNote()
       } catch (err) {
         attachErr = `${f.name}: could not read (${err})`
       }
@@ -3340,6 +3561,7 @@
     for (const a of pending) URL.revokeObjectURL(a.url)
     pending = []
     attachErr = ''
+    attachWarn = ''
   }
 
   // Wait for a turn to finish. `busy` cannot be the condition: start_turn only
@@ -3565,6 +3787,16 @@
   async function send() {
     const text = draft.trim()
     if ((!text && pending.length === 0) || busy) return
+    // No model, no conversation. Ordered before the row is created on purpose: a session opened
+    // against nothing would sit in the sidebar forever with one question in it and no answer coming,
+    // which is a mess the person has to notice and delete by hand.
+    if (!modelReady) {
+      openSetup(
+        'There is no model to answer with, so nothing was sent. Point Cwoffee at an endpoint and pick ' +
+          'one of its models; the conversation stays exactly as it was.',
+      )
+      return
+    }
     const atts = pending.map((a) => ({ mime: a.mime, data_b64: a.b64, name: a.name }))
     draft = ''
     // The transcript shows what was attached by name and size, not a thumbnail:
@@ -3590,6 +3822,15 @@
           await invoke('set_session_persona', { id, persona: 'chat' }).catch((e) =>
             pageLog(`set_session_persona: ${e}`),
           )
+          // The Web chip was a promise made before the row existed. The row exists now, so the
+          // promise is kept here — and only when it was actually made, because the store's default
+          // is already "off" and writing it unconditionally would be noise in the audit log.
+          if (webDraft) {
+            await invoke('set_session_web', { session: id, on: true }).catch((e) => {
+              pageLog(`set_session_web on first send: ${e}`)
+              webNote = cleanErr(e)
+            })
+          }
           // The sidebar lists chats out of the same rows it lists conversations from, so
           // recording the mode on the row is only half of it: the list on screen has to be
           // re-read, or the chat you just started is missing from the list that is for it.
@@ -3606,7 +3847,16 @@
         return
       }
     }
-    const shown = pending.map((a) => ({ mime: a.mime, name: a.name, bytes: a.bytes }))
+    // What the bubble will show. The payload's data URL goes with it, deliberately: this window has
+    // the bytes in hand for the next few seconds, and the picture is what proves the picture went.
+    // The composer's blob URL is *not* used — `clearAttachments` below revokes those, and an <img>
+    // aimed at a revoked URL is a broken frame in the middle of the conversation.
+    const shown = pending.map((a) => ({
+      mime: a.mime,
+      name: a.name,
+      bytes: a.bytes,
+      url: `data:${a.mime};base64,${a.b64}`,
+    }))
     // Ownership and the replay copy are recorded *before* anything is painted.
     // A sessionChanged event for the row we just created can be delivered at any
     // await below; if it lands after the message is painted but before ownership
@@ -4064,6 +4314,11 @@
     // conversation with no folder chosen, and the chip then says what the host will actually
     // use - "No workspace" when that is the scratch folder, which is the honest name for it.
     draftWorkspace = ''
+    // Same reasoning as the folder above: a web grant is a decision about *that* chat. Carrying it
+    // into the next one would start a fresh conversation with two network tools the person never
+    // asked for in it.
+    webDraft = false
+    webNote = ''
     if (transcript) transcript.sessionId = 0
     viewMsgCount = 0
     hasOlder = false
@@ -4237,6 +4492,224 @@
    */
   const personaNow = $derived<'cowork' | 'chat'>(
     hostState?.persona === 'chat' ? 'chat' : hostState?.persona === 'cowork' ? 'cowork' : modeTab,
+  )
+  /**
+   * Whether the conversation on screen may reach the web.
+   *
+   * Read from the host, not from a local toggle state, because this is a fact about the model's
+   * prompt and its mounted tools: a phone watching the same conversation and the window that
+   * flipped the chip have to see one answer. `webDraft` is the exception that proves the rule — a
+   * conversation with no row yet has nothing for the host to remember, so the choice waits here
+   * until the send creates the row, exactly as the folder chosen for a draft does.
+   */
+  let webDraft = $state(false)
+  /** The conversation on screen, and whether the host is the one holding it. */
+  const shownRow = $derived(sessions.find((s) => s.id === viewId) ?? null)
+  const hostHolds = $derived(viewId !== null && hostState?.session_id === viewId)
+  /**
+   * Whether the conversation on screen may reach the web.
+   *
+   * The host's answer wins while it is holding *this* conversation, because it is the one thing that
+   * knows which tools the model process was mounted with. The moment the window is merely *looking* at
+   * a conversation the host is not holding, its state describes a different conversation entirely —
+   * and a chip that shows that would be showing the neighbour's permissions. The row's recorded grant
+   * is then the honest answer, and it is also what the host will mount when a turn moves to it.
+   */
+  const webNow = $derived(
+    viewId === null
+      ? webDraft
+      : hostHolds
+        ? hostState?.web === true
+          ? true
+          : hostState?.web === false
+            ? false
+            : (shownRow?.web_on ?? false)
+        : (shownRow?.web_on ?? false),
+  )
+  /** The last thing the app said about the web switch — a grant, a refusal, or why neither happened.
+   *  It sits under the composer rather than in a toast because it explains a control that is still
+   *  on screen, and because a refusal that vanishes in three seconds teaches nothing. */
+  let webNote = $state('')
+
+  /**
+   * Give the conversation on screen the two web tools, or take them away.
+   *
+   * The checks are not here: they live in the engine's `set_conversation_web`, so a phone on the
+   * gateway is refused in exactly these words for exactly these reasons. What this owns is the
+   * chip's honesty — the state is re-read afterwards instead of believing the click, because a grant
+   * the model process did not take would otherwise be shown as taken.
+   */
+  async function toggleWeb() {
+    const next = !webNow
+    if (viewId === null) {
+      // No row to grant yet. The choice rides on the send that creates the row, exactly as the
+      // folder chosen for a draft does.
+      webDraft = next
+      webNote = next
+        ? 'web on for this chat: the model is given web_search and web_fetch when it starts'
+        : 'web off: this chat starts with no tools at all'
+      return
+    }
+    webNote = ''
+    try {
+      const out = await invoke<string | { note?: string }>('set_session_web', { session: viewId, on: next })
+      webNote = typeof out === 'string' ? out : (out?.note ?? '')
+      webDraft = next
+    } catch (e) {
+      webNote = cleanErr(e)
+    }
+    // The chip follows the host, not this click.
+    await refreshState()
+    void loadSessions()
+  }
+
+  /**
+   * Whether there is a model to answer with at all.
+   *
+   * This question used to be unaskable: the app shipped pointing at `127.0.0.1:8090`, so a fresh
+   * install always had *something* to send to, and sending to it was either magic or a hang. Now an
+   * empty install is honestly empty, and the composer has to say so *before* it creates a
+   * conversation that can never be answered.
+   */
+  const modelReady = $derived(!!(hostState?.model ?? model ?? '').trim())
+  /** The chip's label. "no model" is the state, spelled as the state, rather than a blank where a
+   *  model name usually sits — a blank reads as a rendering bug and gets ignored. */
+  const modelLabel = $derived(modelReady ? shortModel(model) : 'no model')
+
+  /** The first-run flow: endpoint, then model. It reuses the settings screen's probe state (`pvUrl`,
+   *  `probed`, `pvMsg`) rather than keeping a second copy, so the two surfaces cannot disagree about
+   *  what was probed or what the endpoint said. */
+  let setupOpen = $state(false)
+  let setupWhy = $state('')
+  let setupStep = $state<'endpoint' | 'model'>('endpoint')
+  let setupMsg = $state('')
+  let setupAsked = $state(false)
+  let setupUrlEl = $state<HTMLInputElement | null>(null)
+
+  function openSetup(why: string) {
+    setupWhy = why
+    setupOpen = true
+    setupStep = pvUrl.trim() ? 'model' : 'endpoint'
+    void loadProviders()
+    queueMicrotask(() => setupUrlEl?.focus())
+  }
+
+  function closeSetup() {
+    setupOpen = false
+    setupWhy = ''
+  }
+
+  /** Write the address the app answers from, then name the model on it. One step at a time on
+   *  purpose: an endpoint with no model chosen still cannot answer, and a single "Save" that did both
+   *  would have to guess which of the endpoint's models the person means. */
+  async function saveSetupEndpoint() {
+    if (pvBusy) return
+    setupMsg = 'writing the endpoint…'
+    pvMsg = ''
+    try {
+      const out = await invoke<string | { note?: string }>('provider_set_primary', {
+        base_url: pvUrl.trim(),
+        api_key: pvKey || null,
+        kind: pvKind,
+      })
+      setupMsg = typeof out === 'string' ? out : (out?.note ?? '')
+      // Probe, don't just ping: the next step asks which model to answer with, and a reachability
+      // check that said "yes, something is there" would leave that step with nothing in it. The probe
+      // is the thing that names the models — and if it names none, that is the reason the step did
+      // not open, so it goes where the person will read it.
+      await probeProvider()
+      await refreshState()
+      if (probed.length) setupStep = 'model'
+      else setupMsg = `the endpoint was written, but it named no models to answer with: ${pvMsg}`
+    } catch (e) {
+      setupMsg = cleanErr(e)
+    }
+  }
+
+  async function pickSetupModel(id: string) {
+    try {
+      await invoke('set_model', { model: id })
+      await loadModels()
+      await refreshState()
+      setupOpen = false
+      setupMsg = ''
+      say(`answering with ${id}`)
+    } catch (e) {
+      setupMsg = cleanErr(e)
+    }
+  }
+
+  /** What this build is and where the person's files live. Read on demand — it costs a config read
+   *  and two count queries, and the screen that shows it is opened a handful of times a year. */
+  let aboutInfo = $state<Record<string, string | number> | null>(null)
+  async function loadAbout() {
+    try {
+      aboutInfo = await invoke<Record<string, string | number>>('about')
+    } catch (e) {
+      pageLog(`about: ${e}`)
+    }
+  }
+  /**
+   * What to show, and in what order. A field the host could not fill is skipped rather than shown
+   * blank: "Model thread files: —" reads like a broken app, when the truth is that the Rust core has
+   * no second copy of the conversation to name.
+   */
+  const ABOUT_INFO: [string, string][] = [
+    ['app', 'App'],
+    ['version', 'Version'],
+    ['core', 'Answering engine'],
+    ['model', 'Model'],
+    ['endpoint', 'Endpoint'],
+    ['endpoints', 'Endpoints registered'],
+    ['search', 'Web search'],
+    ['gateway', 'Reachable at'],
+    ['build', 'Build'],
+  ]
+  const ABOUT_FILES: [string, string][] = [
+    ['conversations', 'Conversations'],
+    ['messages', 'Messages'],
+    ['workspace', 'Workspace'],
+    ['config_path', 'Settings file'],
+    ['db_path', 'Record (SQLite)'],
+    ['thread_store', 'Model’s own thread files'],
+  ]
+  function aboutRowsOf(keys: [string, string][]): [string, string][] {
+    return keys
+      .map(([k, label]) => [label, aboutInfo?.[k]] as [string, string | number | undefined])
+      .filter(([, v]) => v !== undefined && String(v).trim() !== '')
+      .map(([label, v]) => [label, String(v)] as [string, string])
+  }
+  const aboutInfoRows = $derived(aboutRowsOf(ABOUT_INFO))
+  const aboutFileRows = $derived(aboutRowsOf(ABOUT_FILES))
+
+  /** A first run has no endpoint. Ask once per window, and only while nothing answers. */
+  async function checkSetup() {
+    if (setupAsked) return
+    setupAsked = true
+    if (modelReady) {
+      // Something answers. It may still answer from an endpoint registered nowhere in the file, which
+      // is what `CWOFFEE_URL` looks like — and that is a legitimate way to start, not a hole to plug.
+      return
+    }
+    try {
+      const st = await invoke<{ chosen?: string; chosen_base_url?: string }>('provider_status')
+      if ((st.chosen_base_url ?? '').trim() && (st.chosen ?? '').trim()) return
+      openSetup(
+        'Nothing is answering yet: this app has no model endpoint and no model chosen. It will not ' +
+          'guess a port for you — point it at a server and pick one of its models.',
+      )
+    } catch (e) {
+      pageLog(`first-run check: ${e}`)
+    }
+  }
+
+  /** The greeting screen's cards for the mode on screen — see `TIPS` / `CHAT_TIPS` for why there are two lists. */
+  const TIPS_FOR = $derived(
+    personaNow === 'chat'
+      ? webNow
+        ? CHAT_TIPS.slice(0, 3).concat(CHAT_TIPS_WEB)
+        : CHAT_TIPS
+      : TIPS,
   )
   async function setPersona(p: 'cowork' | 'chat') {
     if (personaNow === p) return
@@ -5080,7 +5553,10 @@
         transcript?.addUser('attachment probe', [
           { mime: 'image/png', name: 'probe.png', bytes: 70 },
         ])
-        const tags = [...document.querySelectorAll('.atttag')]
+        // An image chip and a file chip are two shapes now — the image one shows the picture or
+        // offers to fetch it — so the claim hosted here is the one that has always mattered: the
+        // message says what it carried, by name.
+        const tags = [...document.querySelectorAll('.atttag, .tatt')]
         if (!tags.length) fail('attachment tag not rendered in the transcript')
         else if (!tags[tags.length - 1].textContent?.includes('probe.png'))
           fail(`attachment tag missing the name: ${tags[tags.length - 1].textContent}`)
@@ -5251,7 +5727,7 @@
         else if (nav.some((t) => (t.textContent ?? '').split(/\s+/).length > 3))
           fail(`a rail entry is a sentence rather than a name: ${JSON.stringify(railText)}`)
         else if (!nav.every((t) => t.querySelector('svg')))
-          fail('a rail entry has no icon: five identical words are harder to scan than five marks')
+          fail('a rail entry has no icon: words alone are harder to scan than a mark beside them')
         else pageLog(`settings rail ok (${railText.join(', ')})`)
 
         // 2. Nothing orphaned: every name that used to be a page must still land.
@@ -5907,10 +6383,11 @@
             const main = document.querySelector('main') ?? document.body
             if (!(main.textContent ?? '').includes('Chat has no folder'))
               fail('the composer still offers a folder line where a chat owns none')
-            if (
-              !document.querySelector('[data-approvals="none"]') ||
-              document.querySelector('[data-approvals]:not([data-approvals="none"])')
-            )
+            // No approvals control at all. It used to be replaced by a inert label carrying
+            // `data-approvals="none"`; that slot now holds the one tool decision a chat does have
+            // (see the Web chip), so the claim here is the simpler one: nothing in a chat's composer
+            // is an approvals control.
+            if (document.querySelector('[data-approvals]'))
               fail('the approvals control is still offered in chat mode, where nothing can need approving')
             // A mode switch resets the view, so the check has to give it a view to reset:
             // open the chat the way a person does, by clicking its row. Without that the
@@ -6417,9 +6894,20 @@
           if (!under) fail('the sidebar footer row has no control to test the dim against')
           else {
             const ub = under.getBoundingClientRect()
-            const hit = document.elementFromPoint(ub.x + ub.width / 2, ub.y + ub.height / 2)
+            const pr = panel.getBoundingClientRect()
+            // Aim at the strip of window beside the dialog, at the height of that control. It used
+            // to aim at the control's own centre — which passed only because the dialog sat in the
+            // bottom-right corner for the first 200ms of its entrance, the very bug the placement
+            // check now measures. With the dialog centred from the first frame, a click there
+            // legitimately lands on the dialog, and the claim being tested is about the dim.
+            const px = pr.left > 24 ? pr.left - 16 : Math.min(window.innerWidth - 8, pr.right + 16)
+            const py = ub.y + ub.height / 2
+            const hit = document.elementFromPoint(px, py)
             if (hit && !hit.classList.contains('mscrim'))
-              fail(`a click over the sidebar footer row while settings is open lands on .${String(hit.className || hit.tagName)}, not on the dim`)
+              fail(
+                `a click on the window beside the dialog (at ${Math.round(px)},${Math.round(py)}; the dialog starts at x=${Math.round(pr.left)}) ` +
+                  `lands on .${String(hit.className || hit.tagName)}, not on the dim`,
+              )
             if (!document.querySelector('.app-shell.modal-open'))
               fail('the app shell does not mark a modal open, so nothing behind the dialog is taken out of the tab order')
             // `inert` is a property on current engines and nothing at all on older ones; the
@@ -7311,45 +7799,28 @@
             if (table.textContent?.includes('|')) fail('stray pipes left in the table')
           }
 
-          const rblk = document.querySelector('.blk-reasoning') as HTMLElement | null
-          if (!rblk) {
-            fail('no thinking line in the turn')
+          // A thinking line on a turn that never had one would be its own bug, and this is the
+          // scenario to catch it in: `markdown-table-only` sends no reasoning at all. The claims
+          // about what a *real* thinking line looks like used to sit here, and they were reading
+          // whichever thinking block an earlier scenario happened to leave on screen — which is why
+          // they passed in a full run and fell over when this group ran on its own. They now live
+          // under `thought-line`, whose own script is what puts a thought on the page.
+          //
+          // Scope to the turn that just streamed: `.turn` is one live turn's container, the answer
+          // is inside it, and the run accordion next to it is where a thought would be. The first
+          // version of this asked for `closest('.blk-run')`, and an answer is a *sibling* of the
+          // run, never inside it — so the scope fell back to the whole document and the check
+          // reported the previous turn's thinking line as if this turn had grown one.
+          const ownTurn = lastAns?.closest('.turn') as HTMLElement | null
+          if (!ownTurn) {
+            fail('the newest answer is outside any .turn element, so a thinking line cannot be attributed to one turn')
           } else {
-            const head = rblk.querySelector('.blk-head') as HTMLElement | null
-            if (!head) fail('the thinking line has no header')
-            else {
-              const label = head.textContent ?? ''
-              if (!/^Thought for /i.test(label))
-                fail(`thinking label was not replaced with a duration: ${JSON.stringify(label)}`)
-              // The arrow wrapping onto its own line was the reported bug; now the line carries
-              // a duration and a word count, so it has to stay one line to stay readable.
-              if (head.getBoundingClientRect().height > 22)
-                fail(`thinking head is not a single line: ${head.getBoundingClientRect().height}px`)
-              // The preview is gone, and the ask was "indefinitely not accessible behind its
-              // header": no body element at all, no expander, and nothing clickable.
-              const bodies = rblk.querySelectorAll('.blk-body').length
-              if (bodies) fail(`a thinking line carries ${bodies} body element(s); a thought has no body to open`)
-              const pseudo = getComputedStyle(head, '::after').content
-              if (pseudo !== 'none' && pseudo !== 'normal') fail('the thinking header still paints an expander')
-              if (getComputedStyle(head).cursor !== 'default') fail('the thinking header still looks clickable')
-              head.click()
-              await new Promise((r) => setTimeout(r, 120))
-              if (rblk.classList.contains('is-open') || head.classList.contains('open'))
-                fail('clicking a thinking line opened something')
-              const trun = rblk.closest('.blk-run') as HTMLElement | null
-              if (!trun) fail('a thinking line in a live turn sits outside the run accordion')
-              else {
-                // "Show the working" reveals what the steps did. It must not bring the thinking
-                // text back: this is the half of the removal a display setting could otherwise
-                // undo, and the reason the check turns the setting on and reads the page again.
-                transcript?.setVerbose(true)
-                await new Promise((r) => setTimeout(r, 200))
-                const extra = [...rblk.children].filter((n) => !n.matches('.blk-head')).length
-                transcript?.setVerbose(false)
-                await new Promise((r) => setTimeout(r, 200))
-                if (extra) fail(`"show the working" put ${extra} element(s) back under a thinking line`)
-              }
-            }
+            const stray = ownTurn.querySelector('.blk-reasoning')
+            if (stray)
+              fail(
+                'a turn whose endpoint sent no reasoning grew a thinking line anyway: ' +
+                  `"${stray.querySelector('.blk-head')?.textContent ?? ''}"`,
+              )
           }
         }
       }
@@ -11550,6 +12021,35 @@
             fail(`answer label is no longer outdented: head ${Math.round(aHead.left)} body ${Math.round(aBody.left)}`)
           const label = think.querySelector('.blk-head')?.textContent ?? ''
           if (!/^Thought for /i.test(label.trim())) fail(`settled thinking reads "${label}"`)
+          // What a thinking line is *not*: no body, no expander, not clickable, one line tall, and
+          // unmoved by "show the working". These came from the ask that thoughts stay collapsed
+          // "indefinitely not accessible behind its header". They used to be asserted from inside
+          // the markdown-table check — reading a block another scenario had left on the page — and
+          // here the block is the one this scenario's own script put there.
+          const rhead = think.querySelector('.blk-head') as HTMLElement | null
+          if (!rhead) fail('the thinking line has no header')
+          else {
+            // The arrow wrapping onto its own line was the reported bug; the line now carries a
+            // duration and a word count, so it has to stay one line to stay readable.
+            if (rhead.getBoundingClientRect().height > 22)
+              fail(`thinking head is not a single line: ${rhead.getBoundingClientRect().height}px`)
+            const pseudo = getComputedStyle(rhead, '::after').content
+            if (pseudo !== 'none' && pseudo !== 'normal') fail('the thinking header still paints an expander')
+            if (getComputedStyle(rhead).cursor !== 'default') fail('the thinking header still looks clickable')
+            rhead.click()
+            await new Promise((r) => setTimeout(r, 120))
+            if (think.classList.contains('is-open') || rhead.classList.contains('open'))
+              fail('clicking a thinking line opened something')
+            // "Show the working" reveals what the steps did. It must not bring the thinking text
+            // back: this is the half of the removal a display setting could otherwise undo, and the
+            // reason the check turns the setting on and reads the page again.
+            transcript?.setVerbose(true)
+            await new Promise((r) => setTimeout(r, 200))
+            const extra = [...think.children].filter((n) => !n.matches('.blk-head')).length
+            transcript?.setVerbose(false)
+            await new Promise((r) => setTimeout(r, 200))
+            if (extra) fail(`"show the working" put ${extra} element(s) back under a thinking line`)
+          }
         }
         transcript?.clear()
         pageLog('a thought is one line and the answer keeps its outdented label')
@@ -12753,6 +13253,984 @@
         pageLog('turn files ok (each turn owns its own files, and a share leaves no chip)')
       }
 
+      // --- your own message can be copied, and corrected where it was said ----------
+      //
+      // Two asks there was no way to make: get your own question back out of a conversation, and
+      // fix a message you phrased wrong. The second is the dangerous one, so what is checked here
+      // is the shape that makes it safe rather than the pixels: every one of my messages carries
+      // the two controls, the editor states what each button does to the conversation, and what
+      // reaches the host identifies the message by its stored row when the window has one and by
+      // its position counted back from my newest message when it does not — and in both cases the
+      // words on screen travel with the ask, because a host that cannot match them refuses rather
+      // than rewriting whichever row now sits at that position.
+      if (want('user-message', 'your own message can be copied, and corrected where it was said')) {
+        const row = (id: number, role: string, content: string) => ({
+          id,
+          session_id: 7,
+          role,
+          content,
+          reasoning: '',
+          tool_call_id: null,
+          tool_calls_json: '',
+          reasoning_signature: '',
+          reasoning_ms: 0,
+          files: [],
+          created_at: 0,
+          attachments: [],
+        })
+        transcript?.clear()
+        transcript?.loadHistory([
+          row(701, 'user', 'first ask'),
+          row(702, 'assistant', 'first answer'),
+          row(703, 'user', 'second ask'),
+          row(704, 'assistant', 'second answer'),
+        ] as never)
+        const acts = [...document.querySelectorAll('.blk-user .user-acts')]
+        if (acts.length !== 2) fail(`${acts.length} action rows for two of my messages, want one under each`)
+        const labels = acts.map((r) => [...r.querySelectorAll('.tact-label')].map((l) => l.textContent?.trim()))
+        if (!labels.every((l) => l.includes('Copy') && l.includes('Edit')))
+          fail(`a message's own controls are ${JSON.stringify(labels)}, want Copy and Edit`)
+
+        let asked: any = null
+        const realEdit = transcript?.onMessageEdit ?? null
+        if (transcript) transcript.onMessageEdit = async (e) => ((asked = e), 'ok')
+
+        const editBtn = acts[0]?.querySelector('.tact.edit') as HTMLButtonElement | null
+        if (!editBtn) fail('no Edit control on my message')
+        else {
+          editBtn.click()
+          await new Promise((r) => setTimeout(r, 30))
+          const ta = document.querySelector('.blk-user.editing .user-edit-ta') as HTMLTextAreaElement | null
+          if (!ta) fail('Edit did not open an editor in place, over the message')
+          else {
+            if (ta.value !== 'first ask') fail(`the editor starts from what is on screen, got ${JSON.stringify(ta.value)}`)
+            const note = document.querySelector('.user-edit-note')?.textContent ?? ''
+            if (!/does not send anything/i.test(note) || !/everything after it goes/i.test(note))
+              fail(`the two buttons have to say what they do to the conversation, where they can be read: ${note.slice(0, 140)}`)
+            const buttons = [...document.querySelectorAll('.user-edit-acts .ue-act')] as HTMLButtonElement[]
+            const save = buttons.find((b) => b.classList.contains('save'))
+            const again = buttons.find((b) => b.classList.contains('again'))
+            if (!save || !again) fail(`the editor offers ${buttons.map((b) => b.className).join(', ')}; want Save and Save-and-send-again`)
+            const againLabel = again?.textContent ?? ''
+            if (!/send again/i.test(againLabel))
+              fail(`the second button is labelled ${againLabel}, which does not say it sends again`)
+            ta.value = 'first ask, said better'
+            save?.click()
+            await new Promise((r) => setTimeout(r, 60))
+            if (!asked) fail('Save asked the host for nothing at all')
+            else {
+              if (asked.id !== 701) fail(`Save addressed the wrong message: ${JSON.stringify(asked)}`)
+              if (asked.fromEnd !== 2)
+                fail(`the counted position is ${asked.fromEnd}, want 2: this is the second-newest of my messages`)
+              if (asked.shown !== 'first ask' || asked.next !== 'first ask, said better')
+                fail(`the words on screen travel with the ask: ${JSON.stringify(asked)}`)
+              if (asked.resend !== false) fail('Save must not re-send anything')
+            }
+            if (document.querySelector('.user-edit')) fail('the editor stayed open after the host answered')
+          }
+        }
+
+        // A message this window painted while it was being sent has no stored id on this side of
+        // the wire, so the ask is addressed by position — and it is the newest, so 1.
+        transcript?.clear()
+        transcript?.addUser('the live one')
+        await new Promise((r) => setTimeout(r, 30))
+        const live = document.querySelector('.blk-user .user-acts .tact.edit') as HTMLButtonElement | null
+        if (!live) fail('the message you just sent offers no Edit')
+        else {
+          live.click()
+          await new Promise((r) => setTimeout(r, 30))
+          const ta2 = document.querySelector('.user-edit-ta') as HTMLTextAreaElement | null
+          if (!ta2) fail('the message you just sent has no editor')
+          else {
+            asked = null
+            ta2.value = 'the live one, said better'
+            const again = [...document.querySelectorAll('.user-edit-acts .ue-act')].find((b) =>
+              b.classList.contains('again'),
+            ) as HTMLButtonElement | undefined
+            again?.click()
+            await new Promise((r) => setTimeout(r, 60))
+            if (!asked) fail('Save and send again asked the host for nothing')
+            else {
+              if (asked.id !== null) fail(`a message this window painted has no stored row to name: ${asked.id}`)
+              if (asked.fromEnd !== 1) fail(`the newest message counts as 1 from the newest, got ${asked.fromEnd}`)
+              if (asked.resend !== true) fail('that button has to say it takes the conversation back and sends again')
+              if (asked.next !== 'the live one, said better') fail(`the new words did not travel: ${JSON.stringify(asked)}`)
+            }
+          }
+        }
+        // Cancelling is not an ask. Escape closes the editor and the host hears nothing.
+        asked = null
+        const againBtn = document.querySelector('.blk-user .user-acts .tact.edit') as HTMLButtonElement | null
+        againBtn?.click()
+        await new Promise((r) => setTimeout(r, 30))
+        const ta3 = document.querySelector('.user-edit-ta') as HTMLTextAreaElement | null
+        ta3?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+        await new Promise((r) => setTimeout(r, 30))
+        if (document.querySelector('.user-edit')) fail('Escape left the editor open')
+        if (asked) fail('Escape asked the host for a change: nothing was cancelled')
+        if (transcript) transcript.onMessageEdit = realEdit
+        transcript?.clear()
+        pageLog(
+          'user message ok (copy and edit under each of my messages; save and save-again addressed the right row; escape cancels)',
+        )
+      }
+
+      // --- the same correction, driven all the way to the host -----------------
+      //
+      // The group above proves the ask is addressed to the right row; it stubs the host, because a
+      // page check should not need an engine to test a control. This one drives the real verb: a
+      // real send, a real row, then "save and send again" for real. What has to follow is the
+      // conversation shortened in the record *and* in what the model can see — the answer that
+      // followed the old wording gone from both — with the corrected words sent as a new turn. On
+      // the pi core that means a pi thread rewritten on disk and reopened by the running pi, which
+      // is precisely what a Rust unit test cannot reach, and the two cores have to answer alike.
+      if (want('edit-resend', 'correcting a message you already sent takes the conversation back and asks again')) {
+        const rowsOf = async (sid: number) =>
+          (
+            await invoke<{ messages: { id: number; role: string; content: string }[] }>('session_messages', {
+              id: sid,
+              before: null,
+              limit: 400,
+            })
+          ).messages
+        newSession()
+        const ask = 'Selftest wipe check: reply with the single word ok.'
+        const fixed = 'Selftest wipe check, asked a second time: reply with the single word ok.'
+        draft = ask
+        await send()
+        // A draft has no id until the send creates the conversation, so the record being checked is
+        // named from here on, not before the first send. And it is waited for rather than read once:
+        // on the pi core the row is created by the send and the page catches up with it a beat later,
+        // and a check that samples once grades the boot speed instead of the feature.
+        let sid = 0
+        for (let i = 0; i < 40 && !sid; i++) {
+          const st = await invoke<{ session_id: number }>('session_state').catch(() => null)
+          sid = viewId ?? transcript?.sessionId ?? st?.session_id ?? 0
+          if (!sid) await new Promise((r) => setTimeout(r, 100))
+        }
+        if (!sid) fail('the send did not open a saved conversation, so the correction check has no record to read')
+        else if (!(await settleTurn('the first answer')))
+          fail('the first turn never ended; the correction has nothing to correct')
+          else {
+          const rows1 = await rowsOf(sid)
+          const mine1 = rows1.filter((m) => m.role === 'user')
+          if (mine1.length !== 1 || rows1.length < 2) {
+            fail(`after one send the record holds ${rows1.length} rows with ${mine1.length} of my messages in it`)
+          } else {
+            const uid = mine1[0].id
+              // Refused while a turn is running — and refused means nothing moved. The person is
+              // allowed to change their mind mid-answer, but not while the answer is being written
+              // to the record, because the cut and the re-send are not atomic against a live turn.
+              // A turn that answers "ok" is over before the harness can blink, and the guard has to
+              // be measured against a turn that is actually in flight. This one counts to fifteen.
+              draft = 'Count out loud from one to fifteen'
+              await send()
+              // Wait for the turn to be *running* before asking to edit under it. The first sample
+              // after a send is often still idle — the host starts a beat later — and a guard
+              // measured against an idle host says nothing about the guard.
+              let running = false
+              for (let i = 0; i < 40 && !running; i++) {
+                running = busy
+                if (!running) await new Promise((r) => setTimeout(r, 100))
+              }
+              let refused = ''
+              try {
+                await invoke('edit_message', {
+                  session: sid,
+                  message_id: uid,
+                  from_end: null,
+                  shown: ask,
+                  next: fixed,
+                  resend: true,
+                })
+              } catch (e) {
+                refused = String(e)
+              }
+              if (!/turn is running/i.test(refused))
+                fail(
+                  `editing during a turn answered ${refused || 'with no error'} (the turn was running when asked: ${running})`,
+                )
+              await settleTurn('the second answer')
+              const rows2 = await rowsOf(sid)
+              const beforeFirst = rows2.filter((m) => m.id < uid).length
+              if (rows2.length - beforeFirst < 4)
+                fail(
+                  `the record holds ${rows2.length - beforeFirst} rows from that message onward where two sends put ` +
+                    'an ask and an answer each; the refused edit has to have changed nothing',
+                )
+              // The real thing, aimed at the first message by its stored id.
+              const out = await invoke<{ note: string; dropped: number; resending: boolean; visible: boolean }>(
+                'edit_message',
+                { session: sid, message_id: uid, from_end: null, shown: ask, next: fixed, resend: true },
+              )
+              if (!out.resending) fail(`the host would not take the corrected ask back: ${out.note}`)
+              if (out.dropped !== rows2.length - beforeFirst)
+                fail(
+                  `the correction dropped ${out.dropped} rows; from that message to the end of the record there were ` +
+                    `${rows2.length - beforeFirst}, and nothing before it belongs to this correction`,
+                )
+              if (!out.visible)
+                fail(
+                  `the host answered "${out.note}" without the re-sent message being in the record yet — a client ` +
+                    'reloading on that answer paints an answer with no question under it',
+                )
+              await settleTurn('the answer to the corrected ask')
+              const rows3 = await rowsOf(sid)
+              const mine3 = rows3.filter((m) => m.role === 'user')
+              if (mine3.length !== 1)
+                fail(
+                  `the conversation now holds ${mine3.length} of my messages (${rows3.length} rows); sending that one ` +
+                    'again was meant to move it, not leave the old wording underneath',
+                )
+              else if (!mine3[0].content.includes('asked a second time'))
+                fail(`the row that came back reads ${JSON.stringify(mine3[0].content.slice(0, 70))}; the correction is not in the record`)
+              // The record is shortened. Whether the *model* was, too, is only knowable from what
+              // the host says out loud, and both cores say it with the same words — the Rust core
+              // rebuilds its prompt from the trimmed history, the pi core reopens a shortened thread.
+              const said = noteLog.filter((t) => /is back to/i.test(t))
+              if (!said.length)
+                fail(
+                  'nothing in the record was announced to the model: the host never said it had taken the conversation ' +
+                    'back, so the model may still be answering from the stretch that was removed',
+                )
+              // And the page ends up agreeing with the record rather than with what it had painted.
+              await loadTranscript(sid)
+              const blocks = [...document.querySelectorAll('.blk-user .blk-body')]
+              if (blocks.length !== 1)
+                fail(`the transcript shows ${blocks.length} of my messages where the record holds 1`)
+              else if (!blocks[0].textContent?.includes('asked a second time'))
+                fail('the transcript still shows the wording that was corrected away')
+              pageLog(
+                `correction ok (${out.dropped} rows went, one came back corrected, and the host said: ${said[0].slice(0, 72)}…)`,
+              )
+          }
+        }
+      }
+
+      // --- a picture pasted off the desktop, sent, and seen at all three places --
+      //
+      // "Pasting an image into the composer seems like the file is attached, but when you send,
+      // there's no indication that it got sent — not in the transcript — and the model did not
+      // acknowledge it." The suite proves the two halves separately and never the seam: the
+      // clipboard check pastes a real screenshot and then *drops* it, and the attachment check
+      // supplies its payload programmatically. A picture can be lost in three places — the bubble
+      // on screen, the row in the record, the blocks the endpoint is handed — and the user is
+      // describing all three at once, so the check reads all three receipts from one real send.
+      if (want('paste-send', 'a pasted picture reaches the composer, the transcript, and the model')) {
+        const noClip = import.meta.env.VITE_SELFTEST_NOCLIP === '1'
+        const cbox = document.querySelector('.cbox') as HTMLElement | null
+        if (!cbox) fail('there is no composer to paste into')
+        else if (!isTauri()) fail('the paste-and-send check ran somewhere other than the desktop shell')
+        else if (noClip) pageLog('paste-send SKIPPED: this machine has no wl-clipboard, so nothing was placed on the selection')
+        else {
+          // Same staging the clipboard check uses: the selection belongs to the desktop, so the
+          // app is asked to put the board's own fixture back on it at the moment it is needed.
+          const staged = await Promise.race([
+            invoke<{ mime: string; bytes: number }>('selftest_stage_clipboard')
+              .then((v) => ({ v, why: '' }))
+              .catch((e) => ({ v: null as null | { mime: string; bytes: number }, why: String(e) })),
+            new Promise<{ v: null; why: string }>((res) =>
+              setTimeout(() => res({ v: null, why: 'the app never answered the staging request (4s)' }), 4000),
+            ),
+          ])
+          if (!staged.v) {
+            pageLog(`paste-send SKIPPED: ${staged.why || 'the app refused to stage a fixture'}`)
+          } else {
+            // Start from nothing attached: an earlier group leaving a picture in the composer would
+            // make the endpoint report two images and this check would be measuring the wrong thing.
+            clearAttachments()
+            const had = pending.length
+            try {
+              cbox!.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true }))
+            } catch (e) {
+              pageLog(`the paste gesture could not be dispatched: ${e}`)
+            }
+            if (!(await waitFor('the pasted image to attach', () => pending.length > had, 9000))) {
+              const why = (document.querySelector('.att-err')?.textContent ?? '').trim()
+              fail(`pasting the desktop selection attached nothing${why ? `: ${why}` : ''}`)
+            } else {
+              const pasted = pending[pending.length - 1]
+              // Reasoning off: this is about whether the bytes travel, not about how long the model
+              // deliberates over one white pixel. Whatever it was, put it back.
+              const thinkWas = (await invoke<HostState>('session_state')).reasoning
+              await invoke('set_reasoning', { level: 'off', persist: false })
+              newSession()
+              const turnsBefore = (await invoke<HostState>('session_state')).turns
+              draft = 'ATTACHMENT ECHO: what is in this picture?'
+              await send()
+              const sid = viewId ?? 0
+              // Receipt one: the bubble this window painted — and not a caption about the picture,
+              // the picture itself. This is the receipt the user said was missing.
+              const chipsLive = [...document.querySelectorAll('.blk-user .tatt')] as HTMLElement[]
+              const mineLive = chipsLive.filter((c) => (c.textContent ?? '').includes(pasted.name))
+              const withPic = mineLive.filter((c) => !!c.querySelector('img'))
+              if (!sid) fail('the send did not open a conversation, so there is no record to read')
+              else if (!mineLive.length)
+                fail(
+                  `the message on screen carries ${JSON.stringify(chipsLive.map((c) => c.textContent ?? ''))}; ` +
+                    `nothing there says ${pasted.name} (${pasted.bytes} bytes of ${pasted.mime}) went with it`,
+                )
+              else if (!withPic.length)
+                fail(
+                  'the attachment chip names the picture but shows no picture: a caption where a thumbnail ' +
+                    'belonged is the complaint this check exists for',
+                )
+              else {
+                const done = await waitTurnDone(turnsBefore, 90000)
+                await invoke('set_reasoning', { level: thinkWas, persist: false })
+                const page = await invoke<{
+                  messages: { role: string; content: string; attachments?: { name?: string; mime: string; bytes: number }[] }[]
+                }>('session_messages', { id: sid, before: null, limit: 50 })
+                // Receipt two: the endpoint's own words. The scripted model reports the image blocks
+                // it was handed, so a core that quietly omits them fails here instead of writing an
+                // answer that never mentions the picture.
+                const receipt = (page.messages ?? [])
+                  .filter((m) => m.role === 'assistant')
+                  .map((m) => String(m.content ?? ''))
+                  .find((t) => t.includes('Attachment seen:'))
+                if (!done) fail('the turn never ended, so the endpoint receipt could not be read')
+                else if (!receipt) fail(`the endpoint never reported an image (last answer said: ${(page.messages ?? []).filter((m) => m.role === 'assistant').map((m) => m.content).slice(-1)[0] ?? 'nothing'})`)
+                else if (!receipt.includes('1 image(s): image/png'))
+                  fail(`the endpoint was handed the wrong thing: "${receipt}"`)
+                else {
+                  // Receipt three: the record, read back — and then the transcript re-painted from
+                  // it, which is the state a person sees when they come back later.
+                  const kept = (page.messages ?? [])
+                    .filter((m) => (m.attachments?.length ?? 0) > 0)
+                    .flatMap((m) => m.attachments ?? [])
+                    .find((a) => a.name === pasted.name)
+                  if (!kept) fail(`the record holds no attachment named ${pasted.name}; the picture was sent and then lost`)
+                  else {
+                    await loadTranscript(sid)
+                    // And what a reader sees when they come back later: the row is on screen again
+                    // with its chip, the chip can be pressed, and pressing it brings the bytes —
+                    // which is the moment the app's cheap-transcript choice has to pay off.
+                    const chipsBack = [...document.querySelectorAll('.blk-user .tatt')] as HTMLElement[]
+                    const chip = chipsBack.find((c) => (c.textContent ?? '').includes(pasted.name))
+                    if (!chip)
+                      fail(
+                        `reopening the conversation shows ${JSON.stringify(chipsBack.map((c) => c.textContent ?? ''))} — ` +
+                          `the record kept ${pasted.name} and the transcript lost it`,
+                      )
+                    else {
+                      chip.click()
+                      const shown = await waitFor('the picture to load into its chip', () => !!chip.querySelector('img'), 6000)
+                      const big = document.querySelector('.picview-img') as HTMLImageElement | null
+                      const src = big?.getAttribute('src') ?? ''
+                      if (!shown || !big)
+                        fail('pressing the attachment chip opened nothing: the picture is in the record but unreachable from the transcript')
+                      else if (!src.startsWith('data:image/png;base64,'))
+                        fail(`the opened picture arrived as ${src.slice(0, 32) || 'nothing'}, not the PNG that was sent`)
+                      else {
+                        const raw = atob(src.slice('data:image/png;base64,'.length))
+                        if (!(raw.charCodeAt(0) === 0x89 && raw.charCodeAt(1) === 0x50 && raw.charCodeAt(2) === 0x4e && raw.charCodeAt(3) === 0x47))
+                          fail('the opened picture is not the PNG that was sent (no PNG magic in what came back)')
+                        pageLog(
+                          `paste ok (desktop selection → ${pasted.name} ${pasted.bytes}B → thumbnail in the bubble, ` +
+                            `the record, and the picture re-openable after a reload; endpoint said: ${receipt})`,
+                        )
+                      }
+                      const scrim = document.querySelector('.picview-scrim') as HTMLElement | null
+                      scrim?.click()
+                    }
+                  }
+                }
+              }
+              await invoke('delete_session', { id: sid }).catch(() => {})
+              await loadSessions()
+            }
+          }
+        }
+      }
+
+      // --- the keys have a page of their own, drawn as the keys they are ----------
+      //
+      // They used to be the last section on Appearance, behind a footer icon that opened a popover:
+      // two ways to reach a list nobody could find, and a page about colours ending in a list of
+      // keystrokes. The rail entry is the fix for finding it. The caps are the fix for reading it —
+      // a row of words like "Ctrl Enter" does not say which parts are keys.
+      if (want('help-keys', 'the shortcuts are a settings page, and each one is drawn as key caps')) {
+        // Opened by the rail, the way a person reaches it, and only then read: the rail is not in
+        // the document while settings is closed, and a check that counted entries then would be
+        // counting nothing.
+        openSettings('appearance')
+        await new Promise((r) => setTimeout(r, 240))
+        const rail = [...document.querySelectorAll('.set-rail [data-set-tab]')] as HTMLElement[]
+        const help = rail.find((b) => (b.textContent ?? '').trim() === 'Help')
+        if (!help)
+          fail(`the settings rail offers ${rail.map((b) => (b.textContent ?? '').trim()).join(', ')}; there is no Help entry`)
+        else {
+          help.click()
+          await new Promise((r) => setTimeout(r, 240))
+          const sect = document.querySelector('.set-body [data-set-section="shortcuts"]')
+          if (!sect) fail('the Help page has no shortcuts section')
+          else {
+            const rows = [...sect.querySelectorAll('[data-shortcut]')]
+            if (rows.length < 8)
+              fail(`the Help page lists ${rows.length} shortcuts; the sheet held more than that before it moved`)
+            const caps = [...sect.querySelectorAll('[data-kbd]')]
+            if (caps.length < rows.length)
+              fail(`${caps.length} key caps for ${rows.length} shortcuts: a shortcut with no caps is a sentence, not a control`)
+            const cs = caps.length ? getComputedStyle(caps[0]) : null
+            if (cs && cs.borderTopWidth === '0px' && /rgba\(0, 0, 0, 0\)|transparent/.test(cs.backgroundColor))
+              fail('the caps are plain text: no edge and no fill, so the row reads as prose')
+            if (cs && parseFloat(cs.fontSize) > 13)
+              fail(`a key cap is set at ${cs.fontSize}; caps are a label, not body text`)
+            // The claim that made this a page: the keys are not on Appearance any more.
+            openSettings('appearance')
+            await new Promise((r) => setTimeout(r, 220))
+            if (document.querySelector('.set-body [data-shortcut]'))
+              fail('the Appearance page still carries the shortcut rows')
+            // And every older name for them still lands here, including the one that used to
+            // open the popover from the footer.
+            const landed: string[] = []
+            for (const name of ['keys', 'shortcuts', 'help']) {
+              openSettings(name)
+              await new Promise((r) => setTimeout(r, 140))
+              const page = document.querySelector('.set-body')?.getAttribute('data-set-page')
+              if (page !== 'help') fail(`openSettings('${name}') landed on ${page}, want help`)
+              else landed.push(name)
+            }
+            pageLog(`help page ok (${rows.length} shortcuts drawn with ${caps.length} key caps; ${landed.join(', ')} all land there)`)
+          }
+        }
+        closeSettings()
+      }
+
+      // --- settings opens where the eye already is -------------------------------
+      //
+      // The report was "opening settings opens it in the bottom right corner, not centered". Both
+      // halves of the old rule were true on their own — `left:50%; top:50%; translate(-50%,-50%)`
+      // centres a panel, and `cwoffee-pop` animates `transform` — but an animation owns the property
+      // it animates, so for the length of the entrance the centring did not exist. A check measured
+      // after the animation would have passed on the broken code, so this one measures during it.
+      if (want('settings-centred', 'settings opens in the middle of the window, not the bottom-right corner')) {
+        closeSettings()
+        await new Promise((r) => setTimeout(r, 80))
+        openSettings('appearance')
+        await new Promise((r) => setTimeout(r, 60))
+        const el = document.querySelector('.settings') as HTMLElement | null
+        if (!el) fail('settings did not open')
+        else {
+          const r = el.getBoundingClientRect()
+          const dx = Math.abs(r.left + r.width / 2 - window.innerWidth / 2)
+          const dy = Math.abs(r.top + r.height / 2 - window.innerHeight / 2)
+          if (dx > 12 || dy > 12)
+            fail(
+              `60ms into opening, the panel is ${dx.toFixed(0)}px across and ${dy.toFixed(0)}px down from the ` +
+                `middle of the window (its corner sits at ${Math.round(r.left)},${Math.round(r.top)} of ` +
+                `${window.innerWidth}x${window.innerHeight}) — that is the entrance animation owning the ` +
+                `transform that used to do the centring`,
+            )
+          if (r.left < 0 || r.top < 0 || r.right > window.innerWidth + 1 || r.bottom > window.innerHeight + 1)
+            fail(`the panel does not fit the window: ${Math.round(r.width)}x${Math.round(r.height)} in ${window.innerWidth}x${window.innerHeight}`)
+          pageLog(
+            `settings placement ok (centred ${Math.round(r.width)}x${Math.round(r.height)} in ` +
+              `${window.innerWidth}x${window.innerHeight}, 60ms into the entrance)`,
+          )
+        }
+        closeSettings()
+      }
+
+      // --- a setting's sentence and its control are one row ----------------------
+      //
+      // The default thinking effort was stacked: the dial on one line, the sentence explaining it
+      // under it. Reading it and clicking it were two places, and on a tall page that meant the
+      // pointer travelled between an explanation and a control it described. Every other row on
+      // that screen already puts the words left and the control right, flush with the panel edge.
+      if (want('settings-rows', 'a setting explains itself on the same line as the control it explains')) {
+        openSettings('models')
+        await new Promise((r) => setTimeout(r, 500))
+        const row = document.querySelector('[data-reasoning-default]') as HTMLElement | null
+        if (!row) fail('the default thinking effort is not laid out as a settings row')
+        else {
+          const label = row.querySelector('[data-reasoning-label]')
+          const dial = row.querySelector('.segmented, [role="radiogroup"], .srow-c > *') as HTMLElement | null
+          const head = row.querySelector('.srow-t')
+          if (!label && !head) fail('the row has no label to line the dial up with')
+          const ctl = (dial ?? row.querySelector('.srow-c')) as HTMLElement | null
+          if (!ctl) fail('the row has no control on it')
+          else if (head) {
+            const t = head.getBoundingClientRect()
+            const c = ctl.getBoundingClientRect()
+            // Same line: the control's middle falls inside the label block's line box, not below it.
+            if (c.bottom < t.top || c.top > t.bottom + 40)
+              fail(`the dial is ${Math.round(c.top - t.bottom)}px below the sentence it belongs to — they are stacked again`)
+            // ...and it is on the right, flush with the row's own edge.
+            const rw = row.getBoundingClientRect()
+            if (rw.right - c.right > 8) fail(`the dial is ${Math.round(rw.right - c.right)}px short of the row's edge`)
+            if (c.left < t.right - 2) fail('the dial overlaps the sentence it is meant to sit beside')
+            pageLog(
+              `settings row ok ("${(head.textContent ?? '').trim()}" and the dial share one line, ` +
+                `the dial flush at the row's right edge)`,
+            )
+          }
+        }
+        closeSettings()
+      }
+
+      // --- the telemetry panel answers two questions, and stops ------------------
+      //
+      // It used to hold ten readouts, a frame ledger and a GPU line. Two of them were questions a
+      // person could act on: how fast this endpoint answers, and how fast it reads. The rest were
+      // a second, noisier answer to the same two questions, or diagnostics for this app's own bugs
+      // — and the board still reads them in the log, which is where someone hunting them is.
+      if (want('telemetry-pair', 'the telemetry panel answers two rates and stops')) {
+        const btnM = document.querySelector('button[aria-label="Session telemetry"]')
+        if (!btnM) fail('the sidebar footer has no telemetry button')
+        else {
+          ;(btnM as HTMLElement).click()
+          await new Promise((r) => setTimeout(r, 260))
+          const cells = [...document.querySelectorAll('.mgrid-two .mcell')]
+          const panel = (document.querySelector('.mgrid-two')?.closest('.pop') ?? document.body) as HTMLElement
+          const text = (panel.textContent ?? '').replace(/\s+/g, ' ')
+          window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+          if (cells.length !== 2)
+            fail(
+              `the panel shows ${cells.length} readouts. Two answer questions a person can act on — how fast ` +
+                'this endpoint answers, how fast it reads what you sent — and the rest were the same two ' +
+                'questions asked noisily, or this window’s own diagnostics',
+            )
+          else {
+            const labels = cells.map((c) => (c.querySelector('span')?.textContent ?? '').trim())
+            if (!labels.some((l) => /decode\/s session avg/.test(l)))
+              fail(`the panel's readouts are ${JSON.stringify(labels)}; the answer rate is missing`)
+            if (!labels.some((l) => /prefill\/s session avg/.test(l)))
+              fail(`the panel's readouts are ${JSON.stringify(labels)}; the reading rate is missing`)
+            if (/\bthis turn\b/i.test(text))
+              fail('the panel carries a per-turn figure beside the session averages again')
+            // A number with no stated window is a guess. The panel has to say what it averaged.
+            if (!/averaged over this conversation/i.test(text))
+              fail('the panel does not say on its own face what its averages are taken over')
+            // The per-turn numbers are still recorded — they are just not on the screen. The page
+            // log is where the board reads them, so the claim has to be that they exist there.
+            pageLog('telemetry panel ok (two session averages, and it says what they average)')
+          }
+        }
+      }
+
+      // --- the theme control turns; it does not swap ----------------------------
+      //
+      // "The icon snaps" was not a taste complaint: with `{#if}` the old glyph left the DOM and the
+      // new one arrived at full opacity in the same frame, so there was nothing to animate. Both
+      // faces have to be in the page for the swap to be a turn, and the turn has to be a property
+      // the browser can actually run — which is also why reduced motion is checked rather than
+      // assumed.
+      if (want('theme-icon', 'the theme button shows both faces and turns between them')) {
+        const btn = document.querySelector('button.thm')
+        if (!btn) fail('the sidebar footer has no theme button')
+        else {
+          const sun = btn.querySelector('.thm-sun')
+          const moon = btn.querySelector('.thm-moon')
+          if (!sun || !moon)
+            fail('the theme button holds one glyph: a glyph that leaves the DOM cannot be animated into its replacement')
+          else {
+            const root = document.documentElement
+            const was = root.getAttribute('data-theme')
+            const lit = (el: Element) => parseFloat(getComputedStyle(el).opacity) > 0.5
+            const before = [lit(sun), lit(moon)]
+            if (before[0] === before[1])
+              fail(`which face is showing is not a state (sun ${before[0]}, moon ${before[1]})`)
+            // Which face is lit is a claim about a transition having run, and a transition runs on
+            // the frame clock: an occluded window gets no frames, so the glyphs sit at the opacity
+            // they started at no matter how the CSS is written. The base state above is asserted
+            // either way, because that is a style, not a motion.
+            const noPaints = unpainted()
+            ;(btn as HTMLElement).click()
+            await new Promise((r) => setTimeout(r, 450))
+            if (root.getAttribute('data-theme') === was)
+              fail('pressing the theme button did not change the theme at all')
+            const after = [lit(sun), lit(moon)]
+            if (!noPaints && (after[0] === before[0] || after[1] === before[1]))
+              fail('pressing the theme button did not change which face is lit')
+            const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+            const tp = getComputedStyle(moon).transitionProperty
+            if (!noPaints && !reduced && tp !== 'all' && !/opacity|transform/.test(tp))
+              fail(`the incoming glyph has transition-property "${tp}"; the swap is meant to be a turn, not a cut`)
+            ;(btn as HTMLElement).click()
+            await new Promise((r) => setTimeout(r, 450))
+            if (!noPaints) {
+              const back = [lit(sun), lit(moon)]
+              if (back[0] !== before[0] || back[1] !== before[1]) fail('the theme did not go back when pressed again')
+            }
+            if (root.getAttribute('data-theme') !== was)
+              fail(`the theme attribute ended on ${root.getAttribute('data-theme')}, not ${was}`)
+            if (noPaints)
+              pageLog(
+                `selftest note: the theme icon's swap was not measured (both faces and the state flip were); ${noPaints}`,
+              )
+            else
+              pageLog(
+                `theme icon ok (both faces in the page, one lit per theme${reduced ? ', motion reduced so the turn itself is not asserted' : ', and the swap is a transition'})`,
+              )
+          }
+        }
+      }
+
+      // --- the About page: what build, which engine, where the files are ------------
+      //
+      // This page exists because filing a bug report meant describing an install from memory. Every
+      // value in it comes from the thing that knows it — the core is asked of the running host, the
+      // record's path is asked of the store — so the check below asks for the same facts over the wire
+      // and compares. A page that prints a plausible path is worse than no page: a plausible path is
+      // what someone pastes into a report.
+      if (want('about-page', 'the About page names the build, the engine and the files, and never a token')) {
+        const until = async (fn: () => boolean, ms: number) => {
+          const end = performance.now() + ms
+          while (performance.now() < end) {
+            if (fn()) return true
+            await new Promise((r) => setTimeout(r, 60))
+          }
+          return false
+        }
+        const raw = await invoke<Record<string, unknown>>('about')
+        const flat = JSON.stringify(raw)
+        if (/token/i.test(flat))
+          fail('the About payload carries something token-shaped: this page gets photographed')
+        // The rail only exists while settings is open — a check written against a closed screen
+        // measures an empty list and calls it a missing entry.
+        openSettings('about')
+        if (!(await until(() => !!document.querySelector('.set-rail button'), 4000)))
+          fail('the settings rail is still empty after openSettings("about")')
+        const rail = [...document.querySelectorAll('.set-rail button')].map((b) => (b.textContent ?? '').trim())
+        if (!rail.includes('About'))
+          fail(`the settings rail has no About entry (it lists: ${rail.join(', ')})`)
+        if (!(await until(() => !!document.querySelector('[data-set-section="info"]'), 4000))) {
+          fail('openSettings("about") does not land on the About page')
+        } else {
+          const body = document.querySelector('.set-body')
+          if (body?.getAttribute('data-set-page') !== 'about')
+            fail(`the About rail entry landed on page "${body?.getAttribute('data-set-page')}"`)
+          const rows = [...document.querySelectorAll('[data-about]')]
+          const seen = rows.map((r) => (r.textContent ?? '').trim())
+          for (const need of ['Answering engine', 'Model', 'Endpoint', 'Version', 'Build'])
+            if (!seen.some((t) => t.includes(need)))
+              fail(`the About page has no "${need}" row (${seen.length} rows: ${seen.slice(0, 6).join(' / ')})`)
+          const coreRow = rows.find((r) => (r.textContent ?? '').includes('Answering engine')) ?? null
+          const coreText = coreRow?.textContent ?? ''
+          if (!/\b(rust|pi)\b/.test(coreText))
+            fail(`the About page cannot say which engine is answering: "${coreText}"`)
+          if (String(raw.core) !== 'rust' && String(raw.core) !== 'pi')
+            fail(`the host called its own core "${String(raw.core)}"`)
+          // The two views of one fact: what the page shows and what the host answers when asked
+          // directly. They are the same call, so this is only worth asserting because a page could
+          // have been written against a config file instead of the running process.
+          const status = await invoke<{ chosen?: string; chosen_base_url?: string }>('provider_status')
+          const epRow = rows.find((r) => (r.textContent ?? '').includes('Endpoint'))
+          if ((epRow?.textContent ?? '').indexOf(String(status.chosen_base_url ?? '')) < 0)
+            fail(
+              `the Endpoint row does not name where this app actually answers (${status.chosen_base_url}): ` +
+                `"${(epRow?.textContent ?? '').slice(0, 90)}"`,
+            )
+          const recRow = rows.find((r) => (r.textContent ?? '').includes('Record (SQLite)'))
+          if (!(recRow?.textContent ?? '').trim())
+            fail('the About page names no record file: the page exists to answer "where is my history?"')
+          // `#paths` is a name the app promises lands here, not a page someone has to find by label.
+          openSettings('paths')
+          if (
+            document.querySelector('.set-body')?.getAttribute('data-set-page') !== 'about' ||
+            !document.querySelector('[data-set-section="files"]')
+          )
+            fail('openSettings("paths") does not land on the About page\'s files section')
+          pageLog(
+            `about page ok (${rows.length} rows; core=${String(raw.core)}, ${rows.length} facts including ` +
+              `${String(raw.conversations)} conversations and ${String(raw.messages)} messages, and no token in sight)`,
+          )
+          closeSettings()
+        }
+      }
+
+      // --- first run: no endpoint invented, and a send that would go nowhere says so ---
+      //
+      // The app used to default to `http://127.0.0.1:8090/v1`. On the one machine in ten where
+      // something listens there, a fresh install appeared to work and answered from a model nobody
+      // had chosen; everywhere else it hung until timeout. Both outcomes are luck. So the default is
+      // now nothing, and this group pins the two things that have to be true afterwards: a bad
+      // address cannot be written at all, and a send with no model refuses *in words* instead of
+      // opening a conversation nothing can answer.
+      if (want('first-run', 'with no model chosen, saying so beats guessing a port')) {
+        const until = async (fn: () => boolean | Promise<boolean>, ms: number) => {
+          const end = performance.now() + ms
+          while (performance.now() < end) {
+            if (await fn()) return true
+            await new Promise((r) => setTimeout(r, 60))
+          }
+          return false
+        }
+        const before = await invoke<{ chosen_base_url?: string; chosen?: string; kind?: string }>('provider_status')
+        let refused = ''
+        for (const bad of ['not a url at all', 'http://', '127.0.0.1:8080/v1']) {
+          try {
+            await invoke('provider_set_primary', { base_url: bad, api_key: null, kind: 'openai' })
+            fail(`"${bad}" was accepted as an endpoint address`)
+          } catch (e) {
+            refused = cleanErr(e)
+          }
+        }
+        if (!/not a usable address|names no host/.test(refused))
+          fail(`a nonsense endpoint was refused for the wrong reason: "${refused}"`)
+        const after = await invoke<{ chosen_base_url?: string; chosen?: string }>('provider_status')
+        if (after.chosen_base_url !== before.chosen_base_url || after.chosen !== before.chosen)
+          fail(
+            `refusing a bad endpoint still moved the app: ${before.chosen_base_url}/${before.chosen} -> ` +
+              `${after.chosen_base_url}/${after.chosen}`,
+          )
+
+        // Now take the model away and try to send. Both halves of "what answers" have to be empty:
+        // the host's state and the composer's own copy of the name.
+        const wasView = viewId
+        newSession()
+        hostState = null
+        model = ''
+        if (modelReady) fail('the composer still claims a model is ready with no host state and no name')
+        // The label is a render, and a render is a frame away: read it once it has landed rather
+        // than reading whatever was on screen when the state changed.
+        await until(() => (document.querySelector('button[data-model-chip]')?.textContent ?? '').includes('no model'), 2500)
+        const chip = document.querySelector('button[data-model-chip]')
+        if (!(chip?.textContent ?? '').includes('no model'))
+          fail(`the model chip does not say there is no model: "${(chip?.textContent ?? '').trim()}"`)
+        if (!chip?.classList.contains('need'))
+          fail('the chip says "no model" without marking itself: a quiet state still has to be findable')
+        const rowsBefore = (await invoke<Session[]>('list_sessions')).length
+        draft = 'Selftest wipe check: reply with the single word ok.'
+        await send()
+        await new Promise((r) => setTimeout(r, 250))
+        const rowsAfter = (await invoke<Session[]>('list_sessions')).length
+        if (rowsAfter !== rowsBefore)
+          fail(`sending with no model created a conversation anyway (${rowsBefore} -> ${rowsAfter} rows in the sidebar)`)
+        if (viewId !== null) fail(`sending with no model opened session ${viewId} and left it there`)
+        if (!(draft || '').includes('Selftest wipe check'))
+          fail('the refusal threw away what had been typed; the words are the person\'s, not the app\'s')
+        if (!setupOpen) fail('the refusal said nothing about how to fix itself: no setup flow was offered')
+        else {
+          const why = document.querySelector('[data-setup-why]')?.textContent ?? ''
+          if (!/no endpoint and no model|no model to answer with/i.test(why))
+            fail(`the setup flow does not say what is missing: "${why.slice(0, 110)}"`)
+          const saveBtn = document.querySelector('[data-setup-save]') as HTMLButtonElement | null
+          if (!saveBtn) fail('the setup flow offers no way to save an endpoint')
+          else if (saveBtn.disabled !== !pvUrl.trim())
+            fail(
+              `the Save endpoint button's state does not follow the address field ` +
+                `(disabled=${saveBtn.disabled}, address=${JSON.stringify(pvUrl.trim())}) — an install with ` +
+                'nothing configured must not be asked to save a blank',
+            )
+          if (!document.querySelector('[data-setup-probe]'))
+            fail('the setup flow offers no way to ask an endpoint what models it has')
+
+          // And the two steps complete: an address typed into the setup is written where the config
+          // loader reads it, the step then asks for a model, and picking one leaves a chip that says a
+          // model is chosen. A scripted run also names its endpoint through the environment, so what
+          // this proves is the write, the reload and the steps — not that a second server took the
+          // turns over. It saves the endpoint this run is already answering from, so nothing after it
+          // is chasing a different server.
+          const mockUrl = before.chosen_base_url ?? ''
+          if (!mockUrl) {
+            pageLog('selftest note: this run names no endpoint, so the setup flow was not carried through')
+          } else {
+            pvUrl = mockUrl
+            pvKind = before.kind ?? 'llama.cpp'
+            ;(document.querySelector('[data-setup-save]') as HTMLButtonElement | null)?.click()
+            if (!(await until(() => setupStep === 'model', 20000)))
+              fail(`saving an endpoint did not move the setup on to picking a model: ${setupMsg || pvMsg}`)
+            if (!(await until(() => !!document.querySelector('[data-setup-model]'), 20000)))
+              fail('the setup asks for a model and then shows no model to pick')
+            ;(document.querySelector('[data-setup-model]') as HTMLButtonElement).click()
+            if (!(await until(() => !setupOpen && modelReady, 20000)))
+              fail('picking a model left the setup open, or the app still says no model is chosen')
+            const after = await invoke<{ chosen_base_url?: string }>('provider_status')
+            if ((after.chosen_base_url ?? '') !== mockUrl)
+              fail(
+                'the setup wrote the endpoint where the config loader does not read it: ' +
+                  `${JSON.stringify(after.chosen_base_url)} for ${JSON.stringify(mockUrl)}`,
+              )
+            draft = 'Selftest wipe check: reply with the single word ok.'
+            await send()
+            if (!(await settleTurn('the send after setup', 60000)))
+              fail('the first send after completing setup never came to rest')
+            const page = await invoke<{ messages: { role: string; content: string }[] }>('session_messages', {
+              id: viewId,
+              limit: 8,
+            })
+            const last = [...(page.messages ?? [])].reverse().find((m) => m.role === 'assistant')
+            if (!/\bok\b/i.test(last?.content ?? ''))
+              fail(
+                'a conversation set up through the first-run flow got no answer: ' +
+                  JSON.stringify((last?.content ?? '').slice(0, 60)),
+              )
+          }
+          closeSetup()
+        }
+        // Put the window back the way the rest of the suite expects it.
+        draft = ''
+        await refreshState()
+        if (!modelReady) fail('the composer thinks there is no model after the check restored the state')
+        if (wasView !== null) openSession(wasView)
+        pageLog(
+          `first run ok (three bad addresses refused, "${refused.slice(0, 46)}…"; a send with no model ` +
+            'opened nothing and said why; an address typed in lands where the config is read, and the ' +
+            'model picked from it answers)',
+        )
+      }
+
+      // --- the Web chip, the record and the mounted tools, held against each other -----
+      //
+      // A chip that says "this chat can reach the web" is a promise about four separate things: the
+      // row in SQLite, the host's state, the system prompt the model was given, and the tools the
+      // model process was actually mounted with. Every one of them is set by different code, which is
+      // exactly how such a promise comes apart. On the pi core the last one is checkable, because the
+      // bridge reports what it launched — and on the rust core, where chat mode does not exist, the
+      // honest claim is that the switch is refused and no chip appears to imply otherwise.
+      if (want('web-grant', 'the Web chip, the record and the mounted tools say one thing')) {
+        const until = async (fn: () => boolean | Promise<boolean>, ms: number) => {
+          const end = performance.now() + ms
+          while (performance.now() < end) {
+            if (await fn()) return true
+            await new Promise((r) => setTimeout(r, 80))
+          }
+          return false
+        }
+        const core = String((await invoke<Record<string, unknown>>('about')).core ?? '')
+        const original = personaNow
+        await setPersona('chat')
+        await refreshState()
+        const chat = personaNow === 'chat'
+        if (core === 'rust') {
+          if (chat)
+            fail('the rust core accepted chat mode: it has no chat prompt or tool policy, so it cannot mean it')
+          if (document.querySelector('button[data-web]'))
+            fail('a Web chip is offered on a core that has no chat mode to grant anything to')
+          pageLog('web switch ok (rust core: chat mode refused in words, and no chip pretending otherwise)')
+          await setPersona('cowork')
+        } else if (!chat) {
+          fail(`the ${core} core would not switch to chat mode, so the Web switch cannot be checked`)
+        } else {
+          const chip = document.querySelector('button[data-web]')
+          if (!chip) fail('a chat conversation offers no Web switch')
+          else {
+            if ((chip as HTMLElement).getAttribute('aria-pressed') !== 'false')
+              fail('a new chat starts with the Web switch on: a chat starts with no tools at all')
+            const tips = () => [...document.querySelectorAll('[data-tip]')].map((t) => (t.textContent ?? '').trim())
+            if (tips().some((t) => /look it up/i.test(t)))
+              fail('the greeting offers to look something up in a chat that has no way to reach the web')
+
+            // The chip is pressed while the conversation is still a draft, and the promise has to be
+            // kept by the send that creates the row — the row does not exist to be told yet.
+            ;(chip as HTMLElement).click()
+            if (!(await until(() => (document.querySelector('button[data-web]') as HTMLElement)?.getAttribute('aria-pressed') === 'true', 4000)))
+              fail('pressing the Web switch on a draft did not flip it')
+            const draftNote = document.querySelector('[data-web-note]')?.textContent ?? ''
+            if (!/web_search and web_fetch/.test(draftNote))
+              fail(`the app did not say what a draft's web switch promises: "${draftNote.slice(0, 90)}"`)
+            if (!tips().some((t) => /look it up/i.test(t)))
+              fail('the chat can reach the web and the greeting still offers nothing that uses it')
+
+            draft = 'Selftest wipe check: reply with the single word ok.'
+            await send()
+            const sid = viewId ?? -1
+            if (sid < 0) fail('the chat send did not open a saved conversation')
+            if (!(await settleTurn('the chat answer', 60000))) fail('the chat turn never came to rest')
+            let st = await invoke<HostState>('session_state')
+            if (st.web !== true)
+              fail(`the switch was on when the conversation was created; the record was written and the host says web=${String(st.web)}`)
+            const row1 = (await invoke<Session[]>('list_sessions')).find((x) => x.id === sid)
+            if (!row1?.web_on)
+              fail('the web switch was on before the first message, and the row it created does not say so')
+            // The child had to start in order to answer, and what it started with is the receipt for
+            // what the model was actually told.
+            if (st.web_tools && st.web_tools !== 'web_search, web_fetch')
+              fail(`the chip promised web_search and web_fetch and the model process was mounted with: ${st.web_tools}`)
+
+            // Take it back: the grant is a switch, not a ratchet.
+            ;(document.querySelector('button[data-web]') as HTMLElement).click()
+            if (!(await until(() => (document.querySelector('button[data-web]') as HTMLElement)?.getAttribute('aria-pressed') === 'false', 4000)))
+              fail('pressing the Web switch again did not take the grant back')
+            st = await invoke<HostState>('session_state')
+            if (st.web !== false) fail(`the chip is off and the host says web=${String(st.web)}`)
+            const row2 = (await invoke<Session[]>('list_sessions')).find((x) => x.id === sid)
+            if (row2?.web_on) fail('the chip and the host are off and the record still says the chat may search')
+            const back = document.querySelector('[data-web-note]')?.textContent ?? ''
+            if (!/no longer reach the web|web off/i.test(back))
+              fail(`taking the grant away was not said in words: "${back.slice(0, 90)}"`)
+            // And the model agrees: a chat with nothing granted gets nothing mounted.
+            draft = 'Selftest wipe check, asked with the switch back off: reply with the single word ok.'
+            await send()
+            if (!(await settleTurn('the switch-off answer', 90000))) fail('the switch-off chat turn never came to rest')
+            st = await invoke<HostState>('session_state')
+            if (st.web_tools && st.web_tools !== 'no tools at all')
+              fail(`the chip says this chat cannot reach the web and the model process was mounted with: ${st.web_tools}`)
+
+            // Mid-conversation, back on: the process that answered is gone, and the next one is
+            // mounted with the pair. This is the part a chip cannot fake.
+            ;(document.querySelector('button[data-web]') as HTMLElement).click()
+            if (!(await until(() => (document.querySelector('button[data-web]') as HTMLElement)?.getAttribute('aria-pressed') === 'true', 4000)))
+              fail('pressing the Web switch mid-conversation did not flip it')
+            draft = 'Selftest wipe check, asked again after the switch: reply with the single word ok.'
+            await send()
+            if (!(await settleTurn('the second chat answer', 90000))) fail('the second chat turn never came to rest')
+            // Mid-conversation, the model has to be able to use it: the process it was talking to is
+            // gone, and the next one is mounted with the pair.
+            draft = 'Selftest wipe check, asked again after the switch: reply with the single word ok.'
+            await send()
+            if (!(await settleTurn('the second chat answer', 90000))) fail('the second chat turn never came to rest')
+            st = await invoke<HostState>('session_state')
+            if (st.web_tools && st.web_tools !== 'web_search, web_fetch')
+              fail(
+                `the chip says this chat can reach the web and the model process was mounted with: ` +
+                  `${st.web_tools}`,
+              )
+            if (st.web !== true) fail(`the process remounted and lost the grant: web=${String(st.web)}`)
+
+            // Refused while a turn is running: the tools a turn started with are the tools it has.
+            draft = 'Count out loud from one to fifteen'
+            await send()
+            if (!(await until(() => busy, 8000))) fail('the long chat turn never started')
+            webNote = ''
+            await toggleWeb()
+            if (!/turn is running/i.test(webNote))
+              fail(`flipping the switch mid-turn was accepted: "${webNote.slice(0, 90)}"`)
+            st = await invoke<HostState>('session_state')
+            if (st.web !== true) fail('a refused switch still took the grant away')
+            if (!(await settleTurn('the long answer', 120000))) fail('the long chat answer never came to rest')
+
+            // And the grant belongs to the conversation, not the window: leave it and come back.
+            const other = await invoke<number>('new_session', { title: 'web switch other' })
+            await invoke('set_session_persona', { id: other, persona: 'chat' }).catch((e) =>
+              pageLog(`set_session_persona (web selftest): ${e}`),
+            )
+            sessions = await invoke<Session[]>('list_sessions').catch(() => sessions)
+            openSession(other)
+            await new Promise((r) => setTimeout(r, 300))
+            await refreshState()
+            const away = document.querySelector('button[data-web]')
+            if (away && (away as HTMLElement).getAttribute('aria-pressed') !== 'false')
+              fail('a brand new chat inherits the web grant from the chat you left')
+            const awayRow = sessions.find((x) => x.id === other)
+            if (awayRow?.web_on)
+              fail(
+                `the new chat ${other} carries web_on in the record although its switch was never touched ` +
+                  `(persona ${awayRow.persona ?? 'unset'}): the grant belongs to one conversation`,
+              )
+            openSession(sid)
+            if (!(await until(() => (document.querySelector('button[data-web]') as HTMLElement)?.getAttribute('aria-pressed') === 'true', 5000)))
+              fail(
+                'opening the chat again lost its web grant: the record has it, the sidebar shows it, ' +
+                  'so the model process has to be mounted with it too',
+              )
+            pageLog(
+              `web grant ok (a draft's switch is kept by the send that creates its row; on and off both ` +
+                `write row + host + process — last mount said ${JSON.stringify(st.web_tools || 'not stated')}; ` +
+                'a mid-turn flip is refused; and the grant comes back with the conversation)',
+            )
+          }
+          // A group that ends in Chat mode leaves every later check about the workspace sidebar
+          // reading a sidebar that is deliberately a flat list of chats, and they report a grouping
+          // bug that isn't one. A group which changes the world puts it back, passed or not.
+          await setPersona(original).catch((e) => pageLog(`set_persona back: ${e}`))
+          await refreshState()
+        }
+      }
+
       // --- only the attachments folder gets a "save it where I like" control -----
       //
       // The report this pins: a turn's strip was full of files, any of which could be
@@ -12978,7 +14456,13 @@
       // session is inside a folder group, the folder the host is in is one of
       // them, and the `+` on a row preselects that folder without creating a
       // session row - sessions come into existence on the first message.
-      {
+      //
+      // The claim belongs to the persona that draws a folder tree. In Chat persona the sidebar is
+      // deliberately a flat list of chats with no folders in it, so running these claims there
+      // measures a thing that does not exist and calls its absence a bug.
+      if (personaNow === 'chat')
+        pageLog('selftest note: the workspace-sidebar invariant was not claimed - this persona draws a flat chat list, not a folder tree')
+      if (personaNow !== 'chat') {
         await loadWorkspaces()
         const groups = wsGroups
         if (!groups.length) fail('the sidebar has no workspace groups')
@@ -12986,8 +14470,13 @@
         // Bare drafts are deliberately not in the sidebar, so the invariant is
         // "every session that the sidebar chooses to show is in a group". Comparing
         // against the full list made this fail whenever another check had left a
-        // draft behind, which read as a grouping bug.
-        const shown = sessions.filter((s) => !isBareDraft(s)).length
+        // draft behind, which read as a grouping bug. Chat conversations are out of the
+        // count for the same reason they are out of the tree: a chat owns no folder, so it
+        // lives in the flat Chats list and has no bucket to be missing from.
+        const shown = sessions.filter((s) => !isBareDraft(s) && !isChat(s)).length
+        const chats = sessions.filter((s) => isChat(s)).length
+        if (chats)
+          pageLog(`selftest note: ${chats} chat row(s) excluded from the grouping count — chats own no folder by design`)
         if (inside !== shown)
           fail(`grouping holds ${inside} of ${shown} sessions the sidebar shows (${sessions.length} rows total)`)
         const cur = hostState?.workspace ?? ''
@@ -13347,6 +14836,17 @@
         clearPick()
         return
       }
+      // The picture view is the outermost layer on the screen: it covers the transcript, the
+      // composer and the sidebar, so it is the first thing Escape should give back.
+      if (picView) {
+        picView = null
+        return
+      }
+      // The setup flow covers the whole window including settings, so it unwinds before them.
+      if (setupOpen) {
+        closeSetup()
+        return
+      }
       if (menu || settings) {
         closeMenu()
         closeSettings()
@@ -13587,6 +15087,41 @@
           transcript?.showError(String(e))
         }
       }
+      // Change one of your own messages. The transcript asks and the host answers, because only the
+      // host can cut a conversation in half: the record, the model's memory of it, and the re-send
+      // all have to move together, and they move in that order (`cwoffee_engine::edit`).
+      //
+      // A change that worked repaints the conversation from the record instead of patching what is
+      // on screen. Patching is where a transcript starts disagreeing with the store: the message the
+      // host dropped and re-created has a new row under it, and an edit addressed to the old one is
+      // a bug waiting for the next click. `apply_and_send` waits for the re-send's row to exist
+      // before answering, which is what makes this reload safe — otherwise the page would repaint a
+      // conversation still missing the message it was just promised, and the answer would stream in
+      // under no question at all.
+      transcript.onMessageEdit = async (e) => {
+        const session = transcript?.sessionId ?? 0
+        if (!session) throw new Error('that conversation is not saved yet, so there is nothing to change')
+        const out = await invoke<{ note: string; dropped: number; resending: boolean; visible: boolean }>(
+          'edit_message',
+          {
+            session,
+            message_id: e.id,
+            from_end: e.fromEnd,
+            shown: e.shown,
+            next: e.next,
+            resend: e.resend,
+          },
+        )
+        // The sidebar previews and a conversation's title can both move: a dropped stretch took the
+        // row it was cut from, and a re-send starts a fresh one.
+        void loadSessions()
+        await loadTranscript(session)
+        return out?.note ?? (e.resend ? 'that message is being sent again' : 'saved')
+      }
+
+      // An attachment chip in your own message: show the picture. See `openAttachment` for why the
+      // bytes are fetched rather than already here.
+      transcript.onAttachmentOpen = (v) => void openAttachment(v)
     }
     // Test seam: lets a browser harness drive the transcript without an engine.
     if (import.meta.env.DEV) (window as any).__cwoffeeTranscript = transcript
@@ -13620,22 +15155,12 @@
       loadModels(),
       loadWebSearch(),
     ]
-      if (transportKind === 'tauri') {
-        // gpu_report is desktop-only and always errors over the gateway, so asking
-        // for one there is a guaranteed-failed round trip in the middle of boot.
-        fetches.push(
-          invoke<GpuReport>('gpu_report')
-            .then((g) => {
-              gpu = g
-            })
-            .catch((e) => {
-              gpu = null
-              ipc = { ok: false, msg: String(e).slice(0, 140) }
-              pageLog(`gpu_report FAILED: ${String(e)}`)
-            }),
-        )
-      }
-      await Promise.all(fetches)
+    // Nothing desktop-only is fetched at boot any more. The telemetry panel used to end with a host
+    // line naming this window's GPU nodes, and `gpu_report` was asked for here only to fill it; the
+    // app's own boot line prints the same report, which is where a person chasing a driver problem
+    // reads it. Asking over IPC for a number that has nowhere honest to be displayed was a round
+    // trip - and a guaranteed failure for a gateway client.
+    await Promise.all(fetches)
       // Open the host's current session rather than a blank draft. On a phone this
       // was the whole "it's using its own session" impression: the list was there
       // but the transcript was the empty screen.
@@ -13726,18 +15251,12 @@
       void send()
     }
   }
-
-  // Guarded field by field on purpose. One missing key in a telemetry struct must
-  // not take down the whole render: a gateway gpu_report stub that returned
-  // `{note: ...}` threw here and blanked the app before it could load a session.
-  const gpuNodes = $derived(gpu?.render_nodes ?? [])
-  const gpuOk = $derived(!!gpu && gpuNodes.includes('renderD128') && !gpu.leaked_nvidia)
 </script>
 
 <div class="app-shell flex h-full flex-col bg-paper text-ink" class:modal-open={settings !== null} bind:this={shellEl}>
   <!-- ============================ titlebar ============================ -->
   <div
-    class="titlebar flex h-11 shrink-0 items-center gap-2 border-b border-hairline bg-paper-2 px-3"
+    class="titlebar flex h-11 shrink-0 items-center gap-2 bg-paper-2 px-3"
     data-tauri-drag-region
   >
     <!-- Sidebar toggle first. Below 768px the sidebar is a drawer, and without this
@@ -13799,15 +15318,20 @@
       tabindex={sidebarOpen ? 0 : -1}
     ></button>
     <aside
-      class="sidebar w-[248px] shrink-0 flex-col gap-1.5 border-r border-hairline p-2.5 min-h-0"
+      class="sidebar w-[248px] shrink-0 flex-col gap-1.5 p-2.5 min-h-0"
       class:open={sidebarOpen}
       class:animating={sidebarAnimating}
       style="background: linear-gradient(160deg, var(--color-wash-1), var(--color-wash-2) 55%, var(--color-wash-3));"
     >
-      <!-- A tab strip, not a headline button. It is not wired to anything yet:
-           Chat mode does not exist, and a control that lies about what the app can
-           do is worse than one that is missing. New session keeps a key on the
-           shortcut, a `+` here, and the `+` on each workspace row. -->
+      <!-- A tab strip, not a headline button. New session keeps a key on the shortcut, a `+`
+           here, and the `+` on each workspace row.
+
+           The two glyphs exist because the two words are not opposites. "Cowork" and "Chat" are both
+           short, both start with a hard consonant, and at 12px inside a 248px sidebar they read as
+           one word said twice - while the difference between them is the largest one in the app: a
+           coworker has tools, a folder and approval cards, a chat has none of those. A shape at the
+           head of each label is seen before the word is read, and it is also the part that survives
+           translating the labels. -->
       <div class="flex items-center gap-1.5">
         <div class="modegrid flex-1" class:chat={personaNow === 'chat'}>
           <button
@@ -13816,14 +15340,29 @@
             aria-selected={personaNow === 'cowork'}
             title="the coworker: tools, a workspace, and the approval cards that go with them"
             onclick={() => void setPersona('cowork')}
-          >Cowork</button>
+          >
+            <!-- Two people, one behind the other: a coworker is someone working alongside. The mark
+                 says "there is another party here, and it does things" without a tool belt. -->
+            <svg class="mode-ic" width="13" height="13" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M6 7.4a2.3 2.3 0 1 0 0-4.6 2.3 2.3 0 0 0 0 4.6M2.2 12.7c0-2.1 1.7-3.6 3.8-3.6s3.8 1.5 3.8 3.6M10.7 3.3a2 2 0 0 1 0 4M11.6 9.3c1.5.4 2.4 1.6 2.4 3.4" stroke="currentColor" stroke-width="1.25" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span>Cowork</span>
+          </button>
           <button
             class="modesel"
             role="tab"
             aria-selected={personaNow === 'chat'}
             title="nothing but the model: no tools, no folder, one line of system prompt"
             onclick={() => void setPersona('chat')}
-          >Chat</button>
+          >
+            <!-- A bubble with three dots: words exchanged, nothing acted on. Not the plain bubble the
+                 Conversation settings page wears - the dots are what say "just talking". -->
+            <svg class="mode-ic" width="13" height="13" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M2.6 4.4a1.5 1.5 0 0 1 1.5-1.5h7.8a1.5 1.5 0 0 1 1.5 1.5v4.9a1.5 1.5 0 0 1-1.5 1.5H6.9l-2.8 2.3v-2.3H4.1a1.5 1.5 0 0 1-1.5-1.5z" stroke="currentColor" stroke-width="1.25" fill="none" stroke-linejoin="round"/>
+              <path d="M5.5 6.85h.01M8 6.85h.01M10.5 6.85h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            </svg>
+            <span>Chat</span>
+          </button>
         </div>
         <button class="newbtn" title="New session (Ctrl+N)" aria-label="New session" onclick={newSession}>
           <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 2.6v8.8M2.6 7h8.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>
@@ -14000,8 +15539,6 @@
                   onblur={() => commitWsRename()}
                 />
               {:else}
-                <!-- The chevron is part of the label button: folding a folder is
-                     a navigation act and needs a target a thumb can hit. -->
                 <button
                   class="wsbtn"
                   aria-expanded={open}
@@ -14015,11 +15552,32 @@
                       {/if}
                     </span>
                   {/if}
-                  <svg class="ws-chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-                    <path d={open ? 'M2 3.5L5 6.5L8 3.5' : 'M3.5 2L6.5 5L3.5 8'} stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+                  <!-- The folder itself, at the head of the row, where a mark of ownership belongs.
+                       It is drawn as an outline with the same colour filling it faintly, because a
+                       flat two-pixel shape at 14px reads as a smudge of colour rather than as a
+                       coloured thing. Uncoloured rows keep the quiet ink: colour is a choice the
+                       person made about some folders, not decoration sprayed over all of them.
+
+                       The chevron used to sit here, at the left. It has moved to the right end of
+                       the label: a leading glyph should say what the row *is*, and the fold state of
+                       a folder is not what a folder is. It stays inside this button — folding a
+                       folder is a navigation act and needs a target a thumb can hit — pushed to the
+                       end of the run by `margin-left: auto`, so the whole label is still the target. -->
+                  <svg
+                    class="ws-folder"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 16 16"
+                    aria-hidden="true"
+                    style={g.color ? `color: ${g.color}` : undefined}
+                  >
+                    <path d="M2.3 4.8a1.3 1.3 0 0 1 1.3-1.3h3.1l1.35 1.7h4.55a1.3 1.3 0 0 1 1.3 1.3v5a1.3 1.3 0 0 1-1.3 1.3H3.6a1.3 1.3 0 0 1-1.3-1.3z" stroke="currentColor" stroke-width="1.2" fill="currentColor" fill-opacity="0.18" stroke-linejoin="round"/>
                   </svg>
                   <span class="ws-name" title={g.path}>{g.label}</span>
                   <span class="ws-n">{g.list.length}</span>
+                  <svg class="ws-chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+                    <path d={open ? 'M2 3.5L5 6.5L8 3.5' : 'M3.5 2L6.5 5L3.5 8'} stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+                  </svg>
                 </button>
                 {#if g.path}
                   <button
@@ -14146,21 +15704,30 @@
               {#if gwDot === 'live'}<span class="sfi-dot live" aria-hidden="true" title="{gwText}"></span>{/if}
             </button>
             <button
-              class="iconbtn sfi"
+              class="iconbtn sfi thm"
               aria-label="Toggle light or dark theme"
               title="Toggle light / dark"
               onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}
             >
-              {#if theme === 'dark'}
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <!-- Both glyphs are in the page, and which one is lit is a CSS state keyed off the
+                   theme. With `{#if}` there was nothing to animate: the old glyph left the DOM and
+                   the new one arrived at full opacity in the same frame, which is the "icon snaps"
+                   complaint. Two stacked spans let the swap be a *turn* — the outgoing glyph scales
+                   down and rotates away while the incoming one rotates in — which is also the right
+                   metaphor for a dial. Neither one is announced to a screen reader (the button
+                   already carries its name), and neither one is hit-testable, so a click cannot land
+                   on the hidden copy. -->
+              <span class="thm-ic thm-sun" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="12" cy="12" r="4.2" />
                   <path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6" />
                 </svg>
-              {:else}
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              </span>
+              <span class="thm-ic thm-moon" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M20 14.2A8.4 8.4 0 1 1 9.8 4a7 7 0 0 0 10.2 10.2z" />
                 </svg>
-              {/if}
+              </span>
             </button>
           </span>
         </div>
@@ -14168,7 +15735,7 @@
     </aside>
 
     <!-- main -->
-    <main class="flex min-w-0 flex-1 flex-col min-h-0" class:empty-mode={showEmpty}>
+    <main class="bg-pane flex min-w-0 flex-1 flex-col min-h-0" class:empty-mode={showEmpty}>
       {#if connNote}
         <!-- Rendered, not logged: a phone cannot open a console, and "no model"
              was sending people to fix a config file on the wrong machine. -->
@@ -14221,8 +15788,8 @@
             </button>
           {/if}
           <div class="tips" role="group" aria-label="Start with">
-            {#each TIPS as t}
-              <button class="tip" onclick={() => seedTip(t.text)}>{t.label}</button>
+            {#each TIPS_FOR as t}
+              <button class="tip" data-tip={t.label} onclick={() => seedTip(t.text)}>{t.label}</button>
             {/each}
           </div>
         </div>
@@ -14366,6 +15933,7 @@
                   </span>
                 {/each}
                 {#if attachErr}<span class="att-err">{attachErr}</span>{/if}
+                {#if attachWarn}<span class="att-warn">{attachWarn}</span>{/if}
               </div>
             {/if}
             <textarea
@@ -14405,15 +15973,52 @@
                 <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
               </button>
               {:else}
-              <!-- Nothing to approve where no tool can run. The tab says which mode this
-                   is; a control that could only ever be ignored would be decoration. -->
-              <span class="cbtn chip" data-approvals="none" title="Chat mode has no tools, so nothing needs approving">Chat</span>
+              <!-- A chat has nothing to approve, and that slot would otherwise be a label. What it
+                   carries instead is the one tool decision a chat does have: whether it may reach the
+                   web at all.
+
+                   It is a real switch rather than a badge because the grant changes what the model
+                   process is mounted with — `web_search` and `web_fetch`, or no tools at all — and it
+                   belongs to *this conversation*, in the record, so a phone watching the same rows
+                   reads the same truth. Mid-turn it refuses, because the tools a turn was given are
+                   the tools it has until it ends. -->
+              <button
+                class="cbtn chip web"
+                data-web
+                aria-pressed={webNow}
+                disabled={busy}
+                onclick={() => void toggleWeb()}
+                title={
+                  (busy
+                    ? 'This turn keeps the tools it started with — the switch waits for it to finish. '
+                    : webNow
+                      ? 'This chat can reach the web. Click to take web_search and web_fetch away.'
+                      : 'This chat has no tools at all. Click to give it web_search and web_fetch.') +
+                  (hostState?.web_tools ? ` · the model process was started with: ${hostState.web_tools}` : '') +
+                  ' · nothing needs approving in Chat mode'
+                }
+              >
+                <svg width="13" height="13" viewBox="0 0 14 14" class="mode-ic" aria-hidden="true">
+                  <circle cx="7" cy="7" r="5.4" fill="none" stroke="currentColor" stroke-width="1.2" />
+                  <path d="M1.8 7h10.4M7 1.8c-1.7 1.6-2.5 3.4-2.5 5.2s.8 3.6 2.5 5.2c1.7-1.6 2.5-3.4 2.5-5.2S8.7 3.4 7 1.8Z" fill="none" stroke="currentColor" stroke-width="1.2" />
+                </svg>
+                <span>Web</span>
+                <span class="web-state" aria-hidden="true">{webNow ? 'on' : 'off'}</span>
+              </button>
               {/if}
 
               <div class="ml-auto flex items-center gap-1">
-                <button class="cbtn chip" data-menu onclick={(e) => openMenu('model', e.currentTarget as HTMLElement)} aria-expanded={menu?.kind === 'model'}>
+                <button
+                  class="cbtn chip"
+                  class:need={!modelReady}
+                  data-menu
+                  data-model-chip
+                  onclick={(e) => openMenu('model', e.currentTarget as HTMLElement)}
+                  aria-expanded={menu?.kind === 'model'}
+                  title={modelReady ? 'Which model answers' : 'No model is chosen yet — click to add an endpoint and pick one'}
+                >
                   <svg width="13" height="13" viewBox="0 0 14 14"><path d="M7.8 1.6 3.4 7.6h2.6l-.8 4.8 4.4-6H7z" fill="currentColor"/></svg>
-                  <span class="chip-label">{shortModel(model)}</span>
+                  <span class="chip-label">{modelLabel}</span>
             {#if modelErr}<span class="chip-warn" title="Endpoint unreachable">!</span>{/if}
                   <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4 5 6.5 7.5 4" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
                 </button>
@@ -14432,7 +16037,13 @@
                   class="cbtn go {approval ? 'warn' : ''}"
                   onclick={() => (busy ? stopTurn() : send())}
                   disabled={!busy && !draft.trim()}
-                  title={busy ? 'Stop this turn' : approval ? 'Waiting on an approval above' : 'Send'}
+                  title={busy
+                    ? 'Stop this turn'
+                    : approval
+                      ? 'Waiting on an approval above'
+                      : modelReady
+                        ? 'Send'
+                        : 'No model is chosen yet — sending would open a conversation nothing can answer'}
                   aria-label={busy ? 'Stop' : 'Send'}
                 >
                   {#if busy}
@@ -14445,6 +16056,12 @@
             </div>
 
           </div>
+
+          {#if webNote}
+            <!-- Under the composer, next to the chip it explains: a sentence about a switch that
+                 vanishes from the corner of the screen is a sentence nobody re-reads. -->
+            <div class="ctl-note" data-web-note>{webNote}</div>
+          {/if}
 
           {#if personaNow === 'chat'}
             <!-- Not hidden, because the space where the folder used to be would otherwise
@@ -14536,13 +16153,24 @@
   {/snippet}
 
   {#snippet reasoningDefaultBody()}
-    <Segmented
-      aria="Default thinking effort"
-      value={thinkingDefault}
-      options={THINK_CHOICES}
-      onpick={(v) => void setThinking(v as ReasoningLevel, true)}
-    />
-    <p class="set-note">{thinkingDefaultNote}</p>
+    <!-- One row, two columns: the sentence that explains the setting on the left, the dial on the
+         right, flush with the panel edge like every other control on this screen. They used to be
+         stacked — dial on one line, description under it — which put the thing you read and the
+         thing you click on two different lines with the pointer's travel between them. -->
+    <div class="srow" data-reasoning-default>
+      <div>
+        <div class="srow-t" data-reasoning-label>Default thinking effort</div>
+        <div class="srow-h">{thinkingDefaultNote}</div>
+      </div>
+      <div class="srow-c">
+        <Segmented
+          aria="Default thinking effort"
+          value={thinkingDefault}
+          options={THINK_CHOICES}
+          onpick={(v) => void setThinking(v as ReasoningLevel, true)}
+        />
+      </div>
+    </div>
   {/snippet}
 
   {#snippet ceilingRow()}
@@ -14651,53 +16279,32 @@
       </span>
       <span class="mval mono">{cacheLabel}</span>
     </div>
-    <div class="mgrid">
+    <!-- Two numbers, and nothing else. This panel used to hold ten: a live decode rate, a
+         prefill rate "effective" and one "raw", time-to-first-token, the turn's wall clock,
+         the speculative-decode accept rate, prompt and completion counts, compactions, and
+         below them the window's own frame ledger and the host's GPU nodes.
+
+         Only two of those changed anything a person could act on. "How fast does this endpoint
+         answer, and how fast does it read what I sent" is the pair that explains a slow turn,
+         and both are session averages the server's own token counts produced — not a figure
+         this window derived from character arrivals. The per-turn numbers were a second,
+         noisier answer to the same two questions; the render and host lines were diagnostics
+         for this app's own bugs, and they are still in the log the board reads, where a person
+         hunting them is not the one hunting. -->
+    <div class="mgrid mgrid-two">
       <div class="mcell">
-        <b>{liveEstimate ? '\u2248 ' : ''}{fmt.rate(curDecode)}</b>
-        <span>decode/s now{liveEstimate ? ' · estimated' : ''}</span>
-      </div>
-      <div class="mcell"><b>{fmt.rate(avgDecode)}</b><span>decode/s session avg</span></div>
-      <div class="mcell"><b>{fmt.rate(curPrefill)}</b><span>prefill/s effective</span></div>
-      <div class="mcell"><b>{fmt.rate(avgPrefill)}</b><span>prefill/s raw avg</span></div>
-      <div class="mcell">
-        <b>{ttft || '\u2014'}<small>ms</small></b><span>first token</span>
-      </div>
-      <div class="mcell">
-        <b>{turnMs ? (turnMs / 1000).toFixed(1) : '\u2014'}<small>s</small></b><span>this turn</span>
-      </div>
-      <div class="mcell"><b>{fmt.pct(specPct)}</b><span>speculative accept</span></div>
-      <div class="mcell"><b>{lastUsage?.completion ?? 0}</b><span>tokens out</span></div>
-      <div class="mcell">
-        <b>{lastUsage?.prompt ?? promptTokens ?? 0}</b><span>tokens in (prompt)</span>
+        <b>{fmt.rate(avgDecode)}</b>
+        <span title="Mean decode rate over this conversation's recent turns (up to {ROLLING_TURNS}), from the token counts this endpoint reported when each turn ended.">decode/s session avg</span>
       </div>
       <div class="mcell">
-        <b>{hostState?.compactions ?? 0}</b>
-        <span title="history was dropped; the next prefill will be slow">compactions</span>
+        <b>{fmt.rate(avgPrefill)}</b>
+        <span title="Mean prefill rate over this conversation's recent turns (up to {ROLLING_TURNS}) — the server's own compute rate, not prompt tokens over time-to-first-token, which a warm cache makes meaningless.">prefill/s session avg</span>
       </div>
     </div>
-    <div class="mfoot">
-      <span class="mfoot-lbl">render</span>
-      <span class="mfoot-v mono">
-        {frames} frames · {dropped} dropped · worst {worstFrame.toFixed(0)}ms
-      </span>
-    </div>
-    {#if transportKind === 'tauri'}
-      <div class="mfoot">
-        <span class="mfoot-lbl">host</span>
-        <span class="mfoot-v mono">
-          ipc {ipc.ok ? 'ok' : ipc.msg} ·
-          {gpu
-            ? gpuOk
-              ? `iGPU ${gpuNodes.join(',')}`
-              : `GPU LEAK ${gpuNodes.join(',')}`
-            : 'gpu not reported'}
-        </span>
-      </div>
-    {/if}
     <p class="set-note">
-      Rates marked ≈ are estimated from characters: the server reports token counts only when a
-      turn ends. Context is measured against the window the endpoint states, which is a
-      measurement, not a reservation.
+      Both rates are the endpoint's own counts, averaged over this conversation's recent turns
+      (up to {ROLLING_TURNS}); a turn that has not ended yet has no count to add. Context is
+      measured against the window the endpoint states, which is a measurement, not a reservation.
     </p>
   {/snippet}
 
@@ -14927,10 +16534,25 @@
   {/snippet}
 
   {#snippet keysBody()}
-    {#each SHORTCUTS as sc (sc.keys)}
-      <div class="srow">
-        <div class="srow-t">{sc.label}</div>
-        <div class="srow-c mono nowrap">{sc.keys}</div>
+    <!-- One row per key: what it does on the left, the caps that do it on the right. The caps are
+         drawn as caps (a bordered box per key, arrows and return included) because that is the only
+         way the row answers "which characters here are keys" without a sentence. -->
+    {#each SHORTCUTS as sc (sc.label)}
+      <div class="srow" data-shortcut={sc.keys.join(' ')}>
+        <div>
+          <div class="srow-t" data-shortcut-label>{sc.label}</div>
+          {#if sc.hint}
+            <div class="srow-h">{sc.hint}</div>
+          {/if}
+        </div>
+        <div class="srow-c kbdrow" data-shortcut-keys>
+          {#each sc.keys as k, i}
+            {#if i > 0 && sc.sep}
+              <span class="kbd-sep">{sc.sep}</span>
+            {/if}
+            <kbd class="kbd {/^[↵↑↓←→\u21B5\u2190\u2191\u2192\u2193]$/.test(k) ? 'glyph' : ''}" data-kbd>{k}</kbd>
+          {/each}
+        </div>
       </div>
     {/each}
   {/snippet}
@@ -15100,6 +16722,42 @@
             <span class="pop-lbl">Rename</span>
             <span class="pop-sub">Changes the name in the list, never the folder</span>
           </button>
+          {@const wcolor = safeColor(wrow?.color)}
+          <div class="pop-item static pop-colors">
+            <span class="pop-lbl">Colour</span>
+            <span class="pop-sub">
+              {wcolor
+                ? `Tints this folder's mark ${wcolor}. Every window reading this list sees it.`
+                : "Tints this folder's mark, so same-shaped names come apart at a glance."}
+            </span>
+            <span class="swatchrow" role="group" aria-label={`Colour for ${wlabel}`}>
+              <button
+                class="swatch none {wcolor === '' ? 'on' : ''}"
+                data-ws-color=""
+                role="radio"
+                aria-checked={wcolor === ''}
+                aria-label="No colour"
+                title="No colour"
+                onclick={() => void setWsColor(wp, '')}
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4.2" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M3.2 8.8L8.8 3.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+              </button>
+              {#each WS_COLORS as c (c.hex)}
+                <button
+                  class="swatch {wcolor === c.hex ? 'on' : ''}"
+                  data-ws-color={c.hex}
+                  role="radio"
+                  aria-checked={wcolor === c.hex}
+                  aria-label={c.name}
+                  title={c.name}
+                  style={`--sw: ${c.hex}`}
+                  onclick={() => void setWsColor(wp, c.hex)}
+                >
+                  <svg class="sw-check" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.4 5.2L4.2 7L7.6 3.2" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/></svg>
+                </button>
+              {/each}
+            </span>
+          </div>
           {#if gatewayRole() !== 'watch'}
             {@const inside = wsInside[wp] ?? -1}
             <button
@@ -15151,9 +16809,6 @@
       {:else if menu.kind === 'search'}
         <div class="pop-title">Web search</div>
         {@render webBody()}
-      {:else if menu.kind === 'keys'}
-        <div class="pop-title">Keyboard</div>
-        {@render keysBody()}
       {:else}
         {@const sid = menu.sessionId ?? -1}
         <div class="pop-title">{titleOf(sid)}</div>
@@ -15193,6 +16848,134 @@
       bind:this={menuEl}
     >
       {@render body(menu)}
+    </div>
+  {/if}
+
+  {#if setupOpen}
+    <!--
+      First run, said as a step instead of as an empty transcript.
+
+      The app used to ship pointing at `http://127.0.0.1:8090/v1`, which made a first run look like a
+      success on any machine that happened to have llama.cpp on its default port, and like a hang on
+      every other one. Both are luck, and luck is not a setup story. So the default is now no endpoint
+      at all, and this is where the missing thing gets asked for: one address, one model, both written
+      to the same file the settings screen writes, through the same verbs the settings screen uses.
+
+      It reuses the Models screen's probe state (`pvUrl`, `pvKey`, `pvKind`, `probed`, `pvMsg`) rather
+      than keeping its own copy, so the two surfaces can never disagree about what was probed or what
+      the endpoint said.
+    -->
+    <div class="setup-scrim" role="presentation" onclick={closeSetup}></div>
+    <div class="setup" role="dialog" aria-modal="true" aria-labelledby="setup-title" data-setup>
+      <header class="setup-head">
+        <div>
+          <div class="setup-t" id="setup-title">Add a model</div>
+          <p class="setup-d" data-setup-why>
+            {setupWhy ||
+              'Cwoffee has no endpoint and no model chosen. It will not invent an address for you — a port is something you point it at, not something a program guesses.'}
+          </p>
+        </div>
+        <button
+          class="setup-x"
+          onclick={closeSetup}
+          aria-label="Close"
+          title="Close. Nothing will be answering yet; the composer will ask again the moment you try to send."
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+
+      <div class="setup-step">
+        <div class="setup-lab">1 · The address a turn is sent to</div>
+        <div class="setup-grid">
+          <Field label="Base URL" forId="cw-setup-url" hint="The server's root, usually ending in /v1. A local llama.cpp server is often http://127.0.0.1:8080/v1.">
+            <input
+              id="cw-setup-url"
+              class="sinp mono"
+              data-setup-url
+              bind:this={setupUrlEl}
+              bind:value={pvUrl}
+              placeholder="http://127.0.0.1:8080/v1"
+              spellcheck="false"
+              onkeydown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void saveSetupEndpoint()
+                }
+              }}
+            />
+          </Field>
+          <Field label="API compatibility" hint="Which dialect the server speaks.">
+            <Select id="cw-setup-kind" aria="API compatibility" value={pvKind} options={PROVIDER_KINDS} onpick={(v) => (pvKind = v)} />
+          </Field>
+          <Field label="API key" hint="Only if the endpoint asks for one. Left empty, whatever key is already stored stays stored.">
+            <input id="cw-setup-key" class="sinp mono" type="password" bind:value={pvKey} placeholder="optional" spellcheck="false" autocomplete="off" />
+          </Field>
+        </div>
+        <div class="setup-acts">
+          <button class="set-btn primary" data-setup-save onclick={() => void saveSetupEndpoint()} disabled={pvBusy || !pvUrl.trim()}>
+            Save endpoint
+          </button>
+          <button class="set-btn" data-setup-probe onclick={() => void probeProvider()} disabled={probing || !pvUrl.trim()}>
+            Probe its models
+          </button>
+        </div>
+        <p class="set-note">
+          Saving the endpoint is not the same as using it: an address with no model chosen still cannot
+          answer, which is why step 2 asks for one.
+        </p>
+      </div>
+
+      {#if probed.length}
+        <div class="setup-step" data-setup-models>
+          <div class="setup-lab">2 · Pick the model to answer with</div>
+          <div class="setup-models">
+            {#each probed.slice(0, 24) as m (m.id)}
+              <button class="setup-model" data-setup-model={m.id} onclick={() => void pickSetupModel(m.id)}>
+                <span class="setup-mid">{m.id}</span>
+                <span class="setup-mmeta">{capLabel(m).join(' · ')}</span>
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      {#if setupMsg || pvMsg}
+        <p class="setup-msg" class:bad={pvBad} data-setup-msg>{setupMsg || pvMsg}</p>
+      {/if}
+
+      <footer class="setup-foot">
+        <button
+          class="set-btn plain"
+          onclick={() => {
+            closeSetup()
+            openSettings('models')
+          }}
+        >
+          Everything else in Settings › Models
+        </button>
+        <button class="set-btn plain" onclick={closeSetup}>Not now</button>
+      </footer>
+    </div>
+  {/if}
+
+  {#if picView}
+    <!--
+      A picture from the conversation, at the size it was sent at.
+
+      This exists because an attachment chip that only ever says "clipboard-221045.png · 412 kB"
+      answers no question: the person looking at it wants to know *which* picture that was, and the
+      only honest way to say so is to show it. The payload arrives from the store for one row at a
+      time, which is why the transcript itself stays cheap to render.
+    -->
+    <div class="picview-scrim" role="presentation" onclick={() => (picView = null)}></div>
+    <div class="picview" role="dialog" aria-modal="true" aria-label={picView.name}>
+      <div class="picview-head">
+        <span class="picview-name">{picView.name}</span>
+        <span class="picview-size">{fmtBytes(picView.bytes)} · {picView.mime}</span>
+        <button class="picview-x" aria-label="Close" onclick={() => (picView = null)}>×</button>
+      </div>
+      <img class="picview-img" src={picView.url} alt={picView.name} />
     </div>
   {/if}
 
@@ -15910,13 +17693,86 @@
                 </div>
               </div>
             </Section>
-
+          {:else if settings.page === 'help'}
+            <!-- The keys used to be the last section on Appearance, where nobody looked for them and
+                 where a page about colours ended with a list of keystrokes. Its own rail entry is the
+                 fix for finding it; the row shape below is the fix for reading it. -->
             <Section
               id="shortcuts"
               title="Keyboard shortcuts"
-              desc="The keys this app answers. They are the same in the desktop window and in a browser attached to it."
+              desc="The keys this app answers. They are the same in the desktop window and in a browser attached to it. Anything typed into a text field is yours: these only answer when the composer is not asking."
             >
               {@render keysBody()}
+              <p class="set-note">
+                Two of these are not keystrokes at all: <b>Ctrl-click</b> (or <b>⌘-click</b>) picks a
+                conversation in the sidebar, and <b>Shift-click</b> picks the run of them around it.
+                The sidebar says so in words the first time the mode is on.
+              </p>
+            </Section>
+          {:else if settings.page === 'about'}
+            <!-- The facts a bug report needs, in one place.
+
+                 Every value here comes from the host that is answering — the core is asked of the
+                 running host rather than read from `CWOFFEE_CORE`, and the paths are asked of the
+                 store and the config loader rather than recomputed here — because this page's whole
+                 purpose is to be believed. A second copy of that knowledge in the UI is a page that
+                 confidently names a file the app never opened.
+
+                 The gateway's token is deliberately absent: this page gets photographed.
+            -->
+            <Section
+              id="info"
+              title="What this is"
+              desc="Which build, which engine, which model. When something is answered wrong, this is the part that says what was answering."
+            >
+              {#if !aboutInfo}
+                <p class="set-note">Nothing asked yet.</p>
+              {:else if !aboutInfoRows.length}
+                <p class="set-note">The host answered with nothing to show.</p>
+              {:else}
+                {#each aboutInfoRows as [label, value] (label)}
+                  <div class="srow" data-about={label}>
+                    <div>
+                      <div class="srow-t">{label}</div>
+                    </div>
+                    <div class="srow-c about-v">{value}</div>
+                  </div>
+                {/each}
+              {/if}
+              <p class="set-note">
+                The <b>answering engine</b> is the part that holds the model: <b>rust</b> runs it inside
+                this app, <b>pi</b> runs a <b>pi --mode rpc</b> process beside it. Everything else on
+                this page is the same either way.
+              </p>
+            </Section>
+
+            <Section
+              id="files"
+              title="Where your things are"
+              desc="The record of your conversations, the settings file, and the folder new work happens in. Copy these into a report and someone can tell what you have without asking you to describe it."
+            >
+              {#each aboutFileRows as [label, value] (label)}
+                <div class="srow" data-about={label}>
+                  <div>
+                    <div class="srow-t">{label}</div>
+                  </div>
+                  <div class="srow-c about-v" title={value}>{value}</div>
+                </div>
+              {/each}
+              {#if aboutInfo?.thread_store}
+                <p class="set-note">
+                  On this engine there are <b>two</b> copies of a conversation: the SQLite record above,
+                  which is what the sidebar, search and this app read, and the thread files the model
+                  reads. They are kept in step by the app — taking a conversation back to one of your
+                  messages cuts both — and if they ever come apart, the record is the one to trust.
+                </p>
+              {:else}
+                <p class="set-note">
+                  This engine keeps one copy: the SQLite record above is the conversation. Nothing else
+                  holds a history of it, so there is no second place to look, and no second place to
+                  lose.
+                </p>
+              {/if}
             </Section>
           {/if}
         </div>

@@ -180,6 +180,57 @@ const iconDoc = () =>
   svgIcon(['M3.6 2.6h6l2.8 2.8v8H3.6z', 'M9.6 2.6v2.8h2.8', 'M8 8.2v4', 'M6.2 10.4 8 12.2l1.8-1.8'])
 const iconBranch = () =>
   svgIcon(['M5 3.6v7.2', 'M5 12.4a1.4 1.4 0 1 0 0 .1', 'M5 3.5a1.4 1.4 0 1 0 0 .1', 'M11.4 5.6a1.4 1.4 0 1 0 0 .1', 'M11.4 6.9c0 2.4-2.6 2.6-4.4 3.6'])
+// A pencil with a short nick in the tip: it writes, and it is small enough to sit next to "Copy".
+const iconPencil = () =>
+  svgIcon(['M11.6 3.1 12.9 4.4 5.9 11.4 3.6 12.4l1-2.3z', 'M10.4 4.3l1.3 1.3'])
+// A framed square with a hill and a light in it — the picture mark, used where an attached image has
+// no payload in hand yet, so the chip has to say what is coming rather than show a broken frame.
+const iconImage = () =>
+  svgIcon(['M2.6 3.4h10.8v9.2H2.6z', 'M2.6 10.4l3-3 2.4 2.4 2.2-2.6 3.2 3.2', 'M6.1 6a1 1 0 1 0 0 .1'])
+
+/**
+ * An attachment chip the reader pressed, and how to get at the bytes behind it.
+ *
+ * `msgId` is null for a message this window painted itself — for those the payload is already in
+ * `meta.url`, because this is the window that sent it. A chip from the record has a row id and no
+ * payload, and the store is asked for that one row's attachments.
+ */
+export interface AttachmentView {
+  msgId: number | null
+  index: number
+  meta: AttachmentMeta
+}
+
+/**
+ * What "edit this message" asks for, as one thing the app can send to a host.
+ *
+ * The transcript does not change the record: it has no store and no idea which transport it is on.
+ * It says which message it means, in the only two ways it can, and the host decides whether that is
+ * a message it can still prove.
+ *
+ * `id` is present for a message that came out of the store. A message this window painted while it
+ * was being sent has no id on this side of the wire, so `fromEnd` counts *your* messages backwards
+ * from the newest one on screen — exact, because the newest message on screen is the newest message
+ * there is. `shown` is the assertion: the host refuses an edit whose words do not match the row it
+ * resolved, which is what stops a window that has drifted from rewriting a message nobody was
+ * looking at.
+ */
+export interface MessageEdit {
+  id: number | null
+  fromEnd: number
+  /** The words this window is showing. */
+  shown: string
+  /** The words it should hold. */
+  next: string
+  /**
+   * Two different asks, and the difference is what the person is being asked to choose between.
+   *
+   * `false` corrects the record and leaves the conversation the length it was — the model already
+   * answered those words, and everything after was built on the answer. `true` takes the
+   * conversation back to this message: everything after it goes, and these words go out again.
+   */
+  resend: boolean
+}
 
 /**
  * Clipboard, with a way out.
@@ -455,6 +506,22 @@ export class Transcript {
   onNote: ((text: string, session: number | null) => void) | null = null
   /** Feedback for actions the user can otherwise not tell worked (copy, share). */
   onToast: ((msg: string, bad?: boolean) => void) | null = null
+  /**
+   * Change one of your own messages. Resolves to the one sentence to show for it, or rejects with
+   * the reason nothing was changed.
+   *
+   * Deliberately a question rather than an operation: the transcript holds what was *said*, the host
+   * holds what was *recorded*, and only the host can cut a conversation in half and re-send it.
+   */
+  onMessageEdit: ((edit: MessageEdit) => Promise<string>) | null = null
+  /**
+   * The reader pressed an attachment chip in their own message.
+   *
+   * The transcript cannot answer "what picture is this" — for a message from the record it holds a
+   * name and a size, and the bytes live in the store. So it reports which chip, in which row, and
+   * the app either shows the copy it already has or fetches the one picture being asked for.
+   */
+  onAttachmentOpen: ((req: AttachmentView) => void) | null = null
   /** Conversation the transcript is showing; export is addressed to it. */
   sessionId = 0
   /** Answer text of the live turn, kept so "copy" copies what the user read. */
@@ -2327,23 +2394,273 @@ export class Transcript {
     this.textKind = 'user'
     body.textContent = text
     this.appendAttachmentTags(body, attachments)
+    // Your own words, while they are still on the way out. The store has the row before the model
+    // is asked — a send is stored, not remembered — so this is the same message the record holds,
+    // and it gets the same two controls as a message you came back to.
+    this.attachUserActions(body.parentElement as HTMLElement, body, text, null)
     // Your own words are the one thing that always moves the view: a message typed while the
     // reader was looking further up belongs at the bottom, and they wrote it.
     this.follow('you')
   }
 
+  // ---- what you can do with your own message -----------------------------
+
   /**
-   * Name and size, not a thumbnail. History pages carry attachment metadata
-   * only, so a thumbnail here would disappear on reopen and make the transcript
-   * look lossy when the payload is in fact intact.
+   * Copy and Edit under one of your messages.
+   *
+   * Copy is there because the thing you may want again is your own question, not only the answer
+   * under it — and because the row of controls under a CWOFFEE turn already exists, so a message
+   * with no controls looks like a different kind of thing.
+   *
+   * Edit opens in place (see `openUserEditor`). Both controls are reachable at all times rather than
+   * on hover, for the same reason the turn's are: this is a touch target on a phone too, and a
+   * control you have to find by hovering is a control a phone does not have.
    */
-  private appendAttachmentTags(body: HTMLElement, attachments: AttachmentMeta[]) {
+  private attachUserActions(wrap: HTMLElement, body: HTMLElement, text: string, id: number | null) {
+    if (!text && !body.querySelector('.attlist')) {
+      // Nothing to copy and nothing to change: a message with no words and no attachments is a
+      // bookkeeping row, and a strip of buttons under nothing is noise.
+      return
+    }
+    const row = this.el('user-acts')
+
+    const btn = (cls: string, label: string, title: string, icon: SVGElement) => {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = `tact ${cls}`
+      b.title = title
+      b.setAttribute('aria-label', label)
+      const ico = this.el('tact-ico')
+      ico.append(icon)
+      b.append(ico, this.el('tact-label', label))
+      row.append(b)
+      return b
+    }
+
+    const copy = btn('copy', 'Copy', 'Copy what you sent, exactly as it is stored', iconCopy())
+    copy.onclick = () => {
+      void copyToClipboard(text).then((ok) => {
+        if (this.onToast) this.onToast(ok ? 'copied your message' : 'the webview refused the clipboard', !ok)
+        if (ok) {
+          copy.classList.add('done')
+          setTimeout(() => copy.classList.remove('done'), 1200)
+        }
+      })
+    }
+
+    const edit = btn('edit', 'Edit', 'Change what you sent', iconPencil())
+    edit.onclick = () => this.openUserEditor(wrap, body, text, id)
+
+    wrap.append(row)
+  }
+
+  /**
+   * Change your own words where they were said.
+   *
+   * The bubble is replaced by a textarea rather than annotated next to it: the message is a single
+   * thing being corrected, and showing both the old text and the new one invites a comparison the
+   * rest of the transcript cannot support — there is only ever one version of a message in the
+   * record.
+   *
+   * The two buttons say what each one does to the conversation, because the difference between them
+   * is not obvious and getting it wrong is expensive. Saving words in place cannot re-run anything:
+   * the model answered the sentence that was there, and every later turn was built on that answer.
+   * Taking the conversation back and sending again is the ask that redoes the answer, and it drops
+   * everything after the message — which is why it is the button with the longer title, not the one
+   * with the brighter colour.
+   */
+  private openUserEditor(wrap: HTMLElement, body: HTMLElement, shown: string, id: number | null) {
+    if (wrap.querySelector('.user-edit')) return
+    if (!this.onMessageEdit) {
+      this.onToast?.('editing is not available on this connection', true)
+      return
+    }
+    const ed = this.el('user-edit')
+    const ta = document.createElement('textarea')
+    ta.className = 'user-edit-ta'
+    ta.value = shown
+    ta.setAttribute('aria-label', 'Your message')
+    // The same measure as the bubble it replaces, so correcting a message does not widen the column
+    // the conversation is set in.
+    ta.rows = Math.max(3, Math.min(18, shown.split('\n').length + 1))
+
+    const note = this.el(
+      'user-edit-note',
+      'Save changes only this message — it does not send anything, and it does not change what the '
+        + 'model already read, because it answered the words that were there and every later turn was '
+        + 'built on that answer. Save and send again takes the conversation back to this message: '
+        + 'everything after it goes, and these words go out again.',
+    )
+
+    const acts = this.el('user-edit-acts')
+    const btn = (cls: string, label: string, title: string) => {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = `ue-act ${cls}`
+      b.title = title
+      b.textContent = label
+      acts.append(b)
+      return b
+    }
+    const save = btn('save', 'Save', 'Keep the conversation as it is and change only this message')
+    const again = btn(
+      'again',
+      'Save and send again',
+      'Drop everything after this message and send these words as a new turn',
+    )
+    const cancel = btn('cancel', 'Cancel', 'Leave this message as it is')
+    ed.append(ta, note, acts)
+
+    const close = () => {
+      wrap.classList.remove('editing')
+      ed.remove()
+    }
+    cancel.onclick = close
+
+    const submit = (resend: boolean) => {
+      const next = ta.value
+      if (!resend && next === shown) {
+        // Nothing to write, and saying so is cheaper than a round trip that reports success about
+        // an edit that changed nothing.
+        close()
+        this.onToast?.('the words are the same, so nothing was changed')
+        return
+      }
+      const fromEnd = this.userMessageBlocks().indexOf(wrap)
+      if (fromEnd < 0) {
+        close()
+        this.onToast?.('that message is no longer in this transcript', true)
+        return
+      }
+      const req: MessageEdit = {
+        id,
+        fromEnd: this.userMessageBlocks().length - fromEnd,
+        shown,
+        next,
+        resend,
+      }
+      save.disabled = again.disabled = cancel.disabled = true
+      void Promise.resolve(this.onMessageEdit?.(req))
+        .then((msg) => {
+          // The app repaints the transcript from the store after a change that worked, which takes
+          // this editor with it. Closing here as well covers the case where it decides not to reload.
+          close()
+          if (msg) this.onToast?.(msg)
+        })
+        .catch((e) => {
+          // The editor stays open with the words still in it: the refusal is about the record, and
+          // the person should be able to read it against what they typed.
+          save.disabled = again.disabled = cancel.disabled = false
+          this.onToast?.(String(e), true)
+        })
+    }
+    save.onclick = () => submit(false)
+    again.onclick = () => submit(true)
+
+    ta.onkeydown = (ev) => {
+      if (ev.key === 'Escape') {
+        // Stop it here as well as handling it: Escape is the app's key for closing menus and
+        // stopping a turn, and a person cancelling an edit means *this* one.
+        ev.stopPropagation()
+        ev.preventDefault()
+        close()
+      } else if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault()
+        submit(true)
+      }
+    }
+
+    wrap.classList.add('editing')
+    wrap.append(ed)
+    ta.focus()
+    ta.setSelectionRange(ta.value.length, ta.value.length)
+    this.scrollIfNeeded('chrome')
+  }
+
+  /** Your messages in this transcript, oldest first — the list `fromEnd` counts back through. */
+  private userMessageBlocks(): HTMLElement[] {
+    return Array.from(this.root.querySelectorAll('.blk-user')) as HTMLElement[]
+  }
+
+  /**
+   * Put bytes the app fetched onto the chip that asked for them.
+   *
+   * The first click on an old attachment costs one read of one row; the chip then holds the picture,
+   * so the same chip does not ask twice and the conversation shows what it contains. Returns false
+   * when that row is not on screen — the caller has already shown the picture, and a transcript that
+   * has scrolled past it is not a reason to fail the click.
+   */
+  rememberAttachment(msgId: number, index: number, url: string): boolean {
+    const body = this.root.querySelector(`.blk-user .blk-body[data-msg="${msgId}"]`) as HTMLElement | null
+    if (!body) return false
+    const list = body.querySelector('.attlist')
+    const chip = list?.querySelector(`.tatt[data-att="${index}"]`) as HTMLElement | null
+    if (!chip) return false
+    const ph = chip.querySelector('.tatt-ph')
+    if (ph) {
+      const im = document.createElement('img')
+      im.src = url
+      im.alt = chip.querySelector('.tatt-meta')?.textContent ?? 'attached image'
+      chip.insertBefore(im, ph)
+      ph.remove()
+      chip.classList.add('loaded')
+    } else {
+      const im = chip.querySelector('img')
+      if (im) im.src = url
+    }
+    return true
+  }
+
+  /**
+   * What your own message carried, drawn where the message is.
+   *
+   * An image is drawn as the image. The first version of this line was a dashed 11px pill with a
+   * filename in muted ink, and the complaint it produced was exact: "pasting an image seems like
+   * the file is attached, but when you send, there's no indication that it got sent". The composer
+   * had just shown a real thumbnail of that picture, so the moment the message was sent the picture
+   * vanished and what was left read like a caption rather than proof. A chip with the pixels in it
+   * answers the question without anyone having to look for the answer.
+   *
+   * The payload is only in hand for a message this window just sent, or one the reader has opened.
+   * A page of stored history carries name and size — by design, since a transcript read that pulled
+   * every attached megabyte would be a slower app for the sake of pictures that are scrolled past —
+   * so an older chip is a button that asks for the one picture being looked at.
+   */
+  private appendAttachmentTags(body: HTMLElement, attachments: AttachmentMeta[], msgId: number | null = null) {
     if (!attachments.length) return
     const row = this.el('attlist')
-    for (const a of attachments) {
+    attachments.forEach((a, i) => {
       const kb = Math.max(1, Math.round(a.bytes / 1024))
-      row.append(this.el('atttag', `${a.name ?? a.mime} · ${kb} kB`))
-    }
+      if (!a.mime.startsWith('image/')) {
+        row.append(this.el('atttag', `${a.name ?? a.mime} · ${kb} kB`))
+        return
+      }
+      const chip = document.createElement('button')
+      chip.type = 'button'
+      chip.className = 'tatt'
+      chip.dataset.att = String(i)
+      const label = `${a.name ?? a.mime} · ${kb} kB`
+      if (a.url) {
+        const im = document.createElement('img')
+        im.src = a.url
+        im.alt = a.name ?? 'attached image'
+        im.loading = 'lazy'
+        chip.append(im)
+        chip.append(this.el('tatt-meta', label))
+        chip.title = `The picture you sent: ${label}`
+      } else {
+        // No payload, and no pretending the transcript has one. The shape is the same chip, so the
+        // row still reads as "this message had a picture in it"; the square is a promise about what
+        // a click will bring, not a broken thumbnail.
+        const ph = this.el('tatt-ph', '')
+        ph.append(iconImage())
+        chip.append(ph)
+        chip.append(this.el('tatt-meta', `${label} · view`))
+        chip.title = `Open the picture in this message (${label})`
+      }
+      chip.onclick = () => this.onAttachmentOpen?.({ msgId, index: i, meta: a })
+      row.append(chip)
+    })
     body.append(row)
   }
 
@@ -3599,7 +3916,15 @@ export class Transcript {
         whoSaid = false
         const body = blk('user', 'you')
         body.textContent = m.content
-        this.appendAttachmentTags(body, m.attachments ?? [])
+        // The row id, on the element the attachments hang off. A chip the reader pressed has to be
+        // findable again once its bytes arrive, and this is the only place that knows which stored
+        // row a bubble came from.
+        body.dataset.msg = String(m.id)
+        this.appendAttachmentTags(body, m.attachments ?? [], m.id)
+        // A stored message knows its own row, so an edit of it is addressed by id — which is the
+        // strictest of the two forms: no counting, no guessing, and a row that has gone in the
+        // meantime is reported as gone rather than resolved to its neighbour.
+        this.attachUserActions(body.parentElement as HTMLElement, body, m.content ?? '', m.id)
       } else if (m.role === 'assistant') {
         if (m.reasoning) {
           // A line, not a body: the stored reasoning is not rendered at all. It is still counted,

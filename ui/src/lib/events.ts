@@ -154,6 +154,24 @@ export interface HostState {
    * never told us", and the UI then shows what it last heard rather than inventing.
    */
   persona?: 'cowork' | 'chat'
+  /**
+   * Whether the conversation the host is holding may reach the web: whether `web_search` and
+   * `web_fetch` are mounted for it, and whether its system prompt tells the model they are there.
+   *
+   * Optional because a window may talk to a host built before the field existed; absence means
+   * "this host never told us", and the UI then behaves as off rather than painting a control that
+   * does nothing. It lives in the host's state rather than only in the composer because it is a
+   * claim about what the *model* was told — the chip, the prompt and the mounted tools have to
+   * agree, and a second window looking at the same conversation has to see the same answer.
+   */
+  web?: boolean
+  /**
+   * What the running model process was actually started with, in words: "no tools at all",
+   * "web_search, web_fetch". The Web chip is a promise about what the model can reach; this is the
+   * receipt for it, so the two can be held against each other instead of one being trusted to imply
+   * the other. Absent means the core does not state one — which must never be rendered as "none".
+   */
+  web_tools?: string
   reasoning: ReasoningLevel
   /** The effort new conversations start at - what the settings screen edits. Optional because a
     page may talk to a gateway built before the field existed. */
@@ -220,11 +238,20 @@ export interface Session {
   /** Which mode made this conversation: "cowork" or "chat". Absent means the store is
       older than the column, which means cowork. */
   persona?: string
+  /** Whether this conversation may reach the web (`web_search`, `web_fetch`). Mirrors the host's
+    `web`; a chat opened from the sidebar has to show its own chip, not the last one typed. */
+  web_on?: boolean
 }
 
 export interface WorkspaceRow {
   path: string
   label: string
+  /** The folder's colour as `#rrggbb`, or empty for "no colour". Optional because a page may talk
+    to a gateway built before the column existed; absence reads as uncoloured. The store refuses
+    anything that is not a colour, and `safeColor` on the client refuses it again before it reaches
+    a `style` attribute — a record written by an older build is not a reason to interpolate text
+    into markup. */
+  color?: string
   sessions: number
 }
 
@@ -241,6 +268,14 @@ export interface AttachmentMeta {
   mime: string
   name: string | null
   bytes: number
+  /**
+   * Set only when *this window* already holds the payload — a message you just sent, or an image
+   * the reader has opened once. A transcript page deliberately carries name and size alone, because
+   * dragging every picture across IPC to render a conversation costs megabytes for pictures nobody
+   * is looking at. The field is how the transcript knows it can draw the picture now instead of
+   * offering to fetch it.
+   */
+  url?: string
 }
 
 export interface StoredMessage {
