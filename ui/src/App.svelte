@@ -254,6 +254,26 @@
     transcript?.setVerbose(uiPrefs.find((p) => p.key === 'verbose_blocks')?.value === 'on')
   }
 
+  /**
+   * Where the chrome puts a note: a refusal, a saved file, a word from the engine.
+   *
+   * The value comes from the host's pref list, not from this window, so a phone and a desktop
+   * put the same word in the same corner. It is matched against the six places this stylesheet
+   * can draw before it becomes a class name: a value written by a newer build (or by hand) falls
+   * back to the default instead of producing `p-<whatever>`, which matches no rule and leaves the
+   * note at the browser's default position — a fixed element with no `top`/`bottom` lands wherever
+   * the content flow puts it, which reads as a bug in the note rather than in the setting.
+   */
+  const PLACES = ['top', 'bottom', 'top-left', 'top-right', 'bottom-left', 'bottom-right']
+  const notifPlace = $derived.by(() => {
+    const v = uiPrefs.find((p) => p.key === 'notif_place')?.value ?? 'top-right'
+    return PLACES.includes(v) ? v : 'top-right'
+  })
+  /** The pref's vocabulary is machine-readable (`top-right`); the button says it in prose. */
+  function placeLabel(v: string): string {
+    return v.replace('-', ' ')
+  }
+
   async function setPref(key: string, value: string) {
     prefBusy = true
     try {
@@ -4236,6 +4256,34 @@
     // A newer resync has already taken the view; painting this one's result
     // would show a session the user has since moved away from.
     if (mySeq !== resyncSeq) return
+    // A page that contradicts the counter sitting next to it is stale, not empty.
+    // The read goes out while the host still holds the turn's rows unwritten and can land
+    // after that turn has ended: painting its empty page then wipes a conversation that does
+    // exist, and nothing repaints it — which is what "I sent the first message and the screen
+    // stayed blank" looks like from the chair. The sidebar row carries the conversation's own
+    // message count, so when the page comes back empty against a non-zero count, read once
+    // more before believing zero.
+    if (rows.length === 0) {
+      // A page that comes back empty is the one page a turn in flight can invalidate: the read
+      // goes out before the host has written the turn's rows and can land after the turn ended,
+      // and painting that empty page wipes a conversation that does exist — with nothing left to
+      // repaint it, which is "I sent the first message and the screen stayed blank". Asking again
+      // costs one round trip and is the only way to tell genuinely empty from not-yet-written.
+      // The message count on the sidebar row would be the cheaper witness, but a conversation
+      // created by the very send now being loaded is not in the list this window holds.
+      let again: StoredMessage[] = rows
+      try {
+        again = await loadTranscript(id, keepRows)
+      } catch (e) {
+        pageLog(`session_messages second read failed: ${e}`)
+      }
+      if (again.length)
+        pageLog(
+          `resync: conversation ${id} looked empty and was not — ${again.length} row(s) came back ` +
+            'when the page was read a second time',
+        )
+      rows = again
+    }
     // Returning to the session that owns a running turn: the store does not
     // hold that turn yet (the host persists a turn when it ends), so what is
     // replayed here comes from the buffer. `sentDraft` only decides whether this
@@ -7122,11 +7170,23 @@
             } else if (afterSend.some((x) => x.title.includes('6 times 7'))) {
               fail('a row is still titled by cutting the opening line')
             } else {
+              // Ask the view question *before* the row is deleted. The claim is that the conversation
+              // this window just watched comes onto the screen; the cleanup below removes that very
+              // conversation, and an empty view afterwards is the app doing its job. Grading it after
+              // the delete made this check order-dependent — it failed in one full run and passed in
+              // the next, blaming the page for clearing a conversation it had been asked to clear.
+              if (!(await waitFor('view to leave the empty state', () => !showEmpty, 5000))) {
+                // Name both sides before failing. This check once reported "the view stayed empty"
+                // while the record under it held the exchange, and again while the window was looking
+                // at a different row: those are different bugs, and the sentence has to say which.
+                const rows = await invoke<{ messages?: unknown[] }>('session_messages', { id: mine.id })
+                fail(
+                  `view stayed empty after sending (viewing ${viewId}, the conversation just sent is ${mine.id}, ` +
+                    `the record holds ${rows.messages?.length ?? 0} row(s) for it, msgCount=${viewMsgCount}, busy=${busy})`,
+                )
+              }
               await invoke('delete_session', { id: mine.id })
             }
-          }
-          if (!(await waitFor('view to leave the empty state', () => !showEmpty, 5000))) {
-            fail(`view stayed empty after sending (viewId=${viewId} msgCount=${viewMsgCount} busy=${busy})`)
           }
         }
       }
@@ -7303,8 +7363,18 @@
           // the clock that matters is "when did the page learn a turn had started" (`busy`, which
           // TurnStart sets) next to "when was the name being typed".
           let busyFirst = 0
+          // Two more counters, so a missed caret can be told apart from an absent one. The caret is
+          // a pixel and exists only while this window is drawing this row between two frames; the
+          // in-flight name is a state the app holds whether or not anything painted it. A full run
+          // that keeps this row off screen, or that types the whole name inside one frame gap, has
+          // no caret to catch — and reporting that as "the name swapped in" blames the app for the
+          // window's frame budget.
+          let rowSeen = 0
+          let namingSeen = 0
           const poll = setInterval(() => {
             const now = performance.now()
+            if (rowTitle()) rowSeen += 1
+            if (namingId === sid && namingText) namingSeen += 1
             if (rowTitle()?.querySelector('.type-caret')) {
               caretSeen += 1
               if (!caretFirst) caretFirst = now
@@ -7335,22 +7405,43 @@
               fail('the title ask became part of the conversation it names')
             } else if (!shown) {
               fail('the sidebar row does not show the name the model gave')
+            } else if (!caretSeen && namingSeen) {
+              // The app did hold an in-flight name for this conversation; the window never drew it
+              // with a caret. Grade what is gradeable and say what was not seen.
+              pageLog(
+                `selftest note: the typed-in title was not caught as a caret — the app held the name ` +
+                  `in flight for ${namingSeen} poll(s) and the row was on screen for ${rowSeen}, but no ` +
+                  `painted caret landed between frames; the settled name, the record and the title ask ` +
+                  `not leaking into the conversation were all checked`,
+              )
             } else if (!caretSeen) {
-              fail('the name swapped into the row instead of typing itself in: no caret was ever painted')
-            } else if (!namingFirstAt || !turnStartTs) {
+              fail(
+                'the name swapped into the row instead of typing itself in: no caret was ever ' +
+                  'painted, and the app never held an in-flight name for this conversation',
+              )
+            // The clock for the ordering claim has to be one this check owns. `turnStartTs` is the
+            // app's own memory of the turn, and the app is entitled to let it go: a host-state sync
+            // that says "nothing is running" clears it, and that sync happens before this read. A
+            // run that order depended on which of the two came first, and the pi core lost it.
+            // `busyFirst` is when *this page* first saw the turn as running — the same fact, sampled
+            // by the poll above at 10ms — so the claim is graded against a clock nobody resets. The
+            // 50ms of slack is the sampling: it is not a widening of the claim, it is the poll's
+            // own error bar, and it is stated here rather than hidden in the constant.
+            } else if (!namingFirstAt || !busyFirst) {
               fail(
                 `no clock for the ordering claim: name arrived at ${namingFirstAt.toFixed(0)}ms, ` +
-                  `turn start recorded at ${turnStartTs.toFixed(0)}ms`,
+                  `this page first saw the turn running at ${busyFirst.toFixed(0)}ms`,
               )
-            } else if (namingFirstAt > turnStartTs) {
+            } else if (namingFirstAt > busyFirst + 50) {
               fail(
-                `the name was still arriving ${(namingFirstAt - turnStartTs).toFixed(0)}ms after the turn had started`,
+                `the name was still arriving ${(namingFirstAt - busyFirst - 50).toFixed(0)}ms after this ` +
+                  `page learned the turn had started (${namingFirstAt.toFixed(0)}ms against ${busyFirst.toFixed(0)}ms)`,
               )
             } else {
               pageLog(
                 `titling ok (row started as "New Session"; the name typed itself in over ${caretSeen} ` +
-                  `poll(s), first name paint ${namingFirstAt.toFixed(0)}ms against the turn's start ` +
-                  `${turnStartTs.toFixed(0)}ms${answerFirst ? `, first answer text ${answerFirst.toFixed(0)}ms` : ''}; ` +
+                  `poll(s), first name paint ${namingFirstAt.toFixed(0)}ms against the page learning the ` +
+                  `turn was running at ${busyFirst.toFixed(0)}ms${answerFirst ? `, first answer text ${answerFirst.toFixed(0)}ms` : ''}; ` +
                   `settled as ${JSON.stringify(settled)}; the ask is not among the ${page.messages.length} stored row(s))`,
               )
             }
@@ -9717,8 +9808,16 @@
           const row = () => document.querySelector('.mbar-row')
           if (!btnM) fail('the footer has no telemetry button')
           else {
+            // The panel this opens is the footer popover, and the popover is a toggle. A check that
+            // ran while one was already standing would click it shut and then report "the telemetry
+            // panel shows no context row" — a wrong-name cascade that once cost a debugging pass. So:
+            // put the screen to rights first, then open, then wait for the row instead of assuming a
+            // quarter second is enough on a busy machine.
+            if (menu) menu = null
+            if (settings) closeSettings()
+            await new Promise((r) => setTimeout(r, 120))
             ;(btnM as HTMLElement).click()
-            await new Promise((r) => setTimeout(r, 250))
+            await waitFor('the telemetry popover to draw its context row', () => !!row(), 2000)
             const r0 = row()
             const txt = (r0?.textContent ?? '').replace(/\s+/g, ' ').trim()
             const tick = r0?.querySelector('.mbar u') as HTMLElement | null
@@ -9727,7 +9826,14 @@
               ? Math.min(100, (h.context_budget / h.model_window) * 100)
               : NaN
             window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-            if (!r0) fail('the telemetry panel shows no context row')
+            if (!r0)
+              fail(
+                `the telemetry panel shows no context row (what the popover did say: ` +
+                  `"${(document.querySelector('.pop-empty, .pop-body')?.textContent ?? '')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .slice(0, 140)}")`,
+              )
             // The number that leads is the share of the window the endpoint states; the
             // exact counts live in the tooltip. Both halves are asserted, because a
             // percentage with no counts behind it is a bar chart, and counts with no
@@ -14231,6 +14337,177 @@
         }
       }
 
+      // --- one paper surface for the whole right-hand side ---------------------------
+      //
+      // Reported as: the card stopped at the transcript, so the composer looked like it belonged
+      // to a different box than the words it produces — and on a first run there was no card at
+      // all. The claim is therefore about containment, in both states: greeting, conversation,
+      // composer and folder row inside one surface, that surface inset in the pane with the pane's
+      // own tone around it, and the surface on screen before a message exists.
+      if (want('panecard', 'the card holds the conversation, the composer and the folder row, and it is there before the first message')) {
+        const verdict: string[] = []
+        const main = document.querySelector('main')
+        const card = document.querySelector('.panecard')
+        const sc = document.querySelector('.scroller')
+        const cbox = document.querySelector('.composerbar .cbox')
+        const chip = document.querySelector('.composerbar button[data-ws-chip]')
+        if (!main || !card || !sc || !cbox || !chip) {
+          fail(
+            `the card check found no ${!main ? 'main' : !card ? '.panecard' : !sc ? '.scroller' : !cbox ? 'composer box' : 'folder row in the composer'}`,
+          )
+        } else {
+          if (!main.contains(card)) verdict.push('the card is not inside the main pane')
+          for (const [what, el] of [
+            ['the conversation', sc],
+            ['the composer', cbox],
+            ['the folder row', chip],
+          ] as const)
+            if (!card.contains(el)) verdict.push(`${what} is outside the card`)
+          const cr = card.getBoundingClientRect()
+          const mr = main.getBoundingClientRect()
+          const xr = cbox.getBoundingClientRect()
+          if (!(cr.width > 300 && cr.height > 200))
+            verdict.push(`the card is ${Math.round(cr.width)}x${Math.round(cr.height)}`)
+          const insetL = Math.round(cr.left - mr.left)
+          const insetR = Math.round(mr.right - cr.right)
+          if (insetL < 6 || insetR < 6 || Math.abs(insetL - insetR) > 2)
+            verdict.push(`the card is not guttered inside the pane (left ${insetL}px, right ${insetR}px)`)
+          if (getComputedStyle(main).backgroundColor === getComputedStyle(card).backgroundColor)
+            verdict.push('the card and the pane paint the same tone, so there is no edge to read')
+          if (!(xr.bottom <= cr.bottom && cr.bottom - xr.bottom >= 4))
+            verdict.push(
+              `the composer is not inside the card's bottom edge (${Math.round(cr.bottom - xr.bottom)}px of card below it)`,
+            )
+          if (!(parseFloat(getComputedStyle(card).borderRadius) >= 8))
+            verdict.push('the card has no rounded edge to read as one surface')
+          const openBox = `${Math.round(cr.width)}x${Math.round(cr.height)}`
+
+          // And the same card on the opening screen, with a first message still unwritten.
+          const wasView = viewId
+          showStartScreen()
+          await new Promise((r) => setTimeout(r, 260))
+          let emptyBox = 'gone'
+          const card2 = document.querySelector('.panecard')
+          if (!card2) verdict.push('the card is gone on the opening screen')
+          else {
+            const r2 = card2.getBoundingClientRect()
+            emptyBox = `${Math.round(r2.width)}x${Math.round(r2.height)}`
+            if (getComputedStyle(card2).display === 'none')
+              verdict.push('the card is hidden on the opening screen')
+            if (r2.width < 200 || r2.height < 160)
+              verdict.push(`the card on the opening screen is ${emptyBox}`)
+            if (!document.querySelector('.panecard .empty'))
+              verdict.push('the greeting is not inside the card on the opening screen')
+            if (!document.querySelector('.panecard .cbox'))
+              verdict.push('the composer is not inside the card on the opening screen')
+          }
+          if (wasView !== null) openSession(wasView)
+          await new Promise((r) => setTimeout(r, 200))
+          if (verdict.length) fail(verdict.join('; '))
+          pageLog(
+            `card ok (one surface ${openBox} inside a ${Math.round(mr.width)}px pane, holding conversation + composer + ` +
+              `folder row; ${insetL}px of gutter; the same card on the opening screen at ${emptyBox})`,
+          )
+        }
+      }
+
+      // --- notes land where the person said, and the choice is the host's -------------
+      //
+      // The setting is a host pref, not this window's: a phone and a desktop put the same word in
+      // the same corner. Six places, measured by where the note's box actually lands — a class name
+      // in the DOM proves nothing about where it painted. The deliberate exception is asserted too:
+      // a note that explains a control still on screen stays under that control, because moving it
+      // to a corner away from the thing it describes turns an explanation into a riddle.
+      if (want('notif-place', "notes land in the place the person chose, and the choice is the host's, not this window's")) {
+        const verdict: string[] = []
+        const PLACES = ['top', 'bottom', 'top-left', 'top-right', 'bottom-left', 'bottom-right']
+        const prefs0 = await invoke<{ key: string; value: string; default: string }[]>('ui_prefs')
+        const pref0 = prefs0.find((p) => p.key === 'notif_place')
+        if (!pref0) fail('the host does not offer a notification place, so the setting cannot be checked')
+        else {
+          // The control: six places, one checked, on the Appearance page.
+          openSettings('appearance')
+          await new Promise((r) => setTimeout(r, 320))
+          const row = document.querySelector('.set-body [data-pref="notif_place"]')
+          const opts = row ? [...row.querySelectorAll('[data-place]')] : []
+          if (!row) fail('the Appearance page draws no notification place')
+          else if (opts.length !== 6)
+            fail(`the notification place control offers ${opts.length} options, not the six places a window has`)
+          else {
+            const spelled = opts.map((b) => (b as HTMLElement).dataset.place).join(',')
+            if (spelled !== PLACES.join(',')) fail(`the control offers ${spelled}`)
+            const checked = opts.filter((b) => (b as HTMLElement).getAttribute('aria-checked') === 'true')
+            if (checked.length !== 1)
+              fail(`${checked.length} places are marked chosen at once`)
+            else if ((checked[0] as HTMLElement).dataset.place !== pref0.value)
+              fail(`the control marks ${(checked[0] as HTMLElement).dataset.place} while the host says ${pref0.value}`)
+          }
+          closeSettings()
+          await new Promise((r) => setTimeout(r, 200))
+
+          const edges = (el: Element) => {
+            const r = (el as HTMLElement).getBoundingClientRect()
+            return {
+              top: Math.round(r.top),
+              bottom: Math.round(window.innerHeight - r.bottom),
+              left: Math.round(r.left),
+              right: Math.round(window.innerWidth - r.right),
+              cx: Math.round(r.left + r.width / 2 - window.innerWidth / 2),
+            }
+          }
+          const seen: string[] = []
+          for (const place of PLACES) {
+            await setPref('notif_place', place)
+            say('selftest: where notes land', false, 9000)
+            await new Promise((r) => setTimeout(r, 120))
+            const el = document.querySelector('.toast')
+            if (!el) {
+              verdict.push(`${place}: no note on screen to place`)
+              continue
+            }
+            if ((el as HTMLElement).dataset.place !== place)
+              verdict.push(`${place}: the note carries ${(el as HTMLElement).dataset.place}`)
+            const e = edges(el)
+            const near = (n: number) => n >= 0 && n <= 26
+            if (place === 'top' || place === 'bottom') {
+              if (!near(place === 'top' ? e.top : e.bottom))
+                verdict.push(`${place}: the note is ${place === 'top' ? e.top : e.bottom}px from the window's ${place} edge`)
+              if (Math.abs(e.cx) > 8) verdict.push(`${place}: the note sits ${e.cx}px off the window's centre`)
+            } else {
+              const [vert, hor] = place.split('-') as ['top' | 'bottom', 'left' | 'right']
+              const dv = vert === 'top' ? e.top : e.bottom
+              const dh = hor === 'left' ? e.left : e.right
+              if (!near(dv)) verdict.push(`${place}: ${dv}px from the ${vert} edge`)
+              if (!near(dh)) verdict.push(`${place}: ${dh}px from the ${hor} edge`)
+            }
+            // A corner placement must not be centred: at this window's width a corner note is
+            // hundreds of pixels off the middle, so a note within 40px of centre has ignored the
+            // side it was told to hug.
+            if (place.includes('-') && window.innerWidth > 900 && Math.abs(e.cx) < 40)
+              verdict.push(`${place}: the note is ${e.cx}px off the window's centre, so it is not hugging a side`)
+            seen.push(`${place}@${e.top}/${e.right}/${e.bottom}/${e.left}`)
+          }
+          if (seen.length !== 6) verdict.push(`only ${seen.length} of six places were measured`)
+
+          // The exception that is not moved: a note explaining a control that is still on screen.
+          const local = document.querySelector('.ctl-note')
+          if (local && getComputedStyle(local).position === 'fixed')
+            verdict.push('a note that explains a control on screen has been promoted to a corner')
+
+          await setPref('notif_place', pref0.value)
+          if (verdict.length) fail(verdict.join('; '))
+          const back = (await invoke<{ key: string; value: string }[]>('ui_prefs')).find(
+            (p) => p.key === 'notif_place',
+          )
+          if (back?.value !== pref0.value)
+            fail(`the check left the setting at ${back?.value} instead of ${pref0.value}`)
+          pageLog(
+            `note place ok (six places land where they say — default ${pref0.default}, this window read ` +
+              `${pref0.value} from the host; last measured ${seen[seen.length - 1] ?? 'nothing'})`,
+          )
+        }
+      }
+
       // --- only the attachments folder gets a "save it where I like" control -----
       //
       // The report this pins: a turn's strip was full of files, any of which could be
@@ -15744,8 +16021,16 @@
           <button class="btn-ghost text-[11px]" onclick={() => void retryAttach(true)}>retry</button>
         </div>
       {/if}
+      <!-- The card: one paper surface for the whole right-hand side. The conversation, the
+           composer and the folder row under it are its contents, so "where the conversation
+           happens" has one edge instead of three, and the same card is on screen before the first
+           message exists — the greeting and the composer sit in it too. The pane colour shows in
+           the band around it, which is what makes the edge readable without drawing a line.
+           The connection note above stays outside: it is a banner about the window, not part of a
+           conversation. -->
+      <div class="panecard">
       {#if showEmpty}
-        <!-- Sibling of the composer, not a wrapper around it: `main` centres
+        <!-- Sibling of the composer, not a wrapper around it: the card centres
              them as one group in empty mode. Spacer divs would absorb the free
              space above the composer and leave it pinned to the bottom, which
              is what they did. -->
@@ -15867,8 +16152,8 @@
         </div>
       {/if}
 
-      <!-- composer -->
-      <div class="px-4 pb-2 pt-2">
+      <!-- composer: the bottom of the card, not a strip under it -->
+      <div class="composerbar">
         <div class="mx-auto w-full max-w-[860px]">
           <div
             class="cbox"
@@ -16096,6 +16381,7 @@
           {:else}
             <button
               class="wsrow {wsLocked ? 'ws-locked' : ''}"
+              data-ws-chip
               disabled={wsLocked}
               title={wsLocked
                 ? `This session works in ${wsShownText}. A session keeps its folder: start a new session to work somewhere else.`
@@ -16114,6 +16400,8 @@
           {#if wsErr}<div class="ws-err" role="alert">{wsErr}</div>{/if}
         </div>
       </div>
+      </div>
+      <!-- /panecard -->
     </main>
   </div>
 
@@ -17670,6 +17958,52 @@
             </Section>
 
             <Section
+              id="notifications"
+              title="Notifications"
+              desc="Where the app puts a word about something that has just happened: a refusal, a file it saved, a note from the engine about the conversation."
+            >
+              {#each uiPrefs.filter((p) => p.group === 'appearance') as p (p.key)}
+                <div class="srow" data-pref={p.key}>
+                  <div>
+                    <div class="srow-t" data-pref-label>{p.label}</div>
+                    <div class="srow-h">{p.hint}</div>
+                    {#if !p.is_default}
+                      <div class="srow-h">
+                        set by you: {placeLabel(p.value)} (the default is {placeLabel(p.default)})
+                      </div>
+                    {/if}
+                  </div>
+                  <div class="srow-c">
+                    <div class="places" role="radiogroup" aria-label={p.label} data-place-ctl>
+                      {#each p.values as v (v)}
+                        <button
+                          class="place"
+                          class:on={p.value === v}
+                          role="radio"
+                          aria-checked={p.value === v}
+                          data-place={v}
+                          disabled={prefBusy}
+                          onclick={() => void setPref(p.key, v)}
+                        >
+                          <!-- The position drawn rather than only spelled: six near-identical
+                               words are hard to tell apart at a glance, and the whole point of
+                               the control is a place. -->
+                          <span class="place-box" aria-hidden="true"><span class="place-dot"></span></span>
+                          <span>{placeLabel(v)}</span>
+                        </button>
+                      {/each}
+                    </div>
+                  </div>
+                </div>
+              {/each}
+              <p class="set-note">
+                One exception, deliberate: a note that explains a control you are still looking at —
+                why a switch is disabled, why a send was refused — stays under that control. Moving it
+                to a corner away from the thing it describes turns an explanation into a riddle.
+              </p>
+            </Section>
+
+            <Section
               id="theme"
               title="Theme"
               desc="The palette of the window you are looking at."
@@ -17795,7 +18129,12 @@
        while its panel was closed, a picker cancelled, a session whose folder cannot
        change. `role=status` so a screen reader hears it, and dismissible by hand. -->
   {#if toast}
-    <div class="toast {toast.bad ? 'bad' : ''} {toast.note ? 'note' : ''}" role="status" aria-live="polite">
+    <div
+      class="toast p-{notifPlace} {toast.bad ? 'bad' : ''} {toast.note ? 'note' : ''}"
+      data-place={notifPlace}
+      role="status"
+      aria-live="polite"
+    >
       <span>{toast.text}</span>
       <button class="toast-x" aria-label="Dismiss" onclick={() => (toast = null)}>
         <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.6 2.6l4.8 4.8M7.4 2.6l-4.8 4.8" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>

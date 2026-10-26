@@ -221,6 +221,37 @@ body {
   flex-direction: column;
   gap: 14px;
 }
+/* The card: one paper surface holding the conversation *and* the composer.
+
+   It used to stop at the transcript, which left the composer on the pane below it — two surfaces
+   stacked, and the thing you type into looking like it belonged to a different box than the words
+   it produced. Now the whole right-hand side is one card: greeting, transcript, composer, folder
+   row. It is also the same card that is on screen for a first run, because the empty screen's
+   greeting lives inside it.
+
+   The surround is `--color-pane`, one notch off the paper, and the edge is tone alone: no border,
+   no shadow. An inset ring on a surface this size measured 32.0ms/frame against 13.0ms idle during
+   a streamed turn, because the ring is repainted with every line that scrolls past under it.
+   The gutter lives here rather than as padding on `.scrollerwrap` so the wrap keeps exactly the
+   box the geometry checks measure. */
+.panecard {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  margin: 10px 16px 14px;
+  background: var(--color-paper);
+  border-radius: 16px;
+}
+/* The bottom of the card. It used to be a strip under the card with its own 16px of side padding;
+   now it is the card's last row, so its text starts on the same 780/860 column the transcript uses
+   and the composer's own box reads as a well in the paper rather than a second card. */
+.composerbar {
+  flex: none;
+  padding: 6px 20px 14px;
+}
+
 /* The label gutter. Making room for the label *outside* the content column is the
    whole point: with a 74px first column every answer started 74px to the right of
    nothing, the user's own message started somewhere else again, and the two never
@@ -252,7 +283,12 @@ body {
    * padding box and starts at the gutter plus the gutter.
    */
   --cup-band: 168px;
-  --cup-left: max(96px, calc(50% - 364px));
+  /* The floor is the scroller's own left padding: the gutter belongs to `.panecard` and this wrap
+     has none of its own, so the column starts at 80px (24px once the label gutter is gone below
+     860px). Both floors used to carry an extra 16px for a gutter that was never drawn, which put
+     the picture 16px right of the text column in a narrow window — the centring branch wins at
+     the widths these checks run at, so nothing noticed. */
+  --cup-left: max(80px, calc(50% - 364px));
 }
 /* The way back down: sticky to the bottom of the transcript, centred on the column the text
    actually occupies. The transcript is padded 80px on the left (the gutter that holds the
@@ -305,14 +341,11 @@ body {
   .jump { transition: none; }
 }
 .scroller {
-  /* The conversation on a surface of its own: the same paper the text has always been read on,
-     rounded, and separated from the pane by tone alone. No ring and no shadow — measured in this
-     app's own check, an inset ring on a surface this size costs frames: a full transcript streamed
-     at 32.0ms/frame against 13.0ms idle on the same page, because the ring is repainted with every
-     line that scrolls past under it. The pane sitting one notch under the paper is what makes the
-     edge, which is also how the reference does it. */
-  background: var(--color-paper);
-  border-radius: 16px;
+  /* The conversation's scroll box, sitting inside `.panecard`. It carries no surface of its own
+     any more: the card behind it is the paper, and giving the scroll box a second paper fill with
+     rounded corners drew an edge in the middle of the card. The padding model is unchanged — the
+     label gutter on the left, the cup band at the bottom — because the checks that measure the
+     column and the picture read this box, not the card. */
   /* The gutter is a variable rather than a magic number because the sticky header of a
      long code block has to know it. A sticky offset is measured against the scrollport's
      *content* edge, so a 24px top padding would park that header 24px below the top of the
@@ -371,10 +404,10 @@ body {
     padding-left: 24px;
     padding-right: 16px;
   }
-  /* No gutter to hang the label in, and no column margin to hang the cup in either. The 16px of
-     card gutter is still there, so the column starts 16px further in than the scroller's padding. */
+  /* No gutter to hang the label in, and no column margin to hang the cup in either: the picture
+     starts at the scroller's own padding. */
   .scrollerwrap {
-    --cup-left: 40px;
+    --cup-left: 24px;
   }
   .blk > .blk-head {
     position: static;
@@ -947,7 +980,9 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 0 24px 10px;
+  /* In the band above the card, flush with its gutter: a banner that sits in the card's margin
+     and lines up on a different edge to the card itself reads as two separate layouts. */
+  margin: 10px 16px 0;
   padding: 8px 12px;
   border: 1px solid var(--color-hairline);
   border-left: 3px solid var(--color-warn);
@@ -993,7 +1028,10 @@ body {
   position: relative;
   border: 1px solid var(--color-hairline);
   border-radius: 16px;
-  background: var(--color-paper);
+  /* A well in the card, not a second card: on paper the old fill made the composer's box
+     invisible except for its outline, and an outline-only box around a multiline textarea reads
+     as two nested frames. One step of tone does the job the border used to do on the pane. */
+  background: var(--color-paper-2);
   padding: 12px 14px 10px;
 }
 .crow {
@@ -2738,6 +2776,8 @@ body {
 /* Empty mode centres the greeting and the composer together. The transcript is
    still in the tree, just not laid out. */
 .empty-mode {
+  /* The card is `main`'s only child, so the centring that used to happen here has to happen one
+     level in: the greeting and the composer are centred as a pair *inside* the card. */
   justify-content: center;
   /* This used to pad the bottom by 116px, which was the right compensation when
      the centred group was *only the composer*. The group is the cup, the greeting
@@ -2749,6 +2789,7 @@ body {
      composer alone left the whole thing ~70px above the middle of the pane. */
   padding-bottom: 0;
 }
+.empty-mode .panecard { justify-content: center; }
 .empty { margin-bottom: 26px; }
 
 /* Markdown tables. The model emits them for anything tabular; before this they
@@ -4051,14 +4092,16 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
      pills keep their dot — live, off, or refusing is the only fact worth the space —
 }
 
-/* A refusal the user can see. It sits above the footer rather than in the panel
-   that raised it, because the panel is often closed by the time the answer comes
-   back from the engine. */
+/* A refusal the user can see. It floats over the window rather than sitting in the panel
+   that raised it, because the panel is often closed by the time the answer comes back from
+   the engine.
+
+   Its corner is a setting (`notif_place`, read into `notifPlace` in App.svelte) and the place
+   arrives as a class, so the six options are six rules and nothing computes an offset in JS.
+   The default is the top-right: the corner a person reads first, and the one that does not
+   cover the composer, the transcript's newest line, or the button they just pressed. */
 .toast {
   position: fixed;
-  left: 50%;
-  bottom: 46px;
-  transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 10px;
@@ -4073,8 +4116,26 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   line-height: 1.45;
   box-shadow: 0 8px 26px rgba(0, 0, 0, 0.14);
   z-index: 60;
-  animation: cwoffee-rise var(--d3) var(--ease-out) both;
+  /* The entrance animates `translate`, not `transform`. The old rule animated `cwoffee-rise`,
+     whose `to` frame is `transform: none`, and with `animation-fill-mode: both` a keyframe value
+     outranks the declaration — so the `translateX(-50%)` that centred this note was discarded the
+     moment the animation started and stayed discarded after it. The "centred" toast has been
+     sitting half its width right of centre. `translate` is a separate property, so the entrance
+     and the centring no longer fight over one channel; a browser without it just fades the note. */
+  animation: cwoffee-note-in var(--d3) var(--ease-out) both;
 }
+@keyframes cwoffee-note-in {
+  from { opacity: 0; translate: 0 6px; }
+  to   { opacity: 1; translate: none; }
+}
+/* The six places. `margin: 0` on the corners is not needed; what matters is that a centred
+   placement keeps its `transform` to itself, so the corner rules never set one. */
+.toast.p-top { top: 14px; left: 50%; transform: translateX(-50%); }
+.toast.p-bottom { bottom: 14px; left: 50%; transform: translateX(-50%); }
+.toast.p-top-left { top: 14px; left: 14px; }
+.toast.p-top-right { top: 14px; right: 14px; }
+.toast.p-bottom-left { bottom: 14px; left: 14px; }
+.toast.p-bottom-right { bottom: 14px; right: 14px; }
 .toast.bad { border-left-color: var(--color-warn); }
 /* An app-level note: a migration, a compaction, an endpoint with no window set. These
    used to be blue lines inside the transcript, which is what made the transcript read as
@@ -4101,6 +4162,57 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 }
 .toast-x:hover { background: var(--color-tint); color: var(--color-ink); }
 @media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+
+/* The notification-place control on the Appearance page: six places in two rows, each showing
+   the position as a mark in a frame as well as in words. Six near-identical two-word labels in a
+   row is a control that makes the person read each one; a dot in a rectangle is read at a glance. */
+.places {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 4px;
+}
+.place {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 7px;
+  border: 1px solid var(--color-hairline);
+  border-radius: 8px;
+  background: var(--color-paper);
+  color: var(--color-ink-2);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.place:hover:not(:disabled) { background: var(--color-paper-2); color: var(--color-ink); }
+.place.on {
+  border-color: var(--color-shell);
+  background: var(--color-tint);
+  color: var(--color-ink);
+}
+.place:disabled { opacity: 0.45; cursor: default; }
+.place-box {
+  position: relative;
+  width: 17px;
+  height: 13px;
+  flex: none;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 3px;
+}
+.place.on .place-box { border-color: var(--color-shell); }
+.place-dot {
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-ink-3);
+}
+.place.on .place-dot { background: var(--color-shell-deep); }
+.place[data-place='top'] .place-dot { left: 50%; top: 2px; transform: translateX(-50%); }
+.place[data-place='top-left'] .place-dot { left: 2px; top: 2px; }
+.place[data-place='top-right'] .place-dot { right: 2px; top: 2px; }
+.place[data-place='bottom'] .place-dot { left: 50%; bottom: 2px; transform: translateX(-50%); }
+.place[data-place='bottom-left'] .place-dot { left: 2px; bottom: 2px; }
+.place[data-place='bottom-right'] .place-dot { right: 2px; bottom: 2px; }
 
 /* A session that already has a folder cannot change it. The row stays legible -
    it is information about where the work goes - but it stops looking like a

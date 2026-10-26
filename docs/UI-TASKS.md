@@ -702,3 +702,210 @@ like a broken app when the truth is that the Rust core keeps no second copy of t
   engine functions both transports call. The desktop and the phone disagreeing about *wording* is the
   first way a user learns there are two implementations.
 
+
+---
+
+# Batch four — the card is the whole right side, and the notices pick their corner
+
+## O. The card stopped halfway down the page
+
+The card from the last batch was the transcript and nothing else: the composer sat on the strip
+below it, the folder chip below that, and the opening screen had no card at all — the greeting
+floated on the surround with a composer under it. That is two surfaces pretending to be one. What
+was asked for is the reading surface for the whole right side: conversation, composer and folder
+line together, and the same card before there is a conversation.
+
+`.panecard` is that surface now, and it is one box in `main`, guttered inside the pane so the
+surround shows around it on all four sides:
+
+```
+┌─ panecard ─────────────────────────────┐
+│  conversation (scrolls)                │
+│  approval / web note / picker          │
+│  composer                              │
+│  folder line        tokens  ceiling    │
+└────────────────────────────────────────┘
+```
+
+The transcript keeps its own scroll box (`.scroller`) but no longer paints anything: it is a
+window onto the card, not a second sheet. The composer's old strip — `px-4 pb-2 pt-2` in App
+markup, with its own top hairline in CSS — became a class, `.composerbar`, so the padding rule and
+the (now removed) divider lived in one place instead of two files; a strip whose padding is in the
+markup and whose border is in the stylesheet is how a divider comes back after someone deletes it.
+
+`main.empty-mode` still centres the greeting, but now inside the card: `.empty-mode .panecard`
+shrinks to its content and centres it, and the cup measures against the card's content box (its
+`::before`), which is the box the greeting is centred in. The cup's `--cup-left` moved to 16px at
+the narrow breakpoint because the gutter now belongs to the card, not to the scroller.
+
+The connection banner lives outside the card — it is about the app, not about the conversation —
+so its margins were set to the card's gutter so it lines up with the card's edge instead of the
+window's.
+
+One thing the change had to survive: the checks that measure the reading column. `.scroller` used
+to *be* the surface; now it is a transparent scroll window inside one, and every geometry claim
+about "the transcript" still holds because the scroller's box did not move — the card grew around
+it. The new `panecard` check asserts the containment rather than the look: the transcript, the
+composer and the folder line are all inside the card's box, the card is guttered inside the pane
+and rounded, and the same card is on screen at the opening (with the greeting and the composer
+inside it) — measured by opening a session, then a draft, then reopening the session.
+
+## P. Six corners for the notices, and the preference that says which
+
+Notifications used to be welded to the bottom centre. The ask: top-right by default, and
+configurable — `top`, `bottom`, `top-left`, `top-right`, `bottom-left`, `bottom-right`.
+
+The choice is a host preference, not `localStorage`: `notif_place` in `crates/engine/src/prefs.rs`,
+group `appearance`, default `top-right`, with the vocabulary validated at the store (`test_pref`
+rejects nonsense) so a phone and a desktop window read the same answer. The page falls back to
+`top-right` for a value it does not recognise, because a store written by a newer build is not a
+reason to position a notice by `undefined`.
+
+Appearance grew a **Notifications** section that renders that preference, and the control is six
+little rectangles with a dot where the notices would land — the setting shows its own meaning. A
+plain `Segmented` of the six words would have worked; it would also have made someone read six
+words to find a corner.
+
+CSS is six placement rules on one container, and the entrance animation had to move off
+`transform`: `.toast` used to sit at the bottom centre with `transform: translateX(-50%)`, while
+the entrance keyframes (`cwoffee-rise`) animate `transform: none` with a fill — so the centring
+was discarded by the animation that was supposed to be decorative, and the toast's final position
+was silently whatever the keyframes said. The centring now rides the `translate` property and the
+animation animates `translate`, so both are the same property and neither can clobber the other.
+
+`.ctl-note` — the quiet explanation under a control ("this chat can no longer reach the web",
+"this conversation has no folder") — is deliberately **not** promoted into a corner notice. The
+`notif-place` check asserts that: it reads notes whose class list is exactly `ctl-note` and fails
+if one of them is standing in the fixed stack. Control-local feedback belongs under the control it
+explains; only app-level toasts travel.
+
+The check drives the real setting (`setPref` → `prefs_set` → reload), fires a toast for each of the
+six values, measures the toast's bounding box against the viewport for each, and restores the
+original value — reporting it rather than leaving the window in the last tested state:
+
+```
+note place ok (six places land where they say — default top-right, this window read
+top-right from the host; last measured bottom-right@723/14/14/956)
+```
+
+## Q. Three checks that had been blaming the app for the harness
+
+The full suite went red in new places after this batch, and each of the three turned out to be a
+check grading its own scaffolding rather than the product.
+
+1. **`titling`: "no caret was ever painted".** The poll counts polls in which the caret was on
+   screen, and fails when that count is zero — which conflates "the name swapped in" (a real bug)
+   with "this window never drew the caret between two frames" (the window's frame budget). Two new
+   counters tell them apart: polls where the row was on screen, and polls where the app was holding
+   an in-flight name for this conversation (`namingId === sid && namingText`). If the state was
+   held and the pixels never landed, the run says so and keeps the claims it can make.
+
+2. **`titling`: "no clock for the ordering claim".** The comparison used `turnStartTs` — the app's
+   own memory of when the turn started — read after the turn. The app is entitled to let that go:
+   a host-state sync that says "nothing is running" clears it, and the sync usually wins. The group
+   had already been recording its own clock, `busyFirst`, and never using it. The claim is now
+   graded against the clock the check owns, with the poll's own 10ms error bar stated in the
+   constant rather than hidden: the pi core lost the old claim on the first try, the rust core lost
+   it on the second.
+
+3. **`drafts`: "the telemetry panel shows no context row"** (a downstream check). The telemetry
+   panel is the footer popover, and the popover is a *toggle*. A check that ran while a popover was
+   already standing clicked it shut and then reported a missing row. The check now puts the screen
+   to rights first (close the menu, close Settings), waits for the row instead of assuming a
+   quarter of a second, and quotes what the popover *did* say when the row is still missing.
+
+The lesson is the same one the suite keeps relearning: **a claim needs a clock and a scope that the
+check owns**, and a failure message has to name which side of the seam broke. Both `titling`
+messages and the `drafts` one now do.
+
+## R. A view wiped by its own refresh — the flake that was a bug
+
+`view stayed empty after sending (viewId=16 msgCount=0 busy=false)` failed two of four full runs
+and looked like a layout regression. It was not, and the old message could not say what it was, so
+the first change was to make the message tell: read the record for the conversation that was just
+sent before failing.
+
+```
+view stayed empty after sending (viewing 16, the conversation just sent is 16, the record
+holds 2 row(s) for it, msgCount=0, busy=false)
+```
+
+Record has it, screen has nothing: the view was wiped by a refresh, not by a missing write. The
+rust core persists a turn **when it ends**, so a `resyncView` whose read goes out during a turn can
+hand back an empty page *after* that turn finished. `resyncView` clears the transcript before it
+loads, so painting that stale page removes a conversation that exists — and nothing repaints it.
+The code already knew about the mid-turn case (`if (turnSessionId === id)` replays the live buffer)
+and about the duplicated-question case (`storeHoldsSentDraft`), but nothing covered a read that
+landed just after the end.
+
+The fix is one more read whenever a page comes back with nothing:
+
+```ts
+if (rows.length === 0) {
+  // A page that comes back empty is the one page a turn in flight can invalidate …
+  again = await loadTranscript(id, keepRows)
+  if (again.length)
+    pageLog(`resync: conversation ${id} looked empty and was not — …`)
+  rows = again
+}
+```
+
+The cheaper witness would have been `Session.message_count` on the sidebar row, and the first
+version used it — which is why the first fix did nothing: the conversation being loaded was created
+by the very send now in flight, so it is not in the list this window holds yet. Believing a counter
+that has not caught up is the same mistake as believing a page that has not caught up.
+
+It is not exotic: one full rust-core run logged the retry **four times** (`16`, `17`, `35`, `36`),
+each time a conversation the person would have seen go blank. The pi core logs none, for the reason
+already written down in `storeHoldsSentDraft`: the bridge writes the user's row *before* asking the
+model, so there is no window where the record is empty behind a finished turn. The race is shaped
+by which core persists when — which is also why it survived as a flake instead of a bug report.
+
+## What this batch changed
+
+- `main` wraps its right-hand content in `.panecard`; the transcript surface, the composer strip and
+  the folder line are one card, on the opening screen too. `.composerbar` is a class now;
+  `.scroller` paints nothing.
+- `notif_place` (host preference, default `top-right`, six values), a Notifications section in
+  Appearance with six picture-of-the-corner controls, and six placement rules in CSS. The toast
+  entrance animates `translate` so it can no longer eat its own centring.
+- `resyncView` re-reads a conversation that hands back an empty page.
+- Three selftest claims re-pointed at clocks and scopes they own; two failure messages rewritten to
+  name the side of the seam that broke.
+- New checks: `panecard` (containment, gutter, rounded edge, and the same card on the greeting
+  screen) and `notif-place` (six placements measured from the toast's own box, `.ctl-note` rows kept
+  out of the fixed stack, the setting restored afterwards).
+
+## Full pass, both cores
+
+```
+rust core: SELFTEST ok — 71 claims, including
+  card ok (one surface 900x709 inside a 932px pane, holding conversation + composer + folder row;
+    16px of gutter; the same card on the opening screen)
+  note place ok (six places land where they say — default top-right, this window read top-right
+    from the host; last measured bottom-right@723/14/14/956)
+  titling ok … first name paint 37117ms against the page learning the turn was running at 37250ms
+  resync: conversation 16 looked empty and was not — 2 row(s) came back when the page was read a
+    second time   (×4 in one run)
+pi core:   SELFTEST ok — 73 claims, same two groups, no resync retries needed
+cargo test --workspace: ok, 0 failing (engine 519, gateway 38, bridge 35, pi fixtures 16, mock 10)
+svelte-check: 0 errors, 0 warnings · vite build: built
+wire-names: OK (unchanged: three desktop/gateway-only verbs reported as notes)
+```
+
+## Lessons
+
+1. **A card that ends where the transcript ends is not a card.** The right-hand surface has to cover
+   everything a person reads and types on that side, including before there is anything to read.
+2. **An animation that animates `transform` will eat a centring that also lives in `transform`.**
+   Put the static offset and the motion on one property, or animate `translate` and keep
+   `transform` for something else.
+3. **A failure message is a debugging tool, not a verdict.** `view stayed empty after sending` cost
+   four runs; `the record holds 2 row(s) for it, msgCount=0` found the bug in one.
+4. **A flake that repeats is a bug with a timing profile.** Two of four full runs, four hits in a
+   single run: the retry is not a workaround, it is the fix for a read that can be older than the
+   write it is waiting for.
+5. **Do not grade motion or ordering on a clock the app owns.** The app is free to clear its memory
+   of a turn; the check has to keep its own.
+6. **A counter that describes a page can be as stale as the page.** The sidebar's `message_count`
+   does not know about the conversation this send just created.
