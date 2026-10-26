@@ -361,6 +361,17 @@ impl Agent {
         self.provider.as_ref()
     }
 
+    /// Point this agent at a different endpoint without rebuilding it.
+    ///
+    /// The endpoint is not a preference the running app may quietly disagree with: the address a turn
+    /// is sent to is written by the model screen, and a host that could not take it up would force a
+    /// restart for something that is one field in one struct. The conversation history stays where it
+    /// is — this swaps who is asked, not what was asked — which is also why the two fields are not
+    /// touched here: a new endpoint does not get to decide what the person already said.
+    pub fn set_provider(&mut self, p: Arc<dyn Provider>) {
+        self.provider = p;
+    }
+
     pub fn set_reasoning(&mut self, r: crate::provider::Reasoning) {
         // The prompt carries a line for the top levels, so a level change also
         // rewrites the system message. Doing both here is the point: a request

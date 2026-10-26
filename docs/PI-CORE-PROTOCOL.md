@@ -122,11 +122,76 @@ The gateway (`crates/gateway/src/lib.rs`) speaks `{cmd,args,id}` → response, p
 | `set_reasoning`, `set_model`, `list_models` | bridge: `set_thinking_level`, `set_model`, `get_available_models` |
 | `set_workspace`, `pick_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label` | **bridge process pool** (no pi verb) |
 | `search_messages`, `search_settings` | our SQLite index (pi has no cross-session search) |
+| `edit_message` | ours: the cwoffee store row, then a **rewind** — bridge rewrites pi's session file and reopens it (see below) |
 | `share_markdown`, `render_report`, `gpu_report`, `boot_log`, `open_file`, `search_probe`, `set_search_backend`, `migration_notes` | ours — product features, not core features (OPEN QUESTION 3) |
 
 **Also still ours, unchanged:** watch vs drive tokens, token-not-in-URL, loopback default,
 approvals failing closed on the engine timeout. Those are cwoffee's security posture and pi
 does not touch them.
+
+### `edit_message`: the record and pi's memory are two ledgers
+
+Correcting a message the person already sent has to change **both** places the conversation lives.
+The cwoffee SQLite rows are the transcript every screen reads. pi's JSONL session file is what the
+model actually answers from. Neither knows about the other, and a feature that edits one and not
+the other produces a transcript whose next answer refers to messages nobody can see.
+
+The order is fixed, and it is the whole feature (`crates/engine/src/edit.rs`): check → cut the
+record → hand the host a rewind (pi: rewrite the JSONL as a prefix, then `switch_session` on the same
+path so pi rereads it; the Rust core: rebuild its prompt from the trimmed history) → put the
+corrected words through the ordinary send path. Re-sending before the rewind would answer from the
+stretch that was just deleted.
+
+pi has no "rewind the current branch" RPC, so the bridge prunes the file: keep the header and the
+prompt scaffolding, keep entries up to the *n*th user entry, where *n* is the number of user rows
+the cwoffee store still holds (`crates/bridge/src/rewind.rs`). Write to a temp name and rename, so
+a crash cannot leave a half-written thread; then `switch_session`, then re-absorb state, then put the
+conversation's thinking level back — the entry that recorded it may have been in the stretch that
+just went, and pi applies thinking per session, not per conversation.
+
+Two things that choice depends on, both worth knowing before this doc goes stale:
+
+* **The bridge does not branch pi sessions today.** File order equals conversation order, so "the
+  *n*th user entry" is the right cut. If branching ever lands, the cut has to walk the tree by
+  `leafId` instead of counting lines — see `docs/session-format.md` in the pi package.
+* **Only pi's own user entries count.** Compaction and scaffolding entries are pi's, not the
+  person's; counting them cuts the thread in the wrong place. The prune asserts on that.
+
+### Chat mode's Web grant: pi decides tools at exec, so a switch is a process lifecycle
+
+A chat conversation starts with **no tools at all**. The composer's `Web` chip grants exactly two —
+`web_search` and `web_fetch` — and nothing else, ever: a chat that can reach the web still cannot read
+a file or run a command. Three things have to change together for the chip to be true, and pi will
+not let the bridge change any of them on a live process:
+
+| thing | what is set | why this half alone is a lie |
+|---|---|---|
+| what pi **declares** | `--tools web_search,web_fetch` | `--tools` with **plain names replaces** pi's whole selection; a denylist (`-read,-bash,…`) would leave pi's other tools live behind a prompt that says two |
+| what the cwoffee extension **registers** | `CWOFFEE_TOOL_ALLOW=web_search,web_fetch` | registration is what makes a tool callable. Narrow the declaration and not the registration and the model is told about two tools while ten are reachable |
+| what the model is **told** | `Persona::CHAT_WEB_PROMPT` instead of `CHAT_PROMPT` | a tool nobody describes is a tool the model does not reach for; and a denial with an exception bolted onto the same sentence is the shape that stops a model searching, so the two prompts are separate texts (`Persona::chat_prompt(web)`) |
+
+Because pi reads all three at exec, `set_web` (and entering a conversation whose stored grant
+differs) **reaps the child**: the next turn starts a new process mounted that way. That is paid for
+once per switch with a cold prefix cache, and the note the app shows says so rather than letting the
+person wonder why the next answer was slow. `HostState.web_tools` carries the receipt — `no tools at
+all`, `web_search, web_fetch`, or the coworker's set — so a check can hold the chip and the actual
+argv against each other instead of trusting that the code which mounts a tool also told the prompt.
+
+The same `no-tools-at-exec` fact is why a `--no-tools` launch now clears `launch.tools` rather than
+keeping the cloned cowork denylist: a field that holds a list pi was never given is a field the next
+reader will believe.
+
+### `provider_set_primary`: repointing the endpoint is also a re-launch
+
+The app has no default endpoint any more, so first run goes through a setup flow that writes one. On
+the pi core there is no RPC that re-points a running pi at a different server: the bridge writes the
+top-level `[provider]` keys, re-mounts the provider rows pi reads from its endpoint registry, and
+reaps the child so the next turn starts against the new address. `HostCmd::ReloadProvider` is deferred
+while a turn is running — finishing a sentence begun somewhere else is not an answer — and the
+transport layer refuses the verb outright while the host is busy. `CWOFFEE_URL` still layers over the
+file at boot, which is why every "is an endpoint configured?" question goes through
+`config::load_effective`: asking the file alone can tell a scripted run it is unconfigured while it is
+busy answering.
 
 ---
 

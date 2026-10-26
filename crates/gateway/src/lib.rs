@@ -831,16 +831,20 @@ const AUDITED: &[&str] = &[
     "switch_session",
     "clear_session",
     "rename_session",
+    "edit_message",
     "set_session_persona",
     "delete_session",
     "set_model",
     "set_mode",
     "set_reasoning",
     "set_persona",
+    "set_session_web",
+    "provider_set_primary",
     "compact",
     "set_workspace",
     "add_workspace",
     "remove_workspace",
+    "set_workspace_color",
     "respond_approval",
     "respond_question",
     "set_search_backend",
@@ -1153,6 +1157,38 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .map_err(|e| e.to_string())?;
             serde_json::to_value(page).map_err(|e| e.to_string())
         }
+        // The bytes behind one message's attachments, for a reader who opens a picture that arrived
+        // in an earlier conversation. A read, and watch-role like `session_messages`: a device that
+        // can read the text of a conversation can show its pictures too. It is bounded by the row
+        // being asked about, which is why the transcript page itself stays payload-free.
+        "message_attachments" => {
+            let mid = arg_i64(&args, "message_id")?;
+            let atts = h.store.message_attachments(mid).map_err(|e| e.to_string())?;
+            serde_json::to_value(atts).map_err(|e| e.to_string())
+        }
+        // Correct one of your own messages, or take the conversation back to it and send it again.
+        // The same command the desktop answers, with the same rules: everything the verb means lives
+        // in `cwoffee_engine::edit::apply_and_send` — the check, the cut of the record, taking the
+        // host's memory back and the re-send, in that order, because a host that re-sent before it
+        // rewound would answer out of the conversation the person has already cut down.
+        "edit_message" => {
+            need_drive(role)?;
+            let req = cwoffee_engine::EditReq {
+                session: arg_i64(&args, "session")?,
+                message_id: args.get("message_id").and_then(|v| v.as_i64()),
+                from_end: args.get("from_end").and_then(|v| v.as_u64()).map(|n| n as usize),
+                shown: arg_str(&args, "shown")?,
+                next: arg_str(&args, "next")?,
+                resend: args.get("resend").and_then(|v| v.as_bool()).unwrap_or(false),
+            };
+            // Same order, same refusal as the desktop command — and the same trap: serialising the
+            // `Result` would answer a refusal with `{"Err": ...}` shaped nothing like the payload the
+            // client reads, and a phone would report "saved" for an edit that changed no rows.
+            let out = cwoffee_engine::edit::apply_and_send(h.store.as_ref(), h.host.as_ref(), &req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
         "migration_notes" => Ok(json!(h.migration_notes)),
 
         // Everything a cold client needs, in one round trip.
@@ -1295,6 +1331,71 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             // Read-only, and from the registry rather than a copy: the list a client
             // shows is the list the model is offered.
             Ok(json!(h.host.tools_view()))
+        }
+        "provider_set_primary" => {
+            need_drive(role)?;
+            // Repointing the app's endpoint over the network: audited, drive-only, and refused while
+            // a turn runs — the same reason the folder move and the web switch are refused. The token
+            // for an endpoint is written as given and never echoed back in the reply.
+            if h.host.state().busy {
+                return Err(
+                    "a turn is running, and it is being answered by the endpoint it started with.                      Stop it first — repointing the app mid-answer would finish a sentence begun                      somewhere else.".into(),
+                );
+            }
+            let base_url = arg_str(&args, "base_url")?;
+            let api_key = args
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let kind = args
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let said = cwoffee_engine::config::set_primary_endpoint_with(
+                &h.config_path, &base_url, &kind, &api_key,
+            )?;
+            h.host.reload_provider()?;
+            Ok(json!({ "note": said }))
+        }
+        "set_session_web" => {
+            need_drive(role)?;
+            // Grant a chat conversation the two web tools, or take them back. Drive-only and audited:
+            // it decides whether the model process gets network reach. Every check lives in the
+            // engine's `set_conversation_web`, so a phone is refused in exactly the desktop's words.
+            let session = arg_i64(&args, "session")?;
+            // A missing `on` is refused rather than read as false: "turn the web off" is a change of
+            // state, and a client that forgot the key should be told, not obeyed.
+            let on = args
+                .get("on")
+                .and_then(|v| v.as_bool())
+                .ok_or("set_session_web needs `on`: true or false")?;
+            cwoffee_engine::host::set_conversation_web(
+                h.store.as_ref(),
+                h.host.as_ref(),
+                session,
+                on,
+            )
+            .map(|note| json!({ "note": note }))
+        }
+        "about" => {
+            // Read-only, and watch-role is enough: what build this is, which core answers, and where
+            // the person's own files live. A phone filing a bug report needs exactly these facts.
+            let (cfg, _) = cwoffee_engine::Config::load(Some(&h.config_path)).unwrap_or_default();
+            let conversations = h.store.conversation_count().unwrap_or(0);
+            let messages = h.store.message_total().unwrap_or(0);
+            let mut a = cwoffee_engine::about::from_config(
+                &cfg,
+                &h.config_path,
+                conversations,
+                messages,
+            );
+            a.core = h.host.core_id().to_string();
+            a.config_path = h.config_path.display().to_string();
+            a.db_path = h.store.db_path();
+            a.thread_store = h.host.thread_store();
+            serde_json::to_value(a).map_err(|e| e.to_string())
         }
         "set_persona" => {
             need_drive(role)?;
@@ -1471,6 +1572,19 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             let n = h
                 .store
                 .set_workspace_label(&raw, label)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(n > 0))
+        }
+        "set_workspace_color" => {
+            need_drive(role)?;
+            let raw = arg_str(&args, "path")?;
+            let color = args.get("color").and_then(|v| v.as_str()).unwrap_or("");
+            // A colour on the sidebar row, spelled #rrggbb or empty to clear. The store refuses
+            // anything else, so a phone cannot put arbitrary text into a style attribute on the
+            // desktop through this door.
+            let n = h
+                .store
+                .set_workspace_color(&raw, color)
                 .map_err(|e| e.to_string())?;
             Ok(json!(n > 0))
         }
@@ -2104,6 +2218,36 @@ mod tests {
         .await
         .expect("renaming a row the client can see is allowed");
         assert_eq!(ok.as_bool(), Some(true));
+        // A colour is the same class of edit as a rename: it says how the person arranged their
+        // own list, so a driver may write it and a watcher may not.
+        let col = run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "#3d8f6f" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("colouring a row the client can see is allowed");
+        assert_eq!(col.as_bool(), Some(true));
+        let col_watch = run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "#3d8f6f" }),
+            Role::Watch,
+            &h,
+        )
+        .await;
+        assert!(col_watch.is_err(), "a watcher may read the coloured list, not recolour it");
+        let col_bad = run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "red; background:url(x)" }),
+            Role::Drive,
+            &h,
+        )
+        .await;
+        assert!(
+            col_bad.is_err(),
+            "a value that is not a colour is refused at the record, not filtered on the way out"
+        );
         let out = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
             .await
             .unwrap();

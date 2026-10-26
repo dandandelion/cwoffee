@@ -87,13 +87,14 @@ stripped from the address bar.
 
 Two roles, enforced server-side per command:
 
-* **watch** - `session_state`, `list_sessions`, `session_messages`,
-  `search_messages`, `migration_notes`, `list_workspaces`. Read-only.
+* **watch** - `session_state`, `list_sessions`, `session_messages`, `message_attachments`,
+  `search_messages`, `migration_notes`, `list_workspaces`, `about`. Read-only.
 * **drive** - everything that changes state: `start_turn`, `cancel_turn`,
   `respond_approval`, `respond_question`, `set_mode`, `set_reasoning`, `new_session`,
   `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
   `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`,
-  `export_markdown`.
+  `set_workspace_color`, `set_session_web`, `provider_set_primary`,
+  `export_markdown`, `edit_message`.
 
 `share_markdown` takes `{ session }` and returns `{ name, markdown }`: that conversation as a
 Markdown document, built from **the workspace stored on that session** rather than the host's
@@ -101,10 +102,69 @@ current one, and **written nowhere**. The client decides where it goes - the des
 a save dialog, a phone downloads. It runs no model call, moves no host, and refuses a session id
 that does not exist.
 
+`edit_message` takes `{ session, message_id?, from_end?, shown, next, resend }` and returns
+`{ note, dropped, resending, visible }` - or an error, which is how a refusal arrives. One verb
+for both "save these words in place" and "take the conversation back to that message and send
+them again", because the second is the first plus a cut and a re-send, and splitting it into two
+round trips would let another device answer in between. It is a drive verb for the obvious reason:
+it rewrites and deletes rows of the record, and it moves what the model can see.
+
+The arguments exist to stop a stale window editing the wrong message. `message_id` when the client
+knows the row, otherwise `from_end` - which of the person's own messages counting back from the
+newest - and `shown`, the text that window is looking at. If `shown` does not match what that row
+says now, nothing is changed and the error says what it says instead. `resend` cuts that row and
+everything after it, hands the host a rewind, and puts the corrected words back through the normal
+send path. Refused while a turn is running: the cut and the re-send are not atomic against a turn
+in flight. `visible` says whether the re-sent row was in the store by the time the verb answered,
+which is what makes a client's reload-after-edit safe.
+
+`message_attachments` takes `{ message_id }` and returns `[{ mime, data_b64, name }]` - the bytes
+behind one stored message. It exists because a transcript page deliberately carries name and size
+only: reading a conversation should not drag every attached megabyte across the wire for pictures
+nobody is looking at. That choice is only honest if the picture is reachable when someone asks, and
+this is that reach - one row per click, watch-role like the text of the conversation it belongs to.
+The desktop answers the same verb with the same argument name; `rename_all = "snake_case"` on the
+command is what keeps the two spellings identical, and `scripts/wire-names.mjs` now fails if they
+drift.
+
 It is not drive-only and not audited, because it is a read: a watch token can already page through
 the same conversation with `session_messages`. It used to be `export_markdown`, drive-only, and it
 wrote the file into `<workspace>/exports/`. A later turn then found a document it had not made -
 and offered to delete it - so the write left the feature entirely.
+
+### Four verbs that came with the beta pass
+
+`set_session_web` takes `{ session, on }` and returns `{ note }`. The Web switch on a chat's composer
+is not a UI preference: it decides which tools the model process is mounted with and which system
+prompt it is told, so the answer to "can this conversation reach the web?" has to live in the record
+(`sessions.web_on`) and be readable by the second window that opens the same chat. Both transports
+call the same function, `cwoffee_engine::host::set_conversation_web`, so the two refusals are worded
+identically everywhere: a turn that is running keeps the tools it started with, and a cowork
+conversation was never without them. It is audited, because it changes what the model can do.
+
+`set_workspace_color` takes `{ path, color }` and returns a boolean. The sidebar's folder colours are
+stored on the workspace row rather than in one window's `localStorage`, so a phone and a desktop show
+the same arranged list; the path stays the fact and the colour is decoration. `color` is validated
+where it is written - empty clears, otherwise exactly `#rrggbb`, and anything else is refused with a
+message rather than stored - because that string ends up in a `style` attribute on another machine.
+Unlike `set_workspace_label`, it creates the workspace row if there is none: if the sidebar shows a
+folder because conversations live in it, colouring the row you are looking at has to be possible.
+
+`provider_set_primary` takes `{ base_url, api_key?, kind? }` and returns `{ note }`. It exists because
+this app no longer ships a default endpoint: a first run has no address to talk to, and inventing
+`127.0.0.1:8090` meant either a hang waiting on a server that was never there, or a conversation with
+a model nobody chose. The writer refuses nonsense before touching the file (no scheme, no host, an
+unknown kind) and then tells the host to reload, so the address is live without restarting the app.
+Refused while a turn is running - an answer half-finished from one endpoint and finished from another
+is one sentence with two authors.
+
+`about` takes nothing and returns the facts a bug report needs: version, which core is answering
+(`core`, from the host itself, not from `CWOFFEE_CORE`, which only says what was asked for), the model
+and endpoint the effective config answers from, conversation and message counts, and the paths of the
+config, the SQLite record and - on the pi core - the directory of the model's own thread files. The
+gateway token is deliberately not in the payload, and neither are endpoint API keys: this is a
+read-only verb reachable by a watch token, and "which build am I running" must not become a way to
+read a secret.
 
 `new_session` takes an optional `workspace`, which the engine validates before the
 session is created; a browser can therefore start a session inside a named folder

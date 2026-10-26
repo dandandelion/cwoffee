@@ -488,6 +488,37 @@ pub fn provider_add(
     Ok(state.host.provider_add(&state.config_path, &req, &caps))
 }
 
+/// Point this app at the endpoint it answers from — the top-level `[provider]` address, which is the
+/// one choice both cores agree on (see `cwoffee_engine::config::set_primary_endpoint_with`).
+///
+/// This is the "add a model" first step: an install with no endpoint has nothing to answer with, and
+/// until this verb existed the only way to say where the model lives was to edit `config.toml` by hand.
+#[tauri::command(rename_all = "snake_case")]
+pub fn provider_set_primary(
+    state: tauri::State<'_, AppState>,
+    base_url: String,
+    api_key: Option<String>,
+    kind: Option<String>,
+) -> Result<String, String> {
+    if state.host.state().busy {
+        return Err(
+            "a turn is running, and it is being answered by the endpoint it started with. Say stop              first — repointing the app mid-answer would finish a sentence begun somewhere else."
+                .into(),
+        );
+    }
+    let said = cwoffee_engine::config::set_primary_endpoint_with(
+        &state.config_path,
+        &base_url,
+        kind.as_deref().unwrap_or(""),
+        api_key.as_deref().unwrap_or(""),
+    )?;
+    // Write it, then hand it to the running host. The order matters: a host that took up an endpoint
+    // the file does not name would be reset by the next start, and the person would be told a change
+    // was made that outlived neither the turn nor the reboot.
+    state.host.reload_provider()?;
+    Ok(said)
+}
+
 #[tauri::command]
 pub fn provider_remove(state: tauri::State<'_, AppState>, name: String) -> Result<String, String> {
     Ok(state.host.provider_remove(&state.config_path, &name))
@@ -838,6 +869,72 @@ pub fn set_workspace_label(
     Ok(n > 0)
 }
 
+/// Grant or take away web reach for one chat conversation.
+///
+/// One sentence of the answer is the record of what happened; the state itself is read back from
+/// `session_state`, which is where every client's idea of the switch comes from. The checks — is this
+/// a chat, is a turn running in it — live in the engine, so a phone on the gateway is refused in the
+/// same words for the same reason.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_session_web(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    on: bool,
+) -> Result<String, String> {
+    cwoffee_engine::host::set_conversation_web(
+        state.store.as_ref(),
+        state.host.as_ref(),
+        session,
+        on,
+    )
+}
+
+/// What this build is and where the person's files live. See `cwoffee_engine::About`.
+#[tauri::command]
+pub fn about(state: tauri::State<'_, AppState>) -> cwoffee_engine::About {
+    let (cfg, _) = cwoffee_engine::Config::load(Some(&state.config_path)).unwrap_or_default();
+    let conversations = state.store.conversation_count().unwrap_or(0);
+    let messages = state.store.message_total().unwrap_or(0);
+    let mut a = cwoffee_engine::about::from_config(&cfg, &state.config_path, conversations, messages);
+    a.core = state.host.core_id().to_string();
+    a.config_path = state.config_path.display().to_string();
+    // Asked of the store, not recomputed from the environment: the page is answering "is my history
+    // at that path?", and only the thing holding the file open can say what it opened.
+    a.db_path = state.store.db_path();
+    a.thread_store = state.host.thread_store();
+    let g = state.gateway.status();
+    a.gateway = if !g.running {
+        "off".to_string()
+    } else {
+        format!(
+            "{}:{} · {} device{}",
+            g.host,
+            g.port,
+            g.clients,
+            if g.clients == 1 { "" } else { "s" }
+        )
+    };
+    a
+}
+
+/// Colour a folder's mark in the sidebar. Empty clears it.
+///
+/// Same class of edit as the label: it changes what the record says about how the person arranged
+/// their own folders, which is why it is a stored field and not localStorage — the phone and a
+/// second window see the same coloured list.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_workspace_color(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    color: String,
+) -> Result<bool, String> {
+    let n = state
+        .store
+        .set_workspace_color(&path, &color)
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
 /// Drop a folder from the sidebar. Sessions that live in it are untouched, so it
 /// comes back if they do.
 #[tauri::command]
@@ -1026,6 +1123,62 @@ pub async fn list_models(
 #[tauri::command]
 pub fn set_model(state: tauri::State<'_, AppState>, model: String) {
     state.host.send(HostCmd::SetModel { model, persist: true });
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn edit_message(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    message_id: Option<i64>,
+    from_end: Option<usize>,
+    shown: String,
+    next: String,
+    resend: bool,
+) -> Result<serde_json::Value, String> {
+    eprintln!(
+        "[cwoffee] edit_message (desktop): session={session} id={message_id:?} from_end={from_end:?} \
+         resend={resend} shown={} chars -> {} chars",
+        shown.chars().count(),
+        next.chars().count()
+    );
+    let req = cwoffee_engine::EditReq {
+        session,
+        message_id,
+        from_end,
+        shown,
+        next,
+        resend,
+    };
+    // Everything the verb means is on the other side of this call, and the phone's gateway makes the
+    // same call with the same words: the check, the cut, the rewind and the re-send, in that order.
+    // The refusal comes back as an error, not as a field: this command used to serialise the whole
+    // `Result`, which handed the client `{"Err": "…"}` where it reads `{note, dropped, …}`, so a
+    // window asking "which message did you change?" got nothing and said "saved" anyway.
+    let out = cwoffee_engine::edit::apply_and_send(state.store.as_ref(), state.host.as_ref(), &req)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+/// The bytes behind one message's attachments, for a reader who opens a picture that arrived in an
+/// earlier conversation.
+///
+/// A transcript page carries name and size only — deliberately, because reading a conversation
+/// should not drag every attached megabyte across IPC for pictures nobody is looking at. This is the
+/// other half of that choice: when someone does click one, the single row they asked about comes
+/// back with its payload.
+///
+/// `rename_all` because the parameter is two words: Tauri's default would demand `messageId` while
+/// the gateway reads `message_id` straight off the frame, and the UI is written once.
+#[tauri::command(rename_all = "snake_case")]
+pub fn message_attachments(
+    state: tauri::State<'_, AppState>,
+    message_id: i64,
+) -> Result<Vec<cwoffee_engine::provider::Attachment>, String> {
+    state
+        .store
+        .message_attachments(message_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

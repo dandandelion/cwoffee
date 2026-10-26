@@ -505,6 +505,8 @@ async fn main() -> anyhow::Result<()> {
             cfg_path: Some(config_path.clone()),
             max_tool_iters: appcfg.max_tool_iters(),
             compact_timeout: appcfg.compact_timeout(),
+            // A chat starts with no network reach at boot; the composer's Web chip grants it, per conversation.
+            web: false,
         })
         .await?;
         // Not a claim about tools or extensions: those are chosen per process by the

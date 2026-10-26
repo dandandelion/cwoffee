@@ -155,6 +155,22 @@ function specs(): any {
  */
 const TOOL_MODE = (process.env.CWOFFEE_TOOL_MODE ?? "full").trim().toLowerCase();
 
+/**
+ * The only tools this process may have at all, when the host wants a subset.
+ *
+ * A chat with Web switched on is the case that asked for it: the person granted that conversation
+ * `web_search` and `web_fetch`, and nothing else. `--tools` on the command line decides what pi
+ * *declares*; this decides what is *registered*, and registration is what makes a tool callable.
+ * Narrowing only the first would leave the other nine tools reachable by a model that was told it
+ * had two — which is not a smaller assistant, it is the same assistant with a hidden wardrobe.
+ *
+ * Empty (the usual case) means "everything the registry has", so cowork sessions are unaffected.
+ */
+const ALLOW = (process.env.CWOFFEE_TOOL_ALLOW ?? "")
+	.split(",")
+	.map((s) => s.trim())
+	.filter(Boolean);
+
 /** Tools the registry mounts and lean mode keeps out of the prompt. What is withheld is the
  *  *declaration* only: the tool stays active, and therefore callable, for the whole session.
  *
@@ -202,7 +218,27 @@ export default function (pi: ExtensionAPI) {
 		return;
 	}
 
-	for (const spec of tools) registered.add(spec.name as string);
+	// The host's allow-list, applied before anything is registered. A name the registry does not
+	// have is said out loud rather than dropped: a session where the model was promised a tool the
+	// bridge cannot supply is a bug in the bridge, and it should show up in the log that the person
+	// is pointed at, not as a mysterious "I cannot do that" from the model.
+	let mounted = tools;
+	if (ALLOW.length) {
+		const missing = ALLOW.filter((n) => !tools.some((t: any) => t.name === n));
+		if (missing.length) {
+			console.error(
+				`[cwoffee-tools] CWOFFEE_TOOL_ALLOW names ${missing.join(", ")} and the registry has no such tool`,
+			);
+		}
+		mounted = tools.filter((t: any) => ALLOW.includes(t.name as string));
+		if (!mounted.length) {
+			console.error(
+				`[cwoffee-tools] the allow-list (${ALLOW.join(", ")}) matched none of the registry's ${tools.length} tool(s); this session has no tools`,
+			);
+		}
+	}
+
+	for (const spec of mounted) registered.add(spec.name as string);
 
 	// Which set is always declared comes from the registry through `cwtool specs`; what the
 	// bridge wants is in `CWOFFEE_TOOL_MODE`. Nothing here is a decision of its own.
@@ -221,7 +257,7 @@ export default function (pi: ExtensionAPI) {
 		leanOn ? (spec.discoverable ?? []).filter((n: unknown) => typeof n === "string") : [],
 	);
 
-	for (const spec of tools) {
+	for (const spec of mounted) {
 		const name = spec.name as string;
 		pi.registerTool({
 			name,

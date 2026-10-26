@@ -1,5 +1,10 @@
 # UI tasks, 2026-10-25 — working doc
 
+Two batches ran today. Items 1-5 are the morning's; the six that came after those were installed
+are tracked under their own heading further down ("Second batch"), lettered A-F because the
+morning's numbering — which the user's own list skipped around — does not continue. Do not merge
+the two status tables: each batch was verified against its own passes.
+
 Tracked here on purpose: the user asked for these five and said *"save this into a markdown doc,
 and track progress there, update each item so that even after compaction, the details are not
 lost."* Update the **Status** line of each item as it changes, and add a **Note** line whenever a
@@ -262,3 +267,438 @@ Reference images the user gave (kept here so they are not lost):
   then `New workspace` and `No workspace selected`.
 - `/tmp/pi-clipboard-21781a8f-40d1-4fe1-9d29-a342f87aa707.png` — the Qoder sidebar footer to copy
   the layout of: profile picture, name, then right-aligned icon buttons.
+
+---
+
+# Second batch, same day — the six that came after the install
+
+Asked after items 1-5 were installed and in use. Same rule as above: each item says what it turned
+out to be, not just what was typed.
+
+| # | Item | Status | Verified by |
+|---|---|---|---|
+| A | Telemetry panel trimmed to the two rates a person can act on | **done** — both cores | `telemetry-pair` |
+| B | Copy and Edit on my own messages; "save and send again" resets the conversation from that message | **done** — both cores, end to end | `user-message` (the control), `edit-resend` (the whole path through the host), 3 tests in `engine::edit`, 2 in `store`, 5 in `bridge::rewind` |
+| C | The dark/light icon snaps; it should turn | **done** | `theme-icon` |
+| D | Settings opens in the bottom-right corner, not centred | **done** | `settings-centred` |
+| E | A setting's description and its selector were on separate lines | **done** | `settings-rows` |
+| F | Keyboard shortcuts move to a "Help" settings page, drawn as key caps | **done** | `help-keys` |
+
+## A. The telemetry panel answers two questions, and stops
+
+It held ten readouts, a frame ledger and a GPU line. Two of them were questions anyone could act
+on — *how fast does this endpoint answer*, *how fast does it read what I sent* — and both are the
+endpoint's own token counts averaged over the conversation's recent turns (up to `ROLLING_TURNS`,
+ten). Everything else was either a second, noisier answer to the same two questions (a live decode
+rate, "effective" and "raw" prefill, time-to-first-token, the turn's wall clock, the
+speculative-accept rate, prompt/completion counts, compactions) or diagnostics for this app's own
+rendering and host GPU. The diagnostics are still in the log the board reads; the panel is where a
+person looks while deciding whether an endpoint is too slow, so it now says two numbers and states
+on its own face what it averaged. `GpuReport` and its boot fetch left the UI with it.
+
+## B. Correcting a message you already sent
+
+The part that is not a text box: **the conversation lives in two places**, and both have to change.
+The cwoffee SQLite rows are the transcript every screen reads. The model's memory is separate —
+the Rust core's in-process agent history, the pi core's JSONL session file — and neither one knows
+about the other. Editing only the record produces a conversation whose next answer refers to
+messages nobody can see.
+
+So one verb, one order, both transports (`crates/engine/src/edit.rs`, called by the desktop command
+and the gateway arm alike):
+
+1. **Check it.** The caller has to *prove which message it means*: a stored `message_id`, or a
+   position counted back from the newest of the person's own messages, plus `shown` — the text that
+   window is looking at. If `shown` does not match the row now, nothing changes and the error says
+   what the row says instead. A second window, or a phone tab that drifted, cannot rewrite a message
+   it never saw.
+2. **Cut the record.** `Store::truncate_from(session, id)` drops that row and everything after it —
+   that row included, because the ask is re-sent and a send writes its own row; leaving the original
+   standing with a copy of it one row lower is the bug that choice prevents. The search index goes
+   with it; the attachments are read *before* the cut, because their rows cascade away with it.
+3. **Hand the host a rewind** (`HostCmd::Rewind`), before anything is sent. The Rust core re-seeds
+   the agent's history from the trimmed store — the same path a reopened conversation takes. The pi
+   core has no rewind RPC, so the bridge rewrites pi's session file as a prefix (keep the header and
+   scaffolding, keep entries up to the *n*th user entry, where *n* is the user rows the store still
+   holds), writes to a temp name and renames, then `switch_session` on the same path, re-absorbs
+   state and puts the conversation's thinking level back — the entry that recorded it may have been
+   in the stretch that went.
+4. **Put the corrected words through the ordinary send path.** Re-sending before the rewind would
+   answer from the conversation that was just deleted, which is the whole reason these are one verb
+   instead of two round trips another device can answer in between.
+
+The verb answers `{ note, dropped, resending, visible }`, and `visible` is there because the client
+reloads the conversation from the record after a change that worked: if the re-send's row does not
+exist yet, that reload paints an answer with no question under it. Refused outright while a turn is
+running — the cut and the re-send are not atomic against a turn in flight.
+
+Written down where the two transports and the two cores have to agree: `docs/GATEWAY.md` (the verb
+and its arguments) and `docs/PI-CORE-PROTOCOL.md` (§4, "the record and pi's memory are two
+ledgers", including what the prune depends on if pi sessions ever branch).
+
+On screen: a quiet Copy / Edit row under each of my own messages. Edit replaces the bubble in place.
+Two buttons say what they do — **Save** changes only that message and says plainly that the model is
+not being told, because it already answered the words that were there; **Save and send again** takes
+the conversation back to that message. Escape cancels and does not reach the host at all.
+
+## C. The theme icon turns instead of swapping
+
+`{#if}` was the problem: the old glyph left the DOM and the new one arrived at full opacity in the
+same frame, so there was nothing to animate. Both faces are in the page now; `[data-theme]` decides
+which is lit, and the swap is a transition on opacity and rotation. Reduced motion keeps the state
+and drops the turn.
+
+## D. Settings opened in the bottom-right corner
+
+`left: 50%; top: 50%; transform: translate(-50%, -50%)` centres a panel, and `cwoffee-pop` animates
+`transform` — and an animation owns the property it animates for its whole length, so for 200ms the
+centring did not exist and the panel's *top-left corner* sat at 50%/50%. Now it is `inset: 0;
+margin: auto`, which centres a box with a definite size without touching `transform`, so the two
+mechanisms that could each centre it are one mechanism.
+
+## E. A setting's sentence and its control are one row
+
+The default thinking effort had the dial on one line and the sentence explaining it underneath:
+reading it and clicking it were two places. Every other row on that screen puts the words left and
+the control right, flush with the panel edge, so it now does the same.
+
+## F. The shortcuts are a page, and they are drawn as keys
+
+They were the last section on Appearance, behind a footer icon that opened a popover: two ways to
+reach a list nobody could find, and a page about colours ending in a list of keystrokes. There is a
+Help entry in the settings rail now (life-buoy), and each shortcut is a row of key caps — `Ctrl`
+`Enter` as two caps with the plus between them, not a sentence that says "Ctrl Enter". The older
+names (`keys`, `shortcuts`) still land there, including the one that used to open the popover.
+
+## Full passes after all of it
+
+- Rust core: `SELFTEST ok`, 65 ok lines, 0 failures (`/tmp/cwoffee-selftest-20261025-200833.log`).
+- Pi core: `SELFTEST ok`, 67 ok lines, 0 failures (`/tmp/cwoffee-selftest-20261025-201540.log`).
+  Both cores print their own `correction ok` line for B — the Rust core says "the model is back to
+  0 messages", the pi core says "pi's thread for conversation 35 is back to 0 of your messages; 4 of
+  its entries went". That is the parity claim, measured rather than asserted.
+- `cargo test --workspace --lib`: engine 510 passed, bridge 35, gateway 38, 0 failed.
+- `node scripts/wire-names.mjs`: ok (every argument a host demands is a name the client sends).
+- `npx svelte-check`: 0 errors, 0 warnings.
+
+Installed with them: `~/.local/share/cwoffee-desktop/{bin/cwoffee-app,bin/cwoffee-gateway,bin/cwtool,ui/dist}`,
+launcher on `core: pi` as before. `--check-only` after the copy reports
+`render OK: … sidefoot=true … cup=none`, i.e. the installed entry opens a window rather than
+installing beautifully and refusing to map one.
+
+## Things learned doing them, worth keeping
+
+- **An animation owns the property it animates.** Centring by `transform` and entering by
+  `transform` are one property fighting itself. Check D measures *during* the entrance, because a
+  check measured after it would have passed on the broken code.
+- **A check written against a bug can pass on the fixed code, and then fail when the bug goes.**
+  The dim check aimed a synthetic click at the sidebar footer control and expected the scrim. It
+  passed only because the dialog sat in the bottom-right corner for the first 200ms of its entrance
+  — the very bug D fixes. Once the dialog was centred from the first frame, the click legitimately
+  landed on the dialog. The claim was about the dim, so the point moved to the strip of window
+  beside the dialog. Same lesson as the footer deletion in the first batch: removing or fixing
+  chrome means re-hosting every claim about it.
+- **Serialising a `Result` instead of propagating it turns a refusal into a success.** Both
+  transports did `serde_json::to_value(apply_and_send(...))`, which hands the client `{"Err": "…"}`
+  where it reads `{note, dropped, resending, visible}` — so an edit that changed nothing was
+  reported as `undefined` fields, and the UI's `out?.note ?? 'saved'` said "saved". The new check
+  caught it on its first run; both transports now map the error out.
+- **Two selftest runs must not overlap.** They share the mock endpoint on 8190; the second reuses
+  the first's ("CURRENT scenarios.json — reusing it") and the first's cleanup then takes it away.
+  The second run reports `list_models returned nothing` and, one run, a transcript that never
+  received its rows. Two confusing failures, one cause, no code at fault.
+- **A motion claim needs paints.** Which face of the theme glyph is lit is a transition that has
+  run, and a transition runs on the frame clock: an occluded window gets no frames, and the glyphs
+  sit where they started. The suite already has `unpainted()` for exactly this; the theme check asks
+  it, and asserts the DOM and the state flip either way.
+- **A harness-side "refusal" has to be aimed at a live turn.** A mock that answers "ok" finishes
+  before the harness can sample `busy`, so the guard looked broken. The filler turn now counts to
+  fifteen.
+
+Reference images from this batch (kept here so they are not lost):
+- `/tmp/pi-clipboard-8b0d8078-cb85-4c2e-806d-1991c29cdef9.png` — the telemetry panel as asked for:
+  two readouts, `decode/s session avg` and `prefill/s session avg`, nothing below them.
+- `/tmp/pi-clipboard-fe7705dc-04bc-4626-af36-d0b1e7010e26.png` — the alignment complaint (E): the
+  sentence explaining a setting and the control it explains, stacked instead of on one line.
+- `/tmp/pi-clipboard-aafeb2b2-c053-4b85-bbd3-3a77edd4bbb8.png`,
+  `/tmp/pi-clipboard-2de6e9aa-f6b7-4216-8a4e-8f92959cad17.png` — the shortcuts page as it now
+  renders (F): the section headed and described, then one row per shortcut with the keys as caps —
+  `Ctrl` `Enter`, and `y` `/` `a` `/` `n` for the three answers an approval card takes.
+
+---
+
+# Third batch, same day — "the image I pasted is gone", and the flat look
+
+Two asks, and they turned out to need different kinds of proof.
+
+> "when I paste an image into the composer it seems like the file is attached, but when you send,
+> there's no indication that it got sent" — and the model did not mention it either.
+
+> "can you copy the layout of this image" — `/tmp/pi-clipboard-59149cb9-f573-4386-a80a-878588229902.png`:
+> almost no divider lines, and the conversation area as a white rounded card.
+
+## G. The picture was sent. Nothing on screen said so.
+
+The send path was sound, and it is now proven rather than argued: the `paste-send` group stages a
+PNG on the desktop clipboard, drives the real paste handler, sends, and then reads three receipts —
+the bubble this window painted, the scripted endpoint's own echo (`Attachment seen: 1 image(s):
+image/png`), and the stored row after a reload. Both cores agree.
+
+The complaint was still true, from the reader's side. The composer had shown a 44px thumbnail of
+that exact picture seconds earlier; once sent, the message carried a dashed 11px pill of muted ink
+saying `clipboard-221045.png · 412 kB`. A caption where a thumbnail belonged reads as a lost
+attachment. So this was a presentation bug with a real pipeline behind it, which is the worst kind
+to be told about, because the answer "it actually worked" is useless to the person looking at it.
+
+What changed:
+
+- An image attachment in your own message is a chip with the picture in it, when this window holds
+  the bytes — which it does for anything you just sent.
+- When it does not — a conversation reopened from the store, an hour later — the chip is a square
+  with an image glyph and the name, and pressing it fetches that one row's payload and opens the
+  picture at reading size. Escape or a click outside gives the transcript back. The chip is filled
+  in once fetched, so a second press is free.
+- The transcript page still carries name and size only. That is kept deliberately: reading a
+  conversation should not pull every attached megabyte across IPC for pictures nobody is looking
+  at. The new `message_attachments` verb (both transports, watch-role like the text of the
+  conversation it belongs to) is what makes that cheap *and* honest instead of cheap and lossy.
+- A model marked text-only now says so in the composer, in the warning palette rather than the
+  refusal red: the file is fine and it will travel. On the pi core pi simply omits the image blocks
+  without a word, which is exactly where "did the app lose my image?" comes from. The line appears
+  only when the endpoint has actually declared its modalities — a warning invented from nothing is
+  the sort of thing that trains people to ignore warnings.
+
+The check (`paste-send`) walks the whole chain, and it caught its own lie while being written: the
+first version asserted the chip existed, not that it could be opened, and it passed while pressing
+the chip fetched nothing. See H about why.
+
+One older check was re-hosted: it looked for `.atttag` by class, which is an image *shape* choice,
+not the claim. The claim is "the message says what it carried, by name", so it now reads
+`.atttag, .tatt` and asserts the name.
+
+## H. Two silent holes in `scripts/wire-names.mjs`, and one real bug through them
+
+`message_attachments` reached a person's screen broken for a full day: the desktop command was
+declared plain `#[tauri::command]`, so Tauri demanded `messageId` while the client sent
+`message_id`. The wire check exists for precisely this, ran on every pass, and said nothing —
+because of two independent holes in it:
+
+- **A call site with a payload-typed generic was invisible.** The pattern for the client stopped a
+  generic at the first `;`, and `invoke<{ mime: string; data_b64: string }[]>('...', {...})` puts a
+  `;` in there. The call simply did not exist as far as the check was concerned.
+- **A Tauri command with a generic in its first parameter demanded no arguments at all.** The
+  parameter splitter opened `<` and never closed it — `>` was not in its close set — so
+  `state: tauri::State<'_, AppState>, message_id: i64` parsed as one fragment named `state`, which
+  is skipped, and the command's required set came back empty. Every command after `state` was in
+  this state, which is also why the earlier "`Result` serialized as a success" bug was invisible to
+  it.
+
+Both are closed: the client walk now crosses a generic to the first `(` at angle-depth 0, and the
+splitter closes angle brackets. The script also counts call sites it cannot read and says so out
+loud, so a clean verdict cannot rest on a silent gap — it reports 334 sites, 2 unreadable. Proof
+the holes are closed: removing `rename_all` from that command again makes the script fail with the
+sentence this bug needed ("needs `messageId` and the client spells it `message_id` — one host reads
+it, this one answers 'missing required key messageId'").
+
+## I. The conversation sits on a card, and the lines between things went away
+
+The reference has no divider lines and one obvious surface. Three rules carried the app's structure
+before: a hairline under the titlebar, one right of the sidebar, and the transcript flat on the same
+page as everything else.
+
+- Both hairlines are gone. The sidebar already wears its own wash and the titlebar its own surface;
+  the lines were saying what those surfaces already say.
+- One token does the separating: `--color-pane`, one notch under the paper in the light theme and
+  one notch deeper in the dark. The card stays exactly `--color-paper`, because every answer, code
+  block and table colour in this app was tuned against paper — tinting the card would have moved
+  all of them, and the ask was about the frame, not about the text.
+- The scroller *is* the card: `background: var(--color-paper)` and a 16px radius. The gutter that
+  floats it (10/16/14) lives on `.scrollerwrap`, not as a margin on the scroller, so the scroller
+  keeps the box the geometry checks measure — that distinction has bitten once before, when a box
+  changed identity mid-layout.
+- The composer row was already padded 16px, so its card and the transcript card line up without a
+  new rule.
+- `--cup-left` gains the gutter (80→96, and 24→40 below 860px). The centred branch does not move:
+  the gutter takes the same off both sides, so the column's centre is unchanged.
+
+**What it cost, measured by the app's own check.** The first version edged the card with
+`box-shadow: inset 0 0 0 1px`. On a surface this size that is not free: `a full transcript makes
+the turn 32.0ms/frame against 13.0ms idle on the same page (x2.5)` — the ring is repainted with
+every line that scrolls under it. And while the page was that starved, an unrelated group failed
+too (`drafts`: the view not leaving the empty state after a send), because Svelte's state updates
+ride the frame clock: `waitFor(...)` gave up on a view that had not been given a frame. Neither
+failure was about the feature being checked. Tone alone is the edge now, which is also how the
+reference does it, and both cadence checks pass again.
+
+## Full passes after all of it
+
+- Rust core, whole suite: `/tmp/cwoffee-selftest-20261026-015909.log` — `SELFTEST ok`, 73 claims
+  logged, including `paste ok`, `correction ok`, `settings placement ok`, `settings row ok`,
+  `telemetry panel ok`, `theme icon ok`, `help page ok`, `user message ok`, `attachment reaches the
+  model`.
+- pi core, whole suite: `/tmp/cwoffee-selftest-20261026-020925.log` — `SELFTEST ok`, 75 claims.
+- The paste chain on its own, before the layout work: rust `/tmp/cwoffee-selftest-20261026-005201.log`,
+  pi `/tmp/cwoffee-selftest-20261026-010037.log`.
+
+## Things learned doing them, worth keeping
+
+- **"It works" is not an answer to "I can't see it."** The image reached the model on both cores.
+  The person was right anyway: the receipt was a caption in a place they had stopped looking. Fix
+  the receipt, then prove the pipeline, in that order.
+- **A check that asserts presence instead of function passes on broken code.** `paste-send` first
+  asserted that a chip named the picture; pressing it fetched nothing, and the check stayed green.
+  It now presses it and reads PNG magic bytes out of what came back.
+- **A check can be reading the previous turn's DOM for weeks.** The markdown-table check asserted
+  "no thinking line in the turn" and passed by finding a thinking block an earlier scenario had
+  left on screen; run on its own it failed. The first fix scoped it to `.blk-run` — and an answer is
+  a *sibling* of the run, never inside it, so the scope fell back to the whole document and the
+  check still failed, now with a message that read like a product bug. `.turn` is the element that
+  means "this turn". The positive claims about what a thinking line looks like moved to
+  `thought-line`, whose own mock script is what puts a thought there; the table scenario now asserts
+  the opposite of what it used to, because its script sends no reasoning at all: a turn with no
+  reasoning must not grow a thinking line.
+- **A starved page breaks checks that have nothing to do with painting.** Frame-pinned state updates
+  time out, and the failure lands in whichever group happens to run next. When two unrelated groups
+  fail in one run, read the cadence lines first.
+- **A guard script is only as wide as its parser.** "The wire check passed" meant nothing here twice
+  over, because the call site and the command's parameters were both unreadable to it. The fix is
+  not only the parser: the script now prints how many call sites it could not read, so silence is
+  no longer mistaken for clean.
+
+---
+
+# Beta pass — a first run that admits it, a chip that is a promise, and a folder that is a folder
+
+Reported as: "before this ships, a fresh install should not point itself at a port I never set;
+Chat mode should behave like Chat mode; and Settings should tell me what this thing is."
+
+## J. The app invented a port, and a first run hung on it
+
+`Config::default()` named `http://127.0.0.1:8090/v1`. On the author's machine that is true, so every
+test passed. On a fresh install it was one of two bad days: nothing listened there and every ask hung
+until timeout — including the invisible titling ask, measured at ~8 s per conversation before the
+transcript showed anything — or something *did* listen there, and the app was suddenly in a
+conversation with a model nobody had chosen. "Not configured" and "configured to 8090" looked
+identical on screen.
+
+The default is now empty, and empty is a state the whole app has to speak about:
+
+* `Config::build_provider()` refuses with one sentence, `NO_ENDPOINT`, and a test asserts the config
+  loader, the provider factory and `ProviderError::NoEndpoint` all say *that* sentence — three doors,
+  one answer.
+* `NullProvider` lets the app boot with nothing configured; asking it to stream or list models is what
+  fails, and it fails in words.
+* The pi bridge refuses **before** spawning a child, because a pi pointed at no endpoint dies with a
+  "model not found" that describes the symptom and not the cause.
+* `endpoint_configured` reads `load_effective` (file *plus* `CWOFFEE_URL`), not the file: a scripted
+  run that is busy answering through the environment must not be told it has no endpoint.
+* The composer's model chip says `no model`, marked, and sending is refused *before* a row is created
+  — a conversation opened against nothing is a dead row in the sidebar forever.
+* A setup flow opens on its own when nothing answers: address (with API key and kind), then pick a
+  model. Two steps on purpose: an endpoint with no model chosen still cannot answer, and one Save
+  button would have to guess which of its models the person means.
+
+## K. A chip that changes what the model can do
+
+The Chat composer's `Web` switch is not a filter on the answer; it decides which tools the model is
+mounted with and which prompt it is told. So the grant lives on the conversation (`sessions.web_on`),
+not in the window: a phone and a desktop opening the same chat have to see one answer, and leaving a
+chat and coming back has to bring the same tools with it. Both transports call the same
+`set_conversation_web`, so both refuse a mid-turn flip and a cowork conversation in the same words.
+
+The tips had to follow the switch. "Summarise my workspace" was offered to a Chat that owns no
+folder, and "look it up and cite" is a tool claim: it appears only while Web is on. A suggestion is a
+promise, and the cup is where the app makes promises.
+
+## L. A folder is a folder on every screen
+
+Folder labels and colours moved out of one window's `localStorage` into the workspace row, so the
+arrangement is a record rather than a decoration of one display. The chevron moved to the right end of
+the row and a folder glyph took its place: the leading mark should say what a row *is*, and folded/not
+folded is not what a folder is. The mode tabs got glyphs for the same reason — two people for the
+party that does things, a bubble with dots for the one that only talks.
+
+Colour is validated twice: `#rrggbb` or nothing at the store, and again in the client before it can
+reach a `style` attribute. A record written by an older build, or hand-edited by whoever owns the
+file, cannot be allowed to put text into another machine's inline style.
+
+## M. "Which build is this, and where are my files?"
+
+An About page in Settings: version, which core is *answering* (asked from the host, not from
+`CWOFFEE_CORE`, which only says what was requested), the model and endpoint the **effective** config
+answers from, how many conversations and messages are in the record, and the paths of the config, the
+SQLite file and — on the pi core — the directory of pi's own thread files, which is the first place
+anyone debugging a rewind bug needs to look. No gateway token, no endpoint API keys: it is a
+watch-role read, and "which build am I running" must not quietly become a way to read a secret.
+Fields the host could not fill are skipped rather than shown blank: "Model thread files: —" reads
+like a broken app when the truth is that the Rust core keeps no second copy of the conversation.
+
+## N. What the beta pass found on the way, in the order it was found
+
+1. **`--no-tools` and a stale tool list.** The receipt on the Web chip read `-read, -bash, -edit,
+   -write` for a chat that had been switched *off*. The web-off branch of a chat launch set
+   `no_tools = true` and left the cloned cowork denylist in `launch.tools`. The launch was correct —
+   pi was given `--no-tools` — but every later reader of that field was reading a fiction. A field
+   that disagrees with the flag next to it is a bug that waits for an innocent reader.
+2. **A test that leaves the world changed teaches the next tests to lie.** The web group left the app
+   in Chat persona; the sidebar-grouping invariant then reported `grouping holds 0 of 2`. Nothing was
+   wrong with grouping: in Chat persona the sidebar is a flat Chats list *by design*, and chat rows
+   own no folder. The invariant now counts the population the tree is built from, and the group puts
+   the persona back whether its claims passed or not.
+3. **Setup called a ping where it needed a probe.** `provider_test` answers "is something there?" —
+   it does not name models, so the second step opened with nothing in it and the check said *"the
+   setup asks for a model and then shows no model to pick"*. The check was right and the flow was
+   wrong.
+4. **Three checks that measured their own assumptions.** The About check read `.set-rail` while
+   settings was closed and called the empty list a missing entry; the model-chip check read the label
+   in the same tick it changed and saw the old name; the Save-button check asserted "disabled before
+   an address is typed" in a run where the address field was legitimately prefilled with the endpoint
+   the run was answering from. The honest version of that assertion is the rule it encodes —
+   `disabled === !pvUrl.trim()` — which holds on a real first run too.
+5. **A pre-existing test was quietly red on `HEAD`.** `a_turn_parked_on_a_human…` expected 40 tok/s
+   and got 80. It was failing before any of this work: the decode window stopped counting the wait for
+   the first token (which the engine's own test insists on) and the fixture's expectation never moved.
+   The expectation was wrong, not the code — 20 tokens over 250 ms of decoding is 80.
+6. **`ALTER TABLE` runs in textual order.** The v13 `workspaces.color` column has to be added *after*
+   the v10 block that creates `workspaces`; on a fresh database the migration ran against a table that
+   did not exist yet, and `add_column_if_missing` cannot tell a missing table from a missing column —
+   its `PRAGMA` reads "no columns".
+
+## Full passes after the beta pass
+
+- Rust core, whole suite: `/tmp/cwoffee-selftest-20261026-131726.log` — `SELFTEST ok`, 69 claims
+  logged, including `about page ok`, `first run ok` and `web switch ok` (the rust core refuses chat
+  mode in words, and the check asserts no Web chip appears where there is no chat to grant anything to).
+- pi core, whole suite: `/tmp/cwoffee-selftest-20261026-132155.log` — `SELFTEST ok`, 71 claims,
+  including `about page ok`, `first run ok`, `web grant ok`, `correction ok`, `paste ok`.
+- The same groups on their own, before the full runs: rust `first-run`+`about-page`
+  (`/tmp/cwoffee-selftest-20261026-130717.log`), pi `first-run`+`about-page`+`web-grant`
+  (`/tmp/cwoffee-selftest-20261026-131029.log`). The pi log carries the process lines that are the
+  actual evidence of the tool mount — at lines 2115/2125/2145: `persona chat, 1 extension(s), tools
+  web_search,web_fetch` with the chip on, `persona chat, 0 extension(s), tools none (--no-tools)`
+  with it off, and the pair again when the switch is thrown mid-conversation.
+- `cargo test --workspace`: 648 passing, 0 failing — including `mock_endpoint` and `pi_fixtures`
+  integration tests that were already red on `HEAD`.
+- `node scripts/wire-names.mjs`: 114 verb-host pairs graded across 359 call sites; two call sites
+  still too dynamic to read, and the script says so.
+- `svelte-check`: 0 errors, 0 warnings. Production `vite build`: clean.
+
+## Things learned doing them, worth keeping
+
+- **A default is a claim about someone else's machine.** `127.0.0.1:8090` was a true statement about
+  one laptop and a wrong one everywhere else. When the honest state is "unknown", the app should say
+  unknown and say what would make it known — and the tests that depended on the guess have to count
+  the scenario, not the request: a conversation that names itself makes two round trips, and treating
+  the titling ask as an unexpected extra call made two good tests look broken.
+- **A switch is a promise; a receipt is what makes it checkable.** `HostState.web_tools` exists so
+  the chip can be held against the argv the model process actually got. Without it, every claim in
+  the web group would have been about a CSS class.
+- **Put the world back, passed or not.** Persona, theme, selection: a group that changes shared state
+  restores it in its own tail, or the next group's failure message describes yesterday's test.
+- **Scope an invariant to the population it was written about.** "Every session the sidebar shows is
+  in a folder group" is a claim about the folder tree. Run it while the sidebar is a chat list and it
+  reports a bug that does not exist — which costs the same debugging time as a real one.
+- **Two hosts, one sentence.** Busy refusals, missing-endpoint refusals and web-grant refusals live in
+  engine functions both transports call. The desktop and the phone disagreeing about *wording* is the
+  first way a user learns there are two implementations.
+

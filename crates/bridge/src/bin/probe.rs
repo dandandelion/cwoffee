@@ -151,6 +151,8 @@ async fn run() -> anyhow::Result<()> {
         db_path: None,
         lean_tools: false,
         persona: cwoffee_engine::host::Persona::Cowork,
+        // A chat starts with no network reach; the composer's Web chip grants it per conversation.
+        web: false,
         cfg_path: None,
         max_tool_iters: 0,
         compact_timeout: std::time::Duration::from_secs(1800),

@@ -155,10 +155,26 @@ pub struct ProviderCfg {
 }
 
 impl Default for ProviderCfg {
+    /// **No endpoint.** This used to default to `http://127.0.0.1:8090/v1`, llama.cpp's usual local
+    /// port, and that default cost more than it saved:
+    ///
+    ///  * it was a guess about someone else's machine. A fresh install "worked" only if a server
+    ///    happened to listen there, and if one did, the app was talking to a model nobody chose;
+    ///  * when nothing listened there, the failure was not a clean error — the ask hung until it
+    ///    timed out. Measured on the pi core: every conversation stalled ~8s waiting for a title
+    ///    from an endpoint that did not exist, and on a machine that *does* run something on 8090
+    ///    that stall is a real prefill of a real model, paid for, unagreed (see
+    ///    `bridge::host::title_provider_at`, whose whole doc is about this);
+    ///  * it made "not configured yet" and "configured to the same address as someone's tutorial"
+    ///    the same state on screen, so the settings screen could not tell them apart either.
+    ///
+    /// An empty `base_url` is now the honest first-run state: the app starts, the model chip reads
+    /// "None", and the setup panel asks the person where their model lives. `CWOFFEE_URL` still
+    /// layers over this for a scripted or packaged start.
     fn default() -> Self {
         Self {
             kind: default_kind(),
-            base_url: "http://127.0.0.1:8090/v1".into(),
+            base_url: String::new(),
             model: String::new(),
             api_key: None,
         }
@@ -1034,6 +1050,11 @@ impl Config {
     pub fn build_provider(&self) -> Result<std::sync::Arc<dyn Provider>, String> {
         let key = self.api_key();
         let url = self.provider.base_url.clone();
+        // Refused here rather than at the first request. `Url::parse("")` answers "relative URL
+        // without a base", which is true, useless, and arrives eight seconds later.
+        if url.trim().is_empty() {
+            return Err(NO_ENDPOINT.into());
+        }
         match self.provider.kind.as_str() {
             "anthropic" => {
                 let mut p = AnthropicProvider::new("anthropic", url)
@@ -1546,6 +1567,31 @@ pub struct ModelSpec {
     pub row: ModelRow,
 }
 
+/// Whether anybody has pointed this app at a model yet.
+///
+/// The environment is applied here on purpose. `CWOFFEE_URL` is a supported way to start the app —
+/// the desktop layers it over the file, and the packaged launchers and the test harnesses use it — so
+/// "is anything configured" has to mean "after the layering", or a scripted run is told it has no
+/// endpoint while every turn of it is going somewhere.
+/// The config as this process actually runs it: the file, with the environment layered over it.
+///
+/// Every question about "what is configured" has to be asked of this, not of the file. `CWOFFEE_URL`
+/// and friends are a supported way to start the app — the desktop layers them over the file, the
+/// packaged launchers set them, and a gateway can be started against a config it was not written for.
+/// Asking the file alone produces confident statements about an endpoint that is not answering.
+pub fn load_effective(cfg_path: Option<&std::path::Path>) -> Config {
+    let mut cfg = match cfg_path {
+        Some(p) => Config::load(Some(p)).map(|(c, _)| c).unwrap_or_default(),
+        None => Config::default(),
+    };
+    cfg.apply_env();
+    cfg
+}
+
+pub fn endpoint_configured(cfg_path: Option<&std::path::Path>) -> bool {
+    !load_effective(cfg_path).provider.base_url.trim().is_empty()
+}
+
 /// The provider half of a `provider/model` id — which endpoint row a model belongs to.
 pub fn provider_of_model(id: &str) -> String {
     match id.split_once('/') {
@@ -1737,6 +1783,83 @@ pub fn add_provider_with(path: &std::path::Path, req: &ProviderReq, caps: &[Mode
     )
 }
 
+/// Point this app at the endpoint it answers from, and say in words what that did.
+///
+/// The top-level `[provider]` section is the one endpoint choice **both cores agree on**: the Rust
+/// core builds its provider from it at start, and the pi core mounts it into pi's `models.json`.
+/// Named `[providers."<name>"]` rows are a registry — useful for filing models under an endpoint and
+/// for the pi core's per-model routing — but on the Rust core they do not move the address a turn is
+/// sent to. A setup flow that only wrote a named row would therefore add an endpoint to a list, look
+/// successful, and still have nothing to answer with. This writes the address.
+///
+/// The refusals are the point of the function. A URL that does not parse is caught here rather than
+/// eight seconds into the first request, and the file is left exactly as it was: a half-written
+/// endpoint is how an app that used to work stops working, and the person editing it had no hand in
+/// it. `api_key` is only written when one is given — clearing a key that works is a worse surprise
+/// than leaving it.
+pub fn set_primary_endpoint_with(
+    path: &std::path::Path,
+    url: &str,
+    kind: &str,
+    api_key: &str,
+) -> Result<String, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("an endpoint address cannot be empty: this is the address a turn is sent to".into());
+    }
+    let parsed = url::Url::parse(url).map_err(|e| {
+        format!("{url} is not a usable address ({e}) — it needs a scheme, like http://127.0.0.1:8080/v1")
+    })?;
+    if parsed.host_str().unwrap_or("").is_empty() {
+        return Err(format!("{url} names no host: there is no machine to send a turn to"));
+    }
+    // The same spellings `build_provider` accepts, and no others. Accepting a typo here would write
+    // a line that the next start refuses to build a provider from, which is the config equivalent of
+    // saving a file that will not open.
+    let kind = {
+        let k = kind.trim().to_lowercase();
+        match k.as_str() {
+            "" => "llama.cpp".to_string(),
+            "llama.cpp" | "llamacpp" | "local" | "openai" | "anthropic" => k,
+            other => {
+                return Err(format!(
+                    "unknown endpoint kind {other:?}: llama.cpp, openai or anthropic"
+                ))
+            }
+        }
+    };
+    let mut kv: Vec<(&str, String)> = vec![
+        ("base_url", Config::toml_str(url)),
+        ("kind", Config::toml_str(&kind)),
+    ];
+    if !api_key.trim().is_empty() {
+        kv.push(("api_key", Config::toml_str(api_key.trim())));
+    }
+    let pairs: Vec<(&str, &str)> = kv.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    match Config::set_provider_keys(path, &pairs) {
+        Ok(changed) => {
+            let wrote = if changed.is_empty() {
+                "the address was already exactly this".to_string()
+            } else {
+                format!("saved {}", changed.join(", "))
+            };
+            Ok(format!(
+                "this app answers from {url} as a {kind} endpoint ({wrote} in {}). Pick a model from                  it next: an endpoint with no model chosen still cannot answer.",
+                path.display()
+            ))
+        }
+        // `set_keys` re-parses the edited text with this crate's own reader and refuses the write if
+        // it would not load, so the file on disk is still the file that worked.
+        Err(e) => Err(format!("endpoint NOT written to {}: {e}", path.display())),
+    }
+}
+
+/// What a person should be told when they ask this app to answer without an endpoint. One sentence,
+/// in one place, so the composer's warning, the host's refusal and the provider's error do not drift
+/// into three different descriptions of the same missing thing.
+pub const NO_ENDPOINT: &str =
+    "no model endpoint is configured: add one under Settings › Models";
+
 pub fn remove_provider_with(path: &std::path::Path, name: &str) -> String {
     match forget_provider_in(path, name) {
         Err(e) => format!("could not remove {name}: {e}"),
@@ -1859,6 +1982,8 @@ mod tests {
     /// state the next boot reads back.
     #[test]
     fn a_provider_added_from_a_probe_comes_back_with_its_models_attached() {
+        // Takes the env lock even though it never touches an environment variable itself: the picture it asserts is built through `apply_env`, and `CWOFFEE_URL` is one variable shared by the whole test binary. Without the lock this assertion is decided by thread scheduling — which is what made it flip between 8090 and the mock's 8190 depending on which tests ran.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("cw-status-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -2032,6 +2157,8 @@ mod tests {
     /// number the meter keeps believing.
     #[test]
     fn the_endpoint_picture_names_the_address_the_chosen_model_answers_from() {
+        // Takes the env lock even though it never touches an environment variable itself: the picture it asserts is built through `apply_env`, and `CWOFFEE_URL` is one variable shared by the whole test binary. Without the lock this assertion is decided by thread scheduling — which is what made it flip between 8090 and the mock's 8190 depending on which tests ran.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Two shapes the app can start in: an endpoint filed as a `[providers."x"]` row, and the
         // top-level `[provider]` section when nobody has registered anything. The settings screen
         // needs an address in both — it prefills a form with it and describes an endpoint with it
@@ -2580,10 +2707,92 @@ base_url = "http://127.0.0.1:9/v1"
         assert_eq!(Config::expand_tilde("a~/b"), "a~/b");
     }
 
+    /// A default that named a port was a guess about someone else's machine, and a guess that could
+    /// not be told apart from a choice. `Config::default()` now means "nothing configured", and the
+    /// app is expected to survive that: it opens, it says "no model yet", and it asks.
+    /// Three parts of the app refuse a missing endpoint — the config loader, the provider factory and
+    /// the request path — and a person should read one sentence, not three. This test is the seam that
+    /// keeps them one sentence.
     #[test]
-    fn defaults_match_the_documented_local_setup() {
+    fn every_door_names_the_missing_endpoint_with_the_same_words() {
+        assert_eq!(
+            crate::provider::ProviderError::NoEndpoint.to_string(),
+            NO_ENDPOINT,
+            "ProviderError::NoEndpoint and config::NO_ENDPOINT have drifted apart"
+        );
+        let cfg = Config::default();
+        let err = match cfg.build_provider() {
+            Ok(_) => panic!("an unconfigured endpoint must be refused, not built"),
+            Err(e) => e,
+        };
+        assert_eq!(err, NO_ENDPOINT, "{err}");
+    }
+
+    /// A first run has to be able to be *told* where the model is, in one step, without editing a
+    /// file by hand — and the write has to land in the section this app actually reads.
+    #[test]
+    fn naming_an_endpoint_moves_where_turns_go_and_refuses_to_write_nonsense() {
+        let dir = std::env::temp_dir().join(format!("cw-endpoint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[provider]\nkind = \"llama.cpp\"\nbase_url = \"\"\nmodel = \"\"\n").unwrap();
+
+        assert!(!endpoint_configured(Some(&path)), "an empty base_url is not configured");
+
+        // Garbage is refused, and the file is untouched: a half-written endpoint is how an app that
+        // used to work stops working.
+        for bad in ["not a url", "http://", "://x", "127.0.0.1:8080/v1"] {
+            let e = set_primary_endpoint_with(&path, bad, "", "").unwrap_err();
+            assert!(e.contains("not a usable address") || e.contains("names no host"), "{bad}: {e}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "[provider]\nkind = \"llama.cpp\"\nbase_url = \"\"\nmodel = \"\"\n",
+                "{bad} must not have changed the file"
+            );
+        }
+        let e = set_primary_endpoint_with(&path, "http://127.0.0.1:8080/v1", "lms", "").unwrap_err();
+        assert!(e.contains("unknown endpoint kind"), "{e}");
+
+        let said =
+            set_primary_endpoint_with(&path, "http://127.0.0.1:8080/v1", "llama.cpp", "").unwrap();
+        assert!(said.contains("http://127.0.0.1:8080/v1"), "{said}");
+        assert!(said.contains("Pick a model"), "{said}");
+        assert!(endpoint_configured(Some(&path)), "the write did not land where we read");
+
+        // The address is now real enough to build a provider from, and a key survives being left out
+        // of the request rather than being wiped.
+        std::fs::write(
+            &path,
+            format!(
+                "[provider]\nkind = \"llama.cpp\"\nbase_url = \"http://127.0.0.1:8080/v1\"\napi_key = \"keep-me\"\nmodel = \"\"\n"
+            ),
+        )
+        .unwrap();
+        set_primary_endpoint_with(&path, "http://127.0.0.1:9090/v1", "openai", "").unwrap();
+        let (cfg, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.provider.base_url, "http://127.0.0.1:9090/v1");
+        assert_eq!(cfg.provider.kind, "openai");
+        assert_eq!(cfg.provider.api_key.as_deref(), Some("keep-me"), "an empty key asked to clear it");
+        set_primary_endpoint_with(&path, "http://127.0.0.1:9091/v1", "", "sk-new").unwrap();
+        let (cfg, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.provider.api_key.as_deref(), Some("sk-new"));
+        assert_eq!(cfg.provider.kind, "llama.cpp", "an empty kind should fall back, not fail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_default_config_names_no_endpoint_and_says_so_instead_of_stalling() {
         let c = Config::default();
-        assert_eq!(c.provider.base_url, "http://127.0.0.1:8090/v1");
+        assert_eq!(c.provider.base_url, "", "no endpoint is invented for a first run");
+        assert_eq!(c.provider.model, "", "and no model either");
+        let err = match c.build_provider() {
+            Ok(_) => panic!("an app with no endpoint must not be able to build a provider"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("no model endpoint is configured"),
+            "the refusal names what to do about it, not a URL parse error: {err}"
+        );
         assert_eq!(c.provider.kind, "llama.cpp");
         assert_eq!(c.context.target_tokens, None, "unset means derive it from the model");
         assert!(c.sandbox.enabled);
@@ -2739,7 +2948,11 @@ searxng_url = "http://127.0.0.1:8888/search"
         let (cfg, loaded) = Config::load(Some(std::path::Path::new("/nonexistent/cwoffee.toml")))
             .expect("missing file is fine");
         assert!(loaded.is_none());
-        assert_eq!(cfg.provider.base_url, "http://127.0.0.1:8090/v1");
+        assert_eq!(
+            cfg.provider.base_url,
+            "",
+            "no file means nothing is configured — not a default endpoint someone never chose"
+        );
 
         let dir = std::env::temp_dir().join(format!("cwoffee_cfg_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2978,6 +3191,9 @@ topP = 0.9"#,
     #[test]
     fn unknown_provider_kind_is_reported_not_panicking() {
         let mut c = Config::default();
+        // An endpoint has to be named before the kind is worth arguing about: `build_provider`
+        // refuses the missing endpoint first, and this test is about the *kind*.
+        c.provider.base_url = "https://generativelanguage.googleapis.com".into();
         c.provider.kind = "gemini".into();
         // dyn Provider is not Debug, so unwrap_err() is not available here.
         let err = match c.build_provider() {

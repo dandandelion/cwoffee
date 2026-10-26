@@ -7,9 +7,11 @@
 //! M0 scope: the event contract, telemetry, and a scripted streamer.
 //! M1 adds providers, the agent loop, the append-only prompt builder, and storage.
 
+pub mod about;
 pub mod agent;
 pub mod approval;
 pub mod config;
+pub mod edit;
 pub mod event;
 pub mod provider;
 pub mod prefs;
@@ -26,8 +28,10 @@ pub mod stream;
 pub mod tools;
 
 pub use agent::{Agent, AgentConfig, EngineSink};
+pub use about::About;
 pub use approval::{ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalRequest};
 pub use config::Config;
+pub use edit::{EditOutcome, EditPlan, EditReq};
 pub use event::{EngineEvent, ExecStream, FinishReason};
 pub use provider::{
     ChatRequest, Delta, DeltaSink, Message, Provider, ProviderError, Reasoning, Role, ToolCall,

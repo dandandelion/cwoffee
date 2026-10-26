@@ -802,6 +802,8 @@ fn main() {
             commands::model_forget,
             commands::search_messages,
             commands::session_messages,
+            commands::message_attachments,
+            commands::edit_message,
             commands::share_markdown,
             commands::save_markdown_file,
             commands::save_attachment_as,
@@ -814,7 +816,11 @@ fn main() {
             commands::list_workspaces,
             commands::add_workspace,
             commands::remove_workspace,
+            commands::set_session_web,
+            commands::provider_set_primary,
+            commands::about,
             commands::set_workspace_label,
+            commands::set_workspace_color,
             commands::rename_session,
             commands::set_session_persona,
             commands::compact,
@@ -1067,6 +1073,8 @@ async fn pi_host(
         cfg_path: cfg.cfg_path.clone(),
         max_tool_iters: appcfg.max_tool_iters(),
         compact_timeout: appcfg.compact_timeout(),
+        // A chat starts with no network reach at boot; the composer's Web chip grants it, per conversation.
+        web: false,
     })
     .await
     .map_err(|e| format!("{e}"))?;

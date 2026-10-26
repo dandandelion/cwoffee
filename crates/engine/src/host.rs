@@ -40,6 +40,14 @@ pub struct HostConfig {
     /// remembering what it last asked for, so a second client cannot be shown a
     /// switch that the host did not make.
     pub persona: Persona,
+    /// Whether a chat conversation may reach the web — `web_search` and `web_fetch` mounted, and the
+    /// prompt telling the model they exist. See [`HostState::web`] for why this is the host's fact
+    /// to report rather than the window's to remember.
+    ///
+    /// Off by default in both directions, on purpose: a coworker already has these tools as part of
+    /// its job, and a chat that suddenly grows network reach is a change in what the person agreed
+    /// to. The chip in the composer is what turns it on, per conversation.
+    pub web: bool,
     pub reasoning: Reasoning,
     /// Cap on provider round-trips in one turn; 0 = no cap. See AgentConfig: the
     /// old hardcoded 14 acted as a work budget and cut real tasks short.
@@ -103,6 +111,9 @@ impl HostConfig {
             workspace: workspace.into(),
             mode: ApprovalMode::Ask,
             persona: Persona::Cowork,
+            // A chat starts with no network reach; the composer chip is what grants it, per
+            // conversation. Cowork keeps its web tools because they are part of the job.
+            web: false,
             reasoning: Reasoning::XHigh,
             // Uncapped by default; set max_tool_iters in config.toml for a hard stop.
             max_tool_iters: 0,
@@ -409,6 +420,86 @@ pub fn persist_setting(path: &Option<std::path::PathBuf>, key: &str, toml_value:
     }
 }
 
+/// Take up whatever endpoint the config names now, in the running host.
+///
+/// Queued by [`HostOps::reload_provider`], so it only ever runs between turns — which is the whole
+/// point of putting it in the queue: a stream that changed endpoint mid-answer would be one answer
+/// written by two models, and the transcript would not say so.
+async fn reload_provider_now(
+    agent: &mut crate::agent::Agent,
+    budget_provider: &mut Arc<dyn Provider>,
+    provider_cell: &Arc<Mutex<Arc<dyn Provider>>>,
+    cfg: &HostConfig,
+    state: &Arc<Mutex<HostState>>,
+    gauge: &Arc<Mutex<crate::prompt::ContextGauge>>,
+    budget_pin: Option<usize>,
+    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+) {
+    let cfg_now = crate::config::load_effective(cfg.cfg_path.as_deref());
+    let url = cfg_now.provider.base_url.trim().to_string();
+    if url.is_empty() {
+        // The config says nothing, so the running host keeps whatever it was already answering
+        // with. Saying so is the difference between "the setting did not take" and "the setting said
+        // there is nothing to take".
+        let sess = state.lock().unwrap().session_id;
+        let _ = ev_tx.send(EngineEvent::Note {
+            session: Some(sess),
+            message: format!(
+                "nothing was taken up: {} still names no endpoint, so this app keeps answering from                  whatever it started with. Add an address under Settings › Models.",
+                cfg.cfg_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the config".into())
+            ),
+        });
+        return;
+    }
+    let built = match cfg_now.build_provider() {
+        Ok(p) => p,
+        Err(e) => {
+            // An `Error` event, not a `Note`: the person asked for an endpoint and did not get one.
+            // The variant carries no session by design — an endpoint failure is not a conversation's.
+            let _ = ev_tx.send(EngineEvent::Error {
+                message: format!("the endpoint in the config was not taken up: {e}"),
+                fatal: false,
+            });
+            return;
+        }
+    };
+    let kind = cfg_now.provider.kind.clone();
+    let model = agent.model();
+    agent.set_provider(Arc::clone(&built));
+    *budget_provider = built;
+    // Swap the shell's handle in its own statement, and do not hold the guard across anything that
+    // can await or ask for the same lock — that exact shape deadlocked this task once before.
+    {
+        let mut cell = provider_cell.lock().unwrap();
+        *cell = Arc::clone(budget_provider);
+    }
+    // Different endpoint, different model's window. The compaction ceiling comes from the window, so
+    // leaving it at the previous endpoint's number is how a fold shows up in a conversation that is
+    // nowhere near full — or never shows up in one that is.
+    apply_context_budget(
+        agent,
+        budget_provider,
+        budget_pin,
+        state,
+        &cfg.sampling,
+        gauge,
+        true,
+        cfg.cfg_path.as_deref(),
+    )
+    .await;
+    let sess = state.lock().unwrap().session_id;
+    let _ = ev_tx.send(EngineEvent::Note {
+        session: Some(sess),
+        message: format!(
+            "this app answers from {url} ({kind}) now, with {model}: {t}",
+            t = context_budget_note(state, &model)
+        ),
+    });
+}
+
 fn context_budget_note(state: &Arc<std::sync::Mutex<HostState>>, model: &str) -> String {    let s = state.lock().unwrap();
     match s.model_window {
         Some(w) => format!(
@@ -420,6 +511,58 @@ fn context_budget_note(state: &Arc<std::sync::Mutex<HostState>>, model: &str) ->
             s.context_budget
         ),
     }
+}
+
+/// Grant or take away web reach for one conversation, on both transports, in one place.
+///
+/// Two doors lead here — the desktop window and the gateway on a phone — and both have to refuse the
+/// same asks for the same reasons, otherwise "the Web chip" means one thing on a laptop and another
+/// on a phone. The record is written here (never by the host), and the host is only told when the
+/// conversation being changed is the one it is holding.
+///
+/// The refusals are the substance:
+///
+///  * **not a chat** — a cowork conversation already has `web_search` and `web_fetch`; writing a
+///    grant for it would put a number on the row that nothing reads, and a stored setting that does
+///    nothing is the start of a UI that lies;
+///  * **mid-turn, for the conversation in hand** — the model was given its tools when the turn
+///    started. Flipping the chip then would show a switch the running turn never had, which is the
+///    same half-applied failure the folder move refuses to make.
+pub fn set_conversation_web(
+    store: &dyn crate::store::StoreOps,
+    host: &dyn HostOps,
+    session: i64,
+    on: bool,
+) -> Result<String, String> {
+    let st = host.state();
+    let held = st.session_id == session;
+    if held && st.busy {
+        return Err(format!(
+            "a turn is running in conversation {session}: it was given the tools it started with.              Ask again once it finishes, or stop it first — otherwise the switch says one thing and              the model is busy answering with another."
+        ));
+    }
+    let row = store
+        .session(session)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {session} is not in the record"))?;
+    if row.persona != "chat" {
+        return Err(format!(
+            "conversation {session} is a cowork conversation: its coworker already has web_search              and web_fetch. The Web switch is a chat thing — a chat starts with no tools at all."
+        ));
+    }
+    store.set_session_web(session, on).map_err(|e| e.to_string())?;
+    if held {
+        host.set_web(on);
+    }
+    Ok(format!(
+        "conversation {session} can {}reach the web{}.",
+        if on { "" } else { "no longer " },
+        if held {
+            " — the model process remounts on the next turn"
+        } else {
+            ", and it will be mounted that way when you open it"
+        }
+    ))
 }
 
 /// The engine's one definition of "a workspace this app will run tools in": an
@@ -547,6 +690,37 @@ impl Persona {
         conversation only: you have no tools and no folder to work in, so never offer to open, \
         run or change anything — say what you think instead.";
 
+    /// The same assistant with the two network tools granted. See [`Persona::chat_prompt`] for when
+    /// each is sent, and the test `the_two_chat_prompts_are_one_assistant` for why the shared opening
+    /// is asserted rather than trusted.
+    pub const CHAT_WEB_PROMPT: &'static str = "You are cwoffee, a helpful assistant. This mode is \
+        conversation only: you have no file tools and no folder to work in, so never offer to open, \
+        run or change anything on this machine — say what you think instead. Two tools are yours: \
+        web_search, which finds pages about a topic, and web_fetch, which reads one. Use them \
+        whenever an answer depends on something only looking can tell you — prices, versions, dates, \
+        anything current — and name the page an answer came from. A search that returns nothing \
+        useful is answered by saying so, not by guessing.";
+
+    /// Written as its own text rather than an appended sentence on the plain one, because the plain
+    /// one spends its first clause denying tools. "…except these two" bolted onto a denial is how a
+    /// model ends up not searching: the two halves answer each other instead of the question. So the
+    /// web text restates the file-and-shell prohibition where the model will read it, because in this
+    /// mode that is still the sentence keeping a chat from promising to fix someone's folder.
+
+    /// The whole instruction a chat gets, in whichever shape the Web switch makes it.
+    ///
+    /// Two texts, chosen here rather than assembled at each call site, so the chip in the composer,
+    /// the tools mounted by the model process and the words the model reads are decided in one place.
+    /// A chat with Web off must never be told about `web_search`; a chat with it on must be told,
+    /// because a tool nobody describes is a tool the model does not reach for.
+    pub fn chat_prompt(web: bool) -> &'static str {
+        if web {
+            Self::CHAT_WEB_PROMPT
+        } else {
+            Self::CHAT_PROMPT
+        }
+    }
+
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "cowork" | "coworker" => Some(Self::Cowork),
@@ -568,6 +742,20 @@ pub enum HostCmd {
     /// this on the pi side: the tool set and the system prompt are decided when the
     /// process starts, so switching is process lifecycle, not a request parameter.
     SetPersona { persona: Persona },
+    /// Grant or take away the two web tools for the chat conversation this host is holding.
+    ///
+    /// Deliberately not a general "set tools" verb: the pair is the whole of what a chat is allowed
+    /// to be given, and a knob that could mount any tool from the wire would be a much larger door
+    /// for a phone to walk through.
+    SetWeb { on: bool },
+    /// Take up the endpoint this app's config now names, without a restart.
+    ///
+    /// The address a turn goes to is written by the model screen; if the running host could not
+    /// accept it, the only honest answer would be "restart the app", and that is a poor price for
+    /// changing one line. On the Rust core this swaps the provider the agent streams through and
+    /// re-reads the window the budget comes from. On the pi core it re-mounts cwoffee's endpoints in
+    /// pi's provider file and closes the model process, which reads that file when it starts.
+    ReloadProvider,
     /// `attachments` are validated at this boundary, before anything reaches the
     /// provider: an unbounded or arbitrary-mime payload from a UI would be a
     /// memory and SSRF-adjacent problem downstream.
@@ -618,6 +806,17 @@ pub enum HostCmd {
     ClearSession,
     NewSession { title: String },
     SwitchSession { id: i64 },
+    /// Forget what the host was told after the stored transcript for this conversation now ends.
+    ///
+    /// Ordering is the whole contract: the caller has already cut the store (`crate::edit`), and
+    /// this verb re-syncs the *model's* memory to what the record says. Sent before the re-send, so
+    /// the queue does the ordering for it: rewind, then the new turn.
+    ///
+    /// It is a verb rather than something the caller does, because only the host loop owns the
+    /// memory: on the Rust core that is the agent's in-process history, on the pi core it is a
+    /// JSONL file pi owns. A host that is not holding this conversation has nothing to forget and
+    /// says so in the transcript.
+    Rewind { session: i64 },
     Cancel,
     Shutdown,
 }
@@ -634,6 +833,26 @@ pub struct HostState {
     /// remembering what they last asked for, so a second client is never shown a
     /// switch the host did not make.
     pub persona: Persona,
+    /// Whether the conversation the host is holding can reach the web: whether `web_search` and
+    /// `web_fetch` are mounted for the model, and whether its system prompt says they are.
+    ///
+    /// It lives on the host's state rather than only in the window because it is a fact about what
+    /// the model was told. The chip, the system prompt and the mounted tools are three places that
+    /// have to agree, and a phone watching the same conversation must read the same answer the
+    /// desktop flipped. Defaulted so a client built before the field exists reads "off" rather than
+    /// losing the whole state payload.
+    #[serde(default)]
+    pub web: bool,
+    /// What the running model was actually given, in words: "no tools at all", "web_search,
+    /// web_fetch", "the coworker's set".
+    ///
+    /// This exists because a switch is a promise, and a promise should be checkable. The chip says a
+    /// chat may search; this field is what the process was launched with, and a check can compare the
+    /// two instead of trusting that the code which sets one also sets the other. Empty means "not
+    /// stated" — the Rust core does not fill it today, and an empty string must never be rendered as
+    /// though it said "none".
+    #[serde(default)]
+    pub web_tools: String,
     pub reasoning: Reasoning,
     /// The effort new conversations start at - what the settings screen sets. `reasoning` is what
     /// *this* conversation is using. The two part company the moment the composer dial moves, and a
@@ -727,7 +946,12 @@ pub struct SessionHost {
     cancel: Arc<AtomicBool>,
     /// The host keeps a handle so the shell can ask the endpoint questions that
     /// are not turns - the composer's model picker being the obvious one.
-    provider: Arc<dyn Provider>,
+    ///
+    /// Behind a lock because the endpoint is not fixed for the life of the process: the model screen
+    /// can point this app at another address, and a picker that kept listing the old endpoint's
+    /// models after that would be a UI answering from memory. The search tool below already says the
+    /// same thing about itself; this is the rest of the app catching up.
+    provider: Arc<Mutex<Arc<dyn Provider>>>,
     /// And the search tool, typed: the provider can change while the app runs, and
     /// the only safe place to change it is inside the live tool. Rebuilding the
     /// registry would move prompt bytes and drop every prefix cache, and the
@@ -773,6 +997,10 @@ impl SessionHost {
             model: cfg.model.clone(),
             mode: cfg.mode,
             persona: cfg.persona,
+            web: cfg.web,
+            // Not stated until a process exists to state it. The bridge fills this when it launches
+            // the model; the Rust core's agent loop does not publish a tool list today.
+            web_tools: String::new(),
             reasoning: cfg.reasoning,
             reasoning_default: cfg.reasoning,
             reasoning_overridden: false,
@@ -811,10 +1039,14 @@ impl SessionHost {
         let gauge_bg = Arc::clone(&gauge);
         // The task takes the provider; the host keeps a second handle for
         // non-turn questions like the model list.
-        let host_provider = Arc::clone(&provider);
+        // The handle the shell asks non-turn questions with, in a cell the loop can move: see
+        // `SessionHost::provider`.
+        let provider_cell = Arc::new(Mutex::new(Arc::clone(&provider)));
         // The loop task needs a handle too: the compaction budget comes from the
         // window the *loaded* model advertises, which is a provider question.
-        let budget_provider = Arc::clone(&provider);
+        let mut budget_provider = Arc::clone(&provider);
+        // A second handle to the same cell for the loop task; the struct keeps the outer one.
+        let loop_cell = Arc::clone(&provider_cell);
 
         // Built here, not inside the task, so the host can hold the agent's own
         // cancel flag. `SessionHost::cancel()` used to set a separate AtomicBool
@@ -1140,8 +1372,102 @@ impl SessionHost {
                             session: Some(sess),
                         });
                     }
+                    HostCmd::ReloadProvider => {
+                        reload_provider_now(
+                            &mut agent,
+                            &mut budget_provider,
+                            &loop_cell,
+                            &cfg,
+                            &state_bg,
+                            &gauge_bg,
+                            budget_pin,
+                            &ev_tx,
+                        )
+                        .await;
+                    }
+                    HostCmd::SetWeb { on } => {
+                        // Nothing to change, and the reason is worth saying out loud: this core has no
+                        // chat mode, and its coworker already has `web_search` and `web_fetch` as part
+                        // of the job. A switch that answers "done" here would be reporting a change
+                        // that could not be observed anywhere.
+                        let sess = state_bg.lock().unwrap().session_id;
+                        let _ = ev_tx.send(EngineEvent::Note {
+                            message: format!(
+                                "the web switch is a chat thing, and chat mode is not available on the rust core:                                  this core's coworker already has web_search and web_fetch. Nothing changed (asked: {}).",
+                                if on { "on" } else { "off" }
+                            ),
+                            session: Some(sess),
+                        });
+                    }
                     HostCmd::Cancel => {
                         agent_cancel.store(true, Ordering::Relaxed);
+                    }
+
+                    HostCmd::Rewind { session } => {
+                        // Half of "edit a message and send it again" happened in the store, before
+                        // this was queued. What is left is the part only this loop can do: the
+                        // agent's in-process history still holds the messages the person has just
+                        // cut out of the record, and a turn built from that answers a question that
+                        // is no longer on screen.
+                        //
+                        // Re-seeded from the store rather than spliced by hand, because the store is
+                        // the transcript: it already holds exactly what the conversation now says,
+                        // in the order it says it, and replaying it is the same path a reopened
+                        // conversation takes (see `adopt_view!`), down to the sequence bookkeeping
+                        // that keeps those rows from being persisted a second time.
+                        if session != session_id {
+                            // The host is holding a different conversation, so it was never told
+                            // the one that was edited: there is nothing here to take back. The edit
+                            // itself stands — the record was cut, and that is what the user asked
+                            // for — so this is a note, not an error.
+                            let _ = ev_tx.send(EngineEvent::Note {
+                                session: Some(session),
+                                message: format!(
+                                    "conversation {session} was taken back to that message. This engine is \
+                                     holding conversation {session_id}, so it had not been told anything \
+                                     about the one you edited; the next time you open it, it starts from \
+                                     what the transcript now says."
+                                ),
+                            });
+                            continue;
+                        }
+                        match store.history(session) {
+                            Ok(hist) => {
+                                let n = hist.len() as u64;
+                                agent.prompt_mut().with_history(hist);
+                                agent.prompt_mut().set_first_seq(0);
+                                agent.reset_turn_id();
+                                persisted_next = n;
+                                {
+                                    let mut s = state_bg.lock().unwrap();
+                                    // Whatever folds the old in-memory prompt had been carrying go
+                                    // with it; the replayed history is un-folded.
+                                    s.compactions = 0;
+                                    s.context_tokens = agent.prompt_mut().estimate_tokens("");
+                                    agent.publish_gauge("");
+                                }
+                                let _ = ev_tx.send(EngineEvent::Note {
+                                    session: Some(session),
+                                    message: format!(
+                                        "the model is back to {n} {} in conversation {session}: anything \
+                                         after the message you edited is off its context.",
+                                        if n == 1 { "message" } else { "messages" }
+                                    ),
+                                });
+                            }
+                            Err(e) => {
+                                // The record is cut and the model still remembers: that is worth
+                                // saying out loud, because the two will disagree until this works.
+                                let _ = ev_tx.send(EngineEvent::Error {
+                                    message: format!(
+                                        "the transcript for conversation {session} was cut, but the model \
+                                         could not be re-read from it ({e}) — it is still working from the \
+                                         messages you removed. Reopen the conversation to fix that."
+                                    ),
+                                    fatal: false,
+                                });
+                            }
+                        }
                     }
 
                     HostCmd::ClearSession => {
@@ -1624,7 +1950,7 @@ impl SessionHost {
             state,
             gauge,
             cancel,
-            provider: host_provider,
+            provider: provider_cell,
             search: search_tool,
         }
     }
@@ -1638,14 +1964,19 @@ impl SessionHost {
         if !self.state().model.trim().is_empty() {
             return None;
         }
-        let first = self.provider.list_models().await.ok()?.into_iter().next()?;
+        // Read the handle out and drop the guard before the await: a lock held across a network call
+        // is how this app has deadlocked before (see the session-id note in the command loop).
+        let provider = self.provider();
+        let first = provider.list_models().await.ok()?.into_iter().next()?;
         self.send(HostCmd::SetModel { model: first.clone(), persist: false });
         Some(first)
     }
 
-    /// Handle to the endpoint, for shell-level queries that are not turns.
-    pub fn provider(&self) -> &Arc<dyn Provider> {
-        &self.provider
+    /// Handle to the endpoint, for shell-level queries that are not turns. Cloned out rather than
+    /// borrowed: the handle can be moved by the loop the moment the person changes endpoint, and a
+    /// borrow would be a promise that it stays there.
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.provider.lock().unwrap())
     }
 
     /// What search is currently doing, in one line ("DuckDuckGo (keyless HTML
@@ -1833,8 +2164,61 @@ pub trait HostOps: Send + Sync {
     /// Stop the running turn and release whatever it is parked on.
     fn cancel(&self);
 
+    /// Take a conversation back to an earlier message.
+    ///
+    /// The stored transcript has already been cut by the caller — see [`crate::edit`]. This is the
+    /// other half: the host has been told things the record no longer contains, and unless it is
+    /// brought back too, the next turn is answered from a conversation the user cannot see any more.
+    ///
+    /// Queued like every other verb here, so it lands in the host's own loop where that memory
+    /// lives, and it arrives ahead of the re-send that follows it.
+    fn rewind(&self, session: i64) {
+        self.send(HostCmd::Rewind { session })
+    }
+
+    /// Grant or take away web reach for the chat conversation this host holds. Queued like every
+    /// other verb here: the tools live in the model process, and only its own loop can re-make it.
+    ///
+    /// The default refuses in words, on the Rust core, where a chat does not exist and the coworker's
+    /// web tools are part of its job rather than a switch — see [`set_conversation_web`], which is
+    /// where the check that this is a chat at all lives.
+    fn set_web(&self, on: bool) {
+        self.send(HostCmd::SetWeb { on })
+    }
+
+    /// Re-read the endpoint and start answering from it. Queued, so it waits for the turn like every
+    /// other verb here; it answers `Err` when the config names no usable address, so the caller can
+    /// say which half of the setup is missing instead of pointing at a transcript that stayed empty.
+    fn reload_provider(&self) -> Result<String, String> {
+        self.send(HostCmd::ReloadProvider);
+        Ok("the endpoint was handed to the model host".into())
+    }
+
     /// Snapshot for status lines and the composer's current-state labels.
     fn state(&self) -> HostState;
+
+    /// Which engine is answering, in one word: `rust` for the in-process agent, `pi` for a
+    /// `pi --mode rpc` child.
+    ///
+    /// Asked of the host rather than read from `CWOFFEE_CORE` by whoever is rendering a page, because
+    /// the environment is how the core is *chosen*, not evidence of what is running: a gateway started
+    /// standalone, a desktop launched by a wrapper script, and a test harness all set that variable
+    /// differently, and an About page that guessed wrong is a bug report filed against the wrong core.
+    fn core_id(&self) -> &'static str {
+        "rust"
+    }
+
+    /// Where this core keeps **the model's** copy of a conversation, for the About page.
+    ///
+    /// Empty means "there is no second copy: the record above is the whole of it", which is true of
+    /// the Rust core — its history is rebuilt from the SQLite rows. The pi core overrides this,
+    /// because on that core the model genuinely does keep its own thread files, in a directory this
+    /// app owns and the person cannot find from the settings screen. A page that says "your
+    /// conversations live in one file" to a pi-core user is a page that tells them where *not* to
+    /// look.
+    fn thread_store(&self) -> String {
+        String::new()
+    }
 
     /// Move the tools to another workspace, refusing anything the checks reject.
     async fn set_workspace_checked(&self, path: &str) -> Result<String, String>;

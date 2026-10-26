@@ -31,6 +31,11 @@ pub enum StoreError {
     /// FTS5 is not available. With `bundled` this should be unreachable; if it
     /// ever fires, it means someone turned the feature off.
     FtsUnavailable(String),
+    /// A value the record refuses to hold. The store is the one place every client agrees, so a
+    /// shape check written here is enforced on the desktop, the browser and the phone at once —
+    /// and a value that never enters the row cannot come back out as markup, a style attribute or
+    /// a claim about a folder.
+    Invalid(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -41,6 +46,7 @@ impl std::fmt::Display for StoreError {
                 write!(f, "database schema v{from} is newer than this build supports (v{to})")
             }
             StoreError::FtsUnavailable(m) => write!(f, "full-text search unavailable: {m}"),
+            StoreError::Invalid(m) => write!(f, "{m}"),
         }
     }
 }
@@ -56,7 +62,7 @@ impl From<rusqlite::Error> for StoreError {
 // database and not in a browser's localStorage because localStorage is per-origin: a gateway
 // on another port is another store, and the desktop, the browser and the phone are three
 // origins between them. A preference only one of the three remembers is not a setting.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 14;
 
 /// A workspace the user has registered (or that holds sessions).
 /// How many conversations one folder can be asked for at a time. See
@@ -70,6 +76,14 @@ pub struct WorkspaceEntry {
     /// Optional display name. Empty means "show the folder name", which is what
     /// people want nine times out of ten and why it is not a required field.
     pub label: String,
+    /// A colour for this folder's mark in the sidebar, as `#rrggbb`, or empty for "no colour".
+    ///
+    /// It is stored rather than kept in a window's localStorage for the same reason the label is:
+    /// the sidebar is a record of the person's own arrangement, and a phone or a second window that
+    /// cannot tell the inventory folder from the notes folder is reading a list the person already
+    /// fixed up once. The palette is the client's business; the record only insists the value is a
+    /// colour, so a stale or hand-edited config cannot put arbitrary text into a style attribute.
+    pub color: String,
     pub sessions: i64,
 }
 
@@ -87,6 +101,15 @@ pub struct Session {
     /// describes how the conversation came to exist — a chat opened while the app happens
     /// to be in cowork mode is still a chat, and it belongs in the chat list.
     pub persona: String,
+    /// Whether this conversation may reach the web — the chat-mode `web_search` / `web_fetch` pair,
+    /// mounted for the model and described in its prompt.
+    ///
+    /// Stored per conversation because that is what the person is choosing: "let *this* chat look
+    /// things up". A conversation whose chip remembers its own state is also the only way the host
+    /// can reopen a chat and mount the tools it had last time, instead of answering from a process
+    /// that quietly lost its network reach.
+    #[serde(default)]
+    pub web_on: bool,
 }
 
 /// One bounded page of transcript history.
@@ -170,6 +193,17 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         Self::setup(conn)
+    }
+
+    /// Which file this record lives in, as SQLite itself says. `:memory:` for an in-memory store.
+    ///
+    /// Asked of the database rather than recomputed from the environment, because the About page
+    /// exists to answer "is my history at that path?" — and a path derived from `CWOFFEE_DATA` by the
+    /// page could name a file this store never opened.
+    pub fn db_path(&self) -> String {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("PRAGMA database_list", [], |r| r.get::<_, String>(2))
+            .unwrap_or_default()
     }
 
     pub fn in_memory() -> Result<Self, StoreError> {
@@ -281,6 +315,30 @@ impl Store {
         Ok(n)
     }
 
+    /// Colour a folder's mark in the sidebar. Empty clears it. Returns the rows touched, which is 0
+    /// when the folder has never been added — the sidebar can show a group for a folder that has no
+    /// row of its own, and colouring that would silently write nothing.
+    pub fn set_workspace_color(&self, path: &str, color: &str) -> Result<usize, StoreError> {
+        let color = color.trim().to_ascii_lowercase();
+        if !color.is_empty() && !is_hex_color(&color) {
+            return Err(StoreError::Invalid(format!(
+                "{color} is not a folder colour: use empty to clear it, or #rrggbb like #c08a2e"
+            )));
+        }
+        // The row is created on demand, like a label: a folder the person can see is a folder the
+        // record can hold a colour for, and requiring them to "add" it first is a dance.
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO workspaces (path, label, added_at) VALUES (?1, '', ?2)",
+            params![path, now_ts()],
+        )?;
+        let n = conn.execute(
+            "UPDATE workspaces SET color = ?2 WHERE path = ?1",
+            params![path, color],
+        )?;
+        Ok(n)
+    }
+
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceEntry>, StoreError> {
         let conn = self.conn.lock().unwrap();
         // Registered paths unioned with paths that actually hold sessions: the
@@ -290,6 +348,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT p.path,
                     COALESCE((SELECT label FROM workspaces w WHERE w.path = p.path), '') AS label,
+                    COALESCE((SELECT color FROM workspaces w WHERE w.path = p.path), '') AS color,
                     (SELECT COUNT(*) FROM sessions s WHERE s.workspace = p.path) AS n
              FROM (
                  SELECT DISTINCT workspace AS path FROM sessions WHERE workspace <> ''
@@ -303,7 +362,14 @@ impl Store {
             Ok(WorkspaceEntry {
                 path: r.get(0)?,
                 label: r.get(1)?,
-                sessions: r.get(2)?,
+                // A value written by hand or by an older build that is not a colour reads as empty
+                // here rather than reaching a `style` attribute: the record may be old, but what it
+                // hands the UI still has to be safe to interpolate.
+                color: match r.get::<_, String>(2)? {
+                    c if c.is_empty() || is_hex_color(&c) => c,
+                    _ => String::new(),
+                },
+                sessions: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -357,6 +423,16 @@ impl Store {
         Ok(())
     }
 
+    /// Choose whether this conversation may reach the web. See `Session::web_on`.
+    pub fn set_session_web(&self, id: i64, on: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET web_on = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, on as i64, now_ts()],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, id: i64) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
@@ -366,12 +442,27 @@ impl Store {
         Ok(())
     }
 
+    /// How many conversations the record holds, and how many messages are in them. Two counts for
+    /// the About page: "where do my things live" is only half the question, the other half is
+    /// "is the thing at that path the thing I expected", and a number answers that in a glance.
+    pub fn conversation_count(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    pub fn message_total(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                    s.persona
+                    s.persona, s.web_on
              FROM sessions s
              ORDER BY s.updated_at DESC, s.id DESC
              LIMIT ?1",
@@ -386,6 +477,7 @@ impl Store {
                 updated_at: r.get(5)?,
                 message_count: r.get(6)?,
                 persona: r.get(7)?,
+                web_on: r.get::<_, i64>(8)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -408,7 +500,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                    s.persona
+                    s.persona, s.web_on
              FROM sessions s
              WHERE s.workspace = ?1
              ORDER BY s.updated_at DESC, s.id DESC
@@ -424,6 +516,7 @@ impl Store {
                 updated_at: r.get(5)?,
                 message_count: r.get(6)?,
                 persona: r.get(7)?,
+                web_on: r.get::<_, i64>(8)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -435,7 +528,7 @@ impl Store {
             .query_row(
                 "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
                         (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                        s.persona
+                        s.persona, s.web_on
                  FROM sessions s WHERE s.id = ?1",
                 params![id],
                 |r| {
@@ -448,6 +541,7 @@ impl Store {
                         updated_at: r.get(5)?,
                         message_count: r.get(6)?,
                         persona: r.get(7)?,
+                        web_on: r.get::<_, i64>(8)? != 0,
                     })
                 },
             )
@@ -591,6 +685,68 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// Change one message's words in place. Returns false when no row answers `message_id`, so a
+    /// caller can tell "saved" from "that message is gone" instead of being told both.
+    ///
+    /// The search index is rewritten in the same lock. `messages_fts` is a separate copy of the
+    /// text (no `content=` link, no triggers — see the note in the schema), so a correction that
+    /// left it alone would mean the search box still answered with the sentence the person has
+    /// just crossed out, in a transcript where that sentence no longer appears.
+    pub fn edit_message(&self, message_id: i64, content: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE messages SET content = ?2 WHERE id = ?1",
+            params![message_id, content],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        // The fts row carries the message id both as its rowid and as an unindexed column; the
+        // second form is what `truncate_from` deletes by, so both have to be kept in step.
+        conn.execute(
+            "UPDATE messages_fts SET content = ?2 WHERE rowid = ?1",
+            params![message_id, content],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = (SELECT session_id FROM messages WHERE id = ?1)",
+            params![message_id, now_ts()],
+        )?;
+        Ok(true)
+    }
+
+    /// Drop everything stored from `from_id` onward in this conversation. The row it names goes
+    /// with the rest, so handing it the id of a message means "back to just before that one"; 0
+    /// drops the whole transcript. Returns how many rows went.
+    ///
+    /// The named row is included on purpose. A person correcting a message they already sent expects
+    /// that message to be gone from where it stood — the corrected ask goes back in at the end, with
+    /// the answer it now gets. Leaving the original standing and adding a second copy of it one row
+    /// lower is the bug this choice prevents.
+    ///
+    /// This is the half of "edit a message and send it again" the person sees: the conversation
+    /// goes back to that message. Attachments go with their rows (`ON DELETE CASCADE`); the search
+    /// index has no such link and is deleted by hand, same as everywhere else in this file.
+    ///
+    /// What does *not* go is the `turns` telemetry for the lost stretch. Those turns happened, the
+    /// panel's averages are computed from the live event stream rather than from this table, and
+    /// quietly deleting part of a person's usage history is not what "undo that message" asks for.
+    pub fn truncate_from(&self, session_id: i64, from_id: i64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND id >= ?2",
+            params![session_id, from_id],
+        )?;
+        conn.execute(
+            "DELETE FROM messages_fts WHERE session_id = ?1 AND message_id >= ?2",
+            params![session_id, from_id],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![session_id, now_ts()],
+        )?;
+        Ok(n)
+    }
+
     pub fn messages(&self, session_id: i64) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -651,6 +807,17 @@ impl Store {
             out.entry(mid).or_default().push(a);
         }
         Ok(out)
+    }
+
+    /// The attachments of one stored row, payloads included.
+    ///
+    /// "Send it again" needs these and not the metadata the transcript reads: the person is
+    /// re-sending the picture they sent, not a description of it.
+    pub fn message_attachments(
+        &self,
+        message_id: i64,
+    ) -> Result<Vec<crate::provider::Attachment>, StoreError> {
+        Ok(self.attachment_payloads(&[message_id])?.remove(&message_id).unwrap_or_default())
     }
 
     /// Rehydrate a PromptBuilder's history. Tool calls are restored with their
@@ -955,6 +1122,16 @@ fn attach_meta(conn: &Connection, msgs: &mut [StoredMessage]) -> Result<(), Stor
     Ok(())
 }
 
+/// Whether a string is `#rrggbb`. Deliberately strict and deliberately small: the colour goes
+/// straight into a `style` attribute in the sidebar, so "validated" has to mean a shape, not an
+/// intention. Named colours, `#rgb`, and anything with a `url(` in it are all refused.
+fn is_hex_color(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7
+        && b[0] == b'#'
+        && b[1..].iter().all(|c| c.is_ascii_hexdigit())
+}
+
 /// A short, single-line label from the first user message.
 ///
 /// Sessions otherwise stay titled "new session" forever, which turns a list of
@@ -1171,6 +1348,18 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
              );",
         )?;
     }
+    if from < 14 {
+        // v14: whether a conversation may reach the web. Chat mode starts with no tools at all, and
+        // the person can grant it the two network tools. That grant belongs on the row: it is a
+        // decision about one conversation, it has to survive closing the app, and the model process
+        // has to be mounted to match it when the conversation is reopened.
+        add_column_if_missing(
+            conn,
+            "sessions",
+            "web_on",
+            "web_on INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     if from < 10 {
         // v10: workspaces became things you can add, not just side effects of the
         // last path you typed. The sidebar groups sessions by workspace and lets
@@ -1183,6 +1372,23 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
                  label TEXT NOT NULL DEFAULT '',
                  added_at INTEGER NOT NULL
              );",
+        )?;
+    }
+    // Placed after the v10 block that creates `workspaces`, not up with the other newest blocks:
+    // these blocks run in the order they are written, not in numeric order, and asking
+    // `add_column_if_missing` for a table that does not exist yet looks exactly like asking for a
+    // column it already has — its PRAGMA reads "no columns", which is not what it cannot tell from
+    // "no such table". A fresh database only reaches this once its table exists.
+    if from < 13 {
+        // v13: a colour on a folder row. The sidebar lists folders by name, and names of the same
+        // shape ("notes", "notes-old", "notes-new") are the ones a person distinguishes by eye, not
+        // by reading. The colour is decoration on the record, never a fact about the folder: the
+        // path stays the fact.
+        add_column_if_missing(
+            conn,
+            "workspaces",
+            "color",
+            "color TEXT NOT NULL DEFAULT ''",
         )?;
     }
     if from < 9 {
@@ -1244,6 +1450,15 @@ pub trait StoreOps: Send + Sync {
     fn messages_page(&self, session_id: i64, before_id: Option<i64>, limit: usize)
         -> Result<MessagesPage, StoreError>;
     fn messages(&self, session_id: i64) -> Result<Vec<StoredMessage>, StoreError>;
+    /// How many rows a conversation holds. Cheap on purpose: a caller that has to notice a row
+    /// arriving polls this, and polling `messages()` would re-read the whole conversation each time.
+    fn message_count(&self, session_id: i64) -> Result<usize, StoreError>;
+    /// See `Store::edit_message` / `Store::truncate_from`. Both cores need them: a conversation
+    /// the person corrects has to read corrected on every screen, from every device.
+    fn edit_message(&self, message_id: i64, content: &str) -> Result<bool, StoreError>;
+    fn truncate_from(&self, session_id: i64, from_id: i64) -> Result<usize, StoreError>;
+    /// See `Store::message_attachments`.
+    fn message_attachments(&self, message_id: i64) -> Result<Vec<crate::provider::Attachment>, StoreError>;
     fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError>;
 
     /// Full-text search across conversations — the search panel, not the transcript.
@@ -1253,10 +1468,19 @@ pub trait StoreOps: Send + Sync {
     fn session(&self, id: i64) -> Result<Option<Session>, StoreError>;
     fn rename_session(&self, id: i64, title: &str) -> Result<(), StoreError>;
     fn set_workspace_label(&self, path: &str, label: &str) -> Result<usize, StoreError>;
+    fn set_workspace_color(&self, path: &str, color: &str) -> Result<usize, StoreError>;
     /// Say which mode a conversation belongs to. Not part of `create_session` because the
     /// store creates rows in several places (boot, resume, import) that know nothing about
     /// personas; the default is the honest one, and the client that *does* know says so.
     fn set_session_persona(&self, id: i64, persona: &str) -> Result<(), StoreError>;
+    fn set_session_web(&self, id: i64, on: bool) -> Result<(), StoreError>;
+    fn conversation_count(&self) -> Result<usize, StoreError>;
+
+    /// Where this store's file is, for the About page. See [`Store::db_path`].
+    fn db_path(&self) -> String {
+        String::new()
+    }
+    fn message_total(&self) -> Result<usize, StoreError>;
     /// Display preferences a client set for itself. The keys are not free-form — see
     /// `crate::prefs` — because a table every client can invent keys in is a drawer, not
     /// a settings store.
@@ -1289,6 +1513,19 @@ impl StoreOps for Store {
     }
     fn set_session_persona(&self, id: i64, persona: &str) -> Result<(), StoreError> {
         Store::set_session_persona(self, id, persona)
+    }
+    fn set_session_web(&self, id: i64, on: bool) -> Result<(), StoreError> {
+        Store::set_session_web(self, id, on)
+    }
+    fn db_path(&self) -> String {
+        Store::db_path(self)
+    }
+
+    fn conversation_count(&self) -> Result<usize, StoreError> {
+        Store::conversation_count(self)
+    }
+    fn message_total(&self) -> Result<usize, StoreError> {
+        Store::message_total(self)
     }
     fn ui_pref(&self, key: &str) -> Result<Option<String>, StoreError> {
         Store::ui_pref(self, key)
@@ -1326,6 +1563,18 @@ impl StoreOps for Store {
     fn messages(&self, session_id: i64) -> Result<Vec<StoredMessage>, StoreError> {
         Store::messages(self, session_id)
     }
+    fn message_count(&self, session_id: i64) -> Result<usize, StoreError> {
+        Store::message_count(self, session_id)
+    }
+    fn edit_message(&self, message_id: i64, content: &str) -> Result<bool, StoreError> {
+        Store::edit_message(self, message_id, content)
+    }
+    fn truncate_from(&self, session_id: i64, from_id: i64) -> Result<usize, StoreError> {
+        Store::truncate_from(self, session_id, from_id)
+    }
+    fn message_attachments(&self, message_id: i64) -> Result<Vec<crate::provider::Attachment>, StoreError> {
+        Store::message_attachments(self, message_id)
+    }
     fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError> {
         Store::history(self, session_id)
     }
@@ -1341,10 +1590,84 @@ impl StoreOps for Store {
     fn set_workspace_label(&self, path: &str, label: &str) -> Result<usize, StoreError> {
         Store::set_workspace_label(self, path, label)
     }
+    fn set_workspace_color(&self, path: &str, color: &str) -> Result<usize, StoreError> {
+        Store::set_workspace_color(self, path, color)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// What "edit this message" has to guarantee: the corrected sentence is the one every reader
+    /// sees — the transcript, the model's replayed history, and the search box — and the row the
+    /// person did not name is left alone rather than silently rewritten next door.
+    #[test]
+    fn a_corrected_message_reads_corrected_everywhere() {
+        let s = store();
+        let c = sid(&s);
+        let first = s.append_message(c, &Message::user("the old sentence")).unwrap();
+        let second = s.append_message(c, &Message::user("the next one")).unwrap();
+        assert!(
+            s.search("old sentence", 10).unwrap().iter().any(|h| h.message_id == first),
+            "the search index has to hold the row before the edit"
+        );
+
+        assert!(s.edit_message(first, "the fixed sentence").unwrap());
+
+        assert_eq!(
+            s.messages(c).unwrap().iter().find(|m| m.id == first).unwrap().content,
+            "the fixed sentence"
+        );
+        assert_eq!(
+            s.history(c).unwrap().iter().find(|m| m.content == "the fixed sentence").map(|m| m.role),
+            Some(Role::User),
+            "the model has to be told the corrected words, not the ones in the old draft"
+        );
+        assert_eq!(
+            s.messages(c).unwrap().iter().find(|m| m.id == second).unwrap().content,
+            "the next one",
+            "only the named row changes"
+        );
+        // The search copy moved with it: the corrected words answer, the crossed-out ones do not.
+        assert!(s.search("fixed sentence", 10).unwrap().iter().any(|h| h.message_id == first));
+        assert!(
+            s.search("old sentence", 10).unwrap().is_empty(),
+            "a search that still answers the sentence the person crossed out is a second copy \
+             of the transcript they can no longer find"
+        );
+        // A row that is not there says so, instead of reporting a save that saved nothing.
+        assert!(!s.edit_message(999_999, "x").unwrap());
+    }
+
+    /// "Take the conversation back to just before that message" — the row it names goes with the
+    /// rest, and the search index goes with it.
+    #[test]
+    fn a_conversation_can_be_taken_back_to_a_message() {
+        let s = store();
+        let c = sid(&s);
+        let other = sid(&s);
+        let a = s.append_message(c, &Message::user("one")).unwrap();
+        let b = s.append_message(c, &Message::assistant("two")).unwrap();
+        s.append_message(c, &Message::user("three")).unwrap();
+        s.append_message(other, &Message::user("keep me")).unwrap();
+
+        assert_eq!(s.truncate_from(c, b).unwrap(), 2, "`two` and everything after it goes");
+        assert_eq!(
+            s.messages(c).unwrap().into_iter().map(|m| m.content).collect::<Vec<_>>(),
+            vec!["one"],
+            "the named row goes with the stretch after it"
+        );
+        assert_eq!(s.messages(other).unwrap().len(), 1, "another conversation is not involved");
+
+        assert_eq!(s.truncate_from(c, 0).unwrap(), 1, "0 means the whole transcript");
+        assert_eq!(s.message_count(c).unwrap(), 0);
+        assert!(s.search("three", 10).unwrap().is_empty(), "the search copy goes with the rows");
+        assert_eq!(s.messages(other).unwrap()[0].content, "keep me");
+        // Back to nothing is a legal answer, not an error: the next send starts the conversation
+        // over, which is exactly what editing the very first message asks for.
+        assert_eq!(s.truncate_from(c, 0).unwrap(), 0);
+        let _ = a;
+    }
+
     /// The failure this query exists for: a folder that looks empty in the sidebar is not
     /// empty in the store, and deleting the folder then reads as a UI that will not let you
     /// remove it. Chat rows carry the folder path (they were started in it) while the sidebar
@@ -1599,6 +1922,45 @@ mod tests {
             "a pre-v11 store gains the column and the default, it does not fail to open"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A chat's network grant rides with the conversation, not with the window that granted it.
+    #[test]
+    fn a_conversation_remembers_whether_it_may_reach_the_web() {
+        let s = store();
+        let a = sid(&s);
+        let b = sid(&s);
+        assert!(!s.session(a).unwrap().unwrap().web_on, "off until somebody grants it");
+        s.set_session_web(a, true).unwrap();
+        assert!(s.session(a).unwrap().unwrap().web_on);
+        assert!(!s.session(b).unwrap().unwrap().web_on, "the other conversation is untouched");
+        // Read back through the list query too: the sidebar builds its own idea of a chat from that
+        // row, and a grant that survives `session()` but not `list_sessions()` is half a setting.
+        let listed = s.list_sessions(10).unwrap();
+        assert!(listed.iter().any(|x| x.id == a && x.web_on));
+        assert!(listed.iter().any(|x| x.id == b && !x.web_on));
+        s.set_session_web(a, false).unwrap();
+        assert!(!s.session(a).unwrap().unwrap().web_on, "taking it back is a write, not a delete");
+        // A conversation filed in a folder reads its grant there as well: `sessions_in` is the third
+        // query that builds a `Session`, and the third one is where a missed column hides.
+        let s2 = Store::in_memory().unwrap();
+        let c = s2.create_session("in a folder", "/home/me/ws", "m").unwrap();
+        s2.set_session_web(c, true).unwrap();
+        assert!(s2.sessions_in("/home/me/ws").unwrap()[0].web_on);
+    }
+
+    /// The counts the About page prints.
+    #[test]
+    fn the_record_can_say_how_much_is_in_it() {
+        let s = store();
+        let a = sid(&s);
+        s.append_message(a, &Message::user("one")).unwrap();
+        s.append_message(a, &Message::assistant("two")).unwrap();
+        let b = sid(&s);
+        s.append_message(b, &Message::user("three")).unwrap();
+        s.delete_session(b).unwrap();
+        assert_eq!(s.conversation_count().unwrap(), 1, "a deleted conversation stops counting");
+        assert_eq!(s.message_total().unwrap(), 2, "and its rows went with it");
     }
 
     #[test]
@@ -1861,6 +2223,62 @@ mod tests {
         assert_eq!(s.session(id).unwrap().unwrap().workspace, "/home/me/projects/inventory-app");
         // An unknown path renames nothing, rather than creating a stray row.
         assert_eq!(s.set_workspace_label("/home/me/nope", "ghost").unwrap(), 0);
+    }
+
+    /// A colour belongs to the folder row, not to the window that set it: the point of colouring a
+    /// folder is that every client reading the list can tell two same-shaped names apart.
+    #[test]
+    fn a_folder_colour_travels_with_the_folder() {
+        let s = Store::in_memory().unwrap();
+        // A folder with sessions in it but no row of its own still appears in the sidebar, so
+        // colouring it has to create the row it needs. This is the difference from a rename, which
+        // refuses an unknown path: a colour that silently does not stick on the folder the person
+        // is looking at is the failure this path exists to avoid.
+        s.create_session("a", "/home/me/projects/inventory-app", "m").unwrap();
+        assert_eq!(s.list_workspaces().unwrap()[0].color, "", "no colour until one is chosen");
+        assert_eq!(
+            s.set_workspace_color("/home/me/projects/inventory-app", "#3D8F6F").unwrap(),
+            1
+        );
+        assert_eq!(
+            s.list_workspaces().unwrap()[0].color,
+            "#3d8f6f",
+            "stored lower-case, so the client comparing it against a palette agrees with itself"
+        );
+        // Clearing it is a value, not a delete: the label and the count survive.
+        assert_eq!(s.set_workspace_color("/home/me/projects/inventory-app", "").unwrap(), 1);
+        assert_eq!(s.list_workspaces().unwrap()[0].color, "");
+        assert_eq!(s.list_workspaces().unwrap()[0].sessions, 1);
+        // A value that is not a colour is refused where it is written, not filtered on the way
+        // out: the row is what every client is handed, and one of them puts it in a style.
+        for bad in ["red", "#3d8f6", "#gg8f6f", "#3d8f6f; url(x)", "rgb(1,2,3)", "#3d8f6ff"] {
+            assert!(
+                s.set_workspace_color("/home/me/projects/inventory-app", bad).is_err(),
+                "{bad} is not a colour"
+            );
+        }
+        assert_eq!(s.list_workspaces().unwrap()[0].color, "", "a refused write changed nothing");
+    }
+
+    /// A database from before the column exists opens, and its folders read as uncoloured.
+    #[test]
+    fn an_old_store_gains_the_colour_column_without_losing_the_folder() {
+        let path = std::env::temp_dir().join(format!("cw-wscolour-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let st = Store::open(&path).unwrap();
+            st.add_workspace("/home/me/notes").unwrap();
+            st.set_workspace_label("/home/me/notes", "old notes").unwrap();
+            st.conn.lock().unwrap().execute_batch("ALTER TABLE workspaces DROP COLUMN color;").ok();
+            st.conn.lock().unwrap().pragma_update(None, "user_version", 12).unwrap();
+        }
+        let reopened = Store::open(&path).unwrap();
+        let ws = reopened.list_workspaces().unwrap();
+        assert_eq!(ws[0].label, "old notes", "the folder and its name survived the upgrade");
+        assert_eq!(ws[0].color, "", "a pre-v13 store reads as no colour, it does not fail to open");
+        assert_eq!(reopened.set_workspace_color("/home/me/notes", "#c08a2e").unwrap(), 1);
+        assert_eq!(reopened.list_workspaces().unwrap()[0].color, "#c08a2e");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

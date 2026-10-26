@@ -371,13 +371,15 @@ fn a_turn_parked_on_a_human_reports_the_generation_rate_not_the_wall_clock() {
     }
     let u = usage.expect("no Usage event");
     assert_eq!(u.completion_tokens, 20);
-    // 20 tokens over the one second of actual generation, not the five seconds of
-    // wall clock: 19-21 tok/s. Over the wall clock it would read 4.
-    // 20 tokens over the 500 ms the model was actually generating, not over the
-    // 4500 ms since the first delta: 40 tok/s, where the wall clock says 4.4.
+    // 20 tokens over the generation window, not over the five seconds of wall clock a parked card
+    // makes it look like. The window is the gaps *between* deltas — the wait for the first token
+    // belongs to prefill, and counting it as decoding is the mistake the engine's own test
+    // (`the_decode_window_is_generation_time_not_wall_clock`) refuses to make. Two deltas 250 ms
+    // apart is 250 ms of decoding, so 80 tok/s; the wall clock would say 4.4 and the old
+    // first-delta-included window said 40.
     assert!(
-        (39.0..=41.0).contains(&u.server_decode_tps),
-        "decode rate should be ~40 tok/s of generation, got {:.1} (wall clock would say 4.4)",
+        (79.0..=81.0).contains(&u.server_decode_tps),
+        "decode rate should be ~80 tok/s of generation, got {:.1} (wall clock would say 4.4)",
         u.server_decode_tps
     );
     assert!(
