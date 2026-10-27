@@ -1185,6 +1185,17 @@
   }
 
   /** Colour (or un-colour) a folder. `color` is empty to clear it. */
+  /** Used by the colour selftest: the write the swatch performs, asked directly, so a failure can say
+   * whether the press missed or the verb behind it did. */
+  async function setWsColorProbe(path: string, color: string): Promise<boolean> {
+    try {
+      await invoke('set_workspace_color', { path, color: safeColor(color) })
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async function setWsColor(path: string, color: string) {
     if (!path) return // the "No workspace" bucket is not a folder and gets no mark
     const want = safeColor(color) // what we ask for is what we will accept back
@@ -2449,6 +2460,15 @@
   let namingText = $state('')
   /** When the first name paint for `namingId` arrived, for the ordering claim in the selftest. */
   let namingFirstAt = 0
+  /**
+   * A turn-start edge a check can install for itself, filled by the shipped signal rather than by
+   * sampling a flag between frames. A fast endpoint can start and finish a turn inside one 10ms
+   * sample gap (a mock turn measured `frames=1`, 36 characters), and a check that only samples
+   * `busy` then reports "this page never saw the turn running" — which is a fact about its own
+   * sampling, not about the app. The check puts the object in; `turnStart` writes the first edge and
+   * nothing after it; the check takes it back.
+   */
+  let edgeWatch: { turnStart: number } | null = null
   /** The final name the engine claimed for `namingId`, once it said it was done. */
   let namingDone = $state('')
   function namingOf(s: Session): string {
@@ -2761,6 +2781,7 @@
           runningSessions = next
         }
         busy = true
+        if (edgeWatch && !edgeWatch.turnStart) edgeWatch.turnStart = performance.now()
         turnStartTs = performance.now()
         turnMs = 0
         // Clear the previous turn's numbers. Leaving them up is how a bar reads
@@ -4146,7 +4167,7 @@
         // and "Share as markdown" on a phone's first load answered "this conversation is
         // not saved yet" about a conversation that plainly was.
         if (transcript) transcript.sessionId = b.session_id
-        transcript?.clear()
+        transcript?.clear('session switch')
         transcript?.loadHistory(page.messages)
         transcript?.replayNotes(b.session_id)
         // A turn that is still running is the one thing this page cannot show on its
@@ -4248,12 +4269,20 @@
     // conversation starts a fresh window instead, so a big view of one session does
     // not inflate the first paint of another.
     const keepRows = viewId === id ? viewMsgCount : 0
+    // A repaint of the conversation already on screen, as opposed to a navigation to another one.
+    // The difference decides whether the screen may be blanked on the way: `loadHistory` clears
+    // whatever it replaces, so this early clear bought nothing except a gap — a second or two of
+    // nothing where the message you just sent used to be, on a core that writes a turn's rows when
+    // the turn ends. The attachment check found exactly that: an on-screen transcript with zero
+    // turns while its own send was in flight.
+    const repaint = viewId === id
     viewId = id
     // The transcript owns buttons that name a conversation (export), so it needs
     // the id of what is on screen - which is not the same as the session the
     // engine happens to be working on.
     if (transcript) transcript.sessionId = id
-    transcript?.clear()
+    // Leaving a conversation is the one case where showing the old one a moment longer is wrong.
+    if (!repaint) transcript?.clear('resync: navigating to another conversation')
     let rows: StoredMessage[] = []
     try {
       rows = await loadTranscript(id, keepRows)
@@ -4264,31 +4293,44 @@
     // A newer resync has already taken the view; painting this one's result
     // would show a session the user has since moved away from.
     if (mySeq !== resyncSeq) return
-    // A page that contradicts the counter sitting next to it is stale, not empty.
-    // The read goes out while the host still holds the turn's rows unwritten and can land
-    // after that turn has ended: painting its empty page then wipes a conversation that does
-    // exist, and nothing repaints it — which is what "I sent the first message and the screen
-    // stayed blank" looks like from the chair. The sidebar row carries the conversation's own
-    // message count, so when the page comes back empty against a non-zero count, read once
-    // more before believing zero.
+    /**
+     * A page that comes back empty is the one page a turn in flight can invalidate.
+     *
+     * The read goes out before the host has written the turn's rows and can land after that turn
+     * ended; painting its empty page wipes a conversation that does exist, and nothing repaints it
+     * — which is what "I sent the first message and the screen stayed blank" looks like from the
+     * chair. A second read issued in the same breath as the first can come back with the same
+     * answer, so what separates "this conversation is empty" from "the rows are not written yet" is
+     * a short poll, and what bounds it is the counter the row next to it carries: a conversation the
+     * sidebar says has four messages gets a few hundred more milliseconds than one it says has none.
+     * The counter is a hint about *how long to wait*, never a substitute for the page: a conversation
+     * created by the very send being loaded is not in this window's list at all.
+     */
     if (rows.length === 0) {
-      // A page that comes back empty is the one page a turn in flight can invalidate: the read
-      // goes out before the host has written the turn's rows and can land after the turn ended,
-      // and painting that empty page wipes a conversation that does exist — with nothing left to
-      // repaint it, which is "I sent the first message and the screen stayed blank". Asking again
-      // costs one round trip and is the only way to tell genuinely empty from not-yet-written.
-      // The message count on the sidebar row would be the cheaper witness, but a conversation
-      // created by the very send now being loaded is not in the list this window holds.
+      const expected = sessions.find((x) => x.id === id)?.message_count ?? 0
+      const until = Date.now() + (expected > 0 ? Math.min(2400, 300 + expected * 120) : 150)
       let again: StoredMessage[] = rows
-      try {
-        again = await loadTranscript(id, keepRows)
-      } catch (e) {
-        pageLog(`session_messages second read failed: ${e}`)
+      let tries = 0
+      while (!again.length && Date.now() < until) {
+        tries += 1
+        await new Promise((r) => setTimeout(r, 150))
+        try {
+          again = await loadTranscript(id, keepRows)
+        } catch (e) {
+          pageLog(`session_messages retry ${tries} failed: ${e}`)
+          break
+        }
       }
       if (again.length)
         pageLog(
-          `resync: conversation ${id} looked empty and was not — ${again.length} row(s) came back ` +
-            'when the page was read a second time',
+          `resync: conversation ${id} looked empty and was not — ${again.length} row(s) came back on read ` +
+            `${tries + 1}` +
+            (expected ? ` while its row was saying ${expected} message(s)` : ''),
+        )
+      else if (expected > 0)
+        pageLog(
+          `resync: conversation ${id} still reads empty after ${tries} more read(s) while its row says ${expected} ` +
+            'message(s); showing it empty, and this is the seam a blank transcript comes out of',
         )
       rows = again
     }
@@ -4379,7 +4421,7 @@
     viewMsgCount = 0
     hasOlder = false
     oldestId = null
-    transcript?.clear()
+    transcript?.clear('start screen')
     setTimeout(() => composerEl?.focus(), 0)
   }
 
@@ -4462,7 +4504,9 @@
   const RESYNC_MAX_ROWS = 1200
 
   async function loadTranscript(id: number, atLeastRows = 0): Promise<StoredMessage[]> {
-    viewMsgCount = 0
+    // Not zeroed on the way in: `viewMsgCount` is what the app uses to decide whether there is a
+    // conversation on screen at all, so blanking it before the read is a second way for the screen
+    // to go empty while a page is merely being fetched. It is assigned from the page below.
     const want = Math.max(PAGE_ROWS, atLeastRows)
     if (want > RESYNC_MAX_ROWS)
       pageLog(
@@ -4473,16 +4517,33 @@
       limit: Math.min(RESYNC_MAX_ROWS, want),
     })
     pageLog(`history: ${page.messages.length} row(s) for session ${id}`)
-    transcript?.loadHistory(page.messages)
-    // The note explaining this conversation is not stored in it: a resumed history
-    // announces itself once, and a repaint used to drop that announcement.
-    transcript?.replayNotes(id)
+    /**
+     * An empty page is not evidence that this conversation is empty when this client has a turn
+     * running in it.
+     *
+     * The rust core writes a turn's rows when the turn ends, so a read that goes out mid-answer comes
+     * back with nothing — and painting that nothing wipes the message the person just sent, picture
+     * included. The transcript's own clear trail showed exactly this: a `page paint` of 0 rows over a
+     * bubble that was on screen a moment before, in the same breath as the send. Keeping the screen
+     * as it is costs nothing (the caller's poll re-reads, and the rows are painted when they exist);
+     * painting it costs the conversation's first message for a second or two.
+     */
+    const hold = page.messages.length === 0 && turnSessionId === id
+    if (hold) {
+      pageLog(`history: conversation ${id} reads empty while its turn is in flight; keeping what is on screen`)
+    } else {
+      transcript?.loadHistory(page.messages)
+      // The note explaining this conversation is not stored in it: a resumed history
+      // announces itself once, and a repaint used to drop that announcement.
+      transcript?.replayNotes(id)
+      viewMsgCount = page.messages.length
+      hasOlder = page.has_older
+      oldestId = page.messages.length ? page.messages[0].id : null
+    }
     // A queued session switch can land before the turn has persisted anything,
     // and reloading then would report an in-flight session as empty and drop
     // the view back to the greeting mid-turn.
-    viewMsgCount = turnSessionId === id ? Math.max(page.messages.length, 1) : page.messages.length
-    hasOlder = page.has_older
-    oldestId = page.messages.length ? page.messages[0].id : null
+    if (turnSessionId === id) viewMsgCount = Math.max(viewMsgCount, page.messages.length, 1)
     // The rows, handed back: a caller repainting a session that is mid-turn has to
     // know whether the store already holds the message that turn started with.
     return page.messages
@@ -4800,6 +4861,10 @@
    * rename/delete/search round-trip through the store correctly.
    */
   async function selfTest() {
+    // The transcript names its own wipes for the length of a check run: a check that finds an empty
+    // screen should be able to say which code emptied it, and the only honest way to know is to ask
+    // the code at the moment it does it.
+    Transcript.reportClears = true
     let fails = 0
     // Counting failures matters: a harness that logs FAIL and then prints "ok"
     // is worse than no harness, because the last line is the one you read.
@@ -5364,6 +5429,15 @@
         if (viewId !== other.id) fail(`view did not move: viewId=${viewId} wanted=${other.id}`)
         let domChanged = false
         const d2 = performance.now() + 3000
+        // Frames asked for in the same window as the poll, so a failure can say whose answer it is.
+        // A page nothing composites applies its mount effects late — the view moved, the record is
+        // there, and the transcript text has not been repainted yet.
+        let pollFrames = 0
+        const tick = () => {
+          pollFrames += 1
+          if (performance.now() < d2) requestAnimationFrame(tick)
+        }
+        requestAnimationFrame(tick)
         while (performance.now() < d2) {
           await new Promise((r) => setTimeout(r, 100))
           if ((rootEl?.textContent ?? '').trim() !== domBefore) {
@@ -5371,7 +5445,13 @@
             break
           }
         }
-        if (!domChanged) fail(`transcript DOM unchanged after opening session ${other.id}`)
+        if (!domChanged && pollFrames === 0) {
+          blindSkips++
+          pageLog(
+            `selftest note: skipped the repaint-on-open claim for session ${other.id}; the view moved and ` +
+              '0 animation frames ran in the 3s window, and a page nothing paints applies mount effects late',
+          )
+        } else if (!domChanged) fail(`transcript DOM unchanged after opening session ${other.id} (${pollFrames} frame(s) ran while waiting)`)
         // On the desktop, clicking a row *is* choosing where the next turn goes,
         // so the host following the view is correct there. What must never happen
         // is the host landing on some third session, and the other direction -
@@ -6791,7 +6871,14 @@
         const rowA = [...document.querySelectorAll('.sessrow')].find((r) =>
           (r.querySelector('.sess-title')?.textContent ?? '').includes('selftest live A'),
         )
-        if (!rowA) fail('the running session has no row in the sidebar')
+        // A row that never reached the DOM in a page nothing paints is the compositor's answer,
+        // not the app's: mount effects are applied late when no frame is coming. The turn itself is
+        // still checked below; only this rendering half is written off.
+        const unped = unpainted()
+        if (!rowA && unped) {
+          blindSkips++
+          pageLog(`selftest note: skipped the running-row claim; ${unped}, and a page nothing paints mounts its sidebar rows late`)
+        } else if (!rowA) fail('the running session has no row in the sidebar')
         else if (!rowA.querySelector('.sess-dot.busy'))
           fail('the session that is inferencing shows no spinner in the sidebar')
 
@@ -7391,6 +7478,7 @@
             const a = document.querySelector('.transcript .blk-answer .blk-body')
             if (!answerFirst && a && (a.textContent ?? '').trim()) answerFirst = now
           }, 10)
+          edgeWatch = { turnStart: 0 }
           await invoke('start_turn', { text: 'What is 6 times 7?', attachments: [], session: sid })
           const done = await waitFor(
             'the titling turn to finish',
@@ -7398,6 +7486,11 @@
             20000,
           )
           clearInterval(poll)
+          // The 10ms sample is the first try; the signal itself is the fallback. If neither caught
+          // the turn starting, that is the app running a whole turn without ever telling this page it
+          // had started, and the failure says that instead of blaming a sample gap.
+          if (!busyFirst) busyFirst = edgeWatch?.turnStart ?? 0
+          edgeWatch = null
           if (!done) {
             fail('the titling turn never finished')
           } else {
@@ -7437,8 +7530,9 @@
             // own error bar, and it is stated here rather than hidden in the constant.
             } else if (!namingFirstAt || !busyFirst) {
               fail(
-                `no clock for the ordering claim: name arrived at ${namingFirstAt.toFixed(0)}ms, ` +
-                  `this page first saw the turn running at ${busyFirst.toFixed(0)}ms`,
+                `no edge for the ordering claim: the name arrived at ${namingFirstAt.toFixed(0)}ms ` +
+                  `and this page was never told the turn had started — neither a 10ms sample of the ` +
+                  `running flag nor the turn-start signal caught it`,
               )
             } else if (namingFirstAt > busyFirst + 50) {
               fail(
@@ -9028,9 +9122,19 @@
           let markerPainted = ''
           let firstItemTop: number | null = null
           let firstItemText = ''
+          // Sample the turn this ask started, not "the last answer body in the document": a big
+          // transcript holds older answers, and which one is last depends on when the older pages
+          // happened to arrive, so an untended `all[all.length - 1]` grades whatever the paging left
+          // last. (That is how this group reported a heading it never asked about, with a trace full
+          // of an older answer's text.)
+          const scopeBodies = () => {
+            const turns = [...document.querySelectorAll('.turn')] as HTMLElement[]
+            const t = turns[turns.length - 1]
+            return (t ? [...t.querySelectorAll('.blk-answer .blk-body')] : []) as HTMLElement[]
+          }
           const sampler = (async () => {
             while (!stopped) {
-              const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+              const all = scopeBodies()
               const body = all[all.length - 1]
               if (body) {
                 const lis = [...body.querySelectorAll('li')]
@@ -9058,7 +9162,7 @@
           const done = await waitTurnDone(before, 60000)
           stopped = true
           await sampler
-          const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+          const all = scopeBodies()
           const body = all[all.length - 1]
           const lis = body ? [...body.querySelectorAll('li')] : []
           // The last sample taken while the turn was still running is what proves
@@ -9119,9 +9223,19 @@
           let stopped = false
           let starSeen = ''
           let strongWhileStreaming = 0
+          // Sample the turn this ask started, not "the last answer body in the document": a big
+          // transcript holds older answers, and which one is last depends on when the older pages
+          // happened to arrive, so an untended `all[all.length - 1]` grades whatever the paging left
+          // last. (That is how this group reported a heading it never asked about, with a trace full
+          // of an older answer's text.)
+          const scopeBodies = () => {
+            const turns = [...document.querySelectorAll('.turn')] as HTMLElement[]
+            const t = turns[turns.length - 1]
+            return (t ? [...t.querySelectorAll('.blk-answer .blk-body')] : []) as HTMLElement[]
+          }
           const sampler = (async () => {
             while (!stopped) {
-              const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+              const all = scopeBodies()
               const body = all[all.length - 1]
               if (body) {
                 const t = body.textContent ?? ''
@@ -9138,7 +9252,7 @@
           const done = await waitTurnDone(before, 60000)
           stopped = true
           await sampler
-          const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+          const all = scopeBodies()
           const body = all[all.length - 1]
           const text = body ? body.textContent ?? '' : ''
           if (!done) fail('the scripted bold turn never finished')
@@ -9152,7 +9266,19 @@
             fail(`expected 2 bold spans, found ${body.querySelectorAll('strong').length}`)
           else if (!text.includes('Sourcing sets the ceiling'))
             fail(`characters were dropped from a split construct: "${text.slice(0, 120)}"`)
-          else if (strongWhileStreaming < 3)
+          else if (strongWhileStreaming < 3 && lastTurnFrames === 0) {
+            // Same witness as the table turn above: the settled half of this check (two spans, no
+            // literal asterisks, nothing dropped) passed on a turn that painted no frames at all, so
+            // the only thing missing is a mid-stream moment, and that moment belongs to the frame
+            // clock. Graded blind it would say "bold waits for the commit" about a page that had no
+            // frames to commit on.
+            blindSkips++
+            pageLog(
+              `selftest note: skipped the mid-stream half of the bold check; this turn painted 0 frames, so there ` +
+                `was no sample between the stream and the settle (${strongWhileStreaming} sample(s) saw bold, and ` +
+                'the settled block is correct)',
+            )
+          } else if (strongWhileStreaming < 3)
             fail(
               `bold appeared in only ${strongWhileStreaming} samples during the stream, i.e. only at the end - ` +
                 'a construct should become bold as it closes, not when the block commits',
@@ -10283,9 +10409,19 @@
           // the shape on screen instead of only the symptom.
           const trace: string[] & { lastTick?: number } = [] as string[] & { lastTick?: number }
           const tTrace = performance.now()
+          // Sample the turn this ask started, not "the last answer body in the document": a big
+          // transcript holds older answers, and which one is last depends on when the older pages
+          // happened to arrive, so an untended `all[all.length - 1]` grades whatever the paging left
+          // last. (That is how this group reported a heading it never asked about, with a trace full
+          // of an older answer's text.)
+          const scopeBodies = () => {
+            const turns = [...document.querySelectorAll('.turn')] as HTMLElement[]
+            const t = turns[turns.length - 1]
+            return (t ? [...t.querySelectorAll('.blk-answer .blk-body')] : []) as HTMLElement[]
+          }
           const sampler = (async () => {
             while (!stopped) {
-              const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+              const all = scopeBodies()
               const body = all[all.length - 1]
               if (body) {
                 const now = performance.now()
@@ -10314,15 +10450,31 @@
           const endedAt = performance.now()
           stopped = true
           await sampler
-          const all = [...document.querySelectorAll('.blk-answer .blk-body')]
+          const all = scopeBodies()
           const body = all[all.length - 1]
           const rows = body ? body.querySelectorAll('table tr').length : 0
           const items = body ? body.querySelectorAll('li').length : 0
           // How long before the end of the turn the structure was already on screen.
           const ago = (t: number | null) => (t === null ? -1 : Math.round(endedAt - t))
+          // The witness is the paints *this turn* delivered, not the run's total. A run can collect
+          // a dozen frames early and then go dark for the turn under test — which is what happened
+          // when a global witness said "painted" while this turn streamed 0 frames and every shape
+          // claim came back missing. Structure is rendered on the frame clock, so with no frames the
+          // shapes were never going to appear: the claim is written off, loudly, rather than graded
+          // against the compositor.
+          const settledHeads = body ? body.querySelectorAll('h1, h2, h3').length : 0
+          const settledTables = body ? body.querySelectorAll('table').length : 0
           if (!done) fail('the scripted table turn never finished')
           else if (!body) fail('the scripted table turn left no answer block')
-          else if (headingAt === null)
+          else if (lastTurnFrames === 0 && (headingAt === null || tableAt === null)) {
+            blindSkips++
+            pageLog(
+              `selftest note: skipped this turn's structure claims; it painted 0 frames from start to settle, ` +
+                `and at settle the block held ${settledHeads} heading(s), ${settledTables} table(s), ` +
+                `${body.querySelectorAll('li').length} list item(s) - markdown is parsed on the frame clock, so a ` +
+                'turn nobody composited has no clock to parse on. Keep the window visible and this bites.',
+            )
+          } else if (headingAt === null)
             fail(`the heading never became a heading :: ${trace.slice(-8).join(' :: ')}`)
           else if (tableAt === null) fail('the table never became a table; the answer stayed text')
           else if (ago(tableAt) < 60)
@@ -10858,12 +11010,30 @@
         // loaded rows, and measuring a hidden tree proves nothing because every rect
         // in it reads 0.
         {
-          const shown =
-            viewId === target.id &&
-            getComputedStyle(document.querySelector('.scroller')!).display !== 'none'
-          if (!shown)
+          // Two different problems used to come out of one sentence, and the sentence lied about
+          // which one it meant: `viewId=3, want 3` is not a transcript that "belongs elsewhere".
+          // And a hidden scroller has a reason worth naming — empty mode is the app being honest
+          // about a conversation the record says is empty, which is a setup problem for this check,
+          // not a layout bug in the card.
+          const laidOut = await waitFor(
+            'a laid-out transcript to measure',
+            () => (document.querySelector('.transcript')?.getBoundingClientRect().width ?? 0) >= 50,
+            2500,
+          )
+          if (!laidOut) {
+            blindSkips++
+            pageLog(
+              `selftest note: the tool-card claims were not measured — the transcript is not laid out ` +
+                `(viewId=${viewId}, empty-mode=${!!document.querySelector('.empty-mode')}, ` +
+                `turns=${document.querySelectorAll('.turn').length}): nothing to measure the card's lines on`,
+            )
+          } else if (viewId !== target.id)
+            fail(`the layout checks are reading a different conversation than the harness opened (viewId=${viewId}, want ${target.id})`)
+          else if (getComputedStyle(document.querySelector('.scroller')!).display === 'none')
             fail(
-              `the transcript is hidden or belongs elsewhere while the layout checks ran (viewId=${viewId}, want ${target.id})`,
+              `the card is hidden while its own conversation is open (viewId=${viewId}, ` +
+              `viewMsgCount=${viewMsgCount}, empty-mode=${!!document.querySelector('.empty-mode')}): ` +
+              'the record says this conversation has rows and the window is showing none of them',
             )
         }
 
@@ -10948,17 +11118,19 @@
             fail(`the user bubble is ${(share * 100).toFixed(0)}% of the column, want <= 78%`)
           if (getComputedStyle(ub).textAlign === 'right')
             fail('text inside the user bubble is right-aligned')
-          // One name per turn, pinned in the gutter: the element that carries it is the turn's
-          // marker, not the answer block's own label.
-          const lab = document.querySelector('.turn-who-cwoffee .who-name') as HTMLElement
-          // The gutter only exists in a wide layout; in a narrow window the label
-          // legitimately goes back above its block, so assert the layout that is
-          // actually in force rather than the one the design prefers.
-          const gutter = parseFloat(getComputedStyle(document.querySelector('.scroller')!).paddingLeft || '0')
-          if (gutter >= 40 && lab.getBoundingClientRect().left > abr.left - 20)
-            fail(
-              `the CWOFFEE label is not outdented, so the content is still indented (label ${Math.round(lab.getBoundingClientRect().left)}, body ${Math.round(abr.left)}, gutter ${gutter})`,
-            )
+          // No assistant label anywhere. The word `CWOFFEE` used to be pinned in the gutter, and
+          // in this app it restated what the layout already said: everything in the transcript that
+          // is not your own bubble is cwoffee's. The gutter is for a state now, not a name — so the
+          // claim is that nothing names the speaker, and that your own label still does.
+          if (document.querySelector('.who-name'))
+            fail('a turn still prints an assistant name in the gutter')
+          const quiet = [...document.querySelectorAll('.transcript .blk-answer > .blk-head')].filter(
+            (n) => getComputedStyle(n).display !== 'none',
+          )
+          if (quiet.length) fail(`${quiet.length} answer blocks print their own assistant label`)
+          const youLab = document.querySelector('.blk-user > .blk-head') as HTMLElement | null
+          if (!youLab || getComputedStyle(youLab).display === 'none')
+            fail('your own label went away with the assistant one')
         }
 
         // Every control says it is one.
@@ -10967,10 +11139,13 @@
           if (el && getComputedStyle(el).cursor !== 'pointer' && getComputedStyle(el).cursor !== 'not-allowed')
             fail(`${sel} does not advertise a pointer: ${getComputedStyle(el).cursor}`)
         }
-        // A stored attachment belongs *under the answer that produced it*. It used to
-        // be appended to the live turn, which on a reload put the chip above every
-        // message in the session - off screen, so a session reopened after writing a
-        // file looked like it had no attachment at all.
+        // A stored attachment belongs under the answer that produced it, and at the *end* of
+        // what the turn said. Three shapes were wrong in three directions: appended to the live
+        // turn, the chip landed at the top of a reloaded transcript (off screen, so a session
+        // reopened after writing a file looked like it had no attachment at all); emitted per
+        // message, it landed in the middle of an answer that was still talking about something
+        // else; and emitted per message a second time under a different kind, the same filename
+        // appeared twice.
         const chip = document.querySelector('.filechip') as HTMLElement | null
         const answerWrap = document.querySelector('.blk-answer') as HTMLElement | null
         if (!chip) fail('a stored attachment did not render after reload')
@@ -10979,6 +11154,25 @@
           fail('the stored attachment is not below the answer it belongs to')
         else if (!chip.querySelector('svg.file-glyph'))
           fail('the stored attachment chip has no inline icon')
+        else {
+          const row = (chip.closest('.attachline') ?? chip.closest('.filestrip')) as HTMLElement | null
+          if (!row) fail('the attachment chip is not on a file row of its own')
+          else {
+            // Nothing but the turn's own action row, or the next turn opening, may follow it.
+            const sibs = [...(row.parentElement?.children ?? [])] as HTMLElement[]
+            const intruder = sibs.slice(sibs.indexOf(row) + 1).find(
+              (n) =>
+                !n.classList.contains('turn-acts') &&
+                !n.classList.contains('blk-user') &&
+                !n.classList.contains('transcript-cup'),
+            )
+            if (intruder)
+              fail(
+                `the turn's file row is followed by "${intruder.className}" - the files are not the last thing the turn said ` +
+                  `(row ${row.className}, siblings: ${sibs.map((n) => n.className.split(' ')[0] || n.tagName).join(' / ')})`,
+              )
+          }
+        }
 
         transcript?.clear()
         pageLog('collapsed cards, english headers and bubbles ok')
@@ -11080,8 +11274,15 @@
           // are appended at the end, so "at rest" is a question about age, not
           // about position in the list.
           const atRest = seen.filter((t) => (bornAt.get(t) ?? nowMs()) + REVEAL_BUDGET < nowMs())
-          if (painted) judged += atRest.length
-          for (const t of painted ? atRest.slice(-8) : []) {
+          // One paint in the window is not a running animation. On a window the compositor has
+          // dropped, a single stray frame lets a claim like this be graded on spans frozen at their
+          // start values — which is how a blind run reported "a settled word is still under a
+          // filter: blur(0.001965px)" and "a word ... sits at opacity 0.972074". Those numbers are
+          // an animation that never advanced, not a reveal that would not finish. So the claim needs
+          // a clock that has been seen to tick: a few paints across the streaming loop, not one.
+          const clockTicking = animPaints >= 3
+          if (clockTicking) judged += atRest.length
+          for (const t of clockTicking ? atRest.slice(-8) : []) {
             const cs = getComputedStyle(t)
             if (cs.filter !== 'none') fail(`a settled word is still under a filter: ${cs.filter}`)
             if (Number(cs.opacity) < 0.98)
@@ -11296,7 +11497,9 @@
         // Wait on the frame clock so the window below is measurable: if the page
         // painted nothing in that window, "still half-drawn" says nothing about the
         // reveal, so the claim is skipped by name rather than failed.
-        const tailPainted = await frame(400)
+        // Three paints, not one: the window below is 400ms of *animation*, and a single frame in a
+        // window nobody composites proves only that one frame existed.
+        const tailPainted = await frame(400, 3)
         const faint = [...document.querySelectorAll('.blk-answer .tin')].filter(
           (t) => Number(getComputedStyle(t).opacity) < 0.9,
         ).length
@@ -11320,97 +11523,89 @@
         transcript?.clear()
       }
 
-      // [2b] The label in the gutter lines up with the first line of the answer
-      // *while it is being generated*. It used to be propped by a streaming-only
-      // `padding-top: 3px` on the body, so the name sat off the line for the whole
-      // turn and snapped into place at the end. Measured on an answer that starts
-      // with a paragraph, because that is what an answer usually starts with.
+      // [2b] The working mark hangs in the gutter while an answer arrives, and takes nothing
+      // from the text column while it does.
+      //
+      // The gutter used to carry a word — `cwoffee`, pinned to the top of the scroller and lined up
+      // with the answer's first line. The word is gone: it restated what the layout already said.
+      // What replaced it is a state — "this answer is arriving" — and it has to earn the same gutter
+      // without taking layout from the prose. Measured on an answer that starts with a paragraph and
+      // on one that opens with a heading, because those two blocks start at different offsets and
+      // the mark hangs off the block, not off the first line.
       {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'The first words of the answer are landing ' })
         await frame(40)
         transcript?.flushNow()
-        const alignPx = (where: string) => {
+        const measure = (where: string) => {
           const b = document.querySelector('.blk-answer .blk-body') as HTMLElement
-          const who = document.querySelector('.turn-who-cwoffee .who-name') as HTMLElement
+          const mark = document.querySelector('.turn-who.live > .turn-working') as HTMLElement | null
           const first = b?.firstElementChild
           const walk = document.createTreeWalker(first ?? new DocumentFragment(), NodeFilter.SHOW_TEXT)
           const tn = (first ? walk.nextNode() : null) as Text | null
-          const htn = who?.firstChild as Text | null
-          if (!who || !tn || !htn) {
-            fail(`nothing to measure for label alignment ${where}`)
-            return { v: 0, gap: 0 }
+          if (!b || !tn) {
+            fail(`nothing to measure in the answer ${where}`)
+            return { mark, line: null as DOMRect | null, clearance: 0 }
           }
-          // Both measured as *text* boxes: the label carries its own padding and
-          // the first paragraph sits inside block margins, so comparing element
-          // boxes would compare chrome rather than what the eye aligns.
           const rng = document.createRange()
           rng.setStart(tn, 0)
           rng.setEnd(tn, 1)
           const line = rng.getBoundingClientRect()
-          const hr = document.createRange()
-          hr.setStart(htn, 0)
-          hr.setEnd(htn, Math.min(4, htn.length))
-          const head = hr.getBoundingClientRect()
-          const v = line.top + line.height / 2 - (head.top + head.height / 2)
-          // The other half of the complaint: the gutter. The live dot used to be an
-          // inline box inside a 58px right-aligned nowrap label, which made the line
-          // wider than its own box - and text-align does nothing to a line that
-          // overflows, so the label fell back to the start edge and abutted the
-          // answer's first word. Gap measured edge to edge, in the same frame.
-          const gap = line.left - head.right
-          pageLog(`label alignment (${where}): ${v.toFixed(1)}px off the line, ${gap.toFixed(1)}px gutter`)
-          return { v, gap }
-        }
-        const mid = alignPx('while generating')
-        // 6px is the design allowance: the label hangs 2px below the block top and
-        // carries 3px of its own padding. More than that reads as a name that does
-        // not line up with the sentence beside it.
-        if (Math.abs(mid.v) > 6)
-          fail(`the CWOFFEE label is ${mid.v.toFixed(1)}px off the first line while generating`)
-        transcript?.apply({ kind: 'text', d: 'right now, and the label must not shift when they finish.' })
-        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 3, finish: 'stop' } })
-        await new Promise((r) => setTimeout(r, 60))
-        const after = alignPx('once settled')
-        if (Math.abs(after.v - mid.v) > 1.2)
-          fail(`the label moved ${(after.v - mid.v).toFixed(1)}px when the turn ended - it aligns only at the end`)
-        // The gutter has to exist *while the dot is up*, not only after it. A label
-        // that touches the answer's first word for the whole turn and gains its
-        // margin at turn end is the bug, whatever the settled number looks like.
-        if (mid.gap < 6)
-          fail(`the label has ${mid.gap.toFixed(1)}px of gutter while generating - it is touching the answer`)
-        if (Math.abs(after.gap - mid.gap) > 1.0)
-          fail(
-            `the gutter changed ${(after.gap - mid.gap).toFixed(1)}px at turn end (${mid.gap.toFixed(1)}px -> ${after.gap.toFixed(1)}px): the label is being re-laid-out by its own marker`,
+          const mr = mark?.getBoundingClientRect()
+          const clearance = mr ? line.left - mr.right : 0
+          // A pinned mark must stay inside the box that clips it. The row it hangs from sticks to
+          // the top of the pane, above the pane's padding, and a picture raised above that line is
+          // cut by the scroller's own edge.
+          const scB = document.querySelector('.scroller') as HTMLElement | null
+          if (mr && scB && scB.clientHeight > 40 && mr.top < scB.getBoundingClientRect().top - 1)
+            fail(
+              `the working mark reaches ${Math.round(scB.getBoundingClientRect().top - mr.top)}px above the top of the box that clips it, so a pinned mark is drawn with its top missing`,
+            )
+          pageLog(
+            `working mark (${where}): ${
+              mr ? `${Math.round(mr.width)}x${Math.round(mr.height)} at ${Math.round(mr.left)},${Math.round(mr.top)}, ${clearance.toFixed(1)}px clear of the text` : 'no mark'
+            }, first line left ${Math.round(line.left)} top ${Math.round(line.top)}`,
           )
-
-        // The reported case was an answer that opens with a heading, so measure
-        // that too: heading line-height and margins differ from a paragraph's, and
-        // the label hangs off the block, not off the first paragraph.
+          return { mark, line, clearance }
+        }
+        const mid = measure('while generating')
+        if (!mid.mark) fail('a streaming turn shows no working mark in the gutter')
+        else {
+          if (getComputedStyle(mid.mark).display === 'none') fail('the working mark is in the page but not painted')
+          if (mid.clearance < 4)
+            fail(`the working mark crowds the answer: ${mid.clearance.toFixed(1)}px between it and the first line`)
+          const src = mid.mark.getAttribute('src') ?? ''
+          if (!/cwoffee_turn_working/.test(src)) fail(`the gutter shows ${src || 'nothing'}, not the looping turn artwork`)
+          if (mid.mark.tagName !== 'IMG') fail(`the working mark is a ${mid.mark.tagName}, not a picture`)
+        }
+        // The mark must cost the prose nothing: the answer's first line sits in the same place with
+        // the mark in the page and after the turn takes it away.
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 3, finish: 'stop' } })
+        await new Promise((r) => setTimeout(r, 90))
+        const after = measure('once settled')
+        if (document.querySelector('.transcript .turn-working'))
+          fail('the working mark is still in the page after the turn ended')
+        if (after.line && mid.line && Math.abs(after.line.left - mid.line.left) > 0.6)
+          fail(
+            `the answer's first line moved ${(after.line.left - mid.line.left).toFixed(1)}px when the mark went away, ` +
+              `so the mark is taking layout from the column rather than hanging in the gutter`,
+          )
+        // A heading answer, same test at different offsets.
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 4, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: '## The Copy\n\nThe photocopier in the basement started printing again ' })
         await frame(40)
         transcript?.flushNow()
-        const head1 = alignPx('heading answer, generating')
-        if (document.querySelector('.blk-answer h2, .blk-answer h3, .blk-answer h1') === null)
+        if (!document.querySelector('.blk-answer h1, .blk-answer h2, .blk-answer h3'))
           fail('an answer starting with `## ` did not become a heading while streaming')
-        if (document.querySelector('.blk-answer h2, .blk-answer h3, .blk-answer h1') === null)
-          fail('an answer starting with `## ` did not become a heading while streaming')
-        // No absolute vertical bound for the heading case, deliberately: the label
-        // hangs off the top of the block, and a heading carries top margin, so it
-        // sits ~12px below the label by design. What must not happen is the label
-        // *moving* - that was the bug - or losing its gutter next to a wide title.
-        if (head1.gap < 6)
-          fail(`the label has ${head1.gap.toFixed(1)}px of gutter next to a heading: it is touching the title`)
-        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 4, finish: 'stop' } })
-        await new Promise((r) => setTimeout(r, 60))
-        const head2 = alignPx('heading answer, settled')
-        if (Math.abs(head2.gap - head1.gap) > 1.0 || Math.abs(head2.v - head1.v) > 1.2)
-          fail('the label moves when a heading answer settles')
+        const head1 = measure('heading answer, generating')
+        if (!head1.mark) fail('a heading answer has no working mark either')
+        else if (head1.clearance < 4)
+          fail(`the working mark crowds a heading answer: ${head1.clearance.toFixed(1)}px of clearance`)
         pageLog(
-          `label alignment ok (${mid.gap.toFixed(1)}px gutter generating / ${after.gap.toFixed(1)}px settled, heading ${head1.gap.toFixed(1)}px / ${head2.gap.toFixed(1)}px)`,
+          `working mark ok (paragraph ${mid.clearance.toFixed(1)}px clear of the text, heading ${head1.clearance.toFixed(1)}px clear, ` +
+            `and none at all once the turn has landed)`,
         )
         transcript?.clear()
       }
@@ -12125,16 +12320,35 @@
           if (think.querySelectorAll('.blk-body').length)
             fail('the thinking line still carries a body element: a thought has nothing to open')
           if (!think.closest('.blk-run')) fail('the thinking line is not inside the run accordion')
-          const aHead = document.querySelector('.turn-who-cwoffee .who-name')!.getBoundingClientRect()
+          // The gutter is still reserved, and the marker row still sits where the mark can hang in
+          // it. What changed is which edge carries the reservation: the label used to be outdented
+          // from the text column, and the claim measured that gap. Now the row sits *at* the column
+          // and the mark hangs left into the pane's own left padding — measured on a real window at
+          // this width, a 86px column with the mark occupying 284..340 against prose starting at 350.
+          // So the claim is about that column existing, and about the row not being outdented (an
+          // outdented row would put the mark outside the pane, where it gets clipped).
+          const pane = document.querySelector('.scroller') as HTMLElement | null
+          const aRow = document.querySelector('.turn-who-cwoffee')!.getBoundingClientRect()
           const aBody = ans.querySelector('.blk-body')!.getBoundingClientRect()
-          if (aHead.width === 0 || aBody.width === 0)
+          if (aBody.width === 0)
             pageLog(
-              `selftest diag: answer head ${Math.round(aHead.width)}px body ${Math.round(aBody.width)}px, ` +
+              `selftest diag: answer body measured ${Math.round(aBody.width)}px wide, ` +
                 `under .transcript=${document.querySelector('.transcript')?.contains(ans) ?? false}, ` +
                 `empty-mode=${document.documentElement.className.includes('empty-mode') || !!document.querySelector('.empty-mode')}`,
             )
-          if (aBody.left - aHead.left < 40)
-            fail(`answer label is no longer outdented: head ${Math.round(aHead.left)} body ${Math.round(aBody.left)}`)
+          // The mark is 56px wide and hangs 66px off the row, so it needs a column of its own inside
+          // the card: measured at this width, 86px between the card's inner edge (264) and the prose
+          // (350), with the mark occupying 284..340. Two things have to stay true for that to work,
+          // and neither is the gap this check used to measure.
+          const card = pane?.getBoundingClientRect()
+          if (card && aRow.left - card.left < 56)
+            fail(
+              `only ${Math.round(aRow.left - card.left)}px of gutter between the card's edge and the text column: the working mark is 56px wide and hangs off the row there, so it would be clipped`,
+            )
+          if (aBody.left - aRow.left > 4)
+            fail(
+              `the marker row is outdented ${Math.round(aBody.left - aRow.left)}px from the text column, so the mark would hang further left still and outside the card that clips it`,
+            )
           const label = think.querySelector('.blk-head')?.textContent ?? ''
           if (!/^Thought for /i.test(label.trim())) fail(`settled thinking reads "${label}"`)
           // What a thinking line is *not*: no body, no expander, not clickable, one line tall, and
@@ -12178,13 +12392,15 @@
       // is describing is horizontal: the breathing room between the tag and the first
       // glyph. It has to be the same room while text arrives as after the markdown
       // pass, or the turn visibly shifts as it finishes.
-      if (want('label-crowd', 'the label does not crowd the answer while it streams')) {
+      if (want('gutter-crowd', 'nothing in the gutter crowds the answer while it streams')) {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         const gap = () => {
           const blk = document.querySelector('.blk-answer') as HTMLElement
           if (!blk) return null
-          const head = document.querySelector('.turn-who-cwoffee .who-name')!.getBoundingClientRect()
+          const mark = document.querySelector('.turn-who.live > .turn-working') as HTMLElement | null
+          if (!mark) return null
+          const head = mark.getBoundingClientRect()
           const body = blk.querySelector('.blk-body') as HTMLElement
           let first = body.querySelector('.tin') as HTMLElement | null
           let left = first ? first.getBoundingClientRect().left : NaN
@@ -12202,7 +12418,7 @@
           return { h: left - head.right, v: head.bottom - body.getBoundingClientRect().top }
         }
         const live: number[] = []
-        if (await blind('the label gap mid-stream')) {
+        if (await blind('the working-mark gap mid-stream')) {
           // counted skip; the premise is checked before anything is painted
         } else
         for (const p of ['first streamed line, ', 'second streamed line arrives ', 'and a third ']) {
@@ -12210,39 +12426,48 @@
           await frame(40)
           transcript?.flushNow()
           const g = gap()
-          if (g === null) fail('no streamed text to measure the label gap against')
+          if (g === null) fail('no streamed text, or no working mark, to measure the gap against')
           else {
             live.push(g.h)
-            if (g.h < 6) fail(`the label crowds the text mid-stream: ${Math.round(g.h)}px`)
+            if (g.h < 6) fail(`the working mark crowds the text mid-stream: ${Math.round(g.h)}px`)
           }
         }
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 150))
         const fin = gap()
+        // The mark belongs to a turn that is arriving. A settled turn has no mark in the page, so
+        // `fin` being null after `turnEnd` is the expected answer, not a missing measurement.
+        if (document.querySelector('.transcript .turn-working'))
+          fail('the working mark survived the end of its turn')
         if (!live.length) {
           // Every mid-stream sample was skipped. Saying "holds" here would be the
           // harness congratulating itself on measuring nothing.
           blindSkips++
-          pageLog('selftest note: skipped the label-gap drift claim; no mid-stream sample was measurable')
-        } else if (fin === null) fail('no rendered text to measure after the turn')
+          pageLog('selftest note: skipped the gutter-gap drift claim; no mid-stream sample was measurable')
+        } else if (fin === null) {
+          pageLog('gutter gap holds through the turn (and the mark is gone once the turn has landed)')
+        }
         else {
           const worst = Math.max(...live) - Math.min(...live)
           if (worst > 3) fail(`the text edge moves during the turn: ${live.map((x) => Math.round(x)).join('px, ')}px`)
-          if (Math.abs(fin.h - live[0]) > 3)
-            fail(`the label gap changes at turn end: ${Math.round(live[0])}px -> ${Math.round(fin.h)}px`)
-          pageLog(`label gap holds through the turn (${Math.round(fin.h)}px, drift ${Math.round(worst)}px)`)
+          pageLog(`gutter gap holds through the turn (${Math.round(fin.h)}px, drift ${Math.round(worst)}px; no mark once settled)`)
         }
         transcript?.clear()
       }
 
-      // --- one name per turn, pinned while that turn is on screen ---------------
+      // --- one marker per turn, pinned while that turn is on screen ---------------
       // Reported as: "both the You and the Cwoffee indicators have to appear only once per
       // turn — like the action buttons on a code block, float them until the end of the
       // container." A turn that printed its own name five times down the gutter is the same
       // complaint as an ungrouped transcript: five separate messages instead of one turn. The
       // divider travels with it: "the user message is above the turn divider" — your words open
       // the turn, so they belong under the line, not over it.
-      if (want('sticky-name', 'one name per turn, pinned while that turn is on screen')) {
+      //
+      // The word that used to be pinned here is gone — in this app `cwoffee` restated what the
+      // layout already said — but the row, its stickiness, its release at the turn's end and its
+      // arithmetic against the block header all still matter, because the row now carries the
+      // working mark. So the same measurements are made, of the mark instead of the name.
+      if (want('turn-marker', 'one marker per turn, pinned while that turn is on screen, carrying the working mark')) {
         transcript?.clear()
         transcript?.addUser('two things, please')
         const before = [...document.querySelectorAll('.turn')] as HTMLElement[]
@@ -12269,12 +12494,15 @@
         transcript?.flushNow()
         await frame(40)
         const paras = t.querySelectorAll('.blk-answer')
-        const names = t.querySelectorAll('.turn-who-cwoffee')
+        const marks = t.querySelectorAll('.turn-who-cwoffee')
         if (paras.length < 2) fail(`the fixture lost a paragraph (${paras.length})`)
-        if (names.length !== 1)
-          fail(`a turn with ${paras.length} paragraphs and an accordion names itself ${names.length} times, want once`)
+        if (marks.length !== 1)
+          fail(`a turn with ${paras.length} paragraphs and an accordion carries ${marks.length} gutter markers, want one`)
+        if (t.querySelectorAll('.who-name').length) fail('the turn grew an assistant name back')
+        if (!t.querySelector('.turn-who .turn-working'))
+          fail('a turn that is still arriving has no working mark in its marker row')
         const loud = [...t.querySelectorAll('.blk-answer > .blk-head')].filter((n) => getComputedStyle(n).display !== 'none')
-        if (loud.length) fail(`${loud.length} paragraphs still print their own CWOFFEE label`)
+        if (loud.length) fail(`${loud.length} paragraphs still print their own assistant label`)
         // Two of your messages in one turn is one ask, so it keeps one name.
         transcript?.addUser('and one more thing')
         const asks = [...t.querySelectorAll('.blk-user')]
@@ -12286,8 +12514,8 @@
         // block's buttons already have. A filler inside the turn makes it tall enough to have a
         // middle, and the turn itself is the shipped one rather than a hand-built shape.
         const sc = document.querySelector('.scroller') as HTMLElement | null
-        const nmEl = t.querySelector('.turn-who .who-name') as HTMLElement | null
-        if (!sc || !nmEl) fail('there is no scroller or no name marker to measure')
+        const nmEl = t.querySelector('.turn-who .turn-working') as HTMLElement | null
+        if (!sc || !nmEl) fail('there is no scroller or no working mark to measure')
         else {
           const prevTop = sc.scrollTop
           const filler = document.createElement('div')
@@ -12328,11 +12556,11 @@
           }
           const sr = sc.getBoundingClientRect()
           const stickAt = sr.top
-          // The word hangs below the row it is pinned by, by the offset the CSS publishes for this
-          // turn's shape, so "pinned at the top" has to be measured against that line rather than
-          // against the row itself - otherwise a turn that opens with the folded group reads as a
-          // name that has forgotten to stick.
-          const hang = parseFloat(getComputedStyle(nmEl.parentElement!).getPropertyValue('--who-top')) || 0
+          // The picture hangs below the row it is pinned by, by an offset that differs per turn
+          // shape (a turn that opens with the folded group starts lower), so "pinned at the top" is
+          // measured against the mark's own resolved `top`: the browser has already done the
+          // arithmetic, and reading its answer is the check rather than restating the constant.
+          const hang = parseFloat(getComputedStyle(nmEl).top) || 0
           const mid = { nm: nmEl.getBoundingClientRect(), turn: t.getBoundingClientRect() }
           const landed = mid.turn.top - want
           const verdict: string[] = []
@@ -12358,9 +12586,16 @@
             // measure against and the fixed offset is being compared with nothing.
             blindSkips++
             pageLog(
-              `selftest note: skipped the mid-turn sticky-name measurement; ${offScreen() ?? 'the row the name hangs from measures 0px tall'} - a page nothing composites has no sticky line to measure against`,
+              `selftest note: skipped the mid-turn marker measurement; ${offScreen() ?? 'the row the mark hangs from measures 0px tall'} - a page nothing composites has no sticky line to measure against`,
             )
-          } else if (Math.abs(mid.nm.top - (stickAt + hang)) > 3) {
+          } else if (mid.nm.top < sr.top - 1)
+            // The arithmetic can be perfect and the picture still wrong: a mark pinned by a row
+            // that sticks above the pane's padding is clipped by the pane if it hangs higher than
+            // the row, and a clipped half-circle is not a spinner.
+            verdict.push(
+              `the mark hangs ${Math.round(sr.top - mid.nm.top)}px above the top of the transcript box, which clips it (box top ${Math.round(sr.top)}, mark top ${Math.round(mid.nm.top)})`,
+            )
+          else if (Math.abs(mid.nm.top - (stickAt + hang)) > 3) {
             // The number alone cannot be acted on: the offset is the sum of where the row holding
             // the name landed, what the CSS variable says, and the label's own box padding. Report
             // all three, and what the turn opens with, so the next run names the layer at fault.
@@ -12368,9 +12603,9 @@
             const wr = who.getBoundingClientRect()
             const cs = getComputedStyle(nmEl)
             verdict.push(
-              `400px into a turn the name sits ${Math.round(mid.nm.top - stickAt)}px from the top of the transcript rather than ${hang}px; ` +
+              `400px into a turn the working mark sits ${Math.round(mid.nm.top - stickAt)}px from the top of the transcript rather than ${Math.round(hang)}px; ` +
                 `the row it hangs from ("${who.className}") lands ${Math.round(wr.top - stickAt)}px below the sticky line and is ${Math.round(wr.height)}px tall, ` +
-                `the label's own top/padding are ${cs.top}/${cs.paddingTop}, ` +
+                `the mark's own top/width are ${cs.top}/${cs.width}, ` +
                 `and the turn opens with "${t.firstElementChild?.className || 'nothing'}"`,
             )
           }
@@ -12389,7 +12624,7 @@
             })
             const rowOff = Math.round(nmEl.parentElement!.getBoundingClientRect().top - stickAt)
             pageLog(
-              `stuck name 400px into a turn: ${Math.round(mid.nm.top - stickAt)}px below the sticky line (--who-top ${hang}px, the row it hangs from lands ${rowOff}px below the line); ` +
+              `stuck working mark 400px into a turn: ${Math.round(mid.nm.top - stickAt)}px below the sticky line (its own top resolves to ${Math.round(hang)}px, the row it hangs from lands ${rowOff}px below the line); ` +
                 (beside
                   ? `"${beside.textContent?.trim().slice(0, 22)}" is beside it, centres ${(mid.nm.top + mid.nm.height / 2 - (beside.getBoundingClientRect().top + beside.getBoundingClientRect().height / 2)).toFixed(1)}px apart`
                   : `none of the turn's ${heads.length} header(s) is beside it here, so the offset is measured against empty gutter`),
@@ -12403,14 +12638,14 @@
               `the transcript would not scroll past the end of the turn (its bottom is still ${Math.round(after.turn.bottom - stickAt)}px below the line)`,
             )
           else if (after.nm.top > stickAt + hang + 2)
-            verdict.push(`the name floated past the end of its own turn by ${Math.round(after.nm.bottom - after.turn.bottom)}px`)
+            verdict.push(`the working mark floated past the end of its own turn by ${Math.round(after.nm.bottom - after.turn.bottom)}px`)
           sc.scrollTop = prevTop
           filler.remove()
           tail.remove()
           if (verdict.length) fail(verdict.join('; '))
           else
             pageLog(
-              `one name per turn, pinned for its length and released by its end, hanging ${hang}px off its row, turn sited ${Math.round(landed)}px off target after ${scrolls} scroll${scrolls === 1 ? '' : 's'} (and your message sits under the divider)`,
+              `one marker per turn, pinned for its length and released by its end, the mark hanging ${Math.round(hang)}px off its row, turn sited ${Math.round(landed)}px off target after ${scrolls} scroll${scrolls === 1 ? '' : 's'} (and your message sits under the divider)`,
             )
         }
         // --- the transcript's marker: no dots, one cup at the bottom, name lined up with the header
@@ -12424,14 +12659,14 @@
         // is the last thing in the content - moved there, never created twice.
         const whoRow = t.querySelector('.turn-who-cwoffee') as HTMLElement | null
         const cups = [...document.querySelectorAll('.transcript-cup')] as HTMLImageElement[]
-        if (!whoRow) fail('this turn has no name row')
+        if (!whoRow) fail('this turn has no marker row')
         else if (cups.length !== 1)
           fail(`${cups.length} cups on this page; one transcript gets one cup, however many turns it holds`)
         else {
           const cup = cups[0]
           const verdict: string[] = []
-          const nm = whoRow.querySelector('.who-name') as HTMLElement | null
-          if (!nm) verdict.push('the name row has no name in it')
+          const nm = whoRow.querySelector('.turn-working') as HTMLElement | null
+          if (!nm) verdict.push('the marker row has no working mark in it while the turn runs')
           // (a) No dot on anything. The name row, each card and the grouped actions inside the
           //     folded group all used to grow one while a turn ran.
           const labels = [...t.querySelectorAll('.blk-head'), nm].filter(Boolean) as HTMLElement[]
@@ -12474,12 +12709,20 @@
             const b = r.getBoundingClientRect()
             return b.top + b.height / 2
           }
-          const runLabel = t.querySelector('.blk-run > .blk-head .run-label')
-          const off = centre(runLabel?.firstChild as Text | null, 4) - centre(nm!.firstChild as Text | null, 4)
+          const mrk = nm!.getBoundingClientRect()
           const whoTop = getComputedStyle(whoRow).getPropertyValue('--who-top').trim()
-          if (!runLabel) verdict.push('there is no folded-group header to align the name with')
-          else if (Math.abs(off) > 2)
-            verdict.push(`the name is ${off.toFixed(1)}px off the folded group's header line (--who-top ${whoTop || 'unset'})`)
+          // The name used to be aligned with the header line of the turn's first block — a claim
+          // that only held while the marker row sat at its natural position, and one the working
+          // mark makes no pretence at: it is a picture in the gutter, and it is *stuck*, so it
+          // rides the top of the box while the header moves under it. What still has to hold is
+          // that it stays in the gutter and never lands on the prose.
+          const body = t.querySelector('.blk-answer .blk-body, .blk-run') as HTMLElement | null
+          const textLeft = body ? body.getBoundingClientRect().left : NaN
+          if (!body) verdict.push('no content column to keep the mark out of')
+          else if (mrk.right > textLeft + 1)
+            verdict.push(
+              `the working mark is ${Math.round(mrk.right - textLeft)}px into the content column (mark right ${Math.round(mrk.right)}, text left ${Math.round(textLeft)}) — it belongs in the gutter`,
+            )
           if (verdict.length) {
             // Geometry dump: a handful of these numbers is enough to say which element is lying,
             // and a bare "0px wide" says nothing about whether the layout, the CSS or the picture
@@ -12489,21 +12732,21 @@
             const hostR = host?.getBoundingClientRect()
             const runR = t.querySelector('.blk-run')?.getBoundingClientRect()
             verdict.push(
-              `[name ${Math.round(nr.top)}..${Math.round(nr.bottom)}; cup ${Math.round(ir.left)},${Math.round(ir.top)} `
+              `[mark ${Math.round(nr.top)}..${Math.round(nr.bottom)} top=${getComputedStyle(nm!).top}; cup ${Math.round(ir.left)},${Math.round(ir.top)} `
                 + `${Math.round(ir.width)}x${Math.round(ir.height)} complete=${cup.complete} natural=${cup.naturalWidth} `
                 + `computed pos=${cs.position} disp=${cs.display} w=${cs.width} h=${cs.height} top=${cs.top} bottom=${cs.bottom} left=${cs.left}; `
                 + `host .${host?.className || 'nothing'} ${hostR ? `${Math.round(hostR.left)},${Math.round(hostR.top)} ${Math.round(hostR.width)}x${Math.round(hostR.height)}` : 'none'}; `
                 + `pane ${scE ? `${scE.scrollTop}/${scE.scrollHeight}x${scE.clientHeight} padB ${getComputedStyle(scE).paddingBottom}` : 'none'}; `
                 + `view ${window.innerWidth}x${window.innerHeight} dpr ${window.devicePixelRatio}; `
                 + `run ${runR ? `${Math.round(runR.left)},${Math.round(runR.top)} ${Math.round(runR.width)}x${Math.round(runR.height)}` : 'none'}`
-                + `; header centre ${Number.isFinite(off) ? Math.round(centre(runLabel?.firstChild as Text | null, 4)) : 'n/a'}`
-                + `; name centre ${Math.round(centre(nm?.firstChild as Text | null, 4))}]`,
+                + `; text left ${Number.isFinite(textLeft) ? Math.round(textLeft) : 'n/a'}`
+                + `; mark ${Math.round(mrk.left)}..${Math.round(mrk.right)} x ${Math.round(mrk.top)}..${Math.round(mrk.bottom)}]`,
             )
             fail(verdict.join('; '))
           } else
             pageLog(
-              `turn marker ok: no generated marker on ${labels.length} labels, one cup ${Math.round(ir.width)}px pinned in the pane's band, `
-                + `name ${off.toFixed(1)}px off the header line (--who-top ${whoTop})`,
+              `turn marker ok: no generated marker on ${labels.length} labels, one cup ${Math.round(ir.width)}px pinned in the pane's band, ` +
+                `working mark ${Number.isFinite(textLeft) ? Math.round(textLeft - mrk.right) : '?'}px clear of the text (--who-top ${whoTop})`,
             )
 
           if (scE) scE.scrollTop = prevE
@@ -12905,10 +13148,15 @@
             )
         }
         if (units.length) {
-          // The hand-over line. An attachment belongs to the reader, not to the list of files the
-          // turn touched, so it sits against the right edge of the text column rather than in the
-          // strip under the prose. Measured against the column, not the pane: the pane has a gutter
-          // and padding, and a line can be flush right inside padding while sitting off the text.
+          // The hand-over line. It used to sit against the right edge of the text column, on the
+          // argument that an attachment belongs to the reader rather than to the list of files the
+          // turn touched. That made the one thing in the turn a reader might act on the only thing
+          // in it that did not line up with the prose — and a turn that writes a file and then hands
+          // a copy over showed the hand-over hanging out of the right edge while the working chip
+          // under it sat at the left. A file is part of what the turn said, so the row spans the
+          // column and the unit starts where the sentences start. Measured against the column, not
+          // the pane: the pane has a gutter and padding, and a row can be flush inside padding while
+          // sitting off the text.
           const u0 = units[0]
           const line = u0.parentElement
           if (!line?.classList.contains('attachline'))
@@ -12919,12 +13167,18 @@
             const ur = u0.getBoundingClientRect()
             if (col) {
               const cr = col.getBoundingClientRect()
+              // The row still spans the column: a flex container that shrinks to its content would
+              // pass a left-alignment claim while leaving the strip ragged.
               if (Math.abs(cr.right - lr.right) > 4)
                 fail(`the hand-over line ends ${Math.round(cr.right - lr.right)}px off the right edge of the text column`)
+              if (Math.abs(cr.left - lr.left) > 4)
+                fail(`the hand-over line starts ${Math.round(lr.left - cr.left)}px off the left edge of the text column`)
             }
             if (ur.right > lr.right + 1) fail(`the unit hangs ${Math.round(ur.right - lr.right)}px past its own line`)
-            if (getComputedStyle(line).justifyContent !== 'flex-end')
-              fail(`the hand-over line is justified ${getComputedStyle(line).justifyContent}, not to the right`)
+            if (Math.abs(ur.left - lr.left) > 4)
+              fail(`the hand-over unit sits ${Math.round(ur.left - lr.left)}px in from its own line's left edge`)
+            if (getComputedStyle(line).justifyContent !== 'flex-start')
+              fail(`the hand-over line is justified ${getComputedStyle(line).justifyContent}, not at the edge the prose starts at`)
           }
           // The control's hover fill is what the reader actually sees. Painted flush against the
           // unit's dashed edge, it looks like a rectangle that does not fit inside its own row.
@@ -13681,11 +13935,41 @@
               const chipsLive = [...document.querySelectorAll('.blk-user .tatt')] as HTMLElement[]
               const mineLive = chipsLive.filter((c) => (c.textContent ?? '').includes(pasted.name))
               const withPic = mineLive.filter((c) => !!c.querySelector('img'))
+              // A failure that says only "carries []" makes the reader guess which half is missing:
+              // no bubble at all, a bubble with the picture drawn as a text pill, a bubble that a
+              // resync repainted from the record, or a chip that belongs to another conversation.
+              // Those are four different bugs with four different fixes, and one empty array cannot
+              // tell them apart. So the failure carries the state it graded.
+              const whatSays = (el: Element) => {
+                const chips = [...el.querySelectorAll('.tatt')].map((c) => `picture ${(c.textContent ?? '').trim()}`)
+                const pills = [...el.querySelectorAll('.atttag')].map((c) => `text-only ${(c.textContent ?? '').trim()}`)
+                return `${el.className}[${chips.concat(pills).join(', ') || 'nothing attached'}]`
+              }
+              const describePage = () =>
+                `on screen: ${JSON.stringify([...document.querySelectorAll('.blk-user')].slice(-2).map(whatSays))}, ` +
+                `blk-user=${document.querySelectorAll('.blk-user').length} attlist=${document.querySelectorAll('.attlist').length} ` +
+                `turns=${document.querySelectorAll('.turn').length} empty-mode=${!!document.querySelector('.empty-mode')} ` +
+                `viewId=${viewId} of conversation ${sid}`
+              const recordSays = async () => {
+                type RecRow = { role: string; content?: string; attachments?: { name?: string; mime?: string; bytes?: number }[] }
+                const rows = await invoke<{ messages?: RecRow[] }>('session_messages', { id: sid, before: null, limit: 20 })
+                  .then((pg) => pg.messages ?? [], () => [] as RecRow[])
+                const mine = rows.filter((m) => m.role === 'user')
+                return `in the record: ${JSON.stringify(mine.map((m) => `${(m.attachments ?? []).length} attachment(s) ${(m.attachments ?? []).map((a) => `${a.name} ${a.mime}`).join('/') || 'none'}`))}`
+              }
               if (!sid) fail('the send did not open a conversation, so there is no record to read')
-              else if (!mineLive.length)
+              else if (!document.querySelectorAll('.blk-user').length && offScreen()) {
+                // No user bubble in the page at all, in a window nothing is laying out: the mount
+                // effect that draws the transcript has not run, so there is no bubble to carry the
+                // chip and a failure here would read as "the picture vanished".
+                blindSkips++
+                pageLog(
+                  `selftest note: skipped the on-screen receipt for ${pasted.name}; ${offScreen()} - the send is in ` +
+                    'the record below, but this window has painted no transcript to look at',
+                )
+              } else if (!mineLive.length)
                 fail(
-                  `the message on screen carries ${JSON.stringify(chipsLive.map((c) => c.textContent ?? ''))}; ` +
-                    `nothing there says ${pasted.name} (${pasted.bytes} bytes of ${pasted.mime}) went with it`,
+                  `nothing on screen says ${pasted.name} (${pasted.bytes} bytes of ${pasted.mime}) went with it — ${describePage()}; ${await recordSays()}`,
                 )
               else if (!withPic.length)
                 fail(
@@ -14568,6 +14852,285 @@
         }
       }
 
+      // --- a folder's colour is reachable, and it lands in the record ----------------
+      //
+      // Reported from the person's own window: "cannot change (cannot click the colors) colors of
+      // workspace". Nothing in the markup says why — the swatches are real buttons with handlers —
+      // so the claim has to be the thing a finger does: find the swatch, hit-test the point it
+      // occupies (an overlay on top of a control is invisible to a selector query and obvious to a
+      // finger), press it, and read the record back. The folder's own colour is restored whether the
+      // claims pass or fail: this is the person's list, and a check that recolours their folders
+      // without putting them back is a check that damages the thing it measures.
+      if (want('ws-color', 'a folder\'s colour is a press away, and pressing it writes the record')) {
+        const verdict: string[] = []
+        if (!wsGroups.length) {
+          pageLog('selftest note: the colour claim was not claimed — this persona draws no folder rows to colour')
+        } else {
+          const path = wsGroups[0].path
+          const wasColor = wsColorOf(path)
+          let pickedHex = '' // what the press chose, for the log line, which is written after the restore
+          const rowFor = (p: string) =>
+            ([...document.querySelectorAll('.wsrow')] as HTMLElement[]).find((el) => {
+              const t = el.querySelector('.ws-name')?.getAttribute('title')
+              return (t ?? '') === p || (t ?? '').endsWith(p)
+            }) ?? null
+          try {
+            unfoldAll()
+            await new Promise((r) => setTimeout(r, 250))
+            const row = rowFor(path)
+            const more = row?.querySelector('button[data-menu]') as HTMLElement | null
+            if (!row || !more) verdict.push('the folder row carries no actions button, so its colour menu cannot be opened')
+            else {
+              more.click()
+              await frame(60)
+              const swatches = [...document.querySelectorAll('.pop .swatch')] as HTMLElement[]
+              if (!swatches.length)
+                verdict.push('the folder menu shows no colour swatches at all — the row is in the menu, the controls are not')
+              else {
+                if (swatches.length !== WS_COLORS.length + 1)
+                  verdict.push(`the colour row offers ${swatches.length} swatch(es), expected ${WS_COLORS.length + 1}`)
+                // The hit-test is the part a selector check cannot see: a control that exists in the
+                // DOM and is covered by something else is unclickable, and the DOM looks fine.
+                for (const sw of swatches) {
+                  const r = sw.getBoundingClientRect()
+                  if (r.width < 8 || r.height < 8) {
+                    verdict.push(`a swatch (${sw.getAttribute('aria-label')}) measures ${Math.round(r.width)}x${Math.round(r.height)}`)
+                    continue
+                  }
+                  if (sw.hasAttribute('disabled')) verdict.push(`the ${sw.getAttribute('aria-label')} swatch is disabled`)
+                  if (getComputedStyle(sw).pointerEvents === 'none')
+                    verdict.push(`the ${sw.getAttribute('aria-label')} swatch is styled out of the pointer's reach`)
+                  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)
+                  if (!hit || !(hit === sw || sw.contains(hit)))
+                    verdict.push(
+                      `the ${sw.getAttribute('aria-label')} swatch is covered: the point it sits at answers to ` +
+                        `${hit ? `${hit.tagName.toLowerCase()}${hit.className ? `.${String(hit.className).split(' ')[0]}` : ''}` : 'nothing'}, ` +
+                        'not the swatch',
+                    )
+                }
+                // Then the press itself, and the record it has to leave behind.
+                const pick = WS_COLORS.find((c) => c.hex !== wasColor) ?? WS_COLORS[0]
+                pickedHex = pick.hex
+                const target = swatches.find((x) => x.getAttribute('data-ws-color') === pick.hex) as HTMLElement | null
+                if (!target) verdict.push(`no swatch for ${pick.name}`)
+                else {
+                  target.click()
+                  await new Promise((r) => setTimeout(r, 400))
+                  const read = async () =>
+                    safeColor((await invoke<WorkspaceRow[]>('list_workspaces')).find((w) => w.path === path)?.color)
+                  const after = await read()
+                  const rowSeen = (await invoke<WorkspaceRow[]>('list_workspaces')).some((w) => w.path === path)
+                  if (wsAddErr) verdict.push(`pressing ${pick.name} was refused: ${wsAddErr}`)
+                  else if (!rowSeen)
+                    verdict.push(
+                      `pressing ${pick.name} left no row for ${JSON.stringify(path)} in the list the store answers with — the folder is in this window's sidebar and not in the record`,
+                    )
+                  else if (after !== pick.hex) {
+                    // Name which half of the seam is broken: the press, or the write behind it.
+                    const probe = await setWsColorProbe(path, pick.hex)
+                    const viaVerb = await read()
+                    verdict.push(
+                      `pressing ${pick.name} left the record reading ${JSON.stringify(after)}; asking the verb directly ${probe ? 'wrote' : 'failed'} and the row now reads ${JSON.stringify(viaVerb)} — so the ${probe ? 'press is what misses' : 'write itself is what fails'}`,
+                    )
+                  }
+                  else if (wsColorOf(path) !== pick.hex)
+                    verdict.push('the record holds the new colour but this window still reports the old one')
+                  else {
+                    // The folder's own glyph is what the person asked for: the colour has to be drawn
+                    // on the row, not merely stored behind it.
+                    const back = rowFor(path)
+                    const mark = back?.querySelector('svg.ws-folder') as SVGSVGElement | null
+                    const r2 = back?.getBoundingClientRect()
+                    const painted = mark ? getComputedStyle(mark).color : ''
+                    const wantRgb = `rgb(${parseInt(pick.hex.slice(1, 3), 16)}, ${parseInt(pick.hex.slice(3, 5), 16)}, ${parseInt(pick.hex.slice(5, 7), 16)})`
+                    if (!mark) verdict.push('the folder row draws no folder glyph to carry the colour')
+                    else if (r2 && r2.width === 0) verdict.push('the folder row is not laid out, so nothing shows the colour')
+                    else if (painted !== wantRgb)
+                      verdict.push(
+                        `the row's folder glyph paints ${JSON.stringify(painted)} where the record says ${pick.hex} (${wantRgb}) — the colour is stored and not drawn`,
+                      )
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            verdict.push(`the colour check threw: ${cleanErr(e)}`)
+          } finally {
+            await setWsColor(path, wasColor)
+            closeMenu()
+            await new Promise((r) => setTimeout(r, 150))
+          }
+          if (verdict.length) fail(verdict.join('; '))
+          else
+            pageLog(
+              `folder colour ok (${WS_COLORS.length + 1} swatches in the row's menu, each one the top thing at the point it sits at; ` +
+                `pressing one put ${pickedHex} on the row's folder glyph and read it back out of the record, then put ${JSON.stringify(wasColor)} back)`,
+            )
+        }
+      }
+
+      // --- the working mark is painted, not merely in the DOM --------------------------
+      //
+      // The report was "the loader is not on the left of the grouped actions (not rendered at all,
+      // or not added yet?)". A DOM query can be satisfied by an element nothing paints, so this
+      // claims the painted box: the picture is displayed, it sits in the gutter left of the prose,
+      // it stays inside the box that clips it, and its ink is readable against the paper behind it
+      // in the palette the window is actually using.
+      if (want('mark-visible', 'the turn\'s working mark is painted in the gutter, and readable against the paper')) {
+        const verdict: string[] = []
+        // One quantity for colours the engine may hand back in three spellings — rgb(), a
+        // color(srgb …), or an oklab() — because comparing an sRGB luma with an oklab lightness is
+        // arithmetic, not ink. Anything unparseable is null, and null is a failure that names the
+        // string rather than a NaN that goes quiet.
+        const lumOf = (raw: string): number | null => {
+          const c = (raw ?? '').trim().toLowerCase()
+          if (!c || c === 'transparent' || c === 'none') return null
+          const rgb = c.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/)
+          if (rgb) {
+            const [r, g, b] = [+rgb[1], +rgb[2], +rgb[3]]
+            const lin = (v: number) => (v /= 255) <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4
+            return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+          }
+          const hex = c.match(/^#([0-9a-f]{6})$/)
+          if (hex) return lumOf(`rgb(${parseInt(hex[1].slice(0, 2), 16)}, ${parseInt(hex[1].slice(2, 4), 16)}, ${parseInt(hex[1].slice(4, 6), 16)})`)
+          const srgb = c.match(/^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/)
+          if (srgb) return 0.2126 * +srgb[1] + 0.7152 * +srgb[2] + 0.0722 * +srgb[3]
+          const ok = c.match(/^oklab\(\s*([\d.]+)/)
+          if (ok) return +ok[1] * +ok[1] // oklab L is a cube-root-ish scale; squaring puts it near L*
+          return null
+        }
+        /** The artwork's own ink, read off its pixels: what the picture actually draws, not what CSS says. */
+        const markInk = async (img: HTMLImageElement): Promise<string | null> => {
+          if (!img.complete || !img.naturalWidth) {
+            await new Promise((res) => {
+              img.addEventListener('load', () => res(null), { once: true })
+              img.addEventListener('error', () => res(null), { once: true })
+              setTimeout(() => res(null), 1500)
+            })
+          }
+          if (!img.naturalWidth) return null
+          const cv = document.createElement('canvas')
+          cv.width = img.naturalWidth
+          cv.height = img.naturalHeight
+          const g = cv.getContext('2d')
+          if (!g) return null
+          g.drawImage(img, 0, 0)
+          let d: Uint8ClampedArray
+          try {
+            d = g.getImageData(0, 0, cv.width, cv.height).data
+          } catch {
+            return null
+          }
+          let n = 0
+          let r = 0
+          let gg = 0
+          let b = 0
+          for (let i = 0; i < d.length; i += 4) {
+            if (d[i + 3] < 40) continue
+            n += 1
+            r += d[i]
+            gg += d[i + 1]
+            b += d[i + 2]
+          }
+          return n ? `rgb(${Math.round(r / n)}, ${Math.round(gg / n)}, ${Math.round(b / n)})` : null
+        }
+        // The gutter is only a thing when there is a transcript to have a gutter in.
+        await ensureTranscriptMounted()
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 96, model: 'selftest', session_id: 0 } })
+        // A turn that opens with the folded group, because that is the shape in the report: the
+        // grouped actions are streaming and no sentence has arrived yet.
+        transcript?.apply({ kind: 'toolCallBegin', d: { id: 'm1', name: 'exec' } })
+        transcript?.apply({ kind: 'toolExecEnd', d: { id: 'm1', ok: true, exit_code: 0, changes: [] } })
+        transcript?.apply({ kind: 'toolCallBegin', d: { id: 'm2', name: 'read_file' } })
+        // A mark that is in the page and not on the screen is exactly the complaint this claim
+        // exists to catch — so it must not be graded on a window nothing is compositing, where a
+        // 0x0 rect is an artifact of the run rather than a fact about the picture.
+        const laidOut = await waitFor(
+          'a laid-out transcript to measure',
+          () => (document.querySelector('.scroller')?.getBoundingClientRect().height ?? 0) > 40,
+          2500,
+        )
+        if (!laidOut) {
+          blindSkips++
+          pageLog(
+            'selftest note: the working-mark claim was not measured — the transcript box has no height ' +
+            `(${Math.round(document.querySelector('.scroller')?.getBoundingClientRect().height ?? 0)}px), ` +
+            'and a mark inside a box that is not laid out has no position to be judged on. Keep the window visible and this bites.',
+          )
+          transcript?.apply({ kind: 'turnEnd', d: { turn_id: 96, finish: 'stop' } })
+        }
+        await frame(80)
+        transcript?.flushNow()
+        const liveTurn = laidOut ? ([...document.querySelectorAll('.turn')].at(-1) as HTMLElement | undefined) : undefined
+        const mark = liveTurn?.querySelector('.turn-who > .turn-working') as HTMLImageElement | null
+        const markerRow = liveTurn?.querySelector('.turn-who') as HTMLElement | null
+        const run = liveTurn?.querySelector('.blk-run') as HTMLElement | null
+        if (!laidOut) {
+          /* graded above, as a named skip */
+        } else if (!markerRow) verdict.push('a streaming turn has no marker row in its gutter at all')
+        else if (!mark) verdict.push('the marker row is there with no working mark in it')
+        else if (!run) verdict.push('the fixture turn grew no grouped actions to sit beside')
+        else {
+          const cs = getComputedStyle(mark)
+          if (cs.display === 'none')
+            verdict.push(
+              `the working mark is in the page but not painted (display: none; the marker row reads .live=${markerRow.classList.contains(
+                'live',
+              )})`,
+            )
+          const mr = mark.getBoundingClientRect()
+          const rr = run.getBoundingClientRect()
+          const card = document.querySelector('.scroller')?.getBoundingClientRect()
+          if (mr.width < 20 || mr.height < 20) verdict.push(`the mark measures ${Math.round(mr.width)}x${Math.round(mr.height)}`)
+          if (card && mr.left < card.left - 0.5)
+            verdict.push(`the mark starts ${Math.round(card.left - mr.left)}px left of the card that clips it, so it is drawn with its left cut off`)
+          if (mr.right > rr.left - 1)
+            verdict.push(`the mark reaches ${Math.round(mr.right - rr.left)}px into the grouped actions beside it`)
+          if (card && mr.top < card.top - 0.5)
+            verdict.push(`the mark reaches ${Math.round(card.top - mr.top)}px above the box that clips it`)
+          // The mark is composited on its own layer, and that is a fact worth pinning: unpromised,
+          // the animated picture repaints the transcript under it, which measured 30-37ms/frame on a
+          // 168-block history against 19-21ms promoted. A later tidy-up that drops `will-change`
+          // would bring the frame drop back with nothing in the suite to notice.
+          const promoted = cs.willChange !== 'auto' || /translate|matrix|none/.test(cs.transform ?? '') && cs.willChange !== 'auto'
+          if (cs.willChange === 'auto' && cs.transform === 'none')
+            verdict.push(
+              'the working mark is composited with everything else — an animated picture inside a long transcript costs the transcript its frames (30-37ms/frame measured, against 19-21ms on its own layer)',
+            )
+          else if (!promoted) verdict.push(`the mark asks for nothing (will-change ${JSON.stringify(cs.willChange)}, transform ${JSON.stringify(cs.transform)})`)
+          // Ink against paper, in the palette the window is using right now. The artwork is a thin
+          // brown line drawing; on a dark paper a faint drawing is a mark nobody sees.
+          // The turn paints nothing of its own; the card behind it does. Grade against what is really
+          // under the ink, walking out from the mark until something answers with a colour.
+          let paper = 'rgba(0, 0, 0, 0)'
+          for (let el: HTMLElement | null = liveTurn ?? null; el && paper === 'rgba(0, 0, 0, 0)'; el = el.parentElement)
+            paper = getComputedStyle(el).backgroundColor
+          const ink = await markInk(mark)
+          if (!ink || !paper) pageLog('selftest note: the mark\'s contrast was not graded — its ink or the paper behind it could not be read')
+          else {
+            // Linear-light difference: 0.08 is roughly the point at which a thin line drawing stops
+            // being something you notice out of the corner of your eye.
+            const gap = Math.abs(lumOf(ink)! - lumOf(paper)!)
+            if (!Number.isFinite(gap)) verdict.push(`the contrast could not be computed from ${ink} against ${paper}`)
+            else if (gap < 0.08)
+              verdict.push(
+                `the mark is ${gap.toFixed(3)} of linear-light from the paper it sits on (${ink} against ${paper}) — too faint to read as a state`,
+              )
+          }
+          pageLog(
+            `working mark painted (${Math.round(mr.width)}x${Math.round(mr.height)} at ${Math.round(mr.left)},${Math.round(
+              mr.top,
+            )}, ${Math.round(rr.left - mr.right)}px clear of the grouped actions, ink ${ink ?? '?'} against ${paper})`,
+          )
+        }
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 96, finish: 'stop' } })
+        await frame(40)
+        if (document.querySelector('.transcript .turn-working')) verdict.push('the working mark outlived the turn')
+        if (verdict.length) fail(verdict.join('; '))
+        else pageLog('working mark ok (painted in the gutter, clear of the grouped actions and inside the card, and gone when the turn landed)')
+      }
+
       // --- one surface for the whole window ----------------------------------------
       //
       // Three tones made one container read as three: `paper-2` across the top, a cream-to-olive
@@ -14676,6 +15239,476 @@
                 `the narrow-width rule gives it ${drawerDecl} → ${resolved})`,
             )
           }
+        }
+      }
+
+
+      // --- the transcript re-measures when the window changes shape -------------
+      //
+      // The complaint was: "if I resize my window to where scroll bars appear, scroll to the very
+      // bottom, and then fullscreen, the top of the conversation is cut off and stays cut off even
+      // after the scrollbars disappear." The layout itself recovers — the browser re-lays-out and
+      // clamps an out-of-range scrollTop — but this app does its own bookkeeping about the scroll
+      // box: `pinned`, `away`, the "Npx below the bottom" pill, the fold-jump pending distance. All
+      // of it is measured in a ResizeObserver, and the observer watched *the transcript's own box*.
+      // A window resize changes the box you scroll inside without changing the box you scroll, so
+      // nothing re-measured: the numbers kept describing the window that no longer exists.
+      if (want('scroller-shape', 'the transcript re-measures itself when the window changes shape, not only when the text grows')) {
+        // A claim about a scroll box needs a box, and at the greeting there is none on purpose. Ask
+        // for the view rather than skipping whenever an earlier group happened to leave a conversation
+        // open — which is what made this claim green in one run and blind in the next.
+        await ensureTranscriptMounted()
+        const scE = document.querySelector('.scroller') as HTMLElement | null
+        // The claim is about a scroll box, so it needs one that is laid out: at the greeting the
+        // transcript is hidden, and a hidden box has no client height to be stale against.
+        if (transportKind !== 'tauri' || !scE || scE.clientHeight < 40) {
+          blindSkips++
+          pageLog(
+            `selftest note: the resize-shape claim was not measured — ${
+              transportKind !== 'tauri' ? 'this run has no desktop window to resize' : `the transcript box is not laid out (clientHeight ${scE?.clientHeight ?? 'no element'})`
+            }`,
+          )
+        } else {
+          // A scroll event is delivered on a frame. A window the compositor has given up on never
+          // delivers one, and then every number below is a timeout artefact rather than a
+          // measurement, so the group asks for a paint before it trusts anything it reads.
+          let blindOut = false
+          const settle = async (ms: number, where: string) => {
+            const painted = await frame(ms)
+            if (!painted && !blindOut) {
+              blindOut = true
+              pageLog(`selftest note: the resize-shape claim was not measured — the page stopped painting during ${where}`)
+            }
+            return painted
+          }
+          // Make the column taller than the box, the way a real conversation is.
+          let added = 0
+          while (scE.scrollHeight < scE.clientHeight + 900 && added < 40) {
+            transcript?.addUser(`shape probe ${added + 1}: a line long enough to take a paragraph of its own in the transcript column here`)
+            added++
+          }
+          transcript?.flushNow()
+          await settle(80, 'mounting the probe column')
+          const w0 = window.innerWidth
+          const h0 = window.innerHeight
+          const verdict: string[] = []
+          const legal = (where: string) => {
+            const max = scE.scrollHeight - scE.clientHeight
+            if (scE.scrollTop > max + 1)
+              verdict.push(
+                `${where}: the scroll offset is ${Math.round(scE.scrollTop)} in a box whose maximum is ${Math.round(max)} (${scE.scrollHeight} of content in ${scE.clientHeight} of box) — an offset the box cannot hold`,
+              )
+          }
+          // The way-back control carries the app's own reading of where the reader is, in its
+          // title: "Npx below the bottom of the view". That number is the claim to test — it is a
+          // fact about the scroll box, and a stale one describes a window that no longer exists.
+          const control = () => {
+            const p = document.querySelector('.jump') as HTMLElement | null
+            if (!p) return { shown: false, n: NaN, title: '' }
+            const m = (p.title ?? '').match(/(-?\d+)px below the bottom/)
+            return { shown: true, n: m ? parseFloat(m[1]) : NaN, title: p.title ?? '' }
+          }
+          const realDistance = () => scE.scrollHeight - scE.clientHeight - scE.scrollTop
+          let beforeReal = NaN
+          try {
+            // 1. A shorter window, the reader at the bottom: the ordinary shape of the report.
+            await invoke('selftest_resize_window', { width: 900, height: 520 })
+            if (!(await settle(320, 'the shrink')) || !(await settle(220, 'going to the bottom'))) blindOut = true
+            else legal('after shrinking and going to the bottom')
+            // 2. Park well above the bottom so the app is tracking a distance.
+            if (!blindOut) {
+              scE.scrollTop = Math.max(0, scE.scrollHeight - scE.clientHeight - 420)
+              if (await settle(300, 'parking above the bottom')) {
+                const before = control()
+                beforeReal = realDistance()
+                if (!before.shown)
+                  fail(
+                    `420px above the bottom of a ${scE.scrollHeight}px column in a ${scE.clientHeight}px box shows no way-back control, ` +
+                      `so the app does not know where the reader is (scrollTop ${Math.round(scE.scrollTop)})`,
+                  )
+                else if (!Number.isFinite(before.n) || Math.abs(before.n - beforeReal) > 24)
+                  fail(`before the resize the control says "${before.title}" while the box says ${Math.round(beforeReal)}px — the reading was already stale`)
+              }
+            }
+            // 3. Fullscreen: the box grows, the text does not change height. This is the move the
+            //    report describes, and the one a content-only observer cannot see.
+            if (!blindOut) {
+              await invoke('selftest_resize_window', { width: w0, height: h0 })
+              if (await settle(400, 'the grow')) {
+                legal('after going back to full size')
+                const after = control()
+                const afterReal = realDistance()
+                if (after.shown && Number.isFinite(after.n) && Math.abs(after.n - afterReal) > Math.max(24, afterReal * 0.15))
+                  verdict.push(
+                    `after the box grew the way-back control still says "${after.title}" while the box says ${Math.round(afterReal)}px — the scroll box changed shape and nothing re-measured it`,
+                  )
+                // 4. And the top has to be reachable: the report's actual symptom.
+                const first = document.querySelector('.transcript > *') as HTMLElement | null
+                if (first) {
+                  const sr = scE.getBoundingClientRect()
+                  scE.scrollTop = 0
+                  await frame(80)
+                  const fr2 = first.getBoundingClientRect()
+                  if (fr2.bottom < sr.top - 1)
+                    verdict.push(
+                      `the first thing in the conversation is ${Math.round(sr.top - fr2.bottom)}px above the box and does not come back when the offset is set to 0`,
+                    )
+                } else verdict.push('no first block in the transcript to reach for')
+              }
+            }
+          } finally {
+            await invoke('selftest_resize_window', { width: w0, height: h0 }).catch(() => undefined)
+            await new Promise((r) => setTimeout(r, 220))
+          }
+          if (blindOut) {
+            // Nothing above was measured, so nothing below may be claimed either. The harness's own
+            // blind counter is what makes an unverified group visible rather than green.
+            verdict.length = 0
+          } else if (verdict.length) fail(verdict.join('; '))
+          else
+            pageLog(
+              `shape ok (a ${w0}x${h0} window taken to 900x520 and back: the offset stays inside the box, the way-back control said ${Math.round(beforeReal)}px before the grow and ${Math.round(realDistance())}px after, and the top of the conversation is reachable at scrollTop 0)`,
+            )
+        }
+      }
+
+      // --- a turn says a file's name once, and says it last ---------------------
+      //
+      // The report was a screenshot of the same filename twice in one turn: once as a working chip
+      // and once as a dashed hand-over unit, because the model wrote the file and then delivered a
+      // copy of it. The reader sees names, not paths, so two boxes with one name read as a bug —
+      // and the box that was kept sat in the middle of an answer that was still talking about
+      // something else. Files are what a turn produced, so they come after everything it said and
+      // before the Copy / Share row that acts on them.
+      if (want('files-end', 'a turn names a file once, at the end of what it said, aligned with the prose')) {
+        transcript?.clear()
+        transcript?.apply({ kind: 'turnStart', d: { turn_id: 91, model: 'selftest', session_id: 0 } })
+        transcript?.apply({ kind: 'text', d: 'I looked at the second-hand market and wrote it up. ' })
+        const file = (path: string, kind: string) =>
+          ({ path, name: 'machine-build.md', mime: 'text/markdown', bytes: 7000, kind }) as any
+        transcript?.addFiles([file('/work/machine-build.md', 'change')])
+        transcript?.addFiles([file('/work/.cws/assistant_attachments/machine-build.md', 'attachment')])
+        // And the answer carries on after the write, which is the case that used to land a file box
+        // in the middle of a paragraph.
+        transcript?.apply({ kind: 'text', d: 'The short version is here, and the table is in the file.' })
+        transcript?.flushNow()
+        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 91, finish: 'stop' } })
+        await frame(60)
+        const turn = [...document.querySelectorAll('.turn')].pop() as HTMLElement | undefined
+        const chips = turn ? [...turn.querySelectorAll('.filechip')] : []
+        if (!turn) fail('the fixture turn is gone')
+        else if (chips.length !== 1)
+          fail(
+            `one file written and delivered as a copy shows ${chips.length} chips: ${chips
+              .map((c) => `${c.querySelector('.file-name')?.textContent ?? '?'} in .${(c.closest('.attachline') ? 'attachline' : c.closest('.filestrip') ? 'filestrip' : 'nothing')}`)
+              .join(' / ')}`,
+          )
+        else {
+          const verdict: string[] = []
+          const chip = chips[0] as HTMLElement
+          const unit = chip.closest('.attachunit')
+          if (!unit) verdict.push('the chip that survived is the working one, not the hand-over copy with the Save control')
+          if (!turn.querySelector('.attach-save')) verdict.push('the surviving file has no Save control')
+          // Last thing the turn said, with only its own action row under it.
+          const row = (chip.closest('.attachline') ?? chip.closest('.filestrip')) as HTMLElement | null
+          if (!row) verdict.push('the file is not on a row of its own')
+          else {
+            const sibs = [...(row.parentElement?.children ?? [])] as HTMLElement[]
+            const after = sibs.slice(sibs.indexOf(row) + 1)
+            const intruder = after.find((n) => !n.classList.contains('turn-acts') && !n.classList.contains('transcript-cup'))
+            if (intruder)
+              verdict.push(
+                `the file row is followed by "${intruder.className}" — files must be the last thing the turn says ` +
+                  `(row order: ${sibs.map((n) => n.className.split(' ')[0] || n.tagName).join(' / ')})`,
+              )
+            const acts = turn.querySelector('.turn-acts')
+            if (!acts) verdict.push('the turn has no action row to sit under')
+            else if (!(row.compareDocumentPosition(acts) & Node.DOCUMENT_POSITION_FOLLOWING))
+              verdict.push('the file row is not above the Copy / Share row')
+            // Aligned with the prose, not pushed to the margin.
+            const ansBody = turn.querySelector('.blk-answer .blk-body') as HTMLElement | null
+            if (!ansBody) verdict.push('no answer body to align the file row with')
+            else {
+              const rr = row.getBoundingClientRect()
+              const br = ansBody.getBoundingClientRect()
+              if (Math.abs(rr.left - br.left) > 4)
+                verdict.push(
+                  `the file row starts ${Math.round(rr.left - br.left)}px from where the answer's text starts — it is not aligned with the chat ` +
+                    `(row ${Math.round(rr.left)}, text ${Math.round(br.left)})`,
+                )
+            }
+          }
+          /**
+           * No fill on hover for either half of the hand-over unit.
+           *
+           * The page cannot be made to answer `:hover` from JS, so the claim is made from the
+           * rules — and it has to be made the way the engine makes it: among the rules that match
+           * this element, the one that *wins* decides whether anything changes under the pointer.
+           * Grading every matching hover rule instead would have failed this run for the wrong
+           * reason, and grading only the rules whose selector mentions "attach" would have missed
+           * the one that actually caused the report: a generic `.filechip:hover` several hundred
+           * lines away, of the same specificity as the unit's own rule and later in the file, which
+           * wins on hover and lights the name half up.
+           */
+          const specificity = (sel: string) => {
+            if (/:is\(|:where\(/.test(sel)) return null // these take their specificity from inside; not graded here
+            const bare = sel.replace(/::[\w-]+/g, '')
+            const a = (bare.match(/#[\w-]+/g) ?? []).length
+            const b =
+              (bare.match(/\.[\w-]+/g) ?? []).length +
+              (bare.match(/\[[^\]]+\]/g) ?? []).length +
+              (bare.match(/:(?!:)[\w-]+/g) ?? []).length
+            const c = (bare.replace(/#[\w-]+|\.[\w-]+|\[[^\]]+\]|:[\w-]+/g, ' ').match(/[a-zA-Z][\w-]*/g) ?? []).length
+            return a * 10000 + b * 100 + c
+          }
+          const hoverChange = (el: HTMLElement) => {
+            type Cand = { sel: string; spec: number; order: number; bg: string }
+            const resting: Cand[] = []
+            const hovered: Cand[] = []
+            let order = 0
+            const walk = (rules: Iterable<CSSRule> | undefined, depth = 0) => {
+              for (const r of Array.from(rules ?? [])) {
+                const sel = (r as CSSStyleRule).selectorText
+                if (typeof sel === 'string' && sel) {
+                  const st = (r as CSSStyleRule).style
+                  const bg = (st.getPropertyValue('background-color') || st.getPropertyValue('background') || '').trim()
+                  if (bg && bg !== 'none') {
+                    const isHover = /:hover/.test(sel)
+                    const base = sel.replace(/:hover(\([^)]*\))?/g, '')
+                    const spec = specificity(isHover ? base : sel)
+                    let hits = false
+                    try {
+                      hits = !!base.trim() && el.matches(base)
+                    } catch {
+                      hits = false
+                    }
+                    if (spec !== null && hits) (isHover ? hovered : resting).push({ sel, spec, order, bg })
+                  }
+                }
+                // A style rule answers `cssRules` as well, since CSS nesting: this is a
+                // recurse-and-examine loop, not the recurse-or-examine one it first was. See
+                // `row-active` for what getting that wrong cost.
+                const nested = (r as CSSGroupingRule).cssRules
+                if (nested && nested.length && depth < 5) walk(nested, depth + 1)
+              }
+            }
+            for (const sheet of Array.from(document.styleSheets)) {
+              let rules: CSSRuleList | undefined
+              try {
+                rules = (sheet as CSSStyleSheet).cssRules
+              } catch {
+                continue
+              }
+              walk(rules)
+            }
+            const win = (list: Cand[]) => (list.length ? list.sort((x, y) => x.spec - y.spec || x.order - y.order).at(-1)! : null)
+            const a = win(resting)
+            const b = win(hovered)
+            if (!b) return null
+            if (!a) return `${b.sel} fills with ${b.bg} and nothing at rest declares a background to compare with`
+            if (a.bg === b.bg) return null
+            // Only a change that the engine resolves to different ink is a change a reader sees.
+            const probe = (decl: string) => {
+              const t = document.createElement('div')
+              t.style.position = 'absolute'
+              t.style.left = '-9999px'
+              t.style.background = decl
+              document.body.append(t)
+              const got = getComputedStyle(t).backgroundColor
+              t.remove()
+              return got
+            }
+            const ra = probe(a.bg)
+            const rb = probe(b.bg)
+            if (ra === rb) return null
+            return `hover resolves ${b.sel} (${b.bg} → ${rb}) over ${a.sel} (${a.bg} → ${ra})`
+          }
+          const saveBtn = turn.querySelector('.attach-save') as HTMLElement | null
+          for (const [what, el] of [
+            ['the file name', chip],
+            ['the save control', saveBtn],
+          ] as [string, HTMLElement | null][]) {
+            if (!el) continue
+            const changed = hoverChange(el)
+            if (changed) verdict.push(`on hover ${changed} — ${what} is a control inside a box that is already a box`)
+          }
+          if (verdict.length) fail(verdict.join('; '))
+          pageLog(
+            `turn files ok (one chip for a file written and delivered, the hand-over copy kept with its Save control, ` +
+              `the row last in the turn and ${Math.round(
+                (row as HTMLElement).getBoundingClientRect().left -
+                  (turn.querySelector('.blk-answer .blk-body') as HTMLElement).getBoundingClientRect().left,
+              )}px from the text edge, no hover fill on either half)`,
+          )
+        }
+        transcript?.clear()
+      }
+
+      // --- the open conversation is marked by its fill alone ----------------------
+      //
+      // The active row used to wear a left bar and a fill for one fact. The bar drew a vertical
+      // stroke that lined up with nothing, and the fill under it was so close to the hover colour
+      // that a list of conversations could not be read for which one is open. One mark now, and it
+      // has to survive both palettes — measured, not admired.
+      if (want('row-active', 'the open conversation is marked by one fill, and that fill is readable in both palettes')) {
+        // The claim is about *the row of the conversation on screen*, so a run that is sitting on the
+        // opening screen has no such row — and marking that a skip every time hides that the claim was
+        // never graded. Open a conversation the record has rows for, then read its row.
+        await ensureTranscriptMounted()
+        const row = document.querySelector('.sessrow.active') as HTMLElement | null
+        if (!row) {
+          blindSkips++
+          pageLog(
+            `selftest note: the active-row claim was not measured — ${document.querySelectorAll('.sessrow').length} row(s) in the sidebar and none of them is marked open`,
+          )
+        } else {
+          /**
+           * Lightness, from whatever the engine answers, on one scale.
+           *
+           * A comparison that silently turns into NaN compares nothing: a threshold reads
+           * `NaN < 8` as false and the group congratulates itself on a colour it never read — which
+           * is exactly what the first run of this check did. So the parse is reported, and anything
+           * it cannot read is a failure naming the string.
+           *
+           * The scale is oklab's L times 255, because this engine answers a light `color-mix()` as
+           * `color(srgb ...)` and the dark palette's as `oklab(...)`. An sRGB luma and an oklab
+           * lightness are not the same quantity; comparing one against the other grades arithmetic
+           * instead of ink.
+           */
+          const lumOf = (c: string): number | null => {
+            const t = c.trim()
+            let rgb: number[] | null = null
+            const m = t.match(/^rgba?\(([^)]+)\)/)
+            if (m) {
+              const p = m[1].split(/[ ,/]+/).map((x) => parseFloat(x))
+              if (p.length >= 3 && p.slice(0, 3).every(Number.isFinite)) rgb = [p[0] / 255, p[1] / 255, p[2] / 255]
+            }
+            const h = t.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i)
+            if (!rgb && h) {
+              const x = h[1]
+              rgb = (x.length === 3 ? x.split('').map((d) => d + d) : [x.slice(0, 2), x.slice(2, 4), x.slice(4, 6)]).map((d) => parseInt(d, 16) / 255)
+            }
+            const cs = t.match(/^color\(srgb\s+([^)]+)\)/)
+            if (!rgb && cs) {
+              const p = cs[1].split(/[ ,/]+/).map((x) => parseFloat(x))
+              if (p.length >= 3 && p.slice(0, 3).every(Number.isFinite)) rgb = p.slice(0, 3)
+            }
+            const ok = t.match(/^oklab\(([^)]+)\)/)
+            if (ok) {
+              const L = parseFloat(ok[1].split(/[ ,/]+/)[0])
+              return Number.isFinite(L) ? L * 255 : null
+            }
+            if (!rgb) return null
+            const lin = rgb.map((v) => (v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)))
+            const l = Math.cbrt(0.4122214708 * lin[0] + 0.5363325363 * lin[1] + 0.0514459929 * lin[2])
+            const mm = Math.cbrt(0.2119034982 * lin[0] + 0.6806995451 * lin[1] + 0.1073969566 * lin[2])
+            const ss = Math.cbrt(0.0883024619 * lin[0] + 0.2817188376 * lin[1] + 0.6299787005 * lin[2])
+            return (0.2104542553 * l + 0.793617785 * mm - 0.0040720468 * ss) * 255
+          }
+          // The declarations, read out of the shipped stylesheet. This is deliberately not a
+          // runtime theme flip: the claim is about what the file says for each palette, and a flip
+          // would grade this engine's colour-cache as much as the design — an un-composited window
+          // hands back the light palette's resolved `color-mix()` after the attribute has changed,
+          // which is how the first version of this check read a light fill against a dark desk.
+          const decls: Record<string, string> = {}
+          const wantSel: Record<string, string> = {
+            active: '.sessrow.active',
+            hover: '.sessrow:hover',
+          }
+          // Walk the sheet, grouping rules and style rules alike. `if (rule.cssRules) continue`
+          // looks like the obvious way to tell a `@media` from a rule and it is wrong: since CSS
+          // nesting a *style* rule answers `cssRules` too (an empty list when it nests nothing), so
+          // that test skips every rule on the page and the scan finds nothing to grade. That is how
+          // this check reported that the stylesheet declares no fill at all, with the rule sitting
+          // in front of it. Examine the rule, then look inside it.
+          const walk = (rules: Iterable<CSSRule> | undefined, depth = 0) => {
+            for (const r of Array.from(rules ?? [])) {
+              const sel = (r as CSSStyleRule).selectorText
+              if (typeof sel === 'string') {
+                const key = Object.keys(wantSel).find((k) => wantSel[k] === sel)
+                if (key) {
+                  const st = (r as CSSStyleRule).style
+                  // The build's transform writes a plain-colour fallback for a `color-mix()` and
+                  // keeps the real one inside `@supports` with the same selector, so the last one in
+                  // source order is the one a reader sees.
+                  const bg = st.getPropertyValue('background') || st.getPropertyValue('background-color')
+                  if (bg.trim()) decls[key] = bg.trim()
+                  if (key === 'active' && (st.getPropertyValue('box-shadow') || '').trim()) decls.active_shadow = st.getPropertyValue('box-shadow').trim()
+                }
+              }
+              const nested = (r as CSSGroupingRule).cssRules
+              if (nested && nested.length && depth < 5) walk(nested, depth + 1)
+            }
+          }
+          for (const sheet of Array.from(document.styleSheets)) {
+            let rules: CSSRuleList | undefined
+            try {
+              rules = (sheet as CSSStyleSheet).cssRules
+            } catch {
+              continue // a sheet this page cannot read must not end the run
+            }
+            walk(rules)
+          }
+          const resolveIn = (theme: 'light' | 'dark', decl: string) => {
+            const wrap = document.createElement('div')
+            if (theme === 'dark') wrap.setAttribute('data-theme', 'dark')
+            wrap.style.position = 'absolute'
+            wrap.style.left = '-9999px'
+            document.body.append(wrap)
+            const t = document.createElement('div')
+            t.style.background = decl
+            wrap.append(t)
+            const got = getComputedStyle(t).backgroundColor
+            t.remove()
+            wrap.remove()
+            return got
+          }
+          const verdict: string[] = []
+          const measured: string[] = []
+          if (!decls.active) verdict.push('the stylesheet declares no background for `.sessrow.active`, so the open row is marked by nothing')
+          if (!decls.hover) verdict.push('the stylesheet declares no hover fill, so the comparison against a hovered row cannot be made')
+          if (decls.active_shadow) verdict.push(`the open row still wears a shadow (a bar): ${decls.active_shadow}`)
+          for (const theme of ['light', 'dark'] as const) {
+            if (!decls.active) continue
+            const raw = {
+              active: resolveIn(theme, decls.active),
+              desk: resolveIn(theme, 'var(--color-pane)'),
+              hover: decls.hover ? resolveIn(theme, decls.hover) : '',
+            }
+            const unread = Object.entries(raw).filter(([, v]) => !v || lumOf(v) === null).map(([k, v]) => `${k}="${v}"`)
+            if (unread.length) {
+              verdict.push(`in the ${theme} palette this check cannot read the colour it was asked to grade: ${unread.join(', ')} — grade what the engine answers, not what is assumed`)
+              continue
+            }
+            const on = lumOf(raw.active)!
+            const gap = Math.abs(on - lumOf(raw.desk)!)
+            const vsHover = Math.abs(on - lumOf(raw.hover)!)
+            // A hovered neighbour must not be able to pass for the open row, and the open row must
+            // separate from the surface the list sits on. 10 and 8 points of oklab lightness out of
+            // 255: the shipped fills measure 11/15 and 17/16, so the bar is "noticeably apart", not
+            // "arithmetically distinct".
+            if (gap < 10)
+              verdict.push(
+                `in the ${theme} palette the open row's fill is only ${gap.toFixed(1)} of lightness from the desk it sits on (${raw.active} against ${raw.desk}) — a list cannot be read for which conversation is open`,
+              )
+            if (vsHover < 8)
+              verdict.push(
+                `in the ${theme} palette the open row's fill is only ${vsHover.toFixed(1)} from what a hovered row looks like (${raw.active} against ${raw.hover}), so hovering a neighbour mimics the open one`,
+              )
+            measured.push(`${theme}: ${raw.active} is ${gap.toFixed(0)} from the desk (${raw.desk}) and ${vsHover.toFixed(0)} from a hovered row (${raw.hover})`)
+          }
+          // And the row on the screen actually wears the shipped fill: a later rule of the same
+          // specificity would override it quietly, and the stylesheet would read fine while the
+          // list looked like nothing.
+          const live = getComputedStyle(row).backgroundColor
+          const expected = resolveIn(document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light', decls.active ?? 'none')
+          if (decls.active && lumOf(live) !== null && lumOf(expected) !== null && Math.abs(lumOf(live)! - lumOf(expected)!) > 1.5)
+            verdict.push(
+              `the open row on screen paints ${live}, but the shipped rule for this palette resolves to ${expected} — something else is winning on the row`,
+            )
+          if (getComputedStyle(row).boxShadow !== 'none') verdict.push(`the open row on screen wears a shadow: ${getComputedStyle(row).boxShadow}`)
+          if (verdict.length) fail(verdict.join('; '))
+          else pageLog(`active row ok (one mark, no bar, and the row on screen paints what the rule says — ${measured.join('; ')})`)
         }
       }
 

@@ -826,21 +826,32 @@ pub fn new_session(
 #[tauri::command]
 pub fn list_workspaces(state: tauri::State<'_, AppState>) -> Result<Vec<WorkspaceRow>, String> {
     let rows = state.store.list_workspaces().map_err(|e| e.to_string())?;
-    Ok(rows
-        .into_iter()
-        .map(|w| WorkspaceRow {
-            path: w.path,
-            label: w.label,
-            sessions: w.sessions,
-        })
-        .collect())
+    Ok(rows.into_iter().map(ws_row_of).collect())
 }
 
+/// One folder row as it leaves this process.
+///
+/// The names here are the names `WorkspaceRow` in `ui/src/lib/events.ts` reads, and the gateway
+/// hands out the engine's own `WorkspaceEntry` for the same list — so this struct is the one place
+/// where the desktop can quietly disagree with a phone about what a folder *is*. It has happened:
+/// the colour was written to the store, read back from it, and dropped on the way out, which made
+/// "colour this folder" a press that did nothing on the desktop while working on a phone.
 #[derive(serde::Serialize)]
 pub struct WorkspaceRow {
     pub path: String,
     pub label: String,
+    /// `#rrggbb`, or empty for "no colour". Validated by the store; see `set_workspace_color`.
+    pub color: String,
     pub sessions: i64,
+}
+
+fn ws_row_of(w: cwoffee_engine::store::WorkspaceEntry) -> WorkspaceRow {
+    WorkspaceRow {
+        path: w.path,
+        label: w.label,
+        color: w.color,
+        sessions: w.sessions,
+    }
 }
 
 /// Add a folder to the sidebar. Validated by the engine, so the UI cannot offer a
@@ -981,6 +992,47 @@ pub fn selftest_config() -> serde_json::Value {
         Vec::new()
     };
     serde_json::json!({ "only": only })
+}
+
+/// Resize the self-test window, from inside the app.
+///
+/// This exists because the page cannot: `core:window:allow-set-size` is deliberately not in the
+/// capability file — a chat app's page has no business choosing the window's size — so a check that
+/// wants to know what the layout does when the window changes shape has to ask the host, which is
+/// also the only thing that can answer whether the resize actually landed. Wayland and mutter are
+/// free to ignore a resize request, and a check that measured a window that never changed would
+/// report a layout bug that never happened.
+///
+/// Gated on the same arming as the harness: a normal run of the app has no command that resizes its
+/// own window. Like the present ask, the window call runs on its own thread, because a Wayland
+/// window call round-trips through the compositor queue that the IPC handler's own loop drains.
+#[tauri::command]
+pub fn selftest_resize_window(app: tauri::AppHandle, width: u32, height: u32) -> Result<String, String> {
+    if !selftest_armed() {
+        return Err("this process is not an armed self-test run; its window size is not mine to change".into());
+    }
+    if !(300..=4000).contains(&width) || !(300..=4000).contains(&height) {
+        return Err(format!("refusing to resize the window to {width}x{height}: outside 300..4000"));
+    }
+    std::thread::spawn(move || {
+        use tauri::Manager;
+        let Some(w) = app.get_webview_window("main") else {
+            println!("[selftest] selftest_resize_window was asked and there is no main window");
+            return;
+        };
+        // Frameless (`decorations: false`), so the inner size the page measures and the outer size
+        // this call sets are the same box. Stated rather than assumed: a decorated window would need
+        // the decoration delta added back or the page's numbers would be off by the titlebar.
+        let before = w
+            .inner_size()
+            .map(|s| format!("{}x{}", s.width, s.height))
+            .unwrap_or_else(|_| "unknown".into());
+        match w.set_size(tauri::LogicalSize::new(f64::from(width), f64::from(height))) {
+            Ok(()) => println!("[selftest] window resize asked: {before} -> {width}x{height} (logical)"),
+            Err(e) => println!("[selftest] window resize to {width}x{height} failed: {e}"),
+        }
+    });
+    Ok(format!("resize of {width}x{height} asked"))
 }
 
 /// Ask the window manager for the window back, from inside the app.
@@ -1376,6 +1428,7 @@ fn render_is_sane(r: &RenderReport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::picked_to_path;
+    use super::ws_row_of;
     use super::render_is_sane;
     use super::RenderReport;
     use std::path::PathBuf;
@@ -1386,6 +1439,28 @@ mod tests {
     /// whole bug: a folder the user had just picked became `file:///home/...`,
     /// which is not a directory, so the engine refused it and the workspace
     /// control snapped back to whatever the config said.
+    /// `list_workspaces` maps the engine's row into this crate's own struct, which is where a field
+    /// can go missing without anything failing: the store had the colour, the sidebar drew a list of
+    /// colourless folders, and a phone reading the same store saw the colour fine. So the claim is
+    /// about the wire — every name `WorkspaceRow` in `ui/src/lib/events.ts` reads has to be there,
+    /// with the value the record was given.
+    #[test]
+    fn a_folder_row_reaching_the_window_carries_every_name_the_window_reads() {
+        let row = ws_row_of(cwoffee_engine::store::WorkspaceEntry {
+            path: "/work/notes".into(),
+            label: "Notes".into(),
+            color: "#3f9a72".into(),
+            sessions: 3,
+        });
+        let j = serde_json::to_value(&row).expect("a folder row serializes");
+        for key in ["path", "label", "color", "sessions"] {
+            assert!(j.get(key).is_some(), "the sidebar reads {key:?} and the wire does not carry it: {j}");
+        }
+        assert_eq!(j["color"].as_str(), Some("#3f9a72"), "the colour was dropped at the seam: {j}");
+        assert_eq!(j["path"].as_str(), Some("/work/notes"));
+        assert_eq!(j["sessions"].as_i64(), Some(3));
+    }
+
     /// The window is transparent at the corners now, and the launch check used to read a hollow
     /// body background as "the webview never painted". It must not: the shell is the surface.
     #[test]

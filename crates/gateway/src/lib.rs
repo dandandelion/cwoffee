@@ -2148,6 +2148,53 @@ mod tests {
         );
     }
 
+    /// The desktop once wrote a folder colour to the store and dropped it on the way out to the
+    /// window. The gateway serialized the engine's own row, so the same press worked from a phone and
+    /// did nothing on the desktop — which is the whole reason the two transports are checked against
+    /// the same fact.
+    #[tokio::test]
+    async fn a_folder_colour_reads_back_on_the_sidebar_list() {
+        let h = test_handle();
+        let dir = unique_dir("colour");
+        run_cmd("add_workspace", serde_json::json!({ "path": &dir }), Role::Drive, &h)
+            .await
+            .expect("adding a folder is a drive act");
+        run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "#3f9a72" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("colouring a folder is a drive act");
+        let out = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("reading the folder list is read-only");
+        let row = out
+            .as_array()
+            .and_then(|a| a.iter().find(|w| w["path"].as_str() == Some(dir.as_str())))
+            .unwrap_or_else(|| panic!("the folder just added is not in the list: {out}"));
+        assert_eq!(row["color"].as_str(), Some("#3f9a72"), "the colour did not reach the list: {row}");
+
+        // Clearing is a value too, not an absent field a client has to guess about.
+        run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("un-colouring a folder is a drive act");
+        let out2 = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("reading the folder list is read-only");
+        let row2 = out2
+            .as_array()
+            .and_then(|a| a.iter().find(|w| w["path"].as_str() == Some(dir.as_str())))
+            .unwrap_or_else(|| panic!("the folder disappeared from the list: {out2}"));
+        assert_eq!(row2["color"].as_str(), Some(""), "clearing a colour must read as empty: {row2}");
+    }
+
     #[tokio::test]
     async fn adding_a_folder_to_the_sidebar_is_drive_only_and_validated() {
         let h = test_handle();

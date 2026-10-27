@@ -439,11 +439,12 @@ body {
     height: auto;
     margin-bottom: 0;
   }
-  .turn-who > .who-name {
+  .turn-who > .turn-working {
     position: static;
+    margin: 0 0 2px;
+  }
+  .turn-who.live > .turn-working {
     display: block;
-    width: auto;
-    text-align: left;
   }
 }
 
@@ -480,28 +481,56 @@ body {
      children hang off this same offset: the word, and the cup under it. */
   --who-top: 2px;
 }
-.turn-who > .who-name {
+.turn-who > .turn-working {
+  /**
+   * The picture that says this turn is arriving, hung in the label gutter.
+   *
+   * The word that used to live here named the speaker, and in this app the label was a restatement:
+   * everything in the transcript that is not your own bubble is cwoffee's. What the gutter is for is
+   * a state, and the state worth showing is "an answer is being written right now" — which is the one
+   * thing a long turn cannot otherwise say while you are looking at the middle of it.
+   *
+   * The artwork's ink occupies 86x115 of its 199-unit canvas, so at 56px the dots read about 24px
+   * across: big enough to see moving in the corner of the eye, small enough to never compete with the
+   * sentence next to it. It is centred on the 58px label column the block heads use, so the mark and
+   * the labels above it share one axis.
+   */
   position: absolute;
-  /* Same box the per-block labels occupy, so the gutter between a name and the first glyph of
-     the sentence beside it is one number in one place, not two that can drift apart. */
   left: -66px;
-  /* The name has to sit on the same line as whatever header is beside it, so its offset is
-     arithmetic against that header's own top offset rather than a number that drifts when a type
-     size changes. `--who-top` is published per case below: 2px against a block whose head starts at
-     the top of the turn, 13px against the folded group (measured - see the check's log line, which
-     reports the gap in text centres rather than trusting this number). The line-height is stated
-     here because that arithmetic assumes the name and the header share a line box: at the same 11px
-     their ink centres then coincide. */
+  width: 56px;
+  height: 56px;
+  /* The page-wide `img, video { max-width: 100% }` reset has to be lifted HERE even though it stays
+     for the cup: this picture is absolutely positioned inside the zero-wide marker row, and 100% of a
+     zero-wide containing block is zero. The declared 56px survived; the width did not — the artwork
+     measured 0x56, which is a mark that is in the page and not on the screen. */
+  max-width: none;
+  /* Promoted to its own layer, deliberately. Without it the animated picture costs the whole
+     transcript: on the 168-block / 635,054-character history the selftest builds, a streaming turn
+     measured 30.0ms and 37.0ms per frame with the mark painted and 21.0ms with it hidden — a new
+     feature that made a long conversation drop below 30 fps, which is the report this mark was
+     asked for in the first place. With `will-change: transform` the picture composites on its own
+     and the same measurement came back 19.0ms and 21.0ms, i.e. the cost of the mark is the cost of
+     the history it sits in, not of the mark. The element exists only while a turn is arriving
+     (`workingImg` makes it, `dropWorking` removes it), which is the one case `will-change` is for:
+     a layer declared for something known to animate, not one left up forever. */
+  will-change: transform;
+  transform: translateZ(0);
+  /* Hung from the same published line the word used to sit on (2px against a bare block, 13px
+     against the folded group). It is *not* raised to centre on that line the way the word was: the
+     row it hangs from sticks to the top of the pane, above the pane's padding by
+     `--scroller-pad-top`, and a picture that reaches above that line reaches outside the box that
+     clips it — the top of a pinned mark would simply be missing, which is a worse bug than a mark
+     sitting a little low. So it hangs down from the line, and stays whole. */
   top: var(--who-top);
-  padding-top: 3px;
-  line-height: 16px;
-  width: 58px;
-  font-size: 11px;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  text-align: right;
-  white-space: nowrap;
-  color: var(--color-ink-3);
+  display: none;
+  opacity: 0.92;
+  /* The picture is a readout, not a target: a click in the gutter belongs to whatever is behind it. */
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+.turn-who.live > .turn-working {
+  display: block;
 }
 /* The folded group is the turn's first block, so its bottom margin is the gap between the working
    and the saying. 14px rather than the default 12px of a bare `.blk-run`: the two things it
@@ -510,11 +539,10 @@ body {
   margin-bottom: 14px;
 }
 /* A turn that opens with the folded group: the row to line up with is that group's header, which
-   starts 12px lower. The live shape (`.turn-who` inside a `.turn`) and the stored one (a direct
-   child of `.transcript`) are both named, because the two containers space their children
-   differently and only the run block's own margin is the same in both. */
-.turn:has(> .turn-who-cwoffee + .blk-run) > .turn-who-cwoffee,
-.transcript:has(> .turn-who-cwoffee + .blk-run) > .turn-who-cwoffee {
+   starts 12px lower. Only the live shape exists now — a stored transcript carries no marker row at
+   all, because the marker's only content is the working mark and a page you are reading rather than
+   watching has nothing working on it. */
+.turn:has(> .turn-who-cwoffee + .blk-run) > .turn-who-cwoffee {
   /* 13px, measured in this engine against the shipped accordion header: at 2px the name sat 11px
      above the header's line, at 23px it sat 10px below it, so the line they share is 13px. The
      block's own 12px top margin is most of that; the rest is the header row's padding and the
@@ -533,9 +561,10 @@ body {
    and the same drawing at the same scale.
 
    The page-wide `img, video { max-width: 100% }` reset is deliberately not lifted here: in flow
-   inside the transcript it has room, and it was only ever a problem for a picture hung off the
-   zero-wide name row, where 100% of the containing block is 0px and the image vanishes while its
-   height goes unhurt. */
+   inside the transcript it has room. It is lifted for the working mark, one rule up, because that
+   picture is absolutely positioned inside the same zero-wide marker row — and 100% of a zero-wide
+   containing block is zero: the artwork measured 0x56, width gone and height unhurt, which is a mark
+   in the DOM and not on the screen. */
 .transcript-cup {
   /**
    * Pinned to the bottom band of the transcript pane, not the last element in the content.
@@ -591,12 +620,7 @@ body {
    markers at once. `.live` stays on the name row - it is the state the transcript reads to pick
    which picture to show.
 
-   In a stored transcript the marker's container is `.transcript` itself, whose children sit
-   14px apart rather than a turn's 12. Pay back the gap that actually applies, or every stored
-   turn gains 2px between a name and the first thing under it. */
-.transcript > .turn-who {
-  margin-bottom: -14px;
-}
+   A stored transcript has no marker row to pay a gap back for. */
 /* The answer's own label goes away — the turn's pinned name replaced it. The element
    stays: it is where the live marker and any future per-block label still hang, and
    removing it from the DOM would be a change to the transcript's shape for a styling
@@ -1531,8 +1555,17 @@ body {
 }
 .sessrow:hover { background: var(--color-paper-2); }
 .sessrow.active {
-  background: var(--color-tint);
-  box-shadow: inset 2px 0 0 var(--color-shell-deep);
+  /**
+   * One mark, not two.
+   *
+   * The row used to wear both a left bar and a fill for the same fact. The bar drew a vertical
+   * stroke that lined up with nothing in the layout, and it survived next to the fill because
+   * "highlighted" was being achieved by piling on. So the bar is gone and the fill does the work
+   * alone — which is why the fill is stronger than `--color-tint` was: at the old strength the
+   * active row and a hovered row were nearly the same colour, and a list of nine conversations
+   * could not be read for which one is open.
+   */
+  background: color-mix(in srgb, var(--color-shell) 34%, var(--color-paper));
 }
 .sessrow.active .sess-title { font-weight: 550; }
 
@@ -2934,18 +2967,17 @@ body {
    see. A dashed hairline says what is true: this is a grouping, not a place. */
 .attachline {
   /**
-   * The hand-over line, against the right edge of the text column.
+   * The hand-over line, on its own row, starting where the prose starts.
    *
-   * Two kinds of file, two positions. The working strip under the prose is left-aligned because it
-   * is a record of what the turn touched, in the order it touched it. An attachment is a thing the
-   * model wrote *to give you*, so it sits on its own line at the right edge, where the eye finds it
-   * on the way out of the paragraph instead of in the middle of the file list. Right alignment is
-   * also what the Save control asks for: the action is away from the prose, toward the margin.
+   * It used to sit against the right edge of the column, which made a delivered file look like a
+   * margin note and put its Save control over the ragged end of the paragraph. The file is part of
+   * what the turn produced, so it starts on the same edge as the sentences beside it — and it is a
+   * row of its own so it never shares a line with the working chips.
    */
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  justify-content: flex-end;
+  justify-content: flex-start;
   margin: 10px 0 0 0;
 }
 .attachline + .filestrip {
@@ -2973,8 +3005,19 @@ body {
      the button's own box is now a small square that does not reach the unit's edges. */
   border-right: 1px dashed var(--color-hairline-2);
 }
+/* No hover fill anywhere inside the hand-over unit — not on the name half, not on the save half.
+   The unit already draws its own dashed box, and a fill inside a box reads as a second control
+   appearing rather than as the control answering the pointer. This has to be said explicitly
+   rather than by omission: the generic `.filechip:hover` further down this file carries the same
+   specificity as `.attachunit .filechip` and comes later, so on hover it wins and the name half
+   lights up anyway. That is exactly what the report was, and deleting the unit's own hover rule
+   did nothing. */
+.attachunit .filechip:hover,
+.attachunit .attach-save:hover {
+  background: transparent;
+}
 .attachunit .filechip:hover {
-  background: var(--color-tint);
+  border-color: var(--color-hairline-2);
 }
 .attach-save {
   /**
@@ -3001,10 +3044,11 @@ body {
   background: transparent;
   color: var(--color-ink-2);
   cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition: color 0.12s ease;
 }
+/* The glyph darkens and that is all. A fill here lit up a square inside a dashed box, which read
+   as the box being overdrawn rather than as the control answering the pointer. */
 .attach-save:hover {
-  background: var(--color-tint);
   color: var(--color-ink);
 }
 .attach-save:disabled {

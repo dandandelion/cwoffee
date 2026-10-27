@@ -828,6 +828,7 @@ fn main() {
             commands::clear_session,
             commands::switch_session,
             commands::selftest_armed,
+            commands::selftest_resize_window,
             commands::present_selftest_window,
             commands::selftest_window_state,
             commands::selftest_config,

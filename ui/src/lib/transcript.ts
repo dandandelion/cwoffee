@@ -11,6 +11,19 @@ const CUP_ART = {
   idle: '/cwoffee_generating_idle_1.webp',
   idleStill: '/cwoffee_generating_idle_still.webp',
 }
+/**
+ * The mark that says a turn is being written, hung where the turn's name used to be.
+ *
+ * One file, looping, with no holds: the cup below takes random pauses because it is artwork that
+ * would otherwise be the only moving thing on a still page, and this is not artwork, it is a state
+ * readout — "an answer is arriving" — and a readout that stops and starts on a schedule of its own
+ * is a puzzle rather than a signal. The still is for `prefers-reduced-motion`, which is why frame
+ * zero is shipped alongside it.
+ */
+const WORKING_ART = {
+  loop: '/cwoffee_turn_working_1.webp',
+  still: '/cwoffee_turn_working_still.webp',
+}
 /** The pause between laps of the resting cup: the same range the opening-screen cup draws from. */
 const CUP_IDLE_HOLD = IDLE_HOLD
 
@@ -616,7 +629,19 @@ export class Transcript {
     })
   }
 
-  clear() {
+  /**
+   * Whether this page names every transcript wipe as it happens.
+   *
+   * Armed by the page harness and by nothing else. "A blank transcript" is one question — *who*
+   * cleared it — and the answer is currently inferred from which log lines happen to exist nearby.
+   * A loaded session prints its page, a wipe prints nothing, so a mid-send blank looks identical
+   * whether it came from a session switch, a repaint, or the start screen. In normal use nobody is
+   * asking, so the trail is off.
+   */
+  static reportClears = false
+
+  clear(why = 'unspecified') {
+    if (Transcript.reportClears) pageLog(`transcript clear: ${why}`)
     this.stopFollow()
     this.stopCup()
     this.root.textContent = ''
@@ -667,11 +692,17 @@ export class Transcript {
     this.liveWrap?.classList.remove('live')
     this.liveWrap = wrap
     wrap?.classList.add('live')
-    // The name row still carries the turn's state - CSS and the checks read `.live` - and the flip
-    // is what changes the transcript's cup: the generating loop while a block produces output, the
+    // The marker row carries the turn's state — CSS and the checks read `.live` — and the flip is
+    // what changes the transcript's cup: the generating loop while a block produces output, the
     // resting loop with its random holds once none does.
     const marker = (this.turn?.querySelector(':scope > .turn-who-cwoffee') ?? null) as HTMLElement | null
-    marker?.classList.toggle('live', !!body)
+    if (marker) {
+      marker.classList.toggle('live', !!body)
+      // The picture appears with the first live block of the turn and stays for the turn. Creating
+      // it per block would restart the loop at frame zero every time the model paused between a
+      // tool call and a sentence, which is a blink, not a spin.
+      if (body) this.workingImg(marker)
+    }
     if (wasBusy !== !!body) this.repaintCup()
   }
 
@@ -699,25 +730,68 @@ export class Transcript {
   }
 
   /**
-   * The one name marker a turn carries for cwoffee, hung in the gutter and stuck to the top
-   * of the scroller while that turn's text is being read.
+   * The one marker a turn carries in its gutter, stuck to the top of the scroller while that
+   * turn's text is on screen.
    *
-   * Every said block used to repeat the name down the left edge: a turn with a run and four
-   * paragraphs said "CWOFFEE" five times, and the gutter turned into a column of identical
-   * words. One per turn, floating, is the same affordance `.code-head` uses for a code block's
-   * buttons — you always know whose text you are in the middle of, without being told five
-   * times. The marker is a zero-height sticky row so the name costs no vertical space; the word
-   * itself hangs in the gutter where the labels already live, so it never nudges the text
-   * column. Yours is not here: your label sits with your bubble, which is where it is read.
+   * It used to hold a word — `CWOFFEE`, once per turn, pinned so a long turn was never unlabelled.
+   * The word is gone: in this app everything in the transcript but your own bubble is cwoffee's,
+   * so the label restated what the layout already said, and the gutter was the only thing left to
+   * hang a *state* on. So the row stays and the picture in it says "this answer is arriving" while
+   * it is, and nothing once it has landed. The row is zero-height and its child is absolutely
+   * positioned, so a marker costs no vertical space and never nudges the text column.
    */
-  private whoCwoffee(): HTMLElement {
+  private turnMarker(): HTMLElement {
     this.ensureTurn()
     const found = this.turn!.querySelector(':scope > .turn-who-cwoffee') as HTMLElement | null
     if (found) return found
     const wrap = this.el('turn-who turn-who-cwoffee')
-    wrap.append(this.el('who-name', 'cwoffee'))
-    this.turn!.appendChild(wrap)
+    // First child, so the sticky row is bounded by the turn the way `.code-head` is bounded by its
+    // block: it releases when the turn ends rather than floating over the next one.
+    this.turn!.insertBefore(wrap, this.turn!.firstChild)
     return wrap
+  }
+
+  /** The looping picture inside a turn's marker, made once per turn. */
+  private workingImg(marker: HTMLElement): HTMLImageElement {
+    const found = marker.querySelector(':scope > .turn-working') as HTMLImageElement | null
+    if (found) return found
+    const img = document.createElement('img')
+    img.className = 'turn-working'
+    img.alt = ''
+    img.setAttribute('aria-hidden', 'true')
+    // The file's own ANIM header asks for an infinite loop, so there is nothing to drive here:
+    // no hold, no timer, no `LoopHold`. Reduced motion gets the first frame as a still.
+    img.setAttribute('src', prefersStill() ? WORKING_ART.still : WORKING_ART.loop)
+    marker.append(img)
+    return img
+  }
+
+  /** Take the working mark away once the turn has landed. A settled turn shows no mark at all. */
+  private dropWorking() {
+    const marker = this.turn?.querySelector(':scope > .turn-who-cwoffee') as HTMLElement | null
+    marker?.querySelector(':scope > .turn-working')?.remove()
+    marker?.classList.remove('live')
+  }
+
+  /**
+   * Append to the turn and keep the turn's files at the end of it.
+   *
+   * A file row is not a footnote to the sentence that mentioned it: it is what the turn produced,
+   * and it sits under everything the turn said. Appending to the turn directly is what made a
+   * chip land in the middle of an answer — the write event arrives before the next paragraph does,
+   * so the paragraph ended up below the box for the file it was talking about.
+   */
+  private appendToTurn(node: HTMLElement) {
+    this.turn!.appendChild(node)
+    this.pinFilesLast()
+  }
+
+  /** Move this turn's file rows back to the end of the turn, above its action buttons. */
+  private pinFilesLast() {
+    const turn = this.turn
+    if (!turn || !this.fileEls.length) return
+    const acts = turn.querySelector(':scope > .turn-acts') as HTMLElement | null
+    for (const el of this.fileEls) turn.insertBefore(el, acts)
   }
 
   // ---- the transcript's cup ---------------------------------------------------------------
@@ -903,7 +977,7 @@ export class Transcript {
       // and gets its own name later, when the divider moves it into the turn it opens.)
       if (this.turn!.querySelector('.blk-user')) wrap.classList.add('nameless')
     } else {
-      this.whoCwoffee()
+      this.turnMarker()
     }
     // Thinking joins the run accordion; so does any later tool call, even one that
     // happens after the model has said something. What the model *said* goes below the
@@ -917,7 +991,7 @@ export class Transcript {
       // The working pauses while the model talks. It does not end: another tool call joins
       // this same accordion, which is what keeps one turn one block on screen.
       this.closeRunGroup(true)
-      this.turn!.appendChild(wrap)
+      this.appendToTurn(wrap)
     }
     // Anything that reaches here lands outside the run accordion - your message, what the model
     // said, a note or a failure the app is interrupting for - so it counts as content, and a
@@ -948,7 +1022,7 @@ export class Transcript {
     const head = this.el('blk-head streaming', 'thinking')
     wrap.append(head)
     // The working is cwoffee's too, so a turn that opens with a thought still gets its name.
-    this.whoCwoffee()
+    this.turnMarker()
     this.runBodyOf(this.ensureRunGroup()).appendChild(wrap)
     const run = this.runGroup
     if (run) this.bumpRun(run, 'think')
@@ -1078,8 +1152,9 @@ export class Transcript {
 
   private ensureRunGroup(): HTMLElement {
     this.ensureTurn()
-    // The working is cwoffee's too: a turn that opens with a tool call still gets its name.
-    this.whoCwoffee()
+    // A turn that opens with a tool call still gets its marker: the gutter says whose working
+    // this is while the answer has not started arriving yet.
+    this.turnMarker()
     const existing = this.runGroup
     if (existing && existing.parentElement === this.turn) {
       // One accordion per turn, reopened rather than replaced. The model putting a
@@ -1100,7 +1175,7 @@ export class Transcript {
     const wrap = this.mkRun()
     wrap.dataset.opened = String(Math.round(performance.now()))
     wrap.classList.add('running')
-    this.turn!.appendChild(wrap)
+    this.appendToTurn(wrap)
     this.runGroup = wrap
     this.paintRunHead(wrap)
     return wrap
@@ -2024,17 +2099,38 @@ export class Transcript {
     this.measureFollow()
   }
 
-  /** Watch the content's own height: growth that no follow call reports. */
+  /**
+   * Watch the content's height *and* the box it scrolls inside.
+   *
+   * The content grows when a model talks. The box grows when a **window** changes shape — a
+   * resize, a fullscreen, a drawer closing — and the content observer cannot see that at all:
+   * `scrollHeight` is unchanged while `clientHeight` is. Watching only the content left every
+   * number the app keeps about the scroll position describing a box that no longer exists: the
+   * jump control quoting a distance measured in the old window, the cup's band measured against
+   * it, and — reported as "if I resize to where scrollbars appear, scroll to the very bottom, and
+   * then fullscreen, the top is cut off and stays cut off" — a reader left wherever the old
+   * geometry put them. So re-measure on either, and for a reader who was pinned to the latest,
+   * keep them pinned to the latest when the box grows: what they chose was "watch the newest
+   * line", not "sit N px from the top of a particular window".
+   */
   private watchHeight() {
     if (typeof ResizeObserver === 'undefined') return
+    const sc = this.hookScroller()
+    let lastBox = sc?.clientHeight ?? 0
     const ro = new ResizeObserver(() => {
+      const box = sc?.clientHeight ?? 0
+      const boxChanged = box !== lastBox
+      lastBox = box
       if (this.measureRaf) return
       this.measureRaf = requestAnimationFrame(() => {
         this.measureRaf = 0
+        if (boxChanged && sc && this.pinned) this.follow('chrome')
         this.measureFollow()
       })
     })
     ro.observe(this.root)
+    // The scroll box itself: the only signal that the window moved under the reader.
+    if (sc) ro.observe(sc)
     this.ro = ro
   }
 
@@ -2224,12 +2320,12 @@ export class Transcript {
         this.answerEls = []
         const head = this.el('turn-head', `turn ${ev.d.turn_id} · ${ev.d.model}`)
         this.ensureTurn()
-        this.turn!.appendChild(head)
+        this.appendToTurn(head)
         for (const n of trailing) {
           // The one that opens this turn carries your name again: it was quiet in the turn it
           // happened to be typed into, and here it is the line the turn starts with.
           n.classList.remove('nameless')
-          this.turn!.appendChild(n)
+          this.appendToTurn(n)
         }
         trailing.slice(1).forEach((n) => n.classList.add('nameless'))
         break
@@ -2282,6 +2378,10 @@ export class Transcript {
         this.finalizeAnswer()
         this.settleReasoning()
         this.setLive(null)
+        // The turn has landed, so the mark that said it was arriving is taken away rather than
+        // left painted in the gutter at reduced opacity: a settled conversation should have no
+        // motion in it at all.
+        this.dropWorking()
         this.textBuf = null
         this.textKind = null
         // The working surface folds once the answer has landed: what you scan a
@@ -3282,7 +3382,10 @@ export class Transcript {
     }
     for (const el of this.fileEls) el.remove()
     this.fileEls = this.fileRow(this.turnFiles)
-    for (const el of this.fileEls) this.turn!.appendChild(el)
+    // Before the action row if there is one, at the end of the turn if there is not: the copy /
+    // share / branch line belongs to the turn and sits last, and the files it produced sit right
+    // above it. Anything said afterwards gets pinned back over them (see `appendToTurn`).
+    for (const el of this.fileEls) this.turn!.insertBefore(el, this.turn!.querySelector(':scope > .turn-acts'))
     this.closeRunGroup(true)
     this.scrollIfNeeded('text')
   }
@@ -3305,15 +3408,26 @@ export class Transcript {
     // repository is dozens of files, and a strip of 38 chips used to bury the one
     // artifact in the turn. Below the threshold, chips are the right shape for changes
     // too — two edited files are worth seeing.
-    const deliverables = all.filter((f) => f.kind === 'artifact')
+    const deliverables0 = all.filter((f) => f.kind === 'artifact')
     const attachments = all.filter((f) => f.kind === 'attachment')
+    // One chip per file *name*. A turn that wrote `report.md` in the workspace and then handed a
+    // copy over drew the same filename twice, once as a working chip and once as an attachment —
+    // and the reader sees names, not paths, so that reads as a bug rather than as two files. The
+    // hand-over copy wins, because it is the one the model wrote in order to give; the other is
+    // still on disk where the tooltip says.
+    const given = new Set(attachments.map((f) => f.name))
+    const deliverables = deliverables0.filter((f) => !given.has(f.name))
     // A file the model fetched for itself landed under .cws/ on purpose, so the
     // transcript does not present it as something the person asked for. It is
     // still one click away — hidden is not the same as gone, and a file the model
     // read should be checkable by the person who was told about it.
-    const scratch = all.filter((f) => (f as { kind?: string }).kind === 'scratch')
+    const scratch = all.filter((f) => (f as { kind?: string }).kind === 'scratch' && !given.has(f.name))
     const changes = all.filter(
-      (f) => f.kind !== 'artifact' && f.kind !== 'attachment' && (f as { kind?: string }).kind !== 'scratch',
+      (f) =>
+        f.kind !== 'artifact' &&
+        f.kind !== 'attachment' &&
+        (f as { kind?: string }).kind !== 'scratch' &&
+        !given.has(f.name),
     )
     // Attachments on their own line, against the right edge of the column. They are the files the
     // model wrote *to hand over*, and they are read differently from the working strip: the strip
@@ -3786,7 +3900,7 @@ export class Transcript {
   }
 
   loadHistory(msgs: StoredMessage[]) {
-    this.clear()
+    this.clear('page paint')
     this.root.appendChild(this.historyFragment(msgs))
     // One cup for the page, under everything the store produced, resting: a loaded session is a
     // finished one, so this is the loop with the random holds rather than a still.
@@ -3831,24 +3945,23 @@ export class Transcript {
     // arrangement on screen changes, because rewriting history mid-conversation is how a
     // prompt cache stops matching and every turn starts costing full price again.
     let run: HTMLElement | null = null
-    // One name per turn here too. A stored transcript has no `.turn` element to bound the
-    // marker, so it sticks to the scroller until the next turn replaces it — the same
-    // affordance seen from the other end: whoever's words fill the screen is named at the top
-    // of it. `asked` counts as cwoffee speaking: a question the agent asked is its turn.
-    let whoSaid = false
-    const whoCwoffee = () => {
-      if (whoSaid) return
-      whoSaid = true
-      const wrap = this.el('turn-who turn-who-cwoffee')
-      wrap.append(this.el('who-name', 'cwoffee'))
-      frag.appendChild(wrap)
-    }
+    // No name marker here at all. A stored turn has nothing live to show, and the marker's only
+    // content is the working mark: a page you are reading rather than watching carries no mark.
+    // The files a turn produced are accumulated instead of emitted per message, because they
+    // belong to the turn: see `flushTurn`.
+    let histFiles: OutputFile[] = []
     // The last thing this page's turns actually said. One actions row per turn, the
     // same affordance a live turn puts under its final answer - emitted per assistant
     // row, it stamped `Copy | Share as markdown | Branch` under every intermediate
     // message and the transcript read as a stack of separate turns.
     let lastAnswer: { body: HTMLElement; text: string } | null = null
     const flushAnswerActs = () => {
+      // Files first, actions last: the files are what the turn produced and the copy / share /
+      // branch line is what a reader does with a finished turn, so that line stays the last thing
+      // in the turn. A turn that wrote a file but said nothing still shows the file — and only the
+      // file, with no action row under nothing.
+      for (const el of this.fileRow(histFiles)) frag.appendChild(el)
+      histFiles = []
       if (!lastAnswer) return
       const acts = this.turnActionsRow(lastAnswer.text, this.sessionId)
       acts.classList.add('from-history')
@@ -3861,7 +3974,6 @@ export class Transcript {
     }
     const blk = (kind: string, label: string) => {
       endRun()
-      if (kind !== 'user') whoCwoffee()
       const wrap = this.el(`blk blk-${kind}`)
       const head = this.el('blk-head', label)
       const body = this.el('blk-body')
@@ -3879,7 +3991,6 @@ export class Transcript {
     const verboseRuns = this.verbose
     const runBody = () => {
       if (!run) {
-        whoCwoffee()
         run = this.mkRun()
         frag.appendChild(run)
         lastWrap = run
@@ -3910,10 +4021,11 @@ export class Transcript {
         // A user row is where one turn stops and the next starts, so it is where the
         // previous turn's actions row gets placed — and where this turn's accordion is
         // dropped, so the next turn gets its own rather than inheriting this one's steps.
+        // This also places the previous turn's files: they were held for the end of the turn,
+        // and a user row is where one turn stops.
         flushAnswerActs()
         endRun()
         run = null
-        whoSaid = false
         const body = blk('user', 'you')
         body.textContent = m.content
         // The row id, on the element the attachments hang off. A chip the reader pressed has to be
@@ -3967,12 +4079,12 @@ export class Transcript {
           lastAnswer = { body, text: m.content }
         }
         if (m.files?.length) {
-          // Into the fragment, directly under the answer that produced them. This
-          // used to call ensureTurn() and append to the live turn, which landed the
-          // chips at the *top* of a reloaded transcript, above every message: a
-          // session reopened after writing a file looked like it had no attachment,
-          // which is exactly the "the file was not shown at turn end" report.
-          for (const el of this.fileRow(m.files)) frag.insertBefore(el, lastWrap ? lastWrap.nextSibling : null)
+          // Held for the end of the turn. Two earlier shapes were wrong in opposite
+          // directions: appending to the *live* turn put the chips at the top of a reloaded
+          // transcript (the "the file was not shown at turn end" report), and emitting them under
+          // the message that mentioned them put a file box in the middle of an answer that was
+          // still talking about something else.
+          histFiles.push(...m.files)
         }
         for (const call of parseCalls(m.tool_calls_json)) {
           if (call.name === 'ask_user') {

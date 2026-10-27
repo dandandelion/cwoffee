@@ -1103,3 +1103,511 @@ the narrow-width rule gives it var(--color-pane) → rgb(242, 239, 231))
 Lesson: **when you delete a surface, ask what was overlaying something.** "Everything sits on one
 background" is true of a docked column and false of a drawer, and the stylesheet says which one a
 rule belongs to while the markup that carried the paint did not.
+
+---
+
+# Batch seven — a file said twice, a name that said nothing, and a scroll box that never noticed the window
+
+Five reports at once, and the most interesting one was a bug I could not find by looking:
+
+1. the same file appears twice in one turn — keep the dashed hand-over, lose the duplicate, stop the
+   hover fills, align the row with the chat, and never let a file land in the middle of what the turn
+   said;
+2. remove the `cwoffee` label from the transcript;
+3. the open conversation's marker: lose the left bar, make the fill readable in both palettes;
+4. put the animated mark from `~/Downloads/loading-status.webp` where the label was — looping with no
+   holds, sticky the way the label was, gone when the turn ends;
+5. "resize to where the scroll bars appear, scroll to the very bottom, then fullscreen: the top of the
+   conversation is cut off and stays cut off even after the scroll bars disappear."
+
+## O. A file the model wrote and a file the model handed over are one word
+
+The screenshot showed `machine-build.md` twice in one turn. It was not a duplicated render: the model
+wrote the file in the workspace (a working chip) and then put a copy under `.cws/` to hand it over
+(the dashed unit with the Save control). Two real records, one name — and a reader reads *names*, not
+paths, so the turn looked like it had made the same file twice.
+
+The dedupe happens where the reader reads: by name, with the hand-over copy winning, because it is the
+one the model wrote *in order to give*. The working copy is not hidden from the record — `files` still
+lists it and the Save control still hands over the delivered one.
+
+The placement was wrong in two opposite directions, and both shapes are asserted:
+
+- appended to the live turn, a stored transcript put the chip at the *top* of the conversation on
+  reload (the old "the file was not shown at turn end" report);
+- emitted per message, it landed *inside* an answer that was still talking about something else,
+  because the write event arrives before the next paragraph does.
+
+A turn's files are now accumulated and flushed at the end of the turn, above its
+`Copy / Share as markdown / Branch` row — live (`pinFilesLast`, re-applied after every append) and
+stored (`histFiles`, flushed at the turn boundary). The row starts where the sentences start rather
+than being justified to the right edge: it is part of what the turn said, not a margin note.
+
+### The hover fill was not where it looked
+
+"Remove the hover background on the label and on the download control." The rule that looked
+responsible — `.attachunit .filechip:hover` — was already gone. Deleting it again changed nothing,
+because the fill came from a *generic* rule several hundred lines later:
+
+```css
+.filechip:hover { border-color: var(--color-shell); background: var(--color-tint); }
+```
+
+Same specificity as `.attachunit .filechip`, later in the file, so on hover it wins and the name half
+lights up anyway. The unit now says otherwise for both halves, explicitly, and the stylesheet says why
+the explicitness is load-bearing.
+
+### A check that answers the cascade question, not the string question
+
+The page cannot be made to answer `:hover` from JS, so the claim has to come from the rules — and it
+has to be made the way the engine makes it. The first version failed if *any* matching hover rule
+declared a background; that failed for the wrong reason, because a rule that loses the cascade is
+harmless. What is graded now:
+
+- among the rules that match this element and declare a background, find the winner **at rest** and
+  the winner **on hover**, by specificity and source order;
+- resolve both declarations through the engine (`var()` and `color-mix()` are not colours until they
+  are resolved);
+- fail only when the two resolve to different ink.
+
+Verified from both sides — with the CSS override deleted, on a build that had the bug:
+
+```text
+SELFTEST FAIL: on hover hover resolves .filechip:hover (var(--color-tint) → color(srgb 0.947294 0.915765 0.868627))
+over .attachunit .filechip (transparent → rgba(0, 0, 0, 0)) — the file name is a control inside a box
+that is already a box
+```
+
+and with it in place:
+
+```text
+turn files ok (one chip for a file written and delivered, the hand-over copy kept with its Save
+control, the row last in the turn and 0px from the text edge, no hover fill on either half)
+```
+
+## P. The word `cwoffee` said nothing, and the gutter was free
+
+Everything in the transcript that is not your own bubble is cwoffee's. The pinned label restated what
+the layout already announced, so it is gone — from the live marker, from the stored transcript (where
+its container rule and its gap-payback went with it), and from the block heads that were already
+quiet.
+
+What stayed is the *row*: sticky, zero-height, bounded by the turn so it releases at the turn's end
+instead of floating into the next one. The row carries a state now — the looping mark from the file
+provided, `ui/public/cwoffee_turn_working_1.webp`, with frame zero kept as
+`cwoffee_turn_working_still.webp` for `prefers-reduced-motion`.
+
+The looping needed no code. The file's own `ANIM` header says `loop_count=0` (infinite) and every
+`ANMF` frame says 198ms — a uniform lap with no holds, which is what a *state readout* wants. The
+transcript's cups take random pauses because they are artwork that would otherwise be the only moving
+thing on a still page; a readout that stops and starts on a schedule of its own is a riddle. So there
+is no hold logic and no timer here: the picture is made once per turn (per-block creation would restart
+the loop at frame zero every time the model paused between a tool call and a sentence) and removed by
+`dropWorking()` at `turnEnd`, so a settled conversation contains no motion at all.
+
+### A pinned mark must not be raised above the line that pins it
+
+The word used to be *centred* on the header line of the turn's first block, which meant hanging ~22px
+above the marker row. For a picture, that is a clipping hazard: the row sticks to the top of the pane,
+the pane clips at its own edge, and a pinned mark whose top reaches above that line loses its top. The
+first measurement of the new mark showed exactly that — mark at `32..88` against a wrap starting at
+`y=54`, with the dump naming the culprit (`top=-22px`).
+
+So it hangs *down* from the published line (`top: var(--who-top)`) and stays whole. Two claims hold
+that: one measures the mark against the top of the box that clips it while a turn is mid-flight, one
+does the same on a streaming answer.
+
+The old alignment claim ("the name is 0.1px off the folded group's header line") could not be carried
+over honestly: it only ever held while the row sat at its natural position, and a stuck row and a
+header moving under it are two different things. What still has to be true is that the mark costs the
+prose nothing and never enters it:
+
+```text
+turn marker ok: no generated marker on 10 labels, one cup 136px pinned in the pane's band, working
+mark 66px clear of the text (--who-top 2px)
+working mark ok (paragraph …px clear of the text, heading …px clear, and none at all once the turn has landed)
+```
+
+The geometry, measured on a real window: the card runs `264..1164`, the prose starts at `350`, the
+marker row sits at `350`, and the mark occupies `284..340` — inside the card, 20px clear of its edge,
+66px clear of the first word. That column is what the reservation *is* now, which is why the old
+"the label is outdented from the text column" claim had to be re-hosted: the row is not outdented, the
+mark hangs in the pane's own left column.
+
+## Q. One mark for the open conversation, readable in both palettes
+
+The active row wore a left bar *and* a fill for one fact. The bar drew a stroke that lined up with
+nothing, and the fill under it was so close to the hover fill that a list of nine conversations could
+not be read for which one was open. The bar is gone and the fill is stronger:
+
+```css
+.sessrow.active { background: color-mix(in srgb, var(--color-shell) 34%, var(--color-paper)); }
+```
+
+### A colour check that graded NaN
+
+The first version parsed `getComputedStyle(...).backgroundColor` for `rgb(...)`, and this engine
+answers a `color-mix()` as `color(srgb 0.922824 0.876235 0.809804)` in the light palette and
+`oklab(0.909909 0.005904 0.025468)` in the dark one. The parse returned `NaN`, `NaN < 8` is false, and
+the group reported:
+
+```text
+active row ok (no bar; fill NaN of luminance from a neighbour and NaN from the hover fill …)
+```
+
+Green, on a colour it had never read. The parser now handles `rgb()`, hex, `color(srgb …)` and
+`oklab()`, converts to one quantity (oklab L × 255 — an sRGB luma and an oklab lightness are not the
+same number), and anything it cannot read is a **failure naming the string**.
+
+### Grading the file, not the running app's mood
+
+The next version flipped `data-theme` at runtime and re-read the row. That measured the engine's colour
+cache as much as the design: in a window the compositor had stopped painting, no frame arrives to drop
+a cached resolution, and the check read the *light* palette's fill against the *dark* desk — 179
+points apart, which is arithmetic rather than ink.
+
+So the claim is made against the shipped rules: read the declaration out of CSSOM, resolve it inside a
+throwaway element under an ancestor carrying `data-theme`, for both palettes; and separately assert
+that the row on screen paints what the rule says, so a later rule of the same specificity cannot
+quietly win. That also documents a build artefact: the transform emits a plain-colour fallback for
+every `color-mix()` and keeps the real one inside `@supports (color:color-mix(in lab,red,red))` with
+the same selector, so "the declared value" means the last one in source order.
+
+```text
+active row ok (one mark, no bar, and the row on screen paints what the rule says — light:
+color(srgb 0.922824 0.876235 0.809804) is 11 from the desk (rgb(242, 239, 231)) and 15 from a hovered
+row (rgb(247, 245, 239)); dark: color(srgb 0.336314 0.289726 0.231216) is 53 from the desk
+(rgb(25, 24, 22)) and 40 from a hovered row (rgb(38, 36, 31)))
+```
+
+The light palette is the tight one — 11 from the desk, 15 from hover — and the thresholds sit at 10 and
+8: "noticeably apart", with a little room, and deliberately not "arithmetically distinct".
+
+## R. Two ways a stylesheet scan can lie
+
+### `if (rule.cssRules) continue` skips every rule on the page
+
+Both new checks walked the sheet with what looked like the obvious grouping test. Since CSS nesting, a
+**style** rule answers `cssRules` too — an empty list when it nests nothing — so that branch recursed
+into every rule and examined none of them. One consequence was loud, one was silent:
+
+```text
+SELFTEST FAIL: the stylesheet declares no background for `.sessrow.active`, so the open row is marked by nothing
+```
+
+with the rule sitting in the same sheet; and the hover check passing, having found no fills at all.
+The loops now examine the rule *and* look inside it. A scan that finds nothing has to be able to say
+so — `row-active` fails when a declaration it needs is missing, and that is the only reason this
+surfaced instead of shipping.
+
+### My own splice put two copies of a group in the suite
+
+One edit used `s[:i] + new + s[j:]` where `j < i`, duplicating the span between them. The tell was in
+the harness's summary:
+
+```text
+TARGETED 2 named group(s) ran, 57 not run: ... files-end, files-end ...
+```
+
+The "these ran / these did not" list is a checksum on the suite itself, and it is worth reading even
+when the run is green.
+
+## S. A blank transcript is a seam, and the counter next to it names it
+
+Fixing something else here uncovered the real version of an old symptom. `resyncView` re-reads a page
+that comes back empty, because the Rust core writes a turn's rows at turn end and a read issued
+mid-turn can land after it: painting that empty page wipes a conversation that exists, and nothing
+repaints it. That is "I sent the first message and the screen stayed blank."
+
+One extra read was not enough — a second read issued in the same breath as the first can come back with
+the same answer. What bounds the polling honestly is the counter the row carries next to the
+conversation's name:
+
+```ts
+const expected = sessions.find((x) => x.id === id)?.message_count ?? 0
+const until = Date.now() + (expected > 0 ? Math.min(2400, 300 + expected * 120) : 150)
+```
+
+A conversation the sidebar says holds four messages gets a few hundred more milliseconds than one it
+says holds none. The counter is a hint about *how long to wait*, never a substitute for the page: a
+conversation created by the very send being loaded is not in this window's list at all. When the reads
+still come back empty against a non-zero counter, the note says so, because that is exactly the seam a
+blank transcript comes out of:
+
+```text
+resync: conversation 3 looked empty and was not — 2 row(s) came back on read 2
+resync: conversation 4 still reads empty after 15 more read(s) while its row says 4 message(s);
+showing it empty, and this is the seam a blank transcript comes out of
+```
+
+## T. The scroll box that never noticed the window
+
+The transcript keeps its own picture of where the reader is: `pinned`, `away`, the way-back control's
+`Npx below the bottom of the view`, the cup's band, the pending jump distance. All of it is recomputed
+in one place — a `ResizeObserver` that watched **the transcript's own box**.
+
+That observer fires when a model talks. It does not fire when a *window* changes shape: a resize or a
+fullscreen changes the scroll box's `clientHeight` while the content's `scrollHeight` is unchanged. The
+layout recovered on its own — the browser re-lays-out and clamps an out-of-range `scrollTop` — while
+every number the app kept about the reader's position went on describing a box that no longer existed.
+
+`watchHeight()` observes the scroll box as well:
+
+```ts
+const sc = this.hookScroller()
+let lastBox = sc?.clientHeight ?? 0
+const ro = new ResizeObserver(() => {
+  const box = sc?.clientHeight ?? 0
+  const boxChanged = box !== lastBox
+  lastBox = box
+  ...
+  if (boxChanged && sc && this.pinned) this.follow('chrome')
+  this.measureFollow()
+})
+ro.observe(this.root)
+if (sc) ro.observe(sc)
+```
+
+The `pinned` branch carries the decision: a reader who was at the latest, and whose box then grew, is
+no longer at the latest. What they chose was "watch the newest line", not "sit N px from the top of a
+particular window", so they are followed back. A reader who had scrolled away is not moved.
+
+**What the probe did and did not prove.** A group drove the real window
+(`selftest_resize_window`, gated by `selftest_armed`) through shrink → bottom → fullscreen → restore.
+It never reproduced "the top is cut off" as a layout fault: `scrollTop = 0` brought the top back every
+time. What it did show — and what the permanent `scroller-shape` group asserts — is that the app's own
+reading of the position was stale. Saying which of the two was broken matters: the report described a
+visual symptom, the demonstrable fault was bookkeeping, and the fix addresses the bookkeeping. If the
+symptom returns, the claim that would catch it is already in the suite, and it reports its own blind
+spot rather than a number:
+
+```text
+selftest note: the resize-shape claim was not measured — the transcript box is not laid out (clientHeight 0)
+```
+
+## U. Claims that were grading the window manager
+
+Three suite failures turned out to be measurements of the desktop, and each was re-hosted rather than
+loosened:
+
+- **A structure claim sampled the wrong block.** The table/heading check took
+  `all[all.length - 1]` of `.blk-answer .blk-body` across the whole document. In a 168-block transcript
+  that is whatever the paging happened to leave last, so it reported "the heading never became a
+  heading" with a trace quoting an older answer. It now samples the turn the ask started.
+- **A paint witness has to be the turn's, not the run's.** `unpainted()` counts the whole run, and a run
+  can collect a dozen frames early and then go dark for the turn under test — the claim was graded
+  against that darkness. The guard is the paints *this turn* delivered (`lastTurnFrames === 0`), which
+  is what the neighbouring bullet check already used. When the structure exists at settle, the settled
+  half is still asserted; only the mid-stream moment is written off, with a note that says so:
+
+  ```text
+  selftest note: skipped this turn's structure claims; it painted 0 frames from start to settle, and at
+  settle the block held 0 heading(s), 0 table(s), 2 list item(s) - markdown is parsed on the frame
+  clock, so a turn nobody composited has no clock to parse on. Keep the window visible and this bites.
+  ```
+- **"Opening a conversation repaints the transcript" needs frames too.** The prologue polls 3s for a
+  text change; a page nothing composites applies mount effects late. The poll now counts frames in its
+  own window, so the failure says whose answer it is (`… (70 frame(s) ran while waiting)`) and a zero
+  frame window is a named skip rather than a bug report.
+
+`reveal`'s word claims had the same flaw in miniature: they were skipped on "`frame()` returned true",
+which means *at least one* paint. One stray frame in an un-composited window is enough to grade spans
+frozen at their start values — `a settled word is still under a filter: blur(0.001965px)`,
+`a word from an earlier arrival sits at opacity 0.972074`, `10 word spans are still half-drawn after
+400ms`. Those are an animation that never advanced. The claims now need a clock seen to tick (a few
+paints across the streaming loop; three paints in the ghost-tail window).
+
+The desktop, meanwhile, took its own price: on Wayland/GNOME an application cannot take focus back —
+`focused=false visible=true minimized=false` — and WebKitGTK stops painting an unfocused window. The
+harness asks once, up front, says what it needs ("clicking the cwoffee window once does it"), and when
+it does not get it, fails itself instead of reporting green:
+`7 geometry check(s) were skipped … Keep the window visible and re-run.`
+
+## Lessons
+
+- **Two records, one word.** Dedupe where the reader reads. `report.md` written and `report.md` handed
+  over are two facts in the store and one name on screen; keeping the hand-over copy is a product
+  decision, not a rendering one.
+- **A file is part of what the turn said.** Not a footnote to the sentence that mentioned it, and not a
+  note against the right edge: end of turn, above the row that acts on it.
+- **The rule responsible is rarely the rule with the matching name.** Cascade, specificity and source
+  order are the question a check has to answer.
+- **A guard has to be shown to bite.** The hover check was run against a build with the fix deleted
+  before it was believed.
+- **`NaN < 8` is false, so a broken parse is a green test.** Report the string you could not read.
+- **One quantity, or the comparison grades arithmetic instead of ink.** The same token answers
+  `color(srgb …)` in one palette and `oklab(…)` in the other.
+- **Grade the file, not the running app's mood.** A runtime theme flip measures the engine's cache.
+- **A style rule answers `cssRules` too.** "Recurse *or* examine" is wrong under CSS nesting; examine,
+  then recurse — and make a scan that finds nothing fail.
+- **The suite summary is a checksum on the suite.** `files-end, files-end` in the "not run" list was my
+  own splice duplicating a group.
+- **Scope a claim to the thing it asked about.** "The last answer block in the document" is a different
+  answer every time the paging order changes.
+- **A witness has to be taken from the same window as the claim.** A run-level paint count cannot
+  witness a per-turn animation; a global "did anything paint" cannot witness "did *this* turn paint".
+- **A counter beside a record is a bound, not a source of truth.** The sidebar's message count says how
+  long to keep reading an empty page; it never says what to paint.
+- **Watch the box, not only the content.** Anything computed from a scroll position is a claim about two
+  boxes, and the outer one changes on its own.
+- **"It never reproduced" is a result and has to be reported as one.** The layout was not broken; the
+  bookkeeping was.
+
+## Batch seven, second pass — the person's own window says "not rendered" and "cannot click"
+
+Tested by hand at the desktop, the report was two items: the working mark is missing to the left of
+the grouped actions ("not rendered at all, or not added yet?"), and a folder's colours cannot be
+picked ("cannot change (cannot click the colors) colors of workspace"). Both were real, both were
+invisible to the suite, and each had a different reason for being invisible.
+
+### The mark was in the page at 0×56
+
+The element existed, had `display: block`, had `width: 56px` declared, and measured **0 wide by 56
+tall**. The page-wide reset `img, video { max-width: 100% }` resolves a percentage against the
+containing block, and the mark's containing block is the marker row — deliberately zero wide, because
+it is a gutter slot and not a column of text. 100% of nothing is nothing: the declared width lost to
+the reset, and height, which has no percentage in it, came through untouched. The most diagnostic thing
+about the box was that only half of it was missing.
+
+The CSS comment beside the transcript's cup had *already described this exact trap* — "100% of the
+containing block is 0px and the image vanishes while its height goes unhurt" — and had chosen to leave
+the reset in place for the cup, which is right for an image in flow. I wrote the bug anyway, in the
+new absolutely-positioned picture two rules away, in the same zero-wide row. A comment that explains a
+trap is not a guard against writing it again.
+
+Lifted for this element only: `.turn-who > .turn-working { max-width: none }`.
+
+`mark-visible` is a new group, and its point is that a DOM query cannot answer "is it on the screen".
+It grades the painted box against the thing beside it: `display` is not `none`, the rect is a real
+56×56, it stays inside the card that clips it, it does not reach into the grouped actions next to it,
+and its ink is readable against the paper behind it — the artwork's own pixels drawn to a canvas and
+compared to the resolved background, on a linear-light scale, because a thin brown line drawing on a
+dark paper is a state nobody can see. Measured: `ink rgb(159, 122, 82) against rgb(253, 252, 249)`,
+0.75 apart in light, ~0.20 in dark.
+
+### A field dropped at the desktop seam
+
+The colour press worked on the store side and did nothing on the desktop. `crates/tauri-app` maps the
+engine's `WorkspaceEntry` into its *own* `WorkspaceRow` struct, and that struct had `path`, `label`,
+`sessions` — and no `color`. The gateway serializes the engine's entry directly, so the identical press
+on a phone wrote the colour, read it back, and drew it. One record, two transports, one of them blind.
+
+So the person's "cannot click the colors" was accurate as an experience and wrong about the cause: the
+swatches were clickable (a hit-test says so: `document.elementFromPoint` at each swatch's centre answers
+to the swatch), and the press wrote. What was missing was any consequence. A control whose effect the
+window cannot see is an unclickable control as far as a person is concerned, and the check now grades
+the consequence rather than the click.
+
+`ws-color` (new group): open the folder's menu, count the swatches, hit-test each one, press one, read
+the list the *store* answers with, then read the row's folder glyph and compare the colour it actually
+paints with the hex the record holds — and put the folder's original colour back whether the claims
+pass or fail. Two Rust tests on the seams: `a_folder_row_reaching_the_window_carries_every_name_the_window_reads`
+(the desktop's wire row must carry `path`, `label`, `color`, `sessions`), and
+`a_folder_colour_reads_back_on_the_sidebar_list` (gateway: set, read, clear, read).
+
+### The mark was free while it was invisible
+
+Once it painted, it cost. On the 168-block / 635,054-character history the `gutter-crowd` group builds,
+a streaming turn measured **30.0ms and 37.0ms per frame** with the mark displayed and **21.0ms** with it
+hidden — a new feature that pushed a long conversation under 30fps, which is the very report the mark
+was commissioned to answer. `will-change: transform; transform: translateZ(0)` on the mark brought the
+same measurement back to **19.0ms and 21.0ms**: the animated picture composites on its own layer instead
+of repainting the transcript under it, and the cost becomes the cost of the history it sits in. The
+element exists only while a turn is arriving (`workingImg` makes it, `dropWorking` removes it), which is
+the one use `will-change` is for. `mark-visible` now fails if the promotion is removed, so a later
+tidy-up cannot quietly give the frame drop back.
+
+### Three selftest honesty fixes, all from the same run
+
+- **`titling`'s ordering claim had a clock that could miss the event entirely.** The check sampled the
+  app's `busy` flag every 10ms; a mock turn of 36 characters finished inside one sample gap
+  (`frames=1`), and the failure read "no clock for the ordering claim: … this page first saw the turn
+  running at 0ms" — a description of its own sampling. A check can now install a witness that the
+  shipped `turnStart` signal fills (`edgeWatch`), so the fallback is the event rather than a poll; if
+  *neither* caught it, the failure says the app ran a whole turn without ever telling this page it had
+  started, which is a product fact worth failing on.
+- **`tool-card`'s guard contradicted itself.** `the transcript is hidden or belongs elsewhere while the
+  layout checks ran (viewId=3, want 3)` — the ids were equal. Two problems, one sentence, and the
+  sentence named the wrong one. Now they are separate claims, and the "hidden" one names *why*:
+  empty mode is the app being honest about a conversation the record says has no rows.
+- **`mark-visible` needs its blind skip.** A 0×0 rect on a window nothing is compositing is an artifact
+  of the run, so the group waits for a laid-out box and, if it never gets one, says so and counts a
+  skip instead of grading nothing.
+
+### The run's real limitation, recorded
+
+This desktop loses the app's focus every ~20 seconds during a harness run, and an app cannot take focus
+back on Wayland. The harness re-activates the window (30 attempts) and several geometry/paint claims
+still went blind in the full run. Cadence and colour claims measured green in focused runs; `paste-send`
+needs a focused run to prove its on-screen receipt, and the focus problem is why it has not been green
+twice in a row here.
+
+### What this pass taught
+
+- **An element is not a picture.** "It is in the DOM, it has a width, it is displayed" can all be true
+  of something that measures zero. Claims about what a person sees have to be about geometry and paint.
+- **A percentage of nothing is nothing.** A reset that is correct for flow is a trap for something
+  absolutely positioned in the same zero-wide parent, and a comment describing the trap does not stop
+  you writing it again.
+- **A field dropped at a transport seam is a feature that works on one device and not the other.** Two
+  clients of one record disagreeing is the failure this project already treats as the important one; the
+  fix was a field, the guard has to be on both wires.
+- **Clickability is a consequence, not a hit target.** The swatches were hittable and the write landed;
+  what made them feel unclickable was that the window could not see the result. Grade the consequence.
+- **Measure the cost after the feature is visible.** The mark had been free while it was invisible, and
+  the honest number only existed once it painted.
+- **A claim that samples a flag can miss the event.** If the app has a signal, let the check witness the
+  signal; keep the sample, and make "the app never told the page" a failure that means what it says.
+- **A failure message that prints equal numbers is not describing a mismatch.** Say which of the two
+  things you mean, and say when the run could not have known.
+
+### The third bug: a 0-row page painted over the message you had just sent
+
+`paste-send` kept failing with the picture missing from the bubble, and the failure text could not say
+why. Once the failure described the page it had graded, it said the quiet part: *the on-screen
+transcript had zero turns while this window's own send was in flight*. Then the transcript's own clear
+trail — `Transcript.reportClears`, armed by the page harness only, naming every wipe — showed the
+culprit in one line:
+
+```
+transcript clear: start screen              (the check's own newSession)
+send: host is on 20, moving it to the viewed session 21
+start_turn (desktop): session=Some(21) attachments=1
+history: 0 row(s) for session 21
+transcript clear: page paint               ← here
+turn sent with 1 attachment(s)
+```
+
+The rust core writes a turn's rows **when the turn ends**, so a `session_messages` read issued mid-turn
+honestly answers "nothing". The app was painting that nothing over the bubble it had just drawn,
+thumbnail and all, for a second or two — a self-inflicted version of "I sent it and it isn't there",
+caused by the app reloading its own view.
+
+Two changes, both about not blanking a view that is not empty:
+
+- `loadTranscript` holds an empty page when `turnSessionId === id`: keep what is on screen, log
+  `conversation N reads empty while its turn is in flight; keeping what is on screen`, and let the
+  caller's poll paint the rows when they exist. Painting nothing is only honest for a conversation that
+  is actually empty, and "a turn of mine is running in it" is the app's own answer to that question.
+- `resyncView` clears early only when it is *navigating to a different conversation*. A repaint of the
+  conversation already on screen keeps its content while the page is read — `loadHistory` clears what
+  it replaces anyway, so the early clear bought nothing but a gap. `loadTranscript` also stopped
+  zeroing `viewMsgCount` on the way in, which was a second route to an empty screen while a page was
+  merely being fetched.
+
+Also worth keeping: the diagnostic that made this findable. A loaded session logs its page; a wipe
+logged nothing, so "the transcript went blank" could only be inferred from which lines happened to sit
+nearby. Naming every wipe, in a check run only, turned an inference into a log line.
+
+### Two harness lessons from the same chase
+
+- **A claim about a view has to ask for the view.** `scroller-shape`, `row-active` and `mark-visible`
+  were skipping whenever an earlier group happened to leave the app on its opening screen — green in one
+  run, blind in the next, with the skip note blaming the compositor. They now call
+  `ensureTranscriptMounted()` and measure. A skip that is really "the setup didn't happen" is a skip
+  that hides the claim, not one that reports it.
+- **A blind failure needs the state it graded.** `the message on screen carries []` was technically
+  true and useless: no bubble, a bubble with a text pill instead of a picture, a bubble repainted from
+  the record, and a chip belonging to another conversation are four different bugs. The failure now
+  prints the page (`blk-user`, `attlist`, `turns`, empty-mode, which conversation is open) alongside the
+  record's own attachments for it.
