@@ -13904,6 +13904,18 @@
                           )
                         if (copied.some((m, i) => m.content !== rowsNow[i].content))
                           fail('the copy does not say what the conversation it came from says')
+                        // The cost of the copy is said out loud. A branch is a new conversation, and
+                        // its first answer has to read what was copied rather than continue from what
+                        // the engine had loaded — the part of that the engine can actually see is the
+                        // count, so that is what the note names. The wording is deliberately not
+                        // "cold cache": the host refuses to assert an endpoint's cache state it cannot
+                        // observe, and a note that guesses at prefill is how a number becomes a law.
+                        const said2 = [...seen].join(' | ')
+                        if (!/assembled from the \d+ copied (message|messages)/.test(said2))
+                          fail(
+                            `a branch that copied ${copied.length} row(s) never said its first answer reads that ` +
+                              `copy; it said: ${said2.slice(0, 160)}`,
+                          )
                         const ta2 = document.querySelector('textarea.composer') as HTMLTextAreaElement | null
                         if ((ta2?.value ?? '').trim() !== '')
                           fail(

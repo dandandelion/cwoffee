@@ -206,11 +206,24 @@ fn clip(s: &str) -> String {
 /// it back" needs to hear that this is not that, and to use the pencil instead.
 pub fn outcome_note(from: i64, p: &BranchPoint, new_session: i64, copied: usize, title: &str) -> String {
     let rows = if copied == 1 { "message" } else { "messages" };
+    // What the first answer has to read before it can answer. Said as a cost, not as a cache
+    // state: the engine cannot see the endpoint's cache — `host.rs` refuses to put a cache
+    // assertion in a note for the same reason — and the count is the part that is knowable. A
+    // branch that copied nothing pays for nothing, so the sentence is only said when there is a
+    // copy to read.
+    let cold = if copied == 0 {
+        String::new()
+    } else {
+        format!(
+            " Its first answer is assembled from the {copied} copied {rows}, not from what this \
+             engine had already loaded, so that turn reads the copy before it replies."
+        )
+    };
     if p.whole {
         return format!(
             "branched the whole conversation: {copied} {rows} copied into conversation {new_session} \
              ({title}). Both conversations hold them, and they part company at the next message you \
-             send. Conversation {from} is untouched — this is a second path, not a rewind."
+             send. Conversation {from} is untouched — this is a second path, not a rewind.{cold}"
         );
     }
     if p.role == "user" {
@@ -237,7 +250,7 @@ pub fn outcome_note(from: i64, p: &BranchPoint, new_session: i64, copied: usize,
         format!(
             "branched from that message into conversation {new_session} ({title}), carrying {kept}. \
              {after} Your words are back in the composer — say them again and this branch answers, \
-             conversation {from} does not."
+             conversation {from} does not.{cold}"
         )
     } else {
         let later = match p.trailing {
@@ -248,7 +261,7 @@ pub fn outcome_note(from: i64, p: &BranchPoint, new_session: i64, copied: usize,
         format!(
             "branched at that answer into conversation {new_session} ({title}), carrying it and \
              {copied} earlier {rows}; conversation {from} keeps {later} and is untouched — this is a \
-             second path, not a rewind. It continues from the answer you branched at."
+             second path, not a rewind. It continues from the answer you branched at.{cold}"
         )
     }
 }

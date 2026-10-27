@@ -859,8 +859,10 @@ sidebar.
   (`once it is stored`), which is the same rule it was checking before: a disabled control that
   explains itself beats one that pretends.
 
-`scripts/selftest.sh branch` runs on both cores; the fork/adopt sentence is the only claim that
-differs between them, and a core that reports neither fails instead of passing quietly.
+- **The cost of the copy is claimed only when there is a copy.** A branch that carries rows says
+  its first answer is assembled from them; a branch off the first message carries nothing and must
+  not say so. The wording is a count, not "cold cache" — the engine cannot observe the endpoint's
+  cache, and this app has a standing rule (and a test) against notes that assert cache state.
 
 Three new mock scenarios (`branch-stem`, `branch-tail`, `branch-answer`) exist because
 `scripts/mock-llm.mjs` answers an unmatched prompt with a 400, and a check whose turn 400s grades a

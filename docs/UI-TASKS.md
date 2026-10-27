@@ -2023,6 +2023,13 @@ answer went somewhere they did not want it to go, without losing the path that g
 - A selftest needs scenarios. `mock-llm.mjs` answers an unmatched prompt with a 400, so three new
   entries went into `tests/scenarios/scenarios.json` rather than the check reusing someone else's
   scenario by accident.
+- The ask said "state plainly that the branch starts cold-cache". The note names the **count**
+  instead — *"its first answer is assembled from the 4 copied messages, not from what this engine
+  had already loaded"* — because the engine cannot see the endpoint's cache and this app already
+  refuses to put a cache assertion in a note it cannot observe (`host.rs`'s resume note is graded by
+  a test for exactly that: `the resume note asserted … about a cache it cannot see`). A branch that
+  copied nothing gets no such sentence; a branch cut mid-conversation may well hit the endpoint's
+  prefix cache. The knowable part is how much has to be read, and the rate is already in the panel.
 
 ### Receipts
 
