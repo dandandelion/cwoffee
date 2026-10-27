@@ -1831,3 +1831,114 @@ desktop-only verbs). `svelte-check`: 0 errors, 0 warnings. `vite build`: `index-
         model=qwen3.8-flash-next-iq3_s workspace=… mode=Auto reasoning=XHigh
       app says: [cwoffee] render OK: titlebar=true sidebar=true sidefoot=true stream=true empty=false
         overlay=false text=4566 bg=rgb(253, 252, 249) desk=rgb(242, 239, 231) dpr=2.00 cup=none
+
+## Batch ten — one message on the busy button, a loader in the gutter that stops resetting, and two lines that only existed in the installed bundle
+
+The report was three screenshots of the app the desktop actually launches. That bundle was batch
+nine's, so two of the three complaints ("a chat says it has no folder", "a chat says
+`cwoffee-workspace`") had already been removed in the tree and were still being drawn by the running
+window. The fix for those was a claim rather than a change: the chat check now reads the pane's
+text, not just the composer's selectors, so either sentence anywhere in the pane — or in the second
+composer the opening screen keeps — fails the run:
+
+    SELFTEST FAIL: chat mode still says "Chat has no folder" in the pane — a folder line, or a copy
+      of one, is still being drawn
+
+The third complaint was real and visible in both: the send button was drawing the stop square *and*
+the working orbit in the same 14px glyph, which is two sentences in the space of one — "this is
+working" and "press to end it".
+
+### A control with two states should show one of them
+
+The busy button now shows the mark at rest and the square on `:hover`, with `:focus-visible` beside
+the hover rule. The focus half is not decoration: a hover-only affordance is invisible to the person
+who arrives with a keyboard, and the square is the only thing that says this control ends the turn.
+Nothing in this suite can put a pointer on a button, so the runtime half measures the rest state
+(mark lit, square at opacity 0) and the reveal half reads the shipped rules: a rest rule that hides
+the square, and a rule per reveal that brings the square back *and* takes the mark away. Revealing
+without dimming would restack the two for whoever hovers, which is the thing being objected to:
+
+    send loader ok (32x32 button unchanged through the turn, 20px mark inside it at opacity 0.95 over
+      170 painted frame(s), stop glyph held at opacity 0 until hover or keyboard focus, labelled Stop
+      while busy and Send once settled)
+
+### "It resets when something gets appended" was three bugs, not one
+
+The obvious reading — the animation restarts — was true, and its cause was the box, not the file: as
+a flex item in the header row the mark's box was re-laid-out every time the header's text changed, and
+an animated raster whose box is rebuilt starts again at frame zero. `position: absolute` at a fixed
+offset gives it a box that nothing in the turn can change. Then two more, both found by measuring:
+
+- `.blk > .blk-head` exists to put a block's *label* in the gutter, and it carries
+  `position: absolute; left: -66px; top: 2px; width: 58px`. The run header overrode the position and
+  the display but not the geometry, so it kept a label's 58px box — a sentence clipped to 58px with an
+  ellipsis. With `position: relative` it also inherited the -66px shift, which is what made the
+  mark's offset unreadable from the CSS alone. Three resets, and a claim that measures the header
+  against its own block's content column.
+- This WebKit answers `translate: 0 -50%` by ignoring it, so the mark hung half its own height below
+  the row's centre. `top: 50%` plus a negative `margin-top` is the oldest way to centre an absolutely
+  placed box, and it composes with the `transform` that carries the layer promotion instead of
+  competing with it.
+
+Moving the mark into the gutter is arithmetic against the clip box, and the numbers came from a probe
+rather than from the comments: the scroller reserves 80px and the card clips at its own edge, so
+`left: -60px` puts the mark 26px clear of the block's rule and 40px inside the card. The first
+attempt, `-54px`, put it outside the card and the claim said so.
+
+    working loader ok (painted at its declared box, hung 26.0px clear of the block's rule and inside
+      the card, on the header row's centre, the header spanning its block, one line row, the same
+      element through the next step, and gone when the turn landed; the narrow-width offsets are
+      graded as shipped rules rather than measured, because this suite cannot resize its own window)
+
+Keeping the mark last is what lets it never move: `appendToTurn` and `addFiles` insert before it
+rather than after, so nothing has to be re-parented. The claim that grades this appeared only after
+it was written against something real — streamed prose continues the block that is already open and
+adds no node at all, so a paragraph append proves nothing about order; files do add nodes, and that
+claim caught `addFiles` dropping the strip *under* the loader:
+
+    SELFTEST FAIL: 1 node(s) sit after the loose loader, first is <div class="filestrip"> — the
+      loader is no longer the last thing in the turn's writing
+
+### The web switch stopped narrating itself
+
+Turning Web on drew a sentence under the composer saying the model would be given `web_search` and
+`web_fetch`. The chip on the control that was just pressed already says `on`, and its tooltip already
+names the tools. A switch that worked needs no prose; a switch that was *refused* does, because
+nothing else on the screen says the press was refused — so the note is now only ever a refusal, and
+the host's success receipt goes to the log where it can still be read.
+
+### Lessons
+
+- A screenshot of a running app is a screenshot of the installed bundle. Check which one you are
+  looking at before changing code, or you will "fix" a line that is already gone.
+- A geometry claim written from comments about the layout is a guess. Measure, then write the number.
+- When a rule is inherited from a rule written for a different thing, resetting the position is not
+  enough: the geometry travels with it.
+- "The animation resets" is usually about the box. Ask what re-lays-it-out before touching the file.
+- A selftest cannot hover. Grade the reveal against the shipped rules, and grade the rest state from
+  pixels — and say which half each claim is.
+- An append that updates an existing node cannot prove an ordering invariant. Pick the append that
+  adds a node.
+- A claim that nothing is drawn is a claim about text, not about selectors: a copy of the sentence
+  under a new class passes a selector check.
+
+### Receipts
+
+Targeted (`chat web-grant reveal send-loader mark-visible panecard`), pi core, window frontmost:
+`SELFTEST ok`, with `chat list ok (1 chat row(s) drawn, no folder tree, no approvals control)`,
+`web grant ok (… a mid-turn flip is refused; and the grant comes back with the conversation)`,
+`working mark ok (… the same element and still the last block's successor after an append, …)`,
+`card ok`, and the two loader receipts above.
+
+Falsification, five sabotages in one run, each caught by the claim written for it: the web note
+back, the mark back inside the heading (`the loader's right edge is -28.0px from the block's rule
+instead of clear of it`), the header mark rebuilt per step (`the loader is a different element after
+a step landed: the mark is rebuilt…`), the rest rule for the square deleted (`the stop square is
+painted at opacity 1 under the working mark…`), and `appendToTurn` appending back (the `filestrip`
+failure above).
+
+`cargo test --workspace`: 647 passed, 0 failed. `wire-names`: OK, same two desktop/gateway notes.
+`svelte-check`: 0 errors, 0 warnings. Production bundle installed; `install-desktop.sh --check-only`:
+
+    launch check: OK (gio launch ~/.local/share/applications/cwoffee.desktop)
+      app says: [cwoffee] render OK: … cup=none

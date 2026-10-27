@@ -4703,15 +4703,20 @@
       // No row to grant yet. The choice rides on the send that creates the row, exactly as the
       // folder chosen for a draft does.
       webDraft = next
-      webNote = next
-        ? 'web on for this chat: the model is given web_search and web_fetch when it starts'
-        : 'web off: this chat starts with no tools at all'
+      // No sentence about it. The chip carries the state — `on` or `off`, on the switch that was
+      // just pressed — and the line under the composer used to say the same thing in twelve words
+      // that nobody re-reads. What keeps a line is a refusal: a thing that did *not* happen needs
+      // words, because the chip would otherwise look like it did.
+      webNote = ''
       return
     }
     webNote = ''
     try {
       const out = await invoke<string | { note?: string }>('set_session_web', { session: viewId, on: next })
-      webNote = typeof out === 'string' ? out : (out?.note ?? '')
+      // The host's note is a receipt for the log, not a line for the page: on success it restates
+      // what the chip already shows. A refusal comes back as an error, and that keeps its words.
+      const note = typeof out === 'string' ? out : (out?.note ?? '')
+      if (note) pageLog(`set_session_web: ${note}`)
       webDraft = next
     } catch (e) {
       webNote = cleanErr(e)
@@ -6691,6 +6696,16 @@
                   (stray.textContent ?? '').trim().slice(0, 44),
                 )}`,
               )
+            // The reported state was two lines at once — one saying the chat has no folder, one
+            // naming `cwoffee-workspace` — so the claim is not only "no control in that slot": a
+            // copy of either sentence anywhere in the pane is the same bug under a different class,
+            // and a second composer (the opening screen has its own) would slip past a selector
+            // scoped to one of them.
+            const paneText = (document.querySelector('main')?.textContent ?? '').replace(/\s+/g, ' ')
+            for (const phrase of ['Chat has no folder', "this session’s folder", 'Choose workspace']) {
+              if (paneText.includes(phrase))
+                fail(`chat mode still says ${JSON.stringify(phrase)} in the pane — a folder line, or a copy of one, is still being drawn`)
+            }
             // No approvals control at all. It used to be replaced by a inert label carrying
             // `data-approvals="none"`; that slot now holds the one tool decision a chat does have
             // (see the Web chip), so the claim here is the simpler one: nothing in a chat's composer
@@ -11816,8 +11831,19 @@
           } else if (mr) {
             clearance = mr.top - line.bottom
             if (clearance < 0) fail(`the loose loader sits ${(-clearance).toFixed(1)}px into the answer's first line instead of after it`)
-            if (Math.abs(mr.left - line.left) > 1.5)
-              fail(`the loose loader is ${(mr.left - line.left).toFixed(1)}px off the prose column it follows`)
+            // In the gutter, not on the column: the ask was to move the mark left of the block's rule
+            // so it reads as a state rather than as a glyph in the sentence. Two ways that goes wrong
+            // and both are invisible in a screenshot at full width: it ends up back on the column, or
+            // it hangs so far out that the scroll box clips it.
+            if (mr.right > line.left - 2)
+              fail(
+                `the loose loader is ${(mr.right - line.left).toFixed(1)}px into the prose column instead of in the gutter to its left`,
+              )
+            const scR = document.querySelector('.scroller')?.getBoundingClientRect()
+            if (scR && mr.left < scR.left + 1)
+              fail(
+                `the loose loader starts at ${Math.round(mr.left)} where the scroll box starts at ${Math.round(scR.left)} — it is hung outside the box that clips it`,
+              )
           }
           const live = document.querySelectorAll('.transcript .run-working')
           if (live.length > 1) fail(`${live.length} working loaders in one turn: the header mark and the loose one are both painted`)
@@ -11826,7 +11852,9 @@
               mr
                 ? `${Math.round(mr.width)}x${Math.round(mr.height)} at ${Math.round(mr.left)},${Math.round(mr.top)}, ${clearance.toFixed(
                     1,
-                  )}px ${variant === 'tail' ? 'below' : 'above'} the answer's first line`
+                  )}px ${variant === 'tail' ? 'below' : 'above'} the answer's first line, ${(line.left - mr.left).toFixed(
+                    1,
+                  )}px left of the column`
                 : 'no mark'
             }, first line left ${Math.round(line.left)} top ${Math.round(line.top)}`,
           )
@@ -11887,10 +11915,53 @@
           if (tcs.transform === 'none') fail('the loose loader lost its layer promotion, so its loop repaints the transcript')
           if (Number(tcs.opacity) < 0.8) fail(`the loose loader sits at opacity ${tcs.opacity}`)
         }
+        // And it has to *stay* there. The report was that the loader jumps or resets when something
+        // gets appended, and the two ways that happens are invisible in a screenshot taken after the
+        // fact: the mark is pushed above the prose by an `appendChild`, or it is removed and rebuilt
+        // — and a raster rebuilt from scratch starts again at frame zero. So a block is appended here,
+        // through the same path a real delta takes, and both are re-measured.
+        // And it has to stay there when something real is appended. Streamed prose is no test of
+        // this: a paragraph continues the live block that is already open — spans and box kept, which
+        // is the app's streaming design — so no node is added and nothing can move. Files are the
+        // append that does add nodes mid-turn, and they are the append the loader used to be pushed
+        // under: `pinFilesLast` now puts them before the mark (the mark is the last thing in the
+        // writing, a file row is part of it), and `appendToTurn` inserts later blocks before the mark
+        // for the same reason. So: files arrive, and the mark must still be the same element, still
+        // last, and still in the gutter.
+        transcript?.addFiles([
+          {
+            path: 'roast_notes.md',
+            name: 'roast_notes.md',
+            mime: 'text/markdown',
+            bytes: 2400,
+          },
+        ])
+        await frame(40)
+        transcript?.flushNow()
+        const head2 = measure('heading answer, after files arrived')
+        if (!head2.mark) fail('a file row took the loose loader out of the turn')
+        else if (head2.mark !== head1.mark)
+          fail(
+            'the loose loader is a different element after a file row arrived: it is rebuilt, and a raster rebuilt from scratch restarts at frame zero — the reset in the report',
+          )
+        else if (head2.clearance < 0)
+          fail(`a file row pushed the loose loader into the prose it follows: ${head2.clearance.toFixed(1)}px`)
+        else {
+          const kids = Array.from((head2.mark.parentElement ?? document.createElement('div')).children)
+          const at = kids.indexOf(head2.mark)
+          // Nothing after it, files included: a file row below the mark is a hand-over line sitting
+          // under a spinner, and the mark is meant to be the tail of the writing.
+          if (kids.length - 1 - at > 0) {
+            const straggler = kids[at + 1] as HTMLElement
+            fail(
+              `${kids.length - 1 - at} node(s) sit after the loose loader, first is <${straggler.tagName.toLowerCase()} class="${straggler.className}"> — the loader is no longer the last thing in the turn's writing`,
+            )
+          }
+        }
         pageLog(
           `working mark ok (run header ${mid.clearance.toFixed(1)}px clear of the text, plain answer's loose loader ${head1.clearance.toFixed(
             1,
-          )}px below the first line and on the column, and none at all once the turn has landed)`,
+          )}px below the first line in the gutter, the same element and still the last block's successor after an append, and none at all once the turn has landed)`,
         )
         transcript?.clear()
       }
@@ -14252,9 +14323,16 @@
             ;(chip as HTMLElement).click()
             if (!(await until(() => (document.querySelector('button[data-web]') as HTMLElement)?.getAttribute('aria-pressed') === 'true', 4000)))
               fail('pressing the Web switch on a draft did not flip it')
+            // A switch that worked is a chip that changed. The line under the composer used to
+            // repeat it — "web on for this chat: the model is given web_search and web_fetch when it
+            // starts" — and the report was that it is not needed: the chip carries `on`, next to the
+            // control that was just pressed, and its tooltip carries the tools. A refusal keeps its
+            // words (claimed below), because nothing else on the screen says the press was refused.
             const draftNote = document.querySelector('[data-web-note]')?.textContent ?? ''
-            if (!/web_search and web_fetch/.test(draftNote))
-              fail(`the app did not say what a draft's web switch promises: "${draftNote.slice(0, 90)}"`)
+            if (draftNote)
+              fail(
+                `a web switch that worked still draws a line under the composer: "${draftNote.slice(0, 90)}" — the chip already says on, on the control that changed`,
+              )
             if (!tips().some((t) => /look it up/i.test(t)))
               fail('the chat can reach the web and the greeting still offers nothing that uses it')
 
@@ -14283,8 +14361,10 @@
             const row2 = (await invoke<Session[]>('list_sessions')).find((x) => x.id === sid)
             if (row2?.web_on) fail('the chip and the host are off and the record still says the chat may search')
             const back = document.querySelector('[data-web-note]')?.textContent ?? ''
-            if (!/no longer reach the web|web off/i.test(back))
-              fail(`taking the grant away was not said in words: "${back.slice(0, 90)}"`)
+            if (back)
+              fail(
+                `taking the grant away drew a line under the composer: "${back.slice(0, 90)}" — off is what the chip shows, and the host's receipt belongs in the log`,
+              )
             // And the model agrees: a chat with nothing granted gets nothing mounted.
             draft = 'Selftest wipe check, asked with the switch back off: reply with the single word ok.'
             await send()
@@ -14721,6 +14801,10 @@
       // transcript its frames, and readable against the paper this window is using.
       if (want('mark-visible', 'the working loader is painted in the run header, inline, and readable against the paper')) {
         const verdict: string[] = []
+        // What the loop witness had to say, and how far the mark sits from the block's rule — both
+        // kept for the receipt, which is written after the block that measured them goes out of scope.
+        let seamless = ''
+        let markClear = '?'
         // One quantity for colours the engine may hand back in three spellings — rgb(), a
         // color(srgb …), or an oklab() — because comparing an sRGB luma with an oklab lightness is
         // arithmetic, not ink. Anything unparseable is null, and null is a failure that names the
@@ -14789,16 +14873,34 @@
           // is the 0x56 bug returning under a different name.
           if (cs.maxWidth !== 'none' && /px$/.test(cs.maxWidth) && parseFloat(cs.maxWidth) < mr.width - 0.5)
             verdict.push(`the page's img reset clamps the loader to ${cs.maxWidth}, so the declared box never paints`)
-          // "No need to follow screen": the loader is in flow. A pinned one is a picture that rides
-          // the top of the pane while its own sentence scrolls away under it — which is what the
-          // previous shape did, and what cost the clip-box rule to keep its top from being shaved.
-          if (cs.position !== 'static')
-            verdict.push(`the loader is position: ${cs.position}, so it follows the view instead of the sentence it belongs to`)
+          // It belongs to the block, not to the view. `sticky`/`fixed` is the old pinned shape — the
+          // one that needed a clip-box rule to stop its top being shaved off the pane — and the ask
+          // was explicitly "no need to follow the screen". `absolute` inside the header row means it
+          // scrolls away with the block it describes.
+          if (cs.position === 'sticky' || cs.position === 'fixed')
+            verdict.push(`the loader is position: ${cs.position}, so it follows the view instead of the block it belongs to`)
+          else if (cs.position !== 'absolute')
+            verdict.push(
+              `the loader is position: ${cs.position} — it is meant to hang in the gutter off the header row, and a static mark is back inside the sentence it was moved out of`,
+            )
           if (cs.float !== 'none') verdict.push(`the loader floats (${cs.float}) out of the header row`)
-          // Inline with the header's sentence: on its line, to its left, and inside the accordion's
-          // own left edge rather than hanging out of the column.
-          if (mr.right > lr.left + 0.5)
-            verdict.push(`the loader is ${Math.round(mr.right - lr.left)}px past the sentence it should lead, so it is not inline with it`)
+          // Left of the block's rule, in the gutter: "move it to the left of the border (gutter, still
+          // inline with the block, so it is more noticeable)". Inside the sentence it competed with
+          // the words — the header already says `Working on your computer` — and out here it is the
+          // state of the block rather than a glyph in the heading. It still has to stay inside the
+          // scroll box, which is the other way this goes wrong: a mark hung past the box's edge is a
+          // half-clipped spinner, which reads worse than a mark a little closer to the text.
+          const blockR = run.getBoundingClientRect()
+          if (mr.right > blockR.left - 2)
+            verdict.push(
+              `the loader's right edge is ${(blockR.left - mr.right).toFixed(1)}px from the block's rule instead of clear of it, so it is still reading as part of the heading`,
+            )
+          markClear = (blockR.left - mr.right).toFixed(1)
+          const scBox = document.querySelector('.scroller')?.getBoundingClientRect()
+          if (scBox && mr.left < scBox.left + 1)
+            verdict.push(
+              `the loader starts at ${Math.round(mr.left)} where the scroll box starts at ${Math.round(scBox.left)} — it is hung outside the box that clips it`,
+            )
           const drift = Math.abs(mr.top + mr.height / 2 - (lr.top + lr.height / 2))
           if (drift > 4)
             verdict.push(`the loader sits ${Math.round(drift)}px off the middle of the sentence's line, so the header row reads as two lines`)
@@ -14809,6 +14911,64 @@
           const headRow = mark.parentElement!.getBoundingClientRect()
           if (headRow.height > 30)
             verdict.push(`the run header row is ${Math.round(headRow.height)}px tall with the loader in it, so the mark has grown the row rather than fitted into it`)
+          // The header row spans its block. `.blk > .blk-head` gives a block's *label* a 58px column
+          // in the gutter, and the run header overrode its position without overriding its geometry —
+          // so the sentence "Working on your computer" was clipped into a label's 58px box, which is
+          // also what made the mark's offset impossible to reason about from the CSS alone.
+          // The block's own content width: its rule and its padding sit inside the border box, so a
+          // header that spans the content is `blockR.width - 14`, not `blockR.width`.
+          const brStyle = getComputedStyle(run)
+          const contentW =
+            blockR.width - (parseFloat(brStyle.paddingLeft) || 0) - (parseFloat(brStyle.borderLeftWidth) || 0)
+          if (contentW - headRow.width > 6)
+            verdict.push(
+              `the run header row is ${Math.round(headRow.width)}px wide inside a ${Math.round(
+                contentW,
+              )}px content column, so its sentence is clipped into the generic label's 58px column`,
+            )
+          // Narrow widths have 24px of gutter, not 80, and nothing about this window's width makes
+          // that measurable here — the suite runs at desktop width. So the shipped rule is read
+          // instead: an offset pulled back inside 24px has to exist, or a narrow window clips the
+          // mark, which is the failure mode this transcript has already had once.
+          // Narrow widths cut the gutter from 80px to about 24, and this suite only ever runs at
+          // desktop width: a selftest cannot resize the window it is running in. So what is graded is
+          // that the narrow rules exist and pull the offsets inward, which is the difference between a
+          // mark that stays inside the band and one the scroll box clips. The arithmetic of the narrow
+          // band itself is stated as unmeasured rather than claimed.
+          let narrowMark = false
+          let wideMark = false
+          const scanMark = (list: CSSRuleList, insideMedia: boolean, depth: number) => {
+            if (depth > 5) return
+            for (const rule of Array.from(list)) {
+              const r = rule as CSSStyleRule & CSSMediaRule
+              if (r instanceof CSSStyleRule) {
+                const sel = (r.selectorText ?? '').trim()
+                if (sel.includes('.run-working')) {
+                  const v = r.style?.getPropertyValue('left') || r.style?.getPropertyValue('margin-left') || ''
+                  const px = parseFloat(v)
+                  if (Number.isFinite(px) && px < 0) {
+                    if (insideMedia) narrowMark = true
+                    else wideMark = true
+                  }
+                }
+              }
+              const inner = (r as CSSMediaRule).cssRules
+              if (inner && inner.length) scanMark(inner, insideMedia || r instanceof CSSMediaRule, depth + 1)
+            }
+          }
+          for (const sheet of Array.from(document.styleSheets)) {
+            let rules: CSSRuleList | undefined
+            try {
+              rules = (sheet as CSSStyleSheet).cssRules
+            } catch {
+              continue // a sheet this page cannot read must not end the run
+            }
+            scanMark(rules, false, 0)
+          }
+          if (wideMark && !narrowMark)
+            verdict.push(
+              'the loader is offset into the gutter at desktop width with no narrow-width rule pulling it back, so at 860px and below it is hung outside the scroll box that clips it',
+            )
           // Layer promotion, and it is a measured fact worth pinning: unpromoted, an animated picture
           // inside a long transcript cost 30-37ms/frame against 19-21ms promoted on the 168-block
           // history the suite builds. A tidy-up that drops `will-change` would bring the frame drop
@@ -14844,10 +15004,70 @@
           pageLog(
             `working loader painted (${Math.round(mr.width)}x${Math.round(mr.height)} at ${Math.round(mr.left)},${Math.round(
               mr.top,
-            )}, ${Math.round(lr.left - mr.right)}px before the sentence, ${drift.toFixed(1)}px off its line centre, row ${Math.round(
-              headRow.height,
-            )}px tall, ink ${ink ?? '?'} against ${paper})`,
+            )}, ${(blockR.left - mr.right).toFixed(1)}px clear of the block's rule, ${drift.toFixed(
+              1,
+            )}px off the header line's centre, row ${Math.round(headRow.height)}px tall, ink ${ink ?? '?'} against ${paper})`,
           )
+          // "The loading animation resets when something gets appended in chat." A mark that is
+          // removed and rebuilt looks identical to one that kept running, so this grades the two
+          // things a restart needs, neither of which the DOM otherwise shows: whether the element is
+          // still the same node, and how many loader elements the transcript has built. The third is
+          // the picture itself — the mark drawn into a canvas at three moments, because a raster that
+          // never advances is not seamless however stable its node is. An engine that paints frame
+          // zero into a canvas every time is a blind spot, named as one rather than passed.
+          const node0 = mark
+          const made0 = transcript?.workingMarksMade ?? -1
+          const src0 = mark.getAttribute('src') ?? ''
+          // Sampling before more work lands, so a restart caused by an append is caught with the
+          // frames that came before it on record.
+          const snap = (img: HTMLImageElement): number => {
+            const cv = document.createElement('canvas')
+            cv.width = 24
+            cv.height = 24
+            const g = cv.getContext('2d')
+            if (!g) return -1
+            g.clearRect(0, 0, 24, 24)
+            try {
+              g.drawImage(img, 0, 0, 24, 24)
+            } catch {
+              return -1
+            }
+            const px = g.getImageData(0, 0, 24, 24).data
+            let h = 0
+            for (let i = 0; i < px.length; i += 4) h = (h * 31 + px[i] * 3 + px[i + 1] * 7 + px[i + 2] * 13) >>> 0
+            return h
+          }
+          const before = [snap(mark)]
+          for (let i = 0; i < 3; i++) {
+            await new Promise((r) => setTimeout(r, 90))
+            before.push(snap(mark))
+          }
+          transcript?.apply({ kind: 'toolExecEnd', d: { id: 'm2', ok: true, exit_code: 0, changes: [] } })
+          transcript?.apply({ kind: 'toolCallBegin', d: { id: 'm3', name: 'write_file' } })
+          transcript?.apply({ kind: 'text', d: 'More words arrive while the run is still working ' })
+          await frame(60)
+          transcript?.flushNow()
+          const afterMark = run.querySelector('.blk-head > .run-working') as HTMLImageElement | null
+          if (!afterMark) verdict.push('a further tool call took the loader out of the header and did not put it back')
+          else if (afterMark !== node0)
+            verdict.push(
+              'the loader is a different element after a step landed: the mark is rebuilt, and an animated raster rebuilt from scratch starts again at frame zero — that is the reset in the report',
+            )
+          else if ((afterMark.getAttribute('src') ?? '') !== src0)
+            verdict.push('the loader was left in place but its src was rewritten mid-turn, which restarts the animation')
+          else if (transcript && transcript.workingMarksMade !== made0)
+            verdict.push(
+              `the transcript built ${transcript.workingMarksMade - made0} more loader element(s) during one turn (count ${made0} -> ${
+                transcript.workingMarksMade
+              }), so a step appended a second mark rather than keeping the one already running`,
+            )
+          const distinct = new Set(before.filter((h) => h >= 0)).size
+          if (before[0] === -1) pageLog('selftest note: the loader could not be drawn into a canvas here, so its loop was not observed')
+          else if (distinct < 2)
+            pageLog(
+              'selftest note: the loader painted the same frame into a canvas across 270ms — this engine answers drawImage() of an animated raster with a still, so seamlessness was not observed by pixels',
+            )
+          else seamless = `${distinct} distinct frame(s) across 270ms`
         }
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 96, finish: 'stop' } })
         await frame(40)
@@ -14855,7 +15075,11 @@
         if (verdict.length) fail(verdict.join('; '))
         else
           pageLog(
-            'working loader ok (painted at its declared box in the run header, static rather than pinned, one line row, inside the card, and gone when the turn landed)',
+            `working loader ok (painted at its declared box, hung ${markClear}px clear of the block's rule and inside the
+            card, on the header row's centre, the header spanning its
+            block, one line row, the same element through the next step${seamless ? `, ${seamless}` : ''}, and gone
+            when the turn landed; the narrow-width offsets are graded as shipped rules rather than measured, because
+            this suite cannot resize its own window)`,
           )
       }
 
@@ -14980,9 +15204,14 @@
       // whole composer strip sideways under the reader's cursor mid-turn; and a mark that replaces
       // the control's own affordance leaves a person hunting for the thing that ends a turn. So the
       // claims are the button's box before the turn and during it (identical), the mark inside that
-      // box, the stop square still painted on top of it, and the control still labelled as the way
-      // out. It is asserted while the turn is in flight: after it settles the store catches up and
-      // the whole question is invisible again.
+      // box, and the control still labelled as the way out. Then the rule the next report added:
+      // "while the loading animation happens, we only show the loading animation by default, then we
+      // show the stop icon when hovered" — the button had been drawing the square *and* the mark, two
+      // messages stacked in the same 14px. So at rest mid-turn the mark is lit and the square is not,
+      // and the shipped rules have to bring the square back on hover *and* on keyboard focus, which a
+      // pixel sample cannot show: a selftest has no pointer to put on a button. It is asserted while
+      // the turn is in flight: after it settles the store catches up and the whole question is
+      // invisible again.
       if (want('send-loader', 'the send button carries the working loader without changing size')) {
         const btn0 = document.querySelector('.cbtn.go') as HTMLElement | null
         if (!btn0) fail('the composer has no send/stop control to carry a status')
@@ -15011,6 +15240,8 @@
             inBtn: boolean
             bg: string
             filt: string
+            workOp: number
+            stopOp: number
             img: HTMLImageElement
             ratio?: number
           }
@@ -15039,7 +15270,9 @@
               const ir = img.getBoundingClientRect()
               const br = btn.getBoundingClientRect()
               const row = btn.parentElement?.getBoundingClientRect()
-              const sq = btn.querySelector('svg rect')
+              const sq = btn.querySelector('.go-stop')
+              // The class, not `svg rect`: that shape is also what the send arrow leaves behind once
+              // the turn ends, so it would answer for a glyph that is not the stop square.
               shot = {
                 w: ir.width,
                 h: ir.height,
@@ -15047,7 +15280,12 @@
                 bh: br.height,
                 rowL: row?.left ?? NaN,
                 rowW: row?.width ?? NaN,
-                stop: !!sq && getComputedStyle(sq).display !== 'none',
+                // Opacity, not display: the square is hidden by a declaration, and a hidden glyph that
+                // is still in the page is the shape that can be revealed on hover. `display: none`
+                // would mean the reveal needs a class change mid-turn — slower, and a different claim.
+                stop: !!sq && getComputedStyle(sq as Element).display !== 'none',
+                workOp: Number(getComputedStyle(img).opacity),
+                stopOp: sq ? Number(getComputedStyle(sq as Element).opacity) : Number.NaN,
                 label: btn.getAttribute('aria-label') ?? '',
                 title: btn.getAttribute('title') ?? '',
                 disabled: btn.hasAttribute('disabled'),
@@ -15112,9 +15350,64 @@
                   s.rowL,
                 )} w${Math.round(s.rowW)})`,
               )
-            // The affordance survives the status: this control is also how a person ends a turn, and
-            // the loop detector's own note tells them to use it.
-            if (!s.stop) verdict.push('the stop square is gone while a turn runs, so the control that ends a turn no longer says which one it is')
+            // One message at a time: "while the loading animation happens, we only show the loading
+            // animation by default, then we show the stop icon when hovered". The screenshot had the
+            // square inside the ring, under the orbit.
+            if (!(s.workOp > 0.5))
+              verdict.push(`the working mark is at opacity ${s.workOp} while a turn runs, so the button says nothing about the turn`)
+            if (!s.stop)
+              verdict.push(
+                'the button has no stop glyph in the page at all while a turn runs — a hidden one is there to be revealed, an absent one cannot be',
+              )
+            if (Number.isFinite(s.stopOp) && s.stopOp > 0.05)
+              verdict.push(
+                `the stop square is painted at opacity ${s.stopOp} under the working mark, so the control carries two messages stacked in one 14px glyph`,
+              )
+            // The reveal is a hover state, and nothing in this suite can put a pointer on a button, so
+            // the shipped rules are read instead. Both halves matter: `:hover` alone would satisfy the
+            // pixel claim above and leave a keyboard user with a control that never shows its way out,
+            // and revealing the square without dimming the mark would stack them again for the person
+            // who is hovering. `stopSampling` has ended by here, so this reads the stylesheet the page
+            // is running, not a copy.
+            const reveal: { sel: string; op: string }[] = []
+            const walkReveal = (rules: CSSRuleList, depth: number) => {
+              for (const rule of Array.from(rules)) {
+                const r = rule as CSSStyleRule & CSSMediaRule
+                if (r instanceof CSSStyleRule) {
+                  const sel = (r.selectorText ?? '').trim()
+                  if (sel.includes('.cbtn.go') && (sel.includes('.go-stop') || sel.includes('.go-work'))) {
+                    // Only rules that say something about opacity. The reduced-motion rule that turns
+                    // the fade off declares `transition: none` and no opacity, and an absent property
+                    // reads as '' — which `Number('') === 0` would grade as "declared hidden".
+                    const op = r.style?.getPropertyValue('opacity') ?? ''
+                    if (op) reveal.push({ sel, op })
+                  }
+                }
+                const inner = (r as CSSMediaRule).cssRules
+                if (inner && inner.length && depth < 5) walkReveal(inner, depth + 1)
+              }
+            }
+            for (const sheet of Array.from(document.styleSheets)) {
+              let rules: CSSRuleList | undefined
+              try {
+                rules = (sheet as CSSStyleSheet).cssRules
+              } catch {
+                continue // a sheet this page cannot read must not end the run
+              }
+              walkReveal(rules, 0)
+            }
+            const has = (selTest: (s: string) => boolean, opTest: (v: string) => boolean) =>
+              reveal.some((r) => selTest(r.sel) && opTest(r.op))
+            if (reveal.length === 0)
+              verdict.push('the stylesheet declares nothing about the send button\'s two glyphs — the hover rule the report asked for is not in what shipped')
+            if (!has((sel) => sel.includes('.go-stop') && !sel.includes(':hover') && !sel.includes(':focus'), (v) => Number(v) === 0))
+              verdict.push('nothing declares the stop glyph hidden at rest — that is the rule that un-stacks it from the working mark')
+            for (const how of [':hover', ':focus-visible']) {
+              if (!has((sel) => sel.includes(how) && sel.includes('.go-stop') && sel.includes('[data-busy]'), (v) => Number(v) > 0.5))
+                verdict.push(`nothing brings the stop glyph back on ${how}, so the control that ends a turn shows its way out to nobody`)
+              if (!has((sel) => sel.includes(how) && sel.includes('.go-work') && sel.includes('[data-busy]'), (v) => Number(v) === 0))
+                verdict.push(`${how} reveals the stop square without taking the working mark away — the stacking the report objected to, back again for whoever hovers`)
+            }
             if (!/stop/i.test(s.label) || !/stop/i.test(s.title))
               verdict.push(`while a turn runs the control is labelled ${JSON.stringify(s.label)} / ${JSON.stringify(s.title)}`)
             if (s.disabled) verdict.push('the control is disabled while a turn runs, so nothing can end it')
@@ -15179,7 +15472,10 @@
             )
           else
             pageLog(
-              `send loader ok (${Math.round(idle.width)}x${Math.round(idle.height)} button unchanged through the turn, 20px mark inside it over ${framesSeen} painted frame(s), stop square still painted, labelled Stop while busy and Send once settled)`,
+              `send loader ok (${Math.round(idle.width)}x${Math.round(idle.height)} button unchanged through the turn, 20px mark inside it at opacity ${
+                s?.workOp ?? '?'
+              } over ${framesSeen} painted frame(s), stop glyph held at opacity ${s?.stopOp ??
+                '?'} until hover or keyboard focus, labelled Stop while busy and Send once settled)`,
             )
         }
       }
@@ -17994,11 +18290,13 @@
                   aria-label={busy ? 'Stop' : 'Send'}
                 >
                   {#if busy}
-                    <!-- The turn's status lives on the control that starts turns, as well as in the
-                         run header. It is 20px inside a 32px button and absolutely placed, so the
-                         composer's row cannot reflow mid-turn; and the stop square stays on top of
-                         it, in the glyph colour, because the control still ends the turn — the dots
-                         go round the square rather than replacing it. -->
+                    <!-- One message on the control at a time: the working mark while the turn runs,
+                       and the stop square when the pointer is on the button or the keyboard is
+                       focused on it. Both were drawn at once before, which stacked "this is working"
+                       on top of "press to end it" in 14px of space. Both are absolutely placed in the
+                       button's own box, so neither can reflow the composer's row mid-turn, and the
+                       button's own label says Stop the whole time, so the square is a picture rather
+                       than the only name. -->
                     <img class="go-work" src={workingArt} alt="" aria-hidden="true" draggable="false" />
                     <svg class="go-stop" width="14" height="14" viewBox="0 0 14 14"><rect x="4" y="4" width="6" height="6" rx="1.4" fill="currentColor"/></svg>
                   {:else}
@@ -18011,8 +18309,11 @@
           </div>
 
           {#if webNote}
-            <!-- Under the composer, next to the chip it explains: a sentence about a switch that
-                 vanishes from the corner of the screen is a sentence nobody re-reads. -->
+            <!-- Only a refusal comes here. A switch that worked is a chip that changed, and the
+                 sentence under the composer explaining it was a third copy of that fact — on the
+                 chip, in its tooltip, and in a line nobody re-reads. A thing that did not happen is
+                 the one case that needs words, because nothing else on the screen says the press was
+                 refused. -->
             <div class="ctl-note" data-web-note>{webNote}</div>
           {/if}
 

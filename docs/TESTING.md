@@ -770,6 +770,9 @@ and fixed unread conversations. Each one is written against the thing the report
   mark measure `0x56`), must keep their own opacity and layer promotion against `.turn > *`'s entrance
   animation, and must be gone once the turn lands. If layout was measured but no frames were delivered,
   the group says it measured geometry only — a timer can prove a box; only paints prove a screen.
+> **Superseded by the gutter (batch ten).** The header mark is no longer in the sentence and the loose
+> one is no longer on the prose column: both hang in the gutter to the left of the block, and the
+> claims below this one grade the band they now live in.
 - **`mark-art` checks the bytes that ship, not the artwork on disk.** The CSS box the loader actually
   resolves to, the loop's frame count and lap read out of the shipped table, the canvas against that box
   at this window's DPR, and whether the reduced-motion still decodes in this engine. That last claim
@@ -779,3 +782,29 @@ and fixed unread conversations. Each one is written against the thing the report
   `requestAnimationFrame` paints and sample on a timer. Geometry without paints is a named note, not a
   pass; a single sample after `frame(150)` is not evidence about a 130ms fade, which is why `reveal` runs
   its own frame sampler and grades the peak number of mid-fade words rather than one reading.
+
+- **`mark-visible` grades the gutter, not just the box.** The loader hangs left of its block's rule, so
+  the geometry claims are about a band with two edges: the card's own edge clips anything hung too far
+  out, and the block's rule stops it from reading as a glyph in the heading. Both are measured, because
+  the first version of the offset put the mark outside the card and passed a claim that only asked
+  "is it left of the text". Two more claims grade what a screenshot cannot: the header row has to span
+  its own block (it used to inherit a block *label's* 58px column, which clipped the sentence), and the
+  mark must still be the same element after a step lands — a mark removed and rebuilt looks identical
+  to one that kept running, and a rebuilt raster restarts at frame zero. The narrow-width offsets are
+  graded as shipped rules rather than measured, and the receipt says so: a selftest cannot resize the
+  window it is running in.
+- **The loose loader's ordering is graded by the append that adds a node.** Streamed prose continues the
+  block already open — spans and box kept — so appending text adds nothing and proves nothing about
+  order. Files are the mid-turn append that does create nodes, so the check delivers one and requires
+  the mark to be the same element, still below the writing, and still nothing after it: a file strip
+  beneath the mark is a hand-over line sitting under a spinner.
+- **A hover state is graded twice, and the two halves are named.** Nothing in this suite can put a
+  pointer on a button. The runtime half measures the rest state mid-turn (working mark lit, stop glyph
+  at opacity 0, button still 32x32 and still labelled Stop); the reveal half reads the shipped rules for
+  a rest rule that hides the glyph and a rule per reveal (`:hover`, `:focus-visible`) that brings it back
+  *and* takes the mark away. A `:hover`-only reveal would satisfy the pixels and leave a keyboard user
+  with no affordance, and revealing without dimming restacks the two glyphs for whoever hovers.
+- **A claim that a line is gone is a claim about text.** The chat check rejects both the folder control
+  and either sentence anywhere in the pane, because a copy of "Chat has no folder" under a new class name
+  passes a selector check — and the opening screen keeps a second composer that a selector scoped to one
+  of them would miss.

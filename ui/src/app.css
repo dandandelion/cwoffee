@@ -989,6 +989,41 @@ body {
 [data-theme='dark'] .cbtn.go .go-work {
   filter: brightness(0.45);
 }
+/* One thing on the control at a time. The stop square and the working mark are the same size in the
+   same box, and drawing both was two messages stacked: "this is working" and "press to end it", in
+   the same 14px of space. The rule asked for one: while a turn runs the button shows the working
+   mark, and the stop square appears when the pointer is on the button — which is when it is wanted,
+   because a person who is not hovering is not about to press it.
+
+   `:focus-visible` is the other half, and it is not optional: a keyboard user who tabs to the button
+   is exactly the person who needs to see what the button does, and a hover-only affordance is
+   invisible to them. The button's `aria-label` says Stop either way, and its tooltip says it on
+   hover, so the control is never *unlabelled* at rest — the square is the picture, not the name.
+
+   Both are absolutely placed in the button's own 32x32 box, so swapping them cannot reflow the
+   composer's row mid-turn; `pointer-events: none` keeps the button the target. */
+.cbtn.go .go-stop {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--d1) var(--ease-out);
+}
+.cbtn.go[data-busy]:hover:not(:disabled) .go-stop,
+.cbtn.go[data-busy]:focus-visible .go-stop {
+  opacity: 1;
+}
+.cbtn.go[data-busy]:hover:not(:disabled) .go-work,
+.cbtn.go[data-busy]:focus-visible .go-work {
+  opacity: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* The swap stays, the fade goes: a status that changes without easing is still a status. */
+  .cbtn.go .go-stop {
+    transition: none;
+  }
+}
 .cbtn.go:disabled { opacity: 0.3; cursor: not-allowed; }
 .cbtn.go.warn { background: var(--color-warn); }
 /* A button waiting on an approval must still look like it is waiting when the
@@ -4940,7 +4975,21 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   border-left: 2px solid var(--color-shell);
 }
 .blk-run > .blk-head {
-  position: static;
+  /* `relative`, because the working mark hangs in the gutter to this row's left and has to be
+   * measured from the row rather than from the scroller. It is not `static` any more and it is not
+   * `absolute` either — the generic `.blk > .blk-head` rule above puts *labels* in the gutter, and
+   * this row is a header that folds the group, not a label. */
+  position: relative;
+  /* Three resets, and the reason is worth keeping: `.blk > .blk-head` above exists to put a block's
+   * *label* — "THINKING", "TOOLS" — in the 58px column at the left of the prose, and it is written
+   * with `position: absolute; left: -66px; top: 2px; width: 58px`. The run header overrides the
+   * position and the display but not the geometry, so it kept a label's 58px box (and, once it is
+   * `relative` rather than `static`, a label's -66px shift): a sentence like "Working on your
+   * computer" clipped to 58px with an ellipsis, in a row that was never a label. The app's own
+   * geometry check now measures the header against its own block and fails if this goes back. */
+  left: auto;
+  top: auto;
+  width: auto;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -4956,30 +5005,54 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 .blk-run > .blk-head.open::after {
   content: '\25BE';
 }
-/* The loader that says this run is still working, inline in the header's sentence.
+/* The loader that says this run is still working, hung in the gutter to the left of the block.
 
-   Sized to the line it sits on rather than to the gutter it used to hang in: 20px against a 12.5px
-   sentence, which is about the size of a glyph with room to move, and the artwork's own ink is 86 of
-   its 199 units across, so the orbit reads as a small cluster of dots rather than as a picture. The
-   shipped file is 40 units — the CSS box at this display's DPR 2 (`scripts/mark-resize.py`).
+   Two asks, one declaration each: "move it to the left of the border (gutter, still inline with the
+   block, so it is more noticeable)", and "the loop resets when something gets appended".
 
-   It is the first child of the header row, which is a flex row with `align-items: center`, so it
-   takes the line's vertical centre and the sentence starts after it; nothing here needs a reserved
-   column, a clip box, or a sticky rule, because the mark is in the text flow and travels with it.
+   Out of the sentence and into the gutter, because in the sentence it competed with the words: the
+   header says `Working on your computer` and counts steps, and a picture riding inside that line is
+   the third copy of the same sentence. Left of the block's own rule it reads as a state of the block
+   rather than as a glyph in the heading, and it is legible at 20px there, where nothing else is.
+
+   `absolute` rather than a flex item is what makes the loop keep running. As a flex item its box was
+   re-laid-out every time the header's text changed — a step count appearing, a word count ticking —
+   and an animated raster whose box is rebuilt restarts from its first frame. Anchored at a fixed
+   offset with a fixed size, nothing about it changes while the turn streams: the same element, the
+   same box, the same frame clock. `translate` centres it on the row and `transform` carries the layer
+   promotion, so the two do not fight over one property — the mistake that erased a centred settings
+   dialog's position.
+
+   The 20px box is the size the ask asked for, and the artwork's own ink is 86 of its 199 units
+   across, so it reads as a small cluster of dots rather than as a picture. The shipped file is 40
+   units — the CSS box at this display's DPR 2 (`scripts/mark-resize.py`).
 
    `max-width: none` is not decoration. The page-wide `img, video { max-width: 100% }` reset resolves
-   a percentage against the containing block, and a flex item in a row that has to fit a narrow pane
-   is exactly the case where 100% is smaller than the declared size: the app's own check found the
-   previous mark measuring 0x56 for this reason (height, which has no percentage in it, came through
-   untouched). Lifting the reset for this element is the whole fix, and the check fails if it goes.
+   a percentage against the containing block, and this element's containing block is a header row that
+   has to fit a narrow pane: the app's own check found the previous mark measuring 0x56 for this
+   reason (height, which has no percentage in it, came through untouched). Lifting the reset here is
+   the whole fix, and the check fails if it goes.
 
-   Layer promotion, deliberately, and measured: with a mark this size the cost is small either way,
-   but the mark painted at 56px cost a long transcript its frame budget — 30.0ms and 37.0ms per frame
-   against 21.0ms hidden on the 168-block history — so the rule stays for the smaller mark and the
-   claim that grades it stays too. `will-change` belongs on something known to animate: this element
-   exists only while a run is running (`runWorking` makes it, `dropWorking` removes it). */
+   Layer promotion, deliberately, and measured: the mark painted at 56px cost a long transcript its
+   frame budget — 30.0ms and 37.0ms per frame against 21.0ms hidden on the 168-block history — so the
+   promotion stays for the smaller mark and the claim that grades it stays too. `will-change` belongs
+   on something known to animate: this element exists only while a run is running (`runWorking` makes
+   it, `dropWorking` removes it). */
 .blk-run > .blk-head > .run-working {
-  flex: 0 0 auto;
+  position: absolute;
+  /* Measured from this row's padding box, which starts 14px inside the block (2px rule + 12px of
+     padding). The scroller reserves 80px at the left of the prose and the card clips at its own
+     edge, so this puts the picture's right edge 26px clear of the block's rule and 40px inside the
+     card — mid-gutter, which is the same band the block labels live in, and the claim in
+     `mark-visible` fails if either end of that range is crossed. */
+  left: -60px;
+  /* Centred on the row with `top` plus a negative `margin-top`, not with the `translate` property:
+   * this WebKit answers `translate: 0 -50%` by ignoring it, and the mark then hung half its own
+   * height below the row's centre — which is the "9px off the middle of the sentence's line" the
+   * geometry check reports. A negative margin on an absolutely placed box is the oldest way to do
+   * this and it composes with the `transform` below instead of competing with it. */
+  top: 50%;
+  margin-top: -10px;
   width: 20px;
   height: 20px;
   max-width: none;
@@ -5011,12 +5084,41 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   width: 20px;
   height: 20px;
   max-width: none;
+  /* The same gutter as the header mark: this turn's block has no rule to stand left of, so the
+     negative margin is what puts it in the same 80px band. Blocks are appended *before* this mark
+     (`appendToTurn`), which is how it stays last without being moved — and a moved `<img>` restarts
+     its animation, which is the reset this batch is about. */
+  margin-left: -40px;
   opacity: 0.95;
   will-change: transform;
   transform: translateZ(0);
   pointer-events: none;
   -webkit-user-drag: none;
   user-select: none;
+}
+/* Narrow widths have 24px of gutter, not 80 — the same fact that sends block labels back above
+   their blocks at this breakpoint. A mark hung 54px out would be clipped by the scroll box, and a
+   half-clipped spinner is worse than one that sits a little closer to the text. */
+@media (max-width: 860px) {
+  /* Narrow widths reserve a fraction of the 80px gutter, and the clip is the scroll box's own edge,
+     so both the box and the offset come in. Half the mark's own width off each end is what keeps it
+     between the card's edge and the block's rule rather than past one of them. */
+  .blk-run > .blk-head > .run-working {
+    /* The narrow gutter is a quarter of the wide one, so the box shrinks and the offset comes in to
+       keep both ends of the band clear: the card's own edge on the left, the block's rule on the
+       right. Nothing in this suite runs at a narrow width, so this is arithmetic on the gutter the
+       stylesheet declares (about 24px inside the card, plus the block's own 14px), not a measurement
+       — and `mark-visible` says so in its receipt rather than claiming it checked it. */
+    left: -34px;
+    width: 18px;
+    height: 18px;
+    margin-top: -9px;
+  }
+  .turn > .run-working.turn-tail {
+    margin-left: -26px;
+    width: 18px;
+    height: 18px;
+  }
 }
 .run-count {
   font-weight: 450;

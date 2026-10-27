@@ -737,6 +737,7 @@ export class Transcript {
     // there is nothing to drive here: no hold, no timer, no `LoopHold`. Reduced motion gets the
     // first frame as a still.
     img.setAttribute('src', prefersStill() ? WORKING_ART.still : WORKING_ART.loop)
+    this.workingMade++
     head.insertBefore(img, head.firstChild)
     // A turn carries one loader. If this turn began as a plain answer, the loader was parked at the
     // end of the writing (see `syncWorking`); the first tool call or thought gives it a proper head
@@ -769,10 +770,15 @@ export class Transcript {
     img.alt = ''
     img.setAttribute('aria-hidden', 'true')
     img.setAttribute('src', prefersStill() ? WORKING_ART.still : WORKING_ART.loop)
+    this.workingMade++
     // Ahead of the turn's own exits, so a file row or an action row is never pushed down by a mark
     // that is about to disappear.
     const exit = Array.from(turn.children).find(
-      (n) => n.classList.contains('attachline') || n.classList.contains('fileturn') || n.classList.contains('turn-acts'),
+      (n) =>
+        n.classList.contains('filestrip') ||
+        n.classList.contains('attachline') ||
+        n.classList.contains('fileturn') ||
+        n.classList.contains('turn-acts'),
     )
     if (exit) turn.insertBefore(img, exit)
     else turn.append(img)
@@ -805,8 +811,27 @@ export class Transcript {
    * chip land in the middle of an answer — the write event arrives before the next paragraph does,
    * so the paragraph ended up below the box for the file it was talking about.
    */
+  /**
+   * The loose loader this turn is holding, if it has one.
+   *
+   * Its existence is the reason appends are insertions. `syncWorking` parks the mark after the last
+   * thing the turn wrote, and if every later block were `appendChild`ed the mark would end up above
+   * the prose it is supposed to sit under — so the obvious repair is to move the mark down, and
+   * moving an `<img>` in the DOM restarts its raster animation from frame zero. That is the reported
+   * "the loading animation resets when something gets appended". So nothing moves: new blocks go in
+   * *before* the mark, which keeps the mark last and the mark's own render tree untouched.
+   */
+  private workingSlot(): HTMLElement | null {
+    const turn = this.turn
+    if (!turn) return null
+    return turn.querySelector(':scope > .run-working') as HTMLElement | null
+  }
+
   private appendToTurn(node: HTMLElement) {
-    this.turn!.appendChild(node)
+    const turn = this.turn!
+    const slot = this.workingSlot()
+    if (slot) turn.insertBefore(node, slot)
+    else turn.appendChild(node)
     this.pinFilesLast()
   }
 
@@ -814,7 +839,9 @@ export class Transcript {
   private pinFilesLast() {
     const turn = this.turn
     if (!turn || !this.fileEls.length) return
-    const acts = turn.querySelector(':scope > .turn-acts') as HTMLElement | null
+    // Ahead of the loose loader as well as ahead of the action row: a mark is the last thing in the
+    // writing, and a file row is part of the writing rather than a sign after it.
+    const acts = this.workingSlot() ?? (turn.querySelector(':scope > .turn-acts') as HTMLElement | null)
     for (const el of this.fileEls) turn.insertBefore(el, acts)
   }
 
@@ -828,6 +855,21 @@ export class Transcript {
   // than 24px from the end) that existed only because the drawing would otherwise sit on other
   // people's paragraphs. The opening screen keeps its own, larger cup: there it is the artwork on
   // an empty page, which is the one place it was never competing with anything.
+
+  /**
+   * How many loader elements this transcript has built, since it was built.
+   *
+   * A claim about a *seamless* loop cannot be made from the DOM: the mark can be present, painted,
+   * and restarting every step, because a mark that is removed and rebuilt looks identical to a mark
+   * that kept running. So creation is counted here, and `mark-visible` reads the count across a
+   * streaming turn: if it climbs while the header still says `running`, the loop is being rebuilt
+   * under the reader and the seamlessness the batch asked for is not there.
+   */
+  get workingMarksMade(): number {
+    return this.workingMade
+  }
+
+  private workingMade = 0
 
   private ensureTurn() {
     if (this.turn) return
@@ -3258,7 +3300,10 @@ export class Transcript {
     // Before the action row if there is one, at the end of the turn if there is not: the copy /
     // share / branch line belongs to the turn and sits last, and the files it produced sit right
     // above it. Anything said afterwards gets pinned back over them (see `appendToTurn`).
-    for (const el of this.fileEls) this.turn!.insertBefore(el, this.turn!.querySelector(':scope > .turn-acts'))
+    // Ahead of the working mark as well as ahead of the action row: the mark is the tail of the
+    // writing, and a file strip dropped under it would be a hand-over line sitting beneath a spinner
+    // (`pinFilesLast` holds the same line for later appends).
+    for (const el of this.fileEls) this.turn!.insertBefore(el, this.workingSlot() ?? this.turn!.querySelector(':scope > .turn-acts'))
     this.closeRunGroup(true)
     this.scrollIfNeeded('text')
   }
