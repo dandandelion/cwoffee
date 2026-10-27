@@ -832,6 +832,10 @@ const AUDITED: &[&str] = &[
     "clear_session",
     "rename_session",
     "edit_message",
+    // Branching writes a conversation and moves this host onto it, so it is a drive verb like the
+    // pencil next to it is: a phone reading a conversation must not be able to start a second one
+    // from it.
+    "branch_conversation",
     "set_session_persona",
     "delete_session",
     "set_model",
@@ -1171,6 +1175,23 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
         // in `cwoffee_engine::edit::apply_and_send` — the check, the cut of the record, taking the
         // host's memory back and the re-send, in that order, because a host that re-sent before it
         // rewound would answer out of the conversation the person has already cut down.
+        "branch_conversation" => {
+            need_drive(role)?;
+            let req = cwoffee_engine::BranchReq {
+                session: arg_i64(&args, "session")?,
+                message_id: args.get("message_id").and_then(|v| v.as_i64()),
+                from_end: args.get("from_end").and_then(|v| v.as_u64()).map(|n| n as usize),
+                role: args.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string(),
+                shown: arg_str(&args, "shown")?,
+            };
+            // The same function the desktop command calls, so the busy rule, the "which message did
+            // you mean" proof and the note are one text. A phone that could branch a conversation
+            // the desktop refuses would be two answers to one question.
+            let out = cwoffee_engine::branch::apply_and_open(h.store.as_ref(), h.host.as_ref(), &req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
         "edit_message" => {
             need_drive(role)?;
             let req = cwoffee_engine::EditReq {
@@ -3200,6 +3221,79 @@ mod tests {
             .expect("the probe itself is well formed even when the search fails");
         assert!(out["error"].is_string(), "expected an error sentence, got {out}");
         assert!(out["results"].as_array().map(|a| a.is_empty()).unwrap_or(false), "{out}");
+        let _ = std::fs::remove_file(&h.config_path);
+    }
+
+    /// Branching is a drive verb, and a phone that is allowed to do it gets the same answer the
+    /// desktop gets: a new conversation id it can open, the same note, and the source left whole.
+    /// A watch token cannot start a second conversation out of one it can only read.
+    #[tokio::test]
+    async fn a_phone_can_branch_a_conversation_and_gets_the_new_row_back() {
+        let h = test_handle();
+        let id = match run_cmd("new_session", serde_json::json!({ "title": "branch me" }), Role::Drive, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("new_session returned {other:?}"),
+        };
+        for text in ["first ask", "second ask"] {
+            h.store.append_message(id, &cwoffee_engine::provider::Message::user(text)).unwrap();
+            h.store.append_message(id, &cwoffee_engine::provider::Message::assistant("an answer")).unwrap();
+        }
+
+        let err = run_cmd(
+            "branch_conversation",
+            serde_json::json!({ "session": id, "message_id": null, "from_end": 2, "role": "user", "shown": "first ask" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watcher must not create conversations");
+        assert!(err.contains("watch"), "unhelpful: {err}");
+
+        // The phone's own view has drifted: it still shows the words it painted, and the row now
+        // says something else. The refusal has to be an error, not a payload — this verb used to
+        // serialise `Result`, which answered a refusal with `{"Err": …}` and let a client say
+        // "branched" about a conversation that was never created.
+        let drift = h.store.messages(id).unwrap()[0].id;
+        h.store.edit_message(drift, "someone else's ask").unwrap();
+        let err = run_cmd(
+            "branch_conversation",
+            serde_json::json!({ "session": id, "message_id": drift, "shown": "first ask" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("a drifted window must not get its branch applied to a row it never saw");
+        assert!(err.contains("says something else now"), "{err}");
+        h.store.edit_message(drift, "first ask").unwrap();
+
+        let rows = h.store.messages(id).unwrap();
+        let out = match run_cmd(
+            "branch_conversation",
+            serde_json::json!({ "session": id, "message_id": rows[1].id, "role": "assistant", "shown": "an answer" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap()
+        {
+            serde_json::Value::Object(o) => o,
+            other => panic!("branch returned {other:?}"),
+        };
+        let new_id = out.get("session").and_then(|v| v.as_i64()).expect("the new row's id");
+        assert_eq!(out.get("copied").and_then(|v| v.as_i64()), Some(2), "the copied stretch: {out:?}");
+        let note = out.get("note").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(note.contains("branch"), "the note has to say what it made: {note}");
+        assert!(note.contains(&new_id.to_string()), "and name the conversation it made: {note}");
+        assert_eq!(h.store.messages(id).unwrap().len(), 4, "the source conversation is untouched");
+        assert_eq!(h.store.messages(new_id).unwrap().len(), 2);
+        // The branch is a conversation the person can open, so it is listed.
+        assert!(
+            h.store.list_sessions(50).unwrap().iter().any(|r| r.id == new_id),
+            "the sidebar never learns about the branch"
+        );
         let _ = std::fs::remove_file(&h.config_path);
     }
 

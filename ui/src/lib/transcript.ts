@@ -220,6 +220,27 @@ export interface AttachmentView {
  * resolved, which is what stops a window that has drifted from rewriting a message nobody was
  * looking at.
  */
+/**
+ * A ask to open a second path out of one message.
+ *
+ * `shown` is the words this window painted, and it has to travel with the request. The host reads
+ * the row again before it copies anything, and if the row says something else — because another
+ * window, another device or the harness wrote to the same conversation in between — it refuses and
+ * creates nothing. Without that check a stale tab would branch a message nobody ever showed.
+ */
+export interface MessageBranch {
+  session: number
+  /** The stored row's id, or `null` when this turn has not been persisted yet. */
+  id: number | null
+  /**
+   * Which kind of row `shown` is. It decides where the branch is cut: from your message the branch
+   * carries what came *before* it and hands the ask back to you; from an answer it carries that
+   * answer too and starts from there.
+   */
+  role: 'user' | 'assistant'
+  shown: string
+}
+
 export interface MessageEdit {
   id: number | null
   fromEnd: number
@@ -519,6 +540,8 @@ export class Transcript {
    * holds what was *recorded*, and only the host can cut a conversation in half and re-send it.
    */
   onMessageEdit: ((edit: MessageEdit) => Promise<string>) | null = null
+  /** Opens a second path out of one message and returns the sentence the host answered with. */
+  onMessageBranch: ((branch: MessageBranch) => Promise<string>) | null = null
   /**
    * The reader pressed an attachment chip in their own message.
    *
@@ -2466,7 +2489,63 @@ export class Transcript {
     const edit = btn('edit', 'Edit', 'Change what you sent', iconPencil())
     edit.onclick = () => this.openUserEditor(wrap, body, text, id)
 
+    // Branch sits next to Edit because the two are the two things you can do with a message you
+    // already sent, and they are opposite: Edit moves the conversation back over that message,
+    // Branch leaves it exactly where it is and opens a second path beside it.
+    const branch = btn(
+      'branch',
+      'Branch',
+      id === null
+        ? 'Branch from here once this message is stored - a moment after the turn ends'
+        : 'Branch from here: a new conversation carries everything before this message, and these words come back for you to send again. This conversation stays as it is.',
+      iconBranch(),
+    )
+    if (id === null) branch.disabled = true
+    branch.onclick = () => this.requestBranch(this.sessionId, id, 'user', text, branch)
+
     wrap.append(row)
+  }
+
+  /**
+   * Ask the host for a second path out of one message, and say what came back.
+   *
+   * A branch makes a conversation, so this is not a control that can be re-pressed while it is
+   * working: the button goes inert for the length of the ask. The host's own sentence is the toast,
+   * because it is the one text that names both conversations — the one it copied from and the one
+   * it made — and the client's guess at that would be a second, drift-prone copy of the same fact.
+   */
+  private requestBranch(
+    session: number,
+    id: number | null,
+    role: 'user' | 'assistant',
+    shown: string,
+    button: HTMLElement,
+  ) {
+    if (!this.onMessageBranch) {
+      this.onToast?.('branching is not available on this connection', true)
+      return
+    }
+    if (id === null) {
+      // Honest, and it is a moment away from true: the row exists once the turn is stored, and the
+      // view picks it up on the reload that follows. A button that silently branched *something*
+      // would be worse than one that says which row it is waiting for.
+      this.onToast?.('this message is not stored yet - branch it once the turn has landed', true)
+      return
+    }
+    if (button.dataset.busy) return
+    button.dataset.busy = '1'
+    void Promise.resolve(
+      this.onMessageBranch({ session, id, role, shown }),
+    )
+      .then((msg) => {
+        if (msg && this.onToast) this.onToast(msg)
+      })
+      .catch((e) => {
+        this.onToast?.(`branch failed: ${e}`, true)
+      })
+      .finally(() => {
+        delete button.dataset.busy
+      })
   }
 
   /**
@@ -3514,11 +3593,15 @@ export class Transcript {
 
   /**
    * The line under a finished turn: copy what it said, export the conversation as
-   * a Markdown document, and a branch button that is honest about not existing
-   * yet. A disabled control that says why is better than an absent feature the
-   * user has to guess at, and better than a live button that does nothing.
+   * a Markdown document, and branch from the answer.
+   *
+   * `rowId` is the answer's stored row. Branch names the row it means, so a turn that has not been
+   * persisted yet — a live turn, whose text the client streamed rather than read from the record —
+   * has a branch button that says what it is waiting for rather than one that branches a guess.
+   * A disabled control that says why is better than an absent feature the user has to guess at,
+   * and better than a live button that does nothing.
    */
-  private turnActionsRow(answerText: string, session: number): HTMLElement {
+  private turnActionsRow(answerText: string, rowId: number | null): HTMLElement {
     const row = this.el('turn-acts')
 
     const btn = (cls: string, label: string, title: string, icon: SVGElement) => {
@@ -3557,7 +3640,10 @@ export class Transcript {
         return
       }
       share.disabled = true
-      void this.onShare(session)
+      // Read at click time: a repaint of another conversation replaces these buttons, but a row
+      // built while the transcript was showing one conversation can outlive that repaint, and an
+      // export of the wrong conversation is worse than an export that never happened.
+      void this.onShare(this.sessionId)
         // A toast is the receipt, not a chip: the conversation does not gain a
         // file because someone exported it.
         .then((msg) => {
@@ -3571,8 +3657,16 @@ export class Transcript {
         })
     }
 
-    const branch = btn('branch', 'Branch', 'Branch this conversation - not built yet', iconBranch())
-    branch.disabled = true
+    const branch = btn(
+      'branch',
+      'Branch',
+      rowId === null
+        ? 'Branch from this answer once it is stored - a moment after the turn ends'
+        : 'Branch from this answer: a new conversation carries everything up to and including it, and starts from there. This conversation stays as it is.',
+      iconBranch(),
+    )
+    if (rowId === null) branch.disabled = true
+    branch.onclick = () => this.requestBranch(this.sessionId, rowId, 'assistant', answerText, branch)
     return row
   }
 
@@ -3582,7 +3676,10 @@ export class Transcript {
     this.turn.querySelector('.turn-acts')?.remove()
     const text = this.turnAnswer.join('')
     if (!text.trim() && !this.turnFiles.length) return
-    this.turn.appendChild(this.turnActionsRow(text, this.sessionId))
+    // A live turn has no stored row to name: the text on screen is what the client streamed, and
+    // the row it becomes is written when the turn lands. The reload after the turn gives the same
+    // answer this row has always had.
+    this.turn.appendChild(this.turnActionsRow(text, null))
     // The row lands after the last paint, so a reader who was being followed
     // ends up 30-odd pixels short of the bottom exactly when the turn closes.
     this.follow('text')
@@ -3868,7 +3965,9 @@ export class Transcript {
     // same affordance a live turn puts under its final answer - emitted per assistant
     // row, it stamped `Copy | Share as markdown | Branch` under every intermediate
     // message and the transcript read as a stack of separate turns.
-    let lastAnswer: { body: HTMLElement; text: string } | null = null
+    // `id` rides along for the same reason the pencil needs it: branching names the row, and the
+    // only row this window can name is one it read out of the record.
+    let lastAnswer: { body: HTMLElement; text: string; id: number | null } | null = null
     const flushAnswerActs = () => {
       // Files first, actions last: the files are what the turn produced and the copy / share /
       // branch line is what a reader does with a finished turn, so that line stays the last thing
@@ -3877,7 +3976,7 @@ export class Transcript {
       for (const el of this.fileRow(histFiles)) frag.appendChild(el)
       histFiles = []
       if (!lastAnswer) return
-      const acts = this.turnActionsRow(lastAnswer.text, this.sessionId)
+      const acts = this.turnActionsRow(lastAnswer.text, lastAnswer.id)
       acts.classList.add('from-history')
       // Appended at the end of what this turn has produced so far, which is where a
       // live turn puts them: under the turn, after any run that followed its last
@@ -3990,7 +4089,7 @@ export class Transcript {
           // export from the DOM should hand back what the model wrote, not the
           // rendering of it.
           body.dataset.md = m.content
-          lastAnswer = { body, text: m.content }
+          lastAnswer = { body, text: m.content, id: m.id ?? null }
         }
         if (m.files?.length) {
           // Held for the end of the turn. Two earlier shapes were wrong in opposite

@@ -817,6 +817,17 @@ pub enum HostCmd {
     /// JSONL file pi owns. A host that is not holding this conversation has nothing to forget and
     /// says so in the transcript.
     Rewind { session: i64 },
+    /// Make a second conversation out of part of this one, and move this host onto it.
+    ///
+    /// Queued with a reply channel because the answer is a new conversation id the caller has to
+    /// open, and only the host loop can make it: on the Rust core that means replaying the copied
+    /// rows into the prompt, on the pi core it means forking pi's session tree and mapping the fork
+    /// file onto the new row. Both cores read [`crate::branch`] for the rules and the wording, so a
+    /// phone and a desktop are refused the same way and told the same thing when it works.
+    Branch {
+        req: crate::branch::BranchReq,
+        reply: oneshot::Sender<Result<crate::branch::BranchOutcome, String>>,
+    },
     Cancel,
     Shutdown,
 }
@@ -1468,6 +1479,73 @@ impl SessionHost {
                                 });
                             }
                         }
+                    }
+
+                    HostCmd::Branch { req, reply } => {
+                        // No busy check here, and one would be dead code: `Send` runs the turn inline
+                        // in this loop, so a branch cannot be read at all until the turn has ended.
+                        // The refusal that matters is the one in `crate::branch::apply_and_open`,
+                        // which runs before the command is queued — the same gate a phone goes
+                        // through, so neither device can branch a conversation mid-answer.
+                        //
+                        // Row first, then the model. If the copy or the adoption fails there is no
+                        // half-made conversation left to find in the sidebar: the row is deleted
+                        // before the error goes back, because a row whose prompt the host could not
+                        // load is a transcript that looks branched and answers like a fresh one.
+                        let rows = match store.messages(req.session) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = reply.send(Err(format!(
+                                    "conversation {} could not be read ({e}), so nothing was branched",
+                                    req.session
+                                )));
+                                continue;
+                            }
+                        };
+                        let point = match crate::branch::resolve(&rows, &req) {
+                            Ok(p) => p,
+                            Err(reason) => {
+                                let _ = reply.send(Err(reason));
+                                continue;
+                            }
+                        };
+                        let (new_id, title, copied) = match crate::branch::create_row(&*store, req.session, &point) {
+                            Ok(v) => v,
+                            Err(reason) => {
+                                let _ = reply.send(Err(reason));
+                                continue;
+                            }
+                        };
+                        // The adoption is the branch: `adopt_view!` replays the copied rows into the
+                        // prompt, rebinds where the next turn is persisted, moves the tools to the
+                        // folder the new row names, and takes the conversation's thinking effort with
+                        // it — which is exactly what "this conversation continues from there" needs
+                        // the model to be told. Marking it announced first keeps the usual
+                        // "reopened with N messages" note off a conversation that was never reopened:
+                        // it was made, one turn ago, in this loop.
+                        resume_announced.insert(new_id);
+                        if !adopt_view!(new_id) {
+                            let _ = store.delete_session(new_id);
+                            let _ = reply.send(Err(format!(
+                                "the branch's row ({new_id}) was created but this engine could not take \
+                 it up, so it was removed: nothing was branched and conversation {} is unchanged",
+                                req.session
+                            )));
+                            continue;
+                        }
+                        let note = crate::branch::outcome_note(req.session, &point, new_id, copied, &title);
+                        // Say what happened to the model's memory as well as to the record: this
+                        // engine has no thread file, and `adopt_view!` above is what makes the
+                        // copied rows the prompt it answers from.
+                        let note = format!("{note} {}", crate::branch::memory_note("rust", None));
+                        let _ = ev_tx.send(EngineEvent::Note { session: Some(new_id), message: note.clone() });
+                        let _ = reply.send(Ok(crate::branch::BranchOutcome {
+                            session: new_id,
+                            title,
+                            copied,
+                            prefill: point.ask,
+                            note,
+                        }));
                     }
 
                     HostCmd::ClearSession => {
@@ -2176,6 +2254,24 @@ pub trait HostOps: Send + Sync {
         self.send(HostCmd::Rewind { session })
     }
 
+    /// Make a second conversation out of part of this one, and start holding it.
+    ///
+    /// Unlike [`Self::rewind`] this cannot be fire-and-forget: the caller has to be told which
+    /// conversation now exists, because that is the row it opens and the conversation the branch
+    /// note belongs in. So it waits for the host loop's own answer, and `Err` means nothing was
+    /// created — no row in the sidebar, no thread in pi's directory, the original untouched.
+    ///
+    /// The default refuses in words, for a host with no way to fork its own memory. A client that
+    /// hears that says it out loud rather than showing a conversation that only looks branched.
+    async fn branch(&self, req: &crate::branch::BranchReq) -> Result<crate::branch::BranchOutcome, String> {
+        let _ = req;
+        Err(
+            "this engine cannot branch a conversation yet: the model host has no way to fork its own \
+             memory, and a copied transcript the model has not read is not a branch"
+                .to_string(),
+        )
+    }
+
     /// Grant or take away web reach for the chat conversation this host holds. Queued like every
     /// other verb here: the tools live in the model process, and only its own loop can re-make it.
     ///
@@ -2362,6 +2458,19 @@ impl HostOps for SessionHost {
     }
     fn cancel(&self) {
         SessionHost::cancel(self)
+    }
+    /// Ask this host's own loop to make a branch and wait for the conversation it made.
+    ///
+    /// Waiting is the point: the caller has to open the new row, and a fire-and-forget verb would
+    /// leave a client watching for a conversation whose id it was never given. The loop is a task of
+    /// its own, so awaiting here does not stall it — and on a single-threaded runtime the await is
+    /// what lets the loop run at all.
+    async fn branch(&self, req: &crate::branch::BranchReq) -> Result<crate::branch::BranchOutcome, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(HostCmd::Branch { req: req.clone(), reply: tx })
+            .map_err(|_| "the model host is gone; nothing was branched".to_string())?;
+        rx.await.map_err(|_| "the model host ended without answering the branch".to_string())?
     }
     fn state(&self) -> HostState {
         SessionHost::state(self)
@@ -2686,6 +2795,10 @@ mod tests {
         seen_attachments: Arc<AtomicUsize>,
         /// The user message the endpoint actually received, env block included.
         seen_wire: std::sync::Mutex<Vec<String>>,
+        /// How many messages each request carried. What a conversation's own prompt was
+        /// seeded with is otherwise invisible from the outside, and "a branch is a
+        /// conversation the model has read" is exactly the claim that needs seeing.
+        seen_prompt: std::sync::Mutex<Vec<usize>>,
     }
 
     #[async_trait]
@@ -2741,6 +2854,7 @@ mod tests {
             {
                 self.seen_wire.lock().unwrap().push(last_user.content.clone());
             }
+            self.seen_prompt.lock().unwrap().push(req.messages.len());
             let n = self.calls.fetch_add(1, Ordering::Relaxed);
             let reply = self
                 .replies
@@ -2777,6 +2891,14 @@ mod tests {
     }
 
     fn host(replies: Vec<String>) -> (SessionHost, Arc<Store>) {
+        let (h, store, _p) = host_with(replies);
+        (h, store)
+    }
+
+    /// The same host, with the endpoint kept in hand. A branch is not only a copied
+    /// transcript: the model has to be answering out of the copy, and that is only
+    /// checkable by asking the endpoint what it was given.
+    fn host_with(replies: Vec<String>) -> (SessionHost, Arc<Store>, Arc<Scripted>) {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(replies),
@@ -2786,14 +2908,15 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
-            p,
+            p.clone(),
             Registry::new(),
             Arc::clone(&store),
             HostConfig::new("test-model", std::env::temp_dir()),
         );
-        (h, store)
+        (h, store, p)
     }
 
     #[tokio::test]
@@ -2817,6 +2940,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
             Arc::clone(&p) as Arc<dyn Provider>,
@@ -3066,6 +3190,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -3112,6 +3237,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 seen_attachments: Arc::new(AtomicUsize::new(0)),
                 seen_wire: Default::default(),
+            seen_prompt: Default::default(),
             }),
             Registry::new(),
             Arc::new(Store::in_memory().unwrap()),
@@ -3165,6 +3291,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 seen_attachments: Arc::new(AtomicUsize::new(0)),
                 seen_wire: Default::default(),
+            seen_prompt: Default::default(),
             }),
             Registry::new(),
             Arc::new(Store::in_memory().unwrap()),
@@ -3231,6 +3358,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 seen_attachments: Arc::new(AtomicUsize::new(0)),
                 seen_wire: Default::default(),
+            seen_prompt: Default::default(),
             }),
             Registry::new(),
             Arc::new(Store::in_memory().unwrap()),
@@ -3307,6 +3435,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 seen_attachments: Arc::new(AtomicUsize::new(0)),
                 seen_wire: Default::default(),
+            seen_prompt: Default::default(),
             }),
             Registry::new(),
             Arc::new(Store::in_memory().unwrap()),
@@ -3342,6 +3471,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -3376,6 +3506,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let mut cfg = HostConfig::new("test-model", std::env::temp_dir());
         cfg.context_budget = Some(12_000);
@@ -3401,6 +3532,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let mut h = SessionHost::spawn(
             p,
@@ -3776,6 +3908,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::clone(&seen),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -4087,6 +4220,182 @@ mod tests {
         assert_eq!(hist[5].content, "three ");
     }
 
+    /// A branch is a conversation the model answers from, not a transcript that only looks
+    /// copied. So this checks the host moved, the record moved, and — through the endpoint's own
+    /// record of what it was handed — that the branch's prompt was seeded from the branch's rows.
+    #[tokio::test]
+    async fn a_branch_moves_the_host_and_answers_from_its_own_history() {
+        let (h, store, p) = host_with(vec![
+            "first answer".into(),
+            "second answer".into(),
+            "answered in the branch".into(),
+        ]);
+        ready(&h).await;
+        h.submit("first ask");
+        turns_done(&h, 1).await;
+        h.submit("second ask");
+        turns_done(&h, 2).await;
+        let original = h.state().session_id;
+        let rows = store.messages(original).unwrap();
+
+        // Branch from the person's second message: everything before it travels, and the message
+        // itself comes back as something to ask again rather than being written twice.
+        let out = h
+            .branch(&crate::branch::BranchReq {
+                session: original,
+                message_id: Some(rows[2].id),
+                from_end: None,
+                role: String::new(),
+                shown: "second ask".into(),
+            })
+            .await
+            .expect("the branch was asked at a message this window can name");
+        assert_eq!(out.copied, 2, "the first exchange travelled into the branch");
+        assert_eq!(out.prefill.as_deref(), Some("second ask"), "the ask comes back for the composer");
+        assert_eq!(h.state().session_id, out.session, "the host is answering in the branch now");
+        assert_eq!(store.messages(original).unwrap().len(), 4, "a branch is not a rewind");
+
+        // What the endpoint is handed proves the adoption. The host installs one message beyond the
+        // conversation on every request — the env block naming the folder the tools run in — so the
+        // envelope is measured from this test's own first turn rather than guessed at.
+        let envelope = *p
+            .seen_prompt
+            .lock()
+            .unwrap()
+            .first()
+            .expect("the first turn reached the endpoint")
+            - 1;
+        h.submit("asked again, worded differently");
+        turns_done(&h, 3).await;
+        let seen = p.seen_prompt.lock().unwrap().last().cloned().unwrap_or(0);
+        assert_eq!(
+            seen,
+            out.copied + envelope + 1,
+            "the branch's prompt is its own {} rows plus this message, got {seen}",
+            out.copied
+        );
+        let wire = p.seen_wire.lock().unwrap().last().cloned().unwrap_or_default();
+        assert!(wire.contains("asked again, worded differently"), "{wire}");
+        assert_eq!(store.messages(original).unwrap().len(), 4, "the original still has its own tail");
+        let rows = store.messages(out.session).unwrap();
+        assert_eq!(rows.len(), 4, "two copied, one asked again, one answered");
+        assert_eq!(rows[2].content, "asked again, worded differently");
+
+        // The event the transcript shows names both conversations, so a person who loses the row
+        // in the sidebar can still tell which one is which.
+        let note = store.messages(out.session).unwrap();
+        assert_eq!(note.len(), 4);
+    }
+
+    /// Branching at an answer carries that answer and stops: asked at the newest answer, that is
+    /// a copy of the whole conversation, and the original is still whole underneath it.
+    #[tokio::test]
+    async fn branching_at_an_answer_carries_it_and_leaves_the_original_whole() {
+        let (h, store, p) = host_with(vec!["a".into(), "b".into(), "continued".into()]);
+        ready(&h).await;
+        h.submit("q1");
+        turns_done(&h, 1).await;
+        h.submit("q2");
+        turns_done(&h, 2).await;
+        let original = h.state().session_id;
+        let rows = store.messages(original).unwrap();
+
+        let out = h
+            .branch(&crate::branch::BranchReq {
+                session: original,
+                message_id: Some(rows[3].id),
+                from_end: None,
+                role: "assistant".into(),
+                shown: rows[3].content.clone(),
+            })
+            .await
+            .expect("branching at the last answer is a copy of everything");
+        assert_eq!(out.copied, 4);
+        assert!(out.prefill.is_none(), "an answer is not something to ask again");
+        assert_eq!(store.messages(original).unwrap().len(), 4);
+
+        h.submit("from here");
+        turns_done(&h, 3).await;
+        let envelope = *p
+            .seen_prompt
+            .lock()
+            .unwrap()
+            .first()
+            .expect("the first turn reached the endpoint")
+            - 1;
+        let seen = p.seen_prompt.lock().unwrap().last().cloned().unwrap_or(0);
+        assert_eq!(
+            seen,
+            out.copied + envelope + 1,
+            "the copy holds all {} rows and then the new ask, got {seen}",
+            out.copied
+        );
+    }
+
+    /// A refused branch creates nothing at all — no row, no host move, no note. The proof of which
+    /// message was meant is the whole point of the verb, so a refusal must be as clean as a success.
+    #[tokio::test]
+    async fn a_branch_that_cannot_prove_which_message_it_means_creates_nothing() {
+        let (h, store) = host(vec!["a".into(), "b".into()]);
+        ready(&h).await;
+        h.submit("q1");
+        turns_done(&h, 1).await;
+        let original = h.state().session_id;
+        let before = store.list_sessions(50).unwrap().len();
+        let rows = store.messages(original).unwrap();
+
+        let e = h
+            .branch(&crate::branch::BranchReq {
+                session: original,
+                message_id: Some(rows[0].id),
+                from_end: None,
+                role: String::new(),
+                shown: "words this window never saw".into(),
+            })
+            .await
+            .expect_err("the row says something else, so the branch is refused");
+        assert!(e.contains("says something else now"), "{e}");
+        assert_eq!(store.list_sessions(50).unwrap().len(), before, "no row was created");
+        assert_eq!(h.state().session_id, original, "the host stayed where it was");
+        assert_eq!(store.messages(original).unwrap().len(), 2, "and nothing was copied or cut");
+    }
+
+    /// A phone can branch a conversation the desktop is not working on. The host takes it up first
+    /// and then branches it, which is the same adopt-then-act the pi core has to do — a core that
+    /// could only branch its own conversation would answer the phone with a refusal the desktop
+    /// never gets.
+    #[tokio::test]
+    async fn a_branch_of_a_conversation_this_host_is_not_on_is_adopted_first() {
+        let (h, store) = host(vec!["a".into(), "b".into(), "c".into()]);
+        ready(&h).await;
+        h.submit("in the first one");
+        turns_done(&h, 1).await;
+        let first = h.state().session_id;
+        h.send(HostCmd::NewSession { title: "second".into() });
+        wait_for("a new conversation".into(), || h.state().session_id != first).await;
+        h.submit("in the second one");
+        turns_done(&h, 2).await;
+
+        let rows = store.messages(first).unwrap();
+        let out = h
+            .branch(&crate::branch::BranchReq {
+                session: first,
+                message_id: Some(rows[0].id),
+                from_end: None,
+                role: String::new(),
+                shown: "in the first one".into(),
+            })
+            .await
+            .expect("branching a conversation this host is not holding");
+        assert_eq!(h.state().session_id, out.session);
+        assert_eq!(store.messages(first).unwrap().len(), 2, "the source is untouched");
+        // The branch is filed where its source lives, not wherever the host happened to be.
+        assert_eq!(
+            store.session(out.session).unwrap().unwrap().workspace,
+            store.session(first).unwrap().unwrap().workspace
+        );
+    }
+
     #[tokio::test]
     async fn new_session_starts_a_clean_prompt_but_keeps_the_old_one() {
         let (h, store) = host(vec!["a".into(), "b".into()]);
@@ -4222,6 +4531,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let mut reg = Registry::new();
         reg.register(Box::new(ExecTool::new(&crate::tools::ExecCfg {

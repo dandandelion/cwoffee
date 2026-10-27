@@ -1212,6 +1212,47 @@ pub async fn edit_message(
     serde_json::to_value(out).map_err(|e| e.to_string())
 }
 
+/// Branch a conversation from one of the messages on screen.
+///
+/// Same shape as `edit_message`, and for the same reason: the caller names the row it means and
+/// repeats the words it painted, so a window that has drifted cannot branch a message it never
+/// showed. `role` says which kind of row `from_end` counts — the pencil only ever works on your own
+/// message, while a branch can also be asked at an answer, and "the newest answer" and "the newest
+/// message" are different rows.
+///
+/// `rename_all` because the parameters are two words: Tauri's default would demand `messageId`
+/// while the gateway reads `message_id` straight off the frame, and the UI is written once.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn branch_conversation(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    message_id: Option<i64>,
+    from_end: Option<usize>,
+    role: Option<String>,
+    shown: String,
+) -> Result<serde_json::Value, String> {
+    eprintln!(
+        "[cwoffee] branch_conversation (desktop): session={session} id={message_id:?} \
+         from_end={from_end:?} role={role:?} shown={} chars",
+        shown.chars().count()
+    );
+    let req = cwoffee_engine::BranchReq {
+        session,
+        message_id,
+        from_end,
+        role: role.unwrap_or_default(),
+        shown,
+    };
+    // The check, the copy and the adoption are one function, and the phone's gateway calls that
+    // same function with the same arguments. A refusal is an error, never a field: a client that
+    // read `{"Err": "…"}` as a payload would tell the person their branch exists when nothing was
+    // created.
+    let out = cwoffee_engine::branch::apply_and_open(state.store.as_ref(), state.host.as_ref(), &req)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
 /// The bytes behind one message's attachments, for a reader who opens a picture that arrived in an
 /// earlier conversation.
 ///

@@ -1633,6 +1633,45 @@
           "delay_ms": 4
         }
       ]
+    },
+    {
+      "name": "branch-stem",
+      "_why": "the branch check's first turn: it needs a conversation with two exchanges to branch from, and a prompt with no scenario is a 400 rather than an answer",
+      "match": "Selftest branch stem",
+      "steps": [
+        {
+          "content": "stem",
+          "finish": "stop",
+          "chunk_chars": 4,
+          "delay_ms": 4
+        }
+      ]
+    },
+    {
+      "name": "branch-tail",
+      "_why": "the same conversation's second exchange, so the branch can be asked at the first message with a tail after it",
+      "match": "Selftest branch tail",
+      "steps": [
+        {
+          "content": "tail",
+          "finish": "stop",
+          "chunk_chars": 4,
+          "delay_ms": 4
+        }
+      ]
+    },
+    {
+      "name": "branch-answer",
+      "_why": "the turn sent *into* the branch: its answer belongs to the new conversation, and the check reads both records to see that they grew apart",
+      "match": "Selftest branch ask",
+      "steps": [
+        {
+          "content": "branch",
+          "finish": "stop",
+          "chunk_chars": 6,
+          "delay_ms": 4
+        }
+      ]
     }
   ]
 }

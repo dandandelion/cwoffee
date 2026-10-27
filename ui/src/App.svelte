@@ -4574,6 +4574,12 @@
       pageLog(`history: conversation ${id} reads empty while its turn is in flight; keeping what is on screen`)
     } else {
       transcript?.loadHistory(page.messages)
+      // The rows' conversation is the identity the controls under them address. `resyncView` sets
+      // this on the way in; a caller that repaints a *different* conversation through here — a
+      // branch opening, a reload after a correction — used to leave the transcript naming the one
+      // it was showing before, so the Copy/Edit/Branch under freshly painted rows asked about a
+      // conversation nobody was looking at.
+      if (transcript && transcript.sessionId !== id) transcript.sessionId = id
       // The note explaining this conversation is not stored in it: a resumed history
       // announces itself once, and a repaint used to drop that announcement.
       transcript?.replayNotes(id)
@@ -13382,9 +13388,16 @@
         if (!copy || !share || !branch) fail('turn actions are mislabelled')
         else {
           if (!copy.querySelector('svg.tact-glyph')) fail('turn actions use a non-SVG icon')
+          // Branch is built, so the button is live — but not on the turn painted here. That turn
+          // was streamed by this window and has no stored row, and a branch has to name the row it
+          // means. Inert, with the reason on it, is the honest shape for it; `branch` drives the
+          // live control end to end against real stored rows.
           if (!branch.disabled)
-            fail('branch is offered as if it worked; it does not exist yet')
-          if (!/not built yet/i.test(branch.title))
+            fail(
+              'a turn this window streamed, with no stored row behind it, offers a branch control that ' +
+                'claims to work; it can only name a message that has been written down',
+            )
+          if (!/once it is stored/i.test(branch.title))
             fail(`a disabled button should say why: ${branch.title}`)
           if (copy.disabled || share.disabled) fail('working actions are disabled')
           // Sharing answers with a sentence, not a chip. A share is something the
@@ -13680,6 +13693,322 @@
               )
           }
         }
+      }
+
+      // --- a second path out of one message --------------------------------------
+      //
+      // The Branch control sat under every finished turn for months with a tooltip saying "not
+      // built yet", which was honest and useless. Copying rows is the half a unit test can reach;
+      // this group exists for the half only a running app can prove: the answer lands in the new
+      // conversation, the conversation you branched from is still whole underneath it, the branch
+      // is a row you can open, and the words you branched from come back to be asked differently.
+      // Both cores are graded by the same claims, because the person is not meant to be able to
+      // tell which one they are on — and each core has to say, out loud, what it did to the
+      // model's own memory, since a copied transcript the model never read is not a branch.
+      if (want('branch', 'branching a message opens a second conversation and leaves the first alone')) {
+        const rowsOf = async (sid: number) =>
+          (
+            await invoke<{ messages: { id: number; role: string; content: string }[] }>('session_messages', {
+              id: sid,
+              before: null,
+              limit: 400,
+            })
+          ).messages
+        // Which engine is answering, asked of the engine rather than of the environment: a receipt
+        // about "what the model's memory did" has to be graded against the memory that is running.
+        const core = (await invoke<{ core: string }>('about').catch(() => null))?.core ?? ''
+        const seen = new Set<string>()
+        const collect = () => {
+          for (const t of [toastText(), ...noteLog]) if (t) seen.add(t)
+        }
+
+        newSession()
+        const stemAsk = 'Selftest branch stem: reply with the single word stem.'
+        const tailAsk = 'Selftest branch tail: reply with the single word tail.'
+        draft = stemAsk
+        await send()
+        let sid = 0
+        for (let i = 0; i < 40 && !sid; i++) {
+          const st = await invoke<{ session_id: number }>('session_state').catch(() => null)
+          sid = viewId ?? transcript?.sessionId ?? st?.session_id ?? 0
+          if (!sid) await new Promise((r) => setTimeout(r, 100))
+        }
+        if (!sid) fail('the first send did not open a conversation, so there is nothing to branch from')
+        else if (!(await settleTurn('the stem answer'))) fail('the stem turn never ended; the branch has nothing to branch from')
+        else {
+          draft = tailAsk
+          await send()
+          if (!(await settleTurn('the tail answer'))) fail('the second turn never ended; the branch has no tail to check')
+          else {
+            const before = await rowsOf(sid)
+            const mine = before.filter((m) => m.role === 'user')
+            if (mine.length !== 2 || before.length < 4)
+              fail(`the conversation to branch holds ${before.length} rows with ${mine.length} of my messages in it`)
+            else {
+              // Stored ids, not what this window streamed: the button under a live turn says it is
+              // waiting for the row, and only a reload hands this window rows it can name.
+              await loadTranscript(sid)
+              const branchBtns = [
+                ...document.querySelectorAll('.blk-user .user-acts .tact.branch'),
+              ] as HTMLButtonElement[]
+              if (!branchBtns.length) fail('my messages offer no branch control at all')
+              else if (branchBtns.some((b) => b.disabled))
+                fail(
+                  'a stored message offers a branch control that says it is disabled; only a turn that has ' +
+                    'not been persisted yet has a reason to be',
+                )
+              else {
+                const parentTitle = sessions.find((r) => r.id === sid)?.title ?? ''
+                const conversationsBefore = sessions.length
+                branchBtns[0].click() // the FIRST message: nothing before it, its words come back
+
+                // Two things have to happen for the branch to be real: the app is looking at a
+                // different conversation, and the ask came back into the composer.
+                const opened = await waitFor(
+                  'the branch to be opened as its own conversation',
+                  () => viewId !== null && viewId !== sid && (transcript?.sessionId ?? 0) === viewId,
+                  15000,
+                )
+                collect()
+                if (!opened) {
+                  fail(
+                    `branching did not move the view: still on conversation ${sid}, and it said ` +
+                      `${JSON.stringify([...seen].join(' | ').slice(0, 140))}`,
+                  )
+                } else {
+                  const nb = viewId as number
+                  // The ask coming back is a separate claim from the view moving, and it lands a
+                  // beat later: the handler opens the conversation before it writes the composer.
+                  // Waiting for both in one predicate would grade whichever settled second.
+                  const ta = document.querySelector('textarea.composer') as HTMLTextAreaElement | null
+                  const handed = await waitFor(
+                    'the ask to come back into the composer',
+                    () => (ta?.value ?? '').trim() === stemAsk.trim(),
+                    8000,
+                  )
+                  collect()
+                  const draftNow = (ta?.value ?? '').trim()
+                  if (!handed)
+                    fail(
+                      `branching from your message hands the ask back to the composer to be asked again; ` +
+                        `the composer holds ${JSON.stringify(draftNow.slice(0, 60))}`,
+                    )
+                  const after = await rowsOf(sid)
+                  if (after.length !== before.length)
+                    fail(
+                      `a branch is not a rewind: conversation ${sid} held ${before.length} rows before the ` +
+                        `branch and ${after.length} after it`,
+                    )
+                  if (after.some((m, i) => m.content !== before[i].content))
+                    fail('the rows of the conversation branched from changed underneath the branch')
+                  // The row in the sidebar is the only place a branch is discoverable, and two
+                  // conversations with the same first message are indistinguishable there. A branch
+                  // says what it is and what it came from.
+                  const branchRow = sessions.find((r) => r.id === nb)
+                  // Held as a string, not as the row: the checks below await the host, and a `find`
+                  // result narrowed to non-undefined does not survive that — the list is a $state
+                  // this component can rebuild at any point, so the title is captured once, here.
+                  const branchTitle = branchRow?.title ?? ''
+                  if (!branchRow)
+                    fail(`the branch is not in the list of conversations (${conversationsBefore} rows before, ${sessions.length} now)`)
+                  else if (!branchRow.title.includes('branch'))
+                    fail(`the branch's row does not say it is a branch: "${branchRow.title}"`)
+                  else if (parentTitle.slice(0, 24) && !branchRow.title.includes(parentTitle.slice(0, 24)))
+                    fail(`the branch's row does not name its parent: "${branchRow.title}" was made from "${parentTitle}"`)
+                  const said = [...seen].join(' | ')
+                  if (!said.includes(String(nb)))
+                    fail(`nothing told the person which conversation was made (${nb}); the app said: ${said.slice(0, 160)}`)
+                  if (!/not a rewind|untouched/i.test(said))
+                    fail(
+                      `nothing said the conversation branched from was left alone, which is the whole ` +
+                        `difference between this and the pencil above it; it said: ${said.slice(0, 160)}`,
+                    )
+                  // What the model's memory did, in the host's own words. The two cores differ here
+                  // because their memories differ, and each has to say something rather than nothing.
+                  if (core === 'pi') {
+                    if (!/forked this conversation's thread/i.test(said))
+                      fail(
+                        `the pi core made a cwoffee row without saying it forked pi's thread, which is the ` +
+                          `memory that has to follow the copy; it said: ${said.slice(0, 160)}`,
+                      )
+                  } else if (core === 'rust') {
+                    if (!/answers the new conversation from the copied history/i.test(said))
+                      fail(
+                        `the rust core made a branch without saying it answers from the copied history; ` +
+                          `it said: ${said.slice(0, 160)}`,
+                      )
+                  } else {
+                    pageLog(`selftest note: the host reported its core as ${JSON.stringify(core)}, so the fork receipt was not graded`)
+                  }
+
+                  // Ask the branch something. Its answer belongs to it, and the conversation it was
+                  // branched from must not gain a row — which is the whole product promise of the
+                  // verb, and the thing a rewind-shaped implementation gets wrong.
+                  draft = 'Selftest branch ask: reply with the single word branch.'
+                  await send()
+                  if (!(await settleTurn('the branch answer'))) fail('the turn sent into the branch never ended')
+                  else {
+                    const inBranch = await rowsOf(nb)
+                    const mineBranch = inBranch.filter((m) => m.role === 'user')
+                    if (inBranch.length !== 2 || mineBranch.length !== 1)
+                      fail(
+                        `the branch holds ${inBranch.length} rows with ${mineBranch.length} of my messages; branching ` +
+                          `from the first message copies nothing before it and then answers this one ask`,
+                      )
+                    else if (!mineBranch[0].content.includes('reply with the single word branch'))
+                      fail(`the branch's own ask is missing from it: ${JSON.stringify(mineBranch[0].content.slice(0, 60))}`)
+                    const stillOld = await rowsOf(sid)
+                    if (stillOld.length !== before.length)
+                      fail(
+                        `answering in the branch grew conversation ${sid} from ${before.length} rows to ` +
+                        `${stillOld.length}; the two paths are supposed to grow apart`,
+                      )
+                    if (stillOld.some((m, i) => m.content !== before[i].content))
+                      fail('the conversation branched from was rewritten while the branch was answered')
+
+                    // Branch at an *answer*: it carries that answer and everything before it, and an
+                    // answer is not something to ask again, so nothing comes back to the composer.
+                    await loadTranscript(sid)
+                    // The control is inside the conversation, so the check has to know which
+                    // conversation it is holding: clicking an answer's branch on a view that had
+                    // drifted would branch a different conversation and still "succeed".
+                    if ((transcript?.sessionId ?? 0) !== sid)
+                      fail(
+                        `the view was not showing conversation ${sid} when asked to branch its answer ` +
+                          `(it says ${transcript?.sessionId ?? 'nothing'}), so the click would branch the wrong one`,
+                      )
+                    const atAnswer = [
+                      ...document.querySelectorAll('.turn-acts .tact.branch'),
+                    ] as HTMLButtonElement[]
+                    if (!atAnswer.length) fail('a finished answer offers no branch control')
+                    else if (atAnswer.some((b) => b.disabled))
+                      fail('a stored answer offers a disabled branch control; only an unstored, still-live turn has a reason to be')
+                    else {
+                      const rowsNow = await rowsOf(sid)
+                      seen.clear()
+                      atAnswer[atAnswer.length - 1].click()
+                      const opened2 = await waitFor(
+                        'the branch at an answer to open',
+                        () => viewId !== null && viewId !== sid && viewId !== nb,
+                        15000,
+                      )
+                      collect()
+                      if (!opened2) fail('branching at an answer did not open a conversation')
+                      else {
+                        const nb2 = viewId as number
+                        const copied = await rowsOf(nb2)
+                        if (copied.length !== rowsNow.length)
+                          fail(
+                            `branching at the newest answer is a copy of the conversation: it made ${copied.length} ` +
+                              `rows from ${rowsNow.length}`,
+                          )
+                        if (copied.some((m, i) => m.content !== rowsNow[i].content))
+                          fail('the copy does not say what the conversation it came from says')
+                        const ta2 = document.querySelector('textarea.composer') as HTMLTextAreaElement | null
+                        if ((ta2?.value ?? '').trim() !== '')
+                          fail(
+                            `branching at an answer put ${JSON.stringify((ta2?.value ?? '').slice(0, 60))} in the ` +
+                              'composer; an answer is not a thing to send again',
+                          )
+                        if (!sessions.some((r) => r.id === nb2)) fail('the branch at an answer is not in the list')
+
+                        // A branch has to prove which message it means. Two windows, a phone tab and
+                        // this harness all read one conversation, and a view that drifted must not
+                        // have its branch applied to a row it never showed.
+                        const listBefore = sessions.length
+                        const firstUser = (await rowsOf(sid))[0]
+                        let refused = ''
+                        try {
+                          await invoke('branch_conversation', {
+                            session: sid,
+                            message_id: firstUser.id,
+                            from_end: null,
+                            role: 'user',
+                            shown: 'words no window ever painted',
+                          })
+                        } catch (e) {
+                          refused = String(e)
+                        }
+                        if (!/says something else now/i.test(refused))
+                          fail(
+                            `a branch addressed to a row whose words have changed answered ${refused || 'with no error'}; ` +
+                              'it has to refuse and create nothing',
+                          )
+                        if (sessions.length !== listBefore)
+                          fail(`the refused branch still added a conversation (${listBefore} rows before, ${sessions.length} now)`)
+                        if ((await rowsOf(sid)).length !== rowsNow.length)
+                          fail('the refused branch changed the conversation it was refused on')
+
+                        // And not while an answer is being written: a mid-turn branch would let that
+                        // turn's output land in whichever conversation the queue got to first.
+                        draft = 'Count out loud from one to fifteen, one number per line.'
+                        await send()
+                        let running = false
+                        for (let i = 0; i < 40 && !running; i++) {
+                          running = busy
+                          if (!running) await new Promise((r) => setTimeout(r, 100))
+                        }
+                        let busyRefused = ''
+                        try {
+                          await invoke('branch_conversation', {
+                            session: sid,
+                            message_id: firstUser.id,
+                            from_end: null,
+                            role: 'user',
+                            shown: firstUser.content,
+                          })
+                        } catch (e) {
+                          busyRefused = String(e)
+                        }
+                        if (!/turn is running/i.test(busyRefused))
+                          fail(
+                            `branching during a turn answered ${busyRefused || 'with no error'} (the turn was running ` +
+                              `when asked: ${running})`,
+                          )
+                        // Nothing moved while it was refused: no conversation, and no rows in the one
+                        // the ask named. Measured before the turn is allowed to land, because the
+                        // turn's own two rows are a change this check must not be blamed for.
+                        const midRows = await rowsOf(sid)
+                        if (midRows.length !== rowsNow.length)
+                          fail(
+                            `the refused mid-turn branch changed conversation ${sid} from ${rowsNow.length} rows to ` +
+                              `${midRows.length}`,
+                          )
+                        if (sessions.length !== listBefore)
+                          fail(`the refused mid-turn branch still added a conversation (${listBefore} before, ${sessions.length} now)`)
+                        await settleTurn('the counting turn')
+                        // The turn that was running belongs to the conversation being read, and it
+                        // lands on its own two rows — which is what the refusal was protecting: a
+                        // branch accepted mid-turn would have had that answer to write into
+                        // whichever conversation the queue reached first.
+                        const grown = (await rowsOf(nb2)).length - copied.length
+                        if (grown !== 2)
+                          fail(
+                            `the turn that was running wrote ${grown} rows into the conversation it was sent ` +
+                              `from, where its own ask and answer are 2`,
+                          )
+
+                        const grew = sessions.length - conversationsBefore
+                        pageLog(
+                          `branch ok (${grew} conversation(s) made from ${sid}; branching your message copied ` +
+                            `nothing before it and handed the ask back, branching its answer copied ` +
+                            `${copied.length} rows and asked for nothing, the source still holds ` +
+                            `${(await rowsOf(sid)).length} rows, a drifted branch was refused and made nothing, a ` +
+                            `branch during a turn was refused, and ${core || 'the running'} core said what it did ` +
+                            `to the model's memory; the sidebar calls it "${branchTitle.slice(0, 34)}")`,
+                        )
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        // The composer is a shared surface; a check that leaves an ask typed into it hands the next
+        // group a message it did not write.
+        draft = ''
+        showStartScreen()
       }
 
       // --- a picture pasted off the desktop, sent, and seen at all three places --
@@ -17325,6 +17654,43 @@
       // An attachment chip in your own message: show the picture. See `openAttachment` for why the
       // bytes are fetched rather than already here.
       transcript.onAttachmentOpen = (v) => void openAttachment(v)
+
+      // Branch: a second path out of one message, which is the opposite of the pencil above it.
+      // The host copies the record, forks the model's own memory of the conversation, and answers
+      // with the conversation it made — all three or none, in that order (`cwoffee_engine::branch`;
+      // a phone reaches the same `apply_and_open` through the gateway, so the busy rule and the
+      // "which message did you mean" proof are one text on both ends of the wire).
+      //
+      // Opening what it made is the point of the verb: a branch that leaves you looking at the
+      // conversation you branched *from* is a copy nobody asked for. The host has already moved onto
+      // the new row, so the composer's next send goes there — and when you branched from your own
+      // message, the ask comes back as a draft to change rather than something to retype.
+      transcript.onMessageBranch = async (b) => {
+        const session = b.session || (transcript?.sessionId ?? 0)
+        if (!session) throw new Error('that conversation is not saved yet, so there is nothing to branch')
+        const out = await invoke<{
+          session: number
+          title: string
+          copied: number
+          prefill: string | null
+          note: string
+        }>('branch_conversation', {
+          session,
+          message_id: b.id,
+          from_end: null,
+          role: b.role,
+          shown: b.shown,
+        })
+        // The sidebar gains a row, and the conversation being read changes, so both the list and
+        // the view come from the record rather than from what this click guessed.
+        void loadSessions()
+        await openSession(out.session)
+        if (out.prefill) {
+          draft = out.prefill
+          setTimeout(() => composerEl?.focus(), 0)
+        }
+        return out?.note ?? `branched into “${out.title}”`
+      }
     }
     // Test seam: lets a browser harness drive the transcript without an engine.
     if (import.meta.env.DEV) (window as any).__cwoffeeTranscript = transcript

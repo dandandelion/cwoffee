@@ -1942,3 +1942,115 @@ failure above).
 
     launch check: OK (gio launch ~/.local/share/applications/cwoffee.desktop)
       app says: [cwoffee] render OK: … cup=none
+
+---
+
+## Feature 1: Branch — a second path out of one message
+
+The Branch control had been under every finished turn for months with a tooltip that read *Branch
+this conversation — not built yet*. Honest, and useless: the feature a person reaches for when an
+answer went somewhere they did not want it to go, without losing the path that got there.
+
+### What it is, from the chair
+
+- **Branch from one of your messages** (the control sits next to `Edit` under each of your bubbles):
+  a new conversation carries everything **before** that message, and the message itself comes back
+  into the composer so it can be worded differently. Nothing is written twice.
+- **Branch from an answer**: the new conversation carries that answer and everything before it, and
+  starts from there. Branching at the newest answer is a copy of the whole conversation.
+- **The conversation you branched from keeps everything it has.** A branch is not a rewind, and the
+  note the host answers with says so in the same breath as it names the new conversation — because
+  "did I lose the original?" is the only question a person has when a second row appears.
+- **The branch inherits the conversation it came from**: folder, model, persona, the chat's Web
+  grant, the chosen thinking effort. A branch of a cowork conversation that suddenly has no folder,
+  or a chat that suddenly cannot search, is a different kind of conversation wearing the same title.
+- **The sidebar row says what it is**: *"the parent — branch of the parent"*. Two conversations whose
+  first message is identical are indistinguishable otherwise, and a branch of a branch names the
+  parent it was made from rather than its great-grandparent.
+- **A turn that has not been stored yet cannot be branched**, and its control says so
+  ("once it is stored — a moment after the turn ends") rather than branching a guess: a branch names
+  the row it means, and a live turn's text is not a row yet.
+- Refused while a turn is running, by both transports, with the same sentence.
+
+### How it is built
+
+- `crates/engine/src/branch.rs` is the whole ask: `resolve` (which row, proven), `create_row`
+  (inherit + copy), `outcome_note` (what happened, in product words), `memory_note` (what the
+  engine's own memory did), `apply_and_open` (busy rule, then the host). Both transports call
+  `apply_and_open`, so a phone cannot branch a conversation the desktop refuses to branch.
+- **Proof, not trust.** The caller names the row (`message_id`, or `from_end` among rows of a role)
+  and repeats the words it painted (`shown`). If the row says something else now — another window,
+  another device, the harness — the branch is refused and nothing is created. Same discipline as
+  `edit_message`, for the same reason: three clients read one conversation.
+- `Store::copy_through` copies the stretch by SQL rather than through `history()`: `history()`
+  rebuilds rows for the model and drops what only the UI reads. The copy keeps reasoning, its
+  signature and its ms, tool calls, tool meta, file badges, attachments and the search index, and
+  moves the new conversation's `updated_at` to now so it sorts at the top.
+- **Order differs per core, on purpose.** Rust core: create the row, then adopt the copy
+  (`adopt_view!` replays the rows into the prompt and rebinds where turns persist); if adoption
+  fails, the row is deleted, so no half-made conversation is left in the sidebar. pi core: adopt the
+  source thread, fork pi's thread, then write the row; if the row fails, pi goes back to the source
+  thread and the note says an orphan thread file exists and is safe to delete — a conversation the
+  model is answering into that nothing lists is worse than a stray file.
+- **pi's tree is what made `crates/bridge/src/rewind.rs` get rewritten.** Session files are trees;
+  context is built from `leafId` to the root. The old prune kept the first *n* user entries **in file
+  order**, which is only the conversation while nothing has ever branched the file. It now walks
+  leaf→root (with cycle and missing-parent refusals), treats the header id as a tree boundary, keeps
+  the whole exchange rather than just the question, and refuses a compaction whose `firstKeptEntryId`
+  is off the kept chain instead of silently rewriting it.
+- **A forked thread file may not exist yet** — pi writes it when the first entry is appended. The
+  launch and `enter_row` now filter a mapped path through `metadata()`: handing pi a path it cannot
+  open fails the launch, and a window that will not start is worse than a branch that starts as a
+  fresh thread with its transcript said out loud. The note distinguishes an unspoken branch from a
+  conversation imported from the other core.
+- `branch_conversation` is drive-only on the gateway, and the desktop command uses
+  `rename_all = "snake_case"` so `message_id`/`from_end` are spelled identically on both wires.
+
+### Lessons
+
+- A disabled button that says why is still the right shape after the feature ships — it just moves to
+  the case where the control genuinely cannot act yet (a turn with no stored row).
+- "Copied the rows" is not "branched". The claim that matters is about the model's memory, so the
+  engine has to say what it did to it, and the check grades that sentence per core instead of
+  assuming both cores have the same memory.
+- A control painted inside a conversation addresses that conversation, so repainting a conversation
+  has to move the identity along with the rows. `loadTranscript` painted rows and left the transcript
+  naming the previous conversation; Copy, Edit and Branch under them addressed something nobody was
+  looking at.
+- A refusal claim needs to be measured before the change the world is about to make anyway. The
+  mid-turn refusal was checked while the turn was still running: after it settled, the conversation
+  had two more rows and the claim read as though the refusal had written them.
+- A selftest needs scenarios. `mock-llm.mjs` answers an unmatched prompt with a 400, so three new
+  entries went into `tests/scenarios/scenarios.json` rather than the check reusing someone else's
+  scenario by accident.
+
+### Receipts
+
+`cargo test --workspace` (guarded, `-j 2 --test-threads=2`): 670 passed, 0 failed — including
+`branch::tests` (naming, refusal, copied columns, answer cut, ask handed back), four
+`host::tests::branch*` (host moves onto the branch and answers from its own history, an answer branch
+carries the answer, a refusal creates nothing, a conversation this host is not on is adopted first),
+nine `rewind::tests` (tree cut, leaf that is not the newest entry, fold anchors, unreadable file left
+alone), and the gateway parity test (`a_phone_can_branch_a_conversation_and_gets_the_new_row_back`).
+
+Full suite on pi core and on Rust core, window frontmost, mock endpoint on 8190: `SELFTEST ok`, 0
+failures, with
+
+    branch ok (2 conversation(s) made from 36; branching your message copied nothing before it and
+    handed the ask back, branching its answer copied 4 rows and asked for nothing, the source still
+    holds 4 rows, a drifted branch was refused and made nothing, a branch during a turn was refused,
+    and pi core said what it did to the model's memory; the sidebar calls it
+    "Selftest title, typed in — branch ")
+
+and the same receipt on the rust core with "rust core said what it did to the model's memory".
+
+Falsification, both aimed at the halves a unit test cannot reach: a branch implemented as a rewind
+(`truncate_from` the source after the copy) failed with
+`a branch is not a rewind: conversation 21 held 4 rows before the branch and 0 after it` and
+`answering in the branch grew conversation 21 from 4 rows to 0; the two paths are supposed to grow
+apart`; an empty pi `memory_note` failed with
+`the pi core made a cwoffee row without saying it forked pi's thread, which is the memory that has to
+follow the copy`.
+
+`svelte-check`: 0 errors, 0 warnings. `wire-names`: OK, same desktop/gateway notes as before, with
+`branch_conversation` graded on both hosts.

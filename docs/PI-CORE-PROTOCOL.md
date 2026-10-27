@@ -99,7 +99,7 @@ pi does not emit it.**
 | `SetReasoning {off..xhigh}` | `set_thinking_level` (+ `cycle_*`, `get_available_thinking_levels`) | availability is model-dependent; ours was static |
 | `SetModel {model,persist}` | `set_model` (+ `cycle_model`, `get_available_models`) | observed `get_state` returned the model incl. `contextWindow:128000`, `reasoningLevels`, `baseUrl` |
 | `SetWorkspace {path}` | ⚠ **no RPC equivalent** (no `cwd` verb — verified against `rpc-commands.md`) | one pi process per workspace; our 5 workspace verbs become process lifecycle (decision 7) |
-| `ClearSession` / `NewSession` / `SwitchSession` | `new_session` / `switch_session` (+ `fork`, `clone`, `get_tree`) | pi's session **tree/branching** is a free feature we never had |
+| `ClearSession` / `NewSession` / `SwitchSession` | `new_session` / `switch_session` (+ `fork`, `clone`, `get_tree`) | pi's session **tree/branching** is the mechanism `branch_conversation` runs on: `fork` before an entry, `clone` at the leaf. Deferred while a turn is running, like every verb that moves the thread |
 | `Shutdown` | close stdin | |
 | — (new) | `get_state`, `get_messages`, `get_entries`, `get_session_stats`, `compact`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, `set_session_name`, `get_commands`, `export_html`, `get_last_assistant_text`, `bash`, `abort_bash` | `get_session_stats` feeds the context bar; `compact` maps to a manual `/compact`; `bash`/`abort_bash` is **client-side shell, not model-callable** — decide deliberately whether the desktop exposes it |
 
@@ -123,6 +123,7 @@ The gateway (`crates/gateway/src/lib.rs`) speaks `{cmd,args,id}` → response, p
 | `set_workspace`, `pick_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label` | **bridge process pool** (no pi verb) |
 | `search_messages`, `search_settings` | our SQLite index (pi has no cross-session search) |
 | `edit_message` | ours: the cwoffee store row, then a **rewind** — bridge rewrites pi's session file and reopens it (see below) |
+| `branch_conversation` | ours: copy the rows, then a **fork** — bridge compares cwoffee's user rows against pi `get_fork_messages`, forks before that entry (or `clone`s at the leaf), records the new thread (see below) |
 | `share_markdown`, `render_report`, `gpu_report`, `boot_log`, `open_file`, `search_probe`, `set_search_backend`, `migration_notes` | ours — product features, not core features (OPEN QUESTION 3) |
 
 **Also still ours, unchanged:** watch vs drive tokens, token-not-in-URL, loopback default,
@@ -151,11 +152,64 @@ just went, and pi applies thinking per session, not per conversation.
 
 Two things that choice depends on, both worth knowing before this doc goes stale:
 
-* **The bridge does not branch pi sessions today.** File order equals conversation order, so "the
-  *n*th user entry" is the right cut. If branching ever lands, the cut has to walk the tree by
-  `leafId` instead of counting lines — see `docs/session-format.md` in the pi package.
+* **The cut walks the tree, not the file.** A pi session file is a tree: entries carry
+  `id`/`parentId`, more than one entry can share a parent, and what the model was told is decided by
+  `leafId` — context is built by walking from the leaf to the root. "Keep the first *n* user entries
+  in line order" was the first implementation and it is wrong the moment anything branches a file:
+  it keeps entries from a path the person is not on. The prune asks the child for `leafId`
+  (`get_entries`), walks leaf→root, and cuts on that branch; when the child is down it takes the
+  file's last entry and says so. `a_branch_is_cut_on_the_branch_being_kept_not_on_the_files_line_order`
+  and `a_leaf_that_is_not_the_newest_entry_cuts_that_branch` pin both halves.
+* **A cut keeps the exchange, not just the question.** The kept stretch ends with the answer to the
+  last kept user message and that answer's tool results, because cwoffee's transcript ends there too.
+  Cutting at the question would leave the model unable to remember an answer the person can still
+  read.
+* **A fold whose anchor is off the kept chain is refused, not repaired.** A compaction entry's
+  `firstKeptEntryId` points at the message its summary starts from. If the cut drops that anchor,
+  dropping the fold orphans the entries appended under it and repointing it keeps a summary of a path
+  nobody is on, so the rewrite refuses and leaves the file alone.
 * **Only pi's own user entries count.** Compaction and scaffolding entries are pi's, not the
   person's; counting them cuts the thread in the wrong place. The prune asserts on that.
+
+### `branch_conversation`: pi owns a tree, so a branch is a fork
+
+Branching is the case that made the tree above matter. cwoffee copies its rows; pi has to copy the
+*memory*, and it does that with two RPCs (`crates/bridge/src/host.rs`, `branch_row`):
+
+* **`{ "type": "fork", "entryId": "<id>" }`** — a new session file holding the path from `entryId`
+  to the root, with pi as the parent. The bridge forks **before** the entry it was asked at for a
+  person's message, so the branch does not contain the message being asked again; for an answer it
+  forks before the *next* user entry, so the answer stays in the branch.
+* **`{ "type": "clone" }`** — the current active branch copied at the current leaf. That is what
+  "branch at the newest answer" is: a copy of the whole conversation.
+* **`{ "type": "get_fork_messages" }`** — `{ messages: [{ entryId, text }] }`, the entries pi would
+  accept as a fork point. The bridge compares that list against the cwoffee conversation's own user
+  rows — count first, then whitespace-normalised words — and refuses if they disagree. A fork made at
+  an entry the record does not describe is a second conversation with wrong history in it, and no
+  later note can undo that.
+* **`{ "type": "get_state" }`** — `sessionFile` names the thread the child is now on, which is what
+  gets recorded in the thread map for the new conversation.
+
+Two behaviours that are not obvious from the protocol, found by probing pi 1.2.0:
+
+* **A forked file may not exist yet.** `fork` switches the child onto a new thread and writes the
+  file when the first entry is appended to it. So a branch nobody has spoken into has a recorded path
+  and no file, and the note says its file is written when the first message lands. Anything that
+  hands `switch_session` a path pi cannot open fails the launch, so `enter_row` and the launch both
+  filter the mapped path through `metadata()` and treat a missing file as a fresh thread — with a
+  note that says *why* it is fresh, which is a different sentence for an imported conversation than
+  for an unspoken branch.
+* **A branch is adopted before it is forked.** If the child is holding another conversation, the
+  bridge switches onto the source first: the fork point is an entry in *that* thread's file, and
+  `get_fork_messages` answers about whatever is loaded. Order is adopt → fork → write the row → map
+  the thread. If the row cannot be written the child goes back to the source thread and the note says
+  an orphan thread file exists and is safe to delete, because a conversation the model is answering
+  into that nothing lists is worse than a stray file.
+
+The thinking effort the source conversation was at follows the branch: pi copied the entry that
+recorded it, and the bridge copies its own per-row maps so a later reopen keeps it rather than
+falling back to pi's default. `get_state` after the fork is re-absorbed, because what the forked
+thread *runs at* is the answer, not what the source row asked for.
 
 ### Chat mode's Web grant: pi decides tools at exec, so a switch is a process lifecycle
 

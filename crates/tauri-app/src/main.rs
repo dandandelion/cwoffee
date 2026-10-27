@@ -804,6 +804,7 @@ fn main() {
             commands::session_messages,
             commands::message_attachments,
             commands::edit_message,
+            commands::branch_conversation,
             commands::share_markdown,
             commands::save_markdown_file,
             commands::save_attachment_as,

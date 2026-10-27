@@ -10,6 +10,7 @@
 pub mod about;
 pub mod agent;
 pub mod approval;
+pub mod branch;
 pub mod config;
 pub mod edit;
 pub mod event;
@@ -26,10 +27,10 @@ pub mod titling;
 pub mod telemetry;
 pub mod stream;
 pub mod tools;
-
 pub use agent::{Agent, AgentConfig, EngineSink};
 pub use about::About;
 pub use approval::{ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalRequest};
+pub use branch::{BranchOutcome, BranchPoint, BranchReq};
 pub use config::Config;
 pub use edit::{EditOutcome, EditPlan, EditReq};
 pub use event::{EngineEvent, ExecStream, FinishReason};

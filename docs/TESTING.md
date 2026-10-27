@@ -808,3 +808,60 @@ and fixed unread conversations. Each one is written against the thing the report
   and either sentence anywhere in the pane, because a copy of "Chat has no folder" under a new class name
   passes a selector check — and the opening screen keeps a second composer that a selector scoped to one
   of them would miss.
+
+### Branching: two records, two memories, one check
+
+`branch` is the group for a verb whose danger is invisible from the DOM. Copying transcript rows is
+easy and a unit test can do it; the two things that make a branch a branch — the model answering out
+of the copy, and the conversation it was copied from still being whole — are only visible from inside
+a running app, and a rewind-shaped implementation gets both wrong while looking identical in the
+sidebar.
+
+- **The source is measured before and after, row by row.** Not its length: the check compares each
+  row's content too, because a branch that cut the original and left the same count of rows behind
+  would pass a length check. Sabotaging `create_row` to `truncate_from` the source after the copy
+  produces `a branch is not a rewind: conversation 21 held 4 rows before the branch and 0 after it`,
+  and the second claim (`answering in the branch grew conversation 21…`) catches the same bug from the
+  other side — the two paths have to grow apart.
+- **The composer is read from the painted textarea, not from state.** `prefill` is a promise about
+  what the person can now do: branch off your own message and the words come back to be asked again;
+  branch at an answer and nothing comes back, because an answer is not something to send. The view
+  moving and the composer filling are waited for as two claims with two messages, because the handler
+  opens the conversation before it writes the composer and a single predicate would grade whichever
+  of the two settled second.
+- **The host's own sentence is the receipt about memory, and it is graded per core.** A branch is only
+  a branch if the model's memory followed it, and the two engines keep that memory in different
+  places, so each has to say something different: pi names the thread it forked, the Rust core says it
+  answers from the copied history now. The check asks `about` which core is running rather than
+  reading `CWOFFEE_CORE` — the environment says what was asked for, the host says what is running.
+  Emptying the pi arm of `memory_note` fails as
+  `the pi core made a cwoffee row without saying it forked pi's thread, which is the memory that has
+  to follow the copy`. What the check cannot see is whether the fork file's contents match the source
+  branch; the bridge's own unit tests cover the comparison against `get_fork_messages` that guards
+  that, and the receipt says "the core said what it did to the model's memory" rather than claiming
+  the file was read.
+- **The refusal claims measure the population they belong to.** A drifted `shown` must create no
+  conversation *and* change no rows; a mid-turn refusal is measured while the turn is still running,
+  because the running turn is going to grow the conversation by two rows on its own and a claim
+  written as "nothing changed, after the turn" would blame the refusal for the turn. The turn then
+  lands in the conversation it was sent from, which is what the refusal was protecting.
+- **The click has to belong to the conversation the claim names.** Branch controls are painted inside
+  the transcript, so a check that reloads a conversation and clicks "the last answer's branch" can be
+  clicking a control built while a different conversation was on screen. `branch` asserts
+  `transcript.sessionId` equals the conversation it is about to branch before clicking. That
+  assertion is what found a real bug: `loadTranscript` painted a conversation's rows without telling
+  the transcript which conversation they were, so Copy/Edit/Branch under freshly painted rows addressed
+  whatever was on screen before the repaint. Turn actions now read the session at click time for the
+  same reason.
+- **`turn-buttons` keeps the disabled-control rule, pointed at the honest case.** Branch is built, so
+  its button is live — but not under a turn the window streamed, which has no stored row to name.
+  The group now requires that control to be inert *and* to say what it is waiting for
+  (`once it is stored`), which is the same rule it was checking before: a disabled control that
+  explains itself beats one that pretends.
+
+`scripts/selftest.sh branch` runs on both cores; the fork/adopt sentence is the only claim that
+differs between them, and a core that reports neither fails instead of passing quietly.
+
+Three new mock scenarios (`branch-stem`, `branch-tail`, `branch-answer`) exist because
+`scripts/mock-llm.mjs` answers an unmatched prompt with a 400, and a check whose turn 400s grades a
+conversation that never ran.

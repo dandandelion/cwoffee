@@ -747,6 +747,77 @@ impl Store {
         Ok(n)
     }
 
+    /// Copy a conversation's rows, up to and including `through_id`, into another conversation.
+    ///
+    /// This is what a branch is made of: the new conversation has to hold the same words, the same
+    /// thinking (including the signature an Anthropic replay needs), the same tool calls and results,
+    /// the same file badges and the same attachments as the stretch it came from. Copying through
+    /// [`Store::history`] instead would rebuild rows from the *model's* view of them and quietly drop
+    /// the columns that only the UI reads — a branch whose tool cards and picture chips had vanished,
+    /// which is the same loss v8 and v9 were added to prevent.
+    ///
+    /// Row by row, keeping each source row's `created_at`: the transcript's order is its meaning, and
+    /// a branch that read as a scrambled version of the original is a conversation nobody can trust.
+    /// The search index is written in the same call, under the new ids — a branch that cannot be
+    /// searched is a conversation the search panel says does not exist.
+    pub fn copy_through(&self, from: i64, to: i64, through_id: i64) -> Result<usize, StoreError> {
+        if from == to {
+            return Err(StoreError::Invalid(
+                "a branch cannot copy a conversation into itself".to_string(),
+            ));
+        }
+        let now = now_ts();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, reasoning, tool_call_id, tool_calls_json,
+                    reasoning_signature, reasoning_ms, files, tool_meta_json, created_at
+             FROM messages WHERE session_id = ?1 AND id <= ?2 ORDER BY id ASC",
+        )?;
+        let src: Vec<(i64, String, String, String, Option<String>, String, String, i64, String, String, i64)> = stmt
+            .query_map(params![from, through_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut copied = 0usize;
+        for (sid, role, content, reasoning, tool_call_id, tool_calls, sig, ms, files, meta, created) in src {
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, reasoning, reasoning_signature, reasoning_ms,
+                                       tool_call_id, tool_calls_json, tool_meta_json, files, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![to, role, content, reasoning, sig, ms, tool_call_id, tool_calls, meta, files, created],
+            )?;
+            let new_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO messages_fts (rowid, content, session_id, message_id, role)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![new_id, content, to, new_id, role],
+            )?;
+            conn.execute(
+                "INSERT INTO attachments (message_id, mime, name, data_b64, created_at)
+                 SELECT ?1, mime, name, data_b64, ?2 FROM attachments WHERE message_id = ?3",
+                params![new_id, now, sid],
+            )?;
+            copied += 1;
+        }
+        // The branch is a conversation with content in it, so it belongs at "now": a fresh row that
+        // keeps the source's old `updated_at` sorts behind everything in the sidebar list, which reads
+        // as the branch never happened.
+        conn.execute("UPDATE sessions SET updated_at = ?2 WHERE id = ?1", params![to, now])?;
+        Ok(copied)
+    }
+
     pub fn messages(&self, session_id: i64) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1457,6 +1528,10 @@ pub trait StoreOps: Send + Sync {
     /// the person corrects has to read corrected on every screen, from every device.
     fn edit_message(&self, message_id: i64, content: &str) -> Result<bool, StoreError>;
     fn truncate_from(&self, session_id: i64, from_id: i64) -> Result<usize, StoreError>;
+    /// See [`Store::copy_through`] — the row copy a branch is built from. Both cores need it: on the
+    /// Rust core it *is* the branch, and on the pi core it writes the record that sits beside the
+    /// thread pi forks.
+    fn copy_through(&self, from: i64, to: i64, through_id: i64) -> Result<usize, StoreError>;
     /// See `Store::message_attachments`.
     fn message_attachments(&self, message_id: i64) -> Result<Vec<crate::provider::Attachment>, StoreError>;
     fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError>;
@@ -1516,6 +1591,9 @@ impl StoreOps for Store {
     }
     fn set_session_web(&self, id: i64, on: bool) -> Result<(), StoreError> {
         Store::set_session_web(self, id, on)
+    }
+    fn copy_through(&self, from: i64, to: i64, through_id: i64) -> Result<usize, StoreError> {
+        Store::copy_through(self, from, to, through_id)
     }
     fn db_path(&self) -> String {
         Store::db_path(self)

@@ -316,6 +316,19 @@ impl HostOps for PiHost {
         self.push(HostCmd::Cancel);
     }
 
+    /// Ask the model task to fork pi's thread and wait for the conversation it made.
+    ///
+    /// Only that task may talk to the child, and the answer is a row id the caller has to open, so
+    /// this is the one verb on this seam that answers rather than merely queues. `Err` means nothing
+    /// was created: no row, no fork file, the original thread where it was.
+    async fn branch(&self, req: &cwoffee_engine::branch::BranchReq) -> Result<cwoffee_engine::branch::BranchOutcome, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(HostCmd::Branch { req: req.clone(), reply: tx })
+            .map_err(|_| "the model task is gone; nothing was branched".to_string())?;
+        rx.await.map_err(|_| "the model task ended without answering the branch".to_string())?
+    }
+
     /// This host is a `pi --mode rpc` child. Named here rather than inferred by the caller from
     /// `CWOFFEE_CORE`: the environment says what was asked for, this says what is running.
     fn core_id(&self) -> &'static str {
@@ -1251,7 +1264,17 @@ impl Engine {
             // thing, and then it stops trying.
             launch.system_prompt = Some(cowork_prompt_with_workspace_note(lean, &launch.workdir));
         }
-        launch.session_file = self.map.get(self.row()).map(str::to_string).map(PathBuf::from);
+        // Resume this row's own thread — when the file is there. A branch's file is created by pi
+        // when the first entry is appended to it, so a branch nobody has spoken into yet has a
+        // recorded path and no file. Handing pi a path it cannot open is a launch that fails, and a
+        // window that will not start is worse than a branch that starts as a fresh thread with its
+        // transcript said out loud, which is what `enter_row` does for an unmapped row.
+        launch.session_file = self
+            .map
+            .get(self.row())
+            .filter(|f| std::fs::metadata(f).is_ok())
+            .map(str::to_string)
+            .map(PathBuf::from);
         // Name the root for the tools instead of trusting an inherited cwd. A shim that
         // guesses its confinement from the shell that spawned it is a shim that will be
         // right until someone changes how it is started.
@@ -1418,7 +1441,7 @@ impl Engine {
         // `scripts/gateway-midturn-switch.mjs` gates the rule on both cores.
         if matches!(
             cmd,
-            HostCmd::SwitchSession { .. } | HostCmd::ClearSession | HostCmd::NewSession { .. } | HostCmd::SetPersona { .. } | HostCmd::Rewind { .. } | HostCmd::ReloadProvider
+            HostCmd::SwitchSession { .. } | HostCmd::ClearSession | HostCmd::NewSession { .. } | HostCmd::SetPersona { .. } | HostCmd::Rewind { .. } | HostCmd::Branch { .. } | HostCmd::ReloadProvider
         )
             && (self.tr.running() || self.state.lock().unwrap().busy)
         {
@@ -1430,6 +1453,7 @@ impl Engine {
             HostCmd::SetContextBudget { target } => self.set_budget(target),
             HostCmd::Send { text, attachments, session } => self.on_send(text, attachments, session).await,
             HostCmd::Rewind { session } => self.rewind_row(session).await,
+            HostCmd::Branch { req, reply } => self.branch_row(req, reply).await,
             HostCmd::SetWeb { on } => self.set_web(on).await,
             HostCmd::ReloadProvider => self.reload_provider().await,
             HostCmd::Cancel => {
@@ -2010,7 +2034,10 @@ impl Engine {
         let _ = self.ev.send(EngineEvent::SessionChanged { session_id: id, title: title.to_string() });
         if self.child.as_ref().map(|c| c.is_up()) == Some(true) {
             let mut fresh_thread = false;
-            match self.map.get(id) {
+            // A mapped path that is not on disk is a branch nobody has spoken into yet: pi wrote
+            // nothing to it. Saying so beats `switch_session`, which would fail on a file pi cannot
+            // open, and beats pretending the conversation has a thread it does not have.
+            match self.map.get(id).filter(|f| std::fs::metadata(f).is_ok()) {
                 Some(file) => {
                     let req = json!({ "type": "switch_session", "sessionPath": file });
                     match self.request(req, Duration::from_secs(15)).await {
@@ -2030,9 +2057,15 @@ impl Engine {
                         if let Ok(d) = self.request(json!({ "type": "get_state" }), Duration::from_secs(10)).await {
                             self.absorb_state(&d);
                         }
+                        // Two different reasons for the same fresh thread, and they read differently
+                        // from the chair: a conversation imported from the Rust core never had a pi
+                        // thread, and a branch's thread exists as a path until its first message is
+                        // written to it.
+                        let branched = self.map.get(id).is_some();
                         self.note(format!(
-                            "conversation {id} has no pi thread of its own yet, so the model starts this one from \
-                             scratch; the stored transcript is unchanged"
+                            "conversation {id} has no pi thread of its own{}, so the model starts this one from \
+                             scratch; the stored transcript is unchanged",
+                            if branched { ", because its branch has not been spoken into yet" } else { "" }
                         ));
                     }
                 }
@@ -2186,7 +2219,7 @@ impl Engine {
                 return;
             }
         };
-        let pruned = match rewind::prune_to_user_messages(&text, keep) {
+        let pruned = match self.cut_thread(&text, keep).await {
             Ok(p) => p,
             Err(e) => {
                 self.err(format!(
@@ -2196,7 +2229,7 @@ impl Engine {
                 return;
             }
         };
-        if pruned.dropped == 0 {
+        if pruned.dropped_entries == 0 {
             // Nothing to do, said out loud rather than left silent: the person just asked for the
             // thread to go back, and "it was already there" is the answer.
             self.note(format!(
@@ -2258,11 +2291,274 @@ impl Engine {
                 st.reasoning_overridden = self.row_thinking.contains_key(&row);
             }
         }
+        let mut extra = String::new();
+        if pruned.branched {
+            // Branching put more than one path through this file. A rewind keeps the one the person
+            // is on and drops the rest, which is what "take this conversation back" asks for — but
+            // it is not what every reader expects, so it gets said.
+            extra.push_str(" This thread had more than one path through it; the path you were not on went with it.");
+        }
         self.note(format!(
-            "pi's thread for conversation {row} is back to {keep} of your messages; {} of its entries \
-             went with the stretch you removed.",
-            pruned.dropped
+            "pi's thread for conversation {row} is back to {keep} of your messages, counted from {}; \
+             {} of its entries went with the stretch you removed.{extra}",
+            pruned.leaf, pruned.dropped_entries
         ));
+    }
+
+    /// Cut a thread file to the branch the person is on, ending at the `keep`-th of their messages.
+    ///
+    /// The leaf comes from pi when pi is reachable: context is built by walking from the leaf to
+    /// the root, so the file's line order is not its conversation order, and a rewrite that used
+    /// line order would keep entries from a path nobody is on. With no child to ask, the file's
+    /// last entry is the honest fallback — every entry this app appends becomes the leaf — and the
+    /// returned [`rewind::Pruned::leaf`] says which of the two was used.
+    async fn cut_thread(&self, text: &str, keep: usize) -> Result<rewind::Pruned, String> {
+        let leaf = match self.request(json!({ "type": "get_entries" }), Duration::from_secs(10)).await {
+            Ok(d) => d
+                .get("leafId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Err(_) => None,
+        };
+        rewind::prune_to_user_messages_with_leaf(text, keep, leaf.as_deref())
+    }
+
+    /// Make a second conversation out of part of this one, on pi's own tree.
+    ///
+    /// pi's `fork` copies the source file's prefix into a **new file** and re-binds the running
+    /// process to it, which is what makes a branch on this core real: the original thread keeps its
+    /// own file and its own later messages, and the new thread is a separate file pi can append to.
+    /// `clone` is the same thing asked at the leaf — the whole conversation, copied.
+    ///
+    /// Order, and why: adopt the source row (pi can only fork the thread it is on), fork, then write
+    /// the record. If the fork is refused there is no row and no file, which is the state a person
+    /// can act on; a row whose thread pi never made is a conversation that reads branched and
+    /// answers blank, and that is not a state anybody can fix from the transcript.
+    async fn branch_row(
+        &mut self,
+        req: cwoffee_engine::branch::BranchReq,
+        reply: oneshot::Sender<Result<cwoffee_engine::branch::BranchOutcome, String>>,
+    ) {
+        let from = req.session;
+        let fail = |reason: String, reply: oneshot::Sender<Result<cwoffee_engine::branch::BranchOutcome, String>>| {
+            // One place, so a refusal never goes back with half an answer attached to it.
+            let _ = reply.send(Err(reason));
+        };
+        let source = match self.cfg.store.session(from) {
+            Ok(Some(row)) => row,
+            Ok(None) => return fail(format!("conversation {from} does not exist, so nothing was branched"), reply),
+            Err(e) => return fail(format!("conversation {from} could not be read ({e}), so nothing was branched"), reply),
+        };
+        // pi forks the thread it is holding. A conversation this window is only looking at has to
+        // be opened first, which is the same adopt-then-act the Rust core does by replaying rows.
+        if self.row() != from {
+            if !self.enter_row(from, &source.title).await {
+                return fail(format!(
+                    "conversation {from} could not be opened, so nothing was branched; this window \
+                     stays where it was"
+                ), reply);
+            }
+        }
+        if self.child.as_ref().map(|c| c.is_up()) != Some(true) {
+            if let Err(e) = self.ensure_child().await {
+                return fail(format!("the model process could not be started ({e}), so nothing was branched"), reply);
+            }
+        }
+        let rows = match self.cfg.store.messages(from) {
+            Ok(r) => r,
+            Err(e) => return fail(format!("the transcript of conversation {from} could not be read ({e}), so nothing was branched"), reply),
+        };
+        let point = match cwoffee_engine::branch::resolve(&rows, &req) {
+            Ok(p) => p,
+            Err(reason) => return fail(reason, reply),
+        };
+
+        // Which entry of pi's thread the branch starts at. cwoffee's transcript and pi's thread are
+        // two records of one conversation, and this is the moment they have to agree: pi offers the
+        // user messages of the branch it is on, and the counts and the words are compared before
+        // anything is forked. A branch made at the wrong entry is a second conversation with wrong
+        // history in it, which no note can undo.
+        let entry_id: Option<String> = if point.whole {
+            None // `clone` forks at the leaf, which is where the whole conversation ends
+        } else {
+            let listed = match self.request(json!({ "type": "get_fork_messages" }), Duration::from_secs(12)).await {
+                Ok(d) => d.get("messages").and_then(Value::as_array).cloned().unwrap_or_default(),
+                Err(e) => {
+                    return fail(format!(
+                        "pi could not list the messages this thread can branch from ({e}), so nothing \
+                         was branched"
+                    ), reply)
+                }
+            };
+            // The person's messages, in transcript order, from both records.
+            let mine: Vec<&cwoffee_engine::store::StoredMessage> =
+                rows.iter().filter(|m| m.role == "user").collect();
+            if listed.len() != mine.len() {
+                return fail(format!(
+                    "the record of conversation {from} holds {} of your messages and pi's thread holds \
+                     {}; they are not the same conversation, so nothing was branched. Reopen \
+                     conversation {from} and try again — if the two still disagree, the branch would \
+                     start from a message the model never read."
+                    , mine.len(), listed.len()), reply);
+            }
+            // The row to fork at: the person's own message, or — when the branch starts from an
+            // answer — the message that came after it, since pi forks *before* the entry it is
+            // given and that is what keeps the answer inside the branch.
+            let wanted = if point.role == "user" {
+                mine.iter().position(|m| m.id == point.row_id)
+            } else {
+                mine.iter().position(|m| m.id > point.row_id)
+            };
+            let Some(i) = wanted else {
+                return fail(
+                    "this branch starts past the last message of the conversation, so there is no \
+                     entry to fork at; nothing was branched".to_string(),
+                    reply,
+                );
+            };
+            let Some(hit) = listed.get(i) else {
+                return fail(format!(
+                    "pi's thread has no message at position {i}, though it listed {} — the two records \
+                     moved apart mid-branch, so nothing was branched",
+                    listed.len()
+                ), reply);
+            };
+            let entry = hit.get("entryId").and_then(Value::as_str).unwrap_or_default().to_string();
+            if entry.is_empty() {
+                return fail("pi named no entry to branch at, so nothing was branched".to_string(), reply);
+            }
+            // The words, checked against pi's copy of them. `shown` already proved this window's row;
+            // this proves the entry is the same message.
+            let theirs = hit.get("text").and_then(Value::as_str).unwrap_or_default();
+            let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mine_row = mine[i].content.clone();
+            if norm(theirs) != norm(&mine_row) {
+                return fail(format!(
+                    "pi's message at that position says something else — {} — while conversation {from} \
+                     holds {}, so nothing was branched from it"
+                    , crate::rewind::quote(theirs), crate::rewind::quote(&mine_row)), reply);
+            }
+            Some(entry)
+        };
+
+        if let Some(entry) = entry_id.as_deref() {
+            match self.request(json!({ "type": "fork", "entryId": entry }), Duration::from_secs(20)).await {
+                Ok(d) if d.get("cancelled").and_then(|v| v.as_bool()) == Some(true) => {
+                    return fail("an extension refused the branch, so nothing was created".to_string(), reply)
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return fail(format!(
+                        "pi could not fork this thread at that message ({e}), so nothing was branched"
+                    ), reply)
+                }
+            }
+        } else {
+            match self.request(json!({ "type": "clone" }), Duration::from_secs(20)).await {
+                Ok(d) if d.get("cancelled").and_then(|v| v.as_bool()) == Some(true) => {
+                    return fail("an extension refused the clone, so nothing was created".to_string(), reply)
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return fail(format!(
+                        "pi could not copy this conversation ({e}), so nothing was branched"
+                    ), reply)
+                }
+            }
+        }
+
+        // The new file pi is now answering from. pi creates it on the first entry appended to it,
+        // so the path is recorded even when it is not on disk yet — and `enter_row` and the next
+        // launch both check for existence instead of trusting the path.
+        let thread = match self.request(json!({ "type": "get_state" }), Duration::from_secs(10)).await {
+            Ok(d) => d.get("sessionFile").and_then(Value::as_str).map(str::to_string),
+            Err(e) => {
+                self.err(format!(
+                    "pi forked the thread but would not say which file it is now on ({e}); the record \
+                     was not written, so nothing was branched"
+                ));
+                // pi is holding a thread cwoffee has no row for. Put it back where it was, or the
+                // next turn lands in a conversation nothing lists.
+                if let Some(old) = self.map.get(from).map(str::to_string) {
+                    let _ = self.request(json!({ "type": "switch_session", "sessionPath": old }), Duration::from_secs(15)).await;
+                }
+                return fail("the branch's thread was made but not recorded, so nothing was branched".to_string(), reply);
+            }
+        };
+        let Some(thread) = thread else {
+            if let Some(old) = self.map.get(from).map(str::to_string) {
+                let _ = self.request(json!({ "type": "switch_session", "sessionPath": old }), Duration::from_secs(15)).await;
+            }
+            return fail("pi reported no thread after the fork, so nothing was branched".to_string(), reply);
+        };
+
+        let (new_id, title, copied) = match cwoffee_engine::branch::create_row(&*self.cfg.store, from, &point) {
+            Ok(v) => v,
+            Err(reason) => {
+                // The fork exists in pi's directory and the process is on it, but there is no row
+                // to open it from. Say so, and go back to the source rather than leaving the person
+                // answering into a thread they cannot find again.
+                let _ = self.request(json!({ "type": "switch_session", "sessionPath": &thread }), Duration::from_secs(15)).await;
+                if let Some(old) = self.map.get(from).map(str::to_string) {
+                    let _ = self.request(json!({ "type": "switch_session", "sessionPath": old }), Duration::from_secs(15)).await;
+                }
+                self.err(format!(
+                    "pi made the branch's thread at {thread}, but the record of the new conversation \
+                     could not be written ({reason}); this window went back to conversation {from}. \
+                     The thread file is still there — deleting it is safe, it holds nothing else."
+                ));
+                return fail(reason, reply);
+            }
+        };
+        self.map.set(new_id, &thread);
+
+        self.resume_announced.insert(new_id);
+        // The thinking effort the person chose for the source follows the branch: pi copied the
+        // entry that records it, and this map is what makes a later reopen keep it rather than
+        // pi's own default.
+        if let Some(t) = self.row_thinking.get(&from).copied() {
+            self.row_thinking.insert(new_id, t);
+        }
+        if let Some(t) = self.applied_thinking.get(&from).copied() {
+            self.applied_thinking.insert(new_id, t);
+        }
+
+        {
+            let mut st = self.state.lock().unwrap();
+            st.session_id = new_id;
+        }
+        self.tr.session = new_id;
+        let _ = self.ev.send(EngineEvent::SessionChanged { session_id: new_id, title: title.clone() });
+        // Publish what the forked thread actually runs at, rather than what the source row was
+        // asking for: pi restored the level from the copied entries, and that is the answer.
+        if let Ok(d) = self.request(json!({ "type": "get_state" }), Duration::from_secs(10)).await {
+            self.absorb_state(&d);
+            if let Some(lvl) = d
+                .get("thinkingLevel")
+                .and_then(|v| v.as_str())
+                .and_then(from_pi_level)
+            {
+                let mut st = self.state.lock().unwrap();
+                st.reasoning = lvl;
+            }
+        }
+
+        let note = cwoffee_engine::branch::outcome_note(from, &point, new_id, copied, &title);
+        // Which thread pi is now answering from, and where the one it was on still is. pi writes the
+        // forked file when its first entry is appended, so a branch nobody has spoken into has a
+        // path and no file — and that difference is the difference between "the branch is empty"
+        // and "the branch is a thread waiting for a word".
+        let named = std::fs::metadata(&thread).ok().map(|_| thread.clone());
+        let memory = cwoffee_engine::branch::memory_note("pi", named.as_deref());
+        let note = if memory.is_empty() { note } else { format!("{note} {memory}") };
+        self.note(note.clone());
+        let _ = reply.send(Ok(cwoffee_engine::branch::BranchOutcome {
+            session: new_id,
+            title,
+            copied,
+            prefill: point.ask,
+            note,
+        }));
     }
 
     async fn on_send(&mut self, text: String, attachments: Vec<Attachment>, session: Option<i64>) {

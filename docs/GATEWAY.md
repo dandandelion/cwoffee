@@ -94,7 +94,7 @@ Two roles, enforced server-side per command:
   `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
   `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`,
   `set_workspace_color`, `set_session_web`, `provider_set_primary`,
-  `export_markdown`, `edit_message`.
+  `export_markdown`, `edit_message`, `branch_conversation`.
 
 `share_markdown` takes `{ session }` and returns `{ name, markdown }`: that conversation as a
 Markdown document, built from **the workspace stored on that session** rather than the host's
@@ -117,6 +117,25 @@ everything after it, hands the host a rewind, and puts the corrected words back 
 send path. Refused while a turn is running: the cut and the re-send are not atomic against a turn
 in flight. `visible` says whether the re-sent row was in the store by the time the verb answered,
 which is what makes a client's reload-after-edit safe.
+
+`branch_conversation` takes `{ session, message_id?, from_end?, role?, shown }` and returns
+`{ session, title, copied, prefill, note }` - or an error, which is how a refusal arrives. It opens a
+**second path** out of one message: the conversation the ask names keeps everything it has, and a new
+conversation is created holding the rows before that message (or, with `role: "assistant"`, that
+answer and everything before it). `prefill` is the words you branched from, handed back so a branch
+off your own message can be asked again differently; branching at an answer returns `null`, because
+an answer is not something to send.
+
+Like `edit_message` it is drive-only, and for the same two reasons: it writes rows, and it moves what
+the model can see onto the new conversation. It refuses while a turn is running - a mid-turn branch
+would leave that turn's output to land in whichever conversation the queue reached first.
+
+The identity arguments are the same discipline as the pencil's, and for the same reason: a phone tab,
+a desktop window and the harness all read one conversation, so the caller names the row (`message_id`,
+or `from_end` counting back from the newest among rows of `role`) and repeats the words it painted
+(`shown`). If that row says something else now, nothing is created and the error names what the row
+actually says. Both transports call one function (`cwoffee_engine::branch::apply_and_open`), so a
+phone cannot branch a conversation the desktop would refuse to branch.
 
 `message_attachments` takes `{ message_id }` and returns `[{ mime, data_b64, name }]` - the bytes
 behind one stored message. It exists because a transcript page deliberately carries name and size
