@@ -20,10 +20,10 @@
     WorkspaceRow,
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
-  import { Transcript, linkProbe, subjectFor, riskHeadline } from './lib/transcript'
+  import { Transcript, linkProbe, subjectFor, riskHeadline, WORKING_ART } from './lib/transcript'
   import type { AttachmentView } from './lib/transcript'
   import { describeLoop, LoopWatch } from './lib/loop'
-  import { LoopHold, IDLE_HOLD, aniFrames, armedFromUrl } from './lib/anipause'
+  import { LoopHold, IDLE_HOLD, aniFrames, armedFromUrl, assetBytes } from './lib/anipause'
   import { installContextMenu } from './lib/ctxmenu'
   import { pageLog } from './lib/pagelog'
   import Section from './lib/settings/Section.svelte'
@@ -1915,7 +1915,7 @@
   }
 
   function applyUnread(list: Session[]) {
-    const active = hostState?.session_id ?? 0
+    const active = readHere
     const next = new Set<number>()
     for (const s of list) {
       const seen = seenCounts[s.id]
@@ -1927,13 +1927,28 @@
   }
 
   function recordSeen(list: Session[]) {
-    const active = hostState?.session_id ?? 0
+    const active = readHere
     const s = list.find((x) => x.id === active)
     if (s) {
       seenCounts[active] = s.message_count
       saveSeen()
       if (unread.delete(active)) unread = new Set(unread)
     }
+  }
+
+  /**
+   * Mark the conversation on screen as read, on the spot.
+   *
+   * The poll tick already recomputes the dots, but a poll tick is not an answer to a click: opening
+   * a conversation is the moment its dot should go, and waiting for the next tick left it sitting
+   * there long enough to be reported as broken. Called where the view moves to a conversation; the
+   * turn-end refresh covers a conversation that grows while it is being watched, and a conversation
+   * you are reading while it grows is not unread.
+   */
+  function markViewRead() {
+    if (!readHere) return
+    recordSeen(sessions)
+    applyUnread(sessions)
   }
 
   // Time of day for the greeting; the sub-line is seeded by the date, so it
@@ -2448,6 +2463,23 @@
   let viewId = $state<number | null>(null)
 
   /**
+   * Which conversation counts as "being read", for the unread dot in the sidebar.
+   *
+   * This used to be `hostState?.session_id`, which is a different thing: opening a conversation is
+   * a *view*, not a switch - `adoptHostSession` says so out loud, because a watch-only client must
+   * not move the host's session by loading a page. So the host can be inside conversation 7 while
+   * conversation 12 is what the reader is looking at, and keying the read marker on the host marked
+   * 7 as read while 12 kept its dot however much of it was opened and scrolled. That is the "I
+   * cannot mark it as read even opening it and scrolling to the bottom" report, and it was never
+   * about scrolling: nothing ever recorded the conversation that was actually on screen.
+   *
+   * No fallback to the host when there is no view. On the start screen nothing is being read, and
+   * clearing a dot for a conversation nobody is looking at is the same mistake in the other
+   * direction.
+   */
+  const readHere = $derived(viewId ?? 0)
+
+  /**
    * A conversation typing its own name.
    *
    * `titleDelta` arrives once per token, carrying the name so far; the row is not
@@ -2546,16 +2578,18 @@
   // as what keeps looping if the fetch ever fails.
   let reducedMotion = $state(false)
   const idleArt = $derived(reducedMotion ? '/cwoffee_idle_still.webp' : '/cwoffee_initial_idle_1.webp')
+  /** The same file the run header's loader uses, so "working" is one drawing in the app. */
+  const workingArt = $derived(reducedMotion ? WORKING_ART.still : WORKING_ART.loop)
   let cupEl = $state<HTMLImageElement | null>(null)
   {
     const mq = matchMedia('(prefers-reduced-motion: reduce)')
     reducedMotion = mq.matches
     const sync = () => {
       reducedMotion = mq.matches
-      // The cups in a transcript decide their own picture at paint time, so a change to the
-      // setting has to reach them; waiting for the next turn would leave the conversation on
+      // The working loaders in a transcript pick their picture when they are made, so a change to
+      // the setting has to reach them; waiting for the next turn would leave the conversation on
       // screen still moving (or still) after the user already asked it not to.
-      transcript?.repaintCup()
+      transcript?.setMotion()
     }
     mq.addEventListener('change', sync)
     onDestroy(() => mq.removeEventListener('change', sync))
@@ -4205,6 +4239,11 @@
     void loadWorkspaces()
     try {
       sessions = await invoke<Session[]>('list_sessions')
+      // Where each conversation was last read is a record in storage, not a fact about this
+      // window: another window of the same app writes it too, and a check that writes it gets an
+      // answer. Boot used to be the only time it was read, so this window's copy drifted from the
+      // stored one for the rest of the session.
+      loadSeen()
       // Order matters: record what the open session looks like, then decide who
       // is unread relative to that. Reversing it marks the session you are
       // looking at as unread.
@@ -4348,6 +4387,8 @@
       for (const e of liveBuf) transcript?.apply(e)
     }
     await refreshState()
+    // Reading it is reading it. The session list is refreshed on a tick; this is the click.
+    markViewRead()
   }
 
   /**
@@ -5145,6 +5186,129 @@
       framePaints < 4 || rafStalls > framePaints * 3
         ? `the page reported ${framePaints} paint(s) against ${rafStalls} frame-clock timeout(s)`
         : null
+    /**
+     * Linear-light luminance of a colour this engine can name: `rgb()`, `rgba()`, `#rrggbb`,
+     * `color(srgb ...)` and `oklab()`. Two claims need it — whether the working loader's ink stands
+     * off the paper behind it, and whether it stands off the filled send button — and they need it
+     * on one scale: the shipped CSS answers `color-mix()` as `color(srgb ...)` in one palette and
+     * `oklab(...)` in the other, so a comparison that only understands `rgb()` silently grades one
+     * side as `null`. An unreadable colour is a failure of the claim, never a `NaN` that passes.
+     */
+    const lumOf = (raw: string): number | null => {
+      const c = (raw ?? '').trim().toLowerCase()
+      if (!c || c === 'transparent' || c === 'none') return null
+      const rgb = c.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/)
+      if (rgb) {
+        const [r, g, b] = [+rgb[1], +rgb[2], +rgb[3]]
+        const lin = (v: number) => (v /= 255) <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4
+        return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+      }
+      const hex = c.match(/^#([0-9a-f]{6})$/)
+      if (hex) return lumOf(`rgb(${parseInt(hex[1].slice(0, 2), 16)}, ${parseInt(hex[1].slice(2, 4), 16)}, ${parseInt(hex[1].slice(4, 6), 16)})`)
+      const srgb = c.match(/^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/)
+      if (srgb) return 0.2126 * +srgb[1] + 0.7152 * +srgb[2] + 0.0722 * +srgb[3]
+      const ok = c.match(/^oklab\(\s*([\d.]+)/)
+      if (ok) return +ok[1] * +ok[1] // oklab L is a cube-root-ish scale; squaring puts it near L*
+      return null
+    }
+    /** The artwork's opaque pixels, decoded once per call site. */
+    const markPixels = async (img: HTMLImageElement): Promise<Uint8ClampedArray | null> => {
+      if (!img.complete || !img.naturalWidth) {
+        await new Promise((res) => {
+          img.addEventListener('load', () => res(null), { once: true })
+          img.addEventListener('error', () => res(null), { once: true })
+          setTimeout(() => res(null), 1500)
+        })
+      }
+      if (!img.naturalWidth) return null
+      const cv = document.createElement('canvas')
+      cv.width = img.naturalWidth
+      cv.height = img.naturalHeight
+      const g = cv.getContext('2d')
+      if (!g) return null
+      g.drawImage(img, 0, 0)
+      try {
+        return g.getImageData(0, 0, cv.width, cv.height).data
+      } catch {
+        return null
+      }
+    }
+
+    /**
+     * The drawing's ink split into the hues it is actually drawn with, with this element's CSS
+     * `brightness()` applied. A mean is where a two-tone mark lies: the working loader is drawn in a
+     * slate hue and a terracotta hue, and on the send button's ink fill one of them is the one that
+     * disappears — and which one depends on the palette, because the fill itself flips. Averaging the
+     * two hues reports a number that describes neither. `brightness(f)` multiplies raw sRGB channels
+     * and clamps, which is what the CSS filter does, so the declared filter can be applied to the
+     * samples instead of rendering them.
+     */
+    const markHues = async (
+      img: HTMLImageElement,
+      brightness: number,
+    ): Promise<{ name: string; ink: string; lum: number; px: number }[]> => {
+      const d = await markPixels(img)
+      if (!d) return []
+      // Split on the artwork's own ink, then apply the filter inside each group. Sorting by
+      // brightness first would merge the two hues once a brightening filter pushes both past the
+      // split — which is what happened here: `brightness(1.25)` put the slate hue over the threshold,
+      // one bucket came back, and the check graded a mean of the very two hues it exists to separate.
+      const groups = new Map<string, { n: number; r: number; g: number; b: number }>()
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] < 40) continue
+        const raw = lumOf(`rgb(${d[i]}, ${d[i + 1]}, ${d[i + 2]})`)
+        if (raw === null) continue
+        const mul = (v: number) => Math.min(255, Math.max(0, v * brightness))
+        const name = raw < 0.18 ? 'dark hue' : 'light hue'
+        const cur = groups.get(name) ?? { n: 0, r: 0, g: 0, b: 0 }
+        cur.n += 1
+        cur.r += mul(d[i])
+        cur.g += mul(d[i + 1])
+        cur.b += mul(d[i + 2])
+        groups.set(name, cur)
+      }
+      return [...groups.entries()].map(([name, c]) => {
+        const mixed = `rgb(${Math.round(c.r / c.n)}, ${Math.round(c.g / c.n)}, ${Math.round(c.b / c.n)})`
+        return { name, ink: mixed, lum: lumOf(mixed) ?? 0, px: c.n }
+      })
+    }
+
+    /** The artwork's own ink, read off its pixels: what the picture actually draws, not what CSS says. */
+    const markInk = async (img: HTMLImageElement): Promise<string | null> => {
+      if (!img.complete || !img.naturalWidth) {
+        await new Promise((res) => {
+          img.addEventListener('load', () => res(null), { once: true })
+          img.addEventListener('error', () => res(null), { once: true })
+          setTimeout(() => res(null), 1500)
+        })
+      }
+      if (!img.naturalWidth) return null
+      const cv = document.createElement('canvas')
+      cv.width = img.naturalWidth
+      cv.height = img.naturalHeight
+      const g = cv.getContext('2d')
+      if (!g) return null
+      g.drawImage(img, 0, 0)
+      let d: Uint8ClampedArray
+      try {
+        d = g.getImageData(0, 0, cv.width, cv.height).data
+      } catch {
+        return null
+      }
+      let n = 0
+      let r = 0
+      let gg = 0
+      let b = 0
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] < 40) continue
+        n += 1
+        r += d[i]
+        gg += d[i + 1]
+        b += d[i + 2]
+      }
+      return n ? `rgb(${Math.round(r / n)}, ${Math.round(gg / n)}, ${Math.round(b / n)})` : null
+    }
+
     const blind = async (where: string) => {
       let b = offScreen()
       if (!b) return false
@@ -6516,9 +6680,17 @@
             const titles = [...side.querySelectorAll('.sess-title')].map((e) => e.textContent)
             if (!titles.includes('selftest chat list'))
               fail(`the chat list does not contain the chat it made: ${JSON.stringify(titles.slice(0, 8))}`)
-            const main = document.querySelector('main') ?? document.body
-            if (!(main.textContent ?? '').includes('Chat has no folder'))
-              fail('the composer still offers a folder line where a chat owns none')
+            // A chat owns no folder, so the composer offers no folder row at all — and no row that
+            // stands in its place explaining the absence. Both shapes are caught, because the old
+            // build had the second one: a sentence under the composer that cost a line of the card
+            // to say something the mode already says.
+            const stray = document.querySelector('.composerbar .wsrow, .composerbar .ws-err, .composerbar [data-ws-chip]')
+            if (stray)
+              fail(
+                `chat mode still draws a folder line under the composer: <${stray.tagName.toLowerCase()} class="${stray.className}"> ${JSON.stringify(
+                  (stray.textContent ?? '').trim().slice(0, 44),
+                )}`,
+              )
             // No approvals control at all. It used to be replaced by a inert label carrying
             // `data-approvals="none"`; that slot now holds the one tool decision a chat does have
             // (see the Web chip), so the claim here is the simpler one: nothing in a chat's composer
@@ -11163,8 +11335,7 @@
             const intruder = sibs.slice(sibs.indexOf(row) + 1).find(
               (n) =>
                 !n.classList.contains('turn-acts') &&
-                !n.classList.contains('blk-user') &&
-                !n.classList.contains('transcript-cup'),
+                !n.classList.contains('blk-user'),
             )
             if (intruder)
               fail(
@@ -11240,6 +11411,50 @@
           mo.observe(h, { attributes: true, attributeFilter: ['style', 'class'] })
           moRef.o = mo
         }
+        // The "can you see the reveal at all" count is measured on the frame clock, not once per
+        // delta. The per-delta sample landed on whichever side of the transcript's own flush it
+        // happened to fall: just before it, the newest words were at the start of their fade and
+        // got counted; just after it, they were already ~150ms old, their 130ms animation was
+        // over, and the same feature reported zero. That is how this claim went from 7 to 0 on a
+        // change that touched nothing about the reveal — it had been grading poll phase, not
+        // animation. A word fades for 130ms and a frame here is ~20ms, so a sampler that runs on
+        // every painted frame sees each word mid-fade half a dozen times, and zero means the
+        // reveal really did not run.
+        let samplerOn = true
+        let samplerPaints = 0
+        let samplerPeak = 0
+        // Paints alone are not enough of a witness. On an off-screen window the transcript is laid
+        // out as nothing at all — the app's own diagnostic caught exactly that: `op=1
+        // anim=cwoffee-tin/running box=0,0 0x0`, an animation *running* on spans with no box,
+        // because an element with no box is never painted and a fade that is never painted sits at
+        // its base value forever. Grading "the reveal is invisible" against that grades the window,
+        // not the reveal, so only a frame in which a word had a box counts, and a run that never got
+        // one says so instead of failing.
+        let samplerLaidOut = 0
+        let noBoxLayout = ''
+        const sampler = () => {
+          if (!samplerOn) return
+          samplerPaints += 1
+          const live = document.querySelector('.blk-answer .blk-body')
+          if (live) {
+            const tins = live.querySelectorAll('.tin')
+            const newest = tins[tins.length - 1] as HTMLElement | undefined
+            const box = newest?.getBoundingClientRect()
+            if (box && box.width > 0 && box.height > 0) {
+              samplerLaidOut += 1
+              let midFade = 0
+              for (const t of tins) if (Number(getComputedStyle(t).opacity) < 0.9) midFade += 1
+              if (midFade > samplerPeak) samplerPeak = midFade
+            } else if (!noBoxLayout && tins.length) {
+              const cs = newest ? getComputedStyle(newest) : null
+              noBoxLayout =
+                `${tins.length} word span(s) with a ${box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'missing'} box` +
+                (cs ? `, while its animation reads ${cs.animationName}/${cs.animationPlayState} at opacity ${cs.opacity}` : '')
+            }
+          }
+          requestAnimationFrame(sampler)
+        }
+        requestAnimationFrame(sampler)
         for (const d of deltas) {
           transcript?.apply({ kind: 'text', d })
           // One paint per delta: the reveal unit is whatever landed since the last
@@ -11280,7 +11495,7 @@
           // filter: blur(0.001965px)" and "a word ... sits at opacity 0.972074". Those numbers are
           // an animation that never advanced, not a reveal that would not finish. So the claim needs
           // a clock that has been seen to tick: a few paints across the streaming loop, not one.
-          const clockTicking = animPaints >= 3
+          const clockTicking = animPaints >= 3 && samplerLaidOut >= 2
           if (clockTicking) judged += atRest.length
           for (const t of clockTicking ? atRest.slice(-8) : []) {
             const cs = getComputedStyle(t)
@@ -11297,6 +11512,8 @@
           if (inFlight > maxInFlight) maxInFlight = inFlight
           if (inFlight > 24)
             fail(`${inFlight} words fading at once: the newest line is grey for lines of reading`)
+          if (samplerPeak > 24)
+            fail(`${samplerPeak} words fading at once at the busiest painted moment: the newest line is grey for lines of reading`)
         }
         const body = document.querySelector('.blk-answer .blk-body') as HTMLElement
         const br = body.getBoundingClientRect()
@@ -11312,16 +11529,31 @@
           fail('the thinking block is one line wide, not filling the column')
         if (seen.length < deltas.length)
           fail(`${seen.length} spans for ${deltas.length} arrivals: words are being merged or dropped`)
-        // Both claims are about animation, so both need animation to be observable.
-        if (animPaints < 2) {
+        samplerOn = false
+        // Both claims are about animation, so both need animation to be observable — and the
+        // witness is the sampler's own paints, not the deltas' `frame()` results: a window that
+        // ran two polls but composited nothing in between shows no animation to anyone.
+        if (animPaints < 2 || samplerPaints < 2) {
           blindSkips++
           pageLog(
             `selftest note: skipped the reveal-visibility and settled-word claims; this check saw ` +
-              `${animPaints} real paint(s), and an un-composited window freezes every reveal at its start`,
+              `${animPaints} real paint(s) across its deltas and ${samplerPaints} painted frame(s) in its own sampler, ` +
+              `and an un-composited window freezes every reveal at its start`,
           )
-        } else if (maxInFlight < 4)
-          fail(`only ${maxInFlight} words were ever mid-fade at once: the reveal is invisible`)
-        if (animPaints >= 2 && judged < 4)
+        } else if (samplerLaidOut < 2) {
+          blindSkips++
+          pageLog(
+            `selftest note: skipped the reveal-visibility claim; ${
+              noBoxLayout ?? 'no word span reached this check'
+            } over ${samplerPaints} painted frame(s). A word with no box is never painted, and a fade nobody paints keeps its start value forever — that is the 0 mid-fade this claim would otherwise report as "the reveal is invisible".`,
+          )
+        } else if (samplerPeak < 4)
+          fail(
+            `only ${samplerPeak} words were ever mid-fade at once, across ${samplerLaidOut} laid-out painted frame(s): the reveal is invisible${
+              noBoxLayout ? ` (early frames: ${noBoxLayout})` : ''
+            }`,
+          )
+        if (animPaints >= 2 && samplerLaidOut >= 2 && judged < 4)
           fail(`only ${judged} spans were ever old enough to judge: the reveal check sampled too early`)
         moRef.o?.disconnect()
         if (!watched) fail('no streaming paragraph to watch for style churn')
@@ -11535,12 +11767,21 @@
       {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 3, model: 'selftest', session_id: 0 } })
+        // The loader lives in a run group's header, so the turn under measurement has to have a run
+        // in it. A prose-only turn has no mark of its own — the composer's send button carries that
+        // case — and a check that found no mark here would be grading a fixture, not the app.
+        transcript?.apply({ kind: 'toolCallBegin', d: { id: 'm1', name: 'read_file' } })
+        transcript?.apply({ kind: 'toolExecEnd', d: { id: 'm1', ok: true, exit_code: 0, changes: [] } })
         transcript?.apply({ kind: 'text', d: 'The first words of the answer are landing ' })
         await frame(40)
         transcript?.flushNow()
         const measure = (where: string) => {
           const b = document.querySelector('.blk-answer .blk-body') as HTMLElement
-          const mark = document.querySelector('.turn-who.live > .turn-working') as HTMLElement | null
+          // Either home for the loader: the run header when the turn has an accordion, the loose one
+          // after the last thing the turn wrote when it does not (`syncWorking` in transcript.ts).
+          const mark = document.querySelector(
+            '.blk-run > .blk-head > .run-working, .turn > .run-working.turn-tail',
+          ) as HTMLElement | null
           const first = b?.firstElementChild
           const walk = document.createTreeWalker(first ?? new DocumentFragment(), NodeFilter.SHOW_TEXT)
           const tn = (first ? walk.nextNode() : null) as Text | null
@@ -11553,30 +11794,52 @@
           rng.setEnd(tn, 1)
           const line = rng.getBoundingClientRect()
           const mr = mark?.getBoundingClientRect()
-          const clearance = mr ? line.left - mr.right : 0
-          // A pinned mark must stay inside the box that clips it. The row it hangs from sticks to
-          // the top of the pane, above the pane's padding, and a picture raised above that line is
-          // cut by the scroller's own edge.
-          const scB = document.querySelector('.scroller') as HTMLElement | null
-          if (mr && scB && scB.clientHeight > 40 && mr.top < scB.getBoundingClientRect().top - 1)
-            fail(
-              `the working mark reaches ${Math.round(scB.getBoundingClientRect().top - mr.top)}px above the top of the box that clips it, so a pinned mark is drawn with its top missing`,
-            )
+          // Inline in a header line above the prose, the question is no longer "how far is the mark
+          // from the first glyph" but "is the mark ever drawn on top of the prose". It answers
+          // itself, which is worth a line of code to keep: a mark that grew absolute, or grew past
+          // its header row, is a picture across someone's sentence.
+          const variant = !mr ? '' : mark!.classList.contains('turn-tail') ? 'tail' : 'head'
+          // For a header mark the question is "is it ever drawn on top of the prose" — it answers
+          // itself, which is worth a line of code to keep: a mark that grew absolute, or grew past
+          // its header row, is a picture across someone's sentence. For a tail mark the mark comes
+          // after the answer, so the same question inverts: it must be below the writing and lined
+          // up with the column, not floating beside it.
+          let clearance = 0
+          if (mr && variant === 'head') {
+            clearance = line.top - mr.bottom
+            const across = line.top < mr.bottom - 1 && line.left < mr.right && line.right > mr.left
+            if (across)
+              fail(
+                `the loader is painted over the answer's first line (mark ${Math.round(mr!.top)}..${Math.round(mr!.bottom)} top, ` +
+                  `line ${Math.round(line.top)} top starting at ${Math.round(line.left)})`,
+              )
+          } else if (mr) {
+            clearance = mr.top - line.bottom
+            if (clearance < 0) fail(`the loose loader sits ${(-clearance).toFixed(1)}px into the answer's first line instead of after it`)
+            if (Math.abs(mr.left - line.left) > 1.5)
+              fail(`the loose loader is ${(mr.left - line.left).toFixed(1)}px off the prose column it follows`)
+          }
+          const live = document.querySelectorAll('.transcript .run-working')
+          if (live.length > 1) fail(`${live.length} working loaders in one turn: the header mark and the loose one are both painted`)
           pageLog(
-            `working mark (${where}): ${
-              mr ? `${Math.round(mr.width)}x${Math.round(mr.height)} at ${Math.round(mr.left)},${Math.round(mr.top)}, ${clearance.toFixed(1)}px clear of the text` : 'no mark'
+            `working mark (${where}, ${variant || 'none'}): ${
+              mr
+                ? `${Math.round(mr.width)}x${Math.round(mr.height)} at ${Math.round(mr.left)},${Math.round(mr.top)}, ${clearance.toFixed(
+                    1,
+                  )}px ${variant === 'tail' ? 'below' : 'above'} the answer's first line`
+                : 'no mark'
             }, first line left ${Math.round(line.left)} top ${Math.round(line.top)}`,
           )
-          return { mark, line, clearance }
+          return { mark, line, clearance, variant }
         }
         const mid = measure('while generating')
-        if (!mid.mark) fail('a streaming turn shows no working mark in the gutter')
+        if (!mid.mark) fail('a streaming turn with a working run shows no loader in its header')
         else {
+          if (mid.variant !== 'head') fail('a turn with a working run put its loader somewhere other than the run header')
           if (getComputedStyle(mid.mark).display === 'none') fail('the working mark is in the page but not painted')
-          if (mid.clearance < 4)
-            fail(`the working mark crowds the answer: ${mid.clearance.toFixed(1)}px between it and the first line`)
+          if (mid.clearance < 0) fail(`the working mark overlaps the answer's own header line: ${mid.clearance.toFixed(1)}px`)
           const src = mid.mark.getAttribute('src') ?? ''
-          if (!/cwoffee_turn_working/.test(src)) fail(`the gutter shows ${src || 'nothing'}, not the looping turn artwork`)
+          if (!/cwoffee_turn_working/.test(src)) fail(`the run header shows ${src || 'nothing'}, not the looping turn artwork`)
           if (mid.mark.tagName !== 'IMG') fail(`the working mark is a ${mid.mark.tagName}, not a picture`)
         }
         // The mark must cost the prose nothing: the answer's first line sits in the same place with
@@ -11584,7 +11847,7 @@
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 3, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 90))
         const after = measure('once settled')
-        if (document.querySelector('.transcript .turn-working'))
+        if (document.querySelector('.transcript .run-working'))
           fail('the working mark is still in the page after the turn ended')
         if (after.line && mid.line && Math.abs(after.line.left - mid.line.left) > 0.6)
           fail(
@@ -11600,12 +11863,34 @@
         if (!document.querySelector('.blk-answer h1, .blk-answer h2, .blk-answer h3'))
           fail('an answer starting with `## ` did not become a heading while streaming')
         const head1 = measure('heading answer, generating')
-        if (!head1.mark) fail('a heading answer has no working mark either')
-        else if (head1.clearance < 4)
-          fail(`the working mark crowds a heading answer: ${head1.clearance.toFixed(1)}px of clearance`)
+        // A turn with no tool calls and no thinking has no accordion, so it has no header to carry a
+        // loader. That is the majority of the answers in this app, and it is the case "put the mark
+        // in the grouped actions header" says nothing about — so the loader has a second home, and
+        // this is the claim that it exists and sits with the prose rather than beside it.
+        if (!head1.mark)
+          fail('a plain answer with no accordion carries no working loader: the send button is not the only place a turn says it is still arriving')
+        else if (head1.variant !== 'tail') fail('a turn with no run accordion grew a header to hang its loader in')
+        else if (head1.clearance < 0) fail(`the loose loader crowds the answer it follows: ${head1.clearance.toFixed(1)}px`)
+        else {
+          // The same three things that made the header mark behave have to be true of this one too,
+          // and each has a way to break on its own: the page-wide `img { max-width: 100% }` reset can
+          // take its width to nothing, `.turn > *` can ease it in with a fill that overwrites the
+          // declared opacity and the promoted transform, and a box that never got its size is a
+          // picture nobody can see.
+          const tcs = getComputedStyle(head1.mark)
+          const mr = head1.mark.getBoundingClientRect()
+          if (mr.width < 16 || mr.height < 16) fail(`the loose loader measures ${Math.round(mr.width)}x${Math.round(mr.height)}`)
+          if (tcs.maxWidth === 'none' ? false : parseFloat(tcs.maxWidth) < mr.width - 0.5)
+            fail(`the loose loader is clamped to ${tcs.maxWidth}`)
+          if (tcs.animationName !== 'none')
+            fail(`the loose loader is eased in by ${tcs.animationName}, whose fill holds the end state and undoes its own opacity and layer promotion`)
+          if (tcs.transform === 'none') fail('the loose loader lost its layer promotion, so its loop repaints the transcript')
+          if (Number(tcs.opacity) < 0.8) fail(`the loose loader sits at opacity ${tcs.opacity}`)
+        }
         pageLog(
-          `working mark ok (paragraph ${mid.clearance.toFixed(1)}px clear of the text, heading ${head1.clearance.toFixed(1)}px clear, ` +
-            `and none at all once the turn has landed)`,
+          `working mark ok (run header ${mid.clearance.toFixed(1)}px clear of the text, plain answer's loose loader ${head1.clearance.toFixed(
+            1,
+          )}px below the first line and on the column, and none at all once the turn has landed)`,
         )
         transcript?.clear()
       }
@@ -12320,15 +12605,13 @@
           if (think.querySelectorAll('.blk-body').length)
             fail('the thinking line still carries a body element: a thought has nothing to open')
           if (!think.closest('.blk-run')) fail('the thinking line is not inside the run accordion')
-          // The gutter is still reserved, and the marker row still sits where the mark can hang in
-          // it. What changed is which edge carries the reservation: the label used to be outdented
-          // from the text column, and the claim measured that gap. Now the row sits *at* the column
-          // and the mark hangs left into the pane's own left padding — measured on a real window at
-          // this width, a 86px column with the mark occupying 284..340 against prose starting at 350.
-          // So the claim is about that column existing, and about the row not being outdented (an
-          // outdented row would put the mark outside the pane, where it gets clipped).
-          const pane = document.querySelector('.scroller') as HTMLElement | null
-          const aRow = document.querySelector('.turn-who-cwoffee')!.getBoundingClientRect()
+          // One column, and a gutter paid for by the scroller's padding rather than by a first
+          // table column. This is the rule the outdented-label change established — a 74px first
+          // column meant every answer began 74px to the right of nothing, and the user's own message
+          // began somewhere else again — and it is the reason a label, a run header and a loader can
+          // sit beside the prose without moving it. Measured against the scroller's own content edge,
+          // so shrinking the label column (or letting a block start inside it) shows up here rather
+          // than as a screenshot nobody can explain.
           const aBody = ans.querySelector('.blk-body')!.getBoundingClientRect()
           if (aBody.width === 0)
             pageLog(
@@ -12336,19 +12619,31 @@
                 `under .transcript=${document.querySelector('.transcript')?.contains(ans) ?? false}, ` +
                 `empty-mode=${document.documentElement.className.includes('empty-mode') || !!document.querySelector('.empty-mode')}`,
             )
-          // The mark is 56px wide and hangs 66px off the row, so it needs a column of its own inside
-          // the card: measured at this width, 86px between the card's inner edge (264) and the prose
-          // (350), with the mark occupying 284..340. Two things have to stay true for that to work,
-          // and neither is the gap this check used to measure.
-          const card = pane?.getBoundingClientRect()
-          if (card && aRow.left - card.left < 56)
-            fail(
-              `only ${Math.round(aRow.left - card.left)}px of gutter between the card's edge and the text column: the working mark is 56px wide and hangs off the row there, so it would be clipped`,
-            )
-          if (aBody.left - aRow.left > 4)
-            fail(
-              `the marker row is outdented ${Math.round(aBody.left - aRow.left)}px from the text column, so the mark would hang further left still and outside the card that clips it`,
-            )
+          const pane = document.querySelector('.scroller') as HTMLElement | null
+          const runBox = document.querySelector('.blk-run') as HTMLElement | null
+          if (pane && runBox) {
+            const padLeft = parseFloat(getComputedStyle(pane).paddingLeft || '0')
+            const rr = runBox.getBoundingClientRect()
+            // The claim is the relationship, not a computed edge: blocks share one left edge, and
+            // the label column is paid for by the scroller's padding rather than by a first column
+            // inside the text. Deriving "where a block should start" from padding + content box and
+            // then comparing to the real block invents a 6px disagreement between two rules that
+            // agree perfectly, which is exactly what this check did on its first run.
+            if (Math.abs(rr.left - aBody.left) > 1.5)
+              fail(
+                `the run accordion starts ${Math.round(rr.left - aBody.left)}px off the column the answer is in — two left edges on one page ` +
+                  `(run ${Math.round(rr.left)}, answer body ${Math.round(aBody.left)})`,
+              )
+            if (padLeft < 66)
+              fail(
+                `the scroller reserves ${Math.round(padLeft)}px on the left for labels that hang outside the column; a label box is 58px wide and hangs 66px out`,
+              )
+            // (The thinking line's header is not a gutter label at all — it is the line the thought
+            // is written on, inside the accordion. Nothing in this transcript hangs in the left
+            // padding any more: the answer's label is hidden, the run's header sits in its own row,
+            // and your label rides above its bubble because a left gutter on a right-aligned bubble
+            // anchors to nothing. What the padding still pays for is shown above.)
+          }
           const label = think.querySelector('.blk-head')?.textContent ?? ''
           if (!/^Thought for /i.test(label.trim())) fail(`settled thinking reads "${label}"`)
           // What a thinking line is *not*: no body, no expander, not clickable, one line tall, and
@@ -12386,88 +12681,23 @@
         }
       }
 
-      // --- the label does not crowd the answer while it streams -----------------
-      // Reported as "the CWOFFEE tag sits too close to the text while it writes, and
-      // it fixes itself at the end". The label lives in the gutter, so what the user
-      // is describing is horizontal: the breathing room between the tag and the first
-      // glyph. It has to be the same room while text arrives as after the markdown
-      // pass, or the turn visibly shifts as it finishes.
-      if (want('gutter-crowd', 'nothing in the gutter crowds the answer while it streams')) {
-        transcript?.clear()
-        transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
-        const gap = () => {
-          const blk = document.querySelector('.blk-answer') as HTMLElement
-          if (!blk) return null
-          const mark = document.querySelector('.turn-who.live > .turn-working') as HTMLElement | null
-          if (!mark) return null
-          const head = mark.getBoundingClientRect()
-          const body = blk.querySelector('.blk-body') as HTMLElement
-          let first = body.querySelector('.tin') as HTMLElement | null
-          let left = first ? first.getBoundingClientRect().left : NaN
-          if (!isFinite(left)) {
-            const w = document.createTreeWalker(body, NodeFilter.SHOW_TEXT)
-            const n = w.nextNode()
-            if (n) {
-              const r = document.createRange()
-              r.setStart(n, 0)
-              r.setEnd(n, Math.min(1, (n.textContent ?? '').length))
-              left = r.getBoundingClientRect().left
-            }
-          }
-          if (!isFinite(left)) return null
-          return { h: left - head.right, v: head.bottom - body.getBoundingClientRect().top }
-        }
-        const live: number[] = []
-        if (await blind('the working-mark gap mid-stream')) {
-          // counted skip; the premise is checked before anything is painted
-        } else
-        for (const p of ['first streamed line, ', 'second streamed line arrives ', 'and a third ']) {
-          transcript?.apply({ kind: 'text', d: p })
-          await frame(40)
-          transcript?.flushNow()
-          const g = gap()
-          if (g === null) fail('no streamed text, or no working mark, to measure the gap against')
-          else {
-            live.push(g.h)
-            if (g.h < 6) fail(`the working mark crowds the text mid-stream: ${Math.round(g.h)}px`)
-          }
-        }
-        transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
-        await new Promise((r) => setTimeout(r, 150))
-        const fin = gap()
-        // The mark belongs to a turn that is arriving. A settled turn has no mark in the page, so
-        // `fin` being null after `turnEnd` is the expected answer, not a missing measurement.
-        if (document.querySelector('.transcript .turn-working'))
-          fail('the working mark survived the end of its turn')
-        if (!live.length) {
-          // Every mid-stream sample was skipped. Saying "holds" here would be the
-          // harness congratulating itself on measuring nothing.
-          blindSkips++
-          pageLog('selftest note: skipped the gutter-gap drift claim; no mid-stream sample was measurable')
-        } else if (fin === null) {
-          pageLog('gutter gap holds through the turn (and the mark is gone once the turn has landed)')
-        }
-        else {
-          const worst = Math.max(...live) - Math.min(...live)
-          if (worst > 3) fail(`the text edge moves during the turn: ${live.map((x) => Math.round(x)).join('px, ')}px`)
-          pageLog(`gutter gap holds through the turn (${Math.round(fin.h)}px, drift ${Math.round(worst)}px; no mark once settled)`)
-        }
-        transcript?.clear()
-      }
-
-      // --- one marker per turn, pinned while that turn is on screen ---------------
-      // Reported as: "both the You and the Cwoffee indicators have to appear only once per
-      // turn — like the action buttons on a code block, float them until the end of the
-      // container." A turn that printed its own name five times down the gutter is the same
-      // complaint as an ungrouped transcript: five separate messages instead of one turn. The
-      // divider travels with it: "the user message is above the turn divider" — your words open
-      // the turn, so they belong under the line, not over it.
+      // --- one turn: one ask named, one accordion, no generated markers ----------
+      // Reported as: "both the You and the Cwoffee indicators have to appear only once per turn —
+      // like the action buttons on a code block, float them until the end of the container." A turn
+      // that printed its own name five times down the gutter is the same complaint as an ungrouped
+      // transcript: five separate messages pretending to be one turn. The divider travels with it:
+      // "the user message is above the turn divider" — your words open the turn, so they belong
+      // under the line, not over it.
       //
-      // The word that used to be pinned here is gone — in this app `cwoffee` restated what the
-      // layout already said — but the row, its stickiness, its release at the turn's end and its
-      // arithmetic against the block header all still matter, because the row now carries the
-      // working mark. So the same measurements are made, of the mark instead of the name.
-      if (want('turn-marker', 'one marker per turn, pinned while that turn is on screen, carrying the working mark')) {
+      // The pinned word is gone (in this app `cwoffee` restates what the layout already says) and so
+      // is the pinned cup that briefly replaced it, so what is left to hold is the shape: one
+      // divider under your message, one name for two of your messages, one accordion for a turn's
+      // working however many sentences split it, no per-block assistant label, and — the ask that
+      // followed the dots being deleted ("remove the dot everywhere in the transcript, including
+      // beside the small grouped actions inside the folded group") — no marker painted by CSS on any
+      // label, live or settled. The working mark itself is graded where it now lives: see
+      // `mark-visible`.
+      if (want('turn-shape', 'one turn names your ask once, keeps one accordion, and paints no generated marker')) {
         transcript?.clear()
         transcript?.addUser('two things, please')
         const before = [...document.querySelectorAll('.turn')] as HTMLElement[]
@@ -12494,323 +12724,67 @@
         transcript?.flushNow()
         await frame(40)
         const paras = t.querySelectorAll('.blk-answer')
-        const marks = t.querySelectorAll('.turn-who-cwoffee')
         if (paras.length < 2) fail(`the fixture lost a paragraph (${paras.length})`)
-        if (marks.length !== 1)
-          fail(`a turn with ${paras.length} paragraphs and an accordion carries ${marks.length} gutter markers, want one`)
+        // Two thoughts, two tool calls, two paragraphs of said answer: one accordion. What divides
+        // one run from the next is the model's own message text, and the model pausing to talk is
+        // not the start of a second piece of work — two accordions stacked above one answer was the
+        // mess this replaced.
+        const runs = t.querySelectorAll(':scope > .blk-run')
+        if (runs.length !== 1)
+          fail(`${runs.length} accordions in one turn; a turn's working is one home, however many sentences split it`)
         if (t.querySelectorAll('.who-name').length) fail('the turn grew an assistant name back')
-        if (!t.querySelector('.turn-who .turn-working'))
-          fail('a turn that is still arriving has no working mark in its marker row')
         const loud = [...t.querySelectorAll('.blk-answer > .blk-head')].filter((n) => getComputedStyle(n).display !== 'none')
         if (loud.length) fail(`${loud.length} paragraphs still print their own assistant label`)
+        // No generated marker anywhere in the turn. The pulsing dot used to sit in the name row,
+        // beside each tool card, and beside the grouped actions inside the accordion; a `::before`
+        // that paints content, or one that animates, is that dot rebuilt with different hands.
+        const labels = [...t.querySelectorAll('.blk-head')] as HTMLElement[]
+        if (!labels.length) fail('no labels in this turn to check for generated markers')
+        const dotted = labels.filter((n) => {
+          const cs = getComputedStyle(n, '::before')
+          return cs.content !== 'none' && cs.content !== 'normal'
+        })
+        if (dotted.length) fail(`${dotted.length} labels still paint a generated ::before marker`)
+        const anim = labels.filter((n) => getComputedStyle(n, '::before').animationName !== 'none')
+        if (anim.length) fail(`${anim.length} labels still animate a marker`)
         // Two of your messages in one turn is one ask, so it keeps one name.
         transcript?.addUser('and one more thing')
         const asks = [...t.querySelectorAll('.blk-user')]
         if (asks.length !== 2) fail(`both of your messages should sit in this turn, got ${asks.length}`)
         const youNamed = asks.filter((n) => getComputedStyle(n.querySelector('.blk-head')!).display !== 'none')
         if (youNamed.length !== 1) fail(`${youNamed.length} of your messages in one turn are named, want one`)
-
-        // Pinned for the length of the turn and released by its end — the affordance a code
-        // block's buttons already have. A filler inside the turn makes it tall enough to have a
-        // middle, and the turn itself is the shipped one rather than a hand-built shape.
-        const sc = document.querySelector('.scroller') as HTMLElement | null
-        const nmEl = t.querySelector('.turn-who .turn-working') as HTMLElement | null
-        if (!sc || !nmEl) fail('there is no scroller or no working mark to measure')
-        else {
-          const prevTop = sc.scrollTop
-          const filler = document.createElement('div')
-          filler.style.height = '1200px'
-          t.append(filler)
-          // And something after the turn: without it the turn is the last thing in the document
-          // and "scrolled past its end" is physically unreachable - the scroll clamps and the
-          // check reads the CSS as the thing that is broken.
-          const tail = document.createElement('div')
-          tail.style.height = '900px'
-          sc.append(tail)
-          // Wait for the page to stop moving under its own power before measuring it. The stream
-          // follows the bottom of the transcript with an accelerating animation, and it marks its own
-          // scrolls as programmatic for a frame - which swallows this check's scroll if the two
-          // interleave, leaving the ratchet chasing a bottom the check just moved 2,000px away. A
-          // name measured mid-chase is a measurement of the animation, not of the CSS.
-          const settle = async () => {
-            let last = -1
-            let still = 0
-            for (let i = 0; i < 24; i++) {
-              await new Promise((r) => setTimeout(r, 30))
-              const now = sc.scrollTop
-              if (Math.abs(now - last) < 0.6 && ++still >= 2) break
-              if (Math.abs(now - last) >= 0.6) still = 0
-              last = now
-            }
-          }
-          await settle()
-          // Where the turn's top belongs once the view is 400px into it: 400px above the top of the
-          // scroller, because scrolling down carries the top of the turn up past the line. Stated as
-          // a target rather than as a scroll amount so the loop below can re-aim if the page moved.
-          const want = sc.getBoundingClientRect().top - 400
-          let scrolls = 0
-          for (; scrolls < 3; scrolls++) {
-            sc.scrollTop += t.getBoundingClientRect().top - want
-            await settle()
-            if (Math.abs(t.getBoundingClientRect().top - want) <= 8) break
-          }
-          const sr = sc.getBoundingClientRect()
-          const stickAt = sr.top
-          // The picture hangs below the row it is pinned by, by an offset that differs per turn
-          // shape (a turn that opens with the folded group starts lower), so "pinned at the top" is
-          // measured against the mark's own resolved `top`: the browser has already done the
-          // arithmetic, and reading its answer is the check rather than restating the constant.
-          const hang = parseFloat(getComputedStyle(nmEl).top) || 0
-          const mid = { nm: nmEl.getBoundingClientRect(), turn: t.getBoundingClientRect() }
-          const landed = mid.turn.top - want
-          const verdict: string[] = []
-          if (Math.abs(landed) > 12)
-            verdict.push(
-              `this check could not site the turn 400px into the transcript - it landed ${Math.round(landed)}px off after ${scrolls} scroll${scrolls === 1 ? '' : 's'}`,
-              // The scroll state, not just the answer: a correction that buys nothing every time
-              // means the scroller refused the scroll (clamped, zero-height, or not the scroller at
-              // all), and the numbers say which.
-              `[scroller ${sc.tagName}.${sc.className.split(' ').slice(0, 3).join('.')} scrollTop=${Math.round(sc.scrollTop)}/`
-                + `max=${Math.round(sc.scrollHeight - sc.clientHeight)} sh=${Math.round(sc.scrollHeight)} ch=${Math.round(sc.clientHeight)} `
-                + `rect=${Math.round(sr.top)}..${Math.round(sr.bottom)} ovf=${getComputedStyle(sc).overflowY}; `
-                + `turn connected=${t.isConnected} ${Math.round(t.getBoundingClientRect().top)}..${Math.round(t.getBoundingClientRect().bottom)} `
-                + `offsetH=${t.offsetHeight} parent=${t.parentElement?.className ?? 'none'}; `
-                + `want=${Math.round(want)} filler=${!!filler.parentElement} tail=${!!tail.parentElement}]`,
+        // Your own label is not a gutter label, and it is worth pinning why. The bubble is
+        // right-aligned, so a label parked in the left gutter is anchored to nothing; it goes above
+        // the bubble instead, sharing its right edge, and it pins there while the bubble is being
+        // read — the same affordance the turn's name used to have. Three ways that goes wrong, all
+        // of them layout facts rather than taste: the word lands in the text it labels (unreadable),
+        // it slides out of the box that clips it (a word with its left edge missing), or it pins
+        // transparently over the first lines of your own message.
+        const pane = document.querySelector('.scroller') as HTMLElement | null
+        if (youNamed[0] && pane) {
+          const head = youNamed[0].querySelector('.blk-head')!
+          const headR = head.getBoundingClientRect()
+          const bodyR = (youNamed[0].querySelector('.blk-body') ?? youNamed[0]).getBoundingClientRect()
+          if (headR.bottom > bodyR.top + 1)
+            fail(
+              `your message's label is ${Math.round(headR.bottom - bodyR.top)}px into the text it labels — it belongs above the bubble, not inside it`,
             )
-          else if (mid.turn.top > stickAt)
-            verdict.push(
-              `the turn never reached the sticky line (still ${Math.round(mid.turn.top - stickAt)}px below it), so nothing can be said about its name`,
+          const scR = pane.getBoundingClientRect()
+          if (headR.left < scR.left - 0.5 || headR.right > scR.right + 0.5)
+            fail(
+              `your message's label reaches outside the scroller that clips it (label ${Math.round(headR.left)}..${Math.round(
+                headR.right,
+              )}, scroller ${Math.round(scR.left)}..${Math.round(scR.right)})`,
             )
-          else if (offScreen() || (nmEl.parentElement as HTMLElement).getBoundingClientRect().height < 2) {
-            // A row with no height is what an un-painted page answers; there is no sticky line to
-            // measure against and the fixed offset is being compared with nothing.
-            blindSkips++
-            pageLog(
-              `selftest note: skipped the mid-turn marker measurement; ${offScreen() ?? 'the row the mark hangs from measures 0px tall'} - a page nothing composites has no sticky line to measure against`,
-            )
-          } else if (mid.nm.top < sr.top - 1)
-            // The arithmetic can be perfect and the picture still wrong: a mark pinned by a row
-            // that sticks above the pane's padding is clipped by the pane if it hangs higher than
-            // the row, and a clipped half-circle is not a spinner.
-            verdict.push(
-              `the mark hangs ${Math.round(sr.top - mid.nm.top)}px above the top of the transcript box, which clips it (box top ${Math.round(sr.top)}, mark top ${Math.round(mid.nm.top)})`,
-            )
-          else if (Math.abs(mid.nm.top - (stickAt + hang)) > 3) {
-            // The number alone cannot be acted on: the offset is the sum of where the row holding
-            // the name landed, what the CSS variable says, and the label's own box padding. Report
-            // all three, and what the turn opens with, so the next run names the layer at fault.
-            const who = nmEl.parentElement as HTMLElement
-            const wr = who.getBoundingClientRect()
-            const cs = getComputedStyle(nmEl)
-            verdict.push(
-              `400px into a turn the working mark sits ${Math.round(mid.nm.top - stickAt)}px from the top of the transcript rather than ${Math.round(hang)}px; ` +
-                `the row it hangs from ("${who.className}") lands ${Math.round(wr.top - stickAt)}px below the sticky line and is ${Math.round(wr.height)}px tall, ` +
-                `the mark's own top/width are ${cs.top}/${cs.width}, ` +
-                `and the turn opens with "${t.firstElementChild?.className || 'nothing'}"`,
-            )
-          }
-          // What is actually beside the stuck word at this scroll position. The offset the CSS
-          // publishes is arithmetic against the header of the block the turn opens with, and that is
-          // true at the top of a turn. Four hundred pixels in, that header has scrolled away and the
-          // same offset is measured against nothing - so measure the neighbour when it is there and
-          // say plainly when it is not, rather than letting one constant answer both questions.
-          if (Math.abs(landed) <= 12) {
-            const heads = [...t.querySelectorAll('.blk-head')].filter(
-              (n) => getComputedStyle(n).display !== 'none',
-            ) as HTMLElement[]
-            const beside = heads.find((n) => {
-              const r = n.getBoundingClientRect()
-              return r.bottom > stickAt && r.top < stickAt + 40
-            })
-            const rowOff = Math.round(nmEl.parentElement!.getBoundingClientRect().top - stickAt)
-            pageLog(
-              `stuck working mark 400px into a turn: ${Math.round(mid.nm.top - stickAt)}px below the sticky line (its own top resolves to ${Math.round(hang)}px, the row it hangs from lands ${rowOff}px below the line); ` +
-                (beside
-                  ? `"${beside.textContent?.trim().slice(0, 22)}" is beside it, centres ${(mid.nm.top + mid.nm.height / 2 - (beside.getBoundingClientRect().top + beside.getBoundingClientRect().height / 2)).toFixed(1)}px apart`
-                  : `none of the turn's ${heads.length} header(s) is beside it here, so the offset is measured against empty gutter`),
-            )
-          }
-          sc.scrollTop += t.offsetHeight
-          await settle()
-          const after = { nm: nmEl.getBoundingClientRect(), turn: t.getBoundingClientRect() }
-          if (after.turn.bottom > stickAt + 2)
-            verdict.push(
-              `the transcript would not scroll past the end of the turn (its bottom is still ${Math.round(after.turn.bottom - stickAt)}px below the line)`,
-            )
-          else if (after.nm.top > stickAt + hang + 2)
-            verdict.push(`the working mark floated past the end of its own turn by ${Math.round(after.nm.bottom - after.turn.bottom)}px`)
-          sc.scrollTop = prevTop
-          filler.remove()
-          tail.remove()
-          if (verdict.length) fail(verdict.join('; '))
-          else
-            pageLog(
-              `one marker per turn, pinned for its length and released by its end, the mark hanging ${Math.round(hang)}px off its row, turn sited ${Math.round(landed)}px off target after ${scrolls} scroll${scrolls === 1 ? '' : 's'} (and your message sits under the divider)`,
-            )
+          if (getComputedStyle(head).position !== 'sticky')
+            fail(`your message's label is position: ${getComputedStyle(head).position}, so a long message goes unnamed once its first line scrolls past`)
+          const band = getComputedStyle(head).backgroundColor
+          if (band === 'rgba(0, 0, 0, 0)' || band === 'transparent')
+            fail('a pinned label carries no band, so your own first lines slide under the word that names them')
         }
-        // --- the transcript's marker: no dots, one cup at the bottom, name lined up with the header
-        // Reported as "the dot animation and the assistant name are not aligned with the block
-        // header", then as "remove the dot everywhere in the transcript, including beside the small
-        // grouped actions inside the folded group", then as "put the two animated cups under the
-        // name" - and that one came back wrong: "on multi small turns it gets duplicated and is quite
-        // small; remove it from below the name and put it at the bottom of the content, below the
-        // Copy | Share buttons, enlarged". So this asserts four things: nothing paints a generated
-        // marker, the name shares the folded group's line, the page owns exactly one cup, and that cup
-        // is the last thing in the content - moved there, never created twice.
-        const whoRow = t.querySelector('.turn-who-cwoffee') as HTMLElement | null
-        const cups = [...document.querySelectorAll('.transcript-cup')] as HTMLImageElement[]
-        if (!whoRow) fail('this turn has no marker row')
-        else if (cups.length !== 1)
-          fail(`${cups.length} cups on this page; one transcript gets one cup, however many turns it holds`)
-        else {
-          const cup = cups[0]
-          const verdict: string[] = []
-          const nm = whoRow.querySelector('.turn-working') as HTMLElement | null
-          if (!nm) verdict.push('the marker row has no working mark in it while the turn runs')
-          // (a) No dot on anything. The name row, each card and the grouped actions inside the
-          //     folded group all used to grow one while a turn ran.
-          const labels = [...t.querySelectorAll('.blk-head'), nm].filter(Boolean) as HTMLElement[]
-          const dotted = labels.filter((n) => {
-            const cs = getComputedStyle(n, '::before')
-            return cs.content !== 'none' && cs.content !== 'normal'
-          })
-          if (dotted.length) verdict.push(`${dotted.length} labels still paint a generated ::before marker`)
-          const anim = labels.filter((n) => getComputedStyle(n, '::before').animationName !== 'none')
-          if (anim.length) verdict.push(`${anim.length} labels still animate a marker`)
-          // (b) The cup: pinned in the band the pane reserves, big enough to read as the artwork
-          //     rather than as a status pixel, and out of the way when the reader is mid-page.
-          const host = cup.parentElement
-          const nr = nm!.getBoundingClientRect()
-          // The cup is only lit while the end of the transcript is on screen (see `updateCup`), so the
-          // reading position is set before the picture is measured; a zero box from a hidden picture
-          // would otherwise read as "the cup is 0px wide".
-          const scE = document.querySelector('.scroller') as HTMLElement | null
-          const prevE = scE?.scrollTop ?? 0
-          if (scE) scE.scrollTop = scE.scrollHeight
-          await new Promise((r) => setTimeout(r, 140))
-          const ir = cup.getBoundingClientRect()
-          if (!host || !host.classList.contains('scrollerwrap'))
-            verdict.push(`the cup sits inside .${host?.className || 'nothing'} rather than in the band the pane reserves`)
-          else if (host.lastElementChild !== cup)
-            verdict.push(`the cup is not the last thing in its band (${host.lastElementChild?.className || 'nothing'} is)`)
-          if (cup.closest('.transcript'))
-            verdict.push('the cup is back inside the scrolling content, which is what made it travel')
-          if (cup.classList.contains('bare')) verdict.push('the cup is hidden while the transcript has content')
-          if (cup.classList.contains('cup-out'))
-            verdict.push(`the cup went away at the end of a conversation (the pane is ${scE?.clientHeight}px showing ${scE?.scrollHeight}px of content)`)
-          if (ir.width < 120) verdict.push(`the cup is ${Math.round(ir.width)}px wide; it should read as the drawing, not a pixel`)
-          // (c) The name on the folded group's line. Both measured as *text* boxes: the row carries
-          //     padding and the group carries margins, so comparing element boxes compares chrome.
-          const centre = (n: Text | null, take: number) => {
-            if (!n) return NaN
-            const r = document.createRange()
-            r.setStart(n, 0)
-            r.setEnd(n, Math.min(take, n.length))
-            const b = r.getBoundingClientRect()
-            return b.top + b.height / 2
-          }
-          const mrk = nm!.getBoundingClientRect()
-          const whoTop = getComputedStyle(whoRow).getPropertyValue('--who-top').trim()
-          // The name used to be aligned with the header line of the turn's first block — a claim
-          // that only held while the marker row sat at its natural position, and one the working
-          // mark makes no pretence at: it is a picture in the gutter, and it is *stuck*, so it
-          // rides the top of the box while the header moves under it. What still has to hold is
-          // that it stays in the gutter and never lands on the prose.
-          const body = t.querySelector('.blk-answer .blk-body, .blk-run') as HTMLElement | null
-          const textLeft = body ? body.getBoundingClientRect().left : NaN
-          if (!body) verdict.push('no content column to keep the mark out of')
-          else if (mrk.right > textLeft + 1)
-            verdict.push(
-              `the working mark is ${Math.round(mrk.right - textLeft)}px into the content column (mark right ${Math.round(mrk.right)}, text left ${Math.round(textLeft)}) — it belongs in the gutter`,
-            )
-          if (verdict.length) {
-            // Geometry dump: a handful of these numbers is enough to say which element is lying,
-            // and a bare "0px wide" says nothing about whether the layout, the CSS or the picture
-            // is at fault.
-            const cs = getComputedStyle(cup)
-            const rowR = whoRow.getBoundingClientRect()
-            const hostR = host?.getBoundingClientRect()
-            const runR = t.querySelector('.blk-run')?.getBoundingClientRect()
-            verdict.push(
-              `[mark ${Math.round(nr.top)}..${Math.round(nr.bottom)} top=${getComputedStyle(nm!).top}; cup ${Math.round(ir.left)},${Math.round(ir.top)} `
-                + `${Math.round(ir.width)}x${Math.round(ir.height)} complete=${cup.complete} natural=${cup.naturalWidth} `
-                + `computed pos=${cs.position} disp=${cs.display} w=${cs.width} h=${cs.height} top=${cs.top} bottom=${cs.bottom} left=${cs.left}; `
-                + `host .${host?.className || 'nothing'} ${hostR ? `${Math.round(hostR.left)},${Math.round(hostR.top)} ${Math.round(hostR.width)}x${Math.round(hostR.height)}` : 'none'}; `
-                + `pane ${scE ? `${scE.scrollTop}/${scE.scrollHeight}x${scE.clientHeight} padB ${getComputedStyle(scE).paddingBottom}` : 'none'}; `
-                + `view ${window.innerWidth}x${window.innerHeight} dpr ${window.devicePixelRatio}; `
-                + `run ${runR ? `${Math.round(runR.left)},${Math.round(runR.top)} ${Math.round(runR.width)}x${Math.round(runR.height)}` : 'none'}`
-                + `; text left ${Number.isFinite(textLeft) ? Math.round(textLeft) : 'n/a'}`
-                + `; mark ${Math.round(mrk.left)}..${Math.round(mrk.right)} x ${Math.round(mrk.top)}..${Math.round(mrk.bottom)}]`,
-            )
-            fail(verdict.join('; '))
-          } else
-            pageLog(
-              `turn marker ok: no generated marker on ${labels.length} labels, one cup ${Math.round(ir.width)}px pinned in the pane's band, ` +
-                `working mark ${Number.isFinite(textLeft) ? Math.round(textLeft - mrk.right) : '?'}px clear of the text (--who-top ${whoTop})`,
-            )
-
-          if (scE) scE.scrollTop = prevE
-
-          // Which drawing, and does the resting one carry a random hold? While a block works the cup
-          // is the generating loop at the artist's own timing; once the turn stops it is the resting
-          // loop, re-armed every lap with a hold drawn from IDLE_HOLD. Reading the hold back out of
-          // the bytes the <img> actually points at is the only claim about a pause worth making.
-          const busySrc = cup.getAttribute('src') ?? ''
-          if (!busySrc.endsWith('/cwoffee_generating_generation_1.webp'))
-            fail(`a working turn should show the generating cup, got ${busySrc}`)
-          transcript?.apply({ kind: 'turnEnd', d: { turn_id: 71, finish: 'stop' } })
-          await new Promise((r) => setTimeout(r, 120))
-          // Turn end puts the buttons under the turn. The band is what keeps them clear of the cup:
-          // at the end of a conversation the last row of content stops above the band, so the picture
-          // cannot sit on top of the buttons.
-          const acts = t.querySelector('.turn-acts')
-          if (!acts) fail('the turn lost its Copy / Share / Branch row, so there is nothing to site the cup under')
-          else {
-            const scF = document.querySelector('.scroller') as HTMLElement | null
-            if (scF) scF.scrollTop = scF.scrollHeight
-            await new Promise((r) => setTimeout(r, 160))
-            const ab = acts.getBoundingClientRect()
-            const cr = cup.getBoundingClientRect()
-            if (cup.classList.contains('cup-out'))
-              fail(`the cup is put away at the end of a conversation (the pane shows ${scF?.clientHeight}px of ${scF?.scrollHeight}px)`)
-            else if (cr.top < ab.bottom)
-              fail(`the band does not clear the turn's buttons (buttons bottom ${Math.round(ab.bottom)}, cup top ${Math.round(cr.top)})`)
-          }
-          const idleSrc = cup.getAttribute('src') ?? ''
-          if (!idleSrc.endsWith('/cwoffee_generating_idle_1.webp') && !idleSrc.startsWith('blob:'))
-            fail(`a settled transcript should show the resting cup, got ${idleSrc}`)
-          // Short turns must not multiply it. The cup is moved rather than created, so three more
-          // one-line turns still leave exactly one on the page, still the last thing in the content.
-          for (const id of [72, 73, 74]) {
-            transcript?.apply({ kind: 'turnStart', d: { turn_id: id, model: 'selftest', session_id: 0 } })
-            transcript?.apply({ kind: 'text', d: `short turn ${id}` })
-            transcript?.apply({ kind: 'turnEnd', d: { turn_id: id, finish: 'stop' } })
-          }
-          await frame(40)
-          const many = [...document.querySelectorAll('.transcript-cup')]
-          const nturns = document.querySelectorAll('.turn').length
-          if (many.length !== 1)
-            fail(`${many.length} cups after ${nturns} turns; the cup has to move to the bottom, not spawn one per turn`)
-          else if (cup.parentElement && cup.parentElement.lastElementChild !== cup)
-            fail(`after ${nturns} turns the cup is no longer the last thing in the transcript`)
-          else pageLog(`one cup across ${nturns} turns, still last in the content and still under the buttons`)
-          await new Promise((r) => setTimeout(r, 1200)) // the picture's bytes, then the first re-arm
-          const armed = cup.getAttribute('src') ?? ''
-          if (!armed.startsWith('blob:'))
-            fail(`the resting cup was never re-armed with a random hold; src is still ${armed}`)
-          else {
-            const buf = new Uint8Array(await (await fetch(armed)).arrayBuffer())
-            const fr = aniFrames(buf)
-            if (!fr) fail('the re-armed cup cannot be read as an animation this app patches')
-            else if (fr.lastMs < IDLE_HOLD[0] || fr.lastMs > IDLE_HOLD[1])
-              fail(`the resting cup's hold is ${fr.lastMs}ms, outside the ${IDLE_HOLD[0]}-${IDLE_HOLD[1]}ms range it draws from`)
-            else
-              pageLog(
-                `resting cup re-armed: lap ${(fr.playMs / 1000).toFixed(2)}s carrying a ${fr.lastMs}ms hold, `
-                  + `drawn fresh every lap, on the one cup the page owns`,
-              )
-          }
-        }
+        pageLog(
+          `turn shape ok (${paras.length} answer blocks and 2 pieces of working in 1 accordion, no assistant label, no generated marker on ${labels.length} label(s), 1 name for 2 of your messages, your ask under the divider)`,
+        )
         transcript?.clear()
       }
 
@@ -12875,22 +12849,13 @@
                   `the jump button is not at the bottom of the transcript (its bottom ${Math.round(jr.bottom)}, pane ${Math.round(sr.top)}..${Math.round(sr.bottom)})`,
                 )
               if (jr.height < 22) verdict.push(`the jump button is ${Math.round(jr.height)}px tall, too small to hit with a thumb`)
-              // The pill and the picture live in the same corner of the pane. The picture is put away
-              // on the same gesture that raises the pill, so "both lit" is a bug rather than a
-              // near-miss - and if both are lit, they must at least not be painted on each other.
-              const cupEl = document.querySelector('.transcript-cup') as HTMLElement | null
-              // A faded cup is not in the way, so "lit" here means legible, not merely painted.
-              const cupLit =
-                !!cupEl && !cupEl.classList.contains('bare') && parseFloat(getComputedStyle(cupEl).opacity) > 0.5
-              if (cupLit) {
-                const cr2 = cupEl.getBoundingClientRect()
-                const ox = Math.min(jr.right, cr2.right) - Math.max(jr.left, cr2.left)
-                const oy = Math.min(jr.bottom, cr2.bottom) - Math.max(jr.top, cr2.top)
-                if (ox > 2 && oy > 2)
-                  verdict.push(
-                    `the jump button is painted on top of the cup's picture (${Math.round(ox)}x${Math.round(oy)}px of overlap) while the reader is ${away()}px above the bottom`,
-                  )
-              }
+              // The pill used to have to share the bottom corner of the pane with the conversation's
+              // cup, which needed a rule putting the picture away on the same gesture that raised the
+              // pill. The cup is gone, so the only claim left here is the one about the pill itself:
+              // it sits at the bottom of the transcript, on the axis of the text, and not in the
+              // reader's prose. Measured above.
+              if (document.querySelector('.transcript-cup'))
+                verdict.push('a transcript cup is back in the pane: the reading surface no longer reserves a band for it')
             }
             // 3. the model starts talking: for a reader who never left, the lock applies again and
             //    the newest line ends up on screen. The follow moves at a capped speed on purpose
@@ -13125,28 +13090,14 @@
           if (!u.querySelector('.attach-save')) fail('the unit lost its Save control')
           pageLog(`attachment unit ok (3 writes -> 1 unit, ${Math.round(r.height)}px tall, dashed edge, no box around the name)`)
         }
-        // A loaded session gets the same single cup, resting: one element per page means the
-        // "one moving picture at a time" cost argument no longer forces stills into the history view.
-        // That rule is exactly what made a loaded session's cup look frozen, which is what the report
-        // "the idle webp isn't animated" was seeing.
-        const loadedCups = [...document.querySelectorAll('.transcript-cup')] as HTMLImageElement[]
-        if (loadedCups.length !== 1) fail(`${loadedCups.length} cups in a loaded session; one page owns one cup`)
-        else {
-          const c = loadedCups[0]
-          const src = c.getAttribute('src') ?? ''
-          const host = c.parentElement
-          if (src.endsWith('_still.webp')) fail(`a loaded session's cup is a still (${src}); the resting loop belongs at the bottom`)
-          else if (!host?.classList.contains('scrollerwrap'))
-            fail(
-              `the transcript's cup hangs in "${host?.className || 'nothing'}" rather than pinned in the transcript pane, where the padding reserves its band`,
-            )
-          else
-            pageLog(
-              `transcript cup ok (one cup for ${document.querySelectorAll('.turn').length} stored turns, pinned in the band the pane reserves for it, ` +
-                `showing ${src.startsWith('blob:') ? 'an armed resting loop' : 'the resting loop'}` +
-                `${matchMedia('(prefers-reduced-motion: reduce)').matches ? ' as a still, per the motion setting' : ''})`,
-            )
-        }
+        // A loaded session is a settled one, so it carries no working mark at all: `runWorking`
+        // creates the loader when a run starts and `dropWorking` takes it away at turn end, and the
+        // history painter does either. That is also the cheap-answer case the old cup had to be
+        // written around - a loaded session used to be handed a still because one animated raster
+        // per turn cost a decode per turn, which is what made a reopened conversation look frozen.
+        const loadedMarks = [...document.querySelectorAll('.transcript .run-working')]
+        if (loadedMarks.length)
+          fail(`${loadedMarks.length} working loader(s) painted in a loaded session: a page you are reading has nothing arriving`)
         if (units.length) {
           // The hand-over line. It used to sit against the right edge of the text column, on the
           // argument that an attachment belongs to the reader rather than to the list of files the
@@ -13250,224 +13201,6 @@
         }
       }
 
-      // --- the cup does not travel while the model writes ---------------------
-      // Reported as: "the animated webp in the transcript jumps too much when the assistant is
-      // generating new lines; can we prevent that with sticky or something?" As the last element in
-      // the content its place on screen was a function of everything that arrived: each line pushed
-      // it down, each follow step pulled it back, and a turn that held the view while tool output
-      // piled up below the fold slid it off the bottom and then brought it flying back.
-      // `ui/perf/probe.ts` measures exactly that over a synthetic stream, and the run before the fix
-      // read: 1,348px of travel, p95 261px in a single frame, six reversals of direction in three
-      // turns. Pinned in a band the pane reserves, the number has to come out zero - and the band
-      // has to be deep enough that the newest line of text never runs under the picture.
-      if (want('cup', 'the cup does not travel while the model writes')) {
-        if (await blind('the cup band')) {
-          // counted skip; blind() logged why
-        } else {
-          const verdict: string[] = []
-          const img = document.querySelector('.transcript-cup') as HTMLElement | null
-          const wrap = document.querySelector('.scrollerwrap') as HTMLElement | null
-          const sc = document.querySelector('.scroller') as HTMLElement | null
-          if (!img || !wrap || !sc) {
-            fail(`the cup band check found no ${!img ? 'cup' : !wrap ? 'scrollerwrap' : 'scroller'}`)
-          } else {
-            transcript?.clear()
-            await frame(0)
-            // An empty transcript hides its cup on purpose - the opening screen has its own, larger
-            // one - so the seat is measured with content on the page and the pane at the end of it.
-            // Measuring a hidden cup measures a zero box at the page origin, which is how this check
-            // once reported a picture 524px off the pane's bottom edge and 350px out of the column.
-            transcript?.apply({ kind: 'turnStart', d: { turn_id: 91, model: 'selftest', session_id: 0 } })
-            transcript?.addUser('the picture has to stay put while you write')
-            for (let i = 0; i < 6; i++) {
-              transcript?.apply({ kind: 'text', d: `warm-up line ${i}: the picture stays put while the model writes\n` })
-              await frame(0)
-            }
-            sc.scrollTop = sc.scrollHeight
-            await frame(2)
-            const cs = getComputedStyle(img)
-            const box = img.getBoundingClientRect()
-            const host = (img.parentElement ?? wrap) as HTMLElement
-            const wr = host.getBoundingClientRect()
-            if (cs.position !== 'absolute') verdict.push(`the cup is ${cs.position}, so it scrolls with the content`)
-            if (img.parentElement !== wrap)
-              verdict.push(`the cup is pinned to .${host.className || 'nothing'} rather than to the transcript pane`)
-            const seat = Math.round(wr.bottom - box.bottom)
-            if (Math.abs(seat - 8) > 2)
-              verdict.push(`the cup sits ${seat}px off the pane's bottom edge, not the 8px the band reserves`)
-            const padB = parseFloat(getComputedStyle(sc).paddingBottom)
-            if (!(padB >= box.height + 24))
-              verdict.push(
-                `the scroller reserves ${padB.toFixed(0)}px at the bottom for a ${box.height.toFixed(0)}px picture, so the newest line runs under it`,
-              )
-            const col = document.querySelector('.scroller > div > .transcript') as HTMLElement | null
-            if (col) {
-              const off = Math.round(box.left - col.getBoundingClientRect().left)
-              if (Math.abs(off) > 2) verdict.push(`the cup sits ${off}px off the left edge of the text column`)
-            }
-            // Now keep streaming, and watch it not move. A reversal is what the eye reads as jitter,
-            // which is why the count is reported even when the total is zero.
-            let prev = img.getBoundingClientRect().top
-            let travel = 0
-            let worst = 0
-            let reversals = 0
-            let dir = 0
-            let frames = 0
-            let lit = 0
-            let unlit = 0
-            let toggles = 0
-            let wasLit = !img.classList.contains('cup-out')
-            for (let i = 0; i < 60; i++) {
-              transcript?.apply({ kind: 'text', d: `line ${i}: the picture stays put while the model writes\n` })
-              await frame(0)
-              const box2 = img.getBoundingClientRect()
-              const isLit = !img.classList.contains('cup-out') && box2.height > 2
-              if (isLit !== wasLit) {
-                toggles++
-                wasLit = isLit
-              }
-              if (isLit) lit++
-              else unlit++
-              // A hidden picture has no box: measuring its top would report the 136px it travelled
-              // coming back as if the pinned drawing had jumped.
-              if (isLit) {
-                const d = box2.top - prev
-                if (Math.abs(d) > 0.5) {
-                  travel += Math.abs(d)
-                  worst = Math.max(worst, Math.abs(d))
-                  const nd = Math.sign(d)
-                  if (dir !== 0 && nd !== dir) reversals++
-                  dir = nd
-                }
-                prev = box2.top
-              }
-              frames++
-            }
-            transcript?.apply({ kind: 'turnEnd', d: { turn_id: 91, finish: 'stop' } })
-            await frame(4)
-            // ...and it is put away when the reader is in the middle of the page. A picture pinned to
-            // the pane would otherwise be painted over other people's paragraphs.
-            const range = sc.scrollHeight - sc.clientHeight
-            // 60px is 2.5 lines: enough above the end that the band - and therefore the picture's
-            // seat - is off screen, and the transcript puts the drawing away rather than painting it
-            // across the paragraph the reader stopped on.
-            const pullBack = 60
-            const mid = range > pullBack ? range - pullBack : 0
-            sc.scrollTop = mid
-            // The fade is real, so one sample right after the move catches the picture mid-flight and
-            // reads like a failure. Poll until it settles; the opacity claimed below is then the
-            // settled one.
-            let dimSettled = false
-            for (let t = 0; t < 25; t++) {
-              await new Promise((r) => setTimeout(r, 80))
-              if (img.classList.contains('cup-out') && parseFloat(getComputedStyle(img).opacity) <= 0.16) {
-                dimSettled = true
-                break
-              }
-            }
-            const dimmedAway = dimSettled
-            const midBox = img.getBoundingClientRect()
-            const midOpacity = parseFloat(getComputedStyle(img).opacity)
-            sc.scrollTop = sc.scrollHeight
-            await frame(3)
-            // The way back is driven by a scroll event, which can land late; poll for it rather than
-            // grading the first frame after the write.
-            let back = !img.classList.contains('cup-out')
-            for (let t = 0; t < 12 && !back; t++) {
-              await new Promise((r) => setTimeout(r, 100))
-              back = !img.classList.contains('cup-out')
-            }
-            // Then ride the fade back up: the class flips first and the opacity follows. The first
-            // in-between value seen is the fade itself, and it is reported rather than demanded -
-            // whether a frame lands in that 420ms window is the compositor's business.
-            let midFade = Number.NaN
-            for (let t = 0; t < 20; t++) {
-              const o = parseFloat(getComputedStyle(img).opacity)
-              if (back && o > 0.16 && o < 0.9 && !Number.isFinite(midFade)) midFade = o
-              if (back && o > 0.9) break
-              await new Promise((r) => setTimeout(r, 80))
-            }
-            const backOpacity = parseFloat(getComputedStyle(img).opacity)
-            const backAgain = back && backOpacity > 0.9
-            // The loop above stops at the first frame past 0.9; the number worth printing is the one
-            // the fade ends at, so let it land before reading it. "back to 0.90" would otherwise read
-            // like a picture that never quite came back.
-            let backSettled = backOpacity
-            if (back) {
-              await new Promise((r) => setTimeout(r, 520))
-              backSettled = parseFloat(getComputedStyle(img).opacity)
-            }
-            const cupBlind = unpainted()
-            if (range <= pullBack)
-              pageLog(
-                `selftest note: the cup-away half of this check could not be measured; the transcript offered only ${range}px of scroll, so no reading position on this page is ` +
-                  'far enough above the end for the picture to be put away',
-              )
-            else if (cupBlind) {
-              // The put-away is driven by the scroller's own `scroll` event, and an un-composited page
-              // does not dispatch one: writing scrollTop moves the position but nothing observes it.
-              // That is indistinguishable from the feature being gone, so it is reported as a blind
-              // spot rather than graded.
-              blindSkips++
-              pageLog(`selftest note: skipped the cup-away half of this check; ${cupBlind} - and no scroll event is dispatched without painting`)
-            } else if (!dimmedAway)
-              verdict.push(
-                `the cup stayed at opacity ${getComputedStyle(img).opacity} ${Math.round(sc.scrollHeight - sc.clientHeight - mid)}px above the end of the transcript - a 136px drawing painted over the middle of a paragraph`,
-              )
-            // It fades, it does not go: the picture keeps its box, so the transition has somewhere to
-            // run from and to, and a reader who scrolls back finds the same drawing instead of one
-            // that appeared out of nothing.
-            if (!cupBlind && midBox.height < 100)
-              verdict.push(
-                `the cup lost its layout mid-page (${Math.round(midBox.height)}px tall): a dimmed picture keeps its box, only a hidden one drops it`,
-              )
-            if (!cupBlind && midOpacity > 0.16)
-              verdict.push(`the cup is still ${midOpacity.toFixed(2)} opaque mid-page: the prose under a 136px drawing has to stay readable`)
-            if (!cupBlind && !matchMedia('(prefers-reduced-motion: reduce)').matches && !/opacity/.test(getComputedStyle(img).transitionProperty))
-              verdict.push(
-                `the cup's transitionProperty is "${getComputedStyle(img).transitionProperty}": the fade has to be declared on the base rule, or it runs one way and snaps the other`,
-              )
-            if (!cupBlind && !backAgain) verdict.push('the cup did not come back when the reader went back to the end')
-            if (!cupBlind && travel > 2)
-              verdict.push(`the pinned cup still moved ${travel.toFixed(1)}px while 60 lines streamed (worst frame ${worst.toFixed(1)}px)`)
-            if (!cupBlind && frames < 40) verdict.push(`the streaming half sampled only ${frames} frames and measured nothing`)
-            // A cup that blinks off and on during a turn is worse than one that stays put: the
-            // follow's own catch-up leaves the view a few dozen px short of the bottom for a frame
-            // at a time, and a 136px picture that answers that by disappearing is a flicker.
-            if (!cupBlind && toggles > 2)
-              verdict.push(
-                `the cup lit and put itself away ${toggles} times during 60 streamed lines (${lit} lit frame(s), ${unlit} away) - the hide has no patience, so it flickers with the follow`,
-              )
-            if (verdict.length) {
-              // Every number here distinguishes one cause from the next: a cup at the wrong seat is a
-              // CSS problem, a cup whose parent is not the pane is a placement problem, and a parent
-              // that is shorter than the pane means the pane itself is not the box being measured.
-              const wr2 = host.getBoundingClientRect()
-              const sr = sc.getBoundingClientRect()
-              fail(
-                `cup band: ${verdict.join('; ')} [cup ${Math.round(box.left)},${Math.round(box.top)} ${Math.round(box.width)}x${Math.round(box.height)} ` +
-                  `computed pos=${cs.position} disp=${cs.display} top=${cs.top} bottom=${cs.bottom} left=${cs.left} w=${cs.width}; ` +
-                  `parent .${host.className || 'nothing'} ${Math.round(wr2.left)},${Math.round(wr2.top)} ${Math.round(wr2.width)}x${Math.round(wr2.height)}; ` +
-                  `scroller ${Math.round(sr.left)},${Math.round(sr.top)} ${Math.round(sr.width)}x${Math.round(sr.height)} ` +
-                  `${sc.scrollTop}/${sc.scrollHeight}x${sc.clientHeight} padB ${getComputedStyle(sc).paddingBottom}; ` +
-                  `column ${col ? `${Math.round(col.getBoundingClientRect().left)}..${Math.round(col.getBoundingClientRect().right)}` : 'none'}; ` +
-                  `chain ${[img, host, sc, sc.parentElement, sc.parentElement?.parentElement].filter(Boolean).map((n) => `.${(n as HTMLElement).className || 'nothing'}`).join(' < ')}]`,
-              )
-            } else
-              pageLog(
-                `cup band ok (${Math.round(box.height)}px picture pinned ${seat}px off the pane's bottom, ${padB.toFixed(0)}px of the pane held out of the text, ` +
-                  `column-aligned; across ${frames} streaming frames it travelled ${travel.toFixed(1)}px, worst frame ${worst.toFixed(1)}px, ${reversals} reversals, ` +
-                  `${toggles} lit/away toggle(s) in ${lit} lit and ${unlit} put-away frames; faded to ${midOpacity.toFixed(2)} mid-page and back to ${backSettled.toFixed(2)} once the fade landed${
-                    Number.isFinite(midFade)
-                      ? `, caught mid-fade at ${midFade.toFixed(2)} on the way back in`
-                      : ', no mid-fade frame caught (the compositor clock, not a claim either way)'
-                  }; both ways by transition)`,
-              )
-            transcript?.clear()
-          }
-        }
-      }
-
       // --- the idle cup is one picture and one motion ------------------------
       // The opening screen's cup is now an animated WebP whose frame table ends with a
       // five-second hold. Two ways this goes wrong silently. One: CSS animates a picture that
@@ -13530,13 +13263,13 @@
         const wrap = document.querySelector('.cupwrap')
         if (wrap && wrap.children.length !== 1)
           fail(`${wrap.children.length} elements sit inside .cupwrap; only the picture belongs there`)
-        // Two cups on one page. The transcript keeps its own at the bottom of the conversation, and
-        // an empty transcript sits under this screen - so the transcript's has to stand down here,
-        // or the opening screen shows the same drawing twice at two sizes.
-        const tCup = document.querySelector('.transcript-cup') as HTMLImageElement | null
-        if (wrap && tCup && getComputedStyle(tCup).display !== 'none')
-          fail('the opening screen and the transcript are showing the cup at the same time')
-        if (wrap && tCup) pageLog('one cup on screen: the opening screen shows its own, the transcript keeps its copy hidden')
+        // One picture per page, and the transcript no longer has a copy to show. Its cup - pinned in
+        // a band the pane reserved - was removed with the turn's name and the working mark that
+        // replaced it: a conversation now says it is working with the loader in the run header and
+        // the loader in the send button, so the artwork on this screen is the only cup anywhere, and
+        // the 168px band it used to cost every page of reading surface is back. The rule is asserted
+        // from the shipped stylesheet as well as the live page, because a declaration left behind is
+        // a half-removed feature waiting to come back.
         // The wiring, not just the parts: when the opening screen is on show, the picture it
         // actually points at has to match what this session asked for. A media query cannot
         // pause a raster loop, so getting this wrong is not a style miss, it is motion the
@@ -14644,8 +14377,13 @@
         const card = document.querySelector('.panecard')
         const sc = document.querySelector('.scroller')
         const cbox = document.querySelector('.composerbar .cbox')
+        // A chat owns no folder, so in chat mode the folder row is *expected to be absent* — the
+        // card's contents there are the conversation and the composer only. Requiring the row in both
+        // modes is how this check would have reported the removal as a broken card.
+        const chatMode = personaNow === 'chat'
         const chip = document.querySelector('.composerbar button[data-ws-chip]')
-        if (!main || !card || !sc || !cbox || !chip) {
+        if (chatMode && chip) verdict.push('chat mode still carries a folder row inside the card')
+        if (!main || !card || !sc || !cbox || (!chatMode && !chip)) {
           fail(
             `the card check found no ${!main ? 'main' : !card ? '.panecard' : !sc ? '.scroller' : !cbox ? 'composer box' : 'folder row in the composer'}`,
           )
@@ -14654,8 +14392,8 @@
           for (const [what, el] of [
             ['the conversation', sc],
             ['the composer', cbox],
-            ['the folder row', chip],
-          ] as const)
+            ...(chip && !chatMode ? [['the folder row', chip]] : []),
+          ] as [string, Element][])
             if (!card.contains(el)) verdict.push(`${what} is outside the card`)
           const cr = card.getBoundingClientRect()
           const mr = main.getBoundingClientRect()
@@ -14969,72 +14707,27 @@
         }
       }
 
-      // --- the working mark is painted, not merely in the DOM --------------------------
+      // --- the working loader is painted, inline, and small --------------------------
       //
       // The report was "the loader is not on the left of the grouped actions (not rendered at all,
-      // or not added yet?)". A DOM query can be satisfied by an element nothing paints, so this
-      // claims the painted box: the picture is displayed, it sits in the gutter left of the prose,
-      // it stays inside the box that clips it, and its ink is readable against the paper behind it
-      // in the palette the window is actually using.
-      if (want('mark-visible', 'the turn\'s working mark is painted in the gutter, and readable against the paper')) {
+      // or not added yet?)", and the answer was neither of the guesses: it *was* added, and it was *not* rendered
+      // — the page-wide `img, video { max-width: 100% }` reset resolved 100% against a
+      // zero-wide containing block, so the picture measured 0x56: height intact, width gone, present
+      // in the DOM and absent on the screen. Then the ask changed shape: smaller, "just enough to be
+      // inline", aligned with the grouped actions' header, and no longer following the screen. So
+      // this claims the painted box of the thing that replaced it: an image in the run header's
+      // flex row, about the size of a glyph, in flow rather than pinned, inside the card that clips
+      // it, on its own layer because an animated raster inside a long transcript costs the
+      // transcript its frames, and readable against the paper this window is using.
+      if (want('mark-visible', 'the working loader is painted in the run header, inline, and readable against the paper')) {
         const verdict: string[] = []
         // One quantity for colours the engine may hand back in three spellings — rgb(), a
         // color(srgb …), or an oklab() — because comparing an sRGB luma with an oklab lightness is
         // arithmetic, not ink. Anything unparseable is null, and null is a failure that names the
         // string rather than a NaN that goes quiet.
-        const lumOf = (raw: string): number | null => {
-          const c = (raw ?? '').trim().toLowerCase()
-          if (!c || c === 'transparent' || c === 'none') return null
-          const rgb = c.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/)
-          if (rgb) {
-            const [r, g, b] = [+rgb[1], +rgb[2], +rgb[3]]
-            const lin = (v: number) => (v /= 255) <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4
-            return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
-          }
-          const hex = c.match(/^#([0-9a-f]{6})$/)
-          if (hex) return lumOf(`rgb(${parseInt(hex[1].slice(0, 2), 16)}, ${parseInt(hex[1].slice(2, 4), 16)}, ${parseInt(hex[1].slice(4, 6), 16)})`)
-          const srgb = c.match(/^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/)
-          if (srgb) return 0.2126 * +srgb[1] + 0.7152 * +srgb[2] + 0.0722 * +srgb[3]
-          const ok = c.match(/^oklab\(\s*([\d.]+)/)
-          if (ok) return +ok[1] * +ok[1] // oklab L is a cube-root-ish scale; squaring puts it near L*
-          return null
-        }
-        /** The artwork's own ink, read off its pixels: what the picture actually draws, not what CSS says. */
-        const markInk = async (img: HTMLImageElement): Promise<string | null> => {
-          if (!img.complete || !img.naturalWidth) {
-            await new Promise((res) => {
-              img.addEventListener('load', () => res(null), { once: true })
-              img.addEventListener('error', () => res(null), { once: true })
-              setTimeout(() => res(null), 1500)
-            })
-          }
-          if (!img.naturalWidth) return null
-          const cv = document.createElement('canvas')
-          cv.width = img.naturalWidth
-          cv.height = img.naturalHeight
-          const g = cv.getContext('2d')
-          if (!g) return null
-          g.drawImage(img, 0, 0)
-          let d: Uint8ClampedArray
-          try {
-            d = g.getImageData(0, 0, cv.width, cv.height).data
-          } catch {
-            return null
-          }
-          let n = 0
-          let r = 0
-          let gg = 0
-          let b = 0
-          for (let i = 0; i < d.length; i += 4) {
-            if (d[i + 3] < 40) continue
-            n += 1
-            r += d[i]
-            gg += d[i + 1]
-            b += d[i + 2]
-          }
-          return n ? `rgb(${Math.round(r / n)}, ${Math.round(gg / n)}, ${Math.round(b / n)})` : null
-        }
-        // The gutter is only a thing when there is a transcript to have a gutter in.
+        // `lumOf` and `markInk` live with the other shared witnesses, above: the send-button
+        // loader needs the same two measurements as the run-header one.
+        // A gutter is only a thing when there is a transcript to have a gutter in.
         await ensureTranscriptMounted()
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 96, model: 'selftest', session_id: 0 } })
@@ -15054,81 +14747,441 @@
         if (!laidOut) {
           blindSkips++
           pageLog(
-            'selftest note: the working-mark claim was not measured — the transcript box has no height ' +
-            `(${Math.round(document.querySelector('.scroller')?.getBoundingClientRect().height ?? 0)}px), ` +
-            'and a mark inside a box that is not laid out has no position to be judged on. Keep the window visible and this bites.',
+            'selftest note: the working-loader claim was not measured — the transcript box has no height ' +
+              `(${Math.round(document.querySelector('.scroller')?.getBoundingClientRect().height ?? 0)}px), ` +
+              'and a mark inside a box that is not laid out has no position to be judged on. Keep the window visible and this bites.',
           )
           transcript?.apply({ kind: 'turnEnd', d: { turn_id: 96, finish: 'stop' } })
         }
         await frame(80)
         transcript?.flushNow()
         const liveTurn = laidOut ? ([...document.querySelectorAll('.turn')].at(-1) as HTMLElement | undefined) : undefined
-        const mark = liveTurn?.querySelector('.turn-who > .turn-working') as HTMLImageElement | null
-        const markerRow = liveTurn?.querySelector('.turn-who') as HTMLElement | null
         const run = liveTurn?.querySelector('.blk-run') as HTMLElement | null
+        const mark = run?.querySelector('.blk-head > .run-working') as HTMLImageElement | null
+        const label = run?.querySelector('.blk-head .run-label') as HTMLElement | null
         if (!laidOut) {
           /* graded above, as a named skip */
-        } else if (!markerRow) verdict.push('a streaming turn has no marker row in its gutter at all')
-        else if (!mark) verdict.push('the marker row is there with no working mark in it')
-        else if (!run) verdict.push('the fixture turn grew no grouped actions to sit beside')
+        } else if (!run) verdict.push('the fixture turn grew no grouped actions to hold a loader')
+        else if (!mark)
+          verdict.push(
+            `a working run has no loader in its header (.blk-run.running .blk-head; running=${run.classList.contains(
+              'running',
+            )})`,
+          )
+        else if (!label) verdict.push('the run header has no sentence to be inline with')
         else {
           const cs = getComputedStyle(mark)
           if (cs.display === 'none')
-            verdict.push(
-              `the working mark is in the page but not painted (display: none; the marker row reads .live=${markerRow.classList.contains(
-                'live',
-              )})`,
-            )
+            verdict.push(`the loader is in the page but not painted (display: none; the run reads .running=${run.classList.contains('running')})`)
+          if (mark.tagName !== 'IMG') verdict.push(`the loader is a ${mark.tagName}, not a picture`)
+          const src = mark.getAttribute('src') ?? ''
+          if (!/cwoffee_turn_working/.test(src)) verdict.push(`the run header shows ${src || 'nothing'}, not the looping turn artwork`)
           const mr = mark.getBoundingClientRect()
-          const rr = run.getBoundingClientRect()
+          const lr = label.getBoundingClientRect()
           const card = document.querySelector('.scroller')?.getBoundingClientRect()
-          if (mr.width < 20 || mr.height < 20) verdict.push(`the mark measures ${Math.round(mr.width)}x${Math.round(mr.height)}`)
-          if (card && mr.left < card.left - 0.5)
-            verdict.push(`the mark starts ${Math.round(card.left - mr.left)}px left of the card that clips it, so it is drawn with its left cut off`)
-          if (mr.right > rr.left - 1)
-            verdict.push(`the mark reaches ${Math.round(mr.right - rr.left)}px into the grouped actions beside it`)
-          if (card && mr.top < card.top - 0.5)
-            verdict.push(`the mark reaches ${Math.round(card.top - mr.top)}px above the box that clips it`)
-          // The mark is composited on its own layer, and that is a fact worth pinning: unpromised,
-          // the animated picture repaints the transcript under it, which measured 30-37ms/frame on a
-          // 168-block history against 19-21ms promoted. A later tidy-up that drops `will-change`
-          // would bring the frame drop back with nothing in the suite to notice.
-          const promoted = cs.willChange !== 'auto' || /translate|matrix|none/.test(cs.transform ?? '') && cs.willChange !== 'auto'
+          // Painted, and the size the ask asked for: "just enough to be inline". A 56px picture in a
+          // 12.5px sentence is a poster next to a word, and a 0px picture is the bug the check was
+          // written for. The band 16..24 is that judgement made checkable.
+          if (mr.width < 16 || mr.height < 16) verdict.push(`the loader measures ${Math.round(mr.width)}x${Math.round(mr.height)} — it is not painted at its declared box`)
+          if (mr.width > 24 || mr.height > 24)
+            verdict.push(`the loader measures ${Math.round(mr.width)}x${Math.round(mr.height)}, which is bigger than the sentence it sits in (${Math.round(lr.height)}px tall)`)
+          // The trap itself, named where it lives: a computed `max-width` in px smaller than the box
+          // is the 0x56 bug returning under a different name.
+          if (cs.maxWidth !== 'none' && /px$/.test(cs.maxWidth) && parseFloat(cs.maxWidth) < mr.width - 0.5)
+            verdict.push(`the page's img reset clamps the loader to ${cs.maxWidth}, so the declared box never paints`)
+          // "No need to follow screen": the loader is in flow. A pinned one is a picture that rides
+          // the top of the pane while its own sentence scrolls away under it — which is what the
+          // previous shape did, and what cost the clip-box rule to keep its top from being shaved.
+          if (cs.position !== 'static')
+            verdict.push(`the loader is position: ${cs.position}, so it follows the view instead of the sentence it belongs to`)
+          if (cs.float !== 'none') verdict.push(`the loader floats (${cs.float}) out of the header row`)
+          // Inline with the header's sentence: on its line, to its left, and inside the accordion's
+          // own left edge rather than hanging out of the column.
+          if (mr.right > lr.left + 0.5)
+            verdict.push(`the loader is ${Math.round(mr.right - lr.left)}px past the sentence it should lead, so it is not inline with it`)
+          const drift = Math.abs(mr.top + mr.height / 2 - (lr.top + lr.height / 2))
+          if (drift > 4)
+            verdict.push(`the loader sits ${Math.round(drift)}px off the middle of the sentence's line, so the header row reads as two lines`)
+          if (card && (mr.left < card.left - 0.5 || mr.right > card.right + 0.5 || mr.top < card.top - 0.5))
+            verdict.push(`the loader is outside the card that clips it (${Math.round(mr.left)},${Math.round(mr.top)} against card left ${Math.round(card.left)}, top ${Math.round(card.top)})`)
+          // The row it lives in stays one line tall: "make it fit" is a promise about the header, not
+          // only about the picture.
+          const headRow = mark.parentElement!.getBoundingClientRect()
+          if (headRow.height > 30)
+            verdict.push(`the run header row is ${Math.round(headRow.height)}px tall with the loader in it, so the mark has grown the row rather than fitted into it`)
+          // Layer promotion, and it is a measured fact worth pinning: unpromoted, an animated picture
+          // inside a long transcript cost 30-37ms/frame against 19-21ms promoted on the 168-block
+          // history the suite builds. A tidy-up that drops `will-change` would bring the frame drop
+          // back with nothing in the suite to notice.
           if (cs.willChange === 'auto' && cs.transform === 'none')
             verdict.push(
-              'the working mark is composited with everything else — an animated picture inside a long transcript costs the transcript its frames (30-37ms/frame measured, against 19-21ms on its own layer)',
+              'the loader is composited with everything else — an animated picture inside a long transcript costs the transcript its frames (30-37ms/frame measured, against 19-21ms on its own layer)',
             )
-          else if (!promoted) verdict.push(`the mark asks for nothing (will-change ${JSON.stringify(cs.willChange)}, transform ${JSON.stringify(cs.transform)})`)
-          // Ink against paper, in the palette the window is using right now. The artwork is a thin
-          // brown line drawing; on a dark paper a faint drawing is a mark nobody sees.
-          // The turn paints nothing of its own; the card behind it does. Grade against what is really
-          // under the ink, walking out from the mark until something answers with a colour.
+          // Ink against paper, in the palette this window is using. The drawing is thin line work in
+          // two mid-tone hues; on a dark paper a faint drawing is a mark nobody sees. The turn and
+          // the header paint nothing of their own, so walk out from the mark until something answers
+          // with a colour — grading a `rgba(0, 0, 0, 0)` is grading nothing.
           let paper = 'rgba(0, 0, 0, 0)'
-          for (let el: HTMLElement | null = liveTurn ?? null; el && paper === 'rgba(0, 0, 0, 0)'; el = el.parentElement)
+          for (let el: HTMLElement | null = mark; el && paper === 'rgba(0, 0, 0, 0)'; el = el.parentElement)
             paper = getComputedStyle(el).backgroundColor
           const ink = await markInk(mark)
-          if (!ink || !paper) pageLog('selftest note: the mark\'s contrast was not graded — its ink or the paper behind it could not be read')
+          if (!ink || paper === 'rgba(0, 0, 0, 0)')
+            pageLog(`selftest note: the loader's contrast was not graded — ink ${ink ?? 'unreadable'}, paper ${paper}`)
           else {
             // Linear-light difference: 0.08 is roughly the point at which a thin line drawing stops
             // being something you notice out of the corner of your eye.
-            const gap = Math.abs(lumOf(ink)! - lumOf(paper)!)
-            if (!Number.isFinite(gap)) verdict.push(`the contrast could not be computed from ${ink} against ${paper}`)
-            else if (gap < 0.08)
-              verdict.push(
-                `the mark is ${gap.toFixed(3)} of linear-light from the paper it sits on (${ink} against ${paper}) — too faint to read as a state`,
-              )
+            const li = lumOf(ink)
+            const lp = lumOf(paper)
+            if (li === null || lp === null) verdict.push(`the contrast could not be computed from ${ink} against ${paper}`)
+            else {
+              const gap = Math.abs(li - lp)
+              if (gap < 0.08)
+                verdict.push(
+                  `the loader is ${gap.toFixed(3)} of linear-light from the paper it sits on (${ink} against ${paper}) — too faint to read as a state`,
+                )
+            }
           }
           pageLog(
-            `working mark painted (${Math.round(mr.width)}x${Math.round(mr.height)} at ${Math.round(mr.left)},${Math.round(
+            `working loader painted (${Math.round(mr.width)}x${Math.round(mr.height)} at ${Math.round(mr.left)},${Math.round(
               mr.top,
-            )}, ${Math.round(rr.left - mr.right)}px clear of the grouped actions, ink ${ink ?? '?'} against ${paper})`,
+            )}, ${Math.round(lr.left - mr.right)}px before the sentence, ${drift.toFixed(1)}px off its line centre, row ${Math.round(
+              headRow.height,
+            )}px tall, ink ${ink ?? '?'} against ${paper})`,
           )
         }
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 96, finish: 'stop' } })
         await frame(40)
-        if (document.querySelector('.transcript .turn-working')) verdict.push('the working mark outlived the turn')
+        if (document.querySelector('.transcript .run-working')) verdict.push('the working loader outlived the turn')
         if (verdict.length) fail(verdict.join('; '))
-        else pageLog('working mark ok (painted in the gutter, clear of the grouped actions and inside the card, and gone when the turn landed)')
+        else
+          pageLog(
+            'working loader ok (painted at its declared box in the run header, static rather than pinned, one line row, inside the card, and gone when the turn landed)',
+          )
+      }
+
+      // --- the loader's file: sized for its box, timed as the artist timed it ---------
+      //
+      // Two ways this went wrong while it was being made, and neither shows in a screenshot. One:
+      // a resize that re-times the loop. This Pillow answers `duration: null` for every frame of an
+      // animated WebP, so a build that re-encodes from whatever it has to hand writes its own
+      // elapsed encode time into the frame table — this file came back with 20-39ms per frame where
+      // the artwork's own table says 33, a lap of 2.0s instead of 2.5s, and the first (larger)
+      // build had drifted the other way to 5.0s. Two: a file sized for a box four times the size it
+      // is drawn in, or half the size the display wants. So the shipped asset is read back through
+      // the same frame parser the app uses to re-arm the opening screen's cup: frame count, lap, and
+      // whether the canvas covers the CSS box at this window's device pixel ratio. `scripts/
+      // mark-resize.py` performs the same two checks at build time; this one notices when the asset
+      // in the tree stops matching the rules that draw it.
+      if (want('mark-art', 'the working loader ships at the size it is drawn in and at the artwork timing')) {
+        const verdict: string[] = []
+        // Which box the stylesheet asks for, read from the cascade rather than restated here: the
+        // element is mounted inside a throwaway run header so the rule that matches is the rule that
+        // would have to match in a live turn.
+        const transcriptEl = document.querySelector('.transcript')
+        let wantW = NaN
+        if (transcriptEl) {
+          const host = document.createElement('div')
+          host.className = 'blk-run'
+          const head = document.createElement('div')
+          head.className = 'blk-head'
+          const probe = document.createElement('img')
+          probe.className = 'run-working'
+          probe.alt = ''
+          head.append(probe)
+          host.append(head)
+          transcriptEl.append(host)
+          wantW = parseFloat(getComputedStyle(probe).width)
+          const maxed = getComputedStyle(probe).maxWidth
+          if (maxed !== 'none' && parseFloat(maxed) < wantW - 0.5)
+            verdict.push(`the cascade clamps the loader to ${maxed} while declaring ${wantW}px — the 0x56 trap, waiting`)
+          host.remove()
+        }
+        if (!Number.isFinite(wantW) || wantW < 8) fail(`the stylesheet asks for a loader ${Number.isFinite(wantW) ? wantW : 'nothing'}px wide; nothing here can be sized against that`)
+        const dpr = window.devicePixelRatio || 1
+        for (const [file, expectFrames] of [
+          [WORKING_ART.loop, 40],
+          [WORKING_ART.still, 1],
+        ] as [string, number][]) {
+          const bytes = await assetBytes(file)
+          if (!bytes) {
+            verdict.push(`${file} could not be fetched — a missing asset inside a desktop bundle is a silent 404 and a blank mark`)
+            continue
+          }
+          const t = aniFrames(bytes)
+          if (expectFrames === 1) {
+            // A still has no frame table by design: one frame, no ANMF chunks. What is worth
+            // checking is that it stayed a still and that it decodes, because that is what the
+            // motion setting has to show.
+            if (t) verdict.push(`${file} is a reduced-motion still that carries ${t.frames} frames of animation`)
+            const s1 = document.createElement('img')
+            s1.src = file
+            const ok1 = await new Promise<boolean>((res) => {
+              s1.addEventListener('load', () => res(true), { once: true })
+              s1.addEventListener('error', () => res(false), { once: true })
+              setTimeout(() => res(false), 2000)
+            })
+            if (!ok1) verdict.push(`${file} does not decode in this engine, so reduced motion shows nothing`)
+            else if (s1.naturalWidth + 0.5 < wantW * dpr)
+              verdict.push(`${file} is ${s1.naturalWidth}px for a ${wantW.toFixed(0)}px box at DPR ${dpr.toFixed(2)}`)
+            else pageLog(`loader still ok (${file}: one frame, ${s1.naturalWidth}px, ${Math.round(bytes.length / 1024)}KB)`)
+            continue
+          }
+          if (!t) {
+            verdict.push(`${file}: the frame table is not one this app can read (no ANMF chunks, or a layout aniFrames does not recognise)`)
+            continue
+          }
+          if (t.frames < expectFrames)
+            verdict.push(`${file} carries ${t.frames} frame(s); the artwork has 75 and a shorter loop reads as a different drawing`)
+          // The artist's own lap, measured from the shipped file rather than asserted from a
+          // memory: the drift this catches is a factor of two in either direction, and both have
+          // already happened in this repo.
+          if (t.playMs < 2300 || t.playMs > 2700)
+            verdict.push(
+              `${file} laps in ${t.playMs}ms (${(t.playMs / t.frames).toFixed(1)}ms/frame) — the artwork's own table says 33ms and 2500ms; a re-encode re-timed it`,
+            )
+          const img = document.createElement('img')
+          img.src = file
+          const ok = await new Promise<boolean>((res) => {
+            img.addEventListener('load', () => res(true), { once: true })
+            img.addEventListener('error', () => res(false), { once: true })
+            setTimeout(() => res(false), 2000)
+          })
+          if (!ok) {
+            verdict.push(`${file} does not decode in this engine`)
+            continue
+          }
+          const need = wantW * dpr
+          if (img.naturalWidth + 0.5 < need)
+            verdict.push(
+              `${file} is ${img.naturalWidth}px for a ${wantW.toFixed(0)}px box at DPR ${dpr.toFixed(2)} (${need.toFixed(
+                0,
+              )} needed): the mark is drawn larger than its pixels, so it blurs`,
+            )
+          else if (img.naturalWidth > need * 3)
+            verdict.push(
+              `${file} is ${img.naturalWidth}px for a ${wantW.toFixed(0)}px box at DPR ${dpr.toFixed(
+                2,
+              )}: ${Math.round(bytes.length / 1024)}KB of payload for a mark this size`,
+            )
+          pageLog(
+            `loader art ok (${file}: ${t.frames} frame(s), lap ${t.playMs}ms, ${img.naturalWidth}px canvas for a ${wantW.toFixed(
+              0,
+            )}px box at DPR ${dpr.toFixed(2)}, ${Math.round(bytes.length / 1024)}KB)`,
+          )
+        }
+        if (verdict.length) fail(verdict.join('; '))
+      }
+
+      // --- the composer's own control carries the same status -------------------
+      //
+      // "Put that same loader in the send button on the composer (make it fit, don't expand the
+      // button)." Two failures are invisible to a DOM query, and both were the reason for the
+      // parenthetical: a picture too big for its box grows the button, and a grown button moves the
+      // whole composer strip sideways under the reader's cursor mid-turn; and a mark that replaces
+      // the control's own affordance leaves a person hunting for the thing that ends a turn. So the
+      // claims are the button's box before the turn and during it (identical), the mark inside that
+      // box, the stop square still painted on top of it, and the control still labelled as the way
+      // out. It is asserted while the turn is in flight: after it settles the store catches up and
+      // the whole question is invisible again.
+      if (want('send-loader', 'the send button carries the working loader without changing size')) {
+        const btn0 = document.querySelector('.cbtn.go') as HTMLElement | null
+        if (!btn0) fail('the composer has no send/stop control to carry a status')
+        else {
+          const idle = btn0.getBoundingClientRect()
+          const idleRow = btn0.parentElement?.getBoundingClientRect()
+          const verdict: string[] = []
+          // Watched from animation frames, not polled after the fact. The first version of this
+          // check sent, then asked whether the button had drawn the mark — and the mock endpoint
+          // answers a short ask in well under a second, so the answer was "no loader" with
+          // `busy=false, turns 28->29`: a turn that had already landed. A status that exists for
+          // 400ms is still a status, so the button is sampled on the frame clock from before the
+          // send to after the turn, and what gets graded is the frame the mark was painted in.
+          type Shot = {
+            w: number
+            h: number
+            bw: number
+            bh: number
+            rowL: number
+            rowW: number
+            stop: boolean
+            label: string
+            title: string
+            disabled: boolean
+            src: string
+            inBtn: boolean
+            bg: string
+            filt: string
+            img: HTMLImageElement
+            ratio?: number
+          }
+          let shot: Shot | null = null
+          let stopSampling = false
+          // Both clocks. `requestAnimationFrame` counts the frames the compositor actually delivered
+          // — the only witness that a mark was *painted* rather than merely laid out — and a timer
+          // does the capturing, because on this desktop mutter stops handing out frames as soon as
+          // the window is occluded, and a check that only samples on frames reports "the button never
+          // drew a loader" about a turn that ran perfectly. The box geometry comes from layout, which
+          // is real whether or not anything composited it.
+          let framesSeen = 0
+          let samples = 0
+          const countFrames = () => {
+            if (stopSampling) return
+            framesSeen += 1
+            requestAnimationFrame(countFrames)
+          }
+          requestAnimationFrame(countFrames)
+          const sample = () => {
+            if (stopSampling) return
+            samples += 1
+            const img = document.querySelector('.cbtn.go .go-work') as HTMLImageElement | null
+            if (img && !shot) {
+              const btn = (img.closest('.cbtn.go') ?? img) as HTMLElement
+              const ir = img.getBoundingClientRect()
+              const br = btn.getBoundingClientRect()
+              const row = btn.parentElement?.getBoundingClientRect()
+              const sq = btn.querySelector('svg rect')
+              shot = {
+                w: ir.width,
+                h: ir.height,
+                bw: br.width,
+                bh: br.height,
+                rowL: row?.left ?? NaN,
+                rowW: row?.width ?? NaN,
+                stop: !!sq && getComputedStyle(sq).display !== 'none',
+                label: btn.getAttribute('aria-label') ?? '',
+                title: btn.getAttribute('title') ?? '',
+                disabled: btn.hasAttribute('disabled'),
+                src: img.getAttribute('src') ?? '',
+                bg: getComputedStyle(btn).backgroundColor,
+                // Read here rather than after the turn: `{#if busy}` takes this image out of the page
+                // when the turn ends, and `getComputedStyle` on a detached element answers an empty
+                // string. That is how this check first read the mark's filter as "none" and graded
+                // the artwork's raw ink against the button's fill.
+                filt: getComputedStyle(img).filter,
+                inBtn:
+                  ir.left >= br.left - 0.5 && ir.right <= br.right + 0.5 && ir.top >= br.top - 0.5 && ir.bottom <= br.bottom + 0.5,
+                img,
+              }
+            }
+            setTimeout(sample, 8)
+          }
+          setTimeout(sample, 8)
+          newSession()
+          // A prompt with a real scenario, and one that streams for about a second and a half. The
+          // first version asked for something the scripted endpoint has no scenario for, so the "turn"
+          // was an HTTP 400 that came back in 220ms: the button's own busy state is driven by polling
+          // the host, and a turn shorter than a poll never shows the status anyone is trying to grade.
+          draft = 'Write about coffee roasting in exactly four paragraphs'
+          const turnsBefore = (await invoke<HostState>('session_state')).turns
+          await send()
+          const done = await waitTurnDone(turnsBefore)
+          await frame(60)
+          stopSampling = true
+          // Read through an alias with the type restated: the only assignment happens inside a
+          // closure, so TypeScript has narrowed `shot` to `null` by here and would grade the claim
+          // against a type rather than against what the frames saw.
+          const s = shot as Shot | null
+          if (!s)
+            verdict.push(
+              `the send button never drew a loader while a turn ran (${samples} look(s) at 8ms, busy=${busy}, turns=${turnsBefore}->${
+                (await invoke<HostState>('session_state')).turns
+              })`,
+            )
+          else {
+            if (s.w < 16 || s.h < 16)
+              verdict.push(`the button's loader measured ${Math.round(s.w)}x${Math.round(s.h)} — the page's img reset, or the button's own box, is eating it`)
+            if (s.w > 26 || s.h > 26)
+              verdict.push(
+                `the button's loader measured ${Math.round(s.w)}x${Math.round(s.h)} inside a ${Math.round(s.bw)}x${Math.round(
+                  s.bh,
+                )} button — it fills the control rather than fitting in it`,
+              )
+            if (!s.inBtn) verdict.push('the loader is painted outside its own button')
+            // "Don't expand the button", measured against the same control before the turn began —
+            // and against the strip it sits in, because a button that grows moves the composer row
+            // sideways under the reader's cursor mid-turn.
+            if (Math.abs(s.bw - idle.width) > 0.6 || Math.abs(s.bh - idle.height) > 0.6)
+              verdict.push(
+                `the button grew from ${Math.round(idle.width)}x${Math.round(idle.height)} to ${Math.round(s.bw)}x${Math.round(
+                  s.bh,
+                )} while the turn ran`,
+              )
+            if (isFinite(s.rowL) && idleRow && (Math.abs(s.rowL - idleRow.left) > 0.6 || Math.abs(s.rowW - idleRow.width) > 0.6))
+              verdict.push(
+                `the strip the button sits in moved (${Math.round(idleRow.left)} w${Math.round(idleRow.width)} -> ${Math.round(
+                  s.rowL,
+                )} w${Math.round(s.rowW)})`,
+              )
+            // The affordance survives the status: this control is also how a person ends a turn, and
+            // the loop detector's own note tells them to use it.
+            if (!s.stop) verdict.push('the stop square is gone while a turn runs, so the control that ends a turn no longer says which one it is')
+            if (!/stop/i.test(s.label) || !/stop/i.test(s.title))
+              verdict.push(`while a turn runs the control is labelled ${JSON.stringify(s.label)} / ${JSON.stringify(s.title)}`)
+            if (s.disabled) verdict.push('the control is disabled while a turn runs, so nothing can end it')
+            if (!/cwoffee_turn_working/.test(s.src)) verdict.push(`the button showed ${s.src || 'nothing'}, not the turn's own working artwork`)
+            // The artwork was drawn for paper, and this button is a filled shape the colour of ink.
+            // "Put the loader in the send button" is easy to satisfy with a mark nobody can see: the
+            // picture's own ink is sampled off its pixels and compared with the button's own fill on
+            // one linear-light scale. 3:1 is WCAG's floor for a non-text element that carries meaning,
+            // and this one carries the only status the composer has.
+            const lb = lumOf(s.bg)
+            const filt = s.filt
+            const bright = filt === 'none' ? 1 : Number(filt.match(/brightness\(\s*([\d.]+)/)?.[1] ?? '1')
+            if (!filt)
+              verdict.push("the send button's working mark answered no computed style — it was measured after the turn had taken it out of the page")
+            const hues = await markHues(s.img, Number.isFinite(bright) ? bright : 1)
+            if (lb === null || !hues.length)
+              verdict.push(`the button's contrast cannot be graded: ${hues.length} hue(s) read off the mark, fill ${JSON.stringify(s.bg)}`)
+            else {
+              let worst = Number.POSITIVE_INFINITY
+              const parts: string[] = []
+              for (const h of hues) {
+                const ratio = (Math.max(h.lum, lb) + 0.05) / (Math.min(h.lum, lb) + 0.05)
+                if (ratio < worst) worst = ratio
+                parts.push(`${h.name} ${h.ink} ${ratio.toFixed(2)}:1/${h.px}px`)
+                if (ratio < 3)
+                  verdict.push(
+                    `the button's loader ${h.name} reads at ${ratio.toFixed(2)}:1 on the button's own fill ${JSON.stringify(
+                      s.bg,
+                    )} (${h.ink}, ${h.px} of its pixels) — under 3:1 on a control that carries the only status the composer has`,
+                  )
+              }
+              s.ratio = worst
+              pageLog(
+                `send button loader contrast: worst ${worst.toFixed(2)}:1 against ${s.bg} (filter ${filt}, ${parts.join('; ')})`,
+              )
+            }
+          }
+          // Settled: the mark is gone, the arrow is back, and the button is the box it was.
+          if (document.querySelector('.cbtn.go .go-work')) verdict.push('the button kept its loader after the turn ended')
+          const btnAfter = document.querySelector('.cbtn.go') as HTMLElement | null
+          if (btnAfter?.hasAttribute('data-busy')) verdict.push('the button still announces itself busy after the turn ended')
+          if (btnAfter) {
+            const ar = btnAfter.getBoundingClientRect()
+            if (Math.abs(ar.width - idle.width) > 0.6 || Math.abs(ar.height - idle.height) > 0.6)
+              verdict.push(
+                `the button is ${Math.round(ar.width)}x${Math.round(ar.height)} once settled; it began ${Math.round(idle.width)}x${Math.round(
+                  idle.height,
+                )}`,
+              )
+            if (!btnAfter.querySelector('svg path'))
+              verdict.push('the settled button has no send arrow — the working mark replaced the affordance instead of joining it')
+          }
+          if (!done) verdict.push('the send-loader turn never finished, so the settled half of this claim was graded on a turn still running')
+          if (verdict.length) fail(verdict.join('; '))
+          else if (framesSeen < 1)
+            // Named, not silently passed: the mark was laid out inside an unchanged button, but this
+            // window delivered no frame in which to see it, so nobody has proven it reached the screen.
+            pageLog(
+              `selftest note: the send button's loader was measured by geometry only (${Math.round(
+                idle.width,
+              )}x${Math.round(idle.height)} button unchanged, mark inside it); the window delivered 0 frame(s) during the turn, so its painted state was not witnessed`,
+            )
+          else
+            pageLog(
+              `send loader ok (${Math.round(idle.width)}x${Math.round(idle.height)} button unchanged through the turn, 20px mark inside it over ${framesSeen} painted frame(s), stop square still painted, labelled Stop while busy and Send once settled)`,
+            )
+        }
       }
 
       // --- one surface for the whole window ----------------------------------------
@@ -15415,7 +15468,7 @@
           else {
             const sibs = [...(row.parentElement?.children ?? [])] as HTMLElement[]
             const after = sibs.slice(sibs.indexOf(row) + 1)
-            const intruder = after.find((n) => !n.classList.contains('turn-acts') && !n.classList.contains('transcript-cup'))
+            const intruder = after.find((n) => !n.classList.contains('turn-acts'))
             if (intruder)
               verdict.push(
                 `the file row is followed by "${intruder.className}" — files must be the last thing the turn says ` +
@@ -15719,6 +15772,273 @@
       // in the DOM proves nothing about where it painted. The deliberate exception is asserted too:
       // a note that explains a control still on screen stays under that control, because moving it
       // to a corner away from the thing it describes turns an explanation into a riddle.
+      // --- the chrome row, and where the height it gives back goes ---------------------
+      //
+      // "Reduce the topbar's height and make some more space for the sidebar and transcript's
+      // height." The number on the bar is the easy half; what a person actually asked for is that the
+      // band comes back as *room* rather than as a gap. So the claims are: the row is short, its own
+      // contents still fit inside it (a control the window's decorations clip is a control nobody can
+      // press), the sidebar and the card start on the row's bottom edge and reach the bottom of the
+      // window, and the two other places that measure the row — the narrow-width drawer and the
+      // settings dialog — resolve the same number the row does. `--titlebar-h` exists because there
+      // are four readers of one height; a fifth literal in markup is how they drift.
+      if (want('chrome-height', 'the chrome row is short, holds its own controls, and the height it gives back becomes room')) {
+        const verdict: string[] = []
+        const bar = document.querySelector('.titlebar') as HTMLElement | null
+        const shell = (document.querySelector('#app') ?? document.querySelector('.app-shell')) as HTMLElement | null
+        const side = document.querySelector('.sidebar') as HTMLElement | null
+        const card = document.querySelector('.panecard') as HTMLElement | null
+        if (!bar || !shell || !side || !card)
+          fail(`the chrome check found no ${!bar ? '.titlebar' : !shell ? '#app' : !side ? '.sidebar' : '.panecard'}`)
+        else {
+          const resolve = (decl: string): number => {
+            const t = document.createElement('div')
+            t.style.position = 'absolute'
+            t.style.left = '-9999px'
+            t.style.top = '0'
+            t.style.height = decl
+            document.body.append(t)
+            const got = parseFloat(getComputedStyle(t).height)
+            t.remove()
+            return got
+          }
+          const declared = resolve('var(--titlebar-h)')
+          const br = bar.getBoundingClientRect()
+          if (!Number.isFinite(declared)) fail('--titlebar-h resolves to nothing, so nothing below can be measured against it')
+          if (!(br.height > 24 && br.height <= 40))
+            verdict.push(
+              `the chrome row is ${br.height.toFixed(1)}px tall; shortening it means under about 40px and it still has to hold a 26px control`,
+            )
+          if (Number.isFinite(declared) && Math.abs(br.height - declared) > 1)
+            verdict.push(
+              `the chrome row measures ${br.height.toFixed(1)}px while the window's own --titlebar-h resolves to ${declared.toFixed(
+                1,
+              )}px — the height is being set somewhere other than the token as well`,
+            )
+          for (const el of [...bar.querySelectorAll('button, img, span')] as HTMLElement[]) {
+            const r = el.getBoundingClientRect()
+            if (r.height > br.height + 0.5 || r.top < br.top - 0.5 || r.bottom > br.bottom + 0.5)
+              verdict.push(
+                `${el.tagName.toLowerCase()}${el.className ? `.${String(el.className).split(' ')[0]}` : ''} is ${r.height.toFixed(
+                  1,
+                )}px at ${r.top.toFixed(1)}..${r.bottom.toFixed(1)} inside a ${br.height.toFixed(1)}px row`,
+              )
+          }
+          const sr = side.getBoundingClientRect()
+          const cr = card.getBoundingClientRect()
+          const vr = shell.getBoundingClientRect()
+          const pane = document.querySelector('main') as HTMLElement | null
+          if (!pane) verdict.push('no main pane to measure the freed height against')
+          else {
+            const pr = pane.getBoundingClientRect()
+            // Freed height that turns into a gap is not freed height. The two columns start on the
+            // chrome row's bottom edge; the card is guttered *inside* its pane by its own margin,
+            // which is a different 10px and must not be charged to the chrome row.
+            for (const [what, top] of [
+              ['the sidebar', sr.top],
+              ['the pane', pr.top],
+            ] as [string, number][])
+              if (Math.abs(top - br.bottom) > 1.5) verdict.push(`${what} starts ${Math.round(top - br.bottom)}px off the chrome row's bottom edge`)
+            if (cr.top < br.bottom - 1.5) verdict.push(`the card starts above the chrome row's bottom edge (${Math.round(cr.top - br.bottom)}px)`)
+            if (cr.top - br.bottom > 16)
+              verdict.push(
+                `the card starts ${Math.round(cr.top - br.bottom)}px below the chrome row, past the gutter it is given inside its pane`,
+              )
+          }
+          const below = vr.bottom - Math.max(sr.bottom, cr.bottom)
+          if (below > 24)
+            verdict.push(`${Math.round(below)}px of window sits below both the sidebar and the card — the height is going to a gap, not to the list or the transcript`)
+          // The drawer and the dialog are the other two readers. The drawer rule only applies at
+          // narrow widths, so its declaration is read from the shipped stylesheet and resolved,
+          // rather than measured on a window that is not narrow.
+          let drawerTop = ''
+          // Only a rule inside a grouping block (the narrow-width media query) counts: a `top` on
+          // the docked sidebar would be a different claim, and the last one wins here.
+          const walk = (rules: CSSRuleList, depth: number, inBlock: boolean) => {
+            for (const rule of Array.from(rules)) {
+              const r = rule as CSSStyleRule & CSSMediaRule
+              if (r instanceof CSSStyleRule) {
+                const sel = (r.selectorText ?? '').trim()
+                if (inBlock && (sel === '.sidebar' || sel.split(',').some((s) => s.trim() === '.sidebar'))) {
+                  const t = r.style?.getPropertyValue('top') ?? ''
+                  if (t) drawerTop = t
+                }
+              }
+              const inner = (r as CSSMediaRule).cssRules
+              if (inner && inner.length && depth < 5) walk(inner, depth + 1, true)
+            }
+          }
+          for (const sheet of Array.from(document.styleSheets)) {
+            let rules: CSSRuleList | undefined
+            try {
+              rules = (sheet as CSSStyleSheet).cssRules
+            } catch {
+              continue // a sheet this page cannot read must not end the run
+            }
+            walk(rules, 0, false)
+          }
+          if (!drawerTop) verdict.push('no narrow-width rule gives the drawer a `top`, so it slides under the chrome row')
+          else {
+            const got = resolve(drawerTop)
+            if (Number.isFinite(got) && Number.isFinite(declared) && Math.abs(got - declared) > 1)
+              verdict.push(`the drawer starts at ${drawerTop} → ${got.toFixed(1)}px while the chrome row is ${declared.toFixed(1)}px tall`)
+          }
+          const dlg = resolve('calc(100vh - var(--titlebar-h) - 16px)')
+          if (!Number.isFinite(dlg)) verdict.push('the settings dialog height cannot be resolved from the token it declares')
+          else if (dlg > window.innerHeight - br.height + 1)
+            verdict.push(
+              `the settings dialog opens ${Math.round(dlg)}px tall in a ${window.innerHeight}px window with a ${Math.round(
+                br.height,
+              )}px chrome row — it would reach past the row`,
+            )
+          if (verdict.length) fail(verdict.join('; '))
+          else
+            pageLog(
+              `chrome ok (${br.height.toFixed(1)}px row from --titlebar-h ${declared.toFixed(1)}px, its controls inside it, sidebar and pane starting on its bottom edge with ${Math.round(
+                cr.top - br.bottom,
+              )}px of card gutter and ${Math.round(
+                vr.bottom - Math.max(sr.bottom, cr.bottom),
+              )}px spare below them; drawer top and the settings dialog resolve to the same height)`,
+            )
+        }
+      }
+
+      // --- the unread dot: what it claims, and what actually clears it ------------------
+      //
+      // Reported as: "I cannot mark it as read even opening it and scrolling to the bottom, it
+      // doesn't go away." Scrolling was never part of it. The dot compared a conversation's stored
+      // message count with where that conversation was last *read*, and "last read" was keyed on the
+      // session the host happened to be inside — which is not the conversation on screen, because
+      // opening one is a view and not a switch. So the conversation you were reading kept its mark
+      // however much of it you read, while some other conversation quietly got cleared. This builds
+      // the state a real unread conversation is in — its row count ahead of the reader's marker —
+      // through the same key the app writes, rather than reaching into component state, and then
+      // asks whether opening it ends the claim.
+      if (want('unread-dot', 'the dot says a conversation grew since you read it, and opening that conversation is what clears it')) {
+        const verdict: string[] = []
+        const rows = await invoke<Session[]>('list_sessions')
+        // A conversation the sidebar actually draws: chat conversations are hidden from a cowork
+        // list and drafts are not rows, so a dot on a row nobody can see is a different bug.
+        // `let`, because the block below can make its own subject when the list is empty.
+        let target = rows.find(
+          (r) => r.message_count > 0 && (personaNow === 'chat' ? r.persona === 'chat' : r.persona !== 'chat'),
+        )
+        // A suite deletes the conversations it makes, so "nothing here can be unread" is not a
+        // verdict — it is this check's own world being empty. Make one the way a person does, and
+        // the claim stays about a row that exists.
+        let made = 0
+        if (!target) {
+          made = await invoke<number>('new_session', { title: 'selftest unread' })
+          await invoke('start_turn', { text: 'Selftest unread check: reply with the single word ok.', session: made })
+          if (!(await settleTurn('the unread check\'s first answer', 90000)))
+            fail('the conversation made for the unread claim never came to rest, so no row count to be behind')
+          else {
+            const again = await invoke<Session[]>('list_sessions')
+            target = again.find(
+              (r) => r.id === made && r.message_count > 0 && (personaNow === 'chat' ? r.persona === 'chat' : r.persona !== 'chat'),
+            )
+          }
+        }
+        if (!target) pageLog('selftest note: no conversation in the sidebar has messages, so nothing here can be unread')
+        else {
+          const untilHere = async (fn: () => boolean, ms: number) => {
+            const stop = Date.now() + ms
+            while (Date.now() < stop) {
+              if (fn()) return true
+              await new Promise((r) => setTimeout(r, 60))
+            }
+            return fn()
+          }
+          let seen: Record<string, number> = {}
+          try {
+            seen = JSON.parse(localStorage.getItem(SEEN_KEY) ?? '{}')
+          } catch {
+            seen = {}
+          }
+          const was = seen[target.id]
+          // Where the reader was before this check moved them, so it can put them back.
+          const prevView = viewId
+          try {
+            // Nothing may be on screen while the dot is being claimed: a conversation you are
+            // watching is not unread, and this check just started a turn in the conversation it made,
+            // which moves the view to it. The reported bug was about a conversation nobody was
+            // looking at, so the check has to look away first.
+            showStartScreen()
+            await new Promise((r) => setTimeout(r, 150))
+            if (readHere !== 0) {
+              verdict.push(`the start screen still counts ${readHere} as being read, so nothing can be claimed unread`)
+            } else {
+              // The state a real unread conversation is in: the reader's marker is behind the row's
+              // count. Written through the same key the app writes, so the claim is about the record
+              // a real client keeps and the dot is still derived by the code under test.
+              seen[target.id] = 0
+              localStorage.setItem(SEEN_KEY, JSON.stringify(seen))
+              await loadSessions()
+              const row = [...document.querySelectorAll('.sessrow')].find(
+                (r) => (r.querySelector('.sess-title')?.textContent ?? '') === (target.title ?? ''),
+              ) as HTMLElement | undefined
+              if (!row) verdict.push(`the sidebar draws no row for ${JSON.stringify(target.title)} to carry a dot`)
+              else {
+                if (!row.classList.contains('unread'))
+                  verdict.push(
+                    `conversation ${target.id} holds ${target.message_count} message(s) and the reader's marker says 0, and no dot is drawn - the mark is not derived from the record`,
+                  )
+                const dot = row.querySelector('.sess-dot') as HTMLElement | null
+                if (!dot) verdict.push('the unread row draws no dot element, so the class marks nothing on screen')
+                else if (getComputedStyle(dot).opacity === '0') verdict.push('the unread dot is classed and painted at opacity 0')
+                if (!verdict.length) {
+                  // Opening it is reading it. No scroll, no second window, no waiting for a poll tick.
+                  // The dot is allowed to go when the page lands rather than on the click, but it has
+                  // to go: `viewId` moves before the transcript is loaded, so grading the class the
+                  // instant the view name changes would fail a build that is merely still loading.
+                  openSession(target.id)
+                  if (!(await untilHere(() => viewId === target.id, 6000)))
+                    verdict.push(`opening conversation ${target.id} did not put it in the view (viewId=${viewId})`)
+                  else {
+                    if (!(await untilHere(() => !row.classList.contains('unread'), 5000)))
+                      verdict.push(
+                        `the dot is still on conversation ${target.id} five seconds after opening it, with its ${target.message_count} message(s) on screen - the reported bug: reading a conversation never records it as read`,
+                      )
+                    if (!(await untilHere(() => (JSON.parse(localStorage.getItem(SEEN_KEY) ?? '{}'))[target.id] === target.message_count, 3000))) {
+                      const stored: Record<string, number> = JSON.parse(localStorage.getItem(SEEN_KEY) ?? '{}')
+                      verdict.push(
+                        `opening it left the read marker at ${JSON.stringify(stored[target.id])} while the row says ${target.message_count} message(s), so the next refresh would put the dot back`,
+                      )
+                    }
+                    // A conversation on screen does not become unread again because the list refreshed.
+                    await loadSessions()
+                    if (row.classList.contains('unread'))
+                      verdict.push('the conversation on screen was dotted again by a refresh of the session list')
+                  }
+                }
+              }
+            }
+            if (verdict.length) fail(verdict.join('; '))
+            else
+              pageLog(
+                `unread dot ok (${target.message_count} message(s) ahead of a marker at 0 drew the dot on ${JSON.stringify(
+                  target.title,
+                )}; opening conversation ${target.id} cleared it, wrote the marker at ${target.message_count}, and a refresh kept it clear)`,
+              )
+          } finally {
+            // This check moves a read marker on purpose. Leaving it moved would tell the next start of
+            // this person's app that a conversation they never read had been read.
+            if (was === undefined) delete seen[target.id]
+            else seen[target.id] = was
+            try {
+              localStorage.setItem(SEEN_KEY, JSON.stringify(seen))
+            } catch {
+              /* non-fatal */
+            }
+            if (made) await invoke('delete_session', { id: made }).catch(() => {})
+            // The reader goes back to the conversation this check moved them out of, and the view
+            // they were in gets its read marker back on the way.
+            if (prevView !== null) await openSession(prevView).catch(() => {})
+            await loadSessions().catch(() => {})
+          }
+        }
+      }
+
       if (want('notif-place', "notes land in the place the person chose, and the choice is the host's, not this window's")) {
         const verdict: string[] = []
         const PLACES = ['top', 'bottom', 'top-left', 'top-right', 'bottom-left', 'bottom-right']
@@ -16850,7 +17170,7 @@
   >
   <!-- ============================ titlebar ============================ -->
   <div
-    class="titlebar flex h-11 shrink-0 items-center gap-2 px-3"
+    class="titlebar flex shrink-0 items-center gap-2 px-3"
     data-tauri-drag-region
   >
     <!-- Sidebar toggle first. Below 768px the sidebar is a drawer, and without this
@@ -16869,8 +17189,8 @@
     <span class="text-[13px] font-medium tracking-tight" data-tauri-drag-region>cwoffee</span>
     <!-- The conversation this window is looking at, when there is one.
 
-         The model name used to sit here, and it read as a third thing in a 44px row
-         that already had a mark and a word: eleven grey pixels of endpoint id that
+         The model name used to sit here, and it read as a third thing in a row that
+         already had a mark and a word: eleven grey pixels of endpoint id that
          named nothing you could act on from the titlebar. It is on the composer's
          model chip instead — one tap from the control that changes it, and where the
          rest of the composer's state lives. With no conversation open the wordmark is
@@ -17661,10 +17981,11 @@
                      flag was fixed, did nothing. -->
                 <button
                   class="cbtn go {approval ? 'warn' : ''}"
+                  data-busy={busy ? '' : undefined}
                   onclick={() => (busy ? stopTurn() : send())}
                   disabled={!busy && !draft.trim()}
                   title={busy
-                    ? 'Stop this turn'
+                    ? 'Stop this turn — cwoffee is working'
                     : approval
                       ? 'Waiting on an approval above'
                       : modelReady
@@ -17673,7 +17994,13 @@
                   aria-label={busy ? 'Stop' : 'Send'}
                 >
                   {#if busy}
-                    <svg width="14" height="14" viewBox="0 0 14 14"><rect x="4" y="4" width="6" height="6" rx="1.4" fill="currentColor"/></svg>
+                    <!-- The turn's status lives on the control that starts turns, as well as in the
+                         run header. It is 20px inside a 32px button and absolutely placed, so the
+                         composer's row cannot reflow mid-turn; and the stop square stays on top of
+                         it, in the glyph colour, because the control still ends the turn — the dots
+                         go round the square rather than replacing it. -->
+                    <img class="go-work" src={workingArt} alt="" aria-hidden="true" draggable="false" />
+                    <svg class="go-stop" width="14" height="14" viewBox="0 0 14 14"><rect x="4" y="4" width="6" height="6" rx="1.4" fill="currentColor"/></svg>
                   {:else}
                     <svg width="14" height="14" viewBox="0 0 14 14"><path d="M7 11V3M3.6 6.4 7 3l3.4 3.4" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
                   {/if}
@@ -17689,14 +18016,14 @@
             <div class="ctl-note" data-web-note>{webNote}</div>
           {/if}
 
-          {#if personaNow === 'chat'}
-            <!-- Not hidden, because the space where the folder used to be would otherwise
-                 read as a bug. It says what is true instead. -->
-            <div class="wsrow ws-none">
-              <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
-              <span>Chat has no folder, and no tools to use one with</span>
-            </div>
-          {:else if wsEditing && !wsLocked}
+          {#if personaNow !== 'chat'}
+            <!-- A chat owns no folder, and the row is gone rather than replaced by a row that says
+                 so. It used to keep the space with a sentence - "not hidden, because the space
+                 would read as a bug" - but a line of text under the composer is still a line, and
+                 what it explains is a thing the mode already says: Chat has no tools, so there is
+                 no folder to choose and nothing to choose it for. The card's bottom edge is the
+                 composer's own padding, so removing it leaves no gap to mistake for a bug. -->
+          {#if wsEditing && !wsLocked}
             <div class="wsrow ws-edit">
               <svg width="13" height="13" viewBox="0 0 14 14"><path d="M1.8 4.2h3.4l1 1.4h6v5.6a.8.8 0 0 1-.8.8H2.6a.8.8 0 0 1-.8-.8z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
               <input
@@ -17739,6 +18066,7 @@
             </button>
           {/if}
           {#if wsErr}<div class="ws-err" role="alert">{wsErr}</div>{/if}
+          {/if}
         </div>
       </div>
       </div>

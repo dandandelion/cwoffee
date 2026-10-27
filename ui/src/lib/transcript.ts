@@ -1,31 +1,23 @@
 import { pageLog } from './pagelog'
-import { LoopHold, IDLE_HOLD, prefersStill } from './anipause'
+import { prefersStill } from './anipause'
 
 /**
- * The transcript's cup: two drawings, one element. The loop that runs while a block is producing
- * output, the loop that runs when it is resting, and a still of each for reduced motion.
- */
-const CUP_ART = {
-  busy: '/cwoffee_generating_generation_1.webp',
-  busyStill: '/cwoffee_generating_generation_still.webp',
-  idle: '/cwoffee_generating_idle_1.webp',
-  idleStill: '/cwoffee_generating_idle_still.webp',
-}
-/**
- * The mark that says a turn is being written, hung where the turn's name used to be.
+ * The mark that says a turn is being written.
  *
- * One file, looping, with no holds: the cup below takes random pauses because it is artwork that
- * would otherwise be the only moving thing on a still page, and this is not artwork, it is a state
- * readout — "an answer is arriving" — and a readout that stops and starts on a schedule of its own
- * is a puzzle rather than a signal. The still is for `prefers-reduced-motion`, which is why frame
- * zero is shipped alongside it.
+ * One file, looping, with no holds: the opening screen's cup takes random pauses because it is
+ * artwork that would otherwise be the only moving thing on a still page, and this is not artwork,
+ * it is a state readout — "an answer is arriving" — and a readout that stops and starts on a
+ * schedule of its own is a puzzle rather than a signal. The still is for `prefers-reduced-motion`,
+ * which is why frame zero is shipped alongside it.
+ *
+ * It is drawn for the box it is drawn in: an inline mark next to a run header's sentence and the
+ * same mark inside the composer's send button, both 20 CSS px on a DPR-2 screen, so the shipped
+ * file is 40 units (`scripts/mark-resize.py` builds it from the artwork under `assets/mark/`).
  */
-const WORKING_ART = {
-  loop: '/cwoffee_turn_working_1.webp',
-  still: '/cwoffee_turn_working_still.webp',
+export const WORKING_ART = {
+  loop: '/cwoffee_turn_working_inline_1.webp',
+  still: '/cwoffee_turn_working_inline_still.webp',
 }
-/** The pause between laps of the resting cup: the same range the opening-screen cup draws from. */
-const CUP_IDLE_HOLD = IDLE_HOLD
 
 // Resolved once: the plugin module does not exist in a plain browser build, and a
 // static import would make the preview crash at load rather than at click.
@@ -643,7 +635,6 @@ export class Transcript {
   clear(why = 'unspecified') {
     if (Transcript.reportClears) pageLog(`transcript clear: ${why}`)
     this.stopFollow()
-    this.stopCup()
     this.root.textContent = ''
     this.turn = null
     this.runGroup = null
@@ -669,18 +660,17 @@ export class Transcript {
     this.blockStart = 0
     this.wordRate = 0
     this.lastPaintAt = 0
-    // `textContent = ''` detached the cup with everything else. Put it back and let it hide itself:
-    // an empty transcript sits under the opening screen's own, bigger cup, and two of the same
-    // drawing on one page reads as a bug whether or not either of them moves.
-    this.placeCup()
   }
 
   /**
-   * Mark the one block that is currently producing output, and with it the state of the
-   * transcript's cup: the generating loop while output moves, the resting loop once it stops.
-   * Nothing else in the transcript animates on its own - the old pulsing dot was removed
-   * everywhere, in the gutter and beside every card inside the folded group - so the cup is the
-   * whole "is it working?" tell, and it is the same element either way, only a different drawing.
+   * Mark the one block that is currently producing output.
+   *
+   * Nothing else in the transcript animates on its own — the old pulsing dot was removed
+   * everywhere, in the gutter and beside every card inside the folded group. "Is it working?" is
+   * answered by two marks now, and neither is a block-level picture: the same animated loader
+   * inline in a run header's sentence while the model works (`runWorking`), and the same mark
+   * inside the composer's send button for the turn as a whole — which is what carries the answer
+   * for a turn that has no run group to attach a mark to.
    */
   private setLive(body: HTMLElement | null) {
     // A tool card is its own block, so its marker belongs on the card. Taking the
@@ -688,22 +678,13 @@ export class Transcript {
     // indicator at all while a running answer did.
     const wrap = body?.classList?.contains('blk') ? body : (body?.parentElement ?? null)
     if (this.liveWrap === wrap) return
-    const wasBusy = !!this.liveWrap
     this.liveWrap?.classList.remove('live')
     this.liveWrap = wrap
     wrap?.classList.add('live')
-    // The marker row carries the turn's state — CSS and the checks read `.live` — and the flip is
-    // what changes the transcript's cup: the generating loop while a block produces output, the
-    // resting loop with its random holds once none does.
-    const marker = (this.turn?.querySelector(':scope > .turn-who-cwoffee') ?? null) as HTMLElement | null
-    if (marker) {
-      marker.classList.toggle('live', !!body)
-      // The picture appears with the first live block of the turn and stays for the turn. Creating
-      // it per block would restart the loop at frame zero every time the model paused between a
-      // tool call and a sentence, which is a blink, not a spin.
-      if (body) this.workingImg(marker)
-    }
-    if (wasBusy !== !!body) this.repaintCup()
+    // A turn that starts working also needs its status. Every path that puts live words, thoughts
+    // or a running command on screen comes through here, so this is the one place that can ask
+    // "does this turn have a header to carry the loader, or does it need the loose one?"
+    if (wrap) this.syncWorking()
   }
 
   private liveWrap: HTMLElement | null = null
@@ -730,47 +711,90 @@ export class Transcript {
   }
 
   /**
-   * The one marker a turn carries in its gutter, stuck to the top of the scroller while that
-   * turn's text is on screen.
+   * The loader inside a run group's header sentence, created while that run is working.
    *
-   * It used to hold a word — `CWOFFEE`, once per turn, pinned so a long turn was never unlabelled.
-   * The word is gone: in this app everything in the transcript but your own bubble is cwoffee's,
-   * so the label restated what the layout already said, and the gutter was the only thing left to
-   * hang a *state* on. So the row stays and the picture in it says "this answer is arriving" while
-   * it is, and nothing once it has landed. The row is zero-height and its child is absolutely
-   * positioned, so a marker costs no vertical space and never nudges the text column.
+   * It used to hang in the turn's gutter, where the turn's name used to be: a 56px picture stuck
+   * to the top of the scroller for the length of the turn. That shape cost more than it was worth.
+   * It followed the screen, so it needed a clip-box rule to stop its top being shaved off by the
+   * pane; it needed 66px of the gutter reserved for it; and it qualified a sentence a metre away —
+   * "Working on your computer", which is the words that already say what the picture says. Inline
+   * in that sentence it can do none of that badly: it rides the line it belongs to, it cannot be
+   * clipped by a scroll container it is not near, and it reserves nothing.
+   *
+   * Made once per run group and removed at turn end (`dropWorking`), so a settled or loaded
+   * transcript holds no loader elements and therefore no decodes.
    */
-  private turnMarker(): HTMLElement {
-    this.ensureTurn()
-    const found = this.turn!.querySelector(':scope > .turn-who-cwoffee') as HTMLElement | null
-    if (found) return found
-    const wrap = this.el('turn-who turn-who-cwoffee')
-    // First child, so the sticky row is bounded by the turn the way `.code-head` is bounded by its
-    // block: it releases when the turn ends rather than floating over the next one.
-    this.turn!.insertBefore(wrap, this.turn!.firstChild)
-    return wrap
-  }
-
-  /** The looping picture inside a turn's marker, made once per turn. */
-  private workingImg(marker: HTMLElement): HTMLImageElement {
-    const found = marker.querySelector(':scope > .turn-working') as HTMLImageElement | null
+  private runWorking(wrap: HTMLElement): HTMLImageElement | null {
+    const head = wrap.querySelector(':scope > .blk-head') as HTMLElement | null
+    if (!head) return null
+    const found = head.querySelector(':scope > .run-working') as HTMLImageElement | null
     if (found) return found
     const img = document.createElement('img')
-    img.className = 'turn-working'
+    img.className = 'run-working'
     img.alt = ''
     img.setAttribute('aria-hidden', 'true')
-    // The file's own ANIM header asks for an infinite loop, so there is nothing to drive here:
-    // no hold, no timer, no `LoopHold`. Reduced motion gets the first frame as a still.
+    // The file's own ANIM header asks for an infinite loop at the artist's own frame timing, so
+    // there is nothing to drive here: no hold, no timer, no `LoopHold`. Reduced motion gets the
+    // first frame as a still.
     img.setAttribute('src', prefersStill() ? WORKING_ART.still : WORKING_ART.loop)
-    marker.append(img)
+    head.insertBefore(img, head.firstChild)
+    // A turn carries one loader. If this turn began as a plain answer, the loader was parked at the
+    // end of the writing (see `syncWorking`); the first tool call or thought gives it a proper head
+    // to ride, and the loose one goes away in the same breath rather than leaving two marks.
+    for (const tail of Array.from(this.turn?.querySelectorAll(':scope > .run-working') ?? [])) tail.remove()
     return img
   }
 
-  /** Take the working mark away once the turn has landed. A settled turn shows no mark at all. */
+  /**
+   * Give a working turn a loader when it has no run accordion to hold one.
+   *
+   * "Put the loader in the grouped actions header" is right about where the eye is — and it says
+   * nothing about the commonest turn of all: a plain answer with no tool calls and no thinking has
+   * no header, so a loader that only lives there means half the turns in this app run with no
+   * status in the transcript at all. So the loader goes after the last block the turn has written,
+   * inline with the prose column and ahead of whatever the turn produces on the way out (its files,
+   * its action row), and it is taken away the moment the turn lands. One per turn either way: the
+   * moment a run group appears, `runWorking` moves the mark to the header and removes this one.
+   */
+  private syncWorking() {
+    const turn = this.turn
+    if (!turn) return
+    if (turn.querySelector(':scope > .blk-run > .blk-head')) {
+      this.runWorking(turn.querySelector(':scope > .blk-run') as HTMLElement)
+      return
+    }
+    if (turn.querySelector(':scope > .run-working')) return
+    const img = document.createElement('img')
+    img.className = 'run-working turn-tail'
+    img.alt = ''
+    img.setAttribute('aria-hidden', 'true')
+    img.setAttribute('src', prefersStill() ? WORKING_ART.still : WORKING_ART.loop)
+    // Ahead of the turn's own exits, so a file row or an action row is never pushed down by a mark
+    // that is about to disappear.
+    const exit = Array.from(turn.children).find(
+      (n) => n.classList.contains('attachline') || n.classList.contains('fileturn') || n.classList.contains('turn-acts'),
+    )
+    if (exit) turn.insertBefore(img, exit)
+    else turn.append(img)
+  }
+
+  /** Take the working marks away once the turn has landed. A settled turn shows no mark at all. */
   private dropWorking() {
-    const marker = this.turn?.querySelector(':scope > .turn-who-cwoffee') as HTMLElement | null
-    marker?.querySelector(':scope > .turn-working')?.remove()
-    marker?.classList.remove('live')
+    for (const img of Array.from(this.turn?.querySelectorAll('.run-working') ?? [])) img.remove()
+  }
+
+  /**
+   * Re-pick the working loader's file wherever a run is still working.
+   *
+   * The picture is chosen when the loader is made, because a media query cannot pause a raster loop:
+   * reduced motion has to be a different file rather than a different style. So a motion setting that
+   * flips mid-turn leaves the loaders already on screen showing the wrong file, and waiting for the
+   * next turn would leave a conversation moving after the user asked it not to.
+   */
+  setMotion() {
+    const src = prefersStill() ? WORKING_ART.still : WORKING_ART.loop
+    for (const img of Array.from(this.root.querySelectorAll<HTMLImageElement>('.run-working')))
+      if (img.getAttribute('src') !== src) img.setAttribute('src', src)
   }
 
   /**
@@ -794,155 +818,16 @@ export class Transcript {
     for (const el of this.fileEls) turn.insertBefore(el, acts)
   }
 
-  // ---- the transcript's cup ---------------------------------------------------------------
-  // One picture for the whole transcript, and one place for it to sit: the bottom band of the
-  // transcript pane, reserved by the scroller's padding, where nothing else is drawn. It used to
-  // hang under each turn's name (a column of small cups), then became the last element in the
-  // content (one cup that the whole turn pushed around). The band is the third shape and the first
-  // one where the picture does not move: it is still the artwork at the bottom of the conversation,
-  // still exactly one of them, and now it stays put while lines arrive.
-  // One picture for the whole transcript, moved to the end of whatever it contains, rather than one
-  // under each turn's name. Under the name it multiplied - a session of short turns became a column
-  // of small cups, which is the same turn-per-label mistake the name itself already had - and a cup
-  // small enough to fit a 58px gutter is too small to read as a drawing at all. At the end of the
-  // content there is exactly one, big enough to be the artwork, and turn end puts it under the
-  // Copy / Share / Branch row because that row belongs to the turn while this belongs to the page.
-  //
-  // It is never created twice: `cup()` makes the element once and `placeCup()` moves it. That is
-  // also what the earlier per-turn rule was working around - an animated raster decodes its own
-  // frame stream per element, so a cup per turn costs a decode per turn, and a loaded session used
-  // to get stills because of it. Which is why a loaded session's cup looked frozen.
-
-  private cupImg: HTMLImageElement | null = null
-  private cupHold: LoopHold | null = null
-  private cupVisible = true
-  /** How far above the end of the content the reader may be and still be shown the cup. The cup is
-   *  pinned to the pane, so anything deeper into the transcript than this is text that would sit
-   *  under a 136px drawing. The band is 168px deep and the drawing plus its seat is 144px, so the
-   *  picture stops clearing the content at almost exactly that distance - the number is geometry,
-   *  not taste. */
-  private static readonly CUP_REST_PX = 24
-  /** How long the reader has to be away from the end before the picture is put away. The follow's
-   *  own catch-up leaves the view 20-60px short of the bottom for a frame or two at a time; a cup
-   *  that vanishes and returns inside half a second is a blink, and this one is 136px wide. */
-  private static readonly CUP_HIDE_MS = 400
-  private cupHideTimer = 0
-
-  /** The cup element, made once per transcript and re-used for as long as this transcript lives. */
-  private cup(): HTMLImageElement {
-    if (!this.cupImg) {
-      const img = document.createElement('img')
-      img.className = 'transcript-cup'
-      img.alt = ''
-      img.draggable = false
-      img.setAttribute('src', this.cupSrc())
-      this.cupImg = img
-    }
-    return this.cupImg
-  }
-
-  /** Which of the four files this cup should be showing right now. */
-  private cupSrc(): string {
-    const busy = !!this.liveWrap
-    const still = prefersStill()
-    if (still) return busy ? CUP_ART.busyStill : CUP_ART.idleStill
-    return busy ? CUP_ART.busy : CUP_ART.idle
-  }
-
-  /**
-   * Move the cup after whatever was last added, and hide it when the transcript holds nothing: the
-   * opening screen has its own, larger cup, and a page showing the same drawing twice is a bug
-   * whether or not it is animated.
-   *
-   * The picture lives in the pane, not in the page that scrolls. The scroller's bottom padding
-   * reserves the band it sits in (see `.transcript-cup` and `--cup-band` in app.css), so the newest
-   * line of text stops above it and the drawing never travels. Appending it to `this.root` - the
-   * old shape, the last thing in the content - made the picture's on-screen position a function of
-   * every arriving line and every follow step: measured in `ui/perf/probe.ts` over three streamed
-   * turns that was 1,348px of travel, p95 261px in a single frame, and six reversals of direction.
-   * A drawing that reverses is what the eye reads as jitter, and this one is 136px across.
-   */
-  private placeCup() {
-    const img = this.cup()
-    const host = this.root.closest('.scrollerwrap') ?? this.root.parentElement ?? this.root
-    if (img.parentElement !== host) {
-      // Two transcripts in one pane (a session switch that rebuilds the transcript object) must not
-      // leave two pictures in the band. The transcript guarantees one cup; this is where that is
-      // enforced, since the band belongs to the pane rather than to this transcript's content.
-      for (const stale of Array.from(host.children))
-        if (stale !== img && stale.classList?.contains('transcript-cup')) stale.remove()
-      host.appendChild(img)
-    }
-    img.classList.toggle('bare', this.root.children.length === 0)
-    this.updateCup()
-  }
-
-  /**
-   * Show the pinned cup only when the reader is at rest at the end of the transcript.
-   *
-   * The cup is pinned to the pane, but the text under it scrolls. Kept lit while the reader is
-   * anywhere else, a 136px drawing sits on top of other people's paragraphs halfway through a
-   * conversation - a picture painted over prose is worse than a missing picture. The band the
-   * scroller reserves is the end of the content, so at rest the band is empty and the drawing has
-   * somewhere to live. It is lit again the moment the view comes back down, which includes every
-   * moment the follow is holding the view at the bottom while the model writes.
-   */
-  private updateCup(readerMoved = false) {
-    const img = this.cupImg
-    if (!img) return
-    const sc = this.hookScroller()
-    if (!sc) return
-    const away = sc.scrollHeight - sc.clientHeight - sc.scrollTop
-    const atEnd = this.root.children.length > 0 && away <= Transcript.CUP_REST_PX
-    if (atEnd) {
-      if (this.cupHideTimer) {
-        clearTimeout(this.cupHideTimer)
-        this.cupHideTimer = 0
-      }
-      this.setCupShown(true)
-      return
-    }
-    if (readerMoved) {
-      if (this.cupHideTimer) {
-        clearTimeout(this.cupHideTimer)
-        this.cupHideTimer = 0
-      }
-      this.setCupShown(false)
-      return
-    }
-    if (this.cupHideTimer || !this.cupVisible) return
-    this.cupHideTimer = window.setTimeout(() => {
-      this.cupHideTimer = 0
-      this.setCupShown(false)
-    }, Transcript.CUP_HIDE_MS)
-  }
-
-  private setCupShown(on: boolean) {
-    const img = this.cupImg
-    if (!img || on === this.cupVisible) return
-    this.cupVisible = on
-    img.classList.toggle('cup-out', !on)
-  }
-
-  /**
-   * Re-pick the drawing and its motion. The generating loop runs at the artist's timing with no
-   * hold inserted; the resting loop is re-armed every lap with a fresh hold drawn from CUP_IDLE_HOLD
-   * (see anipause.ts); reduced motion gets a still, because a media query cannot pause a raster
-   * loop. Called whenever the transcript's busy state flips and when the motion setting changes.
-   */
-  repaintCup() {
-    const img = this.cup()
-    const busy = !!this.liveWrap
-    this.stopCup()
-    img.setAttribute('src', this.cupSrc())
-    img.classList.toggle('busy', busy)
-    if (!busy && !prefersStill()) this.cupHold = new LoopHold(img, this.cupSrc(), CUP_IDLE_HOLD[0], CUP_IDLE_HOLD[1])
-  }
-
-  private stopCup() {
-    this.cupHold?.stop()
-    this.cupHold = null
-  }
+  // ---- the transcript's cup: gone ---------------------------------------------------------
+  // A 136px drawing pinned in the bottom band of the pane used to be the transcript's answer to
+  // "is it working". It shared that question with the run header's sentence ("Working on your
+  // computer", counting steps as they land) and, now, with the same animated mark inline in that
+  // sentence and inside the composer's send button — so the band's picture is the third copy of
+  // one answer, and the most expensive one: a 480-unit raster decoding in the pane, a 168px band
+  // of the transcript permanently empty, and a visibility rule (hide it once the reader is more
+  // than 24px from the end) that existed only because the drawing would otherwise sit on other
+  // people's paragraphs. The opening screen keeps its own, larger cup: there it is the artwork on
+  // an empty page, which is the one place it was never competing with anything.
 
   private ensureTurn() {
     if (this.turn) return
@@ -952,8 +837,6 @@ export class Transcript {
     // now, and carrying the history over would mean a map full of the wrong turn.
     this.loop = new LoopWatch()
     this.loopShown = false
-    // The cup belongs under the newest thing, so a new turn takes its place.
-    this.placeCup()
   }
 
   /**
@@ -976,8 +859,6 @@ export class Transcript {
       // name and the rest are quiet. (A message typed while a turn was open lands in that turn
       // and gets its own name later, when the divider moves it into the turn it opens.)
       if (this.turn!.querySelector('.blk-user')) wrap.classList.add('nameless')
-    } else {
-      this.turnMarker()
     }
     // Thinking joins the run accordion; so does any later tool call, even one that
     // happens after the model has said something. What the model *said* goes below the
@@ -1021,8 +902,6 @@ export class Transcript {
     const wrap = this.el('blk blk-reasoning')
     const head = this.el('blk-head streaming', 'thinking')
     wrap.append(head)
-    // The working is cwoffee's too, so a turn that opens with a thought still gets its name.
-    this.turnMarker()
     this.runBodyOf(this.ensureRunGroup()).appendChild(wrap)
     const run = this.runGroup
     if (run) this.bumpRun(run, 'think')
@@ -1152,9 +1031,6 @@ export class Transcript {
 
   private ensureRunGroup(): HTMLElement {
     this.ensureTurn()
-    // A turn that opens with a tool call still gets its marker: the gutter says whose working
-    // this is while the answer has not started arriving yet.
-    this.turnMarker()
     const existing = this.runGroup
     if (existing && existing.parentElement === this.turn) {
       // One accordion per turn, reopened rather than replaced. The model putting a
@@ -1168,6 +1044,7 @@ export class Transcript {
         // thinking that is happening now, not the span since the turn first started.
         existing.dataset.opened = String(Math.round(performance.now()))
         delete existing.dataset.thinkMs
+        this.runWorking(existing)
         this.paintRunHead(existing)
       }
       return existing
@@ -1177,6 +1054,7 @@ export class Transcript {
     wrap.classList.add('running')
     this.appendToTurn(wrap)
     this.runGroup = wrap
+    this.runWorking(wrap)
     this.paintRunHead(wrap)
     return wrap
   }
@@ -1975,10 +1853,6 @@ export class Transcript {
         // 48px is deliberately smaller than a line's worth of growth per paint,
         // so a reader who has been outrun is re-pinned rather than stranded.
         this.pinned = away < 48
-        // A reader who moved is a fact about the reader, not a transient of the follow, so the
-        // picture is put away on the same gesture rather than after its patience: the jump button
-        // appears off the same gesture, and the two must not share the corner of the pane.
-        this.updateCup(true)
         pageLog(`follow ${this.pinned ? 'on' : 'off'}: ${Math.round(away)}px from the bottom`)
         // The jump button answers "how far below the fold is the newest line", so it is measured
         // here too: this is the one place a reader's own scroll shows up.
@@ -2082,7 +1956,6 @@ export class Transcript {
    */
   private measureFollow(force = false) {
     const sc = this.hookScroller()
-    this.updateCup()
     if (!sc || !this.onFollowState) return
     const away = Math.max(0, Math.round(sc.scrollHeight - sc.clientHeight - sc.scrollTop))
     const ask = this.asked > 0
@@ -3902,10 +3775,6 @@ export class Transcript {
   loadHistory(msgs: StoredMessage[]) {
     this.clear('page paint')
     this.root.appendChild(this.historyFragment(msgs))
-    // One cup for the page, under everything the store produced, resting: a loaded session is a
-    // finished one, so this is the loop with the random holds rather than a still.
-    this.placeCup()
-    this.repaintCup()
     pageLog(`history: loaded ${msgs.length} messages`)
   }
 

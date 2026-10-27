@@ -343,6 +343,21 @@ when the clipboard is unreachable rather than waiting for a client that no longe
 
 The newest checks exist because a user read a symptom, not because a number moved:
 
+> **Superseded by the inline loader (batch eight).** The transcript no longer carries a cup. The
+> working status is a 20px picture inside the turn's own header
+> (`.blk-run > .blk-head > .run-working`), or a loose one after the last block when a plain answer has
+> no header (`.turn > .run-working.turn-tail`), and the composer's send button carries the same picture
+> inside its own 32×32 box. The cup bullets below stay as the record of why that picture was built and
+> of how a raster animation is measured — the traps in them (the page-wide `img, video { max-width:
+> 100% }` reset resolving against a zero-wide row, re-arming a loop by rewriting the last frame's
+> duration, a still carved out of a delta frame) are traps the loader runs into instead, and it has
+> checks for each: `mark-visible`, `mark-art`, `send-loader`. `cup-art` still grades the opening
+> screen's cup, which is still there. What ships is
+> `ui/public/cwoffee_turn_working_inline_1.webp` (40×40 for a 20px box at DPR 2, 75 frames, a 2500ms
+> lap, infinite) and `ui/public/cwoffee_turn_working_inline_still.webp` (one frame), both written from
+> `assets/mark/cwoffee_turn_working_source_199.webp` by `scripts/mark-resize.py` — one resample for both
+> files, and both verified with an independent decoder rather than only the library that wrote them.
+
 - **A turn says "working" once, in a drawing, not in five dots.** The report was "the dot animation
   and the assistant name are not aligned with the block header", and then "remove the dot on every
   block - including beside the small grouped actions inside the folded group - and put two animated
@@ -613,7 +628,10 @@ selected item's own fill otherwise swallows the ring, and the ring is on `:focus
 
 The user's screenshots are the spec; each fix carries the measurement that says it holds.
 
-- **The cup's seat, and the patience of its putting-away.** The picture sits
+- **The cup's seat, and the patience of its putting-away.** *(superseded: the transcript's cup band,
+  `--cup-band`, `--cup-left` and `.transcript-cup` are gone, and the follow/jump checks now fail if the
+  cup comes back; the numbers below are the record of how a pinned picture was measured, which is what
+  the loader's geometry checks inherit.)* The picture sits
   `8px` off the bottom of the transcript pane (`cup band ok (136px picture pinned 8px off the pane's
   bottom, 168px of the pane held out of the text, column-aligned; across 60 streaming frames it
   travelled 0.0px, worst frame 0.0px, 0 reversals, 1 lit/away toggle...)`). The seat is measured
@@ -717,3 +735,47 @@ exactly the bug, and it used to be silent because `set_thinking_level` reports s
 The Rust core answers the same field without asking anything, and its test keeps three claims apart:
 what this endpoint was *probed* to accept, what the *dialect* documents, and what a dial may therefore
 offer. An unprobed model is not a model that cannot think, and reporting nothing would say that.
+## The chrome row, the folder row a chat does not need, and a dot that is a record comparison
+
+Three checks were added for the batch that shortened the titlebar, removed the chat mode's folder line,
+and fixed unread conversations. Each one is written against the thing the report was actually about.
+
+- **`chrome-height` grades where the height went, not the number on the bar.** The bar is checked against
+  the window's own `--titlebar-h` as the browser resolves it (a token is a real height; matching the
+  literal string in the file would grade the source), its controls are checked to sit inside it — a
+  control a window's decorations clip is a control nobody can press — and then the claim that matters:
+  the sidebar and the pane start on the bar's bottom edge, and nothing sits below both of them. That last
+  number is printed, because "reduce the topbar and give the space to the list and the transcript" is
+  answered by `0px spare below them` and not by `36px`. The card's own 10px gutter inside its pane is
+  deliberately *not* charged to the chrome row; the first draft of this check failed on it. The drawer's
+  narrow-width `top` and the settings dialog's height are read out of the shipped stylesheet and resolved,
+  so a fifth hard-coded number somewhere else is a failure naming both values.
+- **`unread-dot` sets the record, then reads the dot.** The mark is a comparison between a conversation's
+  stored message count and where that conversation was last read, so the check writes the marker through
+  the app's own `SEEN_KEY` at 0 for a conversation whose row says more, and requires the dot. Then it
+  opens the conversation and requires the dot to be gone and the marker to have moved to the row's count,
+  and requires that a refresh of the session list does not put it back. Three things it has to get right
+  or it lies: it looks away first (`showStartScreen()`), because it makes its own conversation with a
+  turn and a turn moves the view to what it grew; it waits for the dot rather than grading the class the
+  instant `viewId` changes, since the view name moves before the transcript lands; and it restores the
+  person's marker and their view in `finally`, because a suite that leaves a read marker moved tells
+  their next start that a conversation they never read had been read. If the sidebar has no conversation
+  with messages, the check makes one rather than reporting "nothing here can be unread" — that sentence
+  would be its own empty world, not a verdict.
+- **`mark-visible` grades two homes.** A working mark lives in a turn's run header, or loose after the
+  last block when the turn is a plain answer with no header at all. The group accepts either, requires
+  never more than one per turn, and grades them differently: the header mark must sit above and clear of
+  the answer's first line, the loose one below it and on the prose column. Both must be a real painted
+  `img` at the declared box (the page-wide `img, video { max-width: 100% }` reset is what made an earlier
+  mark measure `0x56`), must keep their own opacity and layer promotion against `.turn > *`'s entrance
+  animation, and must be gone once the turn lands. If layout was measured but no frames were delivered,
+  the group says it measured geometry only — a timer can prove a box; only paints prove a screen.
+- **`mark-art` checks the bytes that ship, not the artwork on disk.** The CSS box the loader actually
+  resolves to, the loop's frame count and lap read out of the shipped table, the canvas against that box
+  at this window's DPR, and whether the reduced-motion still decodes in this engine. That last claim
+  exists because Pillow accepted a still carved from a delta frame, `identify` called the same file
+  `corrupt image`, and the app showed nothing for `prefers-reduced-motion`.
+- **Two clocks, for two different questions.** `send-loader` and `reveal` both count real
+  `requestAnimationFrame` paints and sample on a timer. Geometry without paints is a named note, not a
+  pass; a single sample after `frame(150)` is not evidence about a 130ms fade, which is why `reveal` runs
+  its own frame sampler and grades the peak number of mid-fade words rather than one reading.

@@ -133,6 +133,17 @@ async function readBytes(url: string): Promise<Uint8Array | null> {
   })
 }
 
+/**
+ * The shipped bytes of an asset, with no opinion about what they contain.
+ *
+ * `aniBytes` is the one this module uses, and it refuses anything whose frame table it cannot read —
+ * correct for re-arming a loop, wrong for checking a still, which has no ANMF chunks by design. A
+ * claim about the shipped artwork has to look at both, so it asks for the bytes instead.
+ */
+export function assetBytes(url: string): Promise<Uint8Array | null> {
+  return readBytes(url)
+}
+
 export function aniBytes(url: string): Promise<Uint8Array | null> {
   let p = bytesByUrl.get(url)
   if (!p) {

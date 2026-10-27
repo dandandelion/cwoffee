@@ -1197,6 +1197,9 @@ instead of floating into the next one. The row carries a state now — the loopi
 provided, `ui/public/cwoffee_turn_working_1.webp`, with frame zero kept as
 `cwoffee_turn_working_still.webp` for `prefers-reduced-motion`.
 
+*(Superseded one batch later: the pinned 56px gutter mark and the pinned name row are both gone, and
+the mark is inline at 20px in the turn's header or after its last block. See "Batch eight" below.)*
+
 The looping needed no code. The file's own `ANIM` header says `loop_count=0` (infinite) and every
 `ANMF` frame says 198ms — a uniform lap with no holds, which is what a *state readout* wants. The
 transcript's cups take random pauses because they are artwork that would otherwise be the only moving
@@ -1611,3 +1614,220 @@ nearby. Naming every wipe, in a check run only, turned an inference into a log l
   the record, and a chip belonging to another conversation are four different bugs. The failure now
   prints the page (`blk-user`, `attlist`, `turns`, empty-mode, which conversation is open) alongside the
   record's own attachments for it.
+## Batch eight — the working status went inline, and the cup at the end of the transcript left
+
+Three asks: make the loader smaller and inline with the grouped action header, put the same loader in
+the composer's send button without expanding it, and delete the coffee cup at the end of the transcript
+because the loader now says "it's working" and two looping pictures in one window is one too many.
+
+### The header is not a home for the commonest turn
+
+"Put the loader in the run header" sounds complete: a turn with tool calls or thinking has a header, and
+a header is a line the reader's eye is already on. It failed on the first fixture that mattered:
+
+    SELFTEST FAIL: a heading answer has no working mark either
+
+A plain answer — no tool calls, no reasoning — has no `.blk-run > .blk-head` at all, and a plain answer
+is the commonest turn the app writes. So the mark has two homes and `syncWorking()` decides between them:
+the header when there is one, otherwise a loose `.run-working.turn-tail` after the last block written,
+placed before the turn's exits (`.attachline`, `.fileturn`, `.turn-acts`) so a file row never ends up
+under it. `runWorking()` removes a loose mark the moment a real header appears: one loader per turn, in
+whichever line is actually being written.
+
+The tail mark needed `animation: none`. `.turn > *` runs `cwoffee-rise` with `both` fill on every child
+of a turn, and a fill that holds the animation's end state overwrites a status mark's own declared
+opacity and its layer promotion — a direct child of the turn silently loses the two properties that make
+it cheap and legible.
+
+### A mark inside a filled button has to be tested against that fill
+
+The composer's send button is a 32×32 ink square in light mode and a paper square in dark. The loader
+goes inside it at 20px, `position: absolute; inset: 0; margin: auto`, so the button's own metrics do not
+move — the claim measures the button and the strip around it before and during a turn and fails on any
+growth.
+
+Contrast was the interesting part. Measuring the mark against the *paper* passed while the button's fill
+made it unreadable, and measuring the artwork's mean ink passed while one of its two hues was invisible:
+a slate hue and a terracotta hue average into a number that describes neither. Sampling per hue, against
+the fill, before any filter, was 2.72:1 on the light button and 2.42:1 on the dark one — under WCAG's 3:1
+for a graphic. `filter: brightness(1.25)` in light and `brightness(0.45)` in dark, and the selftest
+applies the same scalar to the pixel samples it grades, so a filter removed from CSS cannot quietly take
+the mark back under the threshold. Last run:
+
+    send button loader contrast: worst 4.03:1 against rgb(43, 42, 39) (filter brightness(1.25),
+      dark hue rgb(126, 139, 129) 4.03:1/35px; light hue rgb(238, 164, 90) 6.90:1/67px)
+    send loader ok (32x32 button unchanged through the turn, 20px mark inside it over 178 painted
+      frame(s), stop square still painted, labelled Stop while busy and Send once settled)
+
+The two clocks in that second receipt are deliberate. A timer samples geometry even when the compositor
+is occluded, and a `requestAnimationFrame` counter records whether the mark ever *reached the screen*;
+when frames are zero the group logs a named note ("measured by geometry only … its painted state was not
+witnessed") instead of claiming it saw the animation.
+
+### The cup, and what its removal had to keep paying for
+
+`CUP_ART`, `cupImg`, `placeCup`, `repaintCup`, `stopCup`, `--cup-band: 168px` and `--cup-left` are gone,
+and the scroller's bottom padding went back to the ordinary `var(--scroller-pad-top)`: 168px of reading
+surface came back per conversation. The follow, jump and file-ordering claims were retargeted rather than
+deleted, and now fail if `.transcript-cup` comes back — a removed feature needs a claim that it stays
+removed, or a later "restore the cup" patch looks like a clean revert.
+
+### The still was corrupt, and only a second decoder noticed
+
+The reduced-motion still used to be frame zero of the loop, carved out. The inline loop's frame zero is a
+**delta at (4,3)**, not a full-canvas frame, and delta image data only means something inside its
+animation container. Pillow happily wrote the file and happily read it back; `identify` said
+`corrupt image`; the app's own engine said it did not decode. So:
+
+- `scripts/mark-resize.py` takes `SOURCE LOOP SIZE STILL` and writes both files from one resized frame
+  set — one resample, one size decision, and both outputs checked with an independent decoder before the
+  script is allowed to say it succeeded.
+- `scripts/webp-still.py` refuses a first frame with a non-zero offset:
+  `frame 0 is a delta at (4,3); carving it out would corrupt the still`.
+
+    loader art ok (/cwoffee_turn_working_inline_1.webp: 75 frame(s), lap 2500ms, 40px canvas for a 20px
+      box at DPR 2.00, 64KB)
+    loader still ok (/cwoffee_turn_working_inline_still.webp: one frame, 40px, 1KB)
+
+`mark-art` grades the shipped bytes rather than the source artwork: what CSS box the loader actually
+resolves to (which is how the `0x56` trap would be caught here as well), the loop's frame count and lap,
+the canvas against the box at this window's DPR, and whether the still decodes. `assetBytes()` was added
+to `anipause.ts` for exactly one reason: `aniBytes()` refuses a file whose frame table it cannot read,
+which is right for re-arming a loop and wrong for verifying a still.
+
+### Three claims that were grading something else
+
+- `reveal` reported "only 0 words were ever mid-fade: the reveal is invisible" on a working reveal. It
+  sampled once after `frame(150)`; a 130ms fade can be finished by then, and the poll's phase decided the
+  verdict. It now runs a frame-clock sampler of its own and grades the peak number of simultaneously
+  mid-fade words — and a blind skip needs *both* its deltas and its sampler to have seen zero paints.
+- `thought-line` claimed the thinking header should outdent from the column it labels. A thinking line's
+  header is not a gutter label; it is the line the thought is written on, inside the accordion. The
+  outdent invariant moved to `turn-shape`, where a user bubble really does have a sticky label — and that
+  claim was rewritten to the CSS's actual design (above the body, inside the scroller's clip box, sticky,
+  with a readable band) rather than a horizontal outdent that was never true.
+- `ui/perf/probe.ts` followed the cup. It follows the loader now, and says so plainly when no loader is
+  on the page because every turn has landed.
+
+## Batch nine — shorter chrome, no folder row in a chat, and a dot that would not go
+
+### 44px of titlebar, and where the 8px went
+
+The chrome row carried `h-11` in markup, which is 44px, for three things: a drawer toggle below 768px, a
+wordmark, and the conversation's name. It is now `--titlebar-h: 36px` in the stylesheet and nothing in
+markup, because four places measure that height — the row, the narrow-width drawer that starts under it,
+the settings dialog that has to fit under it, and the check that grades all three. A fifth literal is how
+those drift apart; the drawer's `top` and the dialog's `calc(100vh - var(--titlebar-h) - 16px)` are
+resolved through the browser rather than string-matched.
+
+The height only counts if something receives it, so the claim is about that:
+
+    chrome ok (36.0px row from --titlebar-h 36px, its controls inside it, sidebar and pane starting on its
+      bottom edge with 10px of card gutter and 0px spare below them; drawer top and the settings dialog
+      resolve to the same height)
+
+The first version of that claim failed with `the card starts 10px off the chrome row's bottom edge`, which
+was the card's own gutter inside its pane — a different 10px, and not the chrome row's business. The pane
+is what has to start on the row's bottom edge; the card is allowed its margin. And "0px spare below them"
+is the actual point of the request: the freed band became room rather than a gap.
+
+### A chat does not need a line explaining that it has no folder
+
+Chat mode had replaced the workspace picker with a row that said "Chat has no folder, and no tools to use
+one with". That was written to defend against a gap — "not hidden, because the space where the folder used
+to be would otherwise read as a bug" — but a sentence under the composer is still a line of the card, and
+what it explains is a thing the mode already says: a chat has no tools, so there is no folder to choose
+and nothing to choose it for. The row is gone in chat mode, and the dead `.wsrow.ws-none` rule went with
+it; a rule that styles nothing is a claim about a design that no longer exists.
+
+The chat-mode check now rejects both shapes of the old build — a control that picks a folder, or a
+sentence standing in one's place — and `panecard` requires the folder row only outside chat mode, so the
+removal cannot be read as a broken card.
+
+    chat list ok (1 chat row(s) drawn, no folder tree, no approvals control)
+
+### The unread dot was marking the wrong conversation
+
+"I cannot mark it as read even opening it and scrolling to the bottom, it doesn't go away." Nothing about
+it was about scrolling. The dot compared a conversation's stored message count with where that
+conversation was last read, and "last read" was keyed on `hostState.session_id` — which is not the
+conversation on screen. Opening a conversation is a *view*, not a switch: `adoptHostSession` says so out
+loud, because a watch-only client must not move the engine by loading a page. So the host could be inside
+conversation 7 while conversation 12 was what the reader was looking at, and the marker said 7 had been
+read. However much of 12 you opened, its dot stayed; some conversation you had not looked at got cleared
+instead.
+
+Three changes, in the order the bug needed them:
+
+- `readHere = viewId ?? 0` — the conversation on screen is the one being read. No fallback to the host:
+  on the start screen nothing is being read, and clearing a dot for a conversation nobody is looking at
+  is the same mistake in the other direction.
+- `markViewRead()` runs at the end of `resyncView()`. A poll tick is not an answer to a click; waiting
+  for the next tick is what made the mark look broken from the chair.
+- `loadSessions()` now calls `loadSeen()` first. The read marker is a record in storage, not a fact about
+  this window, and boot used to be the only time it was read — so a window's copy drifted from the stored
+  one for the rest of its life.
+
+The check had to be built carefully, because every shortcut in it would have made it false:
+
+- the marker is written through `SEEN_KEY`, the same key the app writes, rather than by poking component
+  state — a claim about a record should set the record;
+- the check *looks away first* (`showStartScreen()`), because it starts a turn to make the conversation,
+  and a turn moves the view to what it grew — claiming "unread" while reading it would be the opposite
+  bug;
+- it waits for the dot to go rather than grading the class the instant `viewId` changes: the view name
+  moves before the transcript is loaded, and the first version of this check failed on that race, not on
+  the app;
+- it puts the person's own marker and view back in `finally`, passed or failed — a suite that leaves a
+  read marker moved tells the next start of their app that a conversation they never read had been read.
+
+    unread dot ok (2 message(s) ahead of a marker at 0 drew the dot on "Selftest title, typed in";
+      opening conversation 40 cleared it, wrote the marker at 2, and a refresh kept it clear)
+
+### Lessons
+
+- A status mark inside a filled button is graded against that button's fill, per hue. Paper contrast can
+  pass while the mark is invisible, and an average of two hues describes neither.
+- "Freed height" is only freed if something receives it. The number on the bar is the easy half; the
+  claim is that the columns start on the bar's bottom edge and reach the window's bottom.
+- When a row is deleted because it explained an absence, delete the rule that styled it too.
+- The app's own record is the only honest way to set up a claim about a record. If the test cannot make
+  the state through the record, the record is the thing that needs fixing.
+- A view name changing is not the page landing. Do not grade a class on the click when the effect happens
+  on the load.
+- A selftest that mutates a person's state restores it in `finally`, passed or failed.
+
+## Full pass, both cores (batch eight and nine)
+
+Rust core, full suite: one failure, and it was the window, not the app —
+
+    SELFTEST FAIL: 27 geometry checks were skipped: the window was off-screen for most of this run,
+      so nothing about layout was verified. Keep the window visible and re-run.
+
+and the substantive receipts in that same run:
+
+    working mark ok (run header 29.0px clear of the text, plain answer's loose loader 36.6px below the
+      first line and on the column, and none at all once the turn has landed)
+    a thought is one line and the answer keeps its outdented label
+    turn shape ok (2 answer blocks and 2 pieces of working in 1 accordion, no assistant label, no
+      generated marker on 8 label(s), 1 name for 2 of your messages, your ask under the divider)
+    opening screen ok (greeting and composer 26px apart, the pair 21px off the card's middle, the pair
+      spans 581px of a 717px card)
+    card ok (one surface 900x717 inside a 932px pane, holding conversation + composer + folder row;
+      16px of gutter; the same card on the opening screen at 900x717)
+    window surface ok · drawer surface ok · active row ok · turn files ok (two receipts)
+    chrome ok (…) · unread dot ok (…) · loader art ok · loader still ok
+
+Pi core, full suite, window composited: `SELFTEST ok`, with `mode toggle ok`, `chat list ok`,
+`web grant ok`, `send loader ok (… 178 painted frame(s) …)`, and one geometry check skipped.
+
+`cargo test --workspace`: 656 passed, 0 failed. `wire-names`: clean (two pre-existing notes about
+desktop-only verbs). `svelte-check`: 0 errors, 0 warnings. `vite build`: `index-p1hvjwir.css` 90.64 kB,
+`index-Ci2g5Spn.js` 306.76 kB. `install-desktop.sh --core pi` installed that bundle, and
+`install-desktop.sh --check-only`:
+
+    launch check: OK (gio launch ~/.local/share/applications/cwoffee.desktop)
+      app says: [cwoffee] engine up: core=pi persona=chat url=http://127.0.0.1:8090/v1
+        model=qwen3.8-flash-next-iq3_s workspace=… mode=Auto reasoning=XHigh
+      app says: [cwoffee] render OK: titlebar=true sidebar=true sidefoot=true stream=true empty=false
+        overlay=false text=4566 bg=rgb(253, 252, 249) desk=rgb(242, 239, 231) dpr=2.00 cup=none

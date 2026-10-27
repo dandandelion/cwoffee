@@ -26,6 +26,17 @@
   --color-hairline: #e8e5dd;
   --color-hairline-2: #dcd8ce;
 
+  /* The window's chrome row, and the height everything under it is measured from.
+   *
+   * It was 44px (`h-11` written on the element in markup), which cost the sidebar and the
+   * transcript a band each: the row carries three things - the drawer toggle below 768px, the
+   * wordmark, and the name of the conversation - none of which needs 44px of air. It is a token
+   * rather than a number on the element because three places measure it: the row itself, the
+   * narrow-width drawer that starts beneath it, and the settings dialog that has to fit under it.
+   * A fifth number in markup is a fifth chance for those to disagree.
+   */
+  --titlebar-h: 36px;
+
 
   /* ink */
   --color-ink: #2b2a27;
@@ -169,6 +180,7 @@ body {
    replace it with a mousedown handler, that fights the WM on Wayland.
 --------------------------------------------------------------------------- */
 .titlebar {
+  height: var(--titlebar-h);
   -webkit-user-select: none;
   user-select: none;
 }
@@ -288,27 +300,6 @@ body {
   display: flex;
   flex: 1 1 auto;
   min-height: 0;
-  /**
-   * The band the conversation's cup sits in, and the reason the scroller has a deep bottom
-   * padding. The picture is pinned inside this band rather than appended to the end of the
-   * content, and the band is empty of text by construction: the newest line stops above the
-   * drawing instead of sliding under it. Sized from the artwork itself - 8px of air against the
-   * pane's bottom edge, 136px of picture, and 24px of clearance above it - because a band the
-   * picture does not fit is a band that will show the picture overlapping someone's sentence.
-   *
-   * `--cup-left` is the left edge of the 780px text column: the card gutter puts 16px between the
-   * pane and the scroller, the scroller pads 80px on the left and 28px on the right, so at full
-   * width the column starts at `pane centre - 390 + 26` (the gutter cancels: it takes the same
-   * 16px off both sides, so the centre does not move), and below that the column is as wide as the
-   * padding box and starts at the gutter plus the gutter.
-   */
-  --cup-band: 168px;
-  /* The floor is the scroller's own left padding: the gutter belongs to `.panecard` and this wrap
-     has none of its own, so the column starts at 80px (24px once the label gutter is gone below
-     860px). Both floors used to carry an extra 16px for a gutter that was never drawn, which put
-     the picture 16px right of the text column in a narrow window — the centring branch wins at
-     the widths these checks run at, so nothing noticed. */
-  --cup-left: max(80px, calc(50% - 364px));
 }
 /* The way back down: sticky to the bottom of the transcript, centred on the column the text
    actually occupies. The transcript is padded 80px on the left (the gutter that holds the
@@ -321,9 +312,9 @@ body {
    intent, and a button that appeared at 3px below would flicker for the length of a paragraph. */
 .jump {
   position: absolute;
-  /* The thumb's corner. The cup is put away whenever this pill is up, so nothing is drawn here to
-     clear out of the way: an earlier rule lifted the pill a whole band's height above the pane to
-     dodge the picture, which left it floating in the middle of the text it was offering to leave. */
+  /* The thumb's corner. An earlier rule lifted the pill a whole band's height above the pane to
+     dodge the conversation's picture, which left it floating in the middle of the text it was
+     offering to leave. */
   bottom: 20px;
   left: calc(50% + 26px);
   transform: translateX(-50%);
@@ -364,8 +355,8 @@ body {
   /* The conversation's scroll box, sitting inside `.panecard`. It carries no surface of its own
      any more: the card behind it is the paper, and giving the scroll box a second paper fill with
      rounded corners drew an edge in the middle of the card. The padding model is unchanged — the
-     label gutter on the left, the cup band at the bottom — because the checks that measure the
-     column and the picture read this box, not the card. */
+     label gutter on the left, an ordinary band at the bottom — because the checks that measure the
+     column read this box, not the card. */
   /* The gutter is a variable rather than a magic number because the sticky header of a
      long code block has to know it. A sticky offset is measured against the scrollport's
      *content* edge, so a 24px top padding would park that header 24px below the top of the
@@ -374,10 +365,11 @@ body {
      subtracts this value to sit flush instead. */
   --scroller-pad-top: 24px;
   padding-top: var(--scroller-pad-top);
-  /* The band at the bottom belongs to the cup; see `.scrollerwrap`. It replaces the 24px that
-     `py-6` would give, and it is written after the Tailwind import so it wins on order rather
-     than on `!important`. */
-  padding-bottom: var(--cup-band, 168px);
+  /* An ordinary bottom edge. This used to be `--cup-band`, 168px reserved so a pinned drawing had
+     somewhere to sit that no sentence could reach; with the drawing gone the reservation is
+     144px of reading surface missing from every conversation, so the padding went back to what
+     the scroller's own top padding is. */
+  padding-bottom: var(--scroller-pad-top);
   padding-left: 80px;
   padding-right: 28px;
 }
@@ -424,207 +416,38 @@ body {
     padding-left: 24px;
     padding-right: 16px;
   }
-  /* No gutter to hang the label in, and no column margin to hang the cup in either: the picture
-     starts at the scroller's own padding. */
-  .scrollerwrap {
-    --cup-left: 24px;
-  }
+  /* The label column is the scroller's left padding; below this width there is no gutter to hang
+     it in, so it goes back above its block rather than being clipped by the scroll container. */
   .blk > .blk-head {
     position: static;
     width: auto;
     display: block;
     margin-bottom: 2px;
   }
-  .turn-who {
-    height: auto;
-    margin-bottom: 0;
-  }
-  .turn-who > .turn-working {
-    position: static;
-    margin: 0 0 2px;
-  }
-  .turn-who.live > .turn-working {
-    display: block;
-  }
 }
 
-/* ---- one name per turn ------------------------------------------------------
-   A turn says who is speaking once, and the name stays pinned while that speaker's
-   text is on screen. Every block used to repeat "CWOFFEE" down the left edge: a turn
-   with an accordion and four paragraphs of answer said it five times, and the gutter
-   became a column of identical words. Repeating it is noise; dropping it would leave a
-   long turn unlabelled. So it borrows `.code-head`'s trick — a row pinned to the
-   transcript's own scroller and bounded by the turn it belongs to, so it releases the
-   moment the turn ends rather than floating over the next one.
-
-   The row itself is zero-height and the word hangs in the gutter where the block labels
-   already live, so a name costs no vertical space and never nudges the text column. The
-   negative margin pays back the 12px gap `.turn` gives each of its flex children. */
-.turn-who {
-  position: sticky;
-  top: calc(-1 * var(--scroller-pad-top, 0px));
-  z-index: 4;
-  height: 0;
-  margin-bottom: -12px;
-  align-self: flex-start;
-  pointer-events: none;
-}
-.turn-who {
-  position: sticky;
-  top: calc(-1 * var(--scroller-pad-top, 0px));
-  z-index: 4;
-  height: 0;
-  margin-bottom: -12px;
-  align-self: flex-start;
-  pointer-events: none;
-  /* Published on the row, not on the name, because both of the row's absolutely positioned
-     children hang off this same offset: the word, and the cup under it. */
-  --who-top: 2px;
-}
-.turn-who > .turn-working {
-  /**
-   * The picture that says this turn is arriving, hung in the label gutter.
-   *
-   * The word that used to live here named the speaker, and in this app the label was a restatement:
-   * everything in the transcript that is not your own bubble is cwoffee's. What the gutter is for is
-   * a state, and the state worth showing is "an answer is being written right now" — which is the one
-   * thing a long turn cannot otherwise say while you are looking at the middle of it.
-   *
-   * The artwork's ink occupies 86x115 of its 199-unit canvas, so at 56px the dots read about 24px
-   * across: big enough to see moving in the corner of the eye, small enough to never compete with the
-   * sentence next to it. It is centred on the 58px label column the block heads use, so the mark and
-   * the labels above it share one axis.
-   */
-  position: absolute;
-  left: -66px;
-  width: 56px;
-  height: 56px;
-  /* The page-wide `img, video { max-width: 100% }` reset has to be lifted HERE even though it stays
-     for the cup: this picture is absolutely positioned inside the zero-wide marker row, and 100% of a
-     zero-wide containing block is zero. The declared 56px survived; the width did not — the artwork
-     measured 0x56, which is a mark that is in the page and not on the screen. */
-  max-width: none;
-  /* Promoted to its own layer, deliberately. Without it the animated picture costs the whole
-     transcript: on the 168-block / 635,054-character history the selftest builds, a streaming turn
-     measured 30.0ms and 37.0ms per frame with the mark painted and 21.0ms with it hidden — a new
-     feature that made a long conversation drop below 30 fps, which is the report this mark was
-     asked for in the first place. With `will-change: transform` the picture composites on its own
-     and the same measurement came back 19.0ms and 21.0ms, i.e. the cost of the mark is the cost of
-     the history it sits in, not of the mark. The element exists only while a turn is arriving
-     (`workingImg` makes it, `dropWorking` removes it), which is the one case `will-change` is for:
-     a layer declared for something known to animate, not one left up forever. */
-  will-change: transform;
-  transform: translateZ(0);
-  /* Hung from the same published line the word used to sit on (2px against a bare block, 13px
-     against the folded group). It is *not* raised to centre on that line the way the word was: the
-     row it hangs from sticks to the top of the pane, above the pane's padding by
-     `--scroller-pad-top`, and a picture that reaches above that line reaches outside the box that
-     clips it — the top of a pinned mark would simply be missing, which is a worse bug than a mark
-     sitting a little low. So it hangs down from the line, and stays whole. */
-  top: var(--who-top);
-  display: none;
-  opacity: 0.92;
-  /* The picture is a readout, not a target: a click in the gutter belongs to whatever is behind it. */
-  pointer-events: none;
-  -webkit-user-drag: none;
-  user-select: none;
-}
-.turn-who.live > .turn-working {
-  display: block;
-}
-/* The folded group is the turn's first block, so its bottom margin is the gap between the working
-   and the saying. 14px rather than the default 12px of a bare `.blk-run`: the two things it
-   separates are the two halves of the turn, and they want a beat of their own. */
+/* ---- what a live turn looks like ---------------------------------------------
+   A turn used to announce itself twice over: a pinned `CWOFFEE` in the gutter (one
+   per turn, repeating down the left edge once per block before that was fixed), and
+   a 136px cup pinned in a 168px band at the bottom of the pane. Both are gone, and
+   what replaced them is one small animated mark, inline: in the run header's sentence
+   while the model works (`.run-working`, made by `runWorking`, taken away by
+   `dropWorking`), and the same mark inside the composer's send button for the turn as
+   a whole. Three reasons the gutter picture and the band picture lost:
+   - they answered one question three times — the run header already says "Working on
+     your computer" and counts the steps as they land;
+   - pinned pictures need geometry rules: the mark needed a reserved 66px column and a
+     clip-box rule to stop its top being shaved by the pane, and the cup needed a
+     visibility rule (put it away more than 24px from the end of the content) purely so
+     it would not sit on someone's paragraph;
+   - the band was 168px of the reading surface kept empty on every page, and the cup
+     was the most expensive animation on the screen.
+   The answer's own label stays hidden, and the element stays in the DOM: it is where a
+   per-block label or a live marker would hang, and deleting it would change the
+   transcript's shape to settle a styling question. */
 .turn > .blk-run {
   margin-bottom: 14px;
 }
-/* A turn that opens with the folded group: the row to line up with is that group's header, which
-   starts 12px lower. Only the live shape exists now — a stored transcript carries no marker row at
-   all, because the marker's only content is the working mark and a page you are reading rather than
-   watching has nothing working on it. */
-.turn:has(> .turn-who-cwoffee + .blk-run) > .turn-who-cwoffee {
-  /* 13px, measured in this engine against the shipped accordion header: at 2px the name sat 11px
-     above the header's line, at 23px it sat 10px below it, so the line they share is 13px. The
-     block's own 12px top margin is most of that; the rest is the header row's padding and the
-     leading difference between a 600-weight header and the label. */
-  --who-top: 13px;
-}
-/* The transcript's cup: one element per page, kept at the end of the content by the transcript
-   itself (`placeCup`), so it always sits under the newest thing said - and under the Copy /
-   Share / Branch row, because that row is part of the turn and this is part of the page.
-
-   It used to hang in the gutter under each turn's name, and two things came of that: a session of
-   short turns turned into a column of cups, one per turn, which is the turn-per-label mistake the
-   name had already had; and a picture small enough to fit a 58px gutter is too small to read as a
-   drawing. Here it can be nearly the size of the one on the opening screen - 300 of this artwork's
-   480 units are ink, so 136px paints a cup about 85px wide, just under the 152px opening-screen box
-   and the same drawing at the same scale.
-
-   The page-wide `img, video { max-width: 100% }` reset is deliberately not lifted here: in flow
-   inside the transcript it has room. It is lifted for the working mark, one rule up, because that
-   picture is absolutely positioned inside the same zero-wide marker row — and 100% of a zero-wide
-   containing block is zero: the artwork measured 0x56, width gone and height unhurt, which is a mark
-   in the DOM and not on the screen. */
-.transcript-cup {
-  /**
-   * Pinned to the bottom band of the transcript pane, not the last element in the content.
-   *
-   * As the last thing in the page, the picture's position on screen was a function of everything
-   * that arrived: each new line pushed it down, each follow step pulled it back, and a turn that
-   * held the view while tool output piled up below the fold slid it off the bottom entirely and
-   * then brought it flying back. Measured in `ui/perf/probe.ts` over three streamed turns: 1,348px
-   * of travel, 261px in a single frame at p95, six reversals of direction. Reversals are what the
-   * eye reads as jitter, and this is a 136px drawing.
-   *
-   * Pinned, it cannot move: the band is reserved by the scroller's padding, so at the end of the
-   * content there is nothing under it to overlap. Away from the end there is, which is what
-   * `.cup-out` is for - the picture is put away rather than painted over someone's paragraph.
-   */
-  position: absolute;
-  bottom: 8px;
-  left: var(--cup-left);
-  display: block;
-  width: 136px;
-  height: 136px;
-  margin: 0;
-  filter: drop-shadow(0 6px 14px rgb(120 90 40 / 14%));
-  pointer-events: none;
-  z-index: 2;
-  /* The fade is declared on the base rule so it runs in both directions. On the class that turns it
-     off there would be a transition one way and a snap the other, which is what the reader notices.
-     No fill-mode keyword here: `both` belongs to animations, and a transition shorthand carrying it is
-     invalid - the whole declaration is dropped, the cup snaps after all, and the computed
-     transition-property reads `all`, which is how the app's own check caught this. */
-  transition: opacity 0.42s var(--ease);
-}
-/* No conversation, no cup: the opening screen already shows the same artwork, larger. */
-.transcript-cup.bare {
-  display: none;
-}
-/* The end of the transcript is off screen, so the band is off screen, and the picture in it is dimmed
-   rather than removed: the reader is in the middle of a paragraph and a 136px drawing across it is
-   damage, but a drawing that vanishes and reappears as the follow's catch-up breathes is a blink, and
-   the one thing the picture says - "this page is alive, or it is resting" - is said by its presence.
-   At 0.1 it is a watermark: the prose under it stays coherent, and the artwork is still recognisable
-   as the same drawing rather than a grey smudge. It is never painted *over* the prose at full
-   strength: that is what the 24px threshold decides.
-
-   `pointer-events: none` holds in both states, so a faint cup can never swallow a click meant for a
-   word underneath it. */
-.transcript-cup.cup-out {
-  opacity: 0.1;
-}
-/* Nothing else marks a live turn. The pulsing dot that used to sit beside the name, beside each
-   card, and beside the small grouped actions inside the folded group is gone: one picture under
-   the name says "working" and "resting" in its own drawing, and a turn can no longer grow two
-   markers at once. `.live` stays on the name row - it is the state the transcript reads to pick
-   which picture to show.
-
-   A stored transcript has no marker row to pay a gap back for. */
-/* The answer's own label goes away — the turn's pinned name replaced it. The element
-   stays: it is where the live marker and any future per-block label still hang, and
-   removing it from the DOM would be a change to the transcript's shape for a styling
-   decision. */
 .blk-answer > .blk-head {
   display: none;
 }
@@ -1105,6 +928,7 @@ body {
 
 /* send / stop */
 .cbtn.go {
+  position: relative;
   width: 32px;
   height: 32px;
   padding: 0;
@@ -1126,6 +950,45 @@ body {
   box-shadow: 0 0 0 3px var(--color-tint);
 }
 .cbtn.go:active:not(:disabled) { transform: translateY(1px); }
+/* The same animated mark the run header carries, inside the send/stop button, so the control that
+   starts a turn is also the one that says the turn is arriving. It fits rather than grows: the button
+   is a fixed 32x32 box, the picture is 20px absolutely placed inside it, so the composer's row cannot
+   reflow while a turn runs (a button that changes size mid-turn moves the whole strip under the
+   reader's cursor). The stop square stays, drawn on top of it in the glyph colour: the artwork's own
+   ink orbits the middle of its canvas, so the square is the hub the dots go round, and "press to end
+   the turn" is still visible while the turn lasts.
+
+   The mark is brightened here, and that is a measurement rather than a taste. The drawing has two
+   hues, and this button is filled with `--color-ink`, which is near-black in the light palette and
+   near-paper in the dark one — so the same artwork flips which of its two hues disappears. Read off
+   the shipped file's own pixels: unfiltered, the slate hue sits at 2.7:1 on the light palette's
+   button and the terracotta hue at 2.4:1 on the dark palette's. Both are under WCAG's 3:1 for a
+   meaningful non-text element, and "the other hue is fine" is how a status mark ends up half-missing
+   depending on the theme. Brightening the raster on the light palette (both hues to 4.1:1 and 7.1:1)
+   and darkening it on the dark one (10.5:1 and 8.2:1) puts every hue over the bar, and the darker
+   mark in dark mode matches the dark glyph the button already draws its stop square in.
+
+   A filter, not a second asset: the two palettes' needs are a scalar on the same pixels, and shipping
+   a re-inked copy of a 75-frame animation to save one declaration would double the payload and give
+   the theme flip something to keep in sync. */
+.cbtn.go .go-work {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 20px;
+  height: 20px;
+  max-width: none;
+  opacity: 0.95;
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+  will-change: transform;
+  transform: translateZ(0);
+  filter: brightness(1.25);
+}
+[data-theme='dark'] .cbtn.go .go-work {
+  filter: brightness(0.45);
+}
 .cbtn.go:disabled { opacity: 0.3; cursor: not-allowed; }
 .cbtn.go.warn { background: var(--color-warn); }
 /* A button waiting on an approval must still look like it is waiting when the
@@ -1329,13 +1192,10 @@ body {
   font-size: 11.5px;
 }
 .ws-act:hover { color: var(--color-ink); }
-.wsrow.ws-none {
-  /* The shape of the control that used to be here, with the words that are now true.
-     A blank space where a folder used to be reads as a bug. */
-  color: var(--ink-3);
-  cursor: default;
-  font-style: italic;
-}
+/* `.wsrow.ws-none` used to live here. It styled the line a chat drew where the folder picker
+   had been - the shape of the control, in italics, with a sentence in its place. Chat mode now
+   draws no folder line at all, so the rule styled nothing, and a rule that styles nothing is a
+   claim about a design that no longer exists. */
 
 .ws-err {
   margin-top: 4px;
@@ -1858,7 +1718,7 @@ body {
        always had: one notch under the paper it covers, with its own shadow down the right edge. */
     background: var(--color-pane);
     z-index: 40;
-    top: 2.75rem;      /* below the titlebar */
+    top: var(--titlebar-h);      /* below the titlebar */
     bottom: 0;
     left: 0;
     width: 78%;
@@ -3389,9 +3249,14 @@ body {
 /* ================================================================ motion ==
    One curve and three durations, used everywhere. Purposeful motion has a job:
    it says where a thing came from and whether a state change was the one you
-   asked for. Nothing in CSS loops any more: the only looping thing on screen is the cup,
-   and its motion lives inside its own picture file rather than here, because an animated
-   image cannot be styled or frozen (see `.cupwrap .cup`). Nothing here moves more than 6px.
+   asked for. Nothing in CSS loops any more: the two things on this screen that loop are raster
+   animations — the opening screen's cup, and the little loader that says a turn is still arriving —
+   and their motion lives inside their own picture files rather than here, because an animated image
+   cannot be styled or frozen (see `.cupwrap .cup`, and `WORKING_ART` in `lib/transcript.ts`). They
+   are held differently on purpose: the cup's loop is re-armed by JS with a random pause at the end
+   of every lap (`LoopHold`) so an idle page is not strobed at someone reading, and the turn loader
+   is not — its file asks for an infinite lap at the artist's own frame timing, and a working status
+   that stops to take a breath reads as a turn that has stopped. Nothing here moves more than 6px.
 
    A note on the streaming reveal (.tin): each word is one span, appended once,
    animated once, never rewritten. Each markdown block is closed in place when its
@@ -4428,7 +4293,8 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
    * and the page inside still scrolls on its own.
    */
   width: min(1010px, calc(100vw - 32px));
-  height: min(740px, calc(100vh - 44px));
+  /* Under the chrome row with 16px of air, not under a number the chrome used to be. */
+  height: min(740px, calc(100vh - var(--titlebar-h) - 16px));
   min-width: min(430px, calc(100vw - 24px));
   min-height: min(300px, calc(100vh - 32px));
   max-width: calc(100vw - 16px);
@@ -5089,6 +4955,68 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
 }
 .blk-run > .blk-head.open::after {
   content: '\25BE';
+}
+/* The loader that says this run is still working, inline in the header's sentence.
+
+   Sized to the line it sits on rather than to the gutter it used to hang in: 20px against a 12.5px
+   sentence, which is about the size of a glyph with room to move, and the artwork's own ink is 86 of
+   its 199 units across, so the orbit reads as a small cluster of dots rather than as a picture. The
+   shipped file is 40 units — the CSS box at this display's DPR 2 (`scripts/mark-resize.py`).
+
+   It is the first child of the header row, which is a flex row with `align-items: center`, so it
+   takes the line's vertical centre and the sentence starts after it; nothing here needs a reserved
+   column, a clip box, or a sticky rule, because the mark is in the text flow and travels with it.
+
+   `max-width: none` is not decoration. The page-wide `img, video { max-width: 100% }` reset resolves
+   a percentage against the containing block, and a flex item in a row that has to fit a narrow pane
+   is exactly the case where 100% is smaller than the declared size: the app's own check found the
+   previous mark measuring 0x56 for this reason (height, which has no percentage in it, came through
+   untouched). Lifting the reset for this element is the whole fix, and the check fails if it goes.
+
+   Layer promotion, deliberately, and measured: with a mark this size the cost is small either way,
+   but the mark painted at 56px cost a long transcript its frame budget — 30.0ms and 37.0ms per frame
+   against 21.0ms hidden on the 168-block history — so the rule stays for the smaller mark and the
+   claim that grades it stays too. `will-change` belongs on something known to animate: this element
+   exists only while a run is running (`runWorking` makes it, `dropWorking` removes it). */
+.blk-run > .blk-head > .run-working {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  max-width: none;
+  opacity: 0.95;
+  will-change: transform;
+  transform: translateZ(0);
+  /* The mark is a readout, not a target: the header row is the control (it folds the group), and a
+     click that lands on the picture belongs to that row. */
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+/* The same picture for a turn that has no run accordion to carry one — a plain answer, no tool
+   calls, no thinking. It sits after the last thing the turn has written, at the prose column's left
+   edge, ahead of the turn's files and its action row, and `dropWorking` takes it away when the turn
+   lands. Same size, same artwork, same promotion: the difference is only where it is anchored.
+
+   `display: block` rather than inline: an inline image on the last line of a paragraph would ride up
+   into the text it follows, and the mark is meant to read as "more is coming here", not as a glyph
+   in the sentence. The vertical space it costs while the turn runs is real and temporary — the turn
+   loses the row the moment it settles. */
+.turn > .run-working.turn-tail {
+  /* Not an arriving block. `.turn > *` eases every child in with `both` fill, which would leave a
+     status mark holding the animation's end state — opacity 1 and `transform: none` — for the rest
+     of the turn, quietly undoing the opacity and the layer promotion declared below. The mark is a
+     readout; it has no entrance. */
+  animation: none;
+  display: block;
+  width: 20px;
+  height: 20px;
+  max-width: none;
+  opacity: 0.95;
+  will-change: transform;
+  transform: translateZ(0);
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
 }
 .run-count {
   font-weight: 450;
