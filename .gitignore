@@ -11,6 +11,9 @@ ui/.svelte-kit
 
 # Cwoffee
 .cwoffee/
+# Turn checkpoints: copies of files a turn overwrote, so the turn can be undone. Runtime
+# state in whatever folder the conversation is working in, never a product artifact.
+.cws/
 *.db
 *.db-wal
 *.db-shm
