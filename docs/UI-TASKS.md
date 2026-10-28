@@ -2061,3 +2061,111 @@ follow the copy`.
 
 `svelte-check`: 0 errors, 0 warnings. `wire-names`: OK, same desktop/gateway notes as before, with
 `branch_conversation` graded on both hosts.
+
+## Feature 2: Turn checkpoints — undoing a turn's files, not its messages
+
+Branch made a second path out of a conversation; this is the other half of "take that back". A cowork
+turn does not only say something, it *writes*: notes, spreadsheets, patches in the person's folder.
+Deleting the message leaves all of that behind, and the transcript had no way to say so. The feature
+is: every file a turn overwrote is copied **before** it is overwritten, indexed against the turn that
+took the copy, and offered back from the answer row that made the change — with the messages untouched.
+
+Three rules decided the shape:
+
+1. **The copy is taken by the thing that is about to overwrite the file.** Nothing else can see the
+   previous bytes. On the Rust core that is the tool, in-process; on the pi core it is `cwtool`, in a
+   separate process. Both take the copy at the same point in the same code (`ToolCtx::pre_state`,
+   `checkpoint::capture`), so a turn writes the same way on either core.
+2. **A copy nobody can find is worse than no copy.** The bytes live content-addressed under
+   `<workspace>/.cws/snapshots/`, and the index rows live in cwoffee's SQLite. `cwtool` takes copies
+   only when the bridge tells it there is a store to write rows into (`CWOFFEE_CHECKPOINTS=1`, sent
+   alongside `CWOFFEE_DB`), because a snapshot with no row pointing at it is a private file in the
+   folder that nobody can list, revert, or explain.
+3. **Reverting files is not undoing the conversation.** The rows stay; the note says the transcript is
+   untouched and quotes the message count, so the claim is measured rather than promised. A person who
+   wants the messages gone has Delete, and mixing the two in one button is how a folder gets rewritten
+   by someone who meant to hide a sentence.
+
+What the card says, and why:
+
+* **Path, kind, verb.** `created` is undone by deleting, `modified` by putting bytes back, `deleted`
+  by re-creating from the copy. A card that only listed paths would leave "delete my file?" unanswered
+  for the file the turn made.
+* **One line per file, earliest copy.** A turn that rewrote one note six times is one decision. Dedupe
+  is by content on the way in (six writes cost four copies, not six) and by path on the way out.
+* **`edited since` is a flag, and overwriting is a button.** If the person changed the file afterwards,
+  the default leaves it alone and the card marks it; the only way to overwrite is to press a control
+  that reads `Revert anyway`. A checkbox on a card that rarely needs it trains people to tick boxes
+  without reading, which is the opposite of what a confirmation is for.
+* **Scope is offered, not guessed.** "This turn only" and "This turn and after" are different wishes;
+  the second sweeps later turns' changes with it. Both are listed before anything moves.
+* **A short list says why it is short.** The per-conversation cap evicts the oldest copies, and the
+  card reports the number it dropped (`pruned`, summed from the same record that evicted them) under
+  the note rather than presenting a truncated history as the whole one. It is its own line, not a flag
+  on a path, because it is a fact about the conversation's history and not a choice about one file.
+* **The engine re-reads its own scope.** `shown` is the path list the card painted, repeated back with
+  the request; if the rows no longer match, the revert refuses and names both lists, same discipline as
+  Edit and Branch — a stale window must not act on a scope nobody was shown.
+* **Refused while a turn runs.** A turn writing files right now is exactly the state where restoring a
+  copy restores the wrong thing.
+
+Lessons from building it:
+
+* **A confirmation card needs a home that exists in both views.** The first version appended the card to
+  the live turn element, so pressing Undo under a row loaded from the record opened nothing — there is
+  no live turn there. It now attaches to the action row that opened it (`actions.after(card)`), and the
+  selftest caught that by failing on a plan it had already seen: `pressing Undo files opened no card
+  naming what would be put back (the plan said ["selftest_checkpoint_note.md"])`, which is a failure
+  message that names both sides of the seam.
+* **Turn numbers belong to the translator, rows belong to the store.** pi never hands cwoffee a turn id,
+  so the bridge exposes the translator's turn (`Output::turn()`) and records marks against it at the
+  moment the call ends — not at the settle. A turn stopped partway still changed files, and those are
+  the changes a person most wants undone; recording at the settle would have silently dropped them.
+* **Answer-row stamping can only happen after the answer exists.** Rows are recorded per call with
+  `message_id` null and stamped at the settle, the same as file chips. The engine's own test asserts the
+  null-before-stamp state, because "the control sits on the right row" depends on it.
+* **Snapshot directories are derived from the workspace, never stored.** `ToolCtx::snapshot_dir()` reads
+  the folder the tool is running in. A stored path would survive `SetWorkspace` and hand a revert that
+  restores into a folder the conversation no longer works in.
+* **Blob keys are shared, so deletion is reference-counted.** Deleting a conversation drops its index
+  rows and removes a blob only when no other conversation still points at it; a copy two branches share
+  is one file, and deleting one conversation must not break the other's revert.
+* **Eviction is batched and said out loud.** The store keeps `CHECKPOINT_CAP` rows per conversation and
+  prunes in batches of `CHECKPOINT_BATCH`, recording a `checkpoint_prunes` notice so the transcript can
+  say older copies were dropped instead of offering a revert that silently restores less than it claims.
+* **Group grammar matters where the sentence carries the refusal.** Sabotaging the busy guard made the
+  selftest print the edited-since refusal, which read "accept that 1 it stay as they are". That clause
+  is the part that says what did *not* happen, so it now agrees in number with what it names, and both
+  readings are unit-tested.
+
+Receipts. Full suite on pi core and Rust core, window frontmost, mock endpoint on 8190: `SELFTEST ok`,
+0 failures, with
+
+    checkpoints ok (pi core: one turn wrote selftest_checkpoint_note.md three times into one copy,
+    pressing Revert put the file back to the words it held before the turn while the transcript kept
+    its 8 rows, the same card then flagged it as edited since with a "Revert anyway" button, the wider
+    scope still named one path, a revert asked during a turn was refused and moved nothing, and a turn
+    that touched no files refused and said why)
+
+and the same receipt on the rust core. `cargo test --workspace`: 554 engine tests plus gateway,
+bridge and store suites, 0 failures — including
+`checkpoint::tests::two_edited_files_are_named_as_two_in_the_refusal` and
+`agent::tests::a_turn_that_overwrote_a_file_leaves_an_indexed_copy_behind`, which drives a real tool
+call through `run_turn` and proves the copy reaches the disk, the row reaches the store, and the revert
+puts the bytes back.
+
+Falsification, aimed at the claim a unit test cannot reach: making `apply()` report a restore it never
+performed failed with `pressing Revert left selftest_checkpoint_note.md holding "model draft two\nthird
+line\n" instead of the words it held before the turn`; deleting the busy guard failed with
+`reverting during a turn answered … (running when asked: true)`. Both sabotages were reverted.
+
+`turn-buttons` now requires four turn actions — Copy, Share as Markdown, Branch, Undo files — and
+requires the undo control, like Branch, to be inert under a turn the window streamed and to say what it
+is waiting for. That count is a claim about the row a reader learns to aim at, so a fifth control that
+appears quietly is a failure rather than a feature.
+
+`svelte-check`: 0 errors, 0 warnings. `wire-names`: OK, with `checkpoint_preview` and
+`checkpoint_revert` graded on both hosts; the two harness-only readers
+(`selftest_file_bytes`, `selftest_write_file`) print the usual "gateway has no such verb" note, which is
+correct — they exist so the page-side check can read bytes off disk, and they are confined to the
+conversation's folder.

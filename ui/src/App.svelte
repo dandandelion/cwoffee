@@ -21,7 +21,7 @@
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
   import { Transcript, linkProbe, subjectFor, riskHeadline, WORKING_ART } from './lib/transcript'
-  import type { AttachmentView } from './lib/transcript'
+  import type { AttachmentView, RevertPreview } from './lib/transcript'
   import { describeLoop, LoopWatch } from './lib/loop'
   import { LoopHold, IDLE_HOLD, aniFrames, armedFromUrl, assetBytes } from './lib/anipause'
   import { installContextMenu } from './lib/ctxmenu'
@@ -13373,19 +13373,30 @@
           + `${boxW}px box, nothing animating the picture in CSS, nothing drawn over it, ` + onShow + ')')
       }
 
-      // --- a finished turn offers copy, share, and an honest branch button -----
-      if (want('turn-buttons', 'a finished turn offers copy, share, and an honest branch button')) {
+      // --- a finished turn offers copy, share, and two honest buttons ----------
+      //
+      // Four controls, and the count is a claim about the row, not a constant: a turn row that
+      // quietly gains or loses one means a reader's muscle memory points at the wrong thing.
+      // Two of the four are honest-disabled on a turn this window streamed, because both address
+      // a stored row and this turn has none yet.
+      if (want('turn-buttons', 'a finished turn offers copy, share, and two honest buttons')) {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'the answer to copy' })
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
         const acts = [...document.querySelectorAll('.turn-acts .tact')] as HTMLButtonElement[]
-        if (acts.length !== 3) fail(`expected three turn actions, found ${acts.length}`)
+        if (acts.length !== 4)
+          fail(
+            `expected four turn actions - Copy, Share as Markdown, Branch, Undo files - found ` +
+              `${acts.length}: ${acts.map((a) => a.className).join(', ')}`,
+          )
         const copy = acts.find((a) => a.classList.contains('copy'))
         const share = acts.find((a) => a.classList.contains('share'))
         const branch = acts.find((a) => a.classList.contains('branch'))
-        if (!copy || !share || !branch) fail('turn actions are mislabelled')
+        const undo = acts.find((a) => a.classList.contains('revert'))
+        if (!copy || !share || !branch || !undo)
+          fail(`turn actions are mislabelled: ${acts.map((a) => a.className).join(', ')}`)
         else {
           if (!copy.querySelector('svg.tact-glyph')) fail('turn actions use a non-SVG icon')
           // Branch is built, so the button is live — but not on the turn painted here. That turn
@@ -13399,6 +13410,15 @@
             )
           if (!/once it is stored/i.test(branch.title))
             fail(`a disabled button should say why: ${branch.title}`)
+          // Undoing files is the same kind of claim as branching: it names the row a turn wrote,
+          // so on a turn that has not been written down it says so rather than reverting a guess.
+          if (!undo.disabled)
+            fail(
+              'a turn this window streamed offers an undo-files control that claims to work; it can only ' +
+                'name the files a stored turn changed',
+            )
+          if (!/once it is stored/i.test(undo.title))
+            fail(`the disabled undo control does not say what it is waiting for: ${undo.title}`)
           if (copy.disabled || share.disabled) fail('working actions are disabled')
           // Sharing answers with a sentence, not a chip. A share is something the
           // person did *with* the conversation; giving it a file chip put it in the
@@ -14021,6 +14041,324 @@
         // group a message it did not write.
         draft = ''
         showStartScreen()
+      }
+
+      // --- a turn's file changes, copied before they happen, and put back ----------
+      //
+      // "Undo that answer" has always meant the transcript, but a cowork turn wrote into the
+      // person's folder, and deleting the message leaves the file behind. This group grades the
+      // whole chain against the bytes on disk: the copies a turn took are indexed, the card lists
+      // them before anything moves, and pressing the card puts the file back — with the messages
+      // untouched. Every claim reads the file itself rather than the app's report of it, because
+      // a revert that only updated its own card would look identical from inside the app.
+      if (want('checkpoints', 'undoing a turn puts its files back and leaves the messages alone')) {
+        // "Undo that answer" has always meant the transcript, but a cowork turn wrote into the
+        // person's folder and deleting the message leaves the file behind. This group grades the
+        // whole chain against the bytes on disk: the copies a turn took are indexed, the card lists
+        // them before anything moves, and pressing the card puts the file back — with the messages
+        // untouched. Every claim reads the file itself rather than the app's report of it, because
+        // a revert that only updated its own card would look identical from inside the app.
+        const note = 'selftest_checkpoint_note.md'
+        const ownWords = 'the words that were in the file before the turn\n'
+        const core = (await invoke<{ core: string }>('about').catch(() => null))?.core ?? ''
+        const rowsOf = async (sid: number) =>
+          (
+            await invoke<{ messages: { id: number; role: string; content: string }[] }>('session_messages', {
+              id: sid,
+              before: null,
+              limit: 400,
+            })
+          ).messages
+        const bytesOf = async (path: string) =>
+          await invoke<{ text: string; bytes: number }>('selftest_file_bytes', { path }).catch(() => null)
+        // A refusal comes back as an error, so a preview is read as either a plan or a reason.
+        const previewOf = async (sid: number, mid: number, thru: boolean) =>
+          await invoke<RevertPreview>('checkpoint_preview', {
+            session: sid,
+            message_id: mid,
+            through_latest: thru,
+          }).catch((e) => ({ error: String(e) } as RevertPreview & { error: string }))
+        const why = (p: RevertPreview & { error?: string }) => p.error ?? ''
+        // Two waits of this group's own: `waitFor` takes a sync predicate, and both of these wait
+        // on an await — the file's bytes from the engine, and a card drawing a plan.
+        const waitBytes = async (path: string, want: string, budgetMs = 15000) => {
+          const dl = performance.now() + budgetMs
+          while (performance.now() < dl) {
+            const b = await bytesOf(path)
+            if (b && b.text === want) return b
+            await new Promise((r) => setTimeout(r, 100))
+          }
+          return null
+        }
+        const waitCard = async (budgetMs: number, needsFlag: boolean) => {
+          const dl = performance.now() + budgetMs
+          while (performance.now() < dl) {
+            const c = document.querySelector('.revert-card')
+            if (c && c.querySelector('.revert-item') && (!needsFlag || c.querySelector('.revert-flag'))) return c
+            await new Promise((r) => setTimeout(r, 100))
+          }
+          return null
+        }
+
+        // Reasoning off and Auto mode: this group spends four turns, and a thinking model plus an
+        // approval round trip per write would make it slow enough to time out on a loaded machine.
+        // Both are shared state, so both are restored in the `finally` below, passed or failed.
+        const reasoningWas = hostState?.reasoning ?? ''
+        const modeWas = hostState?.mode ?? ''
+        let okLine = ''
+        // Declared outside `run` because the cleanup below needs it too: leaving a file the check
+        // made in the person's folder would be the check doing the thing the feature exists to
+        // prevent.
+        let sid = 0
+
+        const run = async () => {
+          await invoke('set_reasoning', { level: 'off', persist: true })
+          await invoke('set_mode', { mode: 'auto' })
+
+          // The conversation is made by the send rather than borrowed from the suite's scratch
+          // row: a check that writes files into a folder and then reverts them needs a folder of
+          // its own, and the scratch session gets deleted and re-created by the setup, so naming
+          // it here would be a race with another group's bookkeeping.
+          newSession()
+          await invoke('selftest_write_file', { path: note, text: ownWords })
+          const seeded = await bytesOf(note)
+          if (!seeded || seeded.text !== ownWords)
+            return fail(`the harness could not seed ${note}: ${JSON.stringify(seeded)}`)
+
+          const turnsBefore = await turnCount()
+          draft = 'Selftest checkpoint: rewrite the note file twice and correct one line'
+          await send()
+          for (let i = 0; i < 60 && !sid; i++) {
+            const st = await invoke<{ session_id: number }>('session_state').catch(() => null)
+            sid = viewId ?? transcript?.sessionId ?? st?.session_id ?? 0
+            if (!sid) await new Promise((r) => setTimeout(r, 100))
+          }
+          if (!sid)
+            return fail('the send did not open a conversation, so the turn has nowhere to write')
+          if (!(await waitTurnDone(turnsBefore)))
+            return fail('the rewriting turn never ended, so there is no turn to undo')
+
+          const rows = await rowsOf(sid)
+          const aid = [...rows].reverse().find((m) => m.role === 'assistant')?.id ?? 0
+          if (!aid) return fail('the turn left no answer row for the copies to belong to')
+
+          const now = await bytesOf(note)
+          if (!now) return fail(`${note} is gone after the turn that was supposed to rewrite it`)
+          if (now.text === ownWords)
+            return fail(
+              `the turn wrote nothing: ${note} still holds the words the harness seeded it with, so there ` +
+                'is no change below this point to undo',
+            )
+
+          // What the turn left on disk, said by the engine's own flag: `edited_since` is the app
+          // comparing the live file with what the turn finished with, so 0 here means the disk
+          // really holds the model's version and the copy is the one that has to go back.
+          const p1 = await previewOf(sid, aid, false)
+          if (why(p1)) return fail(`no checkpoint for that turn on the ${core || 'running'} core: ${why(p1)}`)
+          const items = p1.items ?? []
+          if (items.length !== 1 || items[0].path !== note)
+            return fail(
+              `the turn's scope lists ${items.map((i) => i.path).join(', ')}; it should name ${note} alone`,
+            )
+          if (items[0].kind !== 'modified')
+            return fail(
+              `${note} was there before the turn, so undoing it puts a file back rather than deleting one; ` +
+                `the plan calls it ${items[0].kind}`,
+            )
+          if (items[0].edited_since)
+            return fail(
+              `the plan says ${note} was edited after the turn when nothing but the turn touched it; that ` +
+                'flag is what protects edits the person made afterwards, so it must not lie'
+            )
+          if (!(p1.turn > 0)) return fail('the preview does not name the turn its rows came from')
+
+          // The control, for the row that turn wrote. Three writes to one file still read as one
+          // decision, not six.
+          await resyncView(sid)
+          const undo = [...document.querySelectorAll('.turn-acts .tact.revert')] as HTMLButtonElement[]
+          if (!undo.length) return fail('a finished answer offers no undo control')
+          if (undo.some((b) => b.disabled))
+            return fail(
+              'a stored answer offers an undo control that says it is disabled; only a turn that has not ' +
+                'been persisted yet has a reason to be',
+            )
+
+          undo[0].click()
+          const card = await waitCard(12000, false)
+          if (!card)
+            return fail(
+              `pressing Undo files opened no card naming what would be put back (the plan said ` +
+                `${JSON.stringify(items.map((i) => i.path))})`,
+            )
+
+          const shown = [...card.querySelectorAll('.revert-path')].map((n) => n.textContent ?? '')
+          const scroller = document.querySelector('.scroller') as HTMLElement | null
+          const box = card.getBoundingClientRect()
+          const clip = scroller?.getBoundingClientRect()
+          if (shown.length !== 1 || shown[0] !== note)
+            return fail(
+              `the card lists ${shown.join(', ')}; it has to name ${note} and nothing else, in the words ` +
+                'the engine uses for it',
+            )
+          if (clip && (box.right > clip.right + 1 || box.left < clip.left - 1))
+            return fail(
+              `the confirmation hangs outside the reading card (card ${Math.round(box.left)}..` +
+                `${Math.round(box.right)}, scroller ${Math.round(clip.left)}..${Math.round(clip.right)})`,
+            )
+          const cardNote = card.querySelector('.revert-note')?.textContent ?? ''
+          if (!/transcript is untouched/i.test(cardNote))
+            return fail(`the card does not say the messages stay: ${JSON.stringify(cardNote.slice(0, 90))}`)
+
+          const go = card.querySelector('.revert-go') as HTMLButtonElement | null
+          if (!go) return fail('the card has no Revert button')
+          if (go.textContent?.trim() !== 'Revert')
+            return fail(
+              `nothing was edited after that turn, so the button should read "Revert", not ` +
+                `${JSON.stringify(go.textContent?.trim() ?? '')} — a scare the person has no reason to read`,
+            )
+
+          const rowsBefore = (await rowsOf(sid)).length
+          go.click()
+          const back = await waitBytes(note, ownWords, 15000)
+          if (!back) {
+            const b = await bytesOf(note)
+            return fail(
+              `pressing Revert left ${note} holding ${JSON.stringify((b?.text ?? '(unreadable)').slice(0, 60))} ` +
+                'instead of the words it held before the turn',
+            )
+          }
+          const said = toastText()
+          if (!/transcript is untouched|back to how (?:it|they) were/i.test(said))
+            return fail(
+              `the revert did not say what it did to the messages; it said ${JSON.stringify(said.slice(0, 120))}`,
+            )
+          // Two claims, kept apart: the file moved, and the question went away. A card that stays
+          // up after its own answer offers a second revert of something already reverted.
+          if (card.isConnected) return fail('the card is still on screen after the revert it answered')
+          const rowsAfter = (await rowsOf(sid)).length
+          if (rowsAfter !== rowsBefore)
+            return fail(
+              `undoing the files changed the transcript from ${rowsBefore} rows to ${rowsAfter}; reverting ` +
+                'files is not undoing the conversation',
+            )
+
+          // The disk moved back, by the engine's own flag: the file no longer matches what the turn
+          // finished with. This is the only way the app itself can notice a file moving.
+          const p2 = await previewOf(sid, aid, false)
+          const it2 = p2.items ?? []
+          if (!it2.length || !it2[0].edited_since)
+            return fail(
+              'after the revert the plan still says nothing changed since the turn — the flag is how the ' +
+                'app notices the file moved, and it stayed quiet',
+            )
+
+          // The same card now offers the overwrite as its own choice, because putting the copy back
+          // a second time does overwrite what is there now.
+          const again = [...document.querySelectorAll('.turn-acts .tact.revert')] as HTMLButtonElement[]
+          again[0]?.click()
+          const card2 = await waitCard(8000, true)
+          if (!card2)
+            return fail(
+              're-asking after the revert opened a card with no "edited since" mark, so the person is being ' +
+                'asked to overwrite a file with no warning',
+            )
+          const flagged = card2.querySelector('.revert-flag')?.textContent ?? ''
+          const goLabel = (card2.querySelector('.revert-go') as HTMLButtonElement | null)?.textContent?.trim() ?? ''
+          if (!/edited since/i.test(flagged)) return fail(`the flag reads ${JSON.stringify(flagged)}, not "edited since"`)
+          if (goLabel !== 'Revert anyway')
+            return fail(
+              `with an edited file in scope the button reads ${JSON.stringify(goLabel)}; the overwrite has to ` +
+                'be the choice it names, not a label that hides it',
+            )
+          ;(card2.querySelector('.revert-cancel') as HTMLButtonElement | null)?.click()
+
+          // "This turn and after" is a different wish, and with nothing later it must still name one
+          // path — the earliest copy per file, not one line per write.
+          const p3 = await previewOf(sid, aid, true)
+          const it3 = p3.items ?? []
+          if (it3.length !== 1 || it3[0].path !== note)
+            return fail(
+              `the wider scope lists ${it3.map((i) => i.path).join(', ')}; three writes to one file are one ` +
+                'decision, and the earliest copy is the one that goes back',
+            )
+          if (!/every turn after/i.test(p3.scope ?? ''))
+            return fail(`the wider scope calls itself ${JSON.stringify(p3.scope ?? '')}`)
+
+          // Refused while a turn is in flight, and the refusal moves nothing: a turn writing files
+          // right now is exactly the state where restoring a copy restores the wrong thing.
+          const diskWas = await bytesOf(note)
+          const turnsN = await turnCount()
+          await invoke('start_turn', { text: 'Selftest checkpoint: count slowly', session: sid })
+          let running = false
+          for (let i = 0; i < 60 && !running; i++) {
+            running = busy
+            if (!running) await new Promise((r) => setTimeout(r, 100))
+          }
+          let refused = ''
+          try {
+            await invoke('checkpoint_revert', {
+              session: sid,
+              message_id: aid,
+              through_latest: false,
+              shown: [note],
+              overwrite_edited: false,
+            })
+          } catch (e) {
+            refused = String(e)
+          }
+          if (!/turn is running/i.test(refused))
+            return fail(
+              `reverting during a turn answered ${refused || 'with no error'} (running when asked: ${running})`,
+            )
+          const diskMid = await bytesOf(note)
+          if (diskMid?.text !== diskWas?.text)
+            return fail(
+              `the refused revert still moved ${note} from ${JSON.stringify(diskWas?.text.slice(0, 40))} to ` +
+                `${JSON.stringify(diskMid?.text.slice(0, 40))}`,
+            )
+          if (!(await waitTurnDone(turnsN)))
+            return fail('the slow turn never ended; the group cannot finish its own state')
+
+          // A turn that wrote no files must not be offered an undo it cannot perform: the refusal
+          // says why in the same words the card would have used.
+          const plainTurns = await turnCount()
+          await invoke('start_turn', {
+            text: 'Selftest branch stem: reply with the single word stem.',
+            session: sid,
+          })
+          if (!(await waitTurnDone(plainTurns))) return fail('the no-files turn never ended')
+          const plainId = [...(await rowsOf(sid))].reverse().find((m) => m.role === 'assistant')?.id ?? 0
+          const p4 = await previewOf(sid, plainId, false)
+          if (!/no files this app kept a copy of|nothing to revert/i.test(why(p4)))
+            return fail(
+              `a turn that touched no files answered ${JSON.stringify(why(p4) || 'a plan')} instead of ` +
+                'refusing and saying why',
+            )
+
+          okLine =
+            `checkpoints ok (${core || 'running'} core: one turn wrote ${note} three times into one copy, ` +
+            `pressing Revert put the file back to the words it held before the turn while the transcript ` +
+            `kept its ${rowsBefore} rows, the same card then flagged it as edited since with a ` +
+            `"Revert anyway" button, the wider scope still named one path, a revert asked during a turn ` +
+            `was refused and moved nothing, and a turn that touched no files refused and said why`
+        }
+
+        try {
+          await run()
+        } finally {
+          if (reasoningWas) await invoke('set_reasoning', { level: reasoningWas, persist: true }).catch(() => null)
+          if (modeWas) await invoke('set_mode', { mode: modeWas }).catch(() => null)
+          // The file goes back the way the check made it — through the model's own tool, in the
+          // folder it works in. The snapshot copies stay: they are the record of that turn.
+          const cleanTurns = await turnCount()
+          await invoke('start_turn', {
+            text: `Delete the file ${note} using exec with: rm -f ${note}. Reply with the single word done.`,
+            session: sid,
+          })
+          if (!(await waitTurnDone(cleanTurns))) pageLog('selftest: the checkpoint cleanup turn did not finish')
+          toast = null
+        }
+        if (okLine) pageLog(okLine)
       }
 
       // --- a picture pasted off the desktop, sent, and seen at all three places --
@@ -17702,6 +18040,40 @@
           setTimeout(() => composerEl?.focus(), 0)
         }
         return out?.note ?? `branched into “${out.title}”`
+      }
+
+      // The revert card asks the engine what it would do before it does anything, and the
+      // answer is a path list with flags on it. Both callbacks are the same two verbs the
+      // phone's gateway serves, so a phone reading the same conversation sees the same list.
+      transcript.onRevertPreview = async (session, id, throughLatest) => {
+        if (!session) throw new Error('that conversation is not saved yet, so there are no copies of its files')
+        return await invoke<RevertPreview>('checkpoint_preview', {
+          session,
+          message_id: id,
+          through_latest: throughLatest,
+        })
+      }
+      transcript.onRevert = async (session, id, throughLatest, shown, overwriteEdited) => {
+        if (!session) throw new Error('that conversation is not saved yet, so there is nothing to undo')
+        const out = await invoke<{
+          scope: string
+          note: string
+          messages: number
+          report: { restored: number; removed: number; skipped_edited: number; failed: string[] }
+        }>('checkpoint_revert', {
+          session,
+          message_id: id,
+          through_latest: throughLatest,
+          shown,
+          overwrite_edited: overwriteEdited,
+        })
+        // The files on disk changed and the transcript did not. Reload the view anyway: a turn
+        // that was reverted has file chips naming what it made, and the folder no longer holds
+        // them, so the reader should see the record re-read rather than a stale list.
+        void loadSessions()
+        const view = viewId ?? transcript?.sessionId ?? 0
+        if (view) await resyncView(view)
+        return out?.note ?? 'the files are back to how they were'
       }
     }
     // Test seam: lets a browser harness drive the transcript without an engine.

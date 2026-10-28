@@ -238,17 +238,24 @@ impl Tool for WriteXlsxTool {
 
         // save() is sync and does its own IO; the workspace is small so blocking
         // here is cheaper than pulling in a blocking-pool hop for one call.
+        // Taken before the save: `write_xlsx` overwrites an existing workbook, and the
+        // person who asks to undo that turn wants their spreadsheet back, not the one the
+        // model just made.
+        let pre = ctx.pre_state(&path);
         match wb.save(&path) {
             Ok(_) => {
                 let rel = super::path::display_rel(&ctx.workspace, &path);
-                let mut res = ToolResult::ok(format!(
+                let res = ToolResult::ok(format!(
                     "wrote {rel} ({})",
                     summary.join("; ")
                 ))
                 .with_file(super::OutputFile::from_path(&ctx.workspace, &path));
+                let res = ctx.stamp_checkpoint(res, &path, &pre);
                 if matches!(place, super::scratch::Place::Attach) {
+                    let mut res = res;
                     res.output.push('\n');
                     res.output.push_str(&super::scratch::place_note(place, &rel));
+                    return res;
                 }
                 res
             }
@@ -273,7 +280,8 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         (
             ToolCtx {
-                workspace: ws.clone(),
+                    checkpoint_store: false,
+            workspace: ws.clone(),
                 max_output_bytes: 4096,
                 ..Default::default()
             },

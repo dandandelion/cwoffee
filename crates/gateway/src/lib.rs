@@ -836,6 +836,9 @@ const AUDITED: &[&str] = &[
     // pencil next to it is: a phone reading a conversation must not be able to start a second one
     // from it.
     "branch_conversation",
+    // Undoing a turn's files writes over the workspace, so it belongs with the verbs that change
+    // what is on disk rather than the ones that only read it.
+    "checkpoint_revert",
     "set_session_persona",
     "delete_session",
     "set_model",
@@ -1207,6 +1210,53 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             // client reads, and a phone would report "saved" for an edit that changed no rows.
             let out = cwoffee_engine::edit::apply_and_send(h.store.as_ref(), h.host.as_ref(), &req)
                 .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
+        // What undoing a turn's files would do. Read-only, so a watch-role tab can show the
+        // path list a phone is being asked to confirm; pressing it is the drive verb below.
+        "checkpoint_preview" => {
+            let req = cwoffee_engine::checkpoint::RevertReq {
+                session: arg_i64(&args, "session")?,
+                message_id: arg_i64(&args, "message_id")?,
+                through_latest: args
+                    .get("through_latest")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                shown: Vec::new(),
+                overwrite_edited: false,
+            };
+            let out = cwoffee_engine::checkpoint::preview(h.store.as_ref(), &req)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(out))
+        }
+        // Undoing files writes over the workspace, which is why it is drive-only: a phone that is
+        // only watching a conversation must not be able to put files back. The engine re-reads its
+        // own scope, so the confirmation a phone saw is the scope the revert uses.
+        "checkpoint_revert" => {
+            need_drive(role)?;
+            let req = cwoffee_engine::checkpoint::RevertReq {
+                session: arg_i64(&args, "session")?,
+                message_id: arg_i64(&args, "message_id")?,
+                through_latest: args
+                    .get("through_latest")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                shown: args
+                    .get("shown")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| p.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                overwrite_edited: args
+                    .get("overwrite_edited")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            };
+            let out = cwoffee_engine::checkpoint::revert(h.store.as_ref(), h.host.as_ref(), &req)
                 .map_err(|e| e.to_string())?;
             serde_json::to_value(out).map_err(|e| e.to_string())
         }
@@ -3222,6 +3272,106 @@ mod tests {
         assert!(out["error"].is_string(), "expected an error sentence, got {out}");
         assert!(out["results"].as_array().map(|a| a.is_empty()).unwrap_or(false), "{out}");
         let _ = std::fs::remove_file(&h.config_path);
+    }
+
+    /// Undoing files is a drive verb, and the phone gets the same plan the desktop preview
+    /// shows. A watch token can read the path list it is being asked to confirm but cannot
+    /// press it: the workspace on disk is not something a read-only tab overwrites.
+    #[tokio::test]
+    async fn a_phone_can_see_what_a_revert_would_do_and_only_drive_can_do_it() {
+        use cwoffee_engine::checkpoint::{capture, snapshot_dir, PreState};
+
+        let h = test_handle();
+        let dir = std::env::temp_dir().join(format!("cwoffee_gw_revert_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "the user's notes\n").unwrap();
+        let id = match run_cmd(
+            "new_session",
+            serde_json::json!({ "title": "revert me", "workspace": dir.to_str().unwrap() }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap()
+        {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("new_session returned {other:?}"),
+        };
+        h.store.append_message(id, &cwoffee_engine::provider::Message::user("rewrite")).unwrap();
+        let aid = h
+            .store
+            .append_message(id, &cwoffee_engine::provider::Message::assistant("rewritten"))
+            .unwrap();
+
+        // Turn 1 overwrote the file. This is what the tool host would have recorded.
+        let snaps = snapshot_dir(&dir);
+        let pre = PreState::of(&dir.join("notes.md"));
+        std::fs::write(dir.join("notes.md"), "the model's version\n").unwrap();
+        let mark = capture(
+            Some(&snaps),
+            &dir,
+            &dir.join("notes.md"),
+            &pre,
+            Some(b"the model's version\n"),
+        )
+        .expect("a copy of a file inside the workspace");
+        h.store.record_checkpoints(id, 1, &[mark]).unwrap();
+        h.store.stamp_checkpoints_turn(id, 1, aid).unwrap();
+
+        let preview = run_cmd(
+            "checkpoint_preview",
+            serde_json::json!({ "session": id, "message_id": aid, "through_latest": false }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect("a watcher can read the plan it is being shown");
+        assert_eq!(preview["items"].as_array().unwrap().len(), 1, "{preview}");
+        assert_eq!(preview["items"][0]["path"], "notes.md");
+        assert_eq!(
+            preview["items"][0]["kind"], "modified",
+            "the card has to say it puts a file back, not that it deletes one"
+        );
+
+        let err = run_cmd(
+            "checkpoint_revert",
+            serde_json::json!({ "session": id, "message_id": aid, "through_latest": false }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watcher must not overwrite files");
+        assert!(err.contains("watch"), "unhelpful: {err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+            "the model's version\n",
+            "and nothing moved on disk"
+        );
+
+        let out = run_cmd(
+            "checkpoint_revert",
+            serde_json::json!({ "session": id, "message_id": aid, "through_latest": false, "shown": ["notes.md"] }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("drive can undo its own turn");
+        assert_eq!(out["report"]["restored"], 1, "{out}");
+        assert!(
+            out["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("The transcript is untouched"),
+            "the phone has to be told the messages did not go with the files: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+            "the user's notes\n",
+            "the file is what it was before that turn"
+        );
+        // The transcript is the record: undoing files must not have edited it.
+        assert_eq!(h.store.message_count(id).unwrap(), 2, "no rows went with the revert");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Branching is a drive verb, and a phone that is allowed to do it gets the same answer the

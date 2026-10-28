@@ -152,6 +152,12 @@ pub enum EngineEvent {
         /// What file tools changed, for the `+N -M` badge and the diff view.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changes: Vec<crate::tools::changes::FileChange>,
+        /// What the call copied before it overwrote, so this turn can be reverted.
+        /// Carried for the same reason as `changes` and by the same rule: the pi core's
+        /// tool calls happen in another process, and the marks come back in that
+        /// process's JSON, so the event is what both cores hand onward.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checkpoints: Vec<crate::checkpoint::Mark>,
     },
 
     /// The gate wants permission before a tool runs.

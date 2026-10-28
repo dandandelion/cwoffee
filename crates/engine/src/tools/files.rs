@@ -400,7 +400,11 @@ impl Tool for WriteFileTool {
                 if append {
                     return ToolResult::err("cannot append to a .docx/.pdf; rewrite the whole document");
                 }
+                // Before the writer, not after: a copy taken after the overwrite is a
+                // copy of the model's own output, which reverts to the same file.
+                let pre = ctx.pre_state(&path);
                 let mut res = write_document(&path, content, &ext, ctx).await;
+                res = ctx.stamp_checkpoint(res, &path, &pre);
                 if res.ok && matches!(place, super::scratch::Place::Attach) {
                     res.output.push('\n');
                     res.output.push_str(&super::scratch::place_note(
@@ -420,8 +424,10 @@ impl Tool for WriteFileTool {
 
         let existed = path.exists();
         // The card shows +N -M against what was really on disk a moment ago, not
-        // against what the model said it was replacing.
+        // against what the model said it was replacing. The same read, taken the same
+        // moment, is what the checkpoint copies: pre-call bytes, from the disk.
         let before = if existed { snapshot(&path) } else { None };
+        let pre = ctx.pre_state(&path);
         let wrote = if append {
             use std::io::Write;
             std::fs::OpenOptions::new().append(true).create(true).open(&path).and_then(|mut f| {
@@ -446,6 +452,7 @@ impl Tool for WriteFileTool {
                     res.changes
                         .push(line_change(&ctx.workspace, &path, before.as_deref(), &after));
                 }
+                let mut res = ctx.stamp_checkpoint(res, &path, &pre);
                 if matches!(place, super::scratch::Place::Attach) {
                     // Stated, so the rule is learned rather than guessed: the next turn
                     // should not have to rediscover which folder the transcript attaches.
@@ -602,6 +609,10 @@ impl Tool for EditFileTool {
         }
 
         let edited = text.replace(old, new);
+        // The disk, not `text`: the file could have been edited by hand between the read
+        // above and this write, and a checkpoint of what the model *thought* was there
+        // would restore a version that has not existed for a while.
+        let pre = ctx.pre_state(&path);
         // Write beside the original and move it into place, so an interrupted
         // write cannot leave a half-written file where a whole one used to be.
         let tmp = sibling_tmp(&path);
@@ -627,7 +638,7 @@ impl Tool for EditFileTool {
         // the card can show exactly which lines the edit replaced.
         res.changes
             .push(line_change(&ctx.workspace, &path, Some(&text), &edited));
-        res
+        ctx.stamp_checkpoint(res, &path, &pre)
     }
 }
 
@@ -744,7 +755,18 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn ctx_in(dir: &Path) -> ToolCtx {
-        ToolCtx { workspace: dir.to_path_buf(), max_output_bytes: 4096, ..Default::default() }
+ToolCtx { workspace: dir.to_path_buf(), max_output_bytes: 4096, ..Default::default() }
+    }
+
+    /// The same context with a checkpoint store on, which is what a real host builds.
+    ///
+    /// Deliberately a *derived* directory (`ToolCtx::snapshot_dir` reads the workspace),
+    /// not a path handed in: a host that moved its workspace would otherwise keep writing
+    /// copies into the folder it left.
+    fn ctx_ckpt(dir: &Path) -> ToolCtx {
+        let mut c = ctx_in(dir);
+        c.checkpoint_store = true;
+        c
     }
 
     use crate::tools::FileKind;
@@ -773,6 +795,104 @@ mod tests {
         assert!(r.ok, "{:?}", r.error);
         assert!(r.output.contains("1\talpha"));
         assert!(r.output.contains("3\tgamma"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn writing_over_a_file_that_exists_leaves_a_copy_of_what_was_there() {
+        let d = tmp("ckpt-write");
+        std::fs::write(d.join("notes.md"), "the user's own notes\n").unwrap();
+        let ctx = ctx_ckpt(&d);
+        let r = WriteFileTool
+            .run(json!({"path": "notes.md", "content": "the model's version\n"}), &ctx, &sink())
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.checkpoints.len(), 1, "one mark for one file");
+        let m = &r.checkpoints[0];
+        assert_eq!(m.path, "notes.md");
+        assert_eq!(m.kind, crate::checkpoint::Kind::Modified);
+        assert_eq!(m.bytes, "the user's own notes\n".len() as u64, "the *pre-call* size");
+        assert_eq!(m.hash, crate::checkpoint::hash_of(b"the user's own notes\n"));
+        assert_eq!(m.after_hash, crate::checkpoint::hash_of(b"the model's version\n"));
+        assert!(m.note.is_none());
+        // The copy is on disk, in the workspace's own scratch folder, and is the old bytes.
+        let blob = crate::checkpoint::blob_path(&ctx.snapshot_dir().unwrap(), &m.hash);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"the user's own notes\n");
+        assert_eq!(
+            std::fs::read_to_string(d.join("notes.md")).unwrap(),
+            "the model's version\n",
+            "the write itself still happened"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn a_file_the_call_created_is_recorded_as_one_to_delete_not_one_to_restore() {
+        let d = tmp("ckpt-create");
+        let ctx = ctx_ckpt(&d);
+        let r = WriteFileTool
+            .run(json!({"path": "report.md", "content": "new\n"}), &ctx, &sink())
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.checkpoints.len(), 1);
+        let m = &r.checkpoints[0];
+        assert_eq!(m.kind, crate::checkpoint::Kind::Created);
+        assert!(m.hash.is_empty(), "nothing was overwritten, so there is nothing to copy");
+        assert!(m.note.is_none());
+        // Nothing to copy, so no folder is created at all: a created file is reverted by
+        // deleting it, which needs no bytes.
+        assert!(
+            !crate::checkpoint::snapshot_dir(&d).exists(),
+            "no store folder for a turn that overwrote nothing"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_keeps_no_copies_reports_no_revert_on_the_card() {
+        let d = tmp("ckpt-off");
+        std::fs::write(d.join("notes.md"), "yours\n").unwrap();
+        let r = WriteFileTool
+            .run(json!({"path": "notes.md", "content": "mine\n"}), &ctx_in(&d), &sink())
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert!(r.checkpoints.is_empty(), "off means off, not an empty promise");
+        assert!(!crate::checkpoint::snapshot_dir(&d).exists(), "no folder appears");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_records_no_checkpoint() {
+        let d = tmp("ckpt-fail");
+        let ctx = ctx_ckpt(&d);
+        // A directory as the target: the tool refuses before touching anything.
+        std::fs::create_dir_all(d.join("folder")).unwrap();
+        let r = WriteFileTool
+            .run(json!({"path": "folder", "content": "x\n"}), &ctx, &sink())
+            .await;
+        assert!(!r.ok);
+        assert!(r.checkpoints.is_empty(), "a call that changed nothing offers nothing to undo");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn an_edit_copies_the_file_it_replaced_not_the_text_it_was_asked_to_change() {
+        let d = tmp("ckpt-edit");
+        let f = d.join("notes.md");
+        std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+        let ctx = ctx_ckpt(&d);
+        let r = EditFileTool
+            .run(json!({"path": "notes.md", "old_text": "two", "new_text": "TWO"}), &ctx, &sink())
+            .await;
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.checkpoints.len(), 1);
+        let m = &r.checkpoints[0];
+        assert_eq!(m.kind, crate::checkpoint::Kind::Modified);
+        assert_eq!(m.hash, crate::checkpoint::hash_of(b"one\ntwo\nthree\n"));
+        assert_eq!(m.after_hash, crate::checkpoint::hash_of(b"one\nTWO\nthree\n"));
+        assert_eq!(m.bytes, 14, "the whole file, not the replaced span");
+        let blob = crate::checkpoint::blob_path(&ctx.snapshot_dir().unwrap(), &m.hash);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"one\ntwo\nthree\n");
         let _ = std::fs::remove_dir_all(&d);
     }
 

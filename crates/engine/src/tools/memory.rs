@@ -313,6 +313,7 @@ mod tests {
 
     fn ctx(store: Store, session: Option<i64>) -> ToolCtx {
         ToolCtx {
+            checkpoint_store: false,
             store: Some(Arc::new(store)),
             session,
             max_output_bytes: 8 * 1024,

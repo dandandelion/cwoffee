@@ -1077,6 +1077,13 @@ impl SessionHost {
             // its conversations, so `session` is filled per turn by the agent loop.
             store: Some(Arc::clone(&store)),
             session: None,
+            // Turn checkpoints, when there is a store to index them in. The bytes on disk
+            // are useless without rows: a copy is only revertible if something can say
+            // which turn took it and which message row that turn wrote.
+            // A `SessionHost` always has a store — it is a constructor argument — so the
+            // index can always be written. A host without one (a probe, an example) builds
+            // its own `ToolCtx` and leaves this off.
+            checkpoint_store: true,
             // The two settings `explore` needs in order to describe the tool set honestly.
             // They come from config because config is where the mounting is decided — the same
             // file the caller read when it built `registry` — and a card that names the wrong
@@ -1985,6 +1992,21 @@ impl SessionHost {
                         }
                         persisted_next = agent.prompt_mut().next_seq();
 
+                        // Name the answer row this turn's copies belong to, so the
+                        // transcript can offer "revert files from this turn" against a row
+                        // id instead of a guess. Done next to the file stamps for the same
+                        // reason: the row only exists once the answer is finished, and a
+                        // control addressed at a row that is not there yet is a control
+                        // that has to say it is waiting.
+                        if let Some(id) = last_assistant {
+                            if let Err(e) = store.stamp_checkpoints_turn(session_id, agent.turn() as i64, id) {
+                                let _ = ev_tx.send(EngineEvent::Error {
+                                    message: format!("failed to index that turn's file checkpoints: {e}"),
+                                    fatal: false,
+                                });
+                            }
+                        }
+
                         let files = agent.take_turn_files();
                         if !files.is_empty() {
                             if let Some(id) = last_assistant {
@@ -2137,6 +2159,18 @@ impl SessionHost {
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Park the host in the busy state without running a turn.
+    ///
+    /// `checkpoint::tests` uses it to grade the revert's "a turn is running, so nothing
+    /// was touched" refusal: that refusal is the thing being tested, and making it wait
+    /// for a scripted turn to be mid-flight would grade the fixture's timing instead.
+    /// Whether a real turn sets the flag at all is graded elsewhere — by the host's own
+    /// tests and by the selftest's mid-turn claim.
+    #[cfg(test)]
+    pub(crate) fn set_busy_for_test(&self, busy: bool) {
+        set_busy(&self.state, busy);
     }
 
     pub fn state(&self) -> HostState {
@@ -2701,7 +2735,7 @@ pub fn check_attachments(atts: &[crate::provider::Attachment], limits: Attachmen
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// The dial's steps have to be the levels this model answers for.
     ///
     /// Three claims, deliberately kept apart here: what this endpoint was **probed** to accept, what
@@ -2898,6 +2932,15 @@ mod tests {
     /// The same host, with the endpoint kept in hand. A branch is not only a copied
     /// transcript: the model has to be answering out of the copy, and that is only
     /// checkable by asking the endpoint what it was given.
+    /// A host for another module's tests, without the endpoint handle: `Scripted` is a
+    /// private type, and a caller that only needs to ask a host whether it is busy should
+    /// not have to see the fixture's provider.
+    #[cfg(test)]
+    pub(crate) fn host_for_test(replies: Vec<String>) -> SessionHost {
+        let (h, _store, _p) = host_with(replies);
+        h
+    }
+
     fn host_with(replies: Vec<String>) -> (SessionHost, Arc<Store>, Arc<Scripted>) {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {

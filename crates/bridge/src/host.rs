@@ -1296,6 +1296,11 @@ impl Engine {
         ));
         if let Some(db) = &self.cfg.db_path {
             launch.extra_env.push(("CWOFFEE_DB".to_string(), db.display().to_string()));
+            // Turn checkpoints, on only when there is a store to index them in. The bytes
+            // `cwtool` copies are useless on their own: without a row saying which turn
+            // took them and which answer row that turn wrote, the transcript cannot offer
+            // a revert and nobody can find the copy again.
+            launch.extra_env.push(("CWOFFEE_CHECKPOINTS".to_string(), "1".to_string()));
         }
         launch.extra_env.push((
             "CWOFFEE_PI_SESSION_MAP".to_string(),
@@ -2866,6 +2871,23 @@ impl Engine {
                 merge_turn_file(&mut self.turn_files, f);
             }
         }
+        // Index the copies `cwtool` took, against the turn it was running. The tool took
+        // them because it was the only thing that saw the file before it wrote over it;
+        // the turn number is the bridge's, and this is where the two meet. Recorded per
+        // call rather than at the settle, because a turn that was stopped partway still
+        // changed files, and those are the changes a person most wants undone.
+        let turn = self.tr.turn() as i64;
+        for (_, marks) in out.checkpoints_by_call.drain(..) {
+            if marks.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.cfg.store.record_checkpoints(row, turn, &marks) {
+                self.err(format!(
+                    "the copies of {} file(s) were taken but not indexed: {e}. That turn                      cannot be reverted from the transcript.",
+                    marks.len()
+                ));
+            }
+        }
         // Stamp at the end of the run, on the answer, once. `take()` so a second settle
         // in the same process cannot re-attach the same files to a later answer.
         if out.settled {
@@ -2873,6 +2895,16 @@ impl Engine {
             // reader asked for the title request to stall the first answer rather than
             // trail it, and the ask shares its prompt, parser and fallback with the Rust
             // core so a conversation gets the same name behind either core.
+        }
+        if out.settled {
+            // Name the answer row this turn's copies belong to, so the transcript can put
+            // a revert control on that row instead of guessing at one. Same reason as the
+            // file stamps below it: the row only exists once the answer is finished.
+            if let Some(mid) = self.last_assistant_row {
+                if let Err(e) = self.cfg.store.stamp_checkpoints_turn(row, turn, mid) {
+                    self.err(format!("could not index that turn's file checkpoints: {e}"));
+                }
+            }
         }
         if out.settled && !self.turn_files.is_empty() {
             let files = std::mem::take(&mut self.turn_files);

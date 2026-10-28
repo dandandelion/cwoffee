@@ -1847,7 +1847,8 @@ mod tests {
     use zip::CompressionMethod;
 
     fn ctx_in(dir: &Path) -> ToolCtx {
-        ToolCtx {
+ToolCtx {
+            checkpoint_store: false,
             workspace: dir.to_path_buf(),
             max_output_bytes: 64 * 1024,
             ..Default::default()

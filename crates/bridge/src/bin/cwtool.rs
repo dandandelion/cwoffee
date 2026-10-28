@@ -163,6 +163,18 @@ fn cfg_for_tools() -> ExecCfg {
     c.exec_cfg()
 }
 
+/// Whether this tool host keeps turn checkpoints, and who says so.
+///
+/// The bridge turns it on for the pi child it starts, alongside `CWOFFEE_DB`: a copy that
+/// no index row points at is a private file in the workspace nobody can find or undo, so
+/// taking one without a store to write the row in would be worse than taking none.
+fn checkpoints_enabled() -> bool {
+    matches!(
+        std::env::var("CWOFFEE_CHECKPOINTS").unwrap_or_default().trim(),
+        "1" | "true" | "yes"
+    )
+}
+
 fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
     let store = store_handle();
     let search_backend = {
@@ -170,6 +182,7 @@ fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
         c.search_backend()
     };
     ToolCtx {
+        checkpoint_store: checkpoints_enabled(),
         workspace: workspace(),
         // The Rust core's host uses 24 KiB (`SessionHost`'s ToolCtx). Match it exactly:
         // a tool dump is prompt bytes, so a second core that lets three times as much in

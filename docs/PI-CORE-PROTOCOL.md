@@ -124,6 +124,7 @@ The gateway (`crates/gateway/src/lib.rs`) speaks `{cmd,args,id}` → response, p
 | `search_messages`, `search_settings` | our SQLite index (pi has no cross-session search) |
 | `edit_message` | ours: the cwoffee store row, then a **rewind** — bridge rewrites pi's session file and reopens it (see below) |
 | `branch_conversation` | ours: copy the rows, then a **fork** — bridge compares cwoffee's user rows against pi `get_fork_messages`, forks before that entry (or `clone`s at the leaf), records the new thread (see below) |
+| `checkpoint_preview`, `checkpoint_revert` | ours on both cores. The copies are taken inside `cwtool`, which is the only thing that sees a file before the tool overwrites it; the marks ride back in the tool's JSON envelope, and the bridge writes the index rows (see below) |
 | `share_markdown`, `render_report`, `gpu_report`, `boot_log`, `open_file`, `search_probe`, `set_search_backend`, `migration_notes` | ours — product features, not core features (OPEN QUESTION 3) |
 
 **Also still ours, unchanged:** watch vs drive tokens, token-not-in-URL, loopback default,
@@ -210,6 +211,37 @@ The thinking effort the source conversation was at follows the branch: pi copied
 recorded it, and the bridge copies its own per-row maps so a later reopen keeps it rather than
 falling back to pi's default. `get_state` after the fork is re-absorbed, because what the forked
 thread *runs at* is the answer, not what the source row asked for.
+
+### Turn checkpoints: the copies come from `cwtool`, the index belongs to the bridge
+
+A checkpoint is a copy of a file taken **before** a tool overwrote it, so that the transcript can
+offer "undo this turn's files" later. Nothing about it is a model-facing thing: the bytes go to a
+content-addressed store under `<workspace>/.cws/snapshots/`, and the index rows go to cwoffee's
+SQLite, which is the only place that knows which turn made them.
+
+On the pi core the file call happens in a **separate process**, so the copy and the index are written
+by two different things and the seam has to be explicit:
+
+* The bridge launches `cwtool` with `CWOFFEE_CHECKPOINTS=1` alongside `CWOFFEE_DB`, and the tool host
+  turns that into `ToolCtx::checkpoint_store`. Both flags come from the same decision: a copy with no
+  index row pointing at it is a private file in the workspace nobody can find or undo, so a tool host
+  that cannot write the row should take no copy at all.
+* `cwtool` returns the marks in the same JSON envelope that already carries `changes` and `files`.
+  The bridge's translator parses them into `Output::checkpoints_by_call`, and `EngineEvent::ToolExecEnd`
+  carries them so the live tool card and a reloaded transcript agree about what the call copied.
+* The bridge writes the rows, because a row needs the **turn number**, and pi does not hand cwoffee
+  one: the translator numbers turns (`Output::turn()`), and `apply()` records each call's marks against
+  it. Recording is per call, not at the settle: a turn that was stopped partway still changed files,
+  and those are the changes a person most wants undone.
+* At the settle the rows are stamped with the answer row's id, so the transcript can put the control on
+  that row instead of guessing at one — the same reason file chips are stamped, and the same reason it
+  can only happen once the row exists.
+
+The snapshot directory is derived from the workspace at the time the tool runs (`ToolCtx::snapshot_dir`),
+never from a path stored earlier: a conversation whose folder moved would otherwise be told to restore
+into a folder it no longer works in. Paths in the index are workspace-relative and `resolve()` refuses
+any that escape the folder — a copy of a file outside the workspace could never be reverted by this
+code, so recording it would promise an undo that cannot happen.
 
 ### Chat mode's Web grant: pi decides tools at exec, so a switch is a process lifecycle
 

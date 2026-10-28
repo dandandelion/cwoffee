@@ -866,4 +866,51 @@ sidebar.
 
 Three new mock scenarios (`branch-stem`, `branch-tail`, `branch-answer`) exist because
 `scripts/mock-llm.mjs` answers an unmatched prompt with a 400, and a check whose turn 400s grades a
-conversation that never ran.
+conversation that never ran. (`checkpoint-overwrite` and `checkpoint-slow` were added for the same
+reason: the first is a turn that writes one file three times and edits it once, the second is slow
+enough to still be running when the harness asks for a revert under it.)
+
+### Checkpoints: the file, not the card, is what gets graded
+
+`checkpoints` is the group for a feature whose whole product is a file on disk. Everything the UI can
+report — the plan, the counts, the note — is the app's own arithmetic, so a revert that updated its own
+card and left the folder alone would look correct from inside the app. The group therefore reads the
+bytes through `selftest_file_bytes`, which goes through the same `confine()` the tools use and cannot
+be pointed outside the conversation's folder, and it never takes the app's word for what the disk holds.
+
+- **The turn has to actually write, or every claim below it is noise.** The file is seeded with words
+  the harness wrote, and the first claim after the turn is that the file no longer holds them. A turn
+  that wrote nothing would leave the group grading a change that never happened, which is why that
+  check exists before any revert claim: `the turn wrote nothing: … still holds the words the harness
+  seeded it with`.
+- **`edited_since` is used as a disk witness, from both sides.** Before the revert it must be false —
+  that is the engine saying the live file matches what the turn finished with. After the revert it must
+  be true — the file no longer matches, which is the only way the app itself notices a file moving.
+  Reading it in both directions is what stops a claim that only ever proves the flag is constant.
+- **The card is graded as a decision, not a list.** It must name the one path, sit inside the reading
+  card's clip box, say the transcript is untouched, and offer a button whose label matches the stakes:
+  `Revert` when nothing was edited afterwards, `Revert anyway` when something was. Sabotaging `apply()`
+  to report a restore it never performed fails as
+  `pressing Revert left selftest_checkpoint_note.md holding "model draft two\nthird line\n" instead of
+  the words it held before the turn`.
+- **The messages are counted on both sides of the revert.** Undoing files must not delete the
+  conversation, and the group compares row counts before and after rather than trusting the note that
+  says so.
+- **The mid-turn refusal is measured against a turn that is really running**, and the disk is read
+  before and after the refused call: `the refused revert still moved …` is a different failure from
+  `reverting during a turn answered …`, and the two used to be one claim. Removing the busy guard fails
+  with the second message — and that sabotage is what surfaced a real wording bug in the refusal, which
+  printed "accept that 1 it stay as they are". The engine now agrees in number with what it names, and
+  both branches are unit-tested, because that clause is the one that says what did *not* happen.
+- **A turn that touched no files must refuse rather than offer an empty plan.** The refusal is the same
+  sentence the card would have shown, and the check asserts its wording; an undo control that opens a
+  card with nothing in it reads as a bug in the card.
+- **Scope is one decision per file.** Three writes to one file produce one line, naming the earliest
+  copy, and widening to "this turn and after" still names one path. A per-write list would make a
+  single rewritten file read as three separate things to approve.
+- **The group owns its state.** Reasoning and approval mode are set for speed and restored in a
+  `finally` that runs whether the claims passed or failed; the file it seeded is deleted through the
+  model's own tool so the folder is left as it was found. It creates its own conversation by sending,
+  rather than borrowing the suite's scratch session, because that row is deleted and re-created by the
+  setup — an earlier version got `useSession(3): the host is still on 0` and then graded a turn that
+  never started.

@@ -115,6 +115,17 @@ pub struct ToolResult {
     /// just wrote is the most expensive possible thing to put back in a prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<changes::FileChange>,
+    /// What this call copied before it overwrote, so the turn can be undone. UI metadata
+    /// on the same footing as `files` and `changes` — a snapshot is not a prompt input, and
+    /// its path and hash would be prompt bytes if it travelled with the output.
+    ///
+    /// The tool fills it because the tool is the only thing that saw the file a moment
+    /// before it wrote over it. The **host** turns marks into index rows, because the tool
+    /// does not know which turn is running; that split is what makes the same code cover a
+    /// tool call executed in-process by the Rust core and one executed by `cwtool` on the
+    /// pi core.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<crate::checkpoint::Mark>,
     /// Tools this call made available to the model, named by the registry that owns them.
     /// Only `explore` fills this, and it never reaches the model as text: the extension reads
     /// it to widen the declared tool set, and the transcript card can show what the call
@@ -309,6 +320,7 @@ impl ToolResult {
             error: None,
             files: Vec::new(),
             changes: Vec::new(),
+            checkpoints: Vec::new(),
             activates: Vec::new(),
         }
     }
@@ -322,8 +334,15 @@ impl ToolResult {
             error: Some(m),
             files: Vec::new(),
             changes: Vec::new(),
+            checkpoints: Vec::new(),
             activates: Vec::new(),
         }
+    }
+
+    /// Record what this call captured. Returns self, same as `with_file`.
+    pub fn with_checkpoint(mut self, m: crate::checkpoint::Mark) -> Self {
+        self.checkpoints.push(m);
+        self
     }
 
     /// Attach a produced file. Returns self so call sites read in one chain.
@@ -379,6 +398,15 @@ pub struct ToolCtx {
     /// simply wrong — the descriptions of `web_search` and `exec` are built from these.
     pub search_backend: web::SearchBackend,
     pub exec_cfg: ExecCfg,
+    /// Whether this host keeps turn checkpoints at all.
+    ///
+    /// Off is not a failure: a probe, an example, and a tool host that was never told
+    /// where the database lives all run file calls with nobody able to revert them. The
+    /// mark then says so on the card rather than claiming a turn is undoable.
+    ///
+    /// It is a flag and not a directory, because the directory is derived from
+    /// `workspace`, and a workspace can move (`SetWorkspace`) while the context lives.
+    pub checkpoint_store: bool,
     /// Paths outside the workspace the **user approved for this one call**.
     /// Rebuilt per call by the agent loop; never inherited by the next call, and
     /// never widened by a session-level "allow for session" answer.
@@ -399,7 +427,50 @@ impl Default for ToolCtx {
             search_backend: web::SearchBackend::DuckDuckGo,
             exec_cfg: ExecCfg::default(),
             session: None,
+            checkpoint_store: false,
             permits: Vec::new(),
+        }
+    }
+}
+
+impl ToolCtx {
+    /// Where this host's copies live, derived from the workspace it is confined to.
+    ///
+    /// Derived rather than stored: `SetWorkspace` moves the folder a running host works
+    /// in, and copies taken under the old one would otherwise keep being written into a
+    /// folder nobody is reading any more.
+    pub fn snapshot_dir(&self) -> Option<std::path::PathBuf> {
+        self.checkpoint_store.then(|| crate::checkpoint::snapshot_dir(&self.workspace))
+    }
+
+    /// What is on `path` at this moment, as a checkpoint needs it read.
+    ///
+    /// Call this **before** the mutation. A file tool that captured afterwards would be
+    /// copying its own output, which is a checkpoint that reverts to the same file.
+    pub fn pre_state(&self, path: &std::path::Path) -> crate::checkpoint::PreState {
+        crate::checkpoint::PreState::of(path)
+    }
+
+    /// Attach the checkpoint mark for a call that wrote `path`, if the host keeps copies.
+    ///
+    /// Only a successful call is marked: a call that failed has not made the change the
+    /// person would want undone, and offering a revert for it would count a file as
+    /// touched when it was not.
+    pub fn stamp_checkpoint(
+        &self,
+        res: ToolResult,
+        path: &std::path::Path,
+        pre: &crate::checkpoint::PreState,
+    ) -> ToolResult {
+        if !res.ok {
+            return res;
+        }
+        let after = crate::checkpoint::read_bytes(path);
+        match crate::checkpoint::capture(self.snapshot_dir().as_deref(), &self.workspace, path, pre, after.as_deref()) {
+            Some(m) => res.with_checkpoint(m),
+            // Outside the workspace: `resolve` would refuse it on the way back, so there
+            // is no undo to promise and no mark to show.
+            None => res,
         }
     }
 }

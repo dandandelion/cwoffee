@@ -1672,6 +1672,66 @@
           "delay_ms": 4
         }
       ]
+    },
+    {
+      "name": "checkpoint-overwrite",
+      "_why": "the turn the checkpoint check reverts: two writes to one file and one edit inside it, so the copy that matters is the earliest one and the dedupe claim has something to dedupe",
+      "match": "Selftest checkpoint: rewrite the note file twice and correct one line",
+      "steps": [
+        {
+          "reasoning": "Rewriting the note the user pointed at.",
+          "tool_calls": [
+            {
+              "id": "mock-ck-1",
+              "name": "write_file",
+              "arguments": "{\"path\": \"selftest_checkpoint_note.md\", \"content\": \"model draft one\\nsecond line\\n\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "tool_calls": [
+            {
+              "id": "mock-ck-2",
+              "name": "write_file",
+              "arguments": "{\"path\": \"selftest_checkpoint_note.md\", \"content\": \"model draft two\\nsecond line\\n\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "tool_calls": [
+            {
+              "id": "mock-ck-3",
+              "name": "edit_file",
+              "arguments": "{\"path\": \"selftest_checkpoint_note.md\", \"old_text\": \"second line\", \"new_text\": \"third line\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "content": "Two drafts and a correction.",
+          "finish": "stop",
+          "chunk_chars": 6,
+          "delay_ms": 8
+        }
+      ]
+    },
+    {
+      "name": "checkpoint-slow",
+      "_why": "a turn long enough to ask for a revert under it: the guard has to be measured against a turn in flight, not an idle host",
+      "match": "Selftest checkpoint: count slowly",
+      "steps": [
+        {
+          "content": "Counting: one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen done.",
+          "finish": "stop",
+          "chunk_chars": 3,
+          "delay_ms": 120
+        }
+      ]
     }
   ]
 }

@@ -62,7 +62,14 @@ impl From<rusqlite::Error> for StoreError {
 // database and not in a browser's localStorage because localStorage is per-origin: a gateway
 // on another port is another store, and the desktop, the browser and the phone are three
 // origins between them. A preference only one of the three remembers is not a setting.
-const SCHEMA_VERSION: i64 = 14;
+// v15: `checkpoints` and `checkpoint_prunes` — what a file call overwrote, so a turn can be
+// undone. The bytes live in a content-addressed folder under the workspace (see
+// `crate::checkpoint`); these rows are the index that makes them findable after a restart.
+// A copy the app cannot locate again is not a checkpoint, and the database is the thing that
+// survives restarts. `checkpoint_prunes` records eviction under the per-conversation cap, so
+// the transcript can say "older snapshots were pruned" instead of offering fewer reverts and
+// not explaining why.
+const SCHEMA_VERSION: i64 = 15;
 
 /// A workspace the user has registered (or that holds sessions).
 /// How many conversations one folder can be asked for at a time. See
@@ -110,6 +117,59 @@ pub struct Session {
     /// that quietly lost its network reach.
     #[serde(default)]
     pub web_on: bool,
+}
+
+/// One checkpoint index row: a path a file call touched, and where its copy lives.
+///
+/// `path` is workspace-relative, the same rule as a file badge — an absolute path here
+/// would let anything that edits the database point a revert at any file on the machine
+/// (`crate::checkpoint::resolve` refuses it on the way back out).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CheckpointRow {
+    pub id: i64,
+    pub session: i64,
+    pub turn: i64,
+    /// The answer row this call belongs to, once the turn has been persisted. Null while
+    /// the turn is still running, which is why a turn's revert control waits for storage
+    /// rather than guessing at the row it will become.
+    pub message_id: Option<i64>,
+    pub path: String,
+    pub kind: crate::checkpoint::Kind,
+    /// Content-addressed blob key; empty when there was nothing to copy (a file the turn
+    /// created is reverted by deleting it).
+    pub hash: String,
+    /// What the file held right after the call. Revert compares the file on disk against
+    /// this to say "edited since".
+    pub after_hash: String,
+    pub bytes: i64,
+    pub created_at: i64,
+}
+
+/// A time the per-conversation cap evicted copies. Kept as a row because the transcript
+/// has to be able to say, after a restart, why an old turn offers no revert.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CheckpointPrune {
+    pub id: i64,
+    pub session: i64,
+    pub dropped: usize,
+    pub note: String,
+    pub created_at: i64,
+}
+
+/// What a conversation can undo, in the shape the transcript reads.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CheckpointOverview {
+    /// Per answer row: how many paths that turn can be reverted to.
+    pub per_message: Vec<TurnCheckpoints>,
+    pub total: usize,
+    /// Copies dropped by the cap, summed over every eviction this conversation suffered.
+    pub pruned: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TurnCheckpoints {
+    pub message_id: i64,
+    pub files: usize,
 }
 
 /// One bounded page of transcript history.
@@ -434,12 +494,293 @@ impl Store {
     }
 
     pub fn delete_session(&self, id: i64) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
-        conn.execute("DELETE FROM messages_fts WHERE session_id = ?1", params![id])?;
-        conn.execute("DELETE FROM turns WHERE session_id = ?1", params![id])?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        // Read the copy keys before the rows go: the cascade deletes them, and a blob whose
+        // last index row is gone has to be deleted from the disk too, or the workspace keeps
+        // growing copies for conversations that no longer exist.
+        let blobs = self.checkpoint_blob_keys(id)?;
+        let workspace = self.session_workspace(id).unwrap_or_default();
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM messages_fts WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM turns WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM checkpoint_prunes WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        }
+        self.drop_unreferenced_blobs(&workspace, &blobs);
         Ok(())
+    }
+
+    /// The folder a conversation works in, as recorded. Checkpoints need it to find the
+    /// snapshot store, and revert needs it to resolve stored paths — both without asking a
+    /// caller to repeat a path the database already knows.
+    pub fn session_workspace(&self, session_id: i64) -> Result<String, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let w: String = conn.query_row("SELECT workspace FROM sessions WHERE id = ?1", params![session_id], |r| r.get(0))?;
+        Ok(w)
+    }
+
+    /// Record what a turn's file calls overwrote. Returns how many rows were written.
+    ///
+    /// Marks come from the tool layer (`ToolResult::checkpoints`) rather than being written
+    /// by the tool itself: only the host knows which turn is running, and the turn number is
+    /// what makes "revert files to before turn N" mean anything. Both cores hand marks in
+    /// from their own turn counter, which is why one implementation covers both.
+    pub fn record_checkpoints(
+        &self,
+        session_id: i64,
+        turn: i64,
+        marks: &[crate::checkpoint::Mark],
+    ) -> Result<usize, StoreError> {
+        let now = chrono::Utc::now().timestamp();
+        let mut written = 0usize;
+        {
+            let conn = self.conn.lock().unwrap();
+            for m in marks.iter() {
+                conn.execute(
+                    "INSERT INTO checkpoints (session_id, turn, message_id, path, kind, hash, after_hash, bytes, created_at)
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        session_id,
+                        turn,
+                        m.path,
+                        m.kind.as_str(),
+                        m.hash,
+                        m.after_hash,
+                        m.bytes as i64,
+                        now
+                    ],
+                )?;
+                written += 1;
+            }
+        }
+        if written > 0 {
+            self.prune_checkpoints(session_id)?;
+        }
+        Ok(written)
+    }
+
+    /// Keep the conversation's index inside the cap, oldest first, and record that it
+    /// happened. Deleting index rows is not enough: a blob nothing points at is a copy of
+    /// somebody's file kept for a change nobody can revert any more.
+    fn prune_checkpoints(&self, session_id: i64) -> Result<(), StoreError> {
+        let cap = crate::checkpoint::CHECKPOINT_CAP as i64;
+        let mut dropped: Vec<String> = Vec::new();
+        let n: i64;
+        {
+            let conn = self.conn.lock().unwrap();
+            let held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )?;
+            if held <= cap {
+                return Ok(());
+            }
+            // Drop past the cap by a batch rather than to the cap exactly: evicting one
+            // row per call would log forty separate notices for one long conversation and
+            // touch the disk forty times. One notice per batch is a sentence a person can
+            // read, and the copies they would have used go together.
+            let excess = held - cap + (crate::checkpoint::CHECKPOINT_BATCH as i64 - 1);
+            n = excess;
+            let mut stmt = conn.prepare(
+                "SELECT hash FROM checkpoints WHERE session_id = ?1 AND hash <> '' ORDER BY id ASC LIMIT ?2",
+            )?;
+            for row in stmt.query_map(params![session_id, excess], |r| r.get::<_, String>(0))? {
+                dropped.push(row?);
+            }
+            drop(stmt);
+            conn.execute(
+                "DELETE FROM checkpoints WHERE session_id = ?1 AND id IN (
+                     SELECT id FROM checkpoints WHERE session_id = ?1 ORDER BY id ASC LIMIT ?2
+                 )",
+                params![session_id, excess],
+            )?;
+        }
+        let workspace = self.session_workspace(session_id).unwrap_or_default();
+        self.drop_unreferenced_blobs(&workspace, &dropped);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO checkpoint_prunes (session_id, dropped, note, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                session_id,
+                n,
+                format!(
+                    "{n} older cop{} pruned: this conversation has reached {cap} checkpoints, so the oldest ones went first",
+                    if n == 1 { "y was" } else { "ies were" }
+                ),
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Keys this conversation holds. Read before a delete, because the cascade takes the
+    /// rows and the disk copy is a separate thing to clean up.
+    pub fn checkpoint_blob_keys(&self, session_id: i64) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT hash FROM checkpoints WHERE session_id = ?1 AND hash <> ''",
+        )?;
+        let mut out = Vec::new();
+        for row in stmt.query_map(params![session_id], |r| r.get::<_, String>(0))? {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Delete copies no index row points at any more.
+    ///
+    /// Checked across every conversation, not just the one being pruned: content-addressing
+    /// means two conversations that overwrote the same bytes share one copy, and taking it
+    /// out because one of them ended would leave the other unable to revert.
+    pub fn drop_unreferenced_blobs(&self, workspace: &str, hashes: &[String]) {
+        if workspace.is_empty() || hashes.is_empty() {
+            return;
+        }
+        let dir = crate::checkpoint::snapshot_dir(std::path::Path::new(workspace));
+        let conn = self.conn.lock().unwrap();
+        for h in hashes {
+            let still: i64 = conn
+                .query_row("SELECT COUNT(*) FROM checkpoints WHERE hash = ?1", params![h], |r| r.get(0))
+                .unwrap_or(0);
+            if still > 0 {
+                continue;
+            }
+            let _ = std::fs::remove_file(crate::checkpoint::blob_path(&dir, h));
+        }
+    }
+
+    fn checkpoint_map(&self, sql: &str, params_list: &[&dyn rusqlite::ToSql]) -> Result<Vec<CheckpointRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params_list, |r| {
+            let kind_s: String = r.get(5)?;
+            Ok(CheckpointRow {
+                id: r.get(0)?,
+                session: r.get(1)?,
+                turn: r.get(2)?,
+                message_id: r.get(3)?,
+                path: r.get(4)?,
+                kind: crate::checkpoint::Kind::parse(&kind_s).unwrap_or(crate::checkpoint::Kind::Modified),
+                hash: r.get(6)?,
+                after_hash: r.get(7)?,
+                bytes: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every copy this conversation holds, oldest first.
+    pub fn checkpoints_for_session(&self, session_id: i64) -> Result<Vec<CheckpointRow>, StoreError> {
+        self.checkpoint_map(
+            "SELECT id, session_id, turn, message_id, path, kind, hash, after_hash, bytes, created_at
+             FROM checkpoints WHERE session_id = ?1 ORDER BY id ASC",
+            &[&session_id],
+        )
+    }
+
+    /// The copies belonging to one answer row — "revert files from this turn".
+    pub fn checkpoints_for_message(&self, session_id: i64, message_id: i64) -> Result<Vec<CheckpointRow>, StoreError> {
+        self.checkpoint_map(
+            "SELECT id, session_id, turn, message_id, path, kind, hash, after_hash, bytes, created_at
+             FROM checkpoints WHERE session_id = ?1 AND message_id = ?2 ORDER BY id ASC",
+            &[&session_id, &message_id],
+        )
+    }
+
+    /// That turn's copies and every later turn's — "revert files to before turn N". The
+    /// anchor is the turn the answer row was written in, so a row whose own turn is unknown
+    /// cannot anchor a rewind of the disk.
+    pub fn checkpoints_from_message(&self, session_id: i64, message_id: i64) -> Result<Vec<CheckpointRow>, StoreError> {
+        self.checkpoint_map(
+            "SELECT id, session_id, turn, message_id, path, kind, hash, after_hash, bytes, created_at
+             FROM checkpoints
+             WHERE session_id = ?1
+               AND turn >= (SELECT turn FROM checkpoints WHERE session_id = ?1 AND message_id = ?2 LIMIT 1)
+             ORDER BY id ASC",
+            &[&session_id, &message_id],
+        )
+    }
+
+    /// Name the answer row a turn's copies belong to, once that row exists. Called at turn
+    /// end, next to `set_message_files`, for the same reason: the row is not written until
+    /// the answer is finished, and the revert control is addressed by row id.
+    pub fn stamp_checkpoints_turn(
+        &self,
+        session_id: i64,
+        turn: i64,
+        message_id: i64,
+    ) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE checkpoints SET message_id = ?3 WHERE session_id = ?1 AND turn = ?2 AND message_id IS NULL",
+            params![session_id, turn, message_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Which turns can be undone, and how much was pruned. The transcript draws a revert
+    /// control only where this says there is one, and says "older snapshots pruned" where
+    /// the cap has been reached — a control that would do nothing is worse than none.
+    pub fn checkpoint_overview(&self, session_id: i64) -> Result<CheckpointOverview, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT message_id, COUNT(*) FROM checkpoints
+             WHERE session_id = ?1 AND message_id IS NOT NULL
+             GROUP BY message_id ORDER BY message_id ASC",
+        )?;
+        let mut per_message = Vec::new();
+        for row in stmt.query_map(params![session_id], |r| {
+            Ok(TurnCheckpoints {
+                message_id: r.get(0)?,
+                files: r.get::<_, i64>(1)? as usize,
+            })
+        })? {
+            per_message.push(row?);
+        }
+        drop(stmt);
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare("SELECT id, session_id, dropped, note, created_at FROM checkpoint_prunes WHERE session_id = ?1 ORDER BY id ASC")?;
+        let mut pruned = 0usize;
+        for row in stmt.query_map(params![session_id], |r| r.get::<_, i64>(2))? {
+            pruned += row? as usize;
+        }
+        Ok(CheckpointOverview {
+            per_message,
+            total: total as usize,
+            pruned,
+        })
+    }
+
+    pub fn checkpoint_prunes(&self, session_id: i64) -> Result<Vec<CheckpointPrune>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, dropped, note, created_at FROM checkpoint_prunes WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let mut out = Vec::new();
+        for row in stmt.query_map(params![session_id], |r| {
+            Ok(CheckpointPrune {
+                id: r.get(0)?,
+                session: r.get(1)?,
+                dropped: r.get::<_, i64>(2)? as usize,
+                note: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })? {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// How many conversations the record holds, and how many messages are in them. Two counts for
@@ -1304,6 +1645,30 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
                  draft_accepted INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
+
+             CREATE TABLE IF NOT EXISTS checkpoints (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 turn INTEGER NOT NULL,
+                 message_id INTEGER,
+                 path TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 hash TEXT NOT NULL,
+                 after_hash TEXT NOT NULL DEFAULT '',
+                 bytes INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, turn);
+             CREATE INDEX IF NOT EXISTS idx_checkpoints_message ON checkpoints(session_id, message_id);
+
+             CREATE TABLE IF NOT EXISTS checkpoint_prunes (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 dropped INTEGER NOT NULL,
+                 note TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_ckprune_session ON checkpoint_prunes(session_id);
              COMMIT;",
         )?;
     }
@@ -1431,6 +1796,36 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
             "web_on INTEGER NOT NULL DEFAULT 0",
         )?;
     }
+    if from < 15 {
+        // v15: the checkpoint index. Same statements as the fresh-database block above:
+        // `IF NOT EXISTS` makes them correct for a database that was created after this
+        // version, and the block is what an older one needs.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS checkpoints (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 turn INTEGER NOT NULL,
+                 message_id INTEGER,
+                 path TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 hash TEXT NOT NULL,
+                 after_hash TEXT NOT NULL DEFAULT '',
+                 bytes INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, turn);
+             CREATE INDEX IF NOT EXISTS idx_checkpoints_message ON checkpoints(session_id, message_id);
+
+             CREATE TABLE IF NOT EXISTS checkpoint_prunes (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 dropped INTEGER NOT NULL,
+                 note TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_ckprune_session ON checkpoint_prunes(session_id);",
+        )?;
+    }
     if from < 10 {
         // v10: workspaces became things you can add, not just side effects of the
         // last path you typed. The sidebar groups sessions by workspace and lets
@@ -1531,7 +1926,49 @@ pub trait StoreOps: Send + Sync {
     /// See [`Store::copy_through`] — the row copy a branch is built from. Both cores need it: on the
     /// Rust core it *is* the branch, and on the pi core it writes the record that sits beside the
     /// thread pi forks.
+    ///
+    /// The checkpoint verbs below are on this trait for the same reason: the pi core's file
+    /// calls run in `cwtool`, a separate process that takes the copies and hands the marks
+    /// back, and the bridge then indexes them — so the store a turn writes checkpoints into
+    /// is reached through this trait on one core and directly on the other. A revert that
+    /// only worked on the Rust core would be a feature the phone cannot use.
     fn copy_through(&self, from: i64, to: i64, through_id: i64) -> Result<usize, StoreError>;
+
+    /// The folder a conversation works in: where its snapshot store lives, and what
+    /// stored checkpoint paths are relative to.
+    fn session_workspace(&self, session_id: i64) -> Result<String, StoreError>;
+    /// Index the copies one turn took. See [`crate::checkpoint::capture`].
+    fn record_checkpoints(
+        &self,
+        session_id: i64,
+        turn: i64,
+        marks: &[crate::checkpoint::Mark],
+    ) -> Result<usize, StoreError>;
+    /// Name the answer row a turn's copies belong to, once that row exists.
+    fn stamp_checkpoints_turn(
+        &self,
+        session_id: i64,
+        turn: i64,
+        message_id: i64,
+    ) -> Result<usize, StoreError>;
+    /// The copies that turn made — "revert files from this turn".
+    fn checkpoints_for_message(
+        &self,
+        session_id: i64,
+        message_id: i64,
+    ) -> Result<Vec<CheckpointRow>, StoreError>;
+    /// That turn's copies and every later turn's — "revert files to before turn N".
+    fn checkpoints_from_message(
+        &self,
+        session_id: i64,
+        message_id: i64,
+    ) -> Result<Vec<CheckpointRow>, StoreError>;
+    /// Which turns can be undone, and how much was pruned. Drives whether the transcript
+    /// offers a revert at all, and whether it says older copies were pruned.
+    fn checkpoint_overview(
+        &self,
+        session_id: i64,
+    ) -> Result<CheckpointOverview, StoreError>;
     /// See `Store::message_attachments`.
     fn message_attachments(&self, message_id: i64) -> Result<Vec<crate::provider::Attachment>, StoreError>;
     fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError>;
@@ -1594,6 +2031,48 @@ impl StoreOps for Store {
     }
     fn copy_through(&self, from: i64, to: i64, through_id: i64) -> Result<usize, StoreError> {
         Store::copy_through(self, from, to, through_id)
+    }
+
+    fn session_workspace(&self, session_id: i64) -> Result<String, StoreError> {
+        Store::session_workspace(self, session_id)
+    }
+
+    fn record_checkpoints(
+        &self,
+        session_id: i64,
+        turn: i64,
+        marks: &[crate::checkpoint::Mark],
+    ) -> Result<usize, StoreError> {
+        Store::record_checkpoints(self, session_id, turn, marks)
+    }
+
+    fn stamp_checkpoints_turn(
+        &self,
+        session_id: i64,
+        turn: i64,
+        message_id: i64,
+    ) -> Result<usize, StoreError> {
+        Store::stamp_checkpoints_turn(self, session_id, turn, message_id)
+    }
+
+    fn checkpoints_for_message(
+        &self,
+        session_id: i64,
+        message_id: i64,
+    ) -> Result<Vec<CheckpointRow>, StoreError> {
+        Store::checkpoints_for_message(self, session_id, message_id)
+    }
+
+    fn checkpoints_from_message(
+        &self,
+        session_id: i64,
+        message_id: i64,
+    ) -> Result<Vec<CheckpointRow>, StoreError> {
+        Store::checkpoints_from_message(self, session_id, message_id)
+    }
+
+    fn checkpoint_overview(&self, session_id: i64) -> Result<CheckpointOverview, StoreError> {
+        Store::checkpoint_overview(self, session_id)
     }
     fn db_path(&self) -> String {
         Store::db_path(self)

@@ -219,7 +219,7 @@ fn the_tool_call_and_its_execution_are_named_to_the_same_call() {
                 EngineEvent::ToolCallBegin { id, name } => begin = Some((id, name)),
                 EngineEvent::ToolCallReady { id, args } => ready = Some((id, args)),
                 EngineEvent::ToolExecStart { id } => exec_start = Some(id),
-                EngineEvent::ToolExecEnd { id, ok, exit_code, changes } => {
+                EngineEvent::ToolExecEnd { id, ok, exit_code, changes, .. } => {
                     exec_end = Some((id, ok, exit_code, changes.len()))
                 }
                 _ => {}

@@ -1111,6 +1111,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
         let ctx = ToolCtx {
+            checkpoint_store: false,
             workspace: ws.clone(),
             ..ToolCtx::default()
         };
@@ -1154,6 +1155,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
         let ctx = ToolCtx {
+            checkpoint_store: false,
             workspace: ws.clone(),
             ..ToolCtx::default()
         };
@@ -1188,7 +1190,7 @@ mod tests {
         mpsc::unbounded_channel().0
     }
     fn ctx() -> ToolCtx {
-        ToolCtx { workspace: ".".into(), max_output_bytes: 4096, ..Default::default() }
+ToolCtx { workspace: ".".into(), max_output_bytes: 4096, ..Default::default() }
     }
 
     // ---- url policy -------------------------------------------------------

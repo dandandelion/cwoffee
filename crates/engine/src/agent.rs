@@ -127,6 +127,10 @@ pub struct Agent {
     /// never enter the prompt, so they cost no prefill and cannot invalidate the
     /// prefix cache.
     turn_files: Vec<crate::tools::OutputFile>,
+    /// The turn currently running, mirrored out of `turn_id` so a tool call in the middle
+    /// of it can index its checkpoint against the turn rather than against a row that does
+    /// not exist yet. `run_turn` sets it before any call can happen.
+    turn_now: u64,
     /// Set when the prompt was rebuilt from the session file rather than built
     /// in this process. The engine cannot see the endpoint's KV cache, so it is
     /// not allowed to claim anything about it - cold or warm. It marks the next
@@ -162,6 +166,7 @@ impl Agent {
             ctx,
             turn_id: 0,
             turn_files: Vec::new(),
+            turn_now: 0,
             resumed_pending: None,
             cancel: Arc::new(AtomicBool::new(false)),
         }
@@ -284,6 +289,13 @@ impl Agent {
 
     /// Files the last turn produced. The host persists these onto the assistant
     /// row so they survive a reload; the event is only the live path.
+    /// The turn currently running: 0 before the first one. Checkpoint rows are indexed by
+    /// it, and the host stamps them onto the answer row at turn end, so it has to be
+    /// readable from outside the loop.
+    pub fn turn(&self) -> u64 {
+        self.turn_id
+    }
+
     pub fn take_turn_files(&mut self) -> Vec<crate::tools::OutputFile> {
         self.drop_deleted_turn_files();
         std::mem::take(&mut self.turn_files)
@@ -400,6 +412,7 @@ impl Agent {
         self.ctx.session = Some(session_id);
         self.turn_id += 1;
         let turn = self.turn_id;
+        self.turn_now = turn;
         self.cancel.store(false, Ordering::Relaxed);
 
         // Which conversation this turn belongs to is a fact about the engine, not
@@ -915,6 +928,7 @@ impl Agent {
                     ok: false,
                     exit_code: None,
                     changes: Vec::new(),
+                    checkpoints: Vec::new(),
                 });
                 // Two different facts, and the model needs the right one. A user
                 // pressing deny means "not this call". The denylist means "this
@@ -999,6 +1013,7 @@ impl Agent {
                 truncated: false,
                 files: Vec::new(),
                 changes: Vec::new(),
+                checkpoints: Vec::new(),
                 activates: Vec::new(),
                 error: Some(if e.is_panic() {
                     format!(
@@ -1031,11 +1046,37 @@ impl Agent {
             self.note_turn_file(f);
         }
 
+        // Index the copies this call took. The tool wrote the bytes; the turn number and
+        // the conversation are what make them findable, and only the host knows both.
+        // Recorded here rather than at the end of the turn, because a turn that ran out of
+        // iterations or was stopped halfway still changed files, and those are exactly the
+        // changes a person wants undone.
+        if !result.checkpoints.is_empty() {
+            if let Some(store) = self.ctx.store.as_ref() {
+                if let Some(session) = self.ctx.session {
+                    if let Err(e) = store.record_checkpoints(
+                        session,
+                        self.turn_now as i64,
+                        &result.checkpoints,
+                    ) {
+                        let _ = out.send(EngineEvent::Note {
+                            session: Some(session),
+                            message: format!(
+                                "the copies of {} file(s) were taken but not indexed: {e}.                                  That turn cannot be reverted from the transcript.",
+                                result.checkpoints.len()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         let _ = out.send(EngineEvent::ToolExecEnd {
             id: call.id.clone(),
             ok: result.ok,
             exit_code: result.exit_code,
             changes: result.changes.clone(),
+            checkpoints: result.checkpoints.clone(),
         });
 
         self.prompt
@@ -1371,6 +1412,182 @@ mod tests {
         }
     }
 
+    /// The whole chain on a real turn: a file tool overwrites a file, the copy reaches
+    /// the disk, the index row reaches the store, and the transcript can then put the file
+    /// back. Graded through `run_turn`, because the three pieces are written by three
+    /// different places — the tool takes the copy, the loop indexes it against the turn,
+    /// and the host names the answer row at the end — and any one of them failing alone
+    /// leaves a revert control that does nothing.
+    #[tokio::test]
+    async fn a_turn_that_overwrote_a_file_leaves_an_indexed_copy_behind() {
+        use crate::checkpoint::{apply, snapshot_dir};
+        use crate::store::Store;
+        use crate::tools::files::WriteFileTool;
+
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ws = std::env::temp_dir().join(format!(
+            "cwoffee_ckpt_turn_{}_{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("notes.md"), "the user's own notes\n").unwrap();
+
+        let store = Arc::new(Store::in_memory().unwrap());
+        let sess = store.create_session("t", ws.to_str().unwrap(), "m").unwrap();
+
+        let ctx = ToolCtx {
+            workspace: ws.clone(),
+            max_output_bytes: 4096,
+            store: Some(Arc::clone(&store)),
+            checkpoint_store: true,
+            ..Default::default()
+        };
+
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(WriteFileTool));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "w1".into(),
+                            name: "write_file".into(),
+                            arguments: r#"{"path":"notes.md","content":"the model's version\n"}"#.into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(
+                crate::approval::ApprovalMode::Auto,
+                atx,
+            )
+            .with_timeout(std::time::Duration::from_millis(150)),
+            AgentConfig::default(),
+            ctx,
+        );
+        let _ = arx;
+        agent.run_turn("rewrite my notes", vec![], &etx, sess).await;
+
+        // What the event carried, so a live card and a reloaded one agree.
+        let carried: Vec<usize> = erx
+            .try_recv()
+            .iter()
+            .cloned()
+            .chain(std::iter::from_fn(|| erx.try_recv().ok()))
+            .filter_map(|e| match e {
+                EngineEvent::ToolExecEnd { checkpoints, .. } => Some(checkpoints.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carried, vec![1], "the call reported one copy it took");
+
+        // The index row, against the turn that ran.
+        let rows = store.checkpoints_for_session(sess).unwrap();
+        assert_eq!(rows.len(), 1, "and the store holds one row for it");
+        assert_eq!(rows[0].turn as u64, agent.turn(), "indexed against the turn that ran");
+        assert_eq!(rows[0].path, "notes.md");
+        assert_eq!(rows[0].hash, crate::checkpoint::hash_of(b"the user's own notes\n"));
+        assert!(
+            rows[0].message_id.is_none(),
+            "no answer row existed yet — the host names it when the turn ends"
+        );
+
+        // The bytes are where the row says they are.
+        let blob = crate::checkpoint::blob_path(&snapshot_dir(&ws), &rows[0].hash);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"the user's own notes\n");
+
+        // The host stamps the answer row at turn end; do that step here, then revert.
+        let aid = store
+            .append_message(sess, &crate::provider::Message::assistant("done"))
+            .unwrap();
+        assert_eq!(store.stamp_checkpoints_turn(sess, 1, aid).unwrap(), 1);
+
+        let out = apply(
+            &ws,
+            &snapshot_dir(&ws),
+            &store.checkpoints_for_message(sess, aid).unwrap(),
+            false,
+        );
+        assert_eq!(out.restored, 1);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("notes.md")).unwrap(),
+            "the user's own notes\n",
+            "the turn is undone on disk"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A host that keeps no copies must not leave a row behind: a row with no blob is a
+    /// revert control that fails when pressed.
+    #[tokio::test]
+    async fn a_host_without_a_snapshot_store_records_nothing() {
+        use crate::store::Store;
+        use crate::tools::files::WriteFileTool;
+
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ws = std::env::temp_dir().join(format!(
+            "cwoffee_ckpt_off_{}_{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("notes.md"), "yours\n").unwrap();
+
+        let store = Arc::new(Store::in_memory().unwrap());
+        let sess = store.create_session("t", ws.to_str().unwrap(), "m").unwrap();
+        let ctx = ToolCtx {
+            workspace: ws.clone(),
+            max_output_bytes: 4096,
+            store: Some(Arc::clone(&store)),
+            checkpoint_store: false,
+            ..Default::default()
+        };
+
+        let (etx, _erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(WriteFileTool));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "w1".into(),
+                            name: "write_file".into(),
+                            arguments: r#"{"path":"notes.md","content":"mine\n"}"#.into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx)
+                .with_timeout(std::time::Duration::from_millis(150)),
+            AgentConfig::default(),
+            ctx,
+        );
+        let _ = arx;
+        agent.run_turn("rewrite it", vec![], &etx, sess).await;
+        assert!(store.checkpoints_for_session(sess).unwrap().is_empty());
+        assert!(!snapshot_dir_exists(&ws), "no snapshot folder either");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    fn snapshot_dir_exists(ws: &std::path::Path) -> bool {
+        crate::checkpoint::snapshot_dir(ws).exists()
+    }
+
     /// Harmless tools must not reach the gate at all. Every prompt that is not
     /// about harm is a prompt that trains the user to click without reading.
     #[tokio::test]
@@ -1585,7 +1802,8 @@ mod tests {
             ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
             AgentConfig::default(),
             ToolCtx {
-                workspace: dir.clone(),
+                    checkpoint_store: false,
+            workspace: dir.clone(),
                 ..Default::default()
             },
         );
@@ -1635,7 +1853,8 @@ mod tests {
             ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
             AgentConfig::default(),
             ToolCtx {
-                workspace: dir.clone(),
+                    checkpoint_store: false,
+            workspace: dir.clone(),
                 ..Default::default()
             },
         );
@@ -2169,7 +2388,7 @@ mod tests {
     fn render_result_never_returns_empty_to_the_model() {
         assert_eq!(render_result(&ToolResult::ok("")), "(succeeded, no output)");
         assert!(render_result(&ToolResult::err("boom")).contains("ERROR"));
-        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new(), changes: Vec::new(), activates: Vec::new() };
+        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new(), changes: Vec::new(), checkpoints: Vec::new(), activates: Vec::new() };
         assert!(render_result(&r).contains("(no output)"));
     }
 

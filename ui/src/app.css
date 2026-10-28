@@ -595,6 +595,121 @@ body {
 .ue-act.again { border-color: var(--color-shell); color: var(--color-shell-deep); }
 .ue-act.cancel { border-color: transparent; color: var(--color-ink-3); }
 
+/* The card is a question, not part of the answer being written, so it does not rise with the
+   turn's own entrance animation — that animation fills `both`, and a card that inherited it would
+   spend its first frames fading in over content the reader is already deciding about. */
+.turn > .revert-card { animation: none; }
+
+/* A turn's file changes, listed before any of them are undone.
+   Deliberately plain: a confirmation that looks like the answer it is undoing reads as part of
+   the answer, and a person skims part of the answer. The card is a question with a list in it,
+   so it is a bordered box on the paper with its own heading and no decoration. */
+.revert-card {
+  margin-top: 8px;
+  padding: 10px 12px 11px;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 11px;
+  background: var(--color-paper-2);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(76%, 660px);
+}
+.revert-h {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+  color: var(--color-ink);
+}
+.revert-scopes { display: flex; gap: 6px; }
+.revert-scope {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--color-hairline-2);
+  background: none;
+  color: var(--color-ink-3);
+  cursor: pointer;
+  transition: background var(--d1) var(--ease), color var(--d1) var(--ease),
+    border-color var(--d1) var(--ease);
+}
+.revert-scope:hover:not(:disabled) { background: var(--color-tint); color: var(--color-ink); }
+/* The chosen scope is filled, not underlined: two words side by side where one is a decision,
+   and the reader needs to see which one they are about to act on. */
+.revert-scope[data-on] {
+  background: var(--color-shell);
+  border-color: var(--color-shell);
+  color: var(--color-on-shell);
+}
+.revert-list { display: flex; flex-direction: column; gap: 3px; }
+.revert-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.revert-path {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--color-ink);
+  /* Long workspace paths wrap; a list that scrolls sideways hides the file being named. */
+  overflow-wrap: anywhere;
+}
+.revert-verb { color: var(--color-ink-3); }
+.revert-flag {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--color-hairline-2);
+  color: var(--color-warn);
+  background: var(--color-warn-bg);
+  border-color: var(--color-warn-hairline);
+}
+/* A file the turn created reads differently from one it overwrote: undoing one deletes, undoing
+   the other writes back. The kind is already in the verb, so this only marks what has no copy. */
+.revert-item[data-kind='deleted'] .revert-verb,
+.revert-item[data-kind='created'] .revert-verb { font-style: italic; }
+.revert-note {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-ink-3);
+  max-width: 62ch;
+}
+/* The cap notice sits under the note and reads quieter than the flags: it is about the conversation's
+   history being shorter than it used to be, not about a file someone can choose differently. */
+.revert-prune {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-ink-3);
+  font-style: italic;
+}
+.revert-acts { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.revert-go,
+.revert-cancel {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--color-hairline-2);
+  background: none;
+  color: var(--color-ink-2);
+  cursor: pointer;
+  transition: background var(--d1) var(--ease), color var(--d1) var(--ease),
+    border-color var(--d1) var(--ease);
+}
+.revert-go:hover:not(:disabled),
+.revert-cancel:hover:not(:disabled) { background: var(--color-tint); color: var(--color-ink); }
+.revert-go:disabled,
+.revert-cancel:disabled { opacity: 0.55; cursor: default; }
+.revert-go[data-warn] { border-color: var(--color-warn-hairline); color: var(--color-warn); }
+.revert-cancel { border-color: transparent; color: var(--color-ink-3); }
+
 .blk-answer .blk-body { color: var(--color-ink); }
 /* A thought is one line, and that is the whole block.
 

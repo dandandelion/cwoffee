@@ -281,6 +281,7 @@ impl Tool for ExecTool {
                 exit_code: None,
                 truncated: false,
                 changes: Vec::new(),
+                checkpoints: Vec::new(),
                 activates: Vec::new(),
                 error: Some(timeout_error(timeout_secs)),
                 files: Vec::new(),
@@ -295,6 +296,7 @@ impl Tool for ExecTool {
                 exit_code: code,
                 truncated: false,
                 changes: Vec::new(),
+                checkpoints: Vec::new(),
                 activates: Vec::new(),
                 error: Some(timeout_error(timeout_secs)),
                 files: Vec::new(),
@@ -356,6 +358,7 @@ impl Tool for ExecTool {
             // knows about, so there is no honest +N -M to show. The card shows the
             // command and its output instead.
             changes: Vec::new(),
+            checkpoints: Vec::new(),
             activates: Vec::new(),
         }
     }

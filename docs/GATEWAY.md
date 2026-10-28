@@ -94,7 +94,7 @@ Two roles, enforced server-side per command:
   `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
   `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`,
   `set_workspace_color`, `set_session_web`, `provider_set_primary`,
-  `export_markdown`, `edit_message`, `branch_conversation`.
+  `export_markdown`, `edit_message`, `branch_conversation`, `checkpoint_revert`.
 
 `share_markdown` takes `{ session }` and returns `{ name, markdown }`: that conversation as a
 Markdown document, built from **the workspace stored on that session** rather than the host's
@@ -136,6 +136,36 @@ or `from_end` counting back from the newest among rows of `role`) and repeats th
 (`shown`). If that row says something else now, nothing is created and the error names what the row
 actually says. Both transports call one function (`cwoffee_engine::branch::apply_and_open`), so a
 phone cannot branch a conversation the desktop would refuse to branch.
+
+`checkpoint_preview` takes `{ session, message_id, through_latest }` and returns
+`{ session, message_id, turn, scope, workspace, items, edited_since, missing_copy, pruned, note }` -
+or an error, which is how a refusal arrives. It is the read half of "undo this turn's files": the plan
+the engine would carry out, computed from its own index rows and the current disk, with nothing
+touched. `pruned` is how many copies this conversation already lost to the per-conversation size cap:
+a non-zero count means the list is what survived, not everything the conversation ever changed, and
+the note says so rather than letting a short list read as a complete history.
+`items[]` names each path relative to the conversation's folder, its `kind` (`created` / `modified` /
+`deleted`), the `action` the revert performs on it, and the three flags a reader needs before saying
+yes: `edited_since` (someone changed it afterwards, so restoring it overwrites their work),
+`copy_missing` (the copy itself is gone - pruned, or the folder moved), `path_missing` (the file is
+gone). `through_latest` widens the scope from that turn alone to that turn and every turn after it.
+
+It is a **watch** verb: a phone that can only read a conversation should still be able to show the
+path list it is being asked to confirm. Pressing it is the other verb.
+
+`checkpoint_revert` takes `{ session, message_id, through_latest, shown, overwrite_edited }` and
+returns `{ session, message_id, scope, report, note, messages }`. It writes files back - the only
+verb here that overwrites anything outside the record - so it is drive-only, and it re-reads its own
+scope before touching the disk: `shown` is the path list the caller painted, and if the scope is no
+longer that list it refuses and names both lists rather than carrying out a scope nobody was shown.
+`overwrite_edited` is the answer to the "edited since" question; without it those paths are left
+alone, and a caller that never offered the choice is refused rather than quietly getting a partial
+revert. Refused while a turn is running, because a turn writing files right now is exactly the state
+where restoring a copy restores the wrong thing.
+
+The transcript is not touched, and `messages` is the message count after the revert, so a client can
+say "the conversation still holds N messages" as a measured fact rather than a promise: undoing
+files is not undoing the conversation, and the record still says what was asked and answered.
 
 `message_attachments` takes `{ message_id }` and returns `[{ mime, data_b64, name }]` - the bytes
 behind one stored message. It exists because a transcript page deliberately carries name and size

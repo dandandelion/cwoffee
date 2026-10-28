@@ -1253,6 +1253,69 @@ pub async fn branch_conversation(
     serde_json::to_value(out).map_err(|e| e.to_string())
 }
 
+/// What reverting a turn's file changes would do, without doing it.
+///
+/// The transcript asks this before it shows a confirmation, so the person reads the actual
+/// path list and the actual "edited since" flags before they press anything. It is a preview of
+/// the same plan `checkpoint_revert` will execute, computed from the same index rows: showing one
+/// plan and running another is how an "undo" ends up overwriting a file the reader never saw.
+///
+/// `whole_turn` is the difference between "undo this answer's files" and "put the folder back the
+/// way it was before this message" — the second takes the later turns' changes with it.
+#[tauri::command(rename_all = "snake_case")]
+pub fn checkpoint_preview(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    message_id: i64,
+    through_latest: bool,
+) -> Result<serde_json::Value, String> {
+    let req = cwoffee_engine::checkpoint::RevertReq {
+        session,
+        message_id,
+        through_latest,
+        shown: Vec::new(),
+        overwrite_edited: false,
+    };
+    let out = cwoffee_engine::checkpoint::preview(state.store.as_ref(), &req)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+/// Undo one turn's file changes. The transcript only calls this after a confirmation naming the
+/// paths, and the engine re-reads its own scope before touching anything.
+///
+/// The transcript rows are not touched: this is about files on disk, and a conversation that
+/// silently lost its messages when someone pressed "undo the files" would be a worse surprise
+/// than a folder that still holds what was written.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn checkpoint_revert(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    message_id: i64,
+    through_latest: bool,
+    shown: Vec<String>,
+    overwrite_edited: bool,
+) -> Result<serde_json::Value, String> {
+    eprintln!(
+        "[cwoffee] checkpoint_revert (desktop): session={session} message={message_id} \
+         through_latest={through_latest} overwrite_edited={overwrite_edited} \
+         shown={} path(s)",
+        shown.len()
+    );
+    let req = cwoffee_engine::checkpoint::RevertReq {
+        session,
+        message_id,
+        through_latest,
+        shown,
+        overwrite_edited,
+    };
+    // An error, not a payload: a phone or window that read `{"Err": …}` as a result would
+    // report "reverted" for a revert that refused.
+    let out = cwoffee_engine::checkpoint::revert(state.store.as_ref(), state.host.as_ref(), &req)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
 /// The bytes behind one message's attachments, for a reader who opens a picture that arrived in an
 /// earlier conversation.
 ///
@@ -1375,6 +1438,55 @@ pub fn gpu_report() -> gpu::GpuReport {
 #[tauri::command]
 pub fn selftest_stage_clipboard() -> Result<serde_json::Value, String> {
     crate::clipboard::stage_fixture()
+}
+
+/// Read one workspace file's bytes, for the harness only.
+///
+/// "The turn is undone on disk" is a claim about a file, and the UI has no file API — a check
+/// that only reads the revert card's own arithmetic would be grading the app's own report card,
+/// not the folder. So the harness reads the bytes the way an editor would, through the same
+/// `confine` the tools use: it cannot be pointed at a file outside the conversation's folder.
+///
+/// The `bytes` field is capped, because the harness asks about small fixtures and a reader that
+/// slurps a whole video would be a harness that hangs.
+#[tauri::command]
+pub fn selftest_file_bytes(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    const CAP: u64 = 64 * 1024;
+    let ws = state.host.state().workspace;
+    let full = cwoffee_engine::tools::path::confine(std::path::Path::new(&ws), &path)
+        .map_err(|e| e.to_string())?;
+    let md = std::fs::metadata(&full).map_err(|_| format!("{path} is not there"))?;
+    if !md.is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    if md.len() > CAP {
+        return Err(format!("{path} is {} bytes, more than this reader returns", md.len()));
+    }
+    let text = std::fs::read_to_string(&full)
+        .map_err(|e| format!("{path} is not readable as text: {e}"))?;
+    Ok(serde_json::json!({ "path": path, "bytes": md.len(), "text": text }))
+}
+
+/// Write one workspace file's bytes, for the harness only.
+///
+/// The checkpoint claims that matter are the ones where a person changed a file after the turn:
+/// the app has to notice and leave it alone. There is no other way to make that state without
+/// spending a model turn to do it, and a turn would add checkpoints of its own to the very
+/// scope being measured. Confined to the folder, like every other file path in this app.
+#[tauri::command]
+pub fn selftest_write_file(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    text: String,
+) -> Result<serde_json::Value, String> {
+    let ws = state.host.state().workspace;
+    let full = cwoffee_engine::tools::path::confine(std::path::Path::new(&ws), &path)
+        .map_err(|e| e.to_string())?;
+    std::fs::write(&full, text.as_bytes()).map_err(|e| format!("could not write {path}: {e}"))?;
+    Ok(serde_json::json!({ "path": path, "bytes": text.len() }))
 }
 
 /// A paste of an image that lives only in the system clipboard.

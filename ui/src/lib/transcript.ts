@@ -185,6 +185,10 @@ const iconDoc = () =>
   svgIcon(['M3.6 2.6h6l2.8 2.8v8H3.6z', 'M9.6 2.6v2.8h2.8', 'M8 8.2v4', 'M6.2 10.4 8 12.2l1.8-1.8'])
 const iconBranch = () =>
   svgIcon(['M5 3.6v7.2', 'M5 12.4a1.4 1.4 0 1 0 0 .1', 'M5 3.5a1.4 1.4 0 1 0 0 .1', 'M11.4 5.6a1.4 1.4 0 1 0 0 .1', 'M11.4 6.9c0 2.4-2.6 2.6-4.4 3.6'])
+// An arrow curving back to where it came from: undo, and specific enough about direction that it
+// does not read as a generic refresh next to it.
+const iconUndo = () =>
+  svgIcon(['M3.4 6.4h7.2a4 4 0 1 1-4 4', 'M3.4 6.4l2.4-2.4', 'M3.4 6.4l2.4 2.4'])
 // A pencil with a short nick in the tip: it writes, and it is small enough to sit next to "Copy".
 const iconPencil = () =>
   svgIcon(['M11.6 3.1 12.9 4.4 5.9 11.4 3.6 12.4l1-2.3z', 'M10.4 4.3l1.3 1.3'])
@@ -239,6 +243,38 @@ export interface MessageBranch {
    */
   role: 'user' | 'assistant'
   shown: string
+}
+
+/** One file a revert would put back, as the engine computed it from its own copies. */
+export interface RevertItem {
+  path: string
+  /** `created` | `modified` | `deleted` — what the turn did, which is what undoing it means. */
+  kind: string
+  /** The verb for this path: "put back", "delete", and why. */
+  action: string
+  bytes: number
+  /** Someone changed this file since that turn. Reverting it would overwrite their work. */
+  edited_since: boolean
+  /** The copy is gone (pruned, or the conversation's folder moved). */
+  copy_missing: boolean
+  /** The file itself is no longer there. */
+  path_missing: boolean
+}
+
+/** The scope a revert would act on, listed before anything is touched. */
+export interface RevertPreview {
+  session: number
+  message_id: number
+  turn: number
+  scope: string
+  workspace: string
+  items: RevertItem[]
+  edited_since: number
+  missing_copy: number
+  /** Copies this conversation lost to the size cap. Non-zero means the list is what survived, not
+   *  everything the conversation ever changed — the note says so, and the card shows the number. */
+  pruned: number
+  note: string
 }
 
 export interface MessageEdit {
@@ -542,6 +578,21 @@ export class Transcript {
   onMessageEdit: ((edit: MessageEdit) => Promise<string>) | null = null
   /** Opens a second path out of one message and returns the sentence the host answered with. */
   onMessageBranch: ((branch: MessageBranch) => Promise<string>) | null = null
+  /** Ask the engine what undoing this turn's files would do. Nothing is touched by this call. */
+  onRevertPreview:
+    | ((session: number, id: number, throughLatest: boolean) => Promise<RevertPreview>)
+    | null = null
+  /** Do it. `shown` is the path list the card painted, repeated back so the engine can refuse a
+   *  scope that moved while the person was reading it. */
+  onRevert:
+    | ((
+        session: number,
+        id: number,
+        throughLatest: boolean,
+        shown: string[],
+        overwriteEdited: boolean,
+      ) => Promise<string>)
+    | null = null
   /**
    * The reader pressed an attachment chip in their own message.
    *
@@ -3667,7 +3718,150 @@ export class Transcript {
     )
     if (rowId === null) branch.disabled = true
     branch.onclick = () => this.requestBranch(this.sessionId, rowId, 'assistant', answerText, branch)
+
+    // Files are the one thing an answer can do that cannot be taken back by deleting the
+    // message: the turn wrote into the folder, and the folder is not the transcript. So this
+    // control is about the folder, and it opens a card naming every path before it acts.
+    const undo = btn(
+      'revert',
+      'Undo files',
+      rowId === null
+        ? 'Undo this turn\'s files once it is stored - a moment after the turn ends'
+        : 'Put the files this turn changed back to how they were before it. The messages stay.',
+      iconUndo(),
+    )
+    if (rowId === null) undo.disabled = true
+    undo.onclick = () => this.openRevertCard(rowId, row)
     return row
+  }
+
+  /**
+   * The confirmation a revert needs, built from the engine's own preview.
+   *
+   * Two scopes, because "undo this answer" and "get my folder back to how it was before this
+   * message" are different wishes and the second one sweeps later turns with it. Both are listed
+   * before anything moves, and the path list on screen is sent back with the request: if the
+   * engine's rows no longer match what the person read, it refuses rather than reverting a scope
+   * nobody was shown.
+   */
+  private openRevertCard(rowId: number | null, actions: HTMLElement) {
+    if (!this.onRevertPreview || !this.onRevert) {
+      this.onToast?.('undoing files is not available on this connection', true)
+      return
+    }
+    if (rowId === null) {
+      this.onToast?.('this turn is not stored yet - undo it once it has landed', true)
+      return
+    }
+    const session = this.sessionId
+    // Attached to the turn's own action row, not to a live turn element: these buttons are also
+    // painted for rows loaded from the record, where there is no turn being written. Asking a
+    // live turn for a home is how a card that was opened vanished without a trace.
+    const turn = actions.closest('.turn') as HTMLElement | null
+    const old = turn?.querySelector('.revert-card')
+    if (old) old.remove()
+
+    const card = this.el('revert-card')
+    card.dataset.row = String(rowId)
+    const head = this.el('revert-h', 'Undo file changes')
+    const scopeRow = this.el('revert-scopes')
+    const only = this.btn('revert-scope', 'This turn only')
+    const thru = this.btn('revert-scope', 'This turn and after')
+    scopeRow.append(only, thru)
+    const list = this.el('revert-list')
+    const note = this.el('revert-note')
+    const acts = this.el('revert-acts')
+    const go = this.btn('revert-go', 'Revert')
+    const cancel = this.btn('revert-cancel', 'Cancel')
+    acts.append(go, cancel)
+    card.append(head, scopeRow, list, note, acts)
+
+    let throughLatest = false
+    let preview: RevertPreview | null = null
+
+    const paint = () => {
+      only.dataset.on = throughLatest ? '' : '1'
+      thru.dataset.on = throughLatest ? '1' : ''
+      if (!preview) return
+      list.textContent = ''
+      for (const it of preview.items) {
+        const li = this.el('revert-item')
+        li.dataset.kind = it.kind
+        li.append(this.el('revert-path', it.path))
+        li.append(this.el('revert-verb', it.action))
+        if (it.edited_since) li.append(this.el('revert-flag', 'edited since'))
+        if (it.copy_missing) li.append(this.el('revert-flag', 'no copy left'))
+        if (it.path_missing) li.append(this.el('revert-flag', 'file is gone'))
+        list.append(li)
+      }
+      note.textContent = preview.note
+      // A conversation that hit the size cap has lost copies, and a list that reads as the whole
+      // history of a folder is a claim about the folder. This is its own line rather than a flag on a
+      // path, because it is about the conversation, not about one file.
+      const gone = card.querySelector('.revert-prune')
+      if (gone) gone.remove()
+      if (preview.pruned > 0) {
+        note.append(this.el('revert-prune',
+          `${preview.pruned} older cop${preview.pruned === 1 ? 'y' : 'ies'} of this conversation `
+          + 'were discarded to stay under the size limit.'))
+      }
+      // The choice that would overwrite someone's later work has to be its own button, and
+      // it only exists when there is something to overwrite. A tick box on a card that never
+      // needs it teaches people to tick boxes.
+      go.textContent = preview.edited_since > 0 ? 'Revert anyway' : 'Revert'
+      go.dataset.warn = preview.edited_since > 0 ? '1' : ''
+      go.disabled = preview.items.length === 0
+    }
+
+    const ask = () => {
+      go.disabled = true
+      return this.onRevertPreview!(session, rowId!, throughLatest)
+        .then((p) => {
+          preview = p
+          paint()
+        })
+        .catch((e) => {
+          note.textContent = String(e)
+          go.disabled = true
+        })
+    }
+
+    only.onclick = () => {
+      if (throughLatest === false) return
+      throughLatest = false
+      ask()
+    }
+    thru.onclick = () => {
+      if (throughLatest === true) return
+      throughLatest = true
+      ask()
+    }
+    cancel.onclick = () => card.remove()
+    go.onclick = () => {
+      if (!preview || go.dataset.busy) return
+      // Repeat what was painted, in the order it was painted. The engine compares this list
+      // with its own rows before it writes anything.
+      const shown = preview.items.map((i) => i.path)
+      const overwrite = preview.edited_since > 0
+      go.dataset.busy = '1'
+      go.disabled = true
+      void this.onRevert!(session, rowId!, throughLatest, shown, overwrite)
+        .then((msg) => {
+          if (msg && this.onToast) this.onToast(msg)
+          card.remove()
+        })
+        .catch((e) => {
+          // A refusal leaves the card up with the reason in it: the person can read the new
+          // scope and decide, instead of being told "failed" and left with nothing.
+          note.textContent = String(e)
+          delete go.dataset.busy
+          go.disabled = false
+        })
+    }
+
+    actions.after(card)
+    this.follow('text')
+    void ask()
   }
 
   /** Live turns get their actions at turn end, from the text we streamed. */

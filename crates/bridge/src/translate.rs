@@ -61,6 +61,9 @@ pub struct Output {
     /// reports the result — so the stamps are applied after the append, which is what
     /// the Rust core does with the same store verb.
     pub files_by_call: Vec<(String, Vec<cwoffee_engine::tools::OutputFile>)>,
+    /// What each call copied before it overwrote, keyed by tool-call id. Indexed into
+    /// `checkpoints` by the host, which owns the turn number the row needs.
+    pub checkpoints_by_call: Vec<(String, Vec<cwoffee_engine::checkpoint::Mark>)>,
     /// True when this record began a compaction, so the host can count them.
     pub compaction_start: bool,
     /// Context size as of the last assistant message, in tokens: input + cached,
@@ -217,6 +220,15 @@ impl Translator {
         }
     }
 
+    /// The turn the translator is running, for the host to index checkpoints against.
+    ///
+    /// Read rather than passed in: the translator numbers turns (pi does not hand cwoffee
+    /// a turn id), and the bridge owns the store rows that need one. Same accessor the
+    /// Rust core's `Agent::turn()` exists for.
+    pub fn turn(&self) -> u64 {
+        self.turn_id
+    }
+
     pub fn on_record(&mut self, rec: &Value, now: Instant) -> Output {
         let kind = rec.get("type").and_then(|t| t.as_str()).unwrap_or("?").to_string();
         let mut out = Output::default();
@@ -241,8 +253,11 @@ impl Translator {
                 }
             }
             "tool_execution_end" => {
-                let (ev, (call, files)) = tool_end(self.turn_id, rec);
+                let (ev, (call, files, marks)) = tool_end(self.turn_id, rec);
                 out.events.extend(ev);
+                if !marks.is_empty() {
+                    out.checkpoints_by_call.push((call.clone(), marks));
+                }
                 if let Some(r) = self.run.as_mut() {
                     // A tool's own runtime is not the model typing, and pi reports
                     // the result once, at the end, so this is the boundary: anchor
@@ -758,13 +773,24 @@ impl Translator {
 ///     shows the text: the transcript would disagree with itself.
 ///   * the file changes, for the card's `+N -M`.
 ///   * the files the tool produced in the workspace, which the host stamps onto the row.
-fn tool_end(turn_id: u64, rec: &Value) -> (Vec<EngineEvent>, (String, Vec<cwoffee_engine::tools::OutputFile>)) {
+fn tool_end(
+    turn_id: u64,
+    rec: &Value,
+) -> (
+    Vec<EngineEvent>,
+    (
+        String,
+        Vec<cwoffee_engine::tools::OutputFile>,
+        Vec<cwoffee_engine::checkpoint::Mark>,
+    ),
+) {
     let _ = &turn_id;
     let mut ev = Vec::new();
     let id = rec.get("toolCallId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let is_err = rec.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut changes: Vec<FileChange> = Vec::new();
     let mut files: Vec<cwoffee_engine::tools::OutputFile> = Vec::new();
+    let mut checkpoints: Vec<cwoffee_engine::checkpoint::Mark> = Vec::new();
     if let Some(txt) = result_text(rec) {
         if let Some(v) = envelope_in(rec, &txt) {
             if let Some(c) = v.get("changes").and_then(|c| serde_json::from_value::<Vec<FileChange>>(c.clone()).ok()) {
@@ -772,6 +798,13 @@ fn tool_end(turn_id: u64, rec: &Value) -> (Vec<EngineEvent>, (String, Vec<cwoffe
             }
             if let Some(f) = v.get("files").and_then(|f| serde_json::from_value::<Vec<cwoffee_engine::tools::OutputFile>>(f.clone()).ok()) {
                 files = f;
+            }
+            // The copies `cwtool` took. They travel the same way `changes` does — in the
+            // envelope the Rust tool emitted, handed over as text by the extension — and
+            // the bridge, not the translation, writes the index rows, because a row needs
+            // the turn number this translator does not own.
+            if let Some(k) = v.get("checkpoints").and_then(|c| serde_json::from_value::<Vec<cwoffee_engine::checkpoint::Mark>>(c.clone()).ok()) {
+                checkpoints = k;
             }
         }
     }
@@ -795,11 +828,17 @@ fn tool_end(turn_id: u64, rec: &Value) -> (Vec<EngineEvent>, (String, Vec<cwoffe
             });
         }
     }
-    ev.push(EngineEvent::ToolExecEnd { id: id.clone(), ok: !is_err, exit_code: None, changes });
+    ev.push(EngineEvent::ToolExecEnd {
+        id: id.clone(),
+        ok: !is_err,
+        exit_code: None,
+        changes,
+        checkpoints: checkpoints.clone(),
+    });
     if !files.is_empty() {
         ev.push(EngineEvent::TurnFiles { turn_id, files: files.clone() });
     }
-    (ev, (id, files))
+    (ev, (id, files, checkpoints))
 }
 
 /// Our tools answer with a JSON envelope; pi hands it over as text. Parse it once,
