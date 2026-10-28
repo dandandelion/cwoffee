@@ -47,6 +47,15 @@
   let busy = $state(false)
   let model = $state('')
   let draft = $state('')
+  /**
+   * Whether this turn has already been told "Enter does not send while cwoffee is answering".
+   *
+   * The composer stopped being `disabled` mid-turn — see `onKey` — so a press of Enter during a
+   * turn is now a keystroke that changes nothing. Silent is the failure the user just reported
+   * about typing, so the first press says once why nothing happened, and later presses in the
+   * same turn stay quiet rather than filling the notices strip.
+   */
+  let busyEnterTold = $state(false)
   let mode = $state<'ask' | 'session' | 'auto'>('ask')
   let thinking = $state<ReasoningLevel>('xhigh')
   /** What the settings screen says a *new* conversation starts at. `thinking` is what this
@@ -2867,6 +2876,7 @@
           runningSessions = next
         }
         busy = true
+        busyEnterTold = false
         if (edgeWatch && !edgeWatch.turnStart) edgeWatch.turnStart = performance.now()
         turnStartTs = performance.now()
         turnMs = 0
@@ -4068,7 +4078,8 @@
     // That trust has to expire, because `turnOurs` outlives the turn it describes
     // whenever the `turnEnd` event never arrives. A phone that backgrounds its tab
     // mid-turn is frozen by the OS; the socket dies with it and the event is gone for
-    // good. `busy` then stays true forever, `disabled={busy}` keeps the composer dead,
+    // good. `busy` then stays true forever, and the composer keeps announcing a turn that
+    // is not running,
     // and reloading the page is the only way out — which is exactly what was reported:
     // "on the phone I can't interact with any input, especially the composer; I always
     // have to refresh. The trigger seems to be minimising the browser and coming back."
@@ -7193,7 +7204,8 @@
       // is typeable — "I can't interact with any input, especially the composer, and I
       // always have to refresh."
       //
-      // The composer is `disabled={busy}`, and `busy` was stuck true: the `turnEnd` that
+      // The composer announces a turn with `data-busy` while `busy` is true, and `busy` was
+      // stuck true: the `turnEnd` that
       // would clear it was delivered to a frozen page and is gone, and `turnOurs` made
       // every later read of host state get thrown away before it could correct anything.
       // The harness cannot background a webview, so the *state* a background leaves
@@ -14756,6 +14768,194 @@
       }
 
 
+      // --- typing in the composer, during a turn and after it -----------------
+      //
+      // The report: "Turn ended and I can type in the composer but the contents I'm typing is
+      // not showing up in the composer (tho I know they're typed since the send button unlocks
+      // and when I click it, the content actually gets sent)."
+      //
+      // That is a form control whose *text* stopped being drawn while its value kept working —
+      // and the only state the composer changed around that moment was `disabled` going true for
+      // the turn and false when it ended. This WebKitGTK repaints a control's text late after it
+      // is re-enabled, so the words were in the box, in `draft`, and in the message that got
+      // sent, and none of it reached the screen. The fix is to stop putting the control in that
+      // state: the composer stays typeable during a turn and refuses the *send*, which is the
+      // thing actually unsafe mid-turn. These claims therefore grade the state that caused it
+      // (no disabled attribute at any point), the words reaching DOM and state together, and the
+      // words finally reaching the record — not a picture, which this machine cannot produce.
+      if (want('composer-type', 'what you type is in the box while you type it, during a turn and after')) {
+        const ta = () => document.querySelector<HTMLTextAreaElement>('textarea.composer')
+        const t0 = ta()
+        if (!t0) fail('there is no composer textarea to type into')
+        else if (t0.disabled)
+          fail(
+            'the composer is a disabled control before anything ran; a control that gets re-enabled ' +
+              'is the one this engine paints late, which is how typed text goes invisible',
+          )
+        else {
+          let okLine = ''
+          // Typed one character at a time, with the input event a real key produces: a check that
+          // assigns `value` once would not notice a handler that overwrites the box mid-word.
+          const typeIn = async (text: string) => {
+            const el = ta()
+            if (!el) return false
+            for (const ch of text) {
+              el.value += ch
+              el.dispatchEvent(new InputEvent('input', { bubbles: true }))
+              await new Promise((r) => setTimeout(r, 30))
+            }
+            return true
+          }
+          const agree = (label: string) => {
+            const el = ta()
+            if (!el) return fail(`${label}: no composer`)
+            if (el.disabled)
+              return fail(`${label}: the composer went disabled, the state that hides typed text`)
+            if (el.value !== draft)
+              return fail(
+                `${label}: the box holds ${JSON.stringify(el.value.slice(0, 30))} and the app holds ` +
+                  `${JSON.stringify(draft.slice(0, 30))} — one of them is lying, and the screen shows the box`,
+              )
+            return null
+          }
+          const pressEnter = () => {
+            ta()?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+          }
+          const toastText = () => document.querySelector('.toast')?.textContent?.trim() ?? ''
+          // How many frames this page is actually being given while measuring. An occluded
+          // window gets none, and then only geometry is being read — the ok line says so rather
+          // than claiming a painted result.
+          const paintFrames = async (ms: number) => {
+            let n = 0
+            const dl = performance.now() + ms
+            await new Promise<void>((res) => {
+              const tick = () => {
+                n += 1
+                if (performance.now() < dl) requestAnimationFrame(tick)
+                else res()
+              }
+              requestAnimationFrame(tick)
+            })
+            return n
+          }
+
+          draft = ''
+          t0.focus()
+          // Words taller than the box must make the box scroll. If the control laid them out, the
+          // text is in it — the closest witness to "drawn" available without a screenshot.
+          const tall = 'one\ntwo\nthree\nfour\nfive\nsix'
+          await typeIn(tall)
+          agree('before any turn')
+          // Read once, into the variables the ok line quotes. Sampling the box again later — when
+          // it is empty again — and quoting *that* in the ok line would print a number that
+          // contradicts the claim above it.
+          const tallScroll = ta()?.scrollHeight ?? 0
+          const tallClient = ta()?.clientHeight ?? 0
+          if (tallScroll <= tallClient)
+            fail(
+              `six lines typed into the composer left it ${tallScroll}px of ${tallClient}px ` +
+                '— the control never laid the words out, so nothing could draw them',
+            )
+          draft = ''
+
+          // A turn long enough to still be running at the moment Enter is pressed. The mock's
+          // counting scenario streams for ~4s; a 1.4s turn would have finished during the typing
+          // loop, and the mid-turn claims below would then be grading an idle host.
+          const ask = 'Selftest checkpoint: count slowly'
+          const turnsBefore = await turnCount()
+          newSession()
+          draft = ask
+          await send()
+          const sid = viewId ?? transcript?.sessionId ?? 0
+          await new Promise((r) => setTimeout(r, 800))
+          // Mid-turn: typing is allowed, and the box says it is mid-turn instead of going dead.
+          const mid = ta()
+          if (mid?.disabled) fail('the composer went disabled during the turn — typed text is invisible from there')
+          if (mid?.dataset.busy !== '1')
+            fail(`during the turn the composer announces ${JSON.stringify(mid?.dataset.busy ?? '')} instead of busy`)
+          // The copy is the affordance now. A box that is typeable but silent about the turn is a
+          // box whose Enter appears broken.
+          if (!/answering/i.test(mid?.placeholder ?? ''))
+            fail(
+              `during the turn the placeholder reads ${JSON.stringify(mid?.placeholder ?? '')} — it does not ` +
+                'say the turn is running, so Enter that refuses looks like a lost key',
+            )
+          const sendable = 'What is 6 times 7?'
+          await typeIn(sendable)
+          agree('typed while cwoffee was answering')
+          if (draft !== sendable) fail(`the words typed mid-turn became ${JSON.stringify(draft.slice(0, 30))}`)
+
+          // Enter mid-turn must not send, and must not swallow the words silently either.
+          // Measured against a turn that is verifiably still running: a refusal sampled after the
+          // turn settled is a claim about an idle composer, which is the mistake this group made
+          // on its first run (the short scenario finished during the typing loop).
+          if (!busy)
+            return fail(
+              'the turn had already ended by the time Enter was pressed — the mid-turn refusal was ' +
+                'measured against an idle composer, not a turn in flight',
+            )
+          const toastWas = toastText()
+          pressEnter()
+          await new Promise((r) => setTimeout(r, 250))
+          if ((await turnCount()) !== turnsBefore)
+            fail('Enter sent a message while cwoffee was still answering')
+          if (draft !== sendable)
+            fail(`Enter during a turn took the words away: draft is ${JSON.stringify(draft.slice(0, 30))}`)
+          if (toastText() === toastWas)
+            fail('Enter during a turn did nothing and said nothing — that reads as a lost keystroke')
+          if (!/kept|answering/i.test(toastText()))
+            fail(`Enter during a turn explained itself as ${JSON.stringify(toastText().slice(0, 80))}`)
+
+          if (!(await waitTurnDone(turnsBefore))) fail('the first turn never ended')
+
+          // The moment the user described: the turn is over, the composer is live, and the words
+          // they typed during it are still there and still the words the box shows.
+          const after = ta()
+          if (!after) fail('the composer left the document when the turn ended')
+          else {
+            if (after.disabled) fail('the composer is disabled after the turn — it never should have been')
+            if (after.dataset.busy === '1') fail('the composer still announces a turn that has ended')
+            if (!/Ask something/.test(after.placeholder ?? ''))
+              fail(`after the turn the placeholder still reads ${JSON.stringify(after.placeholder ?? '')}`)
+            if (after.value !== sendable)
+              fail(
+                `the words typed during the turn are gone from the box at its end: ${JSON.stringify(after.value.slice(0, 30))}`,
+              )
+            agree('at the end of the turn')
+            // Keep typing after the end — this is the exact gesture the report describes.
+            await typeIn(' — answer in one line')
+            agree('typed after the turn ended')
+            const go = document.querySelector<HTMLButtonElement>('.cbtn.go')
+            if (go?.disabled) fail('the send button stayed disabled after the turn ended')
+            pressEnter()
+            const sent = await waitFor('the typed words to become a turn', () => draft === '' , 10000)
+            if (!sent) fail('Enter after the turn did not send what was typed into the box')
+            if (!(await waitTurnDone(turnsBefore + 1))) fail('the turn from the typed words never finished')
+            const page = await invoke<{ messages: StoredMessage[] }>('session_messages', { id: sid, limit: 20 })
+              .catch(() => null)
+            const mine = (page?.messages ?? []).filter((m) => m.role === 'user').map((m) => m.content)
+            const wanted = sendable + ' — answer in one line'
+            if (!mine.includes(wanted))
+              fail(
+                `the words typed into the box never reached the record: rows are ${JSON.stringify(mine.slice(-2))} ` +
+                  `and the composer held ${JSON.stringify(wanted)}`,
+              )
+            // Paint is honestly unmeasured here: screenshots are refused by this session's
+            // compositor. What is graded is that the control is never in the state that mis-paints,
+            // that DOM and state agree every keystroke, and that the words reach the record.
+            const frames = await paintFrames(180)
+            const blind = frames === 0 ? ' (no frames painted while measuring — geometry only)' : ''
+            okLine =
+              `composer typing ok: the box is never a disabled control, six lines grew it to ` +
+              `${tallScroll}px of ${tallClient}px, words typed mid-turn stayed in the box and ` +
+              `in the app, Enter mid-turn sent nothing and said why once, and the words typed after the turn ` +
+              `are the words the record holds${blind}`
+          }
+          draft = ''
+          if (okLine) pageLog(okLine)
+        }
+      }
+
       // --- a picture pasted off the desktop, sent, and seen at all three places --
       //
       // "Pasting an image into the composer seems like the file is attached, but when you send,
@@ -18009,8 +18209,8 @@
       // turnStart and then lost or fell behind the event stream never sees the
       // turnEnd, and the composer stays disabled with nothing computing. That
       // reads as a frozen app, and it is invisible until someone tries to type.
-      if (hostState && !hostState.busy && composerEl?.disabled)
-        fail('composer is disabled while the host says no turn is running')
+      if (hostState && !hostState.busy && composerEl?.dataset.busy === '1')
+        fail('the composer still says it is mid-turn while the host says no turn is running')
       }
 
       await sweepSelftest('end', idFloor)
@@ -18596,6 +18796,26 @@
   function onKey(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
+      // The composer used to carry `disabled={busy}`. That is what made a turn end look like a
+      // broken keyboard: this WebKitGTK repaints a form control's *text* late after it goes from
+      // disabled back to enabled, so the words you typed were in the box and in `draft` — the
+      // send button unlocked and the text arrived — while nothing was drawn. A control that never
+      // enters the disabled state cannot be re-painted wrong.
+      //
+      // Typing during a turn is also what people want: the answer is reading while they compose
+      // the next question. What stays refused is sending mid-turn, and the refusal is said out
+      // loud once, because Enter that does nothing and Enter that lost your keystroke look the
+      // same from the chair.
+      if (busy) {
+        if (!busyEnterTold) {
+          busyEnterTold = true
+          toast = {
+            text: 'Cwoffee is answering. Your words are kept — send them when it finishes.',
+            bad: false,
+          }
+        }
+        return
+      }
       void send()
     }
   }
@@ -19323,14 +19543,23 @@
                 {#if attachWarn}<span class="att-warn">{attachWarn}</span>{/if}
               </div>
             {/if}
+            <!-- The composer is never `disabled`. That attribute is what made a finished turn look
+                 like a broken keyboard: this WebKitGTK repaints a form control's text late after it
+                 is re-enabled, so typed words sat in the box and in `draft` and never got drawn. It
+                 is also the witness the stale-`busy` checks read, so `data-busy` carries that fact
+                 instead — an attribute cannot put the control into that paint state. The mid-turn
+                 guidance lives in the placeholder, which is readable exactly when the box is empty;
+                 one sentence in one place, because a copy in a `title` would drift. -->
             <textarea
               class="composer"
               bind:this={composerEl}
               rows="3"
-              placeholder="Ask something. Enter to send, Shift+Enter for a newline."
+              placeholder={busy
+                ? 'Cwoffee is answering — keep typing, and Enter sends when it finishes.'
+                : 'Ask something. Enter to send, Shift+Enter for a newline.'}
               bind:value={draft}
               onkeydown={onKey}
-              disabled={busy}
+              data-busy={busy ? '1' : '0'}
             ></textarea>
 
             <div class="crow">

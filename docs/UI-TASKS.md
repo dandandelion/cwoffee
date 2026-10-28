@@ -2278,3 +2278,71 @@ Falsified, each red then restored:
 `npx svelte-check`: 0 errors, 0 warnings. `node scripts/wire-names.mjs`: OK — `mcp_status` and
 `tool_inventory` graded on both hosts. Scenarios: 51.
 
+## Batch eleven — the turn ended, and the words you typed were not drawn
+
+The report, kept as said: "Turn ended and I can type in the composer but the contents I'm typing is
+not showing up in the composer (tho I know they're typed since the send button unlocks and when I
+click it, the content actually gets sent)."
+
+The composer carried `disabled={busy}`. That is the whole story: this WebKitGTK repaints a form
+control's **text** late after it goes from disabled back to enabled, so at the moment the user typed,
+the control had just been re-enabled by the turn's end. Their words were in the box's `value`, in
+`draft` — which is why the send button unlocked — and in the message that got sent. None of it
+reached the screen. A diagnostic run said exactly that: `value="hello there" draft="hello there"`,
+`color=rgb(43, 42, 39)`, `op=1`, nothing painted over it (`elementFromPoint` returned the textarea at
+the text line), one textarea in the document, no animations on it. The DOM was telling the truth and
+the pixels were not.
+
+So the fix removes the state instead of papering over its symptom:
+
+* **The composer is never `disabled`.** Typing during a turn is allowed — that is what people want
+  anyway, composing the next question while the answer reads. What stays refused is *sending*
+  mid-turn, which is the thing actually unsafe while the engine is working, and `send()` already
+  guards it independently of the key handler.
+* **`data-busy` carries the fact `disabled` used to carry.** Two checks read `composerEl.disabled` as
+  their witness that this client believes a turn is running while the host says it is not — the
+  stale-`busy` case where a `turnEnd` was lost and the app looks frozen. An attribute says the same
+  thing and cannot put the control into the mis-painting state.
+* **Enter during a turn says so, once.** Refusing silently is the same class of fault as drawing
+  nothing: from the chair, "Enter did nothing" and "Enter lost my keystroke" are the same
+  experience. The first press shows a note — *your words are kept, send them when it finishes* — and
+  later presses in that turn stay quiet.
+* **The placeholder carries the guidance.** The empty box is exactly when the sentence is readable,
+  so it replaced the `disabled` styling as the affordance and there is one copy of the sentence, not
+  a second drifting in a `title`.
+
+Lessons:
+
+* **A control's paint state is behaviour, not cosmetics.** `disabled` was chosen for correctness
+  ("you cannot send while it is answering") and bought a rendering bug on this engine at every turn
+  boundary. Express the refusal at the action, and leave the widget in one state.
+* **A witness attribute has to survive the fix.** Removing `disabled` would have silently deleted two
+  stale-state claims; they were retargeted to `data-busy` in the same change, so "the composer
+  announces a turn that is not running" is still gradeable.
+* **The comment that names a removed attribute is a lie on delivery.** Two comments in `App.svelte`
+  explained behavior through `disabled={busy}`; they were rewritten to describe `data-busy` rather
+  than left explaining a control that no longer exists.
+* **Grade the mid-turn claim against a turn that is verifiably running.** The group's first run used
+  a 1.4s mock scenario, the turn finished during the typing loop, and four "mid-turn" failures fired
+  against an idle composer — a correct product, measured at the wrong moment. It now uses the ~4s
+  counting scenario and refuses outright if `busy` has already cleared.
+* **Quote the number you measured.** The ok line first printed the box's height sampled *after* the
+  draft was cleared, so it read "six lines grew it to 85px of 85px" — a receipt contradicting its own
+  claim. The tall measurement is captured into locals and those are what it prints: `150px of 85px`.
+* **Paint is honestly out of reach here.** This session refuses screenshots, so the group grades what
+  is observable: the control is never in the mis-painting state, DOM and state agree on every
+  keystroke, six lines make the box scroll (`scrollHeight > clientHeight`, i.e. the text was laid
+  out), and the typed words reach the record. The ok line says so and marks a run blind when the page
+  was given no frames at all.
+
+Falsified: putting `disabled={busy}` back fails as `the composer went disabled during the turn —
+typed text is invisible from there`, and deleting the Enter guard fails as `Enter during a turn did
+nothing and said nothing — that reads as a lost keystroke`. Both restored, and the group is green on
+both cores:
+
+```text
+composer typing ok: the box is never a disabled control, six lines grew it to 150px of 85px, words
+typed mid-turn stayed in the box and in the app, Enter mid-turn sent nothing and said why once, and
+the words typed after the turn are the words the record holds
+```
+

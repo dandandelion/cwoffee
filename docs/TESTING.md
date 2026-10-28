@@ -960,3 +960,39 @@ be pointed outside the conversation's folder, and it never takes the app's word 
   rather than borrowing the suite's scratch session, because that row is deleted and re-created by the
   setup — an earlier version got `useSession(3): the host is still on 0` and then graded a turn that
   never started.
+
+### Typing in the composer: what a suite without pixels can honestly claim
+
+The report was that after a turn ended, typed characters did not appear in the composer while the
+send button still unlocked and the text still sent — words present in the control and in state,
+absent from the screen. `composer-type` grades the state that caused it and everything a page-side
+check can reach, and says what it cannot reach:
+
+- **The control must never enter the state that mis-paints.** `disabled` is gone from the composer;
+  the claim is that no point in the turn finds it disabled, before the turn, during it, and after it.
+  Putting `disabled={busy}` back fails as `the composer went disabled during the turn — typed text is
+  invisible from there`. A claim about a paint bug has to be a claim about the *condition*, because
+  the pixels are not observable here.
+- **DOM and state must agree every keystroke.** Typing is one character at a time with the `input`
+  event a real key produces — assigning `value` once would miss a handler that overwrites the box
+  mid-word — and each step compares `textarea.value` with `draft`. A split is the failure a user
+  describes as "I typed it and nothing happened": `the box holds "abc" and the app holds "" — one of
+  them is lying, and the screen shows the box`.
+- **Layout growth is the closest witness to "drawn".** Six lines must make the box scroll
+  (`scrollHeight > clientHeight`; the passing run reports `150px of 85px`). If the control never laid
+  the words out, nothing could draw them. The numbers are captured at the moment of measurement: an
+  earlier version sampled the emptied box afterwards and printed `85px of 85px` under a claim about
+  six lines.
+- **Mid-turn claims need a turn that is verifiably running.** `busy` is asserted before Enter is
+  pressed, and the group refuses outright if it has already cleared: the first run used a 1.4s
+  scenario, the turn ended during the typing loop, and four mid-turn failures fired against an idle
+  composer.
+- **Enter mid-turn refuses and explains itself.** No turn count change, the words still in `draft`,
+  and a note that says they are kept — `Enter during a turn did nothing and said nothing — that reads
+  as a lost keystroke` is what a silent refusal fails as.
+- **The typed words reach the record.** After the turn the same box is typed into again, Enter sends,
+  and `session_messages` is read: the row must hold exactly the composed text. The card of a send is
+  not evidence; the row is.
+- **Blind is said, not skipped.** A frame clock is run alongside the measurements; when the page was
+  given no frames, the ok line marks the run geometry-only rather than implying it saw the screen.
+
