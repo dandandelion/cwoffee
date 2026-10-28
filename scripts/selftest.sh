@@ -39,6 +39,10 @@ MOCK_PORT=${MOCK_PORT:-8190}
 GW_PORT=${GW_PORT:-8199}
 SPEED=1
 NO_BUILD=0
+# `--no-mcp` starts no third-party server. The `mcp` group needs both halves of its claim — a
+# live server and a dead one — so turning this off is for debugging runs that have nothing to do
+# with MCP, not for a cheaper green.
+NO_MCP=0
 KEEP=0
 REAL=""
 ONLY=""
@@ -46,6 +50,7 @@ LIST=0
 for a in "$@"; do
   case "$a" in
     --no-build) NO_BUILD=1 ;;
+    --no-mcp) NO_MCP=1 ;;
     --keep) KEEP=1 ;;
     --speed) : ;;
     --speed=*) SPEED=${a#--speed=} ;;
@@ -171,6 +176,23 @@ if [ -z "$REAL" ]; then
   export XDG_STATE_HOME="$SCRATCH/state"
   export CWOFFEE_PI_AGENT_DIR="$SCRATCH/pi"
   export CWOFFEE_WORKSPACE="$SCRATCH/ws"
+  # A third-party MCP server for the `mcp` group, and it is deliberately *this* run's own:
+  # scripts/fake-mcp-server.mjs is cwoffee's test double, and `--writes` points at the scratch
+  # workspace so a group can read the file the server wrote off disk instead of trusting a card.
+  # `dead` is the second one: it answers tools/list and exits, so the catalog is real and the
+  # *call* is what fails — which is the state a real server reaches when it crashes later.
+  # Env rather than the config file because the suite must not write a config to get a server,
+  # and because the settings walk saves config several times and would drop an [mcp] block it
+  # did not write. With no CWOFFEE_MCP_SERVERS the app starts no servers, so nothing outside
+  # this scratch run can inherit them.
+  if [ "$NO_MCP" = 0 ]; then
+    export CWOFFEE_MCP_SERVERS=$(python3 -c "
+import json, os
+print(json.dumps({
+    'fake': {'command': 'node', 'args': ['$ROOT/scripts/fake-mcp-server.mjs', '--tools', '3', '--writes', '$SCRATCH/ws'], 'enabled': True},
+    'dead': {'command': 'node', 'args': ['$ROOT/scripts/fake-mcp-server.mjs', '--tools', '2', '--die'], 'enabled': True},
+}))")
+  fi
   TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 else
   SCRATCH=""
@@ -187,6 +209,11 @@ export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
 export __GLX_VENDOR_LIBRARY_NAME=mesa
 
 note "endpoint   : $ENDPOINT"
+if [ "$NO_MCP" = 0 ]; then
+  note "mcp servers: fake (live, writes into $SCRATCH/ws) + dead (answers the list, then exits)"
+else
+  note "mcp servers: none (--no-mcp; the mcp group grades the honest no-server path only)"
+fi
 note "config dir : ${XDG_CONFIG_HOME:-$HOME/.config}"
 note "data dir   : ${XDG_DATA_HOME:-$HOME/.local/share}"
 note "state dir  : ${XDG_STATE_HOME:-$HOME/.local/share}"

@@ -328,8 +328,7 @@ impl Tool for DownloadTool {
         {
             return CallRisk {
                 level: Risk::Sensitive,
-                escapes: vec![resolved.display().to_string()],
-            };
+                escapes: vec![resolved.display().to_string()], ..Default::default() };
         }
         if resolved.exists() {
             CallRisk::at(Risk::Workspace)
@@ -1112,6 +1111,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: ws.clone(),
             ..ToolCtx::default()
         };
@@ -1156,6 +1156,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: ws.clone(),
             ..ToolCtx::default()
         };

@@ -957,6 +957,7 @@ mod tests {
     fn ctx_in(d: &Path) -> ToolCtx {
 ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: d.to_path_buf(),
             max_output_bytes: 64 * 1024,
             ..Default::default()
@@ -1391,6 +1392,7 @@ ToolCtx {
         titled_workbook(&xlsx);
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: d.clone(),
             ..Default::default()
         };
@@ -1429,6 +1431,7 @@ ToolCtx {
         titled_workbook(&xlsx);
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: d.clone(),
             ..Default::default()
         };

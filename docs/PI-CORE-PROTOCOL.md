@@ -125,6 +125,8 @@ The gateway (`crates/gateway/src/lib.rs`) speaks `{cmd,args,id}` → response, p
 | `edit_message` | ours: the cwoffee store row, then a **rewind** — bridge rewrites pi's session file and reopens it (see below) |
 | `branch_conversation` | ours: copy the rows, then a **fork** — bridge compares cwoffee's user rows against pi `get_fork_messages`, forks before that entry (or `clone`s at the leaf), records the new thread (see below) |
 | `checkpoint_preview`, `checkpoint_revert` | ours on both cores. The copies are taken inside `cwtool`, which is the only thing that sees a file before the tool overwrites it; the marks ride back in the tool's JSON envelope, and the bridge writes the index rows (see below) |
+| `mcp_status` | ours on both cores, from the hub the app started — the pi core reports `mounted: false` and says why (see below) |
+| `tool_inventory` | rust core: its registry. pi core: an **error**, because pi decides the tool list inside the model process |
 | `share_markdown`, `render_report`, `gpu_report`, `boot_log`, `open_file`, `search_probe`, `set_search_backend`, `migration_notes` | ours — product features, not core features (OPEN QUESTION 3) |
 
 **Also still ours, unchanged:** watch vs drive tokens, token-not-in-URL, loopback default,
@@ -242,6 +244,36 @@ never from a path stored earlier: a conversation whose folder moved would otherw
 into a folder it no longer works in. Paths in the index are workspace-relative and `resolve()` refuses
 any that escape the folder — a copy of a file outside the workspace could never be reverted by this
 code, so recording it would promise an undo that cannot happen.
+
+### MCP servers: the pi core cannot mount them, and says so instead of listing nothing
+
+Third-party MCP tools ride lazy exposure on the rust core: registered into the registry as *hidden*,
+absent from `Registry::defs()` so they cost no prompt bytes, searchable by `explore` with
+`need: "mcp: …"`, declared on the next request of the same turn once `explore` names them, and
+approved per call.
+
+The pi core cannot do that, and the reason is the same one that makes checkpoints a two-process
+affair: **`cwtool` is one process per tool call.** An MCP server is a long-lived child that answers
+JSON-RPC over its stdio for the life of the conversation; a server spawned inside `cwtool` would be
+born and die around a single call, reconnecting and re-handshaking every time — with its session
+state, its file handles and its subprocesses gone between calls. There is nowhere in the pi core for
+one process to hold a server open, since the model itself is the process that decides which tools it
+can call.
+
+So the pi core:
+
+* spawns nothing. It reads `[mcp]` (and `CWOFFEE_MCP_SERVERS`), and if any server is listed it logs
+  that the pi core does not mount MCP tools, that `CWOFFEE_CORE=rust` is the way to use them, and
+  that nothing here calls those servers.
+* does not tell the model about servers it cannot reach. An env block describing tools that a call
+  would fail to run is a model spending turns on a door that is not there.
+* answers `mcp_status` with `mounted: false` and a `why` that names the reason, rather than a zero
+  server list — an empty list reads as "you configured none", which is false.
+* answers `tool_inventory` with an **error**, not `{declared: [], hidden: []}`: pi decides its tool
+  list inside the model process, and two empty lists would claim nothing is hidden about something
+  this side cannot observe. The desktop Settings page shows that refusal verbatim.
+* leaves `ToolCtx::lazy_tools` empty in `cwtool`, so `explore` on the pi core answers "No MCP server
+  is running in this start" instead of inventing a catalog.
 
 ### Chat mode's Web grant: pi decides tools at exec, so a switch is a process lifecycle
 

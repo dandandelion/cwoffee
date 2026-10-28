@@ -225,6 +225,10 @@ cwoffee-app`) before restarting the app.
 | `sheet-query-csv` | the model writes a delimited file and then totals a column with `sheet_query`. `require` names the engine's own result grid (`West\t26`, the column list), so a query tool that ran but returned nothing useful fails the run. This is the gap that made a real session write a 111-line Python xlsx parser. |
 | `sheet-titled-header` | the model writes a file whose first two rows are a school name and a treasurer's name, then queries it. `require` pins `# header: sheet row 3` and the aggregate (`Books\t250`), so a detector that names columns from a title block - which is what made `sheet_query` useless on the user's real cash-flow workbook - fails the turn. |
 | `conversation-title` | the one-line ask the titler sends (`Title this conversation in under`), answered in 7-character chunks. Pins that the name is asked for in its own context before the answer, that it arrives in several paints rather than swapping in, and - because scenario selection is first `match` wins - that the title request is served by the title scenario even though the same turn later asks the mock a normal question. It is the first scenario in the file for that reason. |
+| `mcp-lazy` | explore → a third-party call → an answer that must quote the server's own words. `require` pins `MCP server fake`, `mcp__fake__write_note`, `wrote ` and the file name in the tool output the model actually saw, so a reveal that declared a name the model could not call, or a call that only produced a plausible card, fails the turn. |
+| `mcp-again` | the same third-party call a second time, after a grant was already given for the conversation. Step 2 requires nothing on purpose: this run's call is the one the check denies, so demanding the server's words here would make the endpoint refuse a turn whose job is to show a refusal. |
+| `mcp-dead` | one call into a server that answered `tools/list` and then exited. `require` pins `MCP server dead` in the tool result, so a call that hung on a closed pipe, or answered with an empty string, fails the turn instead of timing the run out. |
+| `mcp-none` | `explore` with `mcp:` when no server is running. `require` pins `No MCP server is running`, so a `discover()` that rebuilt a registry from config and invented a catalog fails the turn. |
 | `long-turn-past-the-old-cap` | one turn that makes seventeen `read_file` calls and then answers. It cannot complete while any cap below 17 exists, which is exactly how its negative control fails (`only 14 read_file calls reached the transcript`). Also pins that an uncapped turn says once, at the iteration where the old build stopped, that it is uncapped. |
 
 Scenario selection is the `match` substring of the newest user message that has a
@@ -237,6 +241,48 @@ Control lines the engine appends to a request only ("continue where you stopped"
 "you have used up your tool budget") are deliberately not scenario anchors: the
 matcher walks back to the older user message that does match. A matcher that only
 looked at the newest message would report a perfectly scripted turn as unscripted.
+
+## Third-party servers: the fake is a real process, and the claims read the disk
+
+`scripts/fake-mcp-server.mjs` is a stdio JSON-RPC server, not a stubbed client: cwoffee's MCP hub
+spawns it, handshakes it, and calls it over real pipes. It offers `t1..tN`, `boom` (an `isError`
+result), `write_note` (writes a real file), a tool whose name is not a valid tool name, and a block
+that is not text. Flags: `--tools N`, `--writes <dir>`, `--noise` (unrequested lines between
+answers), `--slow <ms>` (never answers), `--dialect <v>` (a protocol version it will not agree to),
+`--die`.
+
+`--die` exits immediately after `tools/list`, with no timer. A delay would let a fast machine win the
+race and report a dead server as live; the exit is what makes "the pipes are closed" deterministic.
+
+The selftest supplies its servers through `CWOFFEE_MCP_SERVERS`, never by writing the reader's config
+file: a run that wrote `[mcp]` into a real config would leave a person's MCP servers changed after a
+green run, and a settings save could drop a block the test wrote. `--no-mcp` skips the env entirely,
+which is how the group's "nothing is running" claim is tested. Two servers are configured by default:
+`fake` (live, writes into the scratch workspace) and `dead` (answers the list, then exits).
+
+What the `mcp` group refuses to take on faith:
+
+- **Prompt cost, measured on the registry that builds the request.** `tool_inventory` must show no
+  `mcp__` name in `declared` before anything is looked up, and must show `mcp__fake__t1` in `hidden`.
+  Leaking hidden tools into `Registry::defs()` fails as
+  `hidden MCP tools leaked into the declared list before anything asked: mcp__dead__t1, ...`.
+- **The catalog's arithmetic, not just its size.** The page's two numbers are compared against the
+  engine's own, and `catalog_bytes == catalog_body_bytes + catalog_lead_bytes` must hold; only the
+  body is held to the 1024-byte budget. An earlier version graded the whole block against the budget
+  and failed a correct engine: `the catalog costs 1051B against a 1024B budget`.
+- **The file, not the card.** After the approval is answered, the group reads `selftest_mcp_note.txt`
+  through the confined harness reader and requires the server's words in it. A tool result that only
+  looked right on screen fails as `the MCP call reported success but ... holds "nothing"`.
+- **The ask is per call.** The card's first answer is *Allow for session*, so the grant genuinely
+  exists; the second call must still ask. Setting `per_call: false` fails as
+  `the second MCP call ran without asking, after a yes for the same tool — a session grant covered a
+  third-party call`. Denying it must leave the file untouched.
+- **A dead server is a sentence, not a hang.** The call into the exited server must come back naming
+  that server within its timeout, and `mcp_status` must then report it as dead rather than keeping
+  the live status it earned at startup.
+- **What a core cannot see, it refuses to report.** On the pi core the same group asserts `mounted:
+  false` with a `why` that names the tool-host reason, and that `tool_inventory` errors instead of
+  answering with two empty lists.
 
 ## Machine contention
 

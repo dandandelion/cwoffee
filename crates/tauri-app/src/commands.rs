@@ -63,6 +63,83 @@ pub struct AppState {
     /// search panel writes back to this, because a provider that resets on restart
     /// is a provider that was never enabled.
     pub config_path: std::path::PathBuf,
+    /// The MCP hub, when this start has one. `None` on the pi core, where no server is
+    /// mounted, and the status command says that rather than reporting zero servers as if the
+    /// configuration were empty.
+    pub mcp: Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>>,
+}
+
+/// What the third-party servers are doing, in the words a settings row needs: which core is
+/// running, whether servers are mounted here, what each one answered at startup, and how many
+/// bytes the catalog costs every prompt.
+///
+/// Watch-role on both transports. A reader is asking "is what I configured actually running?",
+/// which is a question about a program the app started, not a change to make.
+#[tauri::command]
+pub async fn mcp_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let core = state.host.core_id().to_string();
+    // Re-read, then re-apply the environment: `[mcp]` in the file and `CWOFFEE_MCP_SERVERS`
+    // describe the same servers, and a page that read only the file would tell a person whose
+    // servers come from a systemd unit that none are configured. Two bugs of that shape are
+    // pinned in the README; this verb is the third place it could have happened.
+    let (mut cfg, _) = cwoffee_engine::Config::load(Some(&state.config_path)).unwrap_or_default();
+    cfg.apply_env();
+    let cfg = cfg.mcp_cfg();
+    match &state.mcp {
+        Some(hub) => {
+            let h = hub.lock().await;
+            let (block, body, lead) = h.catalog_parts();
+            Ok(serde_json::json!({
+                "core": core,
+                "mounted": true,
+                // Two numbers, because they answer two different questions: what the prompt pays
+                // in total, and how much of that grows when somebody adds a server.
+                "catalog_bytes": block,
+                "catalog_body_bytes": body,
+                "catalog_lead_bytes": lead,
+                "catalog_budget": cwoffee_engine::mcp::CATALOG_BYTE_BUDGET,
+                "tools": h.catalog().len(),
+                "servers": h.servers_named().iter().map(|(n, s)| serde_json::json!({ "name": n, "says": s })).collect::<Vec<_>>(),
+                "configured": cfg.servers.len(),
+                "config_path": state.config_path.display().to_string(),
+                "why": "",
+            }))
+        }
+        None => Ok(serde_json::json!({
+            "core": core,
+            "mounted": false,
+            "catalog_bytes": 0,
+            "catalog_body_bytes": 0,
+            "catalog_lead_bytes": 0,
+            "catalog_budget": cwoffee_engine::mcp::CATALOG_BYTE_BUDGET,
+            "tools": 0,
+            "servers": [],
+            "configured": cfg.servers.len(),
+                "config_path": state.config_path.display().to_string(),
+            // The honest sentence for the pi core. It names the reason rather than leaving the
+            // reader to infer it from an empty list, and it says what to do about it.
+            "why": if core == "pi" {
+                "this core does not mount MCP tools: its tool host is one process per call, so a \
+                 server it started would restart on every call. Start with CWOFFEE_CORE=rust to use \
+                 the servers in [mcp].".to_string()
+            } else if cfg.servers.is_empty() {
+                "no [mcp] servers configured".to_string()
+            } else {
+                "[mcp] lists servers and none is enabled".to_string()
+            },
+        }))
+    }
+}
+
+/// What the model is handed right now and what is registered but withheld behind `explore`.
+///
+/// On the pi core this is a refusal with a reason, and the reason is the useful part: a settings
+/// row that showed two zeroes there would say "nothing is hidden" about a core that decides its
+/// tool list inside the model process.
+#[tauri::command]
+pub async fn tool_inventory(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let (declared, hidden) = state.host.tool_inventory().await?;
+    Ok(serde_json::json!({ "declared": declared, "hidden": hidden }))
 }
 
 /// Is remote access on, on what address, and how many devices are attached.

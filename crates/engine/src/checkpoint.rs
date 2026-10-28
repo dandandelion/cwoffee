@@ -1312,7 +1312,8 @@ mod tests {
         let ov = store.checkpoint_overview(sess).unwrap();
         assert!(ov.pruned > 0, "the cap should have evicted: {}", ov.total);
 
-        let h = idle_host();
+        // No host: a plan is computed from the record and the disk, and this claim is about the
+        // record. `preview` takes a host borrow because the verb that *acts* needs one.
         let p = preview(
             &store,
             &RevertReq {

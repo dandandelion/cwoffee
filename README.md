@@ -234,7 +234,48 @@ docs/              protocol, testing, benchmarks, gateway, build/run, work-in-pr
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | measured memory, token rates, tool-block bytes |
 | [`docs/TITLE-THINKING-DECODE-DELETE.md`](docs/TITLE-THINKING-DECODE-DELETE.md), [`docs/UI-TASKS.md`](docs/UI-TASKS.md) | the four most recent asks, with the user's wording kept |
 
+## Third-party tools (MCP)
+
+Servers are declared in the config file, or in `CWOFFEE_MCP_SERVERS` as one JSON object:
+
+```toml
+[mcp]
+enabled = true
+timeout_secs = 20
+
+[mcp.servers.jira]
+command = "jira-mcp"
+args = ["--stdio"]
+```
+
+```sh
+CWOFFEE_MCP_SERVERS='{"jira":{"command":"jira-mcp","args":["--stdio"]}}'
+```
+
+Three things follow from that, and they are the point of the feature:
+
+- **Their tools are not in the prompt.** `jira`'s tools are registered and hidden. The model sees a
+  short sentence in the environment block saying which servers are up and what they offer, within a
+  1024-byte budget for the tool list; the sentence says what was left out rather than presenting a
+  cut-off list as complete. Registering a server costs no prompt bytes until someone asks.
+- **`explore` is the only door.** `explore` with `need: "mcp: …"` searches the servers and, for the
+  tools it returns, cwoffee declares those exact names on the next request of the same turn — the
+  tool becomes callable from the *next* call on. A tool nobody looked up cannot be called, so a
+  guessed name never reaches a third-party program.
+- **Every call asks.** A server is somebody else's program on your machine, so MCP calls are
+  approved per call: an "allow for this conversation" you gave `exec` does not cover it, and an
+  argument naming a path outside the workspace says so on the card. A server's own
+  `readOnlyHint` can lower the bar to workspace-sensitive; it can never make a call harmless.
+
+Settings › Workspace › Third-party tools answers "is what I configured actually running?" — per
+server, plus the catalog's byte counts and the declared / withheld split. It is a status page: no
+button launches a program somebody else wrote.
+
+On the **pi core** MCP tools are not mounted: its tool host is one process per call, so a server it
+started would restart on every call. The app says that instead of showing an empty list, and
+`CWOFFEE_CORE=rust` is the way to use them.
+
 ## Not built
 
-Knowledge Center, a browser module, MCP. `theme` is stored and not fully wired. Everything
+Knowledge Center and a browser module. `theme` is stored and not fully wired. Everything
 described above is running and covered by a check that fails when it stops.

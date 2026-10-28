@@ -87,8 +87,7 @@ impl Tool for WriteXlsxTool {
         if resolved != ws && !resolved.starts_with(&ws) {
             return CallRisk {
                 level: Risk::Sensitive,
-                escapes: vec![resolved.display().to_string()],
-            };
+                escapes: vec![resolved.display().to_string()], ..Default::default() };
         }
         if resolved.exists() {
             CallRisk::at(Risk::Workspace)
@@ -281,6 +280,7 @@ mod tests {
         (
             ToolCtx {
                     checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: ws.clone(),
                 max_output_bytes: 4096,
                 ..Default::default()

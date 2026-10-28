@@ -671,6 +671,7 @@ mod tests {
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -725,6 +726,7 @@ mod tests {
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -762,6 +764,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: Some(std::time::Duration::from_millis(150)),
@@ -820,6 +823,7 @@ mod tests {
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -866,6 +870,7 @@ mod tests {
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -908,6 +913,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -954,6 +960,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -999,6 +1006,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1066,6 +1074,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1114,6 +1123,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1161,6 +1171,7 @@ mod tests {
         drop(rx);
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1186,6 +1197,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1210,6 +1222,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1269,6 +1282,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1319,6 +1333,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1363,6 +1378,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1398,6 +1414,7 @@ mod tests {
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1463,6 +1480,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1521,6 +1539,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,

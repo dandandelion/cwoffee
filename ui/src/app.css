@@ -5337,3 +5337,42 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   opacity: 0.78;
   font-style: italic;
 }
+
+/* Third-party MCP servers, on Settings › Workspace. A status page about programs the app
+   started, so it reads like one log line per server rather than like a control: there is no
+   control here, and a switch that only reopened a config file would misstate what the row does. */
+.mcpsum {
+  font-size: 13px;
+  color: var(--color-ink-soft);
+  margin: 0 0 10px;
+}
+.mcpsum .mcp-n {
+  color: var(--color-ink);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.mcprows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mcprow {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.mcprow .mcp-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink);
+  flex: 0 0 auto;
+}
+.mcprow .mcp-says {
+  font-size: 12px;
+  color: var(--color-ink-soft);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

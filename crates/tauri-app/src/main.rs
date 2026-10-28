@@ -319,6 +319,21 @@ fn main() {
     // turn actually runs in. A snapshot of the startup folder used to be shown to
     // sessions living somewhere else.
     cfg.env_override = None;
+    // Third-party MCP servers, started here and now. Sequentially, each bounded by
+    // `[mcp] timeout_secs`: a startup that waits on somebody else's program is not a
+    // startup, and one broken server must not stop the others — it is recorded as dead
+    // and the catalog says so, which is the honest version of "I could not start it".
+    let mcp_cfg = appcfg.mcp_cfg();
+    if let Err(e) = Config::mcp_problem(&mcp_cfg) {
+        eprintln!("[cwoffee] bad [mcp] config: {e} - fix it in {}", config_path.display());
+        std::process::exit(1);
+    }
+    // Whether to spawn at all is decided here; the spawning happens inside the async block
+    // below, because that is where there is a reactor to spawn a child process on.
+    let mcp_wanted = mcp_cfg.has_servers();
+    if !mcp_wanted && !mcp_cfg.servers.is_empty() {
+        eprintln!("[cwoffee] [mcp] lists {} server(s) and none is enabled; nothing spawned", mcp_cfg.servers.len());
+    }
     // Fail-closed default: an unanswered prompt refuses rather than hanging the
     // turn forever.
     cfg.approval_timeout =
@@ -370,7 +385,7 @@ fn main() {
     // line states the dials the app actually started with, which is the only way a
     // drift between `config.toml` and the running app is visible in a log.
     let reasoning_at_boot = cfg.reasoning;
-    let (host, receivers, questions, model_label): (
+    let (host, receivers, questions, model_label, mcp_hub): (
         Arc<dyn HostOps>,
         Option<(
             cwoffee_engine::host::EventRx,
@@ -378,6 +393,7 @@ fn main() {
         )>,
         Option<tokio::sync::mpsc::UnboundedReceiver<cwoffee_engine::tools::ask::QuestionRx>>,
         String,
+        Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>>,
     ) = tauri::async_runtime::block_on(async {
         if core == "pi" {
             match pi_host(&appcfg, &cfg, &store, &workspace, &configured_model, persona).await {
@@ -390,19 +406,41 @@ fn main() {
                     // before the host becomes the Arc the window and gateway share.
                     let r = h.take_receivers();
                     let q = h.take_questions();
-                    (Arc::new(h) as Arc<dyn HostOps>, r, q, configured_model.clone())
+                    // No hub on this core, said as a value rather than as an absent field:
+                    // `mcp_status` can then answer "this core does not mount them, and here is
+                    // why" instead of showing an empty list that looks like an empty config.
+                    (Arc::new(h) as Arc<dyn HostOps>, r, q, configured_model.clone(), None)
                 }
             }
         } else {
             // The engine spawns tasks, so it must be constructed inside a tokio
             // context. Tauri's async runtime is tokio, so entering it here is enough;
             // calling SessionHost::spawn from bare `main` panics with "no reactor".
-            let mut h = SessionHost::spawn(
-                provider,
-                Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg()),
-                Arc::clone(&store),
-                cfg,
-            );
+            let mut reg = Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg());
+            let mcp_hub: Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>> = if mcp_wanted {
+                let hub = cwoffee_engine::mcp::Hub::start(&mcp_cfg).await;
+                for (name, line) in hub.servers_named() {
+                    // A menu-launched app has no terminal: the launcher's stderr lands in the
+                    // journal, so this is the only place a dead server can be read.
+                    eprintln!("[cwoffee] mcp {name}: {line}");
+                }
+                cfg.mcp_catalog = hub.catalog_block();
+                Some(Arc::new(tokio::sync::Mutex::new(hub)))
+            } else {
+                None
+            };
+            if let Some(hub) = &mcp_hub {
+                // Registered as *hidden*: the tools exist and are callable once named, and cost
+                // no prompt bytes until `explore` names them. That is the whole economy of the
+                // feature — a configured server must not tax every turn in every session.
+                let catalog = hub.lock().await.catalog();
+                cwoffee_engine::mcp::install_into(&mut reg, &catalog, hub);
+                eprintln!(
+                    "[cwoffee] mcp: {} third-party tool(s) registered, hidden behind explore",
+                    catalog.len()
+                );
+            }
+            let mut h = SessionHost::spawn(provider, reg, Arc::clone(&store), cfg);
             // No config file means no model id. Ask the endpoint rather than sending
             // an empty one and taking a 400.
             let adopted = h.adopt_first_model().await;
@@ -414,7 +452,7 @@ fn main() {
             // Read the adopted id from the return value, not host.state(): SetModel is
             // applied by the host task, so state() can still show the old value here.
             let label = adopted.unwrap_or_else(|| configured_model.clone());
-            (Arc::new(h) as Arc<dyn HostOps>, r, q, label)
+            (Arc::new(h) as Arc<dyn HostOps>, r, q, label, mcp_hub)
         }
     });
     eprintln!(
@@ -538,6 +576,7 @@ fn main() {
         clients: gateway_ctl::client_gauge(),
         migration_notes: migration_notes.clone(),
         config_path: config_path.clone(),
+        mcp: mcp_hub.clone(),
     });
     let gateway = Arc::new(gateway_ctl::GatewayCtl::new(gw_handle));
 
@@ -552,6 +591,7 @@ fn main() {
         migration_notes,
         gateway: Arc::clone(&gateway),
         config_path: config_path.clone(),
+        mcp: mcp_hub,
     };
 
     // Boot-time gateway: off unless CWOFFEE_GATEWAY_PORT is set. Started through
@@ -808,6 +848,8 @@ fn main() {
             commands::selftest_file_bytes,
             commands::selftest_write_file,
             commands::checkpoint_preview,
+        commands::mcp_status,
+        commands::tool_inventory,
             commands::checkpoint_revert,
             commands::share_markdown,
             commands::save_markdown_file,

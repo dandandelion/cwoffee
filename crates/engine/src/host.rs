@@ -69,6 +69,15 @@ pub struct HostConfig {
     /// ~/Projects told the model it was working in ~/cwoffee-workspace while its
     /// `pwd` said otherwise.
     pub env_override: Option<String>,
+    /// The MCP catalog: third-party servers and the tools they offered at startup, in a few
+    /// hundred bytes. Appended inside `<env>` per turn rather than put in the system prompt,
+    /// because the env block is rewritten every turn anyway (it names the folder and the
+    /// sandbox) while the system prompt is a cache prefix — so turning a server on or off costs
+    /// history bytes, not a permanently edited prompt for every session.
+    ///
+    /// Empty means no servers, and then the block is byte-identical to what it was before MCP
+    /// existed, which is what keeps a machine with no `[mcp]` from paying for a feature it has.
+    pub mcp_catalog: String,
     /// How long an unanswered approval prompt waits before refusing.
     pub approval_timeout: std::time::Duration,
     /// How long an `ask_user` card stays open. `question_timeout_secs` in config.toml.
@@ -120,6 +129,7 @@ impl HostConfig {
             max_tokens: None,
             context_budget: None,
             env_override: None,
+            mcp_catalog: String::new(),
             approval_timeout: std::time::Duration::from_secs(300),
             question_timeout: None,
             max_attachments: DEFAULT_MAX_ATTACHMENTS,
@@ -777,6 +787,15 @@ pub enum HostCmd {
         session: Option<i64>,
     },
     SetMode { mode: ApprovalMode },
+    /// "What is declared to the model right now, and what is registered but withheld."
+    ///
+    /// Answered by the host loop rather than by the shells, because the registry lives in the
+    /// agent: a settings page or a check that rebuilt a tool list from config would be grading a
+    /// second, invented registry. Asked and answered on a reply channel like `Branch` for the same
+    /// reason — the caller needs the answer, not an event that may arrive.
+    ToolInventory {
+        reply: oneshot::Sender<Result<(Vec<String>, Vec<String>), String>>,
+    },
     /// Set the thinking effort.
     ///
     /// `persist` says which dial was moved, and the two are different asks:
@@ -1077,6 +1096,10 @@ impl SessionHost {
             // its conversations, so `session` is filled per turn by the agent loop.
             store: Some(Arc::clone(&store)),
             session: None,
+            // Filled per round-trip by the agent from the registry it owns: the tools that exist
+            // and are not declared yet. Empty here means "this host holds nothing back", which is
+            // what a host with no MCP servers has.
+            lazy_tools: Vec::new(),
             // Turn checkpoints, when there is a store to index them in. The bytes on disk
             // are useless without rows: a copy is only revertible if something can say
             // which turn took it and which message row that turn wrote.
@@ -1488,6 +1511,13 @@ impl SessionHost {
                         }
                     }
 
+                    HostCmd::ToolInventory { reply } => {
+                        // Read from the agent's own registry, in the loop that owns it. Nothing
+                        // else in the app can say what the next request would carry.
+                        let (declared, hidden) = agent.tool_inventory();
+                        let _ = reply.send(Ok((declared, hidden)));
+                    }
+
                     HostCmd::Branch { req, reply } => {
                         // No busy check here, and one would be dead code: `Send` runs the turn inline
                         // in this loop, so a branch cannot be read at all until the turn has ended.
@@ -1868,10 +1898,9 @@ impl SessionHost {
                         // the workspace the host settled on a moment ago - after
                         // any adoption, draft creation or workspace move - rather
                         // than from anything captured at startup.
-                        let env = cfg.env_override.clone()
-                            .unwrap_or_else(|| {
-                                default_env_block(agent.workspace(), "linux", cfg.egress)
-                            });
+                        let env = cfg.env_override.clone().unwrap_or_else(|| {
+                            env_block_with_mcp(agent.workspace(), "linux", cfg.egress, &cfg.mcp_catalog)
+                        });
                         agent.prompt_mut().set_env(env);
 
                         set_busy(&state_bg, true);
@@ -2306,6 +2335,16 @@ pub trait HostOps: Send + Sync {
         )
     }
 
+    /// "What is declared to the model right now, and what is registered but withheld."
+    ///
+    /// The default says plainly that this core cannot answer, rather than answering with two empty
+    /// lists: `[]` hidden and `[]` declared look exactly like "nothing is withheld", which on the
+    /// pi core is a falsehood — that list is decided inside the model process. A check grading an
+    /// invented answer would pass while the real thing stayed unmeasured.
+    async fn tool_inventory(&self) -> Result<(Vec<String>, Vec<String>), String> {
+        Err("this core decides its tool list inside the model process, so it cannot report one".to_string())
+    }
+
     /// Grant or take away web reach for the chat conversation this host holds. Queued like every
     /// other verb here: the tools live in the model process, and only its own loop can re-make it.
     ///
@@ -2506,6 +2545,13 @@ impl HostOps for SessionHost {
             .map_err(|_| "the model host is gone; nothing was branched".to_string())?;
         rx.await.map_err(|_| "the model host ended without answering the branch".to_string())?
     }
+    async fn tool_inventory(&self) -> Result<(Vec<String>, Vec<String>), String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(HostCmd::ToolInventory { reply: tx })
+            .map_err(|_| "the model host is gone; nothing was read".to_string())?;
+        rx.await.map_err(|_| "the model host ended without answering".to_string())?
+    }
     fn state(&self) -> HostState {
         SessionHost::state(self)
     }
@@ -2653,6 +2699,28 @@ pub fn default_env_block(workspace: &std::path::Path, os: &str, egress: crate::t
          commands run sandboxed: {egress_line}, {writable} is writable\n\
          </env>",
     )
+}
+
+/// `default_env_block` with the MCP catalog folded in, before the closing tag.
+///
+/// A separate function rather than a parameter on `default_env_block`, because the bridge and
+/// every caller that has no servers keeps the three-argument form — and a signature that makes
+/// everyone pass an empty string to mean "no third-party tools" is how a feature that is not
+/// running still shows up in the prompt.
+pub fn env_block_with_mcp(
+    workspace: &std::path::Path,
+    os: &str,
+    egress: crate::tools::net::NetMode,
+    catalog: &str,
+) -> String {
+    let base = default_env_block(workspace, os, egress);
+    if catalog.trim().is_empty() {
+        return base;
+    }
+    match base.rfind("</env>") {
+        Some(i) => format!("{}\n{}\n</env>", &base[..i], catalog.trim_end()),
+        None => format!("{base}\n{catalog}"),
+    }
 }
 
 /// Attachment guardrails, checked before anything reaches a provider.

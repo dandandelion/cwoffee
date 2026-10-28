@@ -4485,7 +4485,21 @@ const TOOL_HEAD: Record<string, { run: string; done: string; bad: string }> = {
 export function toolHeadline(name: string, tense: 'run' | 'done' | 'bad'): string {
   const h = TOOL_HEAD[name]
   if (h) return h[tense]
+  // A third-party tool keeps its server in the header at every tense. The status chip already
+  // carries working/done/failed, so the tense word adds nothing here, while "which program is
+  // this call inside" is the one fact a scanner needs from a list of cards — and it is the same
+  // fact the approval card leads with.
+  const server = mcpServerOf(name)
+  if (server) return `third-party · ${server}`
   return tense === 'done' ? 'Done' : tense === 'bad' ? 'Failed' : 'Working'
+}
+
+/** The server a declared MCP tool name belongs to, mirroring `mcp__<server>__<tool>`. */
+export function mcpServerOf(name: string): string {
+  if (!name.startsWith('mcp__')) return ''
+  const rest = name.slice(5)
+  const server = rest.split('__')[0] ?? ''
+  return server
 }
 
 /**

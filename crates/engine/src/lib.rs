@@ -21,6 +21,7 @@ pub mod prompt;
 pub mod sse;
 pub mod legacy;
 pub mod host;
+pub mod mcp;
 pub mod share;
 pub mod settings;
 pub mod store;
@@ -42,6 +43,7 @@ pub use provider::{
 };
 pub use prompt::PromptBuilder;
 pub use host::{default_env_block, HostCmd, HostConfig, HostState, SessionHost};
+pub use mcp::{Hub, McpCfg, McpServerCfg, McpTool, Status as McpStatus, ToolInfo as McpToolInfo, CATALOG_BYTE_BUDGET};
 pub use store::{
     CheckpointPrune, CheckpointRow, MessagesPage, SearchHit, Session, Store, StoreError,
     StoredMessage, Totals,

@@ -1306,6 +1306,21 @@ impl Engine {
             "CWOFFEE_PI_SESSION_MAP".to_string(),
             self.cfg.session_map.display().to_string(),
         ));
+        // MCP on the pi core: not mounted, and said out loud. A server is a long-lived child
+        // whose pipes carry JSON-RPC frames; `cwtool` is one process per tool call, so a server
+        // spawned inside it would be a new server per call with no memory between them, and a
+        // stateful server would answer correctly exactly once. The Rust core owns the hub for
+        // that reason. Saying this beats parsing `[mcp]` and doing nothing: a person who wrote
+        // the block believes they have a server, and the only honest reply is which core runs
+        // and why this one cannot host it.
+        if cwoffee_engine::config::Config::load(None)
+            .map(|(c, _)| c.mcp_cfg().has_servers())
+            .unwrap_or(false)
+        {
+            self.err(
+                "[mcp] lists server(s), and the pi core does not mount MCP tools: cwtool is one                  process per tool call, so a server it spawned would restart on every call. Run                  CWOFFEE_CORE=rust to use them. Nothing here calls those servers, and the model is                  not told about them.",
+            );
+        }
         let (child, mut rx) = PiChild::spawn(&launch).await.map_err(|e| self.explain_now(&e))?;
         let pid = child.pid;
         // Name the process we started, in a file the next bridge to start reads.
@@ -1459,6 +1474,16 @@ impl Engine {
             HostCmd::Send { text, attachments, session } => self.on_send(text, attachments, session).await,
             HostCmd::Rewind { session } => self.rewind_row(session).await,
             HostCmd::Branch { req, reply } => self.branch_row(req, reply).await,
+            HostCmd::ToolInventory { reply } => {
+                // pi decides which tools it declares when it starts the model process, and the
+                // registry cwoffee hands it is a definition list, not the active set — so this
+                // side genuinely cannot say what the next request carried. Answering with two
+                // empty lists would read as "nothing is hidden", which is the false half of the
+                // claim; the reader gets the reason instead, from the same seam that answers.
+                let _ = reply.send(Err(
+                    "pi decides its tool list when the model process starts, so this core cannot                      report what was declared on the last request".to_string(),
+                ));
+            }
             HostCmd::SetWeb { on } => self.set_web(on).await,
             HostCmd::ReloadProvider => self.reload_provider().await,
             HostCmd::Cancel => {

@@ -81,6 +81,14 @@ pub struct CallRisk {
     pub level: Risk,
     /// Absolute, already-resolved paths outside the workspace this call needs.
     pub escapes: Vec<String>,
+    /// True when a grant remembered for the conversation must not cover *this* call.
+    ///
+    /// `exec` does not set it: its reach is the workspace plus the sandbox, and "yes to exec for
+    /// this conversation" is a decision a person can make once and mean. An MCP server's reach is
+    /// whatever that program can do — outside the workspace, outside the sandbox, outside
+    /// anything cwoffee described — so remembering one yes for it would turn a single click into
+    /// standing access to a third party's privileges.
+    pub per_call: bool,
 }
 
 impl CallRisk {
@@ -88,7 +96,7 @@ impl CallRisk {
         Self::default()
     }
     pub fn at(level: Risk) -> Self {
-        Self { level, escapes: Vec::new() }
+        Self { level, escapes: Vec::new(), per_call: false }
     }
 }
 
@@ -411,6 +419,15 @@ pub struct ToolCtx {
     /// Rebuilt per call by the agent loop; never inherited by the next call, and
     /// never widened by a session-level "allow for session" answer.
     pub permits: Vec<std::path::PathBuf>,
+    /// Tools that exist in this host and are not declared to the model yet — third-party MCP
+    /// tools, waiting for `explore` to name them.
+    ///
+    /// The agent fills this from its own registry on every round-trip rather than letting
+    /// `explore` rebuild a registry. `explore` used to construct one from the config to get the
+    /// exec and search policy right, and a rebuilt registry cannot contain a tool the running
+    /// host registered at startup: an answer of "no MCP server is running" from a host that has
+    /// one running is not a search miss, it is a lie about the app.
+    pub lazy_tools: Vec<LazyTool>,
 }
 
 impl Default for ToolCtx {
@@ -428,6 +445,7 @@ impl Default for ToolCtx {
             exec_cfg: ExecCfg::default(),
             session: None,
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             permits: Vec::new(),
         }
     }
@@ -510,6 +528,30 @@ pub trait Tool: Send + Sync {
     fn host_questions(&self, _args: &Value) -> Option<Result<Vec<ask::Question>, String>> {
         None
     }
+
+    /// Who provides this tool, when it is not cwoffee. Shown on the discovery card and the
+    /// approval card, because "a program the user installed" is a fact a reader needs before
+    /// allowing a call — and it is not recoverable from a description the server wrote.
+    fn source(&self) -> Option<String> {
+        None
+    }
+}
+
+/// A tool that exists here and has not been declared to the model, described for a search.
+///
+/// `risk` travels with it because a search that asks the registry about a hidden tool gets
+/// `Risk::default()` back, and the default is `Harmless` — the one answer a third-party tool
+/// must never receive. The `from` line is shown on the card for the same reason the approval
+/// card names a program: a reader cannot otherwise tell cwoffee's `read_file` from a server's.
+#[derive(Debug, Clone)]
+pub struct LazyTool {
+    pub name: String,
+    pub description: String,
+    pub schema: Value,
+    pub risk: Risk,
+    /// `None` for a first-party tool lean mode is withholding; `Some` for a tool that came from
+    /// somewhere else, named.
+    pub from: Option<String>,
 }
 
 /// Exec knobs that come from config. Kept separate from ExecTool so the registry
@@ -541,6 +583,14 @@ pub struct Registry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
     search: Option<Arc<web::WebSearchTool>>,
+    /// Registered but not declared: third-party tools waiting for `explore` to name them.
+    ///
+    /// This is a second reason a tool is absent from `defs()`, kept separate from lean mode's
+    /// "the config withholds it" because the two answer differently: a lean-withheld first-party
+    /// tool is *already callable* (only its declaration is withheld, and that is what pi's
+    /// loadout does), while an unrevealed MCP tool is not callable at all — a tool from someone
+    /// else's program should not be reachable by a name the model guessed.
+    hidden: std::collections::HashSet<String>,
 }
 
 impl Registry {
@@ -646,6 +696,11 @@ impl Registry {
             .collect()
     }
 
+    /// Every name this registry knows, declared or not.
+    pub fn all_names(&self) -> Vec<String> {
+        self.order.clone()
+    }
+
     pub fn register(&mut self, t: Box<dyn Tool>) {
         let n = t.name().to_string();
         self.tools.insert(n.clone(), Arc::from(t));
@@ -658,6 +713,67 @@ impl Registry {
         let n = t.name().to_string();
         self.tools.insert(n.clone(), t);
         self.order.push(n);
+    }
+
+    /// Register a tool that exists but is not declared to the model yet.
+    ///
+    /// Appended to `order` like every other tool, because the order of *declared* tools is
+    /// prefix-cache bytes and a revealed tool must land in the position it was registered in,
+    /// not at the end of the list each time one is discovered.
+    pub fn register_lazy(&mut self, t: Arc<dyn Tool>) {
+        let n = t.name().to_string();
+        self.tools.insert(n.clone(), t);
+        self.order.push(n.clone());
+        self.hidden.insert(n);
+    }
+
+    /// Names that exist and are still waiting to be named to the model.
+    pub fn lazy_names(&self) -> Vec<String> {
+        self.order.iter().filter(|n| self.hidden.contains(n.as_str())).cloned().collect()
+    }
+
+    pub fn is_lazy(&self, name: &str) -> bool {
+        self.hidden.contains(name)
+    }
+
+    /// Declare a hidden tool. True if it was hidden and is now declared.
+    pub fn reveal(&mut self, name: &str) -> bool {
+        self.hidden.remove(name)
+    }
+
+    /// The hidden tools as a search can see them: name, description, schema, risk, provider.
+    ///
+    /// Risk comes off the tool rather than off the registry lookup, because the lookup's
+    /// default is `Harmless` and a hidden tool is exactly where a defaulted answer would be a
+    /// free pass for someone else's program.
+    pub fn lazy_views(&self) -> Vec<LazyTool> {
+        self.order
+            .iter()
+            .filter(|n| self.hidden.contains(n.as_str()))
+            .filter_map(|n| self.tools.get(n))
+            .map(|t| LazyTool {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                schema: t.schema(),
+                risk: t.risk(),
+                from: t.source(),
+            })
+            .collect()
+    }
+
+    /// Schemas of the hidden tools, in registration order — what `explore` searches when the
+    /// model asks for something the declared set cannot do.
+    pub fn lazy_defs(&self) -> Vec<crate::provider::ToolDef> {
+        self.order
+            .iter()
+            .filter(|n| self.hidden.contains(n.as_str()))
+            .filter_map(|n| self.tools.get(n))
+            .map(|t| crate::provider::ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.schema(),
+            })
+            .collect()
     }
 
     /// The search tool, typed. Switching providers at runtime goes through this
@@ -681,6 +797,7 @@ impl Registry {
     pub fn defs(&self) -> Vec<crate::provider::ToolDef> {
         self.order
             .iter()
+            .filter(|n| !self.hidden.contains(n.as_str()))
             .filter_map(|n| self.tools.get(n))
             .map(|t| crate::provider::ToolDef {
                 name: t.name().to_string(),

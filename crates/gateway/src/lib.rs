@@ -94,6 +94,10 @@ pub struct EngineHandle {
     /// through it, so a provider chosen on a phone is still chosen after a restart,
     /// and so both shells write the same file rather than two.
     pub config_path: std::path::PathBuf,
+    /// The MCP hub when this start has one, shared with the desktop. A phone asking
+    /// "is my Jira server running" gets the same answer the desktop page gives, and on
+    /// the pi core it gets the same sentence explaining that this core mounts none.
+    pub mcp: Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>>,
 }
 
 impl EngineHandle {
@@ -1450,6 +1454,67 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             )
             .map(|note| json!({ "note": note }))
         }
+        "tool_inventory" => {
+            // Watch-role: names, no arguments, no schemas. A phone reading which tools the model
+            // was handed is the same question the desktop page asks, and the pi core's refusal is
+            // the same refusal — a zero there would be a claim about a thing this side cannot see.
+            let (declared, hidden) = h.host.tool_inventory().await?;
+            Ok(json!({ "declared": declared, "hidden": hidden }))
+        }
+        "mcp_status" => {
+            // Watch-role: it reports what a program the app started did at startup. Nothing in
+            // this reply can be acted on from a phone — servers are configured in the config
+            // file, on the machine they run on.
+            // Re-read, then re-apply the environment: `[mcp]` in the file and
+            // `CWOFFEE_MCP_SERVERS` describe the same servers, and a page that read only the file
+            // would tell a person whose servers come from a systemd unit that none are configured.
+            // The README pins two bugs of exactly that shape; this verb is where a third would
+            // have started.
+            let (mut cfg, _) = cwoffee_engine::Config::load(Some(&h.config_path)).unwrap_or_default();
+            cfg.apply_env();
+            let cfg = cfg.mcp_cfg();
+            let core = h.host.core_id().to_string();
+            match &h.mcp {
+                Some(hub) => {
+                    let hub = hub.lock().await;
+                    let (block, body, lead) = hub.catalog_parts();
+                    Ok(json!({
+                        "core": core,
+                        "mounted": true,
+                        "catalog_bytes": block,
+                        "catalog_body_bytes": body,
+                        "catalog_lead_bytes": lead,
+                        "catalog_budget": cwoffee_engine::mcp::CATALOG_BYTE_BUDGET,
+                        "tools": hub.catalog().len(),
+                        "servers": hub.servers_named().iter().map(|(n, s)| json!({ "name": n, "says": s })).collect::<Vec<_>>(),
+                        "configured": cfg.servers.len(),
+                    "config_path": h.config_path.display().to_string(),
+                        "why": "",
+                    }))
+                }
+                None => Ok(json!({
+                    "core": core,
+                    "mounted": false,
+                    "catalog_bytes": 0,
+                    "catalog_body_bytes": 0,
+                    "catalog_lead_bytes": 0,
+                    "catalog_budget": cwoffee_engine::mcp::CATALOG_BYTE_BUDGET,
+                    "tools": 0,
+                    "servers": [],
+                    "configured": cfg.servers.len(),
+                    "config_path": h.config_path.display().to_string(),
+                    "why": if core == "pi" {
+                        "this core does not mount MCP tools: its tool host is one process per \
+                         call, so a server it started would restart on every call. Start with \
+                         CWOFFEE_CORE=rust to use the servers in [mcp].".to_string()
+                    } else if cfg.servers.is_empty() {
+                        "no [mcp] servers configured".to_string()
+                    } else {
+                        "[mcp] lists servers and none is enabled".to_string()
+                    },
+                })),
+            }
+        }
         "about" => {
             // Read-only, and watch-role is enough: what build this is, which core answers, and where
             // the person's own files live. A phone filing a bug report needs exactly these facts.
@@ -1820,6 +1885,7 @@ mod tests {
             clients: Arc::new(Mutex::new(BTreeMap::new())),
             migration_notes: vec![],
             config_path: PathBuf::from("/nonexistent/cwoffee.toml"),
+            mcp: None,
         };
         // The state the composer labels itself from, and the sidebar list the phone
         // draws. If either dispatch were wrong this would not link.
@@ -1924,6 +1990,7 @@ mod tests {
             // because the struct says a gateway always knows which file it would
             // write, and a test that cannot answer that is not a gateway.
             config_path: std::env::temp_dir().join("cwoffee-gw-refused-config.toml"),
+            mcp: None,
         });
         let err = serve(cfg, handle).await.unwrap_err();
         assert!(matches!(err, GatewayError::Refused(_)), "got {err:?}");
@@ -2690,6 +2757,7 @@ mod tests {
                 std::process::id(),
                 config_seq().fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             )),
+            mcp: None,
         })
     }
 
@@ -3676,5 +3744,48 @@ mod tests {
         assert_eq!(headers.get("upgrade").map(|s| s.as_str()), Some("websocket"));
         assert!(find_double_crlf(b"GET / HTTP/1.1\r\nA: b\r\n\r\nrest").is_some());
         assert!(find_double_crlf(b"GET / HTTP/1.1\r\nA: b\r\n").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_watcher_can_ask_what_is_running_and_the_numbers_add_up() {
+        // "Is what I configured actually running?" is the question a phone asks when the desktop
+        // says a server is dead, so `mcp_status` is watch-role. The arithmetic claim matters even
+        // with nothing mounted: a page that prints "0B made of undefinedB + undefinedB" is a page
+        // that reported an answer it never got, and the unmounted branch has to carry the same
+        // three fields the mounted branch does.
+        let h = test_handle();
+        let st = run_cmd("mcp_status", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("a watcher can ask what is running");
+        assert_eq!(st["mounted"], false, "this handle spawned no servers: {st}");
+        let body = st["catalog_body_bytes"].as_u64().expect("body bytes are reported");
+        let lead = st["catalog_lead_bytes"].as_u64().expect("lead bytes are reported");
+        assert_eq!(
+            st["catalog_bytes"].as_u64().unwrap(),
+            body + lead,
+            "the total has to be the two parts a page prints side by side: {st}"
+        );
+        assert_eq!(st["configured"], 0);
+        assert!(
+            st["why"].as_str().unwrap().contains("no [mcp] servers"),
+            "an unmounted status says why: {st}"
+        );
+
+        // Names only, and only what this side can see. This handle has a real registry and nothing
+        // hidden, so it answers with two lists; a core that decides its tools inside the model
+        // process refuses instead of returning two empty lists, which would read as "nothing is
+        // hidden" about a thing it cannot observe.
+        let inv = run_cmd("tool_inventory", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("a watcher can ask which tools were declared");
+        assert!(
+            inv["declared"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n == "exec"),
+            "the declared list is the registry's own: {inv}"
+        );
+        assert_eq!(inv["hidden"].as_array().unwrap().len(), 0, "{inv}");
     }
 }

@@ -274,6 +274,20 @@ impl Agent {
         self.registry.search_tool()
     }
 
+    /// What the model is handed right now, and what is registered but withheld.
+    ///
+    /// The pair exists because the claim a check has to grade is "adding a server costs the
+    /// prompt nothing until someone asks for it", and that is only observable from the side that
+    /// owns the registry. Both lists, not one: a count of hidden tools with no count of declared
+    /// ones cannot show that a revealed tool actually became declared.
+    pub fn tool_inventory(&self) -> (Vec<String>, Vec<String>) {
+        let declared: Vec<String> =
+            self.registry.defs().iter().map(|d| d.name.clone()).collect();
+        let mut hidden = self.registry.lazy_names();
+        hidden.sort();
+        (declared, hidden)
+    }
+
     /// Swap the whole prompt out, e.g. when moving to a different session.
     pub fn replace_prompt(&mut self, p: crate::prompt::PromptBuilder) {
         self.prompt = p;
@@ -431,6 +445,12 @@ impl Agent {
 
         let defs = self.registry.defs();
         let schemas = serde_json::to_string(&defs).unwrap_or_default();
+        // Revealed MCP tools are re-read from the registry on every round-trip (see the loop
+        // below), so a tool `explore` names partway through a turn is declared on the next
+        // round-trip of the same turn. That is what makes the wording in explore's own answer —
+        // "available from your next call" — literally true here rather than a promise about a
+        // later turn. Recomputing is cheap and, while nothing is revealed, byte-identical, so
+        // the prefix cache is not disturbed by the recomputation itself.
         let c = self.prompt.compact_to_budget(&schemas);
         if c.did_anything() {
             // Say so, with the numbers: "context full" without them is a claim the
@@ -503,7 +523,13 @@ impl Agent {
             }
 
             let mut req = self.prompt.build(&self.cfg.model);
-            req.tools = defs.clone();
+            // Read again rather than reusing `defs`: MCP tools revealed by an `explore` call in
+            // this turn join the declaration list here, and nothing else changes the list.
+            req.tools = self.registry.defs();
+            // `explore` searches what this host is holding back, and it can only do that if the
+            // agent hands it the list: the registry belongs to the agent, and a tool cannot
+            // borrow it while running inside a call the agent owns.
+            self.ctx.lazy_tools = self.registry.lazy_views();
             req.reasoning = self.cfg.reasoning;
             req.max_tokens = self.cfg.max_tokens;
             self.cfg.sampling.apply(&mut req);
@@ -857,6 +883,20 @@ impl Agent {
                 call.name,
                 self.registry.defs().iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
             );
+            // A hidden MCP tool is not "unknown": it exists and is one `explore` away. Saying
+            // unknown would send the model back to guessing at a name it half-remembered, when
+            // the repairable answer is the call that reveals it.
+            if self.registry.is_lazy(&call.name) {
+                let msg = format!(
+                    "{:?} exists but is not declared to you yet: it comes from a third-party MCP \
+                     server, so it is only callable after `explore` names it. Ask explore with need \
+                     \"mcp: <what you need>\", and it is callable from your next call on.",
+                    call.name
+                );
+                let _ = out.send(EngineEvent::Error { message: msg.clone(), fatal: false });
+                self.prompt.push_tool_result(&call.id, format!("ERROR: {msg}"));
+                return;
+            }
             let _ = out.send(EngineEvent::Error { message: msg.clone(), fatal: false });
             self.prompt.push_tool_result(&call.id, format!("ERROR: {msg}"));
             return;
@@ -945,6 +985,20 @@ impl Agent {
                 } else {
                     format!("DENIED BY USER ({reason}). Do not retry this call.")
                 };
+                // The card gets the short, owner-named line too. A refused call used to close as
+                // a bare "failed", which is the one state where a reader most wants to know who
+                // said no: their own click, or a policy that would refuse it from any mode. The
+                // long instruction to the model stays in the tool result.
+                let shown = if denied_by_policy {
+                    format!("blocked by the denylist: {reason}")
+                } else {
+                    format!("denied by you ({reason})")
+                };
+                let _ = out.send(EngineEvent::ToolExecOutput {
+                    id: call.id.clone(),
+                    stream: ExecStream::Stdout,
+                    chunk: shown,
+                });
                 self.prompt.push_tool_result(&call.id, text);
                 return;
             }
@@ -1062,12 +1116,36 @@ impl Agent {
                         let _ = out.send(EngineEvent::Note {
                             session: Some(session),
                             message: format!(
-                                "the copies of {} file(s) were taken but not indexed: {e}.                                  That turn cannot be reverted from the transcript.",
+                                "the copies of {} file(s) were taken but not indexed: {e}. That turn \
+                                 cannot be reverted from the transcript.",
                                 result.checkpoints.len()
                             ),
                         });
                     }
                 }
+            }
+        }
+
+        // A discovery answer is a capability claim about this conversation, and the registry is
+        // the thing that can make it true. Revealing here (rather than at the end of the turn) is
+        // what makes explore's "available from your next call" mean the next call, in this turn.
+        if !result.activates.is_empty() {
+            let mut now = Vec::new();
+            for n in result.activates.iter() {
+                if self.registry.reveal(n) {
+                    now.push(n.clone());
+                }
+            }
+            if !now.is_empty() {
+                let _ = out.send(EngineEvent::Note {
+                    session: self.ctx.session,
+                    message: format!(
+                        "declared {} tool(s) this call looked up: {}. They are callable from the \
+                         next call on.",
+                        now.len(),
+                        now.join(", ")
+                    ),
+                });
             }
         }
 
@@ -1399,6 +1477,7 @@ mod tests {
             crate::tools::CallRisk {
                 level: crate::tools::Risk::Sensitive,
                 escapes: vec!["/home/me/.ssh/id_ed25519".into()],
+                per_call: false,
             }
         }
         async fn run(
@@ -1549,6 +1628,7 @@ mod tests {
             max_output_bytes: 4096,
             store: Some(Arc::clone(&store)),
             checkpoint_store: false,
+            lazy_tools: Vec::new(),
             ..Default::default()
         };
 
@@ -1803,6 +1883,7 @@ mod tests {
             AgentConfig::default(),
             ToolCtx {
                     checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: dir.clone(),
                 ..Default::default()
             },
@@ -1854,6 +1935,7 @@ mod tests {
             AgentConfig::default(),
             ToolCtx {
                     checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: dir.clone(),
                 ..Default::default()
             },

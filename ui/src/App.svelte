@@ -408,6 +408,55 @@
   // carries is the same text the model is handed, so a UI-side copy is a second copy of
   // prompt bytes that will drift.
   let toolViews = $state<{ name: string; description: string }[]>([])
+  /**
+   * What the third-party MCP servers are doing, read from the engine rather than from the
+   * config file. A person who wrote `[mcp]` is asking one question of this page: "is it
+   * running?" — and only the process that started the servers can answer, because a config
+   * file says what was intended and a status says what happened.
+   */
+  interface McpStatus {
+    core: string
+    mounted: boolean
+    catalog_bytes: number
+    /// The list the budget applies to, and the fixed sentence around it. Kept apart because a
+    /// total compared against a body-only budget looks like a violation the moment the sentence
+    /// is counted, and a body alone understates what the prompt pays.
+    catalog_body_bytes: number
+    catalog_lead_bytes: number
+    catalog_budget: number
+    tools: number
+    servers: { name: string; says: string }[]
+    configured: number
+    /// The file `[mcp]` belongs in. Named on the row because the answer to "why is nothing
+    /// running" is often "because you wrote it somewhere else".
+    config_path: string
+    why: string
+  }
+  let mcpNow = $state<McpStatus | null>(null)
+  let mcpErr = $state('')
+  /**
+   * What the model is handed versus what is registered and withheld. Read together with the
+   * server list because the two claims belong to each other: servers running *and* their tools
+   * still hidden is the whole economy of the feature, and a page that showed only the server
+   * count would leave the cost question — "does this tax every prompt?" — unanswered.
+   */
+  let mcpInv = $state<{ declared: string[]; hidden: string[] } | null>(null)
+  async function loadMcp() {
+    try {
+      mcpNow = await invoke<McpStatus>('mcp_status')
+      mcpErr = ''
+    } catch (e) {
+      mcpErr = String(e)
+    }
+    try {
+      mcpInv = await invoke<{ declared: string[]; hidden: string[] }>('tool_inventory')
+    } catch (e) {
+      // A core that cannot answer says why, and that sentence goes on the page rather than
+      // becoming a pair of zeroes: two empty lists read as "nothing is withheld".
+      mcpInv = null
+      mcpErr = String(e)
+    }
+  }
   let toolsErr = $state('')
   async function loadTools() {
     try {
@@ -903,6 +952,9 @@
     }
     if (page === 'workspace') {
       if (!toolViews.length) void loadTools()
+      // Fetched when the page is opened, not at boot: a server's answer is about a process the
+      // app started, and this page is where someone goes to find out whether it is alive.
+      void loadMcp()
       void loadWorkspaces()
       if (!webSearch) void loadWebSearch()
     }
@@ -14361,6 +14413,349 @@
         if (okLine) pageLog(okLine)
       }
 
+      if (want('mcp', 'third-party servers stay out of the prompt until explore names them')) {
+        // MCP is a cost feature and a safety feature at once: somebody else's program runs on
+        // this machine, and its tool schemas would be prompt bytes on every turn. So the group
+        // grades four things that are easy to fake and hard to notice otherwise — that a
+        // configured server costs nothing until asked for, that asking makes it callable in the
+        // same turn, that every call asks again, and that a dead server comes back as a sentence
+        // naming itself instead of a hang. On the pi core the honest answer is different, and it
+        // is graded as its own claim rather than skipped.
+        const core = (await invoke<{ core: string }>('about').catch(() => null))?.core ?? ''
+        const noteFile = 'selftest_mcp_note.txt'
+        const bytesOf = async (path: string) =>
+          await invoke<{ text: string; bytes: number }>('selftest_file_bytes', { path }).catch(() => null)
+        interface Inv {
+          declared: string[]
+          hidden: string[]
+          error?: string
+        }
+        const invOf = async (): Promise<Inv> =>
+          await invoke<{ declared: string[]; hidden: string[] }>('tool_inventory').catch(
+            (e) => ({ declared: [], hidden: [], error: String(e) }) as Inv,
+          )
+        const cardUp = async (ms: number) => {
+          const dl = performance.now() + ms
+          while (performance.now() < dl) {
+            if (document.querySelector('.approval-card')) return true
+            await new Promise((r) => setTimeout(r, 60))
+          }
+          return false
+        }
+        // `session` is the answer the per-call rule has to survive: it grants the *tool* for the
+        // rest of the conversation, and on a third-party call that grant must not be honoured.
+        const answerCard = async (which: 'allow' | 'session' | 'deny') => {
+          const sel =
+            which === 'allow' ? '.btn-go' : which === 'deny' ? '.btn-bad' : '.btn-ghost'
+          const btn = document.querySelector<HTMLButtonElement>(`.approval-card ${sel}`)
+          if (!btn) return false
+          btn.click()
+          return true
+        }
+        // The first turn of this group has to be *sent*, not only started: `start_turn` sends to
+        // a draft and leaves the view where it was, and every card claim below reads the
+        // transcript on screen. A group that measured a start screen would report a clean empty
+        // document and call it a pass.
+        const firstTurn = async (text: string) => {
+          const before = await turnCount()
+          newSession()
+          draft = text
+          await send()
+          for (let i = 0; i < 60 && !sid; i++) {
+            const stt = await invoke<{ session_id: number }>('session_state').catch(() => null)
+            sid = viewId ?? transcript?.sessionId ?? stt?.session_id ?? 0
+            await new Promise((r) => setTimeout(r, 120))
+          }
+          if (!sid) return false
+          return waitTurnDone(before)
+        }
+        // A later turn in the conversation this group made. The view check is repeated because a
+        // refusal or a deny can leave the app somewhere else, and the claims are about this
+        // conversation's cards.
+        const moreTurn = async (text: string) => {
+          await invoke('start_turn', { text, session: sid })
+          if (viewId !== sid) await useSession(sid)
+        }
+        // The newest card for that tool, not the first. This group runs the same prompt twice, so
+        // a first-in-document lookup answers with an earlier turn's card — and a denial claim read
+        // against the turn that was *allowed* would pass for the wrong reason.
+        const cardFor = (name: string) => {
+          const all = document.querySelectorAll<HTMLElement>(`.blk-tool[data-tool="${name}"]`)
+          return all.length ? all[all.length - 1] : null
+        }
+        const statusOf = (name: string) =>
+          cardFor(name)?.querySelector('.tool-status')?.textContent?.trim() ?? ''
+        const nameOf = (name: string) => cardFor(name)?.querySelector('.tool-name')?.textContent?.trim() ?? ''
+        const outOf = (name: string) => cardFor(name)?.querySelector('.tool-out')?.textContent ?? ''
+        // A card's body arrives with the turn's rows, and a re-render can replace the live card a
+        // beat after `turnEnd`. Polling for the line is the honest version of "the card says what
+        // the server said": a single sample can read a card that has not been filled yet and
+        // report a fault the app does not have.
+        const waitOut = async (name: string, needle: RegExp, budgetMs = 12000) => {
+          const dl = performance.now() + budgetMs
+          while (performance.now() < dl) {
+            const t = outOf(name)
+            if (needle.test(t)) return t
+            await new Promise((r) => setTimeout(r, 150))
+          }
+          return outOf(name)
+        }
+
+        const reasoningWas = hostState?.reasoning ?? ''
+        const modeWas = hostState?.mode ?? ''
+        const personaWas = hostState?.persona ?? ''
+        let okLine = ''
+        let sid = 0
+
+        const run = async () => {
+          // Cowork, because `explore` is a cowork tool and Chat mode mounts nothing; ask mode,
+          // because the per-call prompt is half of what is being claimed; no thinking, because
+          // this group spends four turns on the rust core. All three are shared state and are
+          // restored in the `finally` below whether the claims passed or failed.
+          await invoke('set_persona', { persona: 'cowork' }).catch(() => null)
+          await invoke('set_reasoning', { level: 'off', persist: true })
+          await invoke('set_mode', { mode: 'ask' })
+
+          const st = await invoke<McpStatus>('mcp_status').catch(() => null)
+          if (!st) return fail('mcp_status answered nothing: nothing can say whether a server is running')
+          if (st.configured < 2)
+            return fail(`the harness asked for two servers ([fake] live, [dead] exiting) and the app read ${st.configured}`)
+          if (st.catalog_body_bytes > st.catalog_budget)
+            return fail(
+              `the tool list is ${st.catalog_body_bytes}B against a ${st.catalog_budget}B budget on the list`,
+            )
+          if (st.catalog_bytes !== st.catalog_body_bytes + st.catalog_lead_bytes)
+            return fail(
+              `the status says the block is ${st.catalog_bytes}B made of ${st.catalog_body_bytes}B + ${st.catalog_lead_bytes}B — ` +
+                'the numbers do not add up to what the prompt pays',
+            )
+          if (st.catalog_lead_bytes > 512)
+            return fail(`the fixed catalog sentence costs ${st.catalog_lead_bytes}B on every prompt`)
+
+          // The settings page answers "is it running?" from the same seam the app started servers
+          // in, so a page reading the config file could not claim a server the process lost.
+          openSettings('tools')
+          await new Promise((r) => setTimeout(r, 700))
+          const sect = document.querySelector('[data-set-section="mcp"]')
+          if (!sect) {
+            closeSettings()
+            return fail('Settings › Workspace has no third-party tools section')
+          }
+          const pageServers = Array.from(sect.querySelectorAll('[data-mcp-server]')).map(
+            (e) => (e as HTMLElement).dataset.mcpServer ?? '',
+          )
+          const pageBytes = sect.querySelector('[data-mcp-bytes]')?.textContent?.trim() ?? ''
+          const pageHidden = sect.querySelector('[data-mcp-hidden]')?.textContent?.trim() ?? ''
+          const unmounted = sect.querySelector('[data-mcp-unmounted]')?.textContent?.trim() ?? ''
+          closeSettings()
+
+          if (core === 'pi') {
+            // The pi core's tool host is one process per call, so a server it started would be a
+            // new server on every call. The claim here is that the app says so instead of showing
+            // an empty list, and that a model on that core is not told about servers it cannot use.
+            if (st.mounted)
+              return fail('mcp_status says the pi core mounted MCP tools; it cannot — cwtool is one process per call')
+            if (!/pi core|this core does not mount/i.test(st.why))
+              return fail(`the unmounted page says ${JSON.stringify(st.why)} instead of naming the core and why`)
+            if (!unmounted) return fail('the MCP settings section draws no explanation of why nothing is mounted')
+            if (st.configured > 0 && !/listed in the config file|config file/i.test(sect.textContent ?? ''))
+              return fail('two servers are configured and the page says nothing about them being unmounted')
+            if (!(pageServers.length === 0 && pageBytes === ''))
+              return fail(
+                `an unmounted core draws ${pageServers.length} server row(s) and a ${pageBytes || '0B'} byte readout`,
+              )
+            const invPi = await invOf()
+            if (!invPi.error)
+              return fail(
+                `tool_inventory answered ${JSON.stringify(invPi)} on the pi core, where the model process decides the list; ` +
+                  'empty lists would read as "nothing is hidden"',
+              )
+            if (!/model process|cannot report/i.test(invPi.error))
+              return fail(`the pi core's inventory refusal says ${JSON.stringify(invPi.error)}`)
+
+            if (!(await firstTurn('MCP NONE: look up a third-party tool')))
+              return fail('the pi-core "no MCP server" turn never ended')
+            // The scenario's `require` strings are checked by the mock endpoint against the bytes
+            // this app put into the request, so a red there means the engine's own refusal never
+            // reached the model — which is the failure that would leave it inventing a server.
+            const out = await waitOut('explore', /No MCP server is running|tool\(s\) fit/)
+            if (!/No MCP server is running/.test(out))
+              return fail(`explore on the pi core said ${JSON.stringify(out.slice(0, 120))} instead of saying nothing is running`)
+            okLine =
+              `mcp ok (${core || 'running'} core: ${st.configured} servers are configured and nothing is mounted, ` +
+              `the page says why in ${JSON.stringify(st.why.slice(0, 46))}… rather than showing an empty list, ` +
+              `the inventory refuses instead of answering with two empty lists, and explore told the model ` +
+              'there is no server to look up'
+            return ''
+          }
+
+          if (!st.mounted)
+            return fail(`the rust core did not mount the two configured servers: ${JSON.stringify(st.why)}`)
+          const names = st.servers.map((s) => s.name).sort()
+          if (names.join(',') !== 'dead,fake') return fail(`the servers the app reports are ${names.join(', ')}`)
+          if (!pageServers.sort().join(',').includes('fake'))
+            return fail(`the settings page lists ${pageServers.join(', ')} and not the server that is running`)
+          // The page's two numbers are the engine's two numbers. A settings row that rounded,
+          // summed or invented either one is a row that cannot be reconciled with the log.
+          if (pageBytes !== `${st.catalog_body_bytes}B`)
+            return fail(`the page prints ${pageBytes} for the tool list and the engine says ${st.catalog_body_bytes}B`)
+          if (!(sect.textContent ?? '').includes(`${st.catalog_bytes}B`))
+            return fail(`the page never states the ${st.catalog_bytes}B the prompt actually pays`)
+          // At startup the exiting server *is* alive: it answered `initialize` and `tools/list`
+          // and then closed its pipes. A catalog that called it dead here would be wrong about
+          // the one thing it is describing, and the state that matters is what a call finds.
+          if (st.servers.some((sv) => !/live/.test(sv.says)))
+            return fail(`a server that answered the list reads ${JSON.stringify(st.servers.map((x) => x.says))}`)
+
+          // The whole economy of the feature, measured on the registry that builds the request:
+          // server tools exist and are withheld, and the declared list carries no MCP name until
+          // someone asks. If `defs()` leaked hidden tools this is the claim that goes red.
+          const inv0 = await invOf()
+          if (inv0.error) return fail(`tool_inventory refused on the rust core: ${inv0.error}`)
+          const leaked = inv0.declared.filter((n) => n.startsWith('mcp__'))
+          if (leaked.length)
+            return fail(`hidden MCP tools leaked into the declared list before anything asked: ${leaked.join(', ')}`)
+          if (!inv0.hidden.some((n) => n.startsWith('mcp__fake__t1')))
+            return fail(`the withheld list holds ${inv0.hidden.slice(0, 4).join(', ')} and not mcp__fake__t1`)
+          if (pageHidden !== String(inv0.hidden.length))
+            return fail(`the page says ${pageHidden} tools are withheld and the registry says ${inv0.hidden.length}`)
+
+          if (await bytesOf(noteFile)) return fail(`${noteFile} already exists before the turn; the run is not clean`)
+
+          const t1 = await turnCount()
+          newSession()
+          draft = 'MCP LAZY: write a note through a third-party tool'
+          await send()
+          for (let i = 0; i < 60 && !sid; i++) {
+            const stt = await invoke<{ session_id: number }>('session_state').catch(() => null)
+            sid = viewId ?? transcript?.sessionId ?? stt?.session_id ?? 0
+            await new Promise((r) => setTimeout(r, 120))
+          }
+          if (!sid) return fail('the lazy MCP turn never produced a conversation to read cards from')
+          if (viewId !== sid) await useSession(sid)
+          if (!(await cardUp(12000))) {
+            return fail('an MCP call raised no approval card — the per-call prompt, which is the safety half, is not happening')
+          }
+          // The card's two halves: the headline names the tool, the body is the engine's one-line
+          // summary, which for a third-party call leads with the server.
+          const summary = document.querySelector('.approval-card .appr-body')?.textContent ?? ''
+          const headTxt = document.querySelector('.approval-card .text-warn')?.textContent?.trim() ?? ''
+          if (!/^MCP server fake:/i.test(summary.trim()))
+            return fail(`the approval card leads with ${JSON.stringify(summary.slice(0, 90))} instead of naming the server`)
+          if (!headTxt.includes('mcp__fake__write_note'))
+            return fail(`the card's headline is ${JSON.stringify(headTxt)} and does not carry the tool name`)
+          // Allow *for the conversation*, so the second call below is tested against a grant that
+          // really exists rather than against nothing.
+          if (!answerCard('session'))
+            return fail('the "Allow for session" button is not in the approval card')
+          if (!(await waitTurnDone(t1))) return fail('the lazy MCP turn never ended')
+
+          // The file, not the card: a server that only produced a plausible tool result would
+          // leave nothing on disk, and the point of a third-party tool is that it really acts.
+          const wrote = await bytesOf(noteFile)
+          if (!wrote || !wrote.text.includes('written through the fake server'))
+            return fail(
+              `the MCP call reported success but ${noteFile} holds ${JSON.stringify(wrote?.text ?? 'nothing')} — no bytes came from the server`,
+            )
+          const cardTxt = await waitOut('mcp__fake__write_note', /wrote /)
+          if (!/wrote /.test(cardTxt)) {
+            const all = Array.from(document.querySelectorAll<HTMLElement>('.blk-tool[data-tool="mcp__fake__write_note"]')).map(
+              (e) => `${e.className}:${(e.querySelector('.tool-out')?.textContent ?? '-').replace(/\s+/g, ' ').slice(0, 40)}`,
+            )
+            return fail(
+              `the tool card says ${JSON.stringify(cardTxt.slice(0, 80))} instead of the server's own line; ` +
+                `cards in the page: [${all.join(' | ')}], turns=${document.querySelectorAll('.turn').length}`,
+            )
+          }
+          if (!/third-party · fake/.test(nameOf('mcp__fake__write_note')))
+            return fail(`the card header reads ${JSON.stringify(nameOf('mcp__fake__write_note'))} and hides which server ran`)
+
+          // And the ask made it callable in the same conversation: the declared list now carries
+          // the name, which is what the next round trip would send to the endpoint.
+          const inv1 = await invOf()
+          if (inv1.error) return fail(`tool_inventory refused after the reveal: ${inv1.error}`)
+          if (!inv1.declared.includes('mcp__fake__write_note'))
+            return fail(
+              `explore named mcp__fake__write_note and the declared list is still ${inv1.declared.length} tools with no MCP name in it`,
+            )
+          if (!inv1.hidden.includes('mcp__fake__t1'))
+            return fail('revealing one tool withheld the whole server: the rest of its tools left the withheld list')
+
+          // Per call, even after a yes for the same tool. This is the one place a remembered grant
+          // must not reach, because a grant for `exec` is about the workspace and a server's reach
+          // is whatever its own program can do.
+          const t2 = await turnCount()
+          await moreTurn('MCP AGAIN: write the same note through a third-party tool')
+          if (!(await cardUp(12000)))
+            return fail(
+              'the second MCP call ran without asking, after a yes for the same tool — a session grant covered a third-party call',
+            )
+          if (!answerCard('deny')) return fail('the Deny button is not in the approval card')
+          if (!(await waitTurnDone(t2))) return fail('the denied MCP turn never ended')
+          const denyTxt = await waitOut('mcp__fake__write_note', /denied|refus|failed/i)
+          if (!/denied|refus/i.test(statusOf('mcp__fake__write_note') + denyTxt))
+            return fail(
+              `a denied MCP call reads ${JSON.stringify(statusOf('mcp__fake__write_note'))} on its card instead of saying it was refused`,
+            )
+          const afterDeny = await bytesOf(noteFile)
+          if (!afterDeny || afterDeny.text !== wrote.text)
+            return fail('a denied MCP call still wrote through the server')
+
+          // A server that answered `tools/list` and then closed its pipes: the catalog is real, so
+          // the model reaches for it, and what comes back has to name the server rather than hang.
+          const t3 = await turnCount()
+          await moreTurn('MCP DEAD: echo something through a third-party tool')
+          if (!(await cardUp(12000))) return fail('the dead-server MCP call raised no approval card')
+          if (!answerCard('allow')) return fail('the Allow button is not in the approval card')
+          if (!(await waitTurnDone(t3, 180000))) return fail('the dead-server turn never ended — a dead server hung the turn')
+          const deadOut = await waitOut('mcp__dead__t1', /MCP server dead/, 20000)
+          if (!/MCP server dead/.test(deadOut))
+            return fail(
+              `a call into a server whose process had gone came back as ${JSON.stringify(deadOut.slice(0, 140))} ` +
+                'instead of a sentence naming that server',
+            )
+          if (/^ok$/.test(statusOf('mcp__dead__t1')))
+            return fail('a dead server answered the call with ok')
+          // The status page follows the process, not the startup log: after a call found the
+          // pipes closed, a row still reading "live" is a page describing a server it is not
+          // describing any more.
+          const st2 = await invoke<McpStatus>('mcp_status').catch(() => null)
+          if (!st2) return fail('mcp_status stopped answering after a call into a dead server')
+          const deadNow = st2.servers.find((sv) => sv.name === 'dead')?.says ?? ''
+          if (!/dead/.test(deadNow))
+            return fail(
+              `a call into the server found its pipes closed and the page still reads ${JSON.stringify(deadNow)}`,
+            )
+          if (!st2.mounted)
+            return fail('one dead server unmounted the whole hub: the live server is gone from the status')
+
+          okLine =
+            `mcp ok (${core || 'running'} core: two servers started and their ${inv0.hidden.length} tools stay withheld ` +
+            `while the declared list carries no MCP name, the catalog's tool list is ${st.catalog_body_bytes}B under ` +
+            `its ${st.catalog_budget}B ceiling (${st.catalog_bytes}B on every prompt with the sentence around it), ` +
+            `the card led with "MCP server fake" and the file the server wrote ` +
+            `is on disk with its words in it, explore's answer made that tool declared in the same turn, the next ` +
+            `call asked again and Deny moved nothing, and a call into the server that had exited came back naming ` +
+            'it rather than hanging'
+        }
+
+        try {
+          await run()
+        } finally {
+          if (personaWas) await invoke('set_persona', { persona: personaWas }).catch(() => null)
+          if (reasoningWas) await invoke('set_reasoning', { level: reasoningWas, persist: true }).catch(() => null)
+          if (modeWas) await invoke('set_mode', { mode: modeWas }).catch(() => null)
+          // The server wrote outside the tool sandbox by design — its own program decided where.
+          // The scratch workspace is deleted with the run, but a `--real-endpoint` run points at a
+          // folder of yours, so the file the check provoked goes away the way any other file does.
+          const ws = (await invoke<{ workspace: string }>('session_state').catch(() => null))?.workspace ?? ''
+          if (ws.includes('cwoffee-selftest.')) await invoke('selftest_write_file', { path: noteFile, text: '' }).catch(() => null)
+          toast = null
+        }
+        if (okLine) pageLog(okLine)
+      }
+
+
       // --- a picture pasted off the desktop, sent, and seen at all three places --
       //
       // "Pasting an image into the composer seems like the file is attached, but when you send,
@@ -19150,6 +19545,67 @@
     </p>
   {/snippet}
 
+  {#snippet mcpBody()}
+    {#if mcpErr}
+      <div class="smsg bad" data-mcp-error>{mcpErr}</div>
+    {/if}
+    {#if mcpNow}
+      {#if mcpNow.mounted}
+        <div class="mcpsum" data-mcp-summary>
+          <span class="mcp-n" data-mcp-tools>{mcpNow.tools}</span>
+          tool{mcpNow.tools === 1 ? '' : 's'} from
+          <span class="mcp-n">{mcpNow.servers.length}</span>
+          server{mcpNow.servers.length === 1 ? '' : 's'}. The list of names costs
+          <span class="mcp-n" data-mcp-bytes>{mcpNow.catalog_body_bytes}B</span> of the
+          {mcpNow.catalog_budget}B it is allowed to take, and
+          <span class="mcp-n">{mcpNow.catalog_bytes}B</span> goes into every prompt with the
+          sentence that says how to use it.
+        </div>
+        <div class="mcprows" data-mcp-rows>
+          {#each mcpNow.servers as sv (sv.name)}
+            <div class="mcprow" data-mcp-server={sv.name}>
+              <code class="mcp-name">{sv.name}</code>
+              <span class="mcp-says">{sv.says}</span>
+            </div>
+          {:else}
+            <div class="smsg">Nothing configured, so nothing was started.</div>
+          {/each}
+        </div>
+        {#if mcpInv}
+          <div class="mcpsum" data-mcp-inventory>
+            <span class="mcp-n" data-mcp-hidden>{mcpInv.hidden.length}</span> of the
+            {mcpInv.hidden.length + mcpInv.declared.length} tool names this core knows are
+            withheld from the model until `explore` names them
+            {mcpInv.hidden.length ? ` (${mcpInv.hidden.slice(0, 3).join(', ')}${mcpInv.hidden.length > 3 ? ', …' : ''})` : ''}.
+          </div>
+        {/if}
+        <p class="set-note">
+          The list above is what each server answered when it was started, not what the config file
+          asked for. A server that did not answer is listed as dead with the reason it gave, and a
+          call into it says so instead of waiting. Servers are declared as
+          <span class="mono">[mcp.servers.&lt;name&gt;]</span> in
+          <span class="mono">{mcpNow.config_path}</span>. This page reads them; it does not start or
+          stop them — a program somebody else wrote should not be launched by a click on a settings
+          row, and a server whose process is gone is not something a button can bring back.
+        </p>
+      {:else}
+        <div class="smsg" data-mcp-unmounted>
+          {mcpNow.why || 'No third-party server is running in this start.'}
+        </div>
+        {#if mcpNow.configured > 0}
+          <p class="set-note">
+            {mcpNow.configured} server{mcpNow.configured === 1 ? ' is' : 's are'} listed in the
+            config file and none is mounted here. Nothing calls them, and the model is not told
+            about them — a catalog naming servers nobody started would have the model reach for
+            tools that cannot answer.
+          </p>
+        {/if}
+      {/if}
+    {:else}
+      <div class="smsg">Reading it from the engine…</div>
+    {/if}
+  {/snippet}
+
   {#snippet reasoningBody()}
     <Segmented
       aria="Thinking effort"
@@ -20427,6 +20883,14 @@
                 a control that changed nothing would be worse than no control. What may run without
                 asking is set below, and where files may be written is set by the folder.
               </p>
+            </Section>
+
+            <Section
+              id="mcp"
+              title="Third-party tools (MCP)"
+              desc="Programs other people wrote, started by this app, speaking MCP over a pipe. Their tools are registered but hidden: the model sees a short list of names, and a tool is only declared and callable after `explore` names it. Each call asks you, and a session grant never covers one."
+            >
+              {@render mcpBody()}
             </Section>
 
             <Section

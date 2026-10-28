@@ -186,11 +186,13 @@ impl ApprovalGate {
         }
         // Session scope is honoured in both prompting modes: it is an explicit
         // user choice ("auto for session" in the composer), not a mode setting.
-        // A session grant is about the *tool*, so it never covers an escape: the
-        // thing being agreed to there is a specific path, and remembering that
-        // for the rest of the session would turn one yes into unlimited access
-        // outside the workspace.
-        if self.session_allowed.contains(tool) && risk.escapes.is_empty() {
+        // Two things it never covers. An escape is one of them: the thing being
+        // agreed to there is a specific path, and remembering that for the rest
+        // of the session would turn one yes into unlimited access outside the
+        // workspace. The other is a call a tool marks `per_call` — MCP calls do,
+        // because a grant remembered for `exec` is a grant about the workspace,
+        // and a server's reach is whatever its own program can do.
+        if self.session_allowed.contains(tool) && risk.escapes.is_empty() && !risk.per_call {
             return GateOutcome::Allow;
         }
 
@@ -329,6 +331,14 @@ fn deny_at(hay: &str, needle: &str) -> bool {
 /// "allow reading /home/me/.ssh/id_ed25519?" can.
 pub fn summarize_with(tool: &str, args: &serde_json::Value, escapes: &[String]) -> String {
     let base = summarize(tool, args);
+    // A third-party call leads with whose program is about to run. The name is the namespace
+    // (`mcp__<server>__<tool>`), but a person reading `mcp__jira__create_issue` should not have
+    // to decode a naming scheme to learn that a program they installed is being asked to act —
+    // and this is the one place both transports render the same sentence.
+    let base = match crate::mcp::server_of(tool) {
+        Some(server) => format!("MCP server {server}: {base}"),
+        None => base,
+    };
     if escapes.is_empty() {
         return base;
     }
@@ -589,6 +599,7 @@ mod tests {
         let esc = CallRisk {
             level: Risk::Sensitive,
             escapes: vec!["/home/me/.ssh/id_ed25519".into()],
+            per_call: false,
         };
         let out = {
             let (mut otx, mut orx) = mpsc::unbounded_channel();

@@ -261,10 +261,11 @@ async fn main() -> anyhow::Result<()> {
     if core != "rust" && core != "pi" {
         anyhow::bail!("unknown --core {core:?} (rust or pi)");
     }
-    let (host, receivers, questions): (
+    let (host, receivers, questions, mcp_hub): (
         Arc<dyn HostOps>,
         Option<(EventIn, ApprovalIn)>,
         Option<QuestionIn>,
+        Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>>,
     ) = if core == "pi" {
         // pi selects a model by provider+model out of its own provider file, so an
         // empty model is not "ask the endpoint" the way it is for the Rust core. It is
@@ -522,14 +523,44 @@ async fn main() -> anyhow::Result<()> {
         );
         let receivers = host.take_receivers();
         let questions = host.take_questions();
-        (Arc::new(host) as Arc<dyn HostOps>, receivers, questions)
+        // No hub on the pi core, carried as a value so `mcp_status` can say why it is empty
+        // instead of reporting an empty list as if nothing were configured.
+        (Arc::new(host) as Arc<dyn HostOps>, receivers, questions, None)
     } else {
-        let mut host = SessionHost::spawn(
-            provider,
-            Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg()),
-            Arc::clone(&store),
-            cfg,
-        );
+        // Third-party MCP servers, on the same terms as in the desktop app: started
+        // sequentially, each bounded, dead ones reported rather than hung on, and installed into
+        // the registry hidden. The gateway is the transport a phone uses, and a person who
+        // configured a server means the phone to have it too — a catalog that exists only in the
+        // window would make "which device am I on" decide whether the tools exist.
+        let mcp_cfg = appcfg.mcp_cfg();
+        if let Err(e) = Config::mcp_problem(&mcp_cfg) {
+            eprintln!("[cwoffee] bad [mcp] config: {e}");
+            std::process::exit(1);
+        }
+        let mut reg = Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg());
+        let mcp: Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>> =
+            if mcp_cfg.has_servers() {
+                let hub = Arc::new(tokio::sync::Mutex::new(
+                    cwoffee_engine::mcp::Hub::start(&mcp_cfg).await,
+                ));
+                for (name, line) in hub.lock().await.servers_named() {
+                    println!("[cwoffee] mcp {name}: {line}");
+                }
+                cfg.mcp_catalog = hub.lock().await.catalog_block();
+                let catalog = hub.lock().await.catalog();
+                // Hidden behind `explore`, exactly as in the desktop app: configured servers must
+                // not put their schemas into every prompt on either transport.
+                cwoffee_engine::mcp::install_into(&mut reg, &catalog, &hub);
+                println!("[cwoffee] mcp: {} third-party tool(s) registered, hidden behind explore", catalog.len());
+                Some(hub)
+            } else {
+                if !mcp_cfg.servers.is_empty() {
+                    println!("[cwoffee] [mcp] lists {} server(s), none enabled; nothing started", mcp_cfg.servers.len());
+                }
+                None
+            };
+        // The engine spawns tasks, so the host is built inside tokio — which this function is.
+        let mut host = SessionHost::spawn(provider, reg, Arc::clone(&store), cfg);
         // Receivers can only be taken once and need &mut, so take them before the host
         // goes behind the Arc the gateway shares. A second consumer would silently
         // split one event stream.
@@ -541,7 +572,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("[cwoffee] using the endpoint's first model: {m}");
             }
         }
-        (host as Arc<dyn HostOps>, receivers, questions)
+        (host as Arc<dyn HostOps>, receivers, questions, mcp)
     };
 
     // The host's receivers are taken once and fanned out to every connected
@@ -615,6 +646,7 @@ async fn main() -> anyhow::Result<()> {
         clients: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         migration_notes,
         config_path,
+        mcp: mcp_hub,
     });
 
     cwoffee_gateway::serve(gw, handle).await.map_err(|e| anyhow::anyhow!("{e}"))

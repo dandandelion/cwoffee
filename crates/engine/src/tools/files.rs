@@ -102,8 +102,7 @@ impl Tool for ReadFileTool {
         match escapes_workspace(ctx, raw) {
             Some(out) => CallRisk {
                 level: Risk::Sensitive,
-                escapes: vec![out],
-            },
+                escapes: vec![out], ..Default::default() },
             None => CallRisk::harmless(),
         }
     }
@@ -336,8 +335,7 @@ impl Tool for WriteFileTool {
         if let Some(out) = escapes_workspace(ctx, &dest) {
             return CallRisk {
                 level: Risk::Sensitive,
-                escapes: vec![out],
-            };
+                escapes: vec![out], ..Default::default() };
         }
         match resolve_path(ctx, &dest) {
             Some(p) if p.exists() => CallRisk::at(Risk::Workspace),
@@ -512,8 +510,7 @@ impl Tool for EditFileTool {
         match escapes_workspace(ctx, raw) {
             Some(out) => CallRisk {
                 level: Risk::Sensitive,
-                escapes: vec![out],
-            },
+                escapes: vec![out], ..Default::default() },
             None => CallRisk::at(Risk::Workspace),
         }
     }

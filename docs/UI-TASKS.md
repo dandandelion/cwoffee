@@ -2169,3 +2169,112 @@ appears quietly is a failure rather than a feature.
 (`selftest_file_bytes`, `selftest_write_file`) print the usual "gateway has no such verb" note, which is
 correct — they exist so the page-side check can read bytes off disk, and they are confined to the
 conversation's folder.
+
+## Feature 3: MCP via lazy exposure — third-party tools that cost nothing until asked
+
+The prompt file said MCP stays unbuilt "until it costs the prompt almost nothing". Two things make a
+third-party tool expensive, and they are not the same thing: a server's tool list can be hundreds of
+lines of JSON schema sitting in every request forever, and the tool is *somebody else's program*
+running on this machine. Lazy exposure answers the first with a budget and the second with an ask.
+
+Three rules decided the shape:
+
+1. **Registered is not declared.** Server tools go into the registry as hidden: `Registry::defs()`
+   filters them, so a request carries no `mcp__` name until `explore` looks it up. The model sees one
+   sentence in the `<env>` block naming the servers and what they offer. Env and not the system
+   prompt: env is rewritten every turn anyway, so adding a server does not permanently edit a cache
+   prefix that was priced before it existed.
+2. **`explore` is the only door, and its promise is literally true.** `need: "mcp: …"` searches the
+   host's *actual* hidden tools (`ToolCtx::lazy_tools`), and the tools it returns are declared on the
+   next provider round-trip of the same turn — so "callable from your next call on" means the next
+   call, in this turn, measured in the selftest by `tool_inventory` gaining exactly the tool explore
+   named. Rebuild-a-registry-inside-explore would have lost startup servers and said "no servers".
+3. **Every call asks.** `CallRisk::per_call` is a fact about whose program it is, not a risk level:
+   an "allow for this conversation" remembered for `exec` does not cover it, and the gate's session
+   shortcut requires `!per_call`. A server's `readOnlyHint` may lower the bar to workspace-sensitive;
+   `risk_of()` never returns `Harmless`, in one place.
+
+What the surface says, and why:
+
+* **The catalog says what it left out.** `CATALOG_BYTE_BUDGET` is 1024 bytes on the *tool list body*;
+  the explanatory sentence around it is fixed and reported separately (`catalog_body_bytes`,
+  `catalog_lead_bytes`, `catalog_bytes`). A truncated catalog ends with "… and N more tool(s) not
+  listed here: ask `explore` with `mcp:` to search all of them", because a cut-off list presented as
+  complete teaches the model that the door is not there.
+* **The approval card leads with the program, not the namespace.** `MCP server fake:
+  mcp__fake__write_note …`, since a person deciding in two seconds should not have to decode
+  `mcp__<server>__<tool>`. Paths in the arguments that resolve outside the workspace are named on the
+  card as an escape — an approval, not a sandbox promise: MCP servers enforce nothing.
+* **A dead server is a sentence.** Timeouts come from `[mcp] timeout_secs` (approvals reuse the
+  app's `approval_timeout_secs`); a call into a server whose pipes closed answers within the timeout
+  naming the server, and the status then says `dead`. Nothing in this feature can hang a turn.
+* **Settings › Workspace › Third-party tools is status, not a control.** "Is what I configured
+  actually running?", per server, plus the byte counts and the declared/withheld split — and it
+  re-reads config and re-applies `CWOFFEE_MCP_SERVERS`, because a page that reads only the file tells
+  a systemd user that none are configured. No button launches somebody else's program.
+* **A tool card names the server instead of repeating the tense.** `third-party · fake`; the status
+  chip already says working/done/failed, and which server ran is the fact a reader cannot re-derive.
+* **A refused call says who refused.** A denied MCP call used to close as a bare "failed". The card
+  now carries `denied by you (…)` or `blocked by the denylist: …` — the one state where "who said no"
+  changes what the reader does next.
+* **The pi core says it cannot mount MCP, rather than showing an empty list.** `cwtool` is one
+  process per tool call, so a server it spawned would be born and die around each call; there is no
+  process in the pi core that can hold a server open. `mcp_status` answers `mounted: false` with the
+  reason, `tool_inventory` answers with an **error** instead of `{declared: [], hidden: []}` — two
+  empty lists would claim nothing is hidden about something that side cannot observe.
+
+Lessons that came out of building it:
+
+* **Grading the wrong number fails a correct engine.** The first byte gate compared the whole block
+  with the budget and went red on a healthy build: `the catalog costs 1051B against a 1024B budget`.
+  The budget is about what a server can grow, so it applies to the body; the total is still reported,
+  because the prompt pays the total.
+* **Every status field a page prints has to exist on every branch.** `undefinedB + undefinedB` is
+  what an unmounted payload produced once the page started printing the two parts: the `mounted:
+  false` arm had `catalog_bytes` and not the two halves. Arithmetic a reader can check is a promise
+  the payload has to keep while reporting nothing.
+* **Server names are validated, not sanitised.** `mcp__<server>__<tool>` has to be parseable in one
+  direction, so a name containing `__`, or a name that cannot be a tool-name segment, is refused at
+  startup (`Config::mcp_problem`) rather than rewritten into something the reader would not recognise.
+* **`--die` has no timer.** A server that exits after a delay lets a fast machine win a race and
+  report live. Exiting immediately after `tools/list` makes "the pipes are closed" deterministic, and
+  matches what a real crashing server does.
+* **A card claim needs the card that belongs to the turn being claimed.** This group runs the same
+  prompt twice; a document-wide `.blk-tool[data-tool=…]` answered with the earlier turn's card, and a
+  denial claim read against the *allowed* turn passed for the wrong reason. Lookups take the newest
+  matching card and poll for the line, because a re-render can replace a live card a beat after
+  `turnEnd`.
+* **`Allow` is not a session grant.** The first per-call sabotage looked caught by an unrelated card
+  failure because the selftest had answered `Allow` — which grants nothing. The claim only tests what
+  it claims once the card is answered with *Allow for session*.
+* **Startup spawns belong inside the runtime.** Deciding whether to spawn happens before
+  `tauri::async_runtime::block_on`; `Hub::start(...).await` happens inside it. Calling `await` from
+  synchronous `main` is `error[E0728]`, and the decision is deliberately outside so a bad `[mcp]`
+  block exits with a message naming the config file instead of after a window exists.
+
+Receipts, from the run that shipped it:
+
+```text
+mcp ok (rust core: two servers started and their 8 tools stay withheld while the declared list carries
+no MCP name, the catalog's tool list is 765B under its 1024B ceiling (1051B on every prompt with the
+sentence around it), the card led with "MCP server fake" and the file the server wrote is on disk with
+its words in it, explore's answer made that tool declared in the same turn, the next call asked again
+and Deny moved nothing, and a call into the server that had exited came back naming it rather than
+hanging)
+mcp ok (pi core: 2 servers are configured and nothing is mounted, the page says why in "this core does
+not mount MCP tools: its tool h"… rather than showing an empty list, the inventory refuses instead of
+answering with two empty lists, and explore told the model there is no server to look up
+```
+
+Falsified, each red then restored:
+
+- `Registry::defs()` including hidden tools -> `hidden MCP tools leaked into the declared list before
+  anything asked: mcp__dead__t1, mcp__dead__t2, mcp__dead__boom, mcp__fake__t1, ...`
+- `per_call: false` on MCP risk -> `the second MCP call ran without asking, after a yes for the same
+  tool — a session grant covered a third-party call`
+- catalog body over budget / status arithmetic -> the byte claims above.
+
+`cargo test --workspace`: 571 engine tests plus bridge, gateway (42), store and the rest, 0 failures.
+`npx svelte-check`: 0 errors, 0 warnings. `node scripts/wire-names.mjs`: OK — `mcp_status` and
+`tool_inventory` graded on both hosts. Scenarios: 51.
+

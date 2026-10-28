@@ -187,7 +187,43 @@ network = "proxy"
 max_mb_per_call = 512
 
 # ---------------------------------------------------------------------------
+# [mcp] - third-party tool servers (optional; rust core only)
+# ---------------------------------------------------------------------------
+# cwoffee spawns each server at startup, talks MCP over its stdin/stdout, and keeps
+# a name plus one-line description of each of its tools inside a 1024-byte catalog
+# in the environment block. Its tools are NOT callable until the model looks them up
+# with `explore` (`need: "mcp: ...`), and every call into one asks you first: an
+# "allow for this conversation" given to another tool does not cover a server.
+# The server's own `readOnlyHint` can lower the bar to workspace-sensitive; it can
+# never make a call harmless.
+#
+# A server name becomes part of every tool name (`mcp__<server>__<tool>`), so it is
+# validated rather than sanitised: letters, digits, `-`, `_`, no `__`. A name that
+# cannot work stops the start with a message instead of being quietly rewritten.
+#
+# [mcp]
+# enabled = true
+# timeout_secs = 20          # handshake and per-call timeout; approvals use
+#                            # approval_timeout_secs above, not a number invented here
+#
+# [mcp.servers.myserver]
+# command = "my-mcp-server"
+# args = ["--stdio"]
+# enabled = true
+#
+# Per-server environment, if the server needs it:
+# [mcp.servers.myserver.env]
+# JIRA_URL = "https://issues.example.com"
+#
+# Without touching this file, for one process:
+#   CWOFFEE_MCP_SERVERS='{"myserver":{"command":"my-mcp-server","args":["--stdio"]}}'
+# That replaces the servers listed here rather than merging with them, and a status
+# page that read only this file would tell you none are configured - so the status
+# re-reads the file and then applies the environment.
+
+# ---------------------------------------------------------------------------
 # Environment overrides (no config keys - these win over the file)
 # ---------------------------------------------------------------------------
 #   CWOFFEE_URL, CWOFFEE_MODEL, CWOFFEE_KEY, CWOFFEE_WORKSPACE, CWOFFEE_MODE,
-#   CWOFFEE_CONTEXT, CWOFFEE_SEARXNG_URL, CWOFFEE_APPROVAL_TIMEOUT_SECS
+#   CWOFFEE_CONTEXT, CWOFFEE_SEARXNG_URL, CWOFFEE_APPROVAL_TIMEOUT_SECS,
+#   CWOFFEE_MCP_SERVERS (replaces the [mcp.servers] table)

@@ -88,7 +88,8 @@ stripped from the address bar.
 Two roles, enforced server-side per command:
 
 * **watch** - `session_state`, `list_sessions`, `session_messages`, `message_attachments`,
-  `search_messages`, `migration_notes`, `list_workspaces`, `about`. Read-only.
+  `search_messages`, `migration_notes`, `list_workspaces`, `about`, `checkpoint_preview`,
+  `mcp_status`, `tool_inventory`. Read-only.
 * **drive** - everything that changes state: `start_turn`, `cancel_turn`,
   `respond_approval`, `respond_question`, `set_mode`, `set_reasoning`, `new_session`,
   `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
@@ -214,6 +215,30 @@ config, the SQLite record and - on the pi core - the directory of the model's ow
 gateway token is deliberately not in the payload, and neither are endpoint API keys: this is a
 read-only verb reachable by a watch token, and "which build am I running" must not become a way to
 read a secret.
+
+`mcp_status` takes nothing and returns `{ core, mounted, catalog_bytes, catalog_body_bytes,
+catalog_lead_bytes, catalog_budget, tools, servers, configured, config_path, why }`. It answers the
+one question a person with a `[mcp]` block actually has: *is what I wrote running?* So it reads the
+hub the app started, not the config file - a config says what was intended, a status says what
+happened - and it re-reads the config and re-applies the environment first, because
+`CWOFFEE_MCP_SERVERS` describes the same servers as `[mcp]` and a page that read only the file would
+tell someone whose servers come from a systemd unit that none exist.
+
+The three byte fields are the prompt cost, split so a page can print the part a server controls
+against the budget without hiding the sentence around it: `catalog_body_bytes` is the tool list,
+`catalog_lead_bytes` the fixed explanatory lines, `catalog_bytes` the total. They are reported even
+when nothing is mounted, and the total is always the sum of the two parts - a page that printed
+"0B made of undefinedB + undefinedB" would be reporting arithmetic it never received.
+
+It is watch-role and it is not a control surface: nothing in the reply starts or stops a server, and
+a phone has no business launching a program somebody else wrote on the desktop machine.
+
+`tool_inventory` takes nothing and returns `{ declared, hidden }` - the tool names the model was
+handed, and the names registered but withheld until `explore` looks them up. Names only: no schemas,
+no arguments, so a watcher can see the shape of the toolset without reading its payload. A core that
+decides its tool list inside the model process - the pi core - returns an **error** rather than two
+empty lists, because two empty lists would say "nothing is hidden" about something that side cannot
+observe.
 
 `new_session` takes an optional `workspace`, which the engine validates before the
 session is created; a browser can therefore start a session inside a named folder

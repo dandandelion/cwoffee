@@ -194,6 +194,10 @@ fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
         question_timeout: None,
         store,
         session: asking_session(),
+        // Nothing hidden here. MCP servers are long-lived children and this process is one
+        // tool call, so the pi core mounts no MCP tools at all and `explore` truthfully
+        // answers "no MCP server is running" rather than offering a server nobody started.
+        lazy_tools: Vec::new(),
         search_backend,
         exec_cfg: cfg_for_tools(),
         permits,

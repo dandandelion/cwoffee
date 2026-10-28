@@ -16,7 +16,6 @@
 // should still find it.
 use async_trait::async_trait;
 use super::*;
-use crate::provider::ToolDef;
 use serde_json::json;
 
 /// Search words a tool answers to, beyond its name and description.
@@ -87,14 +86,23 @@ fn risk_says(risk: Risk) -> &'static str {
 
 /// One discovery card. `body` says whether it carries the argument schema: the model asks
 /// for that when it is about to use the tool, and pays for it only then.
-fn card(reg: &Registry, d: &ToolDef, body: bool) -> Value {
+///
+/// It takes the facts rather than a registry borrow because the tools it describes do not all
+/// live in one place: the declared ones are in the registry the agent owns, and the hidden ones
+/// arrive from the caller's context.
+fn card_of(name: &str, what: &str, risk: Risk, schema: &Value, from: Option<&str>, body: bool) -> Value {
     let mut m = serde_json::Map::new();
-    m.insert("name".into(), json!(d.name));
-    m.insert("what".into(), json!(d.description));
-    let risk = reg.get(&d.name).map(|t| t.risk()).unwrap_or_default();
+    m.insert("name".into(), json!(name));
+    m.insert("what".into(), json!(what));
     m.insert("risk".into(), json!(risk_says(risk)));
+    if let Some(f) = from {
+        // `mcp__<server>__<tool>` already carries the server in the name, but a reader skimming
+        // a card should not have to parse a name to know which program they are being asked to
+        // approve.
+        m.insert("from".into(), json!(f));
+    }
     if body {
-        m.insert("arguments".into(), json!(d.parameters));
+        m.insert("arguments".into(), schema.clone());
     }
     Value::Object(m)
 }
@@ -115,6 +123,14 @@ const STOPWORDS: &[&str] = &[
 
 fn useful(word: &str) -> bool {
     word.len() > 2 && !STOPWORDS.contains(&word)
+}
+
+fn words_of(needle: &str) -> Vec<String> {
+    needle
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| useful(w))
+        .map(|w| w.to_string())
+        .collect()
 }
 
 fn score(name: &str, description: &str, needle: &str, words: &[String]) -> i64 {
@@ -151,24 +167,66 @@ fn score(name: &str, description: &str, needle: &str, words: &[String]) -> i64 {
 /// Rank the registry against a phrase. An empty query means the whole set, in registry
 /// order — which is also how the host can ask "what exists at all".
 pub fn discover(reg: &Registry, query: &str, limit: usize, body: bool) -> Vec<Value> {
+    discover_with(reg, &[], query, limit, body)
+}
+
+/// `discover`, plus the tools this host holds back.
+///
+/// The hidden list arrives from the caller rather than being read off the registry, because in
+/// the running app the registry belongs to the agent and `explore` runs inside a tool call it
+/// owns. `explore` used to rebuild a registry from the config — which got the exec and search
+/// policy right and silently dropped every tool the host registered at startup. That is how an
+/// app with a live MCP server answered "no MCP server is running": a search miss that was a lie
+/// about the app.
+pub fn discover_with(
+    reg: &Registry,
+    lazy: &[super::LazyTool],
+    query: &str,
+    limit: usize,
+    body: bool,
+) -> Vec<Value> {
     let q = query.trim().to_ascii_lowercase();
-    let defs = reg.defs();
+    // `mcp:` narrows the search to third-party tools, because the model often knows which
+    // provider it wants ("look this up in jira") before it knows any tool name, and searching
+    // the first-party set for that phrase returns `web_search` with a straight face.
+    let (only_mcp, needle) = match q.strip_prefix("mcp:") {
+        Some(rest) => (true, rest.trim().to_string()),
+        None => (false, q.clone()),
+    };
     let limit = limit.max(1);
-    if q.is_empty() {
-        return defs.iter().take(limit).map(|d| card(reg, d, body)).collect();
+    let words = words_of(&needle);
+
+    let mut hits: Vec<(i64, usize, Value)> = Vec::new();
+    let mut order = 0usize;
+    if !only_mcp {
+        for d in reg.defs() {
+            order += 1;
+            let risk = reg.get(&d.name).map(|t| t.risk()).unwrap_or_default();
+            let card = card_of(&d.name, &d.description, risk, &d.parameters, None, body);
+            if words.is_empty() {
+                hits.push((1, order, card));
+                continue;
+            }
+            let sc = score(&d.name, &d.description, &needle, &words);
+            if sc > 0 {
+                hits.push((sc, order, card));
+            }
+        }
     }
-    let words: Vec<String> = q
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| useful(w))
-        .map(|w| w.to_string())
-        .collect();
-    let mut hits: Vec<(i64, usize, Value)> = defs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| (score(&d.name, &d.description, &q, &words), i, d))
-        .filter(|(s, _, _)| *s > 0)
-        .map(|(s, i, d)| (s, i, card(reg, d, body)))
-        .collect();
+    for l in lazy.iter() {
+        order += 1;
+        // Risk comes from the tool, never from a registry lookup that defaults to Harmless: the
+        // whole point of a hidden tool is that nobody has vouched for it yet.
+        let card = card_of(&l.name, &l.description, l.risk, &l.schema, l.from.as_deref(), body);
+        if words.is_empty() {
+            hits.push((1, order, card));
+            continue;
+        }
+        let sc = score(&l.name, &l.description, &needle, &words);
+        if sc > 0 {
+            hits.push((sc, order, card));
+        }
+    }
     hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     hits.truncate(limit);
     hits.into_iter().map(|(_, _, v)| v).collect()
@@ -228,11 +286,18 @@ impl Tool for ExploreTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         // The same construction the host used, from the same config, so a card describes the
-        // tool the user actually mounted — search provider and sandbox policy and all.
+        // tool the user actually mounted — search provider and sandbox policy and all. The
+        // hidden tools come from the caller's context, because this registry cannot contain them.
         let reg = Registry::with_v1_tools_exec(ctx.search_backend.clone(), ctx.exec_cfg.clone());
-        let found = discover(&reg, &q, limit, body);
+        let found = discover_with(&reg, &ctx.lazy_tools, &q, limit, body);
+        if found.is_empty() && q.to_ascii_lowercase().starts_with("mcp:") {
+            return ToolResult::ok(
+                "No MCP server is running in this start, so there is nothing to look up there.                  Servers are configured in [mcp] in the config file and listed in the <env> block                  when they are up.".to_string(),
+            );
+        }
         if found.is_empty() {
-            let known: Vec<String> = reg.defs().into_iter().map(|d| d.name).collect();
+            let mut known: Vec<String> = reg.defs().into_iter().map(|d| d.name).collect();
+            known.extend(ctx.lazy_tools.iter().map(|l| l.name.clone()));
             return ToolResult::ok(format!(
                 "Nothing in the tool set matches {q:?}. The full set is: {}. Try different words, or ask with `need` omitted to list them all.",
                 known.join(", ")
@@ -253,7 +318,13 @@ impl Tool for ExploreTool {
             let name = f.get("name").and_then(Value::as_str).unwrap_or("?");
             let what = f.get("what").and_then(Value::as_str).unwrap_or("");
             let risk = f.get("risk").and_then(Value::as_str).unwrap_or("");
-            out.push_str(&format!("\n- {name}: {what}\n  ({risk})"));
+            let from = f.get("from").and_then(Value::as_str).unwrap_or("");
+            let tail = if from.is_empty() {
+                format!("({risk})")
+            } else {
+                format!("({risk}; {from})")
+            };
+            out.push_str(&format!("\n- {name}: {what}\n  {tail}"));
             if let Some(a) = f.get("arguments") {
                 out.push_str(&format!("\n  arguments: {a}"));
             }

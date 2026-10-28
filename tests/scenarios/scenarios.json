@@ -1732,6 +1732,150 @@
           "delay_ms": 120
         }
       ]
+    },
+    {
+      "name": "mcp-lazy",
+      "_why": "third-party tools ride lazy exposure: the model is handed a name list, not schemas, so the only way it can reach a server is to ask explore and then call what explore named. The require strings are the three links in that chain — explore's answer naming the server, the declared name the model then used, and words only the server itself can produce.",
+      "match": "MCP LAZY",
+      "steps": [
+        {
+          "reasoning": "No tool I was given writes through somebody else's program. There is a tool for finding tools.",
+          "tool_calls": [
+            {
+              "id": "mock-mcp-explore-1",
+              "name": "explore",
+              "arguments": "{\"need\":\"mcp: write a note file\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 20
+        },
+        {
+          "reasoning": "explore named mcp__fake__write_note, so it is callable now.",
+          "tool_calls": [
+            {
+              "id": "mock-mcp-write-1",
+              "name": "mcp__fake__write_note",
+              "arguments": "{\"name\":\"selftest_mcp_note.txt\",\"body\":\"written through the fake server\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 20
+        },
+        {
+          "_why": "require the chain, not the model's summary of it",
+          "require": [
+            "MCP server fake",
+            "mcp__fake__write_note",
+            "wrote ",
+            "selftest_mcp_note.txt"
+          ],
+          "content": "MCP LAZY DONE",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 10
+        }
+      ]
+    },
+    {
+      "name": "mcp-dead",
+      "_why": "a server that answered the list and then closed its pipes must come back as a sentence naming itself, not a hang and not an empty result the model reads as success.",
+      "match": "MCP DEAD",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-mcp-explore-2",
+              "name": "explore",
+              "arguments": "{\"need\":\"mcp: echo something back\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 20
+        },
+        {
+          "tool_calls": [
+            {
+              "id": "mock-mcp-dead-1",
+              "name": "mcp__dead__t1",
+              "arguments": "{\"text\":\"anything\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 20
+        },
+        {
+          "require": [
+            "MCP server dead"
+          ],
+          "content": "MCP DEAD DONE",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 10
+        }
+      ]
+    },
+    {
+      "name": "mcp-none",
+      "_why": "the pi core mounts no MCP tools, so explore has to say there is nothing to look up rather than inventing a server from the config file. The require is that sentence, which only the engine can put in the prompt.",
+      "match": "MCP NONE",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-mcp-none-1",
+              "name": "explore",
+              "arguments": "{\"need\":\"mcp: anything at all\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 20
+        },
+        {
+          "require": [
+            "No MCP server is running"
+          ],
+          "content": "MCP NONE DONE",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 10
+        }
+      ]
+    },
+    {
+      "name": "mcp-again",
+      "_why": "the same third-party call a second time, with a grant already given for the conversation. Step 2 asks for nothing: this run's second call is the one a check denies, so requiring the server's words here would make the mock refuse a turn that is supposed to show a refusal.",
+      "match": "MCP AGAIN",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-mcp-explore-3",
+              "name": "explore",
+              "arguments": "{\"need\":\"mcp: write a note file\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 15
+        },
+        {
+          "tool_calls": [
+            {
+              "id": "mock-mcp-write-2",
+              "name": "mcp__fake__write_note",
+              "arguments": "{\"name\":\"selftest_mcp_note.txt\",\"body\":\"written through the fake server\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 15
+        },
+        {
+          "content": "MCP AGAIN DONE",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 10
+        }
+      ]
     }
   ]
 }

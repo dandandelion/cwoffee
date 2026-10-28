@@ -78,6 +78,12 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: SandboxCfg,
 
+    /// Third-party MCP servers. The section is declared here because this parser rejects
+    /// unknown keys on purpose: a `[mcp]` block someone writes by hand and the reader does
+    /// not declare is a config file that stops booting, not a missing feature.
+    #[serde(default)]
+    pub mcp: crate::mcp::McpCfg,
+
     /// Sampling overrides for the inference endpoint. Every key is optional, and
     /// a key that is absent is not sent at all - the server's default then
     /// decides, which is the right answer for an endpoint someone else tuned.
@@ -431,6 +437,9 @@ fn table_hint(err: &toml::de::Error) -> String {
         "context",
         "search",
         "sandbox",
+        "mcp",
+        "command",
+        "args",
     ];
     for key in top_level {
         if msg.contains(key) {
@@ -531,6 +540,25 @@ impl Config {
         if let Some(v) = env2("CWOFFEE_APPROVAL_TIMEOUT_SECS", "COWRY_APPROVAL_TIMEOUT_SECS") {
             if let Ok(n) = v.parse() {
                 self.approval_timeout_secs = Some(n);
+            }
+        }
+        // `CWOFFEE_MCP_SERVERS` is a JSON object in the same shape as
+        // `[mcp.servers.<name>]`: {"fake": {"command": "node", "args": ["/path/server.mjs"]}}.
+        //
+        // It exists because the automated suites need a server and must not write anyone's
+        // config file to get one — the same reason `CWOFFEE_URL` exists rather than making a
+        // test edit `[provider]`. It replaces the file's servers rather than merging: a test
+        // that added a server to a person's own list would start programs on their machine.
+        if let Some(v) = env("CWOFFEE_MCP_SERVERS") {
+            match serde_json::from_str::<std::collections::BTreeMap<String, crate::mcp::McpServerCfg>>(&v) {
+                Ok(map) => {
+                    self.mcp.servers = map;
+                    self.mcp.enabled = true;
+                }
+                Err(e) => eprintln!(
+                    "[cwoffee] CWOFFEE_MCP_SERVERS is not a JSON object of server rows: {e}. \
+                     Ignoring it; [mcp] in the config file still applies."
+                ),
             }
         }
     }
@@ -970,6 +998,35 @@ impl Config {
     }
 
     /// The `[sandbox]` block as the tool layer actually consumes it.
+    /// The MCP servers to start, with the timeouts the rest of the app already uses: a
+    /// JSON-RPC round trip waits `timeout_secs`, and an unanswered approval on an MCP call
+    /// waits `approval_timeout_secs`. There is no third number for MCP, because a second
+    /// timeout nobody can point at in the config is how a hang gets an explanation nobody
+    /// can find.
+    pub fn mcp_cfg(&self) -> crate::mcp::McpCfg {
+        let mut m = self.mcp.clone();
+        if m.approval_timeout_secs.is_none() {
+            m.approval_timeout_secs = self.approval_timeout_secs;
+        }
+        m
+    }
+
+    /// What is wrong with the `[mcp]` block, if anything. A server name that cannot become a
+    /// tool name is refused at boot rather than skipped silently: a person who wrote
+    /// `[mcp.servers."Jira"]` means to have a Jira server, and a catalog that quietly omits it
+    /// reads as the app ignoring them.
+    pub fn mcp_problem(m: &crate::mcp::McpCfg) -> Result<(), String> {
+        let bad = m.bad_names();
+        if bad.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "server name(s) {} are not usable: 2-32 characters of a-z, 0-9, '_' or '-', starting \
+             with a letter or digit, never a double underscore. Rename the table in [mcp.servers].",
+            bad.iter().map(|b| format!("{b:?}")).collect::<Vec<_>>().join(", ")
+        ))
+    }
+
     pub fn exec_cfg(&self) -> crate::tools::ExecCfg {
         crate::tools::ExecCfg {
             timeout_secs: self.sandbox.timeout_secs,
@@ -2778,6 +2835,69 @@ base_url = "http://127.0.0.1:9/v1"
         assert_eq!(cfg.provider.api_key.as_deref(), Some("sk-new"));
         assert_eq!(cfg.provider.kind, "llama.cpp", "an empty kind should fall back, not fail");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A person writes `[mcp]` by hand; every settings save is a rewrite of the same file. If a
+    /// save that only touched a provider dropped the block, the servers would vanish without any
+    /// action of theirs, and the status page would then say "no [mcp] servers configured" about a
+    /// file that still has them one screen lower.
+    #[test]
+    fn a_hand_written_mcp_block_survives_a_settings_save() {
+        let dir = std::env::temp_dir().join(format!("cw-mcp-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let text = r#"mode = "ask"
+
+[providers.local]
+kind = "openai"
+base_url = "http://127.0.0.1:9/v1"
+models = ["local/qwen"]
+
+[mcp]
+enabled = true
+timeout_secs = 20
+
+[mcp.servers.jira]
+command = "jira-mcp"
+args = ["--stdio"]
+enabled = true
+
+[mcp.servers.jira.env]
+JIRA_URL = "https://issues.example.com"
+"#;
+        std::fs::write(&path, text).unwrap();
+
+        let (cfg, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.mcp.servers.len(), 1, "read before the save: {cfg:?}");
+        assert_eq!(
+            cfg.mcp.servers["jira"].env["JIRA_URL"],
+            "https://issues.example.com"
+        );
+
+        // What Settings does when an endpoint is edited: surgical keys under `[provider]`.
+        let row = ProviderRow {
+            kind: "openai".into(),
+            base_url: "http://127.0.0.1:8090/v1".into(),
+            api_key: "".into(),
+            models: vec!["local/qwen".into()],
+        };
+        set_provider_row_in(&path, "local", &row).unwrap();
+
+        let (after, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            after.providers["local"].base_url, "http://127.0.0.1:8090/v1",
+            "the save itself happened: {}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        assert_eq!(
+            after.mcp.servers.len(),
+            1,
+            "and the servers written by hand are still there: {}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        assert_eq!(after.mcp.timeout_secs, 20, "the block's own keys survived verbatim");
+        assert_eq!(after.mcp.servers["jira"].command, "jira-mcp");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

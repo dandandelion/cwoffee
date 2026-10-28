@@ -107,6 +107,30 @@ Verified: streaming tool calls ✅ · `reasoning_content` deltas ✅ · `chat_te
 ```
 See `config/cwoffee.toml.example`.
 
+## Third-party tools (MCP) — optional, one paragraph
+
+To run a first MCP server, add it to the config and restart cwoffee on the **rust** core:
+
+```toml
+[mcp]
+enabled = true
+
+[mcp.servers.myserver]
+command = "my-mcp-server"     # must speak MCP over its stdio
+args = ["--stdio"]
+enabled = true
+```
+
+Or without touching the file, for one process:
+`CWOFFEE_MCP_SERVERS='{"myserver":{"command":"my-mcp-server","args":["--stdio"]}}'`.
+
+Nothing else to do: cwoffee spawns it at startup, keeps a name and one-line description of each of
+its tools inside a 1024-byte catalog in the environment block, and its tools are not callable until
+the model looks them up with `explore` (`need: "mcp: …`). Every call into it asks you first — a
+"allow for this conversation" given to another tool does not cover it. Settings › Workspace ›
+Third-party tools says whether it actually started. The pi core does not mount MCP servers at all
+(see `docs/PI-CORE-PROTOCOL.md`), and the app says so rather than showing an empty list.
+
 ## Build, run, and the traps
 
 See **`docs/BUILDRUN.md`**. It covers the dev loop, the release build, packaging,
