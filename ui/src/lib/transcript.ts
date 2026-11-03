@@ -1,18 +1,23 @@
 import { pageLog } from './pagelog'
-import { LoopHold, IDLE_HOLD, prefersStill } from './anipause'
+import { prefersStill } from './anipause'
 
 /**
- * The transcript's cup: two drawings, one element. The loop that runs while a block is producing
- * output, the loop that runs when it is resting, and a still of each for reduced motion.
+ * The mark that says a turn is being written.
+ *
+ * One file, looping, with no holds: the opening screen's cup takes random pauses because it is
+ * artwork that would otherwise be the only moving thing on a still page, and this is not artwork,
+ * it is a state readout — "an answer is arriving" — and a readout that stops and starts on a
+ * schedule of its own is a puzzle rather than a signal. The still is for `prefers-reduced-motion`,
+ * which is why frame zero is shipped alongside it.
+ *
+ * It is drawn for the box it is drawn in: an inline mark next to a run header's sentence and the
+ * same mark inside the composer's send button, both 20 CSS px on a DPR-2 screen, so the shipped
+ * file is 40 units (`scripts/mark-resize.py` builds it from the artwork under `assets/mark/`).
  */
-const CUP_ART = {
-  busy: '/cwoffee_generating_generation_1.webp',
-  busyStill: '/cwoffee_generating_generation_still.webp',
-  idle: '/cwoffee_generating_idle_1.webp',
-  idleStill: '/cwoffee_generating_idle_still.webp',
+export const WORKING_ART = {
+  loop: '/cwoffee_turn_working_inline_1.webp',
+  still: '/cwoffee_turn_working_inline_still.webp',
 }
-/** The pause between laps of the resting cup: the same range the opening-screen cup draws from. */
-const CUP_IDLE_HOLD = IDLE_HOLD
 
 // Resolved once: the plugin module does not exist in a plain browser build, and a
 // static import would make the preview crash at load rather than at click.
@@ -180,6 +185,331 @@ const iconDoc = () =>
   svgIcon(['M3.6 2.6h6l2.8 2.8v8H3.6z', 'M9.6 2.6v2.8h2.8', 'M8 8.2v4', 'M6.2 10.4 8 12.2l1.8-1.8'])
 const iconBranch = () =>
   svgIcon(['M5 3.6v7.2', 'M5 12.4a1.4 1.4 0 1 0 0 .1', 'M5 3.5a1.4 1.4 0 1 0 0 .1', 'M11.4 5.6a1.4 1.4 0 1 0 0 .1', 'M11.4 6.9c0 2.4-2.6 2.6-4.4 3.6'])
+// A trunk with two offshoots and a dot on the one being read: the tree, and the leaf is the dot.
+// It is drawn apart from `iconBranch` on purpose — Branch opens a new conversation, Tree moves this
+// one's own leaf, and an identical icon would say they are the same ask.
+const iconTree = () =>
+  svgIcon(['M4.4 12.6V2.4', 'M4.4 4.6h5.2', 'M4.4 8.2h3.6', 'M10.6 3.4a1.2 1.2 0 1 0 0 .1', 'M8.6 7.4a1.2 1.2 0 1 0 0 .1', 'M4.4 12.7a1.4 1.4 0 1 0 0 .1'])
+// Two sheets, one behind the other, with a folded corner on the front one: the file ledger — the
+// whole conversation's file history, not one turn's. Drawn apart from `iconUndo` (which puts one
+// turn's files back) and `iconDoc` (which exports the transcript), because all three are about
+// files and a reader has to be able to tell the asks apart without reading the label.
+const iconFiles = () =>
+  svgIcon(['M4.6 3.4h5.2l2.2 2.2v6.8H4.6z', 'M9.8 3.4v2.2h2.2', 'M3 5v7.6h6.2'])
+// An arrow curving back to where it came from: undo, and specific enough about direction that it
+// does not read as a generic refresh next to it.
+const iconUndo = () =>
+  svgIcon(['M3.4 6.4h7.2a4 4 0 1 1-4 4', 'M3.4 6.4l2.4-2.4', 'M3.4 6.4l2.4 2.4'])
+// A pencil with a short nick in the tip: it writes, and it is small enough to sit next to "Copy".
+const iconPencil = () =>
+  svgIcon(['M11.6 3.1 12.9 4.4 5.9 11.4 3.6 12.4l1-2.3z', 'M10.4 4.3l1.3 1.3'])
+// A framed square with a hill and a light in it — the picture mark, used where an attached image has
+// no payload in hand yet, so the chip has to say what is coming rather than show a broken frame.
+const iconImage = () =>
+  svgIcon(['M2.6 3.4h10.8v9.2H2.6z', 'M2.6 10.4l3-3 2.4 2.4 2.2-2.6 3.2 3.2', 'M6.1 6a1 1 0 1 0 0 .1'])
+
+/**
+ * An attachment chip the reader pressed, and how to get at the bytes behind it.
+ *
+ * `msgId` is null for a message this window painted itself — for those the payload is already in
+ * `meta.url`, because this is the window that sent it. A chip from the record has a row id and no
+ * payload, and the store is asked for that one row's attachments.
+ */
+export interface AttachmentView {
+  msgId: number | null
+  index: number
+  meta: AttachmentMeta
+}
+
+/**
+ * What "edit this message" asks for, as one thing the app can send to a host.
+ *
+ * The transcript does not change the record: it has no store and no idea which transport it is on.
+ * It says which message it means, in the only two ways it can, and the host decides whether that is
+ * a message it can still prove.
+ *
+ * `id` is present for a message that came out of the store. A message this window painted while it
+ * was being sent has no id on this side of the wire, so `fromEnd` counts *your* messages backwards
+ * from the newest one on screen — exact, because the newest message on screen is the newest message
+ * there is. `shown` is the assertion: the host refuses an edit whose words do not match the row it
+ * resolved, which is what stops a window that has drifted from rewriting a message nobody was
+ * looking at.
+ */
+/**
+ * A ask to open a second path out of one message.
+ *
+ * `shown` is the words this window painted, and it has to travel with the request. The host reads
+ * the row again before it copies anything, and if the row says something else — because another
+ * window, another device or the harness wrote to the same conversation in between — it refuses and
+ * creates nothing. Without that check a stale tab would branch a message nobody ever showed.
+ */
+export interface MessageBranch {
+  session: number
+  /** The stored row's id, or `null` when this turn has not been persisted yet. */
+  id: number | null
+  /**
+   * Which kind of row `shown` is. It decides where the branch is cut: from your message the branch
+   * carries what came *before* it and hands the ask back to you; from an answer it carries that
+   * answer too and starts from there.
+   */
+  role: 'user' | 'assistant'
+  shown: string
+}
+
+/** One file a revert would put back, as the engine computed it from its own copies. */
+export interface RevertItem {
+  path: string
+  /** `created` | `modified` | `deleted` — what the turn did, which is what undoing it means. */
+  kind: string
+  /** The verb for this path: "put back", "delete", and why. */
+  action: string
+  bytes: number
+  /** Someone changed this file since that turn. Reverting it would overwrite their work. */
+  edited_since: boolean
+  /** The copy is gone (pruned, or the conversation's folder moved). */
+  copy_missing: boolean
+  /** The file itself is no longer there. */
+  path_missing: boolean
+}
+
+/** The scope a revert would act on, listed before anything is touched. */
+export interface RevertPreview {
+  session: number
+  message_id: number
+  turn: number
+  scope: string
+  workspace: string
+  items: RevertItem[]
+  edited_since: number
+  missing_copy: number
+  /** Copies this conversation lost to the size cap. Non-zero means the list is what survived, not
+   *  everything the conversation ever changed — the note says so, and the card shows the number. */
+  pruned: number
+  note: string
+}
+
+/** One conversation on the lineage, as the engine read it. */
+export interface TreeConversation {
+  session: number
+  title: string
+  parent: number | null
+  /** Which kind of row this conversation was cut out of: `user`, `assistant`, or empty when it is
+   *  the root — the conversation nobody was cut out of. */
+  branch_role: string
+  branch_row: number | null
+  /** The words that were there when it was cut. A branch made before the record kept lineage, or one
+   *  whose cut row has since been deleted, is said in words by the tree's own note instead. */
+  branch_quote: string
+  current: boolean
+  parent_gone: boolean
+  rows: number
+  off_branch: number
+  depth: number
+  children: number
+}
+
+/**
+ * One node of a conversation's tree: a row of the record, an entry of the model's thread, or both.
+ *
+ * `content` is the node's words in full, not decoration. Moving the leaf onto a node has to send
+ * those words back, which is how the host knows this window meant *this* row and not a row id it
+ * remembered from an older paint — the same proof `MessageBranch` makes.
+ */
+export interface TreePoint {
+  row: number | null
+  pi_entry: string | null
+  role: string
+  quote: string
+  content: string
+  /** False means the next answer does not read this node: it is on a branch the leaf left behind. */
+  on_branch: boolean
+  /** The node the record's next answer reads through. */
+  current: boolean
+  /** Where pi's own thread stands. On the pi core this can be a different node than `current`, and
+   * the card says so rather than picking one of the two to present as the answer. */
+  pi_current: boolean
+  depth: number
+  /** A node one record has and the other does not — the two memories disagree about the history. */
+  drift: boolean
+}
+
+/** What pi answered about its own thread, kept beside the record's node list so "pi was asked" is
+ *  readable as different from "we guessed from the file". */
+export interface TreePi {
+  consulted: boolean
+  entries: number
+  leaf_entry: string | null
+  file: string
+  why: string
+}
+
+/** The tree of one conversation: where it came from, what hangs off it, and what is being read. */
+export interface TreeRead {
+  session: number
+  core: string
+  lineage: TreeConversation[]
+  nodes: TreePoint[]
+  /** Nodes the card did not list. Always off-path ones — the branch being read is never the part
+   *  that gets dropped, and the note names the number so a short card is not a short conversation. */
+  nodes_hidden: number
+  off_branch: number
+  /** `null` means the conversation reads its newest row: nobody has moved the leaf. */
+  leaf: number | null
+  pi: TreePi
+  drift: string[]
+  drift_count: number
+  note: string
+}
+
+/** An ask to leave the leaf on one node. `shown` is the words this window painted for that node. */
+export interface LeafMove {
+  session: number
+  id: number
+  role: 'user' | 'assistant'
+  shown: string
+}
+
+/** What the engine moved, and what it says the next answer will read. */
+export interface LeafMoveOut {
+  session: number
+  leaf: number | null
+  reads_through: string
+  off_branch: number
+  /** Your own words, coming back to the composer because the leaf now sits in front of them. */
+  prefill: string | null
+  note: string
+}
+
+/** One file, as one turn left it. `checkpoint` is the index row: the diff is addressed at it. */
+export interface LedgerFileRow {
+  checkpoint: number
+  path: string
+  kind: string
+  bytes: number
+  /** The copy is on disk. A file the turn created has no copy by design, and says so. */
+  copy_present: boolean
+  can_revert: boolean
+  edited_since: boolean
+  path_missing: boolean
+  /** The live side, so the card can say which half of a comparison exists before it offers one. */
+  live_exists: boolean
+  live_bytes: number
+  says: string
+}
+
+export interface LedgerTurnRow {
+  turn: number
+  /** The answer row this turn's copies belong to; `null` while that row is not written yet. */
+  message_id: number | null
+  files: number
+  /** The files of this turn, in path order. `files` is this same count. */
+  file_rows: LedgerFileRow[]
+  paths: string[]
+  revertable: number
+  latest: boolean
+  note: string
+}
+
+export interface LedgerPathRow {
+  path: string
+  turns: number[]
+  kinds: string
+  copies: number
+  live_exists: boolean
+  live_bytes: number
+}
+
+export interface LedgerRead {
+  session: number
+  workspace: string
+  turns: LedgerTurnRow[]
+  paths: LedgerPathRow[]
+  turns_total: number
+  turns_hidden: number
+  files_total: number
+  paths_total: number
+  paths_hidden: number
+  copies: number
+  /** Copies the per-conversation cap discarded. Those rows offer nothing, and say so. */
+  pruned: number
+  prune_notes: string[]
+  /** Rows whose blob is gone for some other reason — the folder was emptied outside the app. */
+  copies_missing: number
+  unstamped: number
+  edited_since: number
+  note: string
+}
+
+export interface SnapshotStats {
+  session: number
+  workspace: string
+  dir: string
+  dir_exists: boolean
+  rows: number
+  /** The index's own total. It counts a shared blob once per row, and says so next to the store's. */
+  row_bytes: number
+  blobs: number
+  blob_bytes: number
+  shared: number
+  orphan_blobs: number
+  orphan_bytes: number
+  neighbours: number
+  note: string
+}
+
+/** The copy to compare against, named by row. A window that has drifted gets a refusal, not a guess. */
+export interface FileDiffReq {
+  session: number
+  checkpoint: number
+  shown: string
+}
+
+export interface FileDiffRead {
+  session: number
+  checkpoint: number
+  turn: number
+  message_id: number | null
+  path: string
+  kind: string
+  stored_bytes: number
+  stored_present: boolean
+  live_exists: boolean
+  live_bytes: number
+  added: number
+  removed: number
+  diff: string | null
+  too_big: boolean
+  binary: boolean
+  edited_since: boolean
+  can_revert: boolean
+  note: string
+}
+
+export interface ForgetCopiesOut {
+  session: number
+  dropped: number
+  freed_bytes: number
+  /** Blobs left in the store because another conversation points at them. */
+  kept: number
+  note: string
+}
+
+export interface MessageEdit {
+  id: number | null
+  fromEnd: number
+  /** The words this window is showing. */
+  shown: string
+  /** The words it should hold. */
+  next: string
+  /**
+   * Two different asks, and the difference is what the person is being asked to choose between.
+   *
+   * `false` corrects the record and leaves the conversation the length it was — the model already
+   * answered those words, and everything after was built on the answer. `true` takes the
+   * conversation back to this message: everything after it goes, and these words go out again.
+   */
+  resend: boolean
+}
 
 /**
  * Clipboard, with a way out.
@@ -455,6 +785,65 @@ export class Transcript {
   onNote: ((text: string, session: number | null) => void) | null = null
   /** Feedback for actions the user can otherwise not tell worked (copy, share). */
   onToast: ((msg: string, bad?: boolean) => void) | null = null
+  /**
+   * Change one of your own messages. Resolves to the one sentence to show for it, or rejects with
+   * the reason nothing was changed.
+   *
+   * Deliberately a question rather than an operation: the transcript holds what was *said*, the host
+   * holds what was *recorded*, and only the host can cut a conversation in half and re-send it.
+   */
+  onMessageEdit: ((edit: MessageEdit) => Promise<string>) | null = null
+  /** Opens a second path out of one message and returns the sentence the host answered with. */
+  onMessageBranch: ((branch: MessageBranch) => Promise<string>) | null = null
+  /**
+   * Read one conversation's tree: where it was cut out of, what hangs off it, which node the next
+   * answer reads through, and what the two records disagree about. Nothing is changed by this call,
+   * which is why the card can be opened on a conversation that is mid-turn.
+   */
+  onTree: ((session: number) => Promise<TreeRead>) | null = null
+  /**
+   * Every file this conversation's turns touched, grouped by turn.
+   *
+   * Read-only, and both transports call the same engine function, so a phone and a desktop read one
+   * answer to "what did this conversation write".
+   */
+  onLedger: ((session: number) => Promise<LedgerRead>) | null = null
+  /** What this conversation's copies cost: deduped blobs, shared blobs, and orphan bytes. */
+  onLedgerStats: ((session: number) => Promise<SnapshotStats>) | null = null
+  /** One stored copy against the bytes on disk now, named by index row rather than by path. */
+  onFileDiff: ((q: FileDiffReq) => Promise<FileDiffRead>) | null = null
+  /** Drop this conversation's snapshots. Drive-side: it deletes files. */
+  onForgetCopies: ((session: number, shown: number) => Promise<ForgetCopiesOut>) | null = null
+  /**
+   * Leave the leaf on one node: the record's leaf and the model's own memory move together.
+   *
+   * A phone reaches the same verb through the gateway, so both cores answer in their own terms and
+   * this card paints whichever sentence comes back.
+   */
+  onLeafMove: ((move: LeafMove) => Promise<LeafMoveOut>) | null = null
+  /** Ask the engine what undoing this turn's files would do. Nothing is touched by this call. */
+  onRevertPreview:
+    | ((session: number, id: number, throughLatest: boolean) => Promise<RevertPreview>)
+    | null = null
+  /** Do it. `shown` is the path list the card painted, repeated back so the engine can refuse a
+   *  scope that moved while the person was reading it. */
+  onRevert:
+    | ((
+        session: number,
+        id: number,
+        throughLatest: boolean,
+        shown: string[],
+        overwriteEdited: boolean,
+      ) => Promise<string>)
+    | null = null
+  /**
+   * The reader pressed an attachment chip in their own message.
+   *
+   * The transcript cannot answer "what picture is this" — for a message from the record it holds a
+   * name and a size, and the bytes live in the store. So it reports which chip, in which row, and
+   * the app either shows the copy it already has or fetches the one picture being asked for.
+   */
+  onAttachmentOpen: ((req: AttachmentView) => void) | null = null
   /** Conversation the transcript is showing; export is addressed to it. */
   sessionId = 0
   /** Answer text of the live turn, kept so "copy" copies what the user read. */
@@ -549,9 +938,20 @@ export class Transcript {
     })
   }
 
-  clear() {
+  /**
+   * Whether this page names every transcript wipe as it happens.
+   *
+   * Armed by the page harness and by nothing else. "A blank transcript" is one question — *who*
+   * cleared it — and the answer is currently inferred from which log lines happen to exist nearby.
+   * A loaded session prints its page, a wipe prints nothing, so a mid-send blank looks identical
+   * whether it came from a session switch, a repaint, or the start screen. In normal use nobody is
+   * asking, so the trail is off.
+   */
+  static reportClears = false
+
+  clear(why = 'unspecified') {
+    if (Transcript.reportClears) pageLog(`transcript clear: ${why}`)
     this.stopFollow()
-    this.stopCup()
     this.root.textContent = ''
     this.turn = null
     this.runGroup = null
@@ -577,18 +977,17 @@ export class Transcript {
     this.blockStart = 0
     this.wordRate = 0
     this.lastPaintAt = 0
-    // `textContent = ''` detached the cup with everything else. Put it back and let it hide itself:
-    // an empty transcript sits under the opening screen's own, bigger cup, and two of the same
-    // drawing on one page reads as a bug whether or not either of them moves.
-    this.placeCup()
   }
 
   /**
-   * Mark the one block that is currently producing output, and with it the state of the
-   * transcript's cup: the generating loop while output moves, the resting loop once it stops.
-   * Nothing else in the transcript animates on its own - the old pulsing dot was removed
-   * everywhere, in the gutter and beside every card inside the folded group - so the cup is the
-   * whole "is it working?" tell, and it is the same element either way, only a different drawing.
+   * Mark the one block that is currently producing output.
+   *
+   * Nothing else in the transcript animates on its own — the old pulsing dot was removed
+   * everywhere, in the gutter and beside every card inside the folded group. "Is it working?" is
+   * answered by two marks now, and neither is a block-level picture: the same animated loader
+   * inline in a run header's sentence while the model works (`runWorking`), and the same mark
+   * inside the composer's send button for the turn as a whole — which is what carries the answer
+   * for a turn that has no run group to attach a mark to.
    */
   private setLive(body: HTMLElement | null) {
     // A tool card is its own block, so its marker belongs on the card. Taking the
@@ -596,16 +995,13 @@ export class Transcript {
     // indicator at all while a running answer did.
     const wrap = body?.classList?.contains('blk') ? body : (body?.parentElement ?? null)
     if (this.liveWrap === wrap) return
-    const wasBusy = !!this.liveWrap
     this.liveWrap?.classList.remove('live')
     this.liveWrap = wrap
     wrap?.classList.add('live')
-    // The name row still carries the turn's state - CSS and the checks read `.live` - and the flip
-    // is what changes the transcript's cup: the generating loop while a block produces output, the
-    // resting loop with its random holds once none does.
-    const marker = (this.turn?.querySelector(':scope > .turn-who-cwoffee') ?? null) as HTMLElement | null
-    marker?.classList.toggle('live', !!body)
-    if (wasBusy !== !!body) this.repaintCup()
+    // A turn that starts working also needs its status. Every path that puts live words, thoughts
+    // or a running command on screen comes through here, so this is the one place that can ask
+    // "does this turn have a header to carry the loader, or does it need the loose one?"
+    if (wrap) this.syncWorking()
   }
 
   private liveWrap: HTMLElement | null = null
@@ -632,176 +1028,165 @@ export class Transcript {
   }
 
   /**
-   * The one name marker a turn carries for cwoffee, hung in the gutter and stuck to the top
-   * of the scroller while that turn's text is being read.
+   * The loader inside a run group's header sentence, created while that run is working.
    *
-   * Every said block used to repeat the name down the left edge: a turn with a run and four
-   * paragraphs said "CWOFFEE" five times, and the gutter turned into a column of identical
-   * words. One per turn, floating, is the same affordance `.code-head` uses for a code block's
-   * buttons — you always know whose text you are in the middle of, without being told five
-   * times. The marker is a zero-height sticky row so the name costs no vertical space; the word
-   * itself hangs in the gutter where the labels already live, so it never nudges the text
-   * column. Yours is not here: your label sits with your bubble, which is where it is read.
+   * It used to hang in the turn's gutter, where the turn's name used to be: a 56px picture stuck
+   * to the top of the scroller for the length of the turn. That shape cost more than it was worth.
+   * It followed the screen, so it needed a clip-box rule to stop its top being shaved off by the
+   * pane; it needed 66px of the gutter reserved for it; and it qualified a sentence a metre away —
+   * "Working on your computer", which is the words that already say what the picture says. Inline
+   * in that sentence it can do none of that badly: it rides the line it belongs to, it cannot be
+   * clipped by a scroll container it is not near, and it reserves nothing.
+   *
+   * Made once per run group and removed at turn end (`dropWorking`), so a settled or loaded
+   * transcript holds no loader elements and therefore no decodes.
    */
-  private whoCwoffee(): HTMLElement {
-    this.ensureTurn()
-    const found = this.turn!.querySelector(':scope > .turn-who-cwoffee') as HTMLElement | null
+  private runWorking(wrap: HTMLElement): HTMLImageElement | null {
+    const head = wrap.querySelector(':scope > .blk-head') as HTMLElement | null
+    if (!head) return null
+    const found = head.querySelector(':scope > .run-working') as HTMLImageElement | null
     if (found) return found
-    const wrap = this.el('turn-who turn-who-cwoffee')
-    wrap.append(this.el('who-name', 'cwoffee'))
-    this.turn!.appendChild(wrap)
-    return wrap
-  }
-
-  // ---- the transcript's cup ---------------------------------------------------------------
-  // One picture for the whole transcript, and one place for it to sit: the bottom band of the
-  // transcript pane, reserved by the scroller's padding, where nothing else is drawn. It used to
-  // hang under each turn's name (a column of small cups), then became the last element in the
-  // content (one cup that the whole turn pushed around). The band is the third shape and the first
-  // one where the picture does not move: it is still the artwork at the bottom of the conversation,
-  // still exactly one of them, and now it stays put while lines arrive.
-  // One picture for the whole transcript, moved to the end of whatever it contains, rather than one
-  // under each turn's name. Under the name it multiplied - a session of short turns became a column
-  // of small cups, which is the same turn-per-label mistake the name itself already had - and a cup
-  // small enough to fit a 58px gutter is too small to read as a drawing at all. At the end of the
-  // content there is exactly one, big enough to be the artwork, and turn end puts it under the
-  // Copy / Share / Branch row because that row belongs to the turn while this belongs to the page.
-  //
-  // It is never created twice: `cup()` makes the element once and `placeCup()` moves it. That is
-  // also what the earlier per-turn rule was working around - an animated raster decodes its own
-  // frame stream per element, so a cup per turn costs a decode per turn, and a loaded session used
-  // to get stills because of it. Which is why a loaded session's cup looked frozen.
-
-  private cupImg: HTMLImageElement | null = null
-  private cupHold: LoopHold | null = null
-  private cupVisible = true
-  /** How far above the end of the content the reader may be and still be shown the cup. The cup is
-   *  pinned to the pane, so anything deeper into the transcript than this is text that would sit
-   *  under a 136px drawing. The band is 168px deep and the drawing plus its seat is 144px, so the
-   *  picture stops clearing the content at almost exactly that distance - the number is geometry,
-   *  not taste. */
-  private static readonly CUP_REST_PX = 24
-  /** How long the reader has to be away from the end before the picture is put away. The follow's
-   *  own catch-up leaves the view 20-60px short of the bottom for a frame or two at a time; a cup
-   *  that vanishes and returns inside half a second is a blink, and this one is 136px wide. */
-  private static readonly CUP_HIDE_MS = 400
-  private cupHideTimer = 0
-
-  /** The cup element, made once per transcript and re-used for as long as this transcript lives. */
-  private cup(): HTMLImageElement {
-    if (!this.cupImg) {
-      const img = document.createElement('img')
-      img.className = 'transcript-cup'
-      img.alt = ''
-      img.draggable = false
-      img.setAttribute('src', this.cupSrc())
-      this.cupImg = img
-    }
-    return this.cupImg
-  }
-
-  /** Which of the four files this cup should be showing right now. */
-  private cupSrc(): string {
-    const busy = !!this.liveWrap
-    const still = prefersStill()
-    if (still) return busy ? CUP_ART.busyStill : CUP_ART.idleStill
-    return busy ? CUP_ART.busy : CUP_ART.idle
+    const img = document.createElement('img')
+    img.className = 'run-working'
+    img.alt = ''
+    img.setAttribute('aria-hidden', 'true')
+    // The file's own ANIM header asks for an infinite loop at the artist's own frame timing, so
+    // there is nothing to drive here: no hold, no timer, no `LoopHold`. Reduced motion gets the
+    // first frame as a still.
+    img.setAttribute('src', prefersStill() ? WORKING_ART.still : WORKING_ART.loop)
+    this.workingMade++
+    head.insertBefore(img, head.firstChild)
+    // A turn carries one loader. If this turn began as a plain answer, the loader was parked at the
+    // end of the writing (see `syncWorking`); the first tool call or thought gives it a proper head
+    // to ride, and the loose one goes away in the same breath rather than leaving two marks.
+    for (const tail of Array.from(this.turn?.querySelectorAll(':scope > .run-working') ?? [])) tail.remove()
+    return img
   }
 
   /**
-   * Move the cup after whatever was last added, and hide it when the transcript holds nothing: the
-   * opening screen has its own, larger cup, and a page showing the same drawing twice is a bug
-   * whether or not it is animated.
+   * Give a working turn a loader when it has no run accordion to hold one.
    *
-   * The picture lives in the pane, not in the page that scrolls. The scroller's bottom padding
-   * reserves the band it sits in (see `.transcript-cup` and `--cup-band` in app.css), so the newest
-   * line of text stops above it and the drawing never travels. Appending it to `this.root` - the
-   * old shape, the last thing in the content - made the picture's on-screen position a function of
-   * every arriving line and every follow step: measured in `ui/perf/probe.ts` over three streamed
-   * turns that was 1,348px of travel, p95 261px in a single frame, and six reversals of direction.
-   * A drawing that reverses is what the eye reads as jitter, and this one is 136px across.
+   * "Put the loader in the grouped actions header" is right about where the eye is — and it says
+   * nothing about the commonest turn of all: a plain answer with no tool calls and no thinking has
+   * no header, so a loader that only lives there means half the turns in this app run with no
+   * status in the transcript at all. So the loader goes after the last block the turn has written,
+   * inline with the prose column and ahead of whatever the turn produces on the way out (its files,
+   * its action row), and it is taken away the moment the turn lands. One per turn either way: the
+   * moment a run group appears, `runWorking` moves the mark to the header and removes this one.
    */
-  private placeCup() {
-    const img = this.cup()
-    const host = this.root.closest('.scrollerwrap') ?? this.root.parentElement ?? this.root
-    if (img.parentElement !== host) {
-      // Two transcripts in one pane (a session switch that rebuilds the transcript object) must not
-      // leave two pictures in the band. The transcript guarantees one cup; this is where that is
-      // enforced, since the band belongs to the pane rather than to this transcript's content.
-      for (const stale of Array.from(host.children))
-        if (stale !== img && stale.classList?.contains('transcript-cup')) stale.remove()
-      host.appendChild(img)
-    }
-    img.classList.toggle('bare', this.root.children.length === 0)
-    this.updateCup()
-  }
-
-  /**
-   * Show the pinned cup only when the reader is at rest at the end of the transcript.
-   *
-   * The cup is pinned to the pane, but the text under it scrolls. Kept lit while the reader is
-   * anywhere else, a 136px drawing sits on top of other people's paragraphs halfway through a
-   * conversation - a picture painted over prose is worse than a missing picture. The band the
-   * scroller reserves is the end of the content, so at rest the band is empty and the drawing has
-   * somewhere to live. It is lit again the moment the view comes back down, which includes every
-   * moment the follow is holding the view at the bottom while the model writes.
-   */
-  private updateCup(readerMoved = false) {
-    const img = this.cupImg
-    if (!img) return
-    const sc = this.hookScroller()
-    if (!sc) return
-    const away = sc.scrollHeight - sc.clientHeight - sc.scrollTop
-    const atEnd = this.root.children.length > 0 && away <= Transcript.CUP_REST_PX
-    if (atEnd) {
-      if (this.cupHideTimer) {
-        clearTimeout(this.cupHideTimer)
-        this.cupHideTimer = 0
-      }
-      this.setCupShown(true)
+  private syncWorking() {
+    const turn = this.turn
+    if (!turn) return
+    if (turn.querySelector(':scope > .blk-run > .blk-head')) {
+      this.runWorking(turn.querySelector(':scope > .blk-run') as HTMLElement)
       return
     }
-    if (readerMoved) {
-      if (this.cupHideTimer) {
-        clearTimeout(this.cupHideTimer)
-        this.cupHideTimer = 0
-      }
-      this.setCupShown(false)
-      return
-    }
-    if (this.cupHideTimer || !this.cupVisible) return
-    this.cupHideTimer = window.setTimeout(() => {
-      this.cupHideTimer = 0
-      this.setCupShown(false)
-    }, Transcript.CUP_HIDE_MS)
+    if (turn.querySelector(':scope > .run-working')) return
+    const img = document.createElement('img')
+    img.className = 'run-working turn-tail'
+    img.alt = ''
+    img.setAttribute('aria-hidden', 'true')
+    img.setAttribute('src', prefersStill() ? WORKING_ART.still : WORKING_ART.loop)
+    this.workingMade++
+    // Ahead of the turn's own exits, so a file row or an action row is never pushed down by a mark
+    // that is about to disappear.
+    const exit = Array.from(turn.children).find(
+      (n) =>
+        n.classList.contains('filestrip') ||
+        n.classList.contains('attachline') ||
+        n.classList.contains('fileturn') ||
+        n.classList.contains('turn-acts'),
+    )
+    if (exit) turn.insertBefore(img, exit)
+    else turn.append(img)
   }
 
-  private setCupShown(on: boolean) {
-    const img = this.cupImg
-    if (!img || on === this.cupVisible) return
-    this.cupVisible = on
-    img.classList.toggle('cup-out', !on)
+  /** Take the working marks away once the turn has landed. A settled turn shows no mark at all. */
+  private dropWorking() {
+    for (const img of Array.from(this.turn?.querySelectorAll('.run-working') ?? [])) img.remove()
   }
 
   /**
-   * Re-pick the drawing and its motion. The generating loop runs at the artist's timing with no
-   * hold inserted; the resting loop is re-armed every lap with a fresh hold drawn from CUP_IDLE_HOLD
-   * (see anipause.ts); reduced motion gets a still, because a media query cannot pause a raster
-   * loop. Called whenever the transcript's busy state flips and when the motion setting changes.
+   * Re-pick the working loader's file wherever a run is still working.
+   *
+   * The picture is chosen when the loader is made, because a media query cannot pause a raster loop:
+   * reduced motion has to be a different file rather than a different style. So a motion setting that
+   * flips mid-turn leaves the loaders already on screen showing the wrong file, and waiting for the
+   * next turn would leave a conversation moving after the user asked it not to.
    */
-  repaintCup() {
-    const img = this.cup()
-    const busy = !!this.liveWrap
-    this.stopCup()
-    img.setAttribute('src', this.cupSrc())
-    img.classList.toggle('busy', busy)
-    if (!busy && !prefersStill()) this.cupHold = new LoopHold(img, this.cupSrc(), CUP_IDLE_HOLD[0], CUP_IDLE_HOLD[1])
+  setMotion() {
+    const src = prefersStill() ? WORKING_ART.still : WORKING_ART.loop
+    for (const img of Array.from(this.root.querySelectorAll<HTMLImageElement>('.run-working')))
+      if (img.getAttribute('src') !== src) img.setAttribute('src', src)
   }
 
-  private stopCup() {
-    this.cupHold?.stop()
-    this.cupHold = null
+  /**
+   * Append to the turn and keep the turn's files at the end of it.
+   *
+   * A file row is not a footnote to the sentence that mentioned it: it is what the turn produced,
+   * and it sits under everything the turn said. Appending to the turn directly is what made a
+   * chip land in the middle of an answer — the write event arrives before the next paragraph does,
+   * so the paragraph ended up below the box for the file it was talking about.
+   */
+  /**
+   * The loose loader this turn is holding, if it has one.
+   *
+   * Its existence is the reason appends are insertions. `syncWorking` parks the mark after the last
+   * thing the turn wrote, and if every later block were `appendChild`ed the mark would end up above
+   * the prose it is supposed to sit under — so the obvious repair is to move the mark down, and
+   * moving an `<img>` in the DOM restarts its raster animation from frame zero. That is the reported
+   * "the loading animation resets when something gets appended". So nothing moves: new blocks go in
+   * *before* the mark, which keeps the mark last and the mark's own render tree untouched.
+   */
+  private workingSlot(): HTMLElement | null {
+    const turn = this.turn
+    if (!turn) return null
+    return turn.querySelector(':scope > .run-working') as HTMLElement | null
   }
+
+  private appendToTurn(node: HTMLElement) {
+    const turn = this.turn!
+    const slot = this.workingSlot()
+    if (slot) turn.insertBefore(node, slot)
+    else turn.appendChild(node)
+    this.pinFilesLast()
+  }
+
+  /** Move this turn's file rows back to the end of the turn, above its action buttons. */
+  private pinFilesLast() {
+    const turn = this.turn
+    if (!turn || !this.fileEls.length) return
+    // Ahead of the loose loader as well as ahead of the action row: a mark is the last thing in the
+    // writing, and a file row is part of the writing rather than a sign after it.
+    const acts = this.workingSlot() ?? (turn.querySelector(':scope > .turn-acts') as HTMLElement | null)
+    for (const el of this.fileEls) turn.insertBefore(el, acts)
+  }
+
+  // ---- the transcript's cup: gone ---------------------------------------------------------
+  // A 136px drawing pinned in the bottom band of the pane used to be the transcript's answer to
+  // "is it working". It shared that question with the run header's sentence ("Working on your
+  // computer", counting steps as they land) and, now, with the same animated mark inline in that
+  // sentence and inside the composer's send button — so the band's picture is the third copy of
+  // one answer, and the most expensive one: a 480-unit raster decoding in the pane, a 168px band
+  // of the transcript permanently empty, and a visibility rule (hide it once the reader is more
+  // than 24px from the end) that existed only because the drawing would otherwise sit on other
+  // people's paragraphs. The opening screen keeps its own, larger cup: there it is the artwork on
+  // an empty page, which is the one place it was never competing with anything.
+
+  /**
+   * How many loader elements this transcript has built, since it was built.
+   *
+   * A claim about a *seamless* loop cannot be made from the DOM: the mark can be present, painted,
+   * and restarting every step, because a mark that is removed and rebuilt looks identical to a mark
+   * that kept running. So creation is counted here, and `mark-visible` reads the count across a
+   * streaming turn: if it climbs while the header still says `running`, the loop is being rebuilt
+   * under the reader and the seamlessness the batch asked for is not there.
+   */
+  get workingMarksMade(): number {
+    return this.workingMade
+  }
+
+  private workingMade = 0
 
   private ensureTurn() {
     if (this.turn) return
@@ -811,8 +1196,6 @@ export class Transcript {
     // now, and carrying the history over would mean a map full of the wrong turn.
     this.loop = new LoopWatch()
     this.loopShown = false
-    // The cup belongs under the newest thing, so a new turn takes its place.
-    this.placeCup()
   }
 
   /**
@@ -835,8 +1218,6 @@ export class Transcript {
       // name and the rest are quiet. (A message typed while a turn was open lands in that turn
       // and gets its own name later, when the divider moves it into the turn it opens.)
       if (this.turn!.querySelector('.blk-user')) wrap.classList.add('nameless')
-    } else {
-      this.whoCwoffee()
     }
     // Thinking joins the run accordion; so does any later tool call, even one that
     // happens after the model has said something. What the model *said* goes below the
@@ -850,7 +1231,7 @@ export class Transcript {
       // The working pauses while the model talks. It does not end: another tool call joins
       // this same accordion, which is what keeps one turn one block on screen.
       this.closeRunGroup(true)
-      this.turn!.appendChild(wrap)
+      this.appendToTurn(wrap)
     }
     // Anything that reaches here lands outside the run accordion - your message, what the model
     // said, a note or a failure the app is interrupting for - so it counts as content, and a
@@ -880,8 +1261,6 @@ export class Transcript {
     const wrap = this.el('blk blk-reasoning')
     const head = this.el('blk-head streaming', 'thinking')
     wrap.append(head)
-    // The working is cwoffee's too, so a turn that opens with a thought still gets its name.
-    this.whoCwoffee()
     this.runBodyOf(this.ensureRunGroup()).appendChild(wrap)
     const run = this.runGroup
     if (run) this.bumpRun(run, 'think')
@@ -1011,8 +1390,6 @@ export class Transcript {
 
   private ensureRunGroup(): HTMLElement {
     this.ensureTurn()
-    // The working is cwoffee's too: a turn that opens with a tool call still gets its name.
-    this.whoCwoffee()
     const existing = this.runGroup
     if (existing && existing.parentElement === this.turn) {
       // One accordion per turn, reopened rather than replaced. The model putting a
@@ -1026,6 +1403,7 @@ export class Transcript {
         // thinking that is happening now, not the span since the turn first started.
         existing.dataset.opened = String(Math.round(performance.now()))
         delete existing.dataset.thinkMs
+        this.runWorking(existing)
         this.paintRunHead(existing)
       }
       return existing
@@ -1033,8 +1411,9 @@ export class Transcript {
     const wrap = this.mkRun()
     wrap.dataset.opened = String(Math.round(performance.now()))
     wrap.classList.add('running')
-    this.turn!.appendChild(wrap)
+    this.appendToTurn(wrap)
     this.runGroup = wrap
+    this.runWorking(wrap)
     this.paintRunHead(wrap)
     return wrap
   }
@@ -1833,10 +2212,6 @@ export class Transcript {
         // 48px is deliberately smaller than a line's worth of growth per paint,
         // so a reader who has been outrun is re-pinned rather than stranded.
         this.pinned = away < 48
-        // A reader who moved is a fact about the reader, not a transient of the follow, so the
-        // picture is put away on the same gesture rather than after its patience: the jump button
-        // appears off the same gesture, and the two must not share the corner of the pane.
-        this.updateCup(true)
         pageLog(`follow ${this.pinned ? 'on' : 'off'}: ${Math.round(away)}px from the bottom`)
         // The jump button answers "how far below the fold is the newest line", so it is measured
         // here too: this is the one place a reader's own scroll shows up.
@@ -1940,7 +2315,6 @@ export class Transcript {
    */
   private measureFollow(force = false) {
     const sc = this.hookScroller()
-    this.updateCup()
     if (!sc || !this.onFollowState) return
     const away = Math.max(0, Math.round(sc.scrollHeight - sc.clientHeight - sc.scrollTop))
     const ask = this.asked > 0
@@ -1957,17 +2331,38 @@ export class Transcript {
     this.measureFollow()
   }
 
-  /** Watch the content's own height: growth that no follow call reports. */
+  /**
+   * Watch the content's height *and* the box it scrolls inside.
+   *
+   * The content grows when a model talks. The box grows when a **window** changes shape — a
+   * resize, a fullscreen, a drawer closing — and the content observer cannot see that at all:
+   * `scrollHeight` is unchanged while `clientHeight` is. Watching only the content left every
+   * number the app keeps about the scroll position describing a box that no longer exists: the
+   * jump control quoting a distance measured in the old window, the cup's band measured against
+   * it, and — reported as "if I resize to where scrollbars appear, scroll to the very bottom, and
+   * then fullscreen, the top is cut off and stays cut off" — a reader left wherever the old
+   * geometry put them. So re-measure on either, and for a reader who was pinned to the latest,
+   * keep them pinned to the latest when the box grows: what they chose was "watch the newest
+   * line", not "sit N px from the top of a particular window".
+   */
   private watchHeight() {
     if (typeof ResizeObserver === 'undefined') return
+    const sc = this.hookScroller()
+    let lastBox = sc?.clientHeight ?? 0
     const ro = new ResizeObserver(() => {
+      const box = sc?.clientHeight ?? 0
+      const boxChanged = box !== lastBox
+      lastBox = box
       if (this.measureRaf) return
       this.measureRaf = requestAnimationFrame(() => {
         this.measureRaf = 0
+        if (boxChanged && sc && this.pinned) this.follow('chrome')
         this.measureFollow()
       })
     })
     ro.observe(this.root)
+    // The scroll box itself: the only signal that the window moved under the reader.
+    if (sc) ro.observe(sc)
     this.ro = ro
   }
 
@@ -2157,12 +2552,12 @@ export class Transcript {
         this.answerEls = []
         const head = this.el('turn-head', `turn ${ev.d.turn_id} · ${ev.d.model}`)
         this.ensureTurn()
-        this.turn!.appendChild(head)
+        this.appendToTurn(head)
         for (const n of trailing) {
           // The one that opens this turn carries your name again: it was quiet in the turn it
           // happened to be typed into, and here it is the line the turn starts with.
           n.classList.remove('nameless')
-          this.turn!.appendChild(n)
+          this.appendToTurn(n)
         }
         trailing.slice(1).forEach((n) => n.classList.add('nameless'))
         break
@@ -2215,6 +2610,10 @@ export class Transcript {
         this.finalizeAnswer()
         this.settleReasoning()
         this.setLive(null)
+        // The turn has landed, so the mark that said it was arriving is taken away rather than
+        // left painted in the gutter at reduced opacity: a settled conversation should have no
+        // motion in it at all.
+        this.dropWorking()
         this.textBuf = null
         this.textKind = null
         // The working surface folds once the answer has landed: what you scan a
@@ -2327,23 +2726,343 @@ export class Transcript {
     this.textKind = 'user'
     body.textContent = text
     this.appendAttachmentTags(body, attachments)
+    // Your own words, while they are still on the way out. The store has the row before the model
+    // is asked — a send is stored, not remembered — so this is the same message the record holds,
+    // and it gets the same two controls as a message you came back to.
+    this.attachUserActions(body.parentElement as HTMLElement, body, text, null)
     // Your own words are the one thing that always moves the view: a message typed while the
     // reader was looking further up belongs at the bottom, and they wrote it.
     this.follow('you')
   }
 
+  // ---- what you can do with your own message -----------------------------
+
   /**
-   * Name and size, not a thumbnail. History pages carry attachment metadata
-   * only, so a thumbnail here would disappear on reopen and make the transcript
-   * look lossy when the payload is in fact intact.
+   * Copy and Edit under one of your messages.
+   *
+   * Copy is there because the thing you may want again is your own question, not only the answer
+   * under it — and because the row of controls under a CWOFFEE turn already exists, so a message
+   * with no controls looks like a different kind of thing.
+   *
+   * Edit opens in place (see `openUserEditor`). Both controls are reachable at all times rather than
+   * on hover, for the same reason the turn's are: this is a touch target on a phone too, and a
+   * control you have to find by hovering is a control a phone does not have.
    */
-  private appendAttachmentTags(body: HTMLElement, attachments: AttachmentMeta[]) {
+  private attachUserActions(wrap: HTMLElement, body: HTMLElement, text: string, id: number | null) {
+    if (!text && !body.querySelector('.attlist')) {
+      // Nothing to copy and nothing to change: a message with no words and no attachments is a
+      // bookkeeping row, and a strip of buttons under nothing is noise.
+      return
+    }
+    const row = this.el('user-acts')
+
+    const btn = (cls: string, label: string, title: string, icon: SVGElement) => {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = `tact ${cls}`
+      b.title = title
+      b.setAttribute('aria-label', label)
+      const ico = this.el('tact-ico')
+      ico.append(icon)
+      b.append(ico, this.el('tact-label', label))
+      row.append(b)
+      return b
+    }
+
+    const copy = btn('copy', 'Copy', 'Copy what you sent, exactly as it is stored', iconCopy())
+    copy.onclick = () => {
+      void copyToClipboard(text).then((ok) => {
+        if (this.onToast) this.onToast(ok ? 'copied your message' : 'the webview refused the clipboard', !ok)
+        if (ok) {
+          copy.classList.add('done')
+          setTimeout(() => copy.classList.remove('done'), 1200)
+        }
+      })
+    }
+
+    const edit = btn('edit', 'Edit', 'Change what you sent', iconPencil())
+    edit.onclick = () => this.openUserEditor(wrap, body, text, id)
+
+    // Branch sits next to Edit because the two are the two things you can do with a message you
+    // already sent, and they are opposite: Edit moves the conversation back over that message,
+    // Branch leaves it exactly where it is and opens a second path beside it.
+    const branch = btn(
+      'branch',
+      'Branch',
+      id === null
+        ? 'Branch from here once this message is stored - a moment after the turn ends'
+        : 'Branch from here: a new conversation carries everything before this message, and these words come back for you to send again. This conversation stays as it is.',
+      iconBranch(),
+    )
+    if (id === null) branch.disabled = true
+    branch.onclick = () => this.requestBranch(this.sessionId, id, 'user', text, branch)
+
+    // Tree next to Branch, because the two are the two ways a message can be the *end* of something
+    // rather than its middle: Branch opens a new conversation at this row, Tree moves this
+    // conversation's own leaf back here so the next answer reads up to it and nothing is deleted.
+    const tree = btn(
+      'treebtn',
+      'Tree',
+      id === null
+        ? 'Show the conversation\'s tree once this message is stored - a moment after the turn ends'
+        : 'Show this conversation\'s tree: where it was cut out of, what hangs off it, and which message the next answer reads through.',
+      iconTree(),
+    )
+    if (id === null) tree.disabled = true
+    tree.onclick = () => this.openTreeCard(this.sessionId, id, wrap)
+
+    wrap.append(row)
+  }
+
+  /**
+   * Ask the host for a second path out of one message, and say what came back.
+   *
+   * A branch makes a conversation, so this is not a control that can be re-pressed while it is
+   * working: the button goes inert for the length of the ask. The host's own sentence is the toast,
+   * because it is the one text that names both conversations — the one it copied from and the one
+   * it made — and the client's guess at that would be a second, drift-prone copy of the same fact.
+   */
+  private requestBranch(
+    session: number,
+    id: number | null,
+    role: 'user' | 'assistant',
+    shown: string,
+    button: HTMLElement,
+  ) {
+    if (!this.onMessageBranch) {
+      this.onToast?.('branching is not available on this connection', true)
+      return
+    }
+    if (id === null) {
+      // Honest, and it is a moment away from true: the row exists once the turn is stored, and the
+      // view picks it up on the reload that follows. A button that silently branched *something*
+      // would be worse than one that says which row it is waiting for.
+      this.onToast?.('this message is not stored yet - branch it once the turn has landed', true)
+      return
+    }
+    if (button.dataset.busy) return
+    button.dataset.busy = '1'
+    void Promise.resolve(
+      this.onMessageBranch({ session, id, role, shown }),
+    )
+      .then((msg) => {
+        if (msg && this.onToast) this.onToast(msg)
+      })
+      .catch((e) => {
+        this.onToast?.(`branch failed: ${e}`, true)
+      })
+      .finally(() => {
+        delete button.dataset.busy
+      })
+  }
+
+  /**
+   * Change your own words where they were said.
+   *
+   * The bubble is replaced by a textarea rather than annotated next to it: the message is a single
+   * thing being corrected, and showing both the old text and the new one invites a comparison the
+   * rest of the transcript cannot support — there is only ever one version of a message in the
+   * record.
+   *
+   * The two buttons say what each one does to the conversation, because the difference between them
+   * is not obvious and getting it wrong is expensive. Saving words in place cannot re-run anything:
+   * the model answered the sentence that was there, and every later turn was built on that answer.
+   * Taking the conversation back and sending again is the ask that redoes the answer, and it drops
+   * everything after the message — which is why it is the button with the longer title, not the one
+   * with the brighter colour.
+   */
+  private openUserEditor(wrap: HTMLElement, body: HTMLElement, shown: string, id: number | null) {
+    if (wrap.querySelector('.user-edit')) return
+    if (!this.onMessageEdit) {
+      this.onToast?.('editing is not available on this connection', true)
+      return
+    }
+    const ed = this.el('user-edit')
+    const ta = document.createElement('textarea')
+    ta.className = 'user-edit-ta'
+    ta.value = shown
+    ta.setAttribute('aria-label', 'Your message')
+    // The same measure as the bubble it replaces, so correcting a message does not widen the column
+    // the conversation is set in.
+    ta.rows = Math.max(3, Math.min(18, shown.split('\n').length + 1))
+
+    const note = this.el(
+      'user-edit-note',
+      'Save changes only this message — it does not send anything, and it does not change what the '
+        + 'model already read, because it answered the words that were there and every later turn was '
+        + 'built on that answer. Save and send again takes the conversation back to this message: '
+        + 'everything after it goes, and these words go out again.',
+    )
+
+    const acts = this.el('user-edit-acts')
+    const btn = (cls: string, label: string, title: string) => {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = `ue-act ${cls}`
+      b.title = title
+      b.textContent = label
+      acts.append(b)
+      return b
+    }
+    const save = btn('save', 'Save', 'Keep the conversation as it is and change only this message')
+    const again = btn(
+      'again',
+      'Save and send again',
+      'Drop everything after this message and send these words as a new turn',
+    )
+    const cancel = btn('cancel', 'Cancel', 'Leave this message as it is')
+    ed.append(ta, note, acts)
+
+    const close = () => {
+      wrap.classList.remove('editing')
+      ed.remove()
+    }
+    cancel.onclick = close
+
+    const submit = (resend: boolean) => {
+      const next = ta.value
+      if (!resend && next === shown) {
+        // Nothing to write, and saying so is cheaper than a round trip that reports success about
+        // an edit that changed nothing.
+        close()
+        this.onToast?.('the words are the same, so nothing was changed')
+        return
+      }
+      const fromEnd = this.userMessageBlocks().indexOf(wrap)
+      if (fromEnd < 0) {
+        close()
+        this.onToast?.('that message is no longer in this transcript', true)
+        return
+      }
+      const req: MessageEdit = {
+        id,
+        fromEnd: this.userMessageBlocks().length - fromEnd,
+        shown,
+        next,
+        resend,
+      }
+      save.disabled = again.disabled = cancel.disabled = true
+      void Promise.resolve(this.onMessageEdit?.(req))
+        .then((msg) => {
+          // The app repaints the transcript from the store after a change that worked, which takes
+          // this editor with it. Closing here as well covers the case where it decides not to reload.
+          close()
+          if (msg) this.onToast?.(msg)
+        })
+        .catch((e) => {
+          // The editor stays open with the words still in it: the refusal is about the record, and
+          // the person should be able to read it against what they typed.
+          save.disabled = again.disabled = cancel.disabled = false
+          this.onToast?.(String(e), true)
+        })
+    }
+    save.onclick = () => submit(false)
+    again.onclick = () => submit(true)
+
+    ta.onkeydown = (ev) => {
+      if (ev.key === 'Escape') {
+        // Stop it here as well as handling it: Escape is the app's key for closing menus and
+        // stopping a turn, and a person cancelling an edit means *this* one.
+        ev.stopPropagation()
+        ev.preventDefault()
+        close()
+      } else if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault()
+        submit(true)
+      }
+    }
+
+    wrap.classList.add('editing')
+    wrap.append(ed)
+    ta.focus()
+    ta.setSelectionRange(ta.value.length, ta.value.length)
+    this.scrollIfNeeded('chrome')
+  }
+
+  /** Your messages in this transcript, oldest first — the list `fromEnd` counts back through. */
+  private userMessageBlocks(): HTMLElement[] {
+    return Array.from(this.root.querySelectorAll('.blk-user')) as HTMLElement[]
+  }
+
+  /**
+   * Put bytes the app fetched onto the chip that asked for them.
+   *
+   * The first click on an old attachment costs one read of one row; the chip then holds the picture,
+   * so the same chip does not ask twice and the conversation shows what it contains. Returns false
+   * when that row is not on screen — the caller has already shown the picture, and a transcript that
+   * has scrolled past it is not a reason to fail the click.
+   */
+  rememberAttachment(msgId: number, index: number, url: string): boolean {
+    const body = this.root.querySelector(`.blk-user .blk-body[data-msg="${msgId}"]`) as HTMLElement | null
+    if (!body) return false
+    const list = body.querySelector('.attlist')
+    const chip = list?.querySelector(`.tatt[data-att="${index}"]`) as HTMLElement | null
+    if (!chip) return false
+    const ph = chip.querySelector('.tatt-ph')
+    if (ph) {
+      const im = document.createElement('img')
+      im.src = url
+      im.alt = chip.querySelector('.tatt-meta')?.textContent ?? 'attached image'
+      chip.insertBefore(im, ph)
+      ph.remove()
+      chip.classList.add('loaded')
+    } else {
+      const im = chip.querySelector('img')
+      if (im) im.src = url
+    }
+    return true
+  }
+
+  /**
+   * What your own message carried, drawn where the message is.
+   *
+   * An image is drawn as the image. The first version of this line was a dashed 11px pill with a
+   * filename in muted ink, and the complaint it produced was exact: "pasting an image seems like
+   * the file is attached, but when you send, there's no indication that it got sent". The composer
+   * had just shown a real thumbnail of that picture, so the moment the message was sent the picture
+   * vanished and what was left read like a caption rather than proof. A chip with the pixels in it
+   * answers the question without anyone having to look for the answer.
+   *
+   * The payload is only in hand for a message this window just sent, or one the reader has opened.
+   * A page of stored history carries name and size — by design, since a transcript read that pulled
+   * every attached megabyte would be a slower app for the sake of pictures that are scrolled past —
+   * so an older chip is a button that asks for the one picture being looked at.
+   */
+  private appendAttachmentTags(body: HTMLElement, attachments: AttachmentMeta[], msgId: number | null = null) {
     if (!attachments.length) return
     const row = this.el('attlist')
-    for (const a of attachments) {
+    attachments.forEach((a, i) => {
       const kb = Math.max(1, Math.round(a.bytes / 1024))
-      row.append(this.el('atttag', `${a.name ?? a.mime} · ${kb} kB`))
-    }
+      if (!a.mime.startsWith('image/')) {
+        row.append(this.el('atttag', `${a.name ?? a.mime} · ${kb} kB`))
+        return
+      }
+      const chip = document.createElement('button')
+      chip.type = 'button'
+      chip.className = 'tatt'
+      chip.dataset.att = String(i)
+      const label = `${a.name ?? a.mime} · ${kb} kB`
+      if (a.url) {
+        const im = document.createElement('img')
+        im.src = a.url
+        im.alt = a.name ?? 'attached image'
+        im.loading = 'lazy'
+        chip.append(im)
+        chip.append(this.el('tatt-meta', label))
+        chip.title = `The picture you sent: ${label}`
+      } else {
+        // No payload, and no pretending the transcript has one. The shape is the same chip, so the
+        // row still reads as "this message had a picture in it"; the square is a promise about what
+        // a click will bring, not a broken thumbnail.
+        const ph = this.el('tatt-ph', '')
+        ph.append(iconImage())
+        chip.append(ph)
+        chip.append(this.el('tatt-meta', `${label} · view`))
+        chip.title = `Open the picture in this message (${label})`
+      }
+      chip.onclick = () => this.onAttachmentOpen?.({ msgId, index: i, meta: a })
+      row.append(chip)
+    })
     body.append(row)
   }
 
@@ -2425,12 +3144,17 @@ export class Transcript {
   // ---- produced files -----------------------------------------------------
 
   /**
-   * Files a turn wrote into the workspace, shown as clickable attachments.
-   * The path is workspace-relative and the shell re-validates it before
-   * opening anything, so a model-authored name cannot escape the workspace.
-   */
-  /**
    * Show the files this turn has produced.
+   *
+   * Three shapes, and the file's *location* picks the shape, never a label on the
+   * event: `.cws/assistant_attachments/` becomes the dashed hand-over unit with the
+   * Save control, a generated file in the person's own tree becomes an artifact chip,
+   * and everything the turn merely touched becomes a working chip (rolled into a count
+   * past a few). An earlier version of this comment called all of them "clickable
+   * attachments", and that is how a file the model wrote at the workspace root ended up
+   * wearing the delivery control - see `isAttachPath`. Paths are workspace-relative and
+   * the shell re-validates before opening anything, so a model-authored name cannot
+   * escape the workspace.
    *
    * The event carries the *cumulative* list and fires whenever a tool produces
    * something, so appending a row per event used to print the same file two and
@@ -2960,12 +3684,21 @@ export class Transcript {
     this.ensureTurn()
     for (const f of files) {
       const at = this.turnFiles.findIndex((e) => e.path === f.path)
-      if (at >= 0) this.turnFiles[at] = f
+      // Newest metadata, except for `created`: a turn that made a file and then rewrote it still
+      // made it, and the live path must not disagree with the record the same turn ends in
+      // (both cores keep the flag sticky for the same reason).
+      if (at >= 0) this.turnFiles[at] = { ...f, created: f.created || this.turnFiles[at].created }
       else this.turnFiles.push(f)
     }
     for (const el of this.fileEls) el.remove()
     this.fileEls = this.fileRow(this.turnFiles)
-    for (const el of this.fileEls) this.turn!.appendChild(el)
+    // Before the action row if there is one, at the end of the turn if there is not: the copy /
+    // share / branch line belongs to the turn and sits last, and the files it produced sit right
+    // above it. Anything said afterwards gets pinned back over them (see `appendToTurn`).
+    // Ahead of the working mark as well as ahead of the action row: the mark is the tail of the
+    // writing, and a file strip dropped under it would be a hand-over line sitting beneath a spinner
+    // (`pinFilesLast` holds the same line for later appends).
+    for (const el of this.fileEls) this.turn!.insertBefore(el, this.workingSlot() ?? this.turn!.querySelector(':scope > .turn-acts'))
     this.closeRunGroup(true)
     this.scrollIfNeeded('text')
   }
@@ -2988,22 +3721,89 @@ export class Transcript {
     // repository is dozens of files, and a strip of 38 chips used to bury the one
     // artifact in the turn. Below the threshold, chips are the right shape for changes
     // too — two edited files are worth seeing.
-    const deliverables = all.filter((f) => f.kind === 'artifact')
-    const attachments = all.filter((f) => f.kind === 'attachment')
+    // **The hand-over folder is the only place a file can be handed over from.** The engine's
+    // placement rule and `scratch::attachment_path` both test the path against
+    // `.cws/assistant_attachments/`, and the transcript now does the same: a row that *claims*
+    // `kind: 'attachment'` while sitting at the workspace root or loose inside `.cws/` gets no
+    // dashed unit and no Save control, because that control offers to copy a file nobody agreed to
+    // put in the hand-over folder — and on the desktop it would offer it and then be refused by the
+    // host. Rows are re-read from the record, so a session written before the placement rule was
+    // fixed keeps the claim it was given; the path is what decides here, not the label.
+    const claims = all.filter((f) => f.kind === 'attachment')
+    const attachments = claims.filter((f) => isAttachPath(f.path))
+    // What a mislabelled row really is, by where its bytes are: loose scratch under `.cws/`, or an
+    // ordinary file in the person's own folder. Same split `kind_for` makes, so a chip and a kind
+    // cannot disagree about the same file.
+    const misplaced = claims.filter((f) => !isAttachPath(f.path))
+    const deliverables0 = all.filter(
+      (f) => f.kind === 'artifact' || (misplaced.includes(f) && !isScratchPath(f.path)),
+    )
+    const reclassified = misplaced.filter((f) => isScratchPath(f.path))
+    // **A file this turn made is shown as a card; a file it changed is a chip in a list.**
+    // The fact comes from the tool rather than from a guess afterwards: `write_file` looks at the
+    // disk before it writes, and once the bytes are down there a created file and a replaced one
+    // are indistinguishable. `kind` alone cannot tell them apart — it says `edit` for both — which
+    // is exactly why a screenshot of a workspace-root file wearing a delivery control turned into
+    // an argument about borders: the row could not say "I made this", so the only signal the
+    // renderer had was a label.
+    //
+    // A card is not a delivery. The Save control is the delivery, and it appears only inside
+    // `.cws/assistant_attachments/` (see `isAttachPath`); a card without one opens the file where
+    // it sits and promises nothing past that.
+    //
+    // The cap is what keeps this a design instead of a wall: a turn that created a dozen files in
+    // a build is describing work, not handing things over, and those belong in the rolled working
+    // strip with the edits. One number, `ROLL_FILES_AT`, decides both halves, so the point where
+    // "a few things I made" becomes "a pile of work" is a single rule nobody has to re-derive.
+    const made0 = all.filter(
+      (f) =>
+        f.created === true &&
+        !attachments.includes(f) &&
+        !misplaced.includes(f) &&
+        (f as { kind?: string }).kind !== 'scratch',
+    )
+    const made = made0.length <= ROLL_FILES_AT ? made0 : []
+    // One chip per file *name*. A turn that wrote `report.md` in the workspace and then handed a
+    // copy over drew the same filename twice, once as a working chip and once as an attachment —
+    // and the reader sees names, not paths, so that reads as a bug rather than as two files. The
+    // hand-over copy wins, because it is the one the model wrote in order to give; the other is
+    // still on disk where the tooltip says.
+    const given = new Set([...attachments, ...made].map((f) => f.name))
+    const deliverables = deliverables0.filter((f) => !given.has(f.name))
     // A file the model fetched for itself landed under .cws/ on purpose, so the
     // transcript does not present it as something the person asked for. It is
     // still one click away — hidden is not the same as gone, and a file the model
     // read should be checkable by the person who was told about it.
-    const scratch = all.filter((f) => (f as { kind?: string }).kind === 'scratch')
-    const changes = all.filter(
-      (f) => f.kind !== 'artifact' && f.kind !== 'attachment' && (f as { kind?: string }).kind !== 'scratch',
+    const scratch = all.filter(
+      (f) =>
+        ((f as { kind?: string }).kind === 'scratch' || reclassified.includes(f)) &&
+        !given.has(f.name),
     )
+    const changes = all.filter(
+      (f) =>
+        f.kind !== 'artifact' &&
+        f.kind !== 'attachment' &&
+        (f as { kind?: string }).kind !== 'scratch' &&
+        !made.includes(f) &&
+        !given.has(f.name),
+    )
+    if (misplaced.length) {
+      // Said out loud rather than quietly re-sorted: a turn that shows a file the host will not
+      // hand over is a claim the record made, and the reader deserves to know which of the two is
+      // wrong. One line per turn, and it names the paths.
+      const line = this.el('attach-note')
+      line.textContent = `${misplaced.length} file(s) in this turn are outside .cws/assistant_attachments/, so nothing here is offered for saving: ${misplaced
+        .map((f) => f.path)
+        .join(', ')}`
+      row.append(line)
+    }
     // Attachments on their own line, against the right edge of the column. They are the files the
     // model wrote *to hand over*, and they are read differently from the working strip: the strip
     // says what the turn touched (left, under the prose, in the order it touched them), the line
     // says what it made for you. Sharing one left-aligned row made a deliverable look like one more
     // file it edited - which is how a person ends up hunting for the thing they came back to fetch.
-    for (const f of attachments) line.append(this.attachmentUnit(f))
+    for (const f of attachments) line.append(this.attachmentUnit(f, true))
+    for (const f of made) line.append(this.attachmentUnit(f, false))
     for (const f of deliverables) row.append(this.fileChip(f))
     if (scratch.length) row.append(this.scratchGroup(scratch))
     if (changes.length <= ROLL_FILES_AT) {
@@ -3025,8 +3825,12 @@ export class Transcript {
    * and does not try: it asks the shell, which on the desktop opens a save dialog and
    * on a browser tab downloads.
    */
-  private attachmentUnit(f: OutputFile & { writes?: number }): HTMLElement {
+  private attachmentUnit(f: OutputFile & { writes?: number }, handover: boolean): HTMLElement {
     const unit = this.el('attachunit')
+    // Graded, and readable with the tooltip closed: the control is the whole difference between
+    // "the model put this where it can be copied out" and "the model made this, here".
+    unit.dataset.handover = handover ? 'yes' : 'no'
+    if (!handover) unit.classList.add('made')
     // A file the model meant you to have — and say where it is, rather than drawing a box
     // around it. The folder starts with a dot, so no file manager, screenshot or listing shows
     // it: a solid border promises a container that is not there, and a second box inside a box
@@ -3038,6 +3842,14 @@ export class Transcript {
     // The save control is an icon, like every other action on a block: the row is one line tall and
     // the filename is the thing that has to stay readable. What it does, and what just happened,
     // live in `title` and `aria-label` - a name in those costs no pixels and is still announced.
+    if (!handover) {
+      // No control at all rather than a disabled one: a greyed-out Save is still a promise the
+      // host refuses, which is the shape this rule exists to stop. The chip is already in the
+      // unit, and so is the "written N times" title when there was one; otherwise the tooltip
+      // names the path clicking opens, because that is all a card like this offers.
+      if (!(f.writes && f.writes > 1)) unit.title = `Open ${f.path}`
+      return unit
+    }
     const idle = `Save ${f.name} (${fmtSize(f.bytes)}) wherever you choose`
     const btn = this.btn('attach-save', '')
     btn.innerHTML = actIcon('download', 13)
@@ -3165,11 +3977,15 @@ export class Transcript {
 
   /**
    * The line under a finished turn: copy what it said, export the conversation as
-   * a Markdown document, and a branch button that is honest about not existing
-   * yet. A disabled control that says why is better than an absent feature the
-   * user has to guess at, and better than a live button that does nothing.
+   * a Markdown document, and branch from the answer.
+   *
+   * `rowId` is the answer's stored row. Branch names the row it means, so a turn that has not been
+   * persisted yet — a live turn, whose text the client streamed rather than read from the record —
+   * has a branch button that says what it is waiting for rather than one that branches a guess.
+   * A disabled control that says why is better than an absent feature the user has to guess at,
+   * and better than a live button that does nothing.
    */
-  private turnActionsRow(answerText: string, session: number): HTMLElement {
+  private turnActionsRow(answerText: string, rowId: number | null): HTMLElement {
     const row = this.el('turn-acts')
 
     const btn = (cls: string, label: string, title: string, icon: SVGElement) => {
@@ -3208,7 +4024,10 @@ export class Transcript {
         return
       }
       share.disabled = true
-      void this.onShare(session)
+      // Read at click time: a repaint of another conversation replaces these buttons, but a row
+      // built while the transcript was showing one conversation can outlive that repaint, and an
+      // export of the wrong conversation is worse than an export that never happened.
+      void this.onShare(this.sessionId)
         // A toast is the receipt, not a chip: the conversation does not gain a
         // file because someone exported it.
         .then((msg) => {
@@ -3222,9 +4041,586 @@ export class Transcript {
         })
     }
 
-    const branch = btn('branch', 'Branch', 'Branch this conversation - not built yet', iconBranch())
-    branch.disabled = true
+    const branch = btn(
+      'branch',
+      'Branch',
+      rowId === null
+        ? 'Branch from this answer once it is stored - a moment after the turn ends'
+        : 'Branch from this answer: a new conversation carries everything up to and including it, and starts from there. This conversation stays as it is.',
+      iconBranch(),
+    )
+    if (rowId === null) branch.disabled = true
+    branch.onclick = () => this.requestBranch(this.sessionId, rowId, 'assistant', answerText, branch)
+
+    // Files are the one thing an answer can do that cannot be taken back by deleting the
+    // message: the turn wrote into the folder, and the folder is not the transcript. So this
+    // control is about the folder, and it opens a card naming every path before it acts.
+    const undo = btn(
+      'revert',
+      'Undo files',
+      rowId === null
+        ? 'Undo this turn\'s files once it is stored - a moment after the turn ends'
+        : 'Put the files this turn changed back to how they were before it. The messages stay.',
+      iconUndo(),
+    )
+    if (rowId === null) undo.disabled = true
+    undo.onclick = () => this.openRevertCard(rowId, row)
+
+    // The tree control is on an answer too, because standing at an answer is the common case: the
+    // turn after it is the one you want to take back, and its ask is still in the record.
+    const tree = btn(
+      'treebtn',
+      'Tree',
+      rowId === null
+        ? 'Show the conversation\'s tree once this answer is stored - a moment after the turn ends'
+        : 'Show this conversation\'s tree: where it was cut out of, what hangs off it, and which message the next answer reads through.',
+      iconTree(),
+    )
+    if (rowId === null) tree.disabled = true
+    tree.onclick = () => this.openTreeCard(this.sessionId, rowId, row)
+
+    // Files, next to the undo it belongs to. `Undo files` answers one question - put this turn's
+    // files back - and this answers the other: what has this conversation written at all. That is
+    // the question a person asks when they are not undoing anything, and until now nothing on the
+    // screen could answer it. It is a read, so it opens mid-turn; the half that deletes files is a
+    // button inside it, and refuses mid-turn.
+    const files = btn(
+      'filesbtn',
+      'Files',
+      rowId === null
+        ? 'Show this conversation\'s files once this answer is stored - a moment after the turn ends'
+        : 'Show every file this conversation\'s turns touched, what each turn did to it, and what can still be put back.',
+      iconFiles(),
+    )
+    if (rowId === null) files.disabled = true
+    files.onclick = () => this.openLedgerCard(this.sessionId, rowId, row)
     return row
+  }
+
+  /**
+   * The tree of one conversation: where it was cut out of, what hangs off it, and which message the
+   * next answer reads through.
+   *
+   * A card rather than a dialog, for the reason the revert card is one: the question is about the
+   * turn it was opened from, and a person answering it needs that turn on screen while they read.
+   *
+   * It is a read, not an action, so it opens mid-turn too — moving the leaf is what refuses, and the
+   * button on each node is the thing that carries that refusal.
+   */
+  private openTreeCard(session: number, rowId: number | null, anchor: HTMLElement) {
+    if (!this.onTree || !this.onLeafMove) {
+      this.onToast?.('the conversation tree is not available on this connection', true)
+      return
+    }
+    if (rowId === null) {
+      this.onToast?.('this message is not stored yet - the tree can name it once the turn has landed', true)
+      return
+    }
+    const turn = anchor.closest('.turn') as HTMLElement | null
+    const host = turn ?? anchor
+    const old = host.querySelector('.tree-card')
+    if (old) old.remove()
+
+    const card = this.el('tree-card')
+    card.dataset.row = String(rowId)
+    const head = this.el('tree-h', 'Tree')
+    const said = this.el('tree-said')
+    const fam = this.el('tree-fam')
+    const nodes = this.el('tree-nodes')
+    const piLine = this.el('tree-pi')
+    const drift = this.el('tree-drift')
+    const acts = this.el('tree-acts')
+    const close = this.btn('tree-close', 'Close')
+    close.onclick = () => card.remove()
+    acts.append(close)
+    card.append(head, said, fam, nodes, piLine, drift, acts)
+    host.append(card)
+
+    const paint = (t: TreeRead) => {
+      said.textContent = t.note
+      fam.textContent = ''
+      for (const c of t.lineage) {
+        const li = this.el('tree-convo')
+        li.style.setProperty('--depth', String(c.depth))
+        if (c.current) li.dataset.cur = '1'
+        li.append(this.el('tree-convo-t', c.title))
+        if (c.current) li.append(this.el('tree-flag', 'this conversation'))
+        if (c.parent_gone) li.append(this.el('tree-flag', 'cut out of a conversation that was deleted'))
+        if (c.branch_role === 'user') li.append(this.el('tree-cut', `cut from your message: “${c.branch_quote}”`))
+        else if (c.branch_role === 'assistant')
+          li.append(this.el('tree-cut', `cut from an answer: “${c.branch_quote}”`))
+        li.append(this.el('tree-count', `${c.rows} row${c.rows === 1 ? '' : 's'}${c.children ? ` · ${c.children} branch${c.children === 1 ? '' : 'es'}` : ''}${c.off_branch ? ` · ${c.off_branch} not being read` : ''}`))
+        fam.append(li)
+      }
+      nodes.textContent = ''
+      for (const n of t.nodes) {
+        const li = this.el('tree-node')
+        li.style.setProperty('--depth', String(n.depth))
+        if (n.current) li.dataset.cur = '1'
+        if (!n.on_branch) li.dataset.off = '1'
+        if (n.drift) li.dataset.drift = '1'
+        li.append(this.el('tree-role', n.role === 'user' ? 'you' : n.role === 'assistant' ? 'answer' : n.role))
+        li.append(this.el('tree-quote', n.quote))
+        if (n.current) li.append(this.el('tree-flag', 'read through'))
+        else if (!n.on_branch) li.append(this.el('tree-flag', 'on a branch not being read'))
+        if (n.pi_current && !n.current && (n.row !== null || this.speaks(n)))
+          li.append(this.el('tree-flag', "pi's thread reads through here, not the record"))
+        if (n.drift) li.append(this.el('tree-flag', 'the two records disagree'))
+        if (n.row === null) {
+          // A node pi's thread has and the record does not answer to. There is nothing to press:
+          // moving the leaf is a move onto a row of the record, and a button that addressed an entry
+          // id the engine cannot resolve would be a control that lies about what it does.
+          li.append(this.el('tree-only', this.piOnlyNote(n)))
+        } else {
+          const go = this.btn('tree-go', n.current ? 'Already read' : 'Read from here')
+          go.disabled = n.current
+          go.title =
+            (n.role === 'user'
+              ? 'Stand here: the next answer reads up to this message and not past it, and these words come back for you to send again.'
+              : 'Stand here: the next answer reads up to and including this answer, and your next message joins it.') +
+            ' Nothing is deleted - the messages past here stay in the conversation, on a branch that is not being read.'
+          go.onclick = () => {
+            if (go.dataset.busy) return
+            go.dataset.busy = '1'
+            go.disabled = true
+            void Promise.resolve(
+              this.onLeafMove!({ session, id: n.row!, role: n.role as 'user' | 'assistant', shown: n.content }),
+            )
+              .then(async (out) => {
+                this.onToast?.(out.note)
+                // Repaint from the record rather than from what this click assumed: the leaf moved,
+                // and the conversation may now be reading a different path than the one painted.
+                const again = await this.onTree!(session)
+                paint(again)
+              })
+              .catch((e) => {
+                this.onToast?.(`the leaf did not move: ${e}`, true)
+                go.disabled = false
+              })
+              .finally(() => {
+                delete go.dataset.busy
+              })
+          }
+          li.append(go)
+        }
+        nodes.append(li)
+      }
+      if (t.nodes_hidden > 0) {
+        nodes.append(
+          this.el(
+            'tree-more',
+            `${t.nodes_hidden} node${t.nodes_hidden === 1 ? '' : 's'} on branches that are not being `
+              + 'read are not listed here.',
+          ),
+        )
+      }
+      piLine.textContent = t.pi.consulted
+        ? `the model's own thread: ${t.pi.entries} entries, reading through ${t.pi.leaf_entry ?? 'nothing'}, in ${t.pi.file}`
+        : t.pi.why
+      drift.textContent = ''
+      for (const d of t.drift) drift.append(this.el('tree-drift-l', d))
+      if (t.drift_count > t.drift.length) {
+        drift.append(this.el('tree-drift-l', `${t.drift_count - t.drift.length} more the two records do not answer to each other`))
+      }
+      drift.style.display = t.drift.length ? '' : 'none'
+    }
+
+    said.textContent = 'reading the tree…'
+    void this.onTree(session)
+      .then(paint)
+      .catch((e) => {
+        said.textContent = String(e)
+      })
+  }
+
+  /**
+   * Open the tree card for the conversation on screen from somewhere that is not a message row —
+   * the sidebar's row menu, which is where a person goes when they want the conversation rather than
+   * one message of it.
+   *
+   * It presses the card's own control rather than building a second card: two ways to open the same
+   * tree is two ways for the two to disagree about what is current.
+   */
+  showTree(): boolean {
+    if (!this.onTree || !this.onLeafMove) {
+      this.onToast?.('the conversation tree is not available on this connection', true)
+      return false
+    }
+    const buttons = [
+      ...this.root.querySelectorAll('.blk-user .user-acts .tact.treebtn, .turn .tacts .tact.treebtn'),
+    ] as HTMLButtonElement[]
+    // The newest stored row, which is what the conversation is reading from unless the leaf moved.
+    const live = buttons.reverse().find((b) => !b.disabled)
+    if (!live) {
+      this.onToast?.('nothing on this screen is stored yet, so the tree has nothing to name', true)
+      return false
+    }
+    live.click()
+    return true
+  }
+
+  /** Why a node has no button on it, in the terms of the core that reported it. */
+  /** Is this node something a person said or the model answered, as opposed to pi's own writing? */
+  private speaks(n: TreePoint): boolean {
+    // The record stores messages, answers and tool results. pi's own prompt and its bookkeeping are
+    // not messages of the conversation, and saying the record is missing one of those would be a wolf.
+    return ['user', 'assistant', 'toolResult', 'tool'].includes(n.role)
+  }
+
+  private piOnlyNote(n: TreePoint): string {
+    if (n.pi_current)
+      return this.speaks(n)
+        ? "this is where pi's thread is, and the record has no row for it - there is nothing to stand on"
+        : "pi's thread ends here, on its own bookkeeping - it is reading no message of this conversation"
+    return n.on_branch
+      ? 'an entry of the model\'s thread the record has no row for - there is nothing to stand on'
+      : 'an entry of the model\'s thread, on a branch the record is not reading'
+  }
+
+  /**
+   * Every file this conversation wrote, in one card.
+   *
+   * A card rather than a dialog, for the reason the revert card is one: the question is about the
+   * turn it was opened from, and the answer is only worth reading next to it. The diff is drawn in
+   * the same surface the tool card uses, so one file has one way to be shown.
+   *
+   * Reading it changes nothing, so it opens mid-turn. The one control in it that deletes files
+   * refuses mid-turn, and says so on the button rather than after the press.
+   */
+  private openLedgerCard(session: number, rowId: number | null, anchor: HTMLElement) {
+    if (!this.onLedger || !this.onFileDiff) {
+      this.onToast?.('the file ledger is not available on this connection', true)
+      return
+    }
+    if (rowId === null) {
+      this.onToast?.('this turn is not stored yet - the file record names it a moment later', true)
+      return
+    }
+    const turn = anchor.closest('.turn') as HTMLElement | null
+    const host = turn ?? anchor
+    const old = host.querySelector('.ledger-card')
+    if (old) old.remove()
+
+    const card = this.el('ledger-card')
+    card.dataset.row = String(rowId)
+    const head = this.el('ledger-h', 'Files')
+    const said = this.el('ledger-said')
+    const turns = this.el('ledger-turns')
+    const paths = this.el('ledger-paths')
+    const stats = this.el('ledger-stats')
+    const prunes = this.el('ledger-prunes')
+    const surface = this.el('ledger-surface')
+    const acts = this.el('ledger-acts')
+    const forget = this.btn('ledger-forget', 'Forget copies')
+    // A control that deletes files has to say whether this connection can do it. The desktop and the
+    // gateway both answer `forget_copies`; a client that never wired the hook gets an inert button
+    // naming that, not a button that swallows the press.
+    if (!this.onForgetCopies) {
+      forget.disabled = true
+      forget.title =
+        "Deleting this conversation's copies is not available on this connection - the copies stay where they are"
+    }
+    const close = this.btn('ledger-close', 'Close')
+    close.onclick = () => card.remove()
+    acts.append(forget, close)
+    card.append(head, said, turns, paths, stats, prunes, surface, acts)
+    host.append(card)
+
+    let read: LedgerRead | null = null
+
+    const paintDiff = (d: FileDiffRead) => {
+      surface.textContent = ''
+      const line = this.el('ledger-diff-h')
+      const sides =
+        d.kind === 'created'
+          ? 'written by this turn, so there is no earlier copy'
+          : d.stored_present
+            ? `the copy this app took (${d.stored_bytes} B) against ${d.live_exists ? 'the file on disk' : 'nothing: the file is gone'}`
+            : `no copy was kept, so only the live side exists${d.live_exists ? ` (${d.live_bytes} B on disk)` : ': the file is gone'}`
+      line.textContent = `${d.path} · ${sides} · +${d.added} -${d.removed}`
+      surface.append(line)
+      if (d.diff) {
+        const pre = this.el('tool-diff')
+        for (const l of d.diff.split('\n')) {
+          if (!l) continue
+          const cls = l.startsWith('@@')
+            ? 'diff-hunk'
+            : l.startsWith('+++') || l.startsWith('---')
+              ? 'diff-file'
+              : l.startsWith('+')
+                ? 'diff-add'
+                : l.startsWith('-')
+                  ? 'diff-del'
+                  : 'diff-ctx'
+          pre.append(this.el(`diff-line ${cls}`, l))
+        }
+        surface.append(pre)
+      }
+      surface.append(this.el('ledger-diff-note', d.note))
+    }
+
+    const paint = (l: LedgerRead) => {
+      read = l
+      said.textContent = l.note
+      turns.textContent = ''
+      for (const t of l.turns) {
+        const li = this.el('ledger-turn')
+        li.dataset.turn = String(t.turn)
+        const h = this.el('ledger-turn-h')
+        h.textContent = `turn ${t.turn} - ${t.files} file${t.files === 1 ? '' : 's'}` +
+          (t.latest ? ' (the newest turn that wrote files)' : '')
+        li.append(h)
+        li.append(this.el('ledger-turn-note', t.note))
+        for (const f of t.file_rows) {
+          const row = this.el('ledger-file')
+          row.dataset.kind = f.kind
+          row.dataset.checkpoint = String(f.checkpoint)
+          row.append(this.el('ledger-path', f.path))
+          row.append(this.el('ledger-kind', f.kind))
+          if (f.edited_since) row.append(this.el('ledger-flag', 'edited since'))
+          if (f.path_missing) row.append(this.el('ledger-flag', 'file is gone'))
+          if (!f.can_revert) row.append(this.el('ledger-flag', 'no revert'))
+          row.append(this.el('ledger-says', f.says))
+          // A diff needs two sides. A stored copy against no live file is still a comparison —
+          // "this is what the turn took, and the file is gone" — but a file this turn *created*
+          // has no earlier bytes, and printing its live content as a diff would read as every line
+          // being added by somebody. Those rows carry no button; their `says` line already names
+          // what a revert would do.
+          if (f.copy_present) {
+            const d = this.btn('ledger-diff-btn', 'Diff')
+            d.title = 'Compare the copy this app took with the bytes on disk now.'
+            d.onclick = () => {
+              if (d.dataset.busy) return
+              d.dataset.busy = '1'
+              d.disabled = true
+              void this
+                .onFileDiff!({ session, checkpoint: f.checkpoint, shown: f.path })
+                .then(paintDiff)
+                .catch((e) => {
+                  surface.textContent = ''
+                  surface.append(this.el('ledger-diff-note', String(e)))
+                })
+                .finally(() => {
+                  delete d.dataset.busy
+                  d.disabled = false
+                })
+            }
+            row.append(d)
+          }
+          li.append(row)
+        }
+        turns.append(li)
+      }
+      paths.textContent = ''
+      if (l.paths.length) {
+        paths.append(this.el('ledger-paths-h', `${l.paths_total} path${l.paths_total === 1 ? '' : 's'} in this conversation`))
+        for (const p of l.paths) {
+          const li = this.el('ledger-pathline')
+          li.append(this.el('ledger-path', p.path))
+          li.append(this.el('ledger-kinds', p.kinds))
+          li.append(
+            this.el(
+              'ledger-live',
+              p.live_exists ? `on disk: ${p.live_bytes} B` : 'not in the folder now',
+            ),
+          )
+          paths.append(li)
+        }
+        if (l.paths_hidden > 0)
+          paths.append(this.el('ledger-more', `${l.paths_hidden} path${l.paths_hidden === 1 ? '' : 's'} not listed on this card`))
+      }
+      prunes.textContent = ''
+      for (const n of l.prune_notes) prunes.append(this.el('ledger-prune', n))
+      forget.textContent = labelFor(l.files_total)
+      forget.disabled = l.files_total === 0
+      delete forget.dataset.armed
+    }
+
+    const askStats = () => {
+      if (!this.onLedgerStats) return
+      void this.onLedgerStats(session)
+        .then((s) => {
+          stats.textContent = s.note
+        })
+        .catch((e) => {
+          stats.textContent = String(e)
+        })
+    }
+
+    void this
+      .onLedger(session)
+      .then((l) => {
+        paint(l)
+        askStats()
+      })
+      .catch((e) => {
+        said.textContent = String(e)
+        forget.disabled = true
+      })
+
+    const labelFor = (n: number) =>
+      n === 0 ? 'Nothing to forget' : `Forget ${n} cop${n === 1 ? 'y' : 'ies'} of this conversation`
+
+    forget.onclick = () => {
+      if (!read || !this.onForgetCopies) return
+      // The count is taken from what the card just read, not from what this window assumed: the
+      // engine compares the number against its own rows before it deletes anything.
+      const count = read.files_total
+      if (!forget.dataset.armed) {
+        // Two presses, because this deletes files. The first says what the second will do.
+        forget.dataset.armed = '1'
+        forget.textContent = `Press again to delete ${count} cop${count === 1 ? 'y' : 'ies'}`
+        return
+      }
+      forget.disabled = true
+      void this
+        .onForgetCopies(session, count)
+        .then((out) => {
+          this.onToast?.(out.note)
+          delete forget.dataset.armed
+          forget.textContent = 'Copies forgotten'
+          // Repaint from the record: the rows are gone, and a card still listing them is a list of
+          // files that no longer exist.
+          void this.onLedger!(session).then(paint).catch((e) => {
+            said.textContent = String(e)
+          })
+        })
+        .catch((e) => {
+          this.onToast?.(`nothing was forgotten: ${e}`, true)
+          delete forget.dataset.armed
+          forget.disabled = false
+          forget.textContent = labelFor(count)
+        })
+    }
+  }
+
+  /**
+   * The confirmation a revert needs, built from the engine's own preview.
+   *
+   * Two scopes, because "undo this answer" and "get my folder back to how it was before this
+   * message" are different wishes and the second one sweeps later turns with it. Both are listed
+   * before anything moves, and the path list on screen is sent back with the request: if the
+   * engine's rows no longer match what the person read, it refuses rather than reverting a scope
+   * nobody was shown.
+   */
+  private openRevertCard(rowId: number | null, actions: HTMLElement) {
+    if (!this.onRevertPreview || !this.onRevert) {
+      this.onToast?.('undoing files is not available on this connection', true)
+      return
+    }
+    if (rowId === null) {
+      this.onToast?.('this turn is not stored yet - undo it once it has landed', true)
+      return
+    }
+    const session = this.sessionId
+    // Attached to the turn's own action row, not to a live turn element: these buttons are also
+    // painted for rows loaded from the record, where there is no turn being written. Asking a
+    // live turn for a home is how a card that was opened vanished without a trace.
+    const turn = actions.closest('.turn') as HTMLElement | null
+    const old = turn?.querySelector('.revert-card')
+    if (old) old.remove()
+
+    const card = this.el('revert-card')
+    card.dataset.row = String(rowId)
+    const head = this.el('revert-h', 'Undo file changes')
+    const scopeRow = this.el('revert-scopes')
+    const only = this.btn('revert-scope', 'This turn only')
+    const thru = this.btn('revert-scope', 'This turn and after')
+    scopeRow.append(only, thru)
+    const list = this.el('revert-list')
+    const note = this.el('revert-note')
+    const acts = this.el('revert-acts')
+    const go = this.btn('revert-go', 'Revert')
+    const cancel = this.btn('revert-cancel', 'Cancel')
+    acts.append(go, cancel)
+    card.append(head, scopeRow, list, note, acts)
+
+    let throughLatest = false
+    let preview: RevertPreview | null = null
+
+    const paint = () => {
+      only.dataset.on = throughLatest ? '' : '1'
+      thru.dataset.on = throughLatest ? '1' : ''
+      if (!preview) return
+      list.textContent = ''
+      for (const it of preview.items) {
+        const li = this.el('revert-item')
+        li.dataset.kind = it.kind
+        li.append(this.el('revert-path', it.path))
+        li.append(this.el('revert-verb', it.action))
+        if (it.edited_since) li.append(this.el('revert-flag', 'edited since'))
+        if (it.copy_missing) li.append(this.el('revert-flag', 'no copy left'))
+        if (it.path_missing) li.append(this.el('revert-flag', 'file is gone'))
+        list.append(li)
+      }
+      note.textContent = preview.note
+      // A conversation that hit the size cap has lost copies, and a list that reads as the whole
+      // history of a folder is a claim about the folder. This is its own line rather than a flag on a
+      // path, because it is about the conversation, not about one file.
+      const gone = card.querySelector('.revert-prune')
+      if (gone) gone.remove()
+      if (preview.pruned > 0) {
+        note.append(this.el('revert-prune',
+          `${preview.pruned} older cop${preview.pruned === 1 ? 'y' : 'ies'} of this conversation `
+          + 'were discarded to stay under the size limit.'))
+      }
+      // The choice that would overwrite someone's later work has to be its own button, and
+      // it only exists when there is something to overwrite. A tick box on a card that never
+      // needs it teaches people to tick boxes.
+      go.textContent = preview.edited_since > 0 ? 'Revert anyway' : 'Revert'
+      go.dataset.warn = preview.edited_since > 0 ? '1' : ''
+      go.disabled = preview.items.length === 0
+    }
+
+    const ask = () => {
+      go.disabled = true
+      return this.onRevertPreview!(session, rowId!, throughLatest)
+        .then((p) => {
+          preview = p
+          paint()
+        })
+        .catch((e) => {
+          note.textContent = String(e)
+          go.disabled = true
+        })
+    }
+
+    only.onclick = () => {
+      if (throughLatest === false) return
+      throughLatest = false
+      ask()
+    }
+    thru.onclick = () => {
+      if (throughLatest === true) return
+      throughLatest = true
+      ask()
+    }
+    cancel.onclick = () => card.remove()
+    go.onclick = () => {
+      if (!preview || go.dataset.busy) return
+      // Repeat what was painted, in the order it was painted. The engine compares this list
+      // with its own rows before it writes anything.
+      const shown = preview.items.map((i) => i.path)
+      const overwrite = preview.edited_since > 0
+      go.dataset.busy = '1'
+      go.disabled = true
+      void this.onRevert!(session, rowId!, throughLatest, shown, overwrite)
+        .then((msg) => {
+          if (msg && this.onToast) this.onToast(msg)
+          card.remove()
+        })
+        .catch((e) => {
+          // A refusal leaves the card up with the reason in it: the person can read the new
+          // scope and decide, instead of being told "failed" and left with nothing.
+          note.textContent = String(e)
+          delete go.dataset.busy
+          go.disabled = false
+        })
+    }
+
+    actions.after(card)
+    this.follow('text')
+    void ask()
   }
 
   /** Live turns get their actions at turn end, from the text we streamed. */
@@ -3233,7 +4629,10 @@ export class Transcript {
     this.turn.querySelector('.turn-acts')?.remove()
     const text = this.turnAnswer.join('')
     if (!text.trim() && !this.turnFiles.length) return
-    this.turn.appendChild(this.turnActionsRow(text, this.sessionId))
+    // A live turn has no stored row to name: the text on screen is what the client streamed, and
+    // the row it becomes is written when the turn lands. The reload after the turn gives the same
+    // answer this row has always had.
+    this.turn.appendChild(this.turnActionsRow(text, null))
     // The row lands after the last paint, so a reader who was being followed
     // ends up 30-odd pixels short of the bottom exactly when the turn closes.
     this.follow('text')
@@ -3469,12 +4868,8 @@ export class Transcript {
   }
 
   loadHistory(msgs: StoredMessage[]) {
-    this.clear()
+    this.clear('page paint')
     this.root.appendChild(this.historyFragment(msgs))
-    // One cup for the page, under everything the store produced, resting: a loaded session is a
-    // finished one, so this is the loop with the random holds rather than a still.
-    this.placeCup()
-    this.repaintCup()
     pageLog(`history: loaded ${msgs.length} messages`)
   }
 
@@ -3514,26 +4909,27 @@ export class Transcript {
     // arrangement on screen changes, because rewriting history mid-conversation is how a
     // prompt cache stops matching and every turn starts costing full price again.
     let run: HTMLElement | null = null
-    // One name per turn here too. A stored transcript has no `.turn` element to bound the
-    // marker, so it sticks to the scroller until the next turn replaces it — the same
-    // affordance seen from the other end: whoever's words fill the screen is named at the top
-    // of it. `asked` counts as cwoffee speaking: a question the agent asked is its turn.
-    let whoSaid = false
-    const whoCwoffee = () => {
-      if (whoSaid) return
-      whoSaid = true
-      const wrap = this.el('turn-who turn-who-cwoffee')
-      wrap.append(this.el('who-name', 'cwoffee'))
-      frag.appendChild(wrap)
-    }
+    // No name marker here at all. A stored turn has nothing live to show, and the marker's only
+    // content is the working mark: a page you are reading rather than watching carries no mark.
+    // The files a turn produced are accumulated instead of emitted per message, because they
+    // belong to the turn: see `flushTurn`.
+    let histFiles: OutputFile[] = []
     // The last thing this page's turns actually said. One actions row per turn, the
     // same affordance a live turn puts under its final answer - emitted per assistant
     // row, it stamped `Copy | Share as markdown | Branch` under every intermediate
     // message and the transcript read as a stack of separate turns.
-    let lastAnswer: { body: HTMLElement; text: string } | null = null
+    // `id` rides along for the same reason the pencil needs it: branching names the row, and the
+    // only row this window can name is one it read out of the record.
+    let lastAnswer: { body: HTMLElement; text: string; id: number | null } | null = null
     const flushAnswerActs = () => {
+      // Files first, actions last: the files are what the turn produced and the copy / share /
+      // branch line is what a reader does with a finished turn, so that line stays the last thing
+      // in the turn. A turn that wrote a file but said nothing still shows the file — and only the
+      // file, with no action row under nothing.
+      for (const el of this.fileRow(histFiles)) frag.appendChild(el)
+      histFiles = []
       if (!lastAnswer) return
-      const acts = this.turnActionsRow(lastAnswer.text, this.sessionId)
+      const acts = this.turnActionsRow(lastAnswer.text, lastAnswer.id)
       acts.classList.add('from-history')
       // Appended at the end of what this turn has produced so far, which is where a
       // live turn puts them: under the turn, after any run that followed its last
@@ -3544,7 +4940,6 @@ export class Transcript {
     }
     const blk = (kind: string, label: string) => {
       endRun()
-      if (kind !== 'user') whoCwoffee()
       const wrap = this.el(`blk blk-${kind}`)
       const head = this.el('blk-head', label)
       const body = this.el('blk-body')
@@ -3562,7 +4957,6 @@ export class Transcript {
     const verboseRuns = this.verbose
     const runBody = () => {
       if (!run) {
-        whoCwoffee()
         run = this.mkRun()
         frag.appendChild(run)
         lastWrap = run
@@ -3593,13 +4987,22 @@ export class Transcript {
         // A user row is where one turn stops and the next starts, so it is where the
         // previous turn's actions row gets placed — and where this turn's accordion is
         // dropped, so the next turn gets its own rather than inheriting this one's steps.
+        // This also places the previous turn's files: they were held for the end of the turn,
+        // and a user row is where one turn stops.
         flushAnswerActs()
         endRun()
         run = null
-        whoSaid = false
         const body = blk('user', 'you')
         body.textContent = m.content
-        this.appendAttachmentTags(body, m.attachments ?? [])
+        // The row id, on the element the attachments hang off. A chip the reader pressed has to be
+        // findable again once its bytes arrive, and this is the only place that knows which stored
+        // row a bubble came from.
+        body.dataset.msg = String(m.id)
+        this.appendAttachmentTags(body, m.attachments ?? [], m.id)
+        // A stored message knows its own row, so an edit of it is addressed by id — which is the
+        // strictest of the two forms: no counting, no guessing, and a row that has gone in the
+        // meantime is reported as gone rather than resolved to its neighbour.
+        this.attachUserActions(body.parentElement as HTMLElement, body, m.content ?? '', m.id)
       } else if (m.role === 'assistant') {
         if (m.reasoning) {
           // A line, not a body: the stored reasoning is not rendered at all. It is still counted,
@@ -3639,15 +5042,15 @@ export class Transcript {
           // export from the DOM should hand back what the model wrote, not the
           // rendering of it.
           body.dataset.md = m.content
-          lastAnswer = { body, text: m.content }
+          lastAnswer = { body, text: m.content, id: m.id ?? null }
         }
         if (m.files?.length) {
-          // Into the fragment, directly under the answer that produced them. This
-          // used to call ensureTurn() and append to the live turn, which landed the
-          // chips at the *top* of a reloaded transcript, above every message: a
-          // session reopened after writing a file looked like it had no attachment,
-          // which is exactly the "the file was not shown at turn end" report.
-          for (const el of this.fileRow(m.files)) frag.insertBefore(el, lastWrap ? lastWrap.nextSibling : null)
+          // Held for the end of the turn. Two earlier shapes were wrong in opposite
+          // directions: appending to the *live* turn put the chips at the top of a reloaded
+          // transcript (the "the file was not shown at turn end" report), and emitting them under
+          // the message that mentioned them put a file box in the middle of an answer that was
+          // still talking about something else.
+          histFiles.push(...m.files)
         }
         for (const call of parseCalls(m.tool_calls_json)) {
           if (call.name === 'ask_user') {
@@ -3738,6 +5141,43 @@ export class Transcript {
  * the same turn (an artifact, always shown as its own chip) disappears.
  */
 const ROLL_FILES_AT = 4
+
+/**
+ * The hand-over folder, spelled the way the engine spells it (`scratch::attach_prefix`).
+ *
+ * Three places test a path against it — the engine's placement rule when it writes, the host when
+ * it copies a file somewhere the person picked, and the transcript when it decides what shape a
+ * file row takes. The transcript's half used to be "the row says `kind: 'attachment'`", which made
+ * the *label* the authority: a download with `place: "attach"` and a workspace-root `path` was
+ * labelled an attachment while its bytes sat outside the folder, and the dashed unit offered to
+ * Save a file the host would then refuse to hand over. The path is the fact; the kind is a
+ * description of it.
+ */
+const SCRATCH_DIR = '.cws'
+const ATTACH_DIR = 'assistant_attachments'
+
+/**
+ * Whether a stored path sits in the hand-over folder, decided the way `kind_for` decides it: the
+ * two components next to each other, `.cws` then `assistant_attachments`.
+ *
+ * A prefix test would be a second, weaker rule. It would miss an absolute path (`/work/.cws/…`,
+ * which is how a fixture and an out-of-workspace row are spelled) and, worse, a *substring* test
+ * would call somebody's repository folder `src/assistant_attachments/x` a hand-over file — the same
+ * mistake the engine's comment names: a directory of source files presented as hand-over material.
+ */
+function isAttachPath(path: string): boolean {
+  const parts = (path ?? '').trim().replace(/^\.\//, '').split('/')
+  for (let i = 1; i < parts.length; i++) {
+    if (parts[i] === ATTACH_DIR && parts[i - 1] === SCRATCH_DIR) return true
+  }
+  return false
+}
+
+/** Anything under `.cws/` that is not the hand-over folder is the model's own working material. */
+function isScratchPath(path: string): boolean {
+  const parts = (path ?? '').trim().replace(/^\.\//, '').split('/')
+  return parts.includes(SCRATCH_DIR)
+}
 
 /**
  * How many app announcements stay attachable to a transcript. Enough that the
@@ -3841,7 +5281,21 @@ const TOOL_HEAD: Record<string, { run: string; done: string; bad: string }> = {
 export function toolHeadline(name: string, tense: 'run' | 'done' | 'bad'): string {
   const h = TOOL_HEAD[name]
   if (h) return h[tense]
+  // A third-party tool keeps its server in the header at every tense. The status chip already
+  // carries working/done/failed, so the tense word adds nothing here, while "which program is
+  // this call inside" is the one fact a scanner needs from a list of cards — and it is the same
+  // fact the approval card leads with.
+  const server = mcpServerOf(name)
+  if (server) return `third-party · ${server}`
   return tense === 'done' ? 'Done' : tense === 'bad' ? 'Failed' : 'Working'
+}
+
+/** The server a declared MCP tool name belongs to, mirroring `mcp__<server>__<tool>`. */
+export function mcpServerOf(name: string): string {
+  if (!name.startsWith('mcp__')) return ''
+  const rest = name.slice(5)
+  const server = rest.split('__')[0] ?? ''
+  return server
 }
 
 /**

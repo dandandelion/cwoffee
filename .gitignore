@@ -7,10 +7,16 @@
 node_modules
 ui/dist
 ui/.svelte-kit
+# An npm cache that landed in the repo root when a build ran with npm_config_cache
+# pointing here. Runtime state, and a directory nobody wrote on purpose.
+.npm/
 *.local
 
 # Cwoffee
 .cwoffee/
+# Turn checkpoints: copies of files a turn overwrote, so the turn can be undone. Runtime
+# state in whatever folder the conversation is working in, never a product artifact.
+.cws/
 *.db
 *.db-wal
 *.db-shm

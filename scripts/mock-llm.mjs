@@ -31,6 +31,12 @@
  * example, that `sheet_read` really returned a cell grid before it is allowed to
  * answer from one.
  *
+ * A step may also carry `require_steer`: strings that must appear in a user message positioned
+ * **after the last tool result** of the request that plays it. That is how a mid-turn press is
+ * graded — the claim is about the model's next request, and only the server that received it can
+ * say the message was in it, in that place. `require_steer_absent` is the other half: strings that
+ * must not appear in any user message of the request at all, which is what a withdrawal promises.
+ *
  * Routes:
  *   GET  /health              -> ok
  *   GET  /v1/models           -> the mock model list (meta.n_ctx, input_modalities)
@@ -93,6 +99,16 @@ const stats = {
   tools_requested: 0,
   sampling_seen: [],
   last: [],
+  /// Every user message text this server was ever asked about, newest last. The mid-turn
+  /// checks read it to prove a withdrawn message never reached a model: the witness is the
+  /// request the app actually sent, not the card the UI painted.
+  user_seen: [],
+  /// Needles `require_steer` found in a user message after the last tool result, and the ones it
+  /// did not. `steer_misses` is a 400 the harness failed on; `steer_hits` is the landing.
+  steer_hits: [],
+  steer_misses: [],
+  /// Needles `require_steer_absent` found anyway: a message the person took back that went out.
+  steer_leaks: [],
 }
 
 const log = (...a) => console.error('[mock-llm]', ...a)
@@ -101,6 +117,14 @@ const log = (...a) => console.error('[mock-llm]', ...a)
  * The last user message's text. OpenAI multimodal style puts parts in an array;
  * llama.cpp also accepts a plain string.
  */
+/** A user message's text, in either shape: a plain string, or parts with an image among them. */
+function userText(m) {
+  const c = m?.content
+  if (typeof c === 'string') return c
+  if (Array.isArray(c)) return c.map((p) => (typeof p === 'string' ? p : String(p?.text ?? ''))).join('\n')
+  return ''
+}
+
 function lastUserText(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
@@ -192,11 +216,26 @@ function stepsSince(messages, atIndex) {
  * Expand `$path` to the last path-shaped token of the prompt. The harness
  * interpolates its own temp paths into a prompt, and a canned tool call that
  * names a hard-coded path would exercise nothing.
+ *
+ * Markup is not a path. The env block ends with `</mcp>` and `<env>`, and a token
+ * containing a slash looks path-shaped to the filter above: on a pi-core run that
+ * put `</mcp>` into `write_file`'s argument, so the fixture wrote a file nobody
+ * read, the `require` needles failed, and a dozen checks reported tool behaviour
+ * that had nothing to do with the change under test. A tag is a tag.
  */
 function extractPath(text) {
-  const tokens = (text || '')
+  // The blocks the engine appends are not the person's prompt: `<env>` names the workspace
+  // folder and `<mcp>` names servers, and both arrive *after* the words the harness typed. Taking
+  // the last token of the whole message therefore picked the env block instead of the file the
+  // check named, which is how a scripted turn "wrote" a path nobody asked for.
+  const body = (text || '')
+    .replace(/<env>[\s\S]*?<\/env>/g, ' ')
+    .replace(/<mcp>[\s\S]*?<\/mcp>/g, ' ')
+    .replace(/<tools>[\s\S]*?<\/tools>/g, ' ')
+  const tokens = body
     .split(/[\s,;"'()]+/)
     .map((t) => t.replace(/[.,;:]+$/, ''))
+    .filter((t) => !t.includes('<') && !t.includes('>'))
     .filter((t) => t.length > 1 && (t.includes('/') || /\.[A-Za-z0-9]{1,5}$/.test(t)))
   return tokens.length ? tokens[tokens.length - 1] : ''
 }
@@ -346,6 +385,32 @@ async function streamCompletion(res, step, opts) {
 
 const keepAlive = new Map() // ip -> last activity, for the "who talked to me" audit
 
+// How many times the selftest page (or its script) has been fetched. The browser check reads
+// this after the turn: it is the only proof in the suite that the browser actually opened a
+// socket to something, as opposed to the tool returning plausible text.
+let pageHits = 0
+
+// The two strings the selftest page is built from, published on `/selftest-hits` so a check can
+// compare what a browser saw with what this server actually sent. `<title>` and `<h1>` differ on
+// purpose: a check that matches the wrong one fails a feature that works. (The browser panel titles
+// its page from `document.title`; the transcript quotes the heading, because that is what the page's
+// own text contains.)
+const SELFTEST_TITLE = 'cwoffee selftest'
+const SELFTEST_H1 = 'Cwoffee browse selftest'
+
+// Where the page's clickable target sits, in **page** pixels of the viewport the kept browser
+// uses. Published on `/selftest-hits` because the point of the panel's picture-click is that the
+// check does not have to trust the panel's arithmetic: it asks this server where the box is, turns
+// that into a point in the picture the way the panel does, presses there, and then reads back a
+// count only the page could have raised. A panel that scaled the picture wrongly misses the box
+// and the count stays put.
+const AIM = { x: 120, y: 200, w: 180, h: 56 }
+// The page's own text field, also by its centre in page pixels: the panel's keyboard row is only
+// worth having if a person can aim at a field first, and a check has to know where that field is
+// without reading this file's CSS.
+const INP = { x: 120, y: 200 + 56 / 2 + 10 + 12, w: 180, h: 24 }
+let pageClicks = 0
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
   keepAlive.set(req.socket.remoteAddress ?? '?', Date.now())
@@ -370,8 +435,74 @@ const server = http.createServer(async (req, res) => {
     stats.tools_requested = 0
     stats.sampling_seen = []
     stats.last = []
+    stats.user_seen = []
+    stats.steer_hits = []
+    stats.steer_misses = []
+    stats.steer_leaks = []
     res.writeHead(200, { 'content-type': 'application/json' })
     return res.end(JSON.stringify({ ok: true }))
+  }
+  // A page for the browser selftest, served by the same process the test is already
+  // talking to. It exists so the check can grade something the page did rather than
+  // something the tool claimed: the page asks for a script, and the counter below reports
+  // whether a real browser really asked. A tool that only ever returns a string can be
+  // believed or disbelieved; a server that saw the request ends the argument.
+  if (req.method === 'GET' && url.pathname === '/selftest-page.html') {
+    pageHits++
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    // `#aim` and `#inp` sit at a fixed, published place because a check that points at the page
+    // through the panel's picture has to aim at something whose position it can know independently
+    // of this file: the centre of the box is served on /selftest-hits, and a click that lands there
+    // bumps `pageClicks` — which only the page itself can report, so the panel cannot fake it.
+    return res.end(
+      `<!doctype html><html><head><meta charset="utf-8"><title>${SELFTEST_TITLE}</title></head>` +
+        `<body style="margin:0;font:14px system-ui"><h1 id="h">${SELFTEST_H1}</h1>` +
+        `<p id="p">before</p>` +
+        `<button id="b" onclick="document.getElementById('p').textContent='after'">More</button>` +
+        `<div id="aim" style="position:fixed;left:${AIM.x - AIM.w / 2}px;top:${AIM.y - AIM.h / 2}px;width:${AIM.w}px;height:${AIM.h}px;` +
+        `box-sizing:border-box;border:2px solid #0a7f5c;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#0a7f5c` +
+        `" onclick="document.getElementById('p').textContent='aimed';fetch('/selftest-click').catch(()=>{})">aim here</div>` +
+        `<input id="inp" style="position:fixed;left:${INP.x - INP.w / 2}px;top:${INP.y - INP.h / 2}px;width:${INP.w}px;height:${INP.h}px" placeholder="type here">` +
+        `<div style="height:1800px;padding:8px">tall page: the panel's wheel has somewhere to go</div>` +
+        `<script src="/selftest-page.js"></script>` +
+        `<script>window.cwoffeeProbe = 2 + 3;</script>` +
+        `</body></html>`,
+    )
+  }
+  if (req.method === 'GET' && url.pathname === '/selftest-click') {
+    // Bumped by the page when its aim box is clicked, from inside the browser that was clicked in.
+    pageClicks++
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+    return res.end(JSON.stringify({ ok: true, clicks: pageClicks }))
+  }
+  if (req.method === 'GET' && url.pathname === '/selftest-page.js') {
+    pageHits++
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' })
+    // The page's own code throws here on purpose. An uncaught error on the page is the single
+    // most useful thing a browser tool can report, and the check below grades that the tool
+    // reported *this one*, with this message, which no paraphrase of a fake result produces.
+    return res.end(`console.log("selftest page loaded");\nundefined.x();\n`)
+  }
+  if (req.method === 'GET' && url.pathname === '/selftest-hits') {
+    // Readable from the app's own webview: the check inside the page asks the server how many
+    // times the browser knocked, which is the one fact the tool's own text cannot manufacture.
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        page_hits: pageHits,
+        page_title: SELFTEST_TITLE,
+        page_h1: SELFTEST_H1,
+        page_clicks: pageClicks,
+        aim: AIM,
+        inp: INP,
+      }),
+    )
+  }
+  if (req.method === 'GET' && url.pathname === '/selftest-hits/reset') {
+    pageHits = 0
+    res.writeHead(200, { 'content-type': 'application/json' })
+    return res.end(JSON.stringify({ ok: true, page_hits: pageHits }))
   }
   if (req.method === 'GET' && url.pathname === '/props') {
     res.writeHead(200, { 'content-type': 'application/json' })
@@ -428,6 +559,14 @@ const server = http.createServer(async (req, res) => {
   stats.sampling_seen = stats.sampling_seen.slice(0, 5)
   stats.last.unshift({ prompt: prompt.slice(0, 120), at: Date.now() })
   stats.last = stats.last.slice(0, 12)
+  // What the app put in front of the model, as a user row. Capped, because a long conversation
+  // re-sends its whole history on every round-trip and the list would otherwise grow with the
+  // prompt rather than with the presses.
+  for (const m of messages.filter((x) => x.role === 'user')) {
+    const t = userText(m)
+    if (t && !stats.user_seen.includes(t)) stats.user_seen.push(t)
+  }
+  stats.user_seen = stats.user_seen.slice(-80)
 
   if (!scenario) {
     stats.misses.push(prompt.slice(0, 160))
@@ -482,10 +621,65 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // `require_steer`: strings that must appear in a **user message after the last tool result** of
+  // this request. That is the mid-turn claim, and only the endpoint can make it: a steer is real
+  // when the next request carries it in that position — after the tool results, before the answer.
+  // A UI that painted a receipt for a message the model never received fails here, on the bytes it
+  // actually sent.
+  const steerNeeds = Array.isArray(step.require_steer) ? step.require_steer : []
+  if (steerNeeds.length) {
+    const tail = messages.slice(found.at + 1)
+    const lastTool = tail.reduce((m, x, i) => (x.role === 'tool' ? i : m), -1)
+    const after = lastTool >= 0 ? tail.slice(lastTool + 1).filter((m) => m.role === 'user').map(userText) : []
+    const missing = steerNeeds.filter((needle) => !after.some((t) => t.includes(needle)))
+    log(
+      `STEER ${scenario.name} step ${stepNo}: ${steerNeeds.length} needle(s) against ${after.length} user ` +
+        `message(s) after the last tool result`,
+    )
+    if (missing.length) {
+      stats.steer_misses.push(...missing)
+      const why =
+        `mock-llm scenario "${scenario.name}" step ${stepNo} required ${JSON.stringify(missing)} in a user ` +
+        `message after the tool results of THIS request, and did not find one. A mid-turn press must reach ` +
+        `the model's next request, after the tool results and before the answer. What the request held there ` +
+        `was: ${JSON.stringify(after.slice(0, 3))}`
+      log(`STEER FAILED: ${scenario.name} step ${stepNo}: ${missing.join(', ')}`)
+      res.writeHead(400, { 'content-type': 'application/json' })
+      return res.end(JSON.stringify({ error: { message: why } }))
+    }
+    stats.steer_hits.push(...steerNeeds)
+  }
+  // `require_steer_absent`: strings that must not appear in any user message of this request at
+  // all. This is the withdrawal half of the claim — a message the person took back must reach
+  // neither the model nor the record — and "the card said it was taken back" is not evidence.
+  const absentNeeds = Array.isArray(step.require_steer_absent) ? step.require_steer_absent : []
+  if (absentNeeds.length) {
+    const tail = messages.slice(found.at).map(userText)
+    const foundOnes = absentNeeds.filter((needle) => tail.some((t) => t.includes(needle)))
+    log(`STEER-ABSENT ${scenario.name} step ${stepNo}: ${absentNeeds.length} needle(s), ${foundOnes.length} hit(s)`)
+    if (foundOnes.length) {
+      stats.steer_leaks.push(...foundOnes)
+      const why =
+        `mock-llm scenario "${scenario.name}" step ${stepNo} was told these must not be on the wire at all ` +
+        `and found them: ${JSON.stringify(foundOnes)}. A withdrawn mid-turn message reached the model, which ` +
+        `is the failure the withdrawal exists to prevent.`
+      log(`STEER LEAK: ${scenario.name} step ${stepNo}: ${foundOnes.join(', ')}`)
+      res.writeHead(400, { 'content-type': 'application/json' })
+      return res.end(JSON.stringify({ error: { message: why } }))
+    }
+  }
+
   stats.turns += 1
   stats.hits[scenario.name] = (stats.hits[scenario.name] ?? 0) + 1
   log(`#${stats.turns} ${scenario.name} step ${stepNo}${thinkingOff ? ' (thinking off)' : ''}`)
 
+  // `$base` -> this server's own origin. The browser check needs a URL the *engine* can
+  // fetch, and the only honest way to hand the model one is to say it here, where the port is
+  // known: a scenario with a port baked into the JSON breaks the moment someone sets
+  // MOCK_PORT, and a broken scenario reads like a broken browser.
+  const wantBase = /\$base/.test(JSON.stringify(step))
+  const base = wantBase ? `http://127.0.0.1:${PORT}` : ''
+  if (wantBase && !base) log(`scenario ${scenario.name} asked for $base and got nothing`)
   // `$path` -> the path the harness named in its own prompt.
   const wantPath = /\$path/.test(JSON.stringify(step))
   const realPath = wantPath ? extractPath(prompt) : ''
@@ -494,7 +688,9 @@ const server = http.createServer(async (req, res) => {
   // attachment travelled all the way to the model instead of being dropped a hop short.
   const stepCopy = renderStep(
     JSON.parse(
-      JSON.stringify(step).replaceAll('$path', wantPath ? JSON.stringify(realPath).slice(1, -1) : '$path'),
+      JSON.stringify(step)
+        .replaceAll('$path', wantPath ? JSON.stringify(realPath).slice(1, -1) : '$path')
+        .replaceAll('$base', base),
     ),
     messages,
   )

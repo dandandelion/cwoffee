@@ -45,14 +45,51 @@ function clientCalls(src) {
   const calls = new Map() // cmd -> Set of keys
   const skipped = []
   const clean = stripTs(src)
-  const re = /\binvoke\s*(?:<[^;]*?>)?\(\s*'([a-z_][a-z0-9_]*)'\s*,?/g
+  // The verb name is what matters, and a type argument must not be allowed to hide a call site.
+  // The old pattern stopped a generic at the first `;`, which is exactly where a payload-typed
+  // generic like `invoke<{ mime: string; data_b64: string }[]>('message_attachments', {...})` puts
+  // one — so that call was invisible to this check, and the desktop command behind it was spelled
+  // in the wrong dialect for two days. Instead: walk forward from `invoke` through an optional
+  // generic, balancing nothing but "the first `(` at angle-depth 0 ends it", then read the verb.
   let m
-  while ((m = re.exec(clean))) {
-    const cmd = m[1]
-    let i = clean.indexOf('{', m.index + m[0].length - 1)
-    const after = clean.slice(m.index + m[0].length).trimStart()
-    if (after.startsWith(')') || !after.startsWith('{') || i < 0 || i > m.index + 400) {
-      if (after && !after.startsWith(')')) skipped.push(`${cmd}: payload is not a literal object`)
+  let sites = 0
+  let unread = 0
+  const ire = /\binvoke\s*/g
+  while ((m = ire.exec(clean))) {
+    let p = m.index + m[0].length
+    sites++
+    if (clean[p] === '<') {
+      let angle = 0
+      while (p < clean.length) {
+        const ch = clean[p]
+        if (ch === '<') angle++
+        else if (ch === '>' && angle > 0) angle--
+        else if (ch === '(' && angle === 0) break
+        p++
+      }
+    }
+    const rest = clean.slice(p, p + 90)
+    const vm = rest.match(/^\(\s*'([a-z_][a-z0-9_]*)'\s*,?/)
+    if (!vm) {
+      // A call site this check cannot read is a call site it cannot protect. Say so out loud in the
+      // tally rather than letting a clean verdict rest on a silent gap.
+      unread++
+      continue
+    }
+    const cmd = vm[1]
+    let i = clean.indexOf('{', p + vm[0].length)
+    const after = clean.slice(p + vm[0].length).trimStart()
+    if (after.startsWith(')')) {
+      // A call with no payload is still a call: both hosts have to answer it. Grading only verbs
+      // that carry arguments left the zero-argument ones — `about`, `session_state`, `cancel` — free
+      // to exist on one host and not the other, which is the exact drift this script is for: the
+      // desktop answers and the phone's request dies with "unknown verb". Register the verb with no
+      // keys, so existence is checked even though there is nothing to spell.
+      if (!calls.has(cmd)) calls.set(cmd, new Set())
+      continue
+    }
+    if (!after.startsWith('{') || i < 0 || i > p + 400) {
+      if (after) skipped.push(`${cmd}: payload is not a literal object`)
       continue
     }
     let depth = 0
@@ -95,7 +132,7 @@ function clientCalls(src) {
     if (!calls.has(cmd)) calls.set(cmd, new Set())
     for (const k of named) calls.get(cmd).add(k)
   }
-  return { calls, skipped }
+  return { calls, skipped, sites, unread }
 }
 
 /* ---------------------------------- the engine ---------------------------------- */
@@ -207,8 +244,12 @@ function tauriCommands(src) {
     let depth = 0
     let cur = ''
     for (const ch of params) {
-      if ('(<[('.includes(ch)) depth++
-      else if (')]'.includes(ch)) depth--
+      // `>` closes a generic. Leaving it out is not cosmetic: `state: tauri::State<'_, AppState>`
+      // opens a depth that never comes back down, so every parameter after it folds into the same
+      // fragment, only `state` gets recognised, and the command ends up demanding nothing at all —
+      // which is how a two-word argument spelled in the wrong dialect reached a person's screen.
+      if ('(<['.includes(ch)) depth++
+      else if (')>]'.includes(ch) && depth > 0) depth--
       if (ch === ',' && depth === 0) {
         parts.push(cur)
         cur = ''
@@ -233,7 +274,7 @@ function tauriCommands(src) {
 
 /* ----------------------------------- the verdict --------------------------------- */
 
-const { calls, skipped } = clientCalls(read(UI))
+const { calls, skipped, sites, unread } = clientCalls(read(UI))
 const structs = structFields(ENGINE_FILES)
 const gw = gatewayArms(read(GW), structs)
 const tv = tauriCommands(read(TAURI))
@@ -250,6 +291,16 @@ for (const [cmd, keys] of calls) {
   if (!hosts.length) {
     bad.push(`${cmd}: neither the gateway dispatch nor a desktop command implements it — the page calls into the void`)
     continue
+  }
+  if (hosts.length === 1) {
+    // One host answers and the other does not. Some of those are correct — a window cannot be
+    // presented to a phone — but "correct" has to be a decision someone can look at, because the
+    // other shape of this is a feature that works on a laptop and dies with `unknown verb` on a
+    // phone. The client cannot be blamed for the spelling here: there is nothing to spell. So it is
+    // named, and not failed.
+    const only = hosts[0][0]
+    const other = only === 'gateway' ? 'desktop' : 'gateway'
+    vague.push(`${cmd}: ${other} has no such verb — a ${other === 'desktop' ? 'phone or browser' : 'desktop window'} asking the same question gets "unknown verb"`)
   }
   for (const [where, h] of hosts) {
     hostChecks++
@@ -274,10 +325,18 @@ for (const [cmd, keys] of calls) {
 }
 
 console.log(
-  `[wire-names] client: ${calls.size} verbs with arguments; hosts read: ${gw.size} gateway arms, ` +
-    `${tv.size} desktop commands; ${hostChecks} verb-host pairs graded` +
+  `[wire-names] client: ${calls.size} verbs with arguments across ${sites} call site(s); hosts read: `
+    + `${gw.size} gateway arms, ${tv.size} desktop commands; ${hostChecks} verb-host pairs graded` +
+    (unread ? `; ${unread} call site(s) too dynamic to read` : '') +
     (skipped.length ? `; ${skipped.length} payload(s) not literal: ${skipped.join('; ')}` : ''),
 )
+if (unread) {
+  console.log(
+    `[wire-names] note: ${unread} invoke site(s) name their verb in a way this script cannot follow. ` +
+      `Those calls are ungraded — a missing or misspelled argument there is a runtime error, not a ` +
+      `report here. Name the verb as a literal if you can.`,
+  )
+}
 for (const v of vague) console.log(`[wire-names] note: ${v}`)
 if (bad.length) {
   for (const b of bad) console.error(`[wire-names] FAIL ${b}`)

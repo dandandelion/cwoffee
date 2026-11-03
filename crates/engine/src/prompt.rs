@@ -234,7 +234,7 @@ Tool use:
 - Emit exactly one JSON object per tool call.
 - If you cannot do something, say so plainly rather than inventing an answer.
 - A file you want for yourself — a reference download, a fetched dataset, a script to run, a scratch dump — belongs under `.cws/` in the workspace, not among the person's files. Write into the folder proper only for the file they asked you for.
-- A file you are handing over rather than leaving in their folder: pass `"place": "attach"`, which writes it under `.cws/assistant_attachments/`. Only files there are attached to the turn, so a probe file or a scaffold is never presented as a deliverable.
+- To give the person a file there is only one route: write it under `.cws/assistant_attachments/`, by passing `"place": "attach"` — the tool puts it there whatever path you name. The transcript attaches files from that folder and nowhere else, so a file left in the folder proper or loose in `.cws/` appears only as a working file the turn touched, with no way for the person to take it away. If the file you made is meant to be read, delivered, opened or shared, put it there.
 
 {environment}"#
     )
@@ -317,6 +317,28 @@ impl PromptBuilder {
         });
     }
 
+    /// A user turn that was typed during a turn and landed at its step boundary.
+    ///
+    /// The only difference from `push_user_with` is the stamp: the record keeps the moment Enter
+    /// was pressed rather than the moment the loop got round to it, so a steer that landed two
+    /// minutes later does not read as though it was asked after the answer it was reacting to.
+    /// The append itself is the same append-only push, which is what keeps every earlier request a
+    /// prefix of the next one.
+    pub fn push_user_stamped(
+        &mut self,
+        text: impl Into<String>,
+        attachments: Vec<crate::provider::Attachment>,
+        sent_at: i64,
+    ) {
+        self.history.push(Message {
+            role: Role::User,
+            content: text.into(),
+            attachments,
+            sent_at: Some(sent_at),
+            ..Default::default()
+        });
+    }
+
     pub fn push_assistant(&mut self, text: impl Into<String>) {
         self.push_assistant_with(text, None, None);
     }
@@ -364,22 +386,30 @@ impl PromptBuilder {
     }
 
     pub fn push_tool_result(&mut self, call_id: &str, output: impl Into<String>) {
-        self.push_tool_result_with(call_id, output, Vec::new())
+        self.push_tool_result_with(call_id, output, Vec::new(), Vec::new())
     }
 
     /// `changes` is UI-only (see `Message::changes`): it rides along to the store
     /// and never enters the bytes sent to the model.
+    ///
+    /// `images` is the opposite: it is model-facing. A tool that saw something — the browser
+    /// looking at a page — hands the pixels here, and only a model whose endpoint was
+    /// confirmed to take image input is ever given them (the tool decides that; this function
+    /// just carries what it decided). Providers put them where their API wants a picture
+    /// inside a tool result, which is not the same place anywhere the two agree.
     pub fn push_tool_result_with(
         &mut self,
         call_id: &str,
         output: impl Into<String>,
         changes: Vec<crate::tools::changes::FileChange>,
+        images: Vec<crate::provider::Attachment>,
     ) {
         self.history.push(Message {
             role: Role::Tool,
             content: output.into(),
             tool_call_id: Some(call_id.to_string()),
             changes,
+            attachments: images,
             ..Default::default()
         });
     }
@@ -603,6 +633,41 @@ mod tests {
     /// named. Asserting the words is asserting the claims, and asserting the *absence* of the
     /// note in full mode is what keeps a mode that declares everything from telling the model
     /// that it must go looking.
+    /// The hand-over folder is not a convention the model has to guess at. The transcript can
+    /// only attach a file from `.cws/assistant_attachments/` — that is a fact about the UI, and
+    /// the report that started this was a model writing a deliverable at the workspace root and
+    /// the person wondering how it got attached. So the prompt says the rule, says it is the
+    /// only route, and says what happens to a file left anywhere else.
+    #[test]
+    fn the_prompt_says_the_attachments_folder_is_the_only_way_to_hand_a_file_over() {
+        for lean in [false, true] {
+            let p = cowork_prompt_text(lean);
+            let i = p
+                .find("assistant_attachments")
+                .expect("the prompt must name the hand-over folder");
+            let line = p[i..].split('\n').next().unwrap_or("");
+            assert!(
+                line.contains("only") || p[..i].rsplit('\n').next().unwrap_or("").contains("only"),
+                "the sentence must say it is the only route: {line}"
+            );
+            assert!(line.contains("place\""), "and name the argument that does it: {line}");
+            assert!(
+                line.contains("no way") || line.contains("nowhere else"),
+                "and say what a file left elsewhere gets: {line}"
+            );
+        }
+        // Both cores read this text: the Rust core builds its prompt from here, and the pi
+        // core's launch prompt is this function plus the temp-workspace note
+        // (`bridge::cowork_prompt_with_workspace_note`), so there is one rule to learn.
+        assert_eq!(
+            cowork_prompt_text(false)
+                .matches("assistant_attachments")
+                .count(),
+            1,
+            "one sentence about the hand-over folder, not two that can drift"
+        );
+    }
+
     #[test]
     fn the_short_menu_comes_with_the_way_back_to_the_long_one() {
         let lean = cowork_prompt_text(true);

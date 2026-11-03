@@ -1115,8 +1115,7 @@ pub(crate) fn read_call_risk(args: &Value, ctx: &ToolCtx) -> CallRisk {
     } else {
         CallRisk {
             level: Risk::Sensitive,
-            escapes: vec![p.display().to_string()],
-        }
+            escapes: vec![p.display().to_string()], ..Default::default() }
     }
 }
 
@@ -1847,7 +1846,9 @@ mod tests {
     use zip::CompressionMethod;
 
     fn ctx_in(dir: &Path) -> ToolCtx {
-        ToolCtx {
+ToolCtx {
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: dir.to_path_buf(),
             max_output_bytes: 64 * 1024,
             ..Default::default()

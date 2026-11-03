@@ -8,6 +8,8 @@
 //!   vocabulary, and why pi's "turn" is not cwoffee's.
 //! - `host.rs` — the `HostOps` implementation: addressing, approvals, session
 //!   switching, the idle reaper.
+//! - `rewind.rs` — taking a pi thread back to one of the person's own messages, when the
+//!   transcript above it has been cut and sent again.
 //! - `sessions.rs` — which pi session file belongs to which cwoffee conversation.
 //!
 //! Nothing here is a shim over pi's own semantics: the approvals, the transcript,
@@ -17,6 +19,7 @@
 pub mod host;
 pub mod mount;
 pub mod process;
+pub mod rewind;
 pub mod sessions;
 pub mod translate;
 

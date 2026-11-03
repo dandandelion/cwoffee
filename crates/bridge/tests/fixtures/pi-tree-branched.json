@@ -1,0 +1,78 @@
+{
+  "type": "get_entries",
+  "leafId": "b2",
+  "_why": [
+    "A captured pi `get_entries` answer, written so that the order the entries were appended to the",
+    "file is NOT the order of the conversation. The straight path (a1..a4) was written first; the",
+    "leaf was then moved back to the first answer and the branch (b1, b2) was appended after it,",
+    "hanging off a2. leafId is on the branch, because that is what pi builds context from.",
+    "Anything that reads the list top-down marks a3/a4 as the conversation and misses b1/b2.",
+    "m1 is pi's own writing — a model change nobody asked the record to hold — and it is a root of",
+    "its own, off the path the leaf reads.",
+    "It is `get_entries` rather than `get_tree` because pi's tree answer nests one JSON level per",
+    "entry: a sixty-message conversation exceeds the bridge reader's recursion limit and the whole",
+    "record comes back unparseable. See docs/SESSION-TREE.md."
+  ],
+  "entries": [
+    {
+      "id": "a1",
+      "parentId": null,
+      "type": "message",
+      "timestamp": "2026-10-28T10:00:00.000Z",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "first ask" }] }
+    },
+    {
+      "id": "a2",
+      "parentId": "a1",
+      "type": "message",
+      "timestamp": "2026-10-28T10:00:02.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "first answer" }]
+      }
+    },
+    {
+      "id": "a3",
+      "parentId": "a2",
+      "type": "message",
+      "timestamp": "2026-10-28T10:01:00.000Z",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "second ask" }] }
+    },
+    {
+      "id": "a4",
+      "parentId": "a3",
+      "type": "message",
+      "timestamp": "2026-10-28T10:01:04.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "second answer" }]
+      }
+    },
+    {
+      "id": "b1",
+      "parentId": "a2",
+      "type": "message",
+      "timestamp": "2026-10-28T10:05:00.000Z",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "branch ask" }] }
+    },
+    {
+      "id": "b2",
+      "parentId": "b1",
+      "type": "message",
+      "timestamp": "2026-10-28T10:05:03.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "branch answer" }]
+      }
+    },
+    {
+      "id": "m1",
+      "parentId": null,
+      "type": "model_change",
+      "timestamp": "2026-10-28T10:06:00.000Z",
+      "provider": "cwoffee",
+      "modelId": "glm-4.5",
+      "thinkingLevel": "medium"
+    }
+  ]
+}

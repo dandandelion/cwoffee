@@ -87,13 +87,17 @@ stripped from the address bar.
 
 Two roles, enforced server-side per command:
 
-* **watch** - `session_state`, `list_sessions`, `session_messages`,
-  `search_messages`, `migration_notes`, `list_workspaces`. Read-only.
+* **watch** - `session_state`, `list_sessions`, `session_messages`, `message_attachments`,
+  `search_messages`, `migration_notes`, `list_workspaces`, `about`, `checkpoint_preview`,
+  `files_ledger`, `file_diff`, `snapshot_stats`, `mcp_status`, `tool_inventory`, `session_tree`,
+  `browser_status`. Read-only.
 * **drive** - everything that changes state: `start_turn`, `cancel_turn`,
   `respond_approval`, `respond_question`, `set_mode`, `set_reasoning`, `new_session`,
   `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
   `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`,
-  `export_markdown`.
+  `set_workspace_color`, `set_session_web`, `provider_set_primary`,
+  `export_markdown`, `edit_message`, `branch_conversation`, `switch_leaf`, `checkpoint_revert`,
+  `forget_copies`.
 
 `share_markdown` takes `{ session }` and returns `{ name, markdown }`: that conversation as a
 Markdown document, built from **the workspace stored on that session** rather than the host's
@@ -101,10 +105,216 @@ current one, and **written nowhere**. The client decides where it goes - the des
 a save dialog, a phone downloads. It runs no model call, moves no host, and refuses a session id
 that does not exist.
 
+`edit_message` takes `{ session, message_id?, from_end?, shown, next, resend }` and returns
+`{ note, dropped, resending, visible }` - or an error, which is how a refusal arrives. One verb
+for both "save these words in place" and "take the conversation back to that message and send
+them again", because the second is the first plus a cut and a re-send, and splitting it into two
+round trips would let another device answer in between. It is a drive verb for the obvious reason:
+it rewrites and deletes rows of the record, and it moves what the model can see.
+
+The arguments exist to stop a stale window editing the wrong message. `message_id` when the client
+knows the row, otherwise `from_end` - which of the person's own messages counting back from the
+newest - and `shown`, the text that window is looking at. If `shown` does not match what that row
+says now, nothing is changed and the error says what it says instead. `resend` cuts that row and
+everything after it, hands the host a rewind, and puts the corrected words back through the normal
+send path. Refused while a turn is running: the cut and the re-send are not atomic against a turn
+in flight. `visible` says whether the re-sent row was in the store by the time the verb answered,
+which is what makes a client's reload-after-edit safe.
+
+`branch_conversation` takes `{ session, message_id?, from_end?, role?, shown }` and returns
+`{ session, title, copied, prefill, note }` - or an error, which is how a refusal arrives. It opens a
+**second path** out of one message: the conversation the ask names keeps everything it has, and a new
+conversation is created holding the rows before that message (or, with `role: "assistant"`, that
+answer and everything before it). `prefill` is the words you branched from, handed back so a branch
+off your own message can be asked again differently; branching at an answer returns `null`, because
+an answer is not something to send.
+
+Like `edit_message` it is drive-only, and for the same two reasons: it writes rows, and it moves what
+the model can see onto the new conversation. It refuses while a turn is running - a mid-turn branch
+would leave that turn's output to land in whichever conversation the queue reached first.
+
+`session_tree` takes `{ session }` and returns the conversation's lineage (parent, the role and row id
+each child was cut at, the quote captured there, depth, row counts, how many children), its nodes, which
+node is current, how many rows are on branches nobody is reading, what pi's thread said if there was a
+thread to ask, and the lines where the two records disagree. It is **watch**-role: a phone that can read
+the transcript should be able to see where the conversation was cut and what its next answer will read,
+and reading changes nothing — which is why it answers while a turn is running, when `switch_leaf` will
+not. The desktop command and this verb call the same `cwoffee_engine::tree::read`, so a phone and a
+window cannot be shown two different answers to "who is whose parent".
+
+`switch_leaf` takes `{ session, message_id?, from_end?, role?, shown }` and returns
+`{ session, leaf, reads_through, off_branch, prefill, note }`. It moves what the next answer reads, and
+nothing else: it copies no rows (that is `branch_conversation`) and deletes none (that is
+`edit_message` with `resend`), and a message sent afterwards joins the branch the leaf was left on.
+`leaf` is `0` when the leaf sits in front of the first message — the conversation reads nothing — and
+`prefill` carries the words that message was, because taking back your own ask is the point of standing
+in front of it. It is drive-only and audited, it refuses mid-turn, and it refuses a row whose words the
+caller did not paint: a leaf moved by a row id alone is a leaf moved onto whatever that id holds by now.
+On the pi core the move is a fork of pi's own thread, so the receipt names the thread the model is on
+now and says the previous thread is still there holding the off-path messages; on the Rust core it says
+the branch was re-read from the record. The two cores answer differently on purpose, and the phone gets
+whichever sentence the running core gives.
+
+The identity arguments are the same discipline as the pencil's, and for the same reason: a phone tab,
+a desktop window and the harness all read one conversation, so the caller names the row (`message_id`,
+or `from_end` counting back from the newest among rows of `role`) and repeats the words it painted
+(`shown`). If that row says something else now, nothing is created and the error names what the row
+actually says. Both transports call one function (`cwoffee_engine::branch::apply_and_open`), so a
+phone cannot branch a conversation the desktop would refuse to branch.
+
+`checkpoint_preview` takes `{ session, message_id, through_latest }` and returns
+`{ session, message_id, turn, scope, workspace, items, edited_since, missing_copy, pruned, note }` -
+or an error, which is how a refusal arrives. It is the read half of "undo this turn's files": the plan
+the engine would carry out, computed from its own index rows and the current disk, with nothing
+touched. `pruned` is how many copies this conversation already lost to the per-conversation size cap:
+a non-zero count means the list is what survived, not everything the conversation ever changed, and
+the note says so rather than letting a short list read as a complete history.
+`items[]` names each path relative to the conversation's folder, its `kind` (`created` / `modified` /
+`deleted`), the `action` the revert performs on it, and the three flags a reader needs before saying
+yes: `edited_since` (someone changed it afterwards, so restoring it overwrites their work),
+`copy_missing` (the copy itself is gone - pruned, or the folder moved), `path_missing` (the file is
+gone). `through_latest` widens the scope from that turn alone to that turn and every turn after it.
+
+It is a **watch** verb: a phone that can only read a conversation should still be able to show the
+path list it is being asked to confirm. Pressing it is the other verb.
+
+`checkpoint_revert` takes `{ session, message_id, through_latest, shown, overwrite_edited }` and
+returns `{ session, message_id, scope, report, note, messages }`. It writes files back - the only
+verb here that overwrites anything outside the record - so it is drive-only, and it re-reads its own
+scope before touching the disk: `shown` is the path list the caller painted, and if the scope is no
+longer that list it refuses and names both lists rather than carrying out a scope nobody was shown.
+`overwrite_edited` is the answer to the "edited since" question; without it those paths are left
+alone, and a caller that never offered the choice is refused rather than quietly getting a partial
+revert. Refused while a turn is running, because a turn writing files right now is exactly the state
+where restoring a copy restores the wrong thing.
+
+The transcript is not touched, and `messages` is the message count after the revert, so a client can
+say "the conversation still holds N messages" as a measured fact rather than a promise: undoing
+files is not undoing the conversation, and the record still says what was asked and answered.
+
+`files_ledger` takes `{ session }` and returns `{ session, workspace, turns, paths, turns_total,
+turns_hidden, files_total, paths_total, paths_hidden, copies, pruned, prune_notes, copies_missing,
+unstamped, edited_since, note }`. Where `checkpoint_preview` reads one turn, this reads the whole
+conversation: every turn that wrote a file, newest first, with its rows (`checkpoint`, `path`, `kind`,
+`bytes`, `copy_present`, `can_revert`, `edited_since`, `path_missing`, `live_exists`, `live_bytes`,
+`says`). Watch-role and answered mid-turn, because it is a question about what has already happened
+and reading changes nothing. `pruned` counts **only** the copies the size cap discarded; copies a
+person deleted, and copies the snapshot folder lost out of band, are in `prune_notes` and
+`copies_missing` instead, so a short list is never misread as a limit somebody hit. The caps
+(`turns_hidden`, `paths_hidden`) hide the oldest turns from the card while `files_total` stays the
+record's count.
+
+`file_diff` takes `{ session, checkpoint, shown }` and returns the stored copy against the bytes on
+disk through the same diff the tool card prints. `checkpoint` is the ledger row's id and `shown` is
+the path that card painted, as a pair: a window that has been sitting open cannot ask for "the copy
+of `a.md`" and get whatever `a.md` belongs to for the newest turn by now, so a mismatch refuses and
+names what the row holds. It also refuses when there is only one side to show — a row that *created*
+the file has no earlier bytes, and a row whose copy is gone has no stored side; printing the live
+file alone would read as every line having been added by somebody. Both refusals say "Nothing was
+diffed" and write nothing. Watch-role: it reads two files and changes none.
+
+`snapshot_stats` takes `{ session }` and returns the cost of that conversation's copies, with the two
+numbers kept apart on purpose: `rows`/`row_bytes` from the index (which double-counts a blob two turns
+share, because it counts the copies the turns took) and `blobs`/`blob_bytes` from the store (distinct
+files, what `du` agrees with), plus `shared` for blobs another conversation points at and
+`orphan_blobs`/`orphan_bytes` for bytes in the store no index row reaches. Putting those in one
+sentence is how a double-count gets read as disk usage.
+
+`forget_copies` takes `{ session, shown }` and returns `{ session, dropped, freed_bytes, kept, note }`.
+It deletes files — the copies, never the workspace's own files — so it is drive-only and audited like
+`checkpoint_revert`, refused while a turn runs (that turn is taking copies right now), and `shown` is
+the copy count the card printed: a mismatch deletes nothing and prints both counts. It checks every
+conversation for reach before deleting a blob and leaves the ones another conversation points at,
+saying how many in `kept`; `freed_bytes` counts the blobs it actually removed, deduped, so two rows
+sharing one copy report one file's bytes and not twice them.
+
+`message_attachments` takes `{ message_id }` and returns `[{ mime, data_b64, name }]` - the bytes
+behind one stored message. It exists because a transcript page deliberately carries name and size
+only: reading a conversation should not drag every attached megabyte across the wire for pictures
+nobody is looking at. That choice is only honest if the picture is reachable when someone asks, and
+this is that reach - one row per click, watch-role like the text of the conversation it belongs to.
+The desktop answers the same verb with the same argument name; `rename_all = "snake_case"` on the
+command is what keeps the two spellings identical, and `scripts/wire-names.mjs` now fails if they
+drift.
+
 It is not drive-only and not audited, because it is a read: a watch token can already page through
 the same conversation with `session_messages`. It used to be `export_markdown`, drive-only, and it
 wrote the file into `<workspace>/exports/`. A later turn then found a document it had not made -
 and offered to delete it - so the write left the feature entirely.
+
+### Four verbs that came with the beta pass
+
+`set_session_web` takes `{ session, on }` and returns `{ note }`. The Web switch on a chat's composer
+is not a UI preference: it decides which tools the model process is mounted with and which system
+prompt it is told, so the answer to "can this conversation reach the web?" has to live in the record
+(`sessions.web_on`) and be readable by the second window that opens the same chat. Both transports
+call the same function, `cwoffee_engine::host::set_conversation_web`, so the two refusals are worded
+identically everywhere: a turn that is running keeps the tools it started with, and a cowork
+conversation was never without them. It is audited, because it changes what the model can do.
+
+`set_workspace_color` takes `{ path, color }` and returns a boolean. The sidebar's folder colours are
+stored on the workspace row rather than in one window's `localStorage`, so a phone and a desktop show
+the same arranged list; the path stays the fact and the colour is decoration. `color` is validated
+where it is written - empty clears, otherwise exactly `#rrggbb`, and anything else is refused with a
+message rather than stored - because that string ends up in a `style` attribute on another machine.
+Unlike `set_workspace_label`, it creates the workspace row if there is none: if the sidebar shows a
+folder because conversations live in it, colouring the row you are looking at has to be possible.
+
+`provider_set_primary` takes `{ base_url, api_key?, kind? }` and returns `{ note }`. It exists because
+this app no longer ships a default endpoint: a first run has no address to talk to, and inventing
+`127.0.0.1:8090` meant either a hang waiting on a server that was never there, or a conversation with
+a model nobody chose. The writer refuses nonsense before touching the file (no scheme, no host, an
+unknown kind) and then tells the host to reload, so the address is live without restarting the app.
+Refused while a turn is running - an answer half-finished from one endpoint and finished from another
+is one sentence with two authors.
+
+`about` takes nothing and returns the facts a bug report needs: version, which core is answering
+(`core`, from the host itself, not from `CWOFFEE_CORE`, which only says what was asked for), the model
+and endpoint the effective config answers from, conversation and message counts, and the paths of the
+config, the SQLite record and - on the pi core - the directory of the model's own thread files. The
+gateway token is deliberately not in the payload, and neither are endpoint API keys: this is a
+read-only verb reachable by a watch token, and "which build am I running" must not become a way to
+read a secret.
+
+`mcp_status` takes nothing and returns `{ core, mounted, catalog_bytes, catalog_body_bytes,
+catalog_lead_bytes, catalog_budget, tools, servers, configured, config_path, route, why }`. It answers the
+one question a person with a `[mcp]` block actually has: *is what I wrote running?* So it reads the
+hub the app started, not the config file - a config says what was intended, a status says what
+happened - and it re-reads the config and re-applies the environment first, because
+`CWOFFEE_MCP_SERVERS` describes the same servers as `[mcp]` and a page that read only the file would
+tell someone whose servers come from a systemd unit that none exist.
+
+`route` answers a question `mounted` cannot: *how does a call get there*. On the Rust core it is
+this process; on the pi core the hub is still the app's but the tool host is a child of it and asks
+over a unix socket, so the route names that socket — or says the hub is unreachable from a tool
+process, which happens when the socket could not be opened and is not something a green row should
+cover. A phone reading this row is reading the same Arc its own turns go through.
+
+The three byte fields are the prompt cost, split so a page can print the part a server controls
+against the budget without hiding the sentence around it: `catalog_body_bytes` is the tool list,
+`catalog_lead_bytes` the fixed explanatory lines, `catalog_bytes` the total. They are reported even
+when nothing is mounted, and the total is always the sum of the two parts - a page that printed
+"0B made of undefinedB + undefinedB" would be reporting arithmetic it never received.
+
+It is watch-role and it is not a control surface: nothing in the reply starts or stops a server, and
+a phone has no business launching a program somebody else wrote on the desktop machine.
+
+`browser_status` takes `{ model }` and answers what the built-in browser will do in this start:
+`{ mounted, driver, node, headed, why, screenshot_default, vision, says }`. The model is an argument
+because the answer is about the model that is answering — whether a run paints a window on the
+machine the app is running on comes from that model's recorded modalities, and those are read from
+the config file the settings screen writes, not from a claim carried across the wire. `says` is the
+tool's own sentence rather than a paraphrase written on the phone side, because a screen that
+restates a policy is a screen that eventually contradicts it. When no driver was found, `mounted` is
+false and `says` names the two commands that would install one; a client must not render an absent
+tool as an available one. See [`BROWSER.md`](BROWSER.md).
+
+`tool_inventory` takes nothing and returns `{ declared, hidden }` - the tool names the model was
+handed, and the names registered but withheld until `explore` looks them up. Names only: no schemas,
+no arguments, so a watcher can see the shape of the toolset without reading its payload. A core that
+decides its tool list inside the model process - the pi core - returns an **error** rather than two
+empty lists, because two empty lists would say "nothing is hidden" about something that side cannot
+observe.
 
 `new_session` takes an optional `workspace`, which the engine validates before the
 session is created; a browser can therefore start a session inside a named folder

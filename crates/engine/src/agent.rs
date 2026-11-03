@@ -64,6 +64,16 @@ pub struct AgentConfig {
     /// it here - rather than having the host snapshot it at the end of a turn -
     /// is what makes the number in the bar the number the next prefill pays.
     pub gauge: Arc<std::sync::Mutex<crate::prompt::ContextGauge>>,
+    /// Stop's own flag, so a caller can hold the handle before the agent exists. A test drives it
+    /// from the scripted provider — the shape of a person pressing Stop mid-round-trip; the host
+    /// passes the handle it took from [`Agent::cancel_handle`] and nothing else changes.
+    pub cancel: Arc<AtomicBool>,
+    /// The mid-turn queue, polled at the step boundary.
+    ///
+    /// A handle rather than a mailbox command: this loop runs the turn inline, so a command sent
+    /// during a turn is not read until the turn is over — which is the behaviour steering exists to
+    /// replace. The host holds the other half of the same `Arc`.
+    pub queue: crate::steer::Queue,
 }
 
 impl Default for AgentConfig {
@@ -86,6 +96,9 @@ impl Default for AgentConfig {
             sampling: crate::provider::Sampling::default(),
             // A private gauge is fine for a test agent: nothing is reading it.
             gauge: Arc::new(std::sync::Mutex::new(crate::prompt::ContextGauge::default())),
+            // An empty queue, which is what a test agent with no shell attached has.
+            queue: crate::steer::Queue::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -127,6 +140,10 @@ pub struct Agent {
     /// never enter the prompt, so they cost no prefill and cannot invalidate the
     /// prefix cache.
     turn_files: Vec<crate::tools::OutputFile>,
+    /// The turn currently running, mirrored out of `turn_id` so a tool call in the middle
+    /// of it can index its checkpoint against the turn rather than against a row that does
+    /// not exist yet. `run_turn` sets it before any call can happen.
+    turn_now: u64,
     /// Set when the prompt was rebuilt from the session file rather than built
     /// in this process. The engine cannot see the endpoint's KV cache, so it is
     /// not allowed to claim anything about it - cold or warm. It marks the next
@@ -147,6 +164,8 @@ impl Agent {
     ) -> Self {
         // The prompt must argue for the same level the request will carry, so
         // seed it here rather than leaving PromptBuilder at its default.
+        // The config's flag, taken before the config moves into the struct.
+        let cancel_flag = cfg.cancel.clone();
         let mut prompt = PromptBuilder::new();
         prompt.set_reasoning(cfg.reasoning);
         // Before the first prompt is built: this is system-prompt text, so it has
@@ -162,8 +181,10 @@ impl Agent {
             ctx,
             turn_id: 0,
             turn_files: Vec::new(),
+            turn_now: 0,
             resumed_pending: None,
-            cancel: Arc::new(AtomicBool::new(false)),
+            // The same flag the config carries: whoever holds it is holding the agent's Stop.
+            cancel: cancel_flag,
         }
     }
 
@@ -269,6 +290,32 @@ impl Agent {
         self.registry.search_tool()
     }
 
+    /// The registry this agent builds its requests from.
+    ///
+    /// Exactly one caller is allowed: a third-party server appearing while a conversation is open. A
+    /// server the person added from the settings page is running and in the catalog, and a model that
+    /// is never offered it is a capability the app is hiding — so the registry that owns the prompt
+    /// has to be where it lands, registered hidden like every other server tool. Everything else goes
+    /// through the build-time `register_*` calls, because the order of declared tools is prefix-cache
+    /// bytes and a tool revealed mid-conversation must keep the position it was registered in.
+    pub fn registry_mut(&mut self) -> &mut Registry {
+        &mut self.registry
+    }
+
+    /// What the model is handed right now, and what is registered but withheld.
+    ///
+    /// The pair exists because the claim a check has to grade is "adding a server costs the
+    /// prompt nothing until someone asks for it", and that is only observable from the side that
+    /// owns the registry. Both lists, not one: a count of hidden tools with no count of declared
+    /// ones cannot show that a revealed tool actually became declared.
+    pub fn tool_inventory(&self) -> (Vec<String>, Vec<String>) {
+        let declared: Vec<String> =
+            self.registry.defs().iter().map(|d| d.name.clone()).collect();
+        let mut hidden = self.registry.lazy_names();
+        hidden.sort();
+        (declared, hidden)
+    }
+
     /// Swap the whole prompt out, e.g. when moving to a different session.
     pub fn replace_prompt(&mut self, p: crate::prompt::PromptBuilder) {
         self.prompt = p;
@@ -284,6 +331,13 @@ impl Agent {
 
     /// Files the last turn produced. The host persists these onto the assistant
     /// row so they survive a reload; the event is only the live path.
+    /// The turn currently running: 0 before the first one. Checkpoint rows are indexed by
+    /// it, and the host stamps them onto the answer row at turn end, so it has to be
+    /// readable from outside the loop.
+    pub fn turn(&self) -> u64 {
+        self.turn_id
+    }
+
     pub fn take_turn_files(&mut self) -> Vec<crate::tools::OutputFile> {
         self.drop_deleted_turn_files();
         std::mem::take(&mut self.turn_files)
@@ -317,7 +371,15 @@ impl Agent {
             .iter_mut()
             .find(|e| e.path == f.path)
         {
-            Some(existing) => *existing = f.clone(),
+            Some(existing) => {
+                // Newest metadata wins — it is the file on disk — except for `created`, which is
+                // a claim about the turn rather than about the bytes. A model that wrote a file
+                // and then edited it made that file; overwriting the flag with the second
+                // write's `false` would demote the thing it produced to "something it touched".
+                let made_it = existing.created || f.created;
+                *existing = f.clone();
+                existing.created = made_it;
+            }
             None => self.turn_files.push(f.clone()),
         }
     }
@@ -353,12 +415,42 @@ impl Agent {
         self.cfg.model.clone()
     }
 
+    /// What the browser tool should assume about the model's eyes, refreshed per turn.
+    ///
+    /// The tool cannot look this up itself: it has a workspace and a permission list, not a model
+    /// or a config path. The host does, and it is the host that owns the volatile facts — the env
+    /// block is rebuilt on the same line for the same reason. Frozen at spawn, the value was wrong
+    /// in two ordinary cases: a probe that recorded modalities after boot, and a model change in
+    /// the middle of a session. Both decide whether a window is painted on a person's desktop.
+    pub fn set_browser_vision(&mut self, vision: crate::tools::browser::Vision) {
+        if self.ctx.browser.vision != vision {
+            self.ctx.browser.vision = vision;
+        }
+    }
+
+    /// The vision state the tools currently carry. Read by the host's own tests and by anything
+    /// that has to report what a browser run would do without running one.
+    pub fn browser_vision(&self) -> crate::tools::browser::Vision {
+        self.ctx.browser.vision
+    }
+
     /// The endpoint this agent answers through. Exposed for the one thing that is
     /// not a conversation: naming one. The titler has to ask the *same* endpoint,
     /// with the same auth and the same chat-template knobs, or a title could be
     /// produced by a model that never answered the question it is naming.
     pub fn provider(&self) -> &dyn Provider {
         self.provider.as_ref()
+    }
+
+    /// Point this agent at a different endpoint without rebuilding it.
+    ///
+    /// The endpoint is not a preference the running app may quietly disagree with: the address a turn
+    /// is sent to is written by the model screen, and a host that could not take it up would force a
+    /// restart for something that is one field in one struct. The conversation history stays where it
+    /// is — this swaps who is asked, not what was asked — which is also why the two fields are not
+    /// touched here: a new endpoint does not get to decide what the person already said.
+    pub fn set_provider(&mut self, p: Arc<dyn Provider>) {
+        self.provider = p;
     }
 
     pub fn set_reasoning(&mut self, r: crate::provider::Reasoning) {
@@ -375,6 +467,72 @@ impl Agent {
         self.cancel.clone()
     }
 
+    /// The step boundary: take what the person typed during this turn and put it into the prompt
+    /// the next request is built from.
+    ///
+    /// Returns how many messages landed, so the caller knows whether there is a reason to spend
+    /// another round-trip. `step` is that round-trip, counted from the start of the turn, and it is
+    /// quoted in the receipt — "into this turn at step 3" is a claim the next request can be
+    /// checked against, where "the model has it now" is not.
+    ///
+    /// Steers are taken at every boundary. Follow-ups are looked at only when there were no steers
+    /// and the turn has run out of tool calls, which is the order pi polls its two queues in — one
+    /// gesture, one answer, on either core.
+    fn poll_queue(&mut self, turn: u64, step: usize, out: &EngineSink, session_id: i64) -> usize {
+        // A turn somebody stopped does not go and read their queue on the way out. The words stay
+        // where they are and the host hands them back to the composer — see `QueueReturned`.
+        if self.cancel.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let mut landed = 0;
+        for item in self.cfg.queue.take_kind(crate::steer::MidTurn::Steer, session_id) {
+            self.inject(item, turn, step, out, session_id);
+            landed += 1;
+        }
+        if landed > 0 {
+            return landed;
+        }
+        for item in self.cfg.queue.take_kind(crate::steer::MidTurn::FollowUp, session_id) {
+            self.inject(item, turn, step, out, session_id);
+            landed += 1;
+        }
+        landed
+    }
+
+    /// Append one queued message to the history and say where it went.
+    ///
+    /// The order inside this function is the contract: the push happens before the event, so a
+    /// client that saw `SteerLanded` knows the next request built from this prompt carries the row.
+    /// The receipt is the engine's own wording (`crate::steer`), because both cores owe the person
+    /// the same sentence for the same gesture.
+    fn inject(
+        &mut self,
+        item: crate::steer::Item,
+        turn: u64,
+        step: usize,
+        out: &EngineSink,
+        session_id: i64,
+    ) {
+        self.prompt.push_user_stamped(item.text.clone(), item.atts.clone(), item.typed_at);
+        let _ = out.send(EngineEvent::SteerLanded {
+            id: item.id,
+            session: session_id,
+            kind: item.kind,
+            text: item.text.clone(),
+            typed_at: item.typed_at,
+            turn_id: turn,
+            step,
+        });
+        let _ = out.send(EngineEvent::Note {
+            session: Some(session_id),
+            message: crate::steer::landing_note(item.kind, step),
+        });
+        let _ = out.send(EngineEvent::QueueChanged {
+            session: session_id,
+            items: self.cfg.queue.snapshot(),
+        });
+    }
+
     /// Run one user turn to completion. Returns aggregated telemetry.
     pub async fn run_turn(
         &mut self,
@@ -389,6 +547,7 @@ impl Agent {
         self.ctx.session = Some(session_id);
         self.turn_id += 1;
         let turn = self.turn_id;
+        self.turn_now = turn;
         self.cancel.store(false, Ordering::Relaxed);
 
         // Which conversation this turn belongs to is a fact about the engine, not
@@ -407,6 +566,12 @@ impl Agent {
 
         let defs = self.registry.defs();
         let schemas = serde_json::to_string(&defs).unwrap_or_default();
+        // Revealed MCP tools are re-read from the registry on every round-trip (see the loop
+        // below), so a tool `explore` names partway through a turn is declared on the next
+        // round-trip of the same turn. That is what makes the wording in explore's own answer —
+        // "available from your next call" — literally true here rather than a promise about a
+        // later turn. Recomputing is cheap and, while nothing is revealed, byte-identical, so
+        // the prefix cache is not disturbed by the recomputation itself.
         let c = self.prompt.compact_to_budget(&schemas);
         if c.did_anything() {
             // Say so, with the numbers: "context full" without them is a claim the
@@ -479,7 +644,13 @@ impl Agent {
             }
 
             let mut req = self.prompt.build(&self.cfg.model);
-            req.tools = defs.clone();
+            // Read again rather than reusing `defs`: MCP tools revealed by an `explore` call in
+            // this turn join the declaration list here, and nothing else changes the list.
+            req.tools = self.registry.defs();
+            // `explore` searches what this host is holding back, and it can only do that if the
+            // agent hands it the list: the registry belongs to the agent, and a tool cannot
+            // borrow it while running inside a call the agent owns.
+            self.ctx.lazy_tools = self.registry.lazy_views();
             req.reasoning = self.cfg.reasoning;
             req.max_tokens = self.cfg.max_tokens;
             self.cfg.sampling.apply(&mut req);
@@ -563,6 +734,14 @@ impl Agent {
                     });
                 }
 
+                // The answer is in. pi polls its steering queue at exactly this point — a message
+                // typed during the answer lands and the run continues rather than ending — and only
+                // when nothing is steering does it look at follow-ups. Same here, so one gesture
+                // lands the same way on either core.
+                if self.poll_queue(turn, iters + 1, out, session_id) > 0 {
+                    continue;
+                }
+
                 self.emit_turn_files(turn, out);
                 let _ = out.send(EngineEvent::TurnEnd { turn_id: turn, finish: collected.finish });
                 return agg;
@@ -581,6 +760,13 @@ impl Agent {
                 self.run_tool(call, out).await;
             }
 
+            // The step boundary, and it is this exact point: every tool result of this round-trip
+            // is back in the history, and the next request has not been built yet. A message typed
+            // while the tools were running goes in here — nowhere earlier, because the exchange is
+            // still mid-flight, and nowhere later, because then it would be the next turn's.
+            if self.poll_queue(turn, iters + 1, out, session_id) > 0 {
+                continue;
+            }
         }
 
         // The tool budget is spent and the model still has not answered. Stopping
@@ -589,6 +775,12 @@ impl Agent {
         // that was just done. So spend no more tools - one last round-trip with
         // the tool list removed, whose only job is to say what it did and what is
         // left.
+        //
+        // The queue is read first, because that last round-trip *is* the next request: a message
+        // typed while the budget was being spent goes in ahead of the summary, and the summary then
+        // answers it. Anything typed during the summary stays queued and is handed back by the host
+        // rather than being silently dropped.
+        self.poll_queue(turn, iters + 1, out, session_id);
         self.wrap_up_without_tools(out, &mut agg, session_id).await;
 
         self.emit_turn_files(turn, out);
@@ -833,6 +1025,20 @@ impl Agent {
                 call.name,
                 self.registry.defs().iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
             );
+            // A hidden MCP tool is not "unknown": it exists and is one `explore` away. Saying
+            // unknown would send the model back to guessing at a name it half-remembered, when
+            // the repairable answer is the call that reveals it.
+            if self.registry.is_lazy(&call.name) {
+                let msg = format!(
+                    "{:?} exists but is not declared to you yet: it comes from a third-party MCP \
+                     server, so it is only callable after `explore` names it. Ask explore with need \
+                     \"mcp: <what you need>\", and it is callable from your next call on.",
+                    call.name
+                );
+                let _ = out.send(EngineEvent::Error { message: msg.clone(), fatal: false });
+                self.prompt.push_tool_result(&call.id, format!("ERROR: {msg}"));
+                return;
+            }
             let _ = out.send(EngineEvent::Error { message: msg.clone(), fatal: false });
             self.prompt.push_tool_result(&call.id, format!("ERROR: {msg}"));
             return;
@@ -904,6 +1110,7 @@ impl Agent {
                     ok: false,
                     exit_code: None,
                     changes: Vec::new(),
+                    checkpoints: Vec::new(),
                 });
                 // Two different facts, and the model needs the right one. A user
                 // pressing deny means "not this call". The denylist means "this
@@ -920,6 +1127,20 @@ impl Agent {
                 } else {
                     format!("DENIED BY USER ({reason}). Do not retry this call.")
                 };
+                // The card gets the short, owner-named line too. A refused call used to close as
+                // a bare "failed", which is the one state where a reader most wants to know who
+                // said no: their own click, or a policy that would refuse it from any mode. The
+                // long instruction to the model stays in the tool result.
+                let shown = if denied_by_policy {
+                    format!("blocked by the denylist: {reason}")
+                } else {
+                    format!("denied by you ({reason})")
+                };
+                let _ = out.send(EngineEvent::ToolExecOutput {
+                    id: call.id.clone(),
+                    stream: ExecStream::Stdout,
+                    chunk: shown,
+                });
                 self.prompt.push_tool_result(&call.id, text);
                 return;
             }
@@ -988,7 +1209,9 @@ impl Agent {
                 truncated: false,
                 files: Vec::new(),
                 changes: Vec::new(),
+                checkpoints: Vec::new(),
                 activates: Vec::new(),
+            images: Vec::new(),
                 error: Some(if e.is_panic() {
                     format!(
                         "tool '{}' panicked and was isolated; the session continues",
@@ -1020,15 +1243,72 @@ impl Agent {
             self.note_turn_file(f);
         }
 
+        // Index the copies this call took. The tool wrote the bytes; the turn number and
+        // the conversation are what make them findable, and only the host knows both.
+        // Recorded here rather than at the end of the turn, because a turn that ran out of
+        // iterations or was stopped halfway still changed files, and those are exactly the
+        // changes a person wants undone.
+        if !result.checkpoints.is_empty() {
+            if let Some(store) = self.ctx.store.as_ref() {
+                if let Some(session) = self.ctx.session {
+                    if let Err(e) = store.record_checkpoints(
+                        session,
+                        self.turn_now as i64,
+                        &result.checkpoints,
+                    ) {
+                        let _ = out.send(EngineEvent::Note {
+                            session: Some(session),
+                            message: format!(
+                                "the copies of {} file(s) were taken but not indexed: {e}. That turn \
+                                 cannot be reverted from the transcript.",
+                                result.checkpoints.len()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // A discovery answer is a capability claim about this conversation, and the registry is
+        // the thing that can make it true. Revealing here (rather than at the end of the turn) is
+        // what makes explore's "available from your next call" mean the next call, in this turn.
+        if !result.activates.is_empty() {
+            let mut now = Vec::new();
+            for n in result.activates.iter() {
+                if self.registry.reveal(n) {
+                    now.push(n.clone());
+                }
+            }
+            if !now.is_empty() {
+                let _ = out.send(EngineEvent::Note {
+                    session: self.ctx.session,
+                    message: format!(
+                        "declared {} tool(s) this call looked up: {}. They are callable from the \
+                         next call on.",
+                        now.len(),
+                        now.join(", ")
+                    ),
+                });
+            }
+        }
+
         let _ = out.send(EngineEvent::ToolExecEnd {
             id: call.id.clone(),
             ok: result.ok,
             exit_code: result.exit_code,
             changes: result.changes.clone(),
+            checkpoints: result.checkpoints.clone(),
         });
 
-        self.prompt
-            .push_tool_result_with(&call.id, render_result(&result), result.changes.clone());
+        self.prompt.push_tool_result_with(
+            &call.id,
+            render_result(&result),
+            result.changes.clone(),
+            // What the tool saw, if it saw anything. `browse` fills this only for a model the
+            // config says can look; for every other tool and every other model it is empty and
+            // the request is byte-identical to what it was before a browser existed.
+            result.images.clone(),
+        );
     }
 }
 
@@ -1324,6 +1604,7 @@ mod tests {
                 mime: "text/markdown".into(),
                 bytes: (100 * (n as u64 + 1)) as u64,
                 kind: crate::tools::FileKind::Edit,
+                created: true,
             });
             r
         }
@@ -1347,6 +1628,7 @@ mod tests {
             crate::tools::CallRisk {
                 level: crate::tools::Risk::Sensitive,
                 escapes: vec!["/home/me/.ssh/id_ed25519".into()],
+                per_call: false,
             }
         }
         async fn run(
@@ -1358,6 +1640,183 @@ mod tests {
             // The point of the test: permits arrive per call, and nothing else.
             ToolResult::ok(format!("permits={}", ctx.permits.len()))
         }
+    }
+
+    /// The whole chain on a real turn: a file tool overwrites a file, the copy reaches
+    /// the disk, the index row reaches the store, and the transcript can then put the file
+    /// back. Graded through `run_turn`, because the three pieces are written by three
+    /// different places — the tool takes the copy, the loop indexes it against the turn,
+    /// and the host names the answer row at the end — and any one of them failing alone
+    /// leaves a revert control that does nothing.
+    #[tokio::test]
+    async fn a_turn_that_overwrote_a_file_leaves_an_indexed_copy_behind() {
+        use crate::checkpoint::{apply, snapshot_dir};
+        use crate::store::Store;
+        use crate::tools::files::WriteFileTool;
+
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ws = std::env::temp_dir().join(format!(
+            "cwoffee_ckpt_turn_{}_{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("notes.md"), "the user's own notes\n").unwrap();
+
+        let store = Arc::new(Store::in_memory().unwrap());
+        let sess = store.create_session("t", ws.to_str().unwrap(), "m").unwrap();
+
+        let ctx = ToolCtx {
+            workspace: ws.clone(),
+            max_output_bytes: 4096,
+            store: Some(Arc::clone(&store)),
+            checkpoint_store: true,
+            ..Default::default()
+        };
+
+        let (etx, mut erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(WriteFileTool));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "w1".into(),
+                            name: "write_file".into(),
+                            arguments: r#"{"path":"notes.md","content":"the model's version\n"}"#.into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(
+                crate::approval::ApprovalMode::Auto,
+                atx,
+            )
+            .with_timeout(std::time::Duration::from_millis(150)),
+            AgentConfig::default(),
+            ctx,
+        );
+        let _ = arx;
+        agent.run_turn("rewrite my notes", vec![], &etx, sess).await;
+
+        // What the event carried, so a live card and a reloaded one agree.
+        let carried: Vec<usize> = erx
+            .try_recv()
+            .iter()
+            .cloned()
+            .chain(std::iter::from_fn(|| erx.try_recv().ok()))
+            .filter_map(|e| match e {
+                EngineEvent::ToolExecEnd { checkpoints, .. } => Some(checkpoints.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carried, vec![1], "the call reported one copy it took");
+
+        // The index row, against the turn that ran.
+        let rows = store.checkpoints_for_session(sess).unwrap();
+        assert_eq!(rows.len(), 1, "and the store holds one row for it");
+        assert_eq!(rows[0].turn as u64, agent.turn(), "indexed against the turn that ran");
+        assert_eq!(rows[0].path, "notes.md");
+        assert_eq!(rows[0].hash, crate::checkpoint::hash_of(b"the user's own notes\n"));
+        assert!(
+            rows[0].message_id.is_none(),
+            "no answer row existed yet — the host names it when the turn ends"
+        );
+
+        // The bytes are where the row says they are.
+        let blob = crate::checkpoint::blob_path(&snapshot_dir(&ws), &rows[0].hash);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"the user's own notes\n");
+
+        // The host stamps the answer row at turn end; do that step here, then revert.
+        let aid = store
+            .append_message(sess, &crate::provider::Message::assistant("done"))
+            .unwrap();
+        assert_eq!(store.stamp_checkpoints_turn(sess, 1, aid).unwrap(), 1);
+
+        let out = apply(
+            &ws,
+            &snapshot_dir(&ws),
+            &store.checkpoints_for_message(sess, aid).unwrap(),
+            false,
+        );
+        assert_eq!(out.restored, 1);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("notes.md")).unwrap(),
+            "the user's own notes\n",
+            "the turn is undone on disk"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A host that keeps no copies must not leave a row behind: a row with no blob is a
+    /// revert control that fails when pressed.
+    #[tokio::test]
+    async fn a_host_without_a_snapshot_store_records_nothing() {
+        use crate::store::Store;
+        use crate::tools::files::WriteFileTool;
+
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ws = std::env::temp_dir().join(format!(
+            "cwoffee_ckpt_off_{}_{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("notes.md"), "yours\n").unwrap();
+
+        let store = Arc::new(Store::in_memory().unwrap());
+        let sess = store.create_session("t", ws.to_str().unwrap(), "m").unwrap();
+        let ctx = ToolCtx {
+            workspace: ws.clone(),
+            max_output_bytes: 4096,
+            store: Some(Arc::clone(&store)),
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
+            ..Default::default()
+        };
+
+        let (etx, _erx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (atx, arx) = mpsc::unbounded_channel();
+        let mut reg = Registry::new();
+        reg.register(Box::new(WriteFileTool));
+        let mut agent = Agent::new(
+            Arc::new(Scripted {
+                turns: vec![
+                    vec![
+                        Delta::ToolCallReady {
+                            id: "w1".into(),
+                            name: "write_file".into(),
+                            arguments: r#"{"path":"notes.md","content":"mine\n"}"#.into(),
+                        },
+                        Delta::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)],
+                ],
+                n: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            reg,
+            ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx)
+                .with_timeout(std::time::Duration::from_millis(150)),
+            AgentConfig::default(),
+            ctx,
+        );
+        let _ = arx;
+        agent.run_turn("rewrite it", vec![], &etx, sess).await;
+        assert!(store.checkpoints_for_session(sess).unwrap().is_empty());
+        assert!(!snapshot_dir_exists(&ws), "no snapshot folder either");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    fn snapshot_dir_exists(ws: &std::path::Path) -> bool {
+        crate::checkpoint::snapshot_dir(ws).exists()
     }
 
     /// Harmless tools must not reach the gate at all. Every prompt that is not
@@ -1574,7 +2033,9 @@ mod tests {
             ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
             AgentConfig::default(),
             ToolCtx {
-                workspace: dir.clone(),
+                    checkpoint_store: false,
+            lazy_tools: Vec::new(),
+            workspace: dir.clone(),
                 ..Default::default()
             },
         );
@@ -1624,7 +2085,9 @@ mod tests {
             ApprovalGate::new(crate::approval::ApprovalMode::Auto, atx),
             AgentConfig::default(),
             ToolCtx {
-                workspace: dir.clone(),
+                    checkpoint_store: false,
+            lazy_tools: Vec::new(),
+            workspace: dir.clone(),
                 ..Default::default()
             },
         );
@@ -2158,7 +2621,7 @@ mod tests {
     fn render_result_never_returns_empty_to_the_model() {
         assert_eq!(render_result(&ToolResult::ok("")), "(succeeded, no output)");
         assert!(render_result(&ToolResult::err("boom")).contains("ERROR"));
-        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new(), changes: Vec::new(), activates: Vec::new() };
+        let r = ToolResult { ok: false, output: "".into(), exit_code: Some(2), truncated: false, error: None, files: Vec::new(), changes: Vec::new(), checkpoints: Vec::new(), activates: Vec::new(), images: Vec::new() };
         assert!(render_result(&r).contains("(no output)"));
     }
 
@@ -2386,5 +2849,389 @@ mod tests {
             s.streaming_ms,
             s.est_tokens
         );
+    }
+
+    // ---- mid-turn steering -------------------------------------------------------------
+    //
+    // A provider that keeps what it was handed, and can put a press into the queue while it is
+    // still streaming. The claims below are about **the request** — a steer is only real if the next
+    // request carries it, after the tool results and before the next answer — and only a provider
+    // that records its own input can say which request held which message.
+    struct Recorder {
+        turns: Vec<Vec<Delta>>,
+        n: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+        /// A press typed while the model is answering: queued once the request at this index has
+        /// been served, which makes it mid-turn by construction rather than by a sleep racing a
+        /// boundary.
+        press: Option<(crate::steer::Queue, i64, crate::steer::MidTurn, String, i64)>,
+        press_after: usize,
+        /// Stop, raised while the request at this index is live: `run_turn` clears the flag on the
+        /// way in, so a test that set it beforehand would be testing nothing.
+        cancel: Option<(Arc<AtomicBool>, usize)>,
+    }
+
+    impl Recorder {
+        fn new(turns: Vec<Vec<Delta>>) -> Self {
+            Self {
+                turns,
+                n: std::sync::atomic::AtomicUsize::new(0),
+                seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                press: None,
+                press_after: 0,
+                cancel: None,
+            }
+        }
+
+        fn presses(
+            mut self,
+            after: usize,
+            q: crate::steer::Queue,
+            session: i64,
+            kind: crate::steer::MidTurn,
+            text: &str,
+            typed_at: i64,
+        ) -> Self {
+            self.press = Some((q, session, kind, text.to_string(), typed_at));
+            self.press_after = after;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Recorder {
+        fn id(&self) -> &str {
+            "recorder"
+        }
+        fn label(&self) -> &str {
+            "recorder"
+        }
+        fn wants_reasoning(&self) -> bool {
+            false
+        }
+        async fn stream(&self, req: &ChatRequest, sink: &DeltaSink) -> Result<(), ProviderError> {
+            let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.seen.lock().unwrap().push(req.messages.clone());
+            let seq = self.turns.get(i).cloned().unwrap_or_else(|| {
+                vec![Delta::Text("done".into()), Delta::Done(FinishReason::Stop)]
+            });
+            for d in seq {
+                sink.send(d).ok();
+            }
+            if let Some((q, session, kind, text, typed_at)) = self.press.clone() {
+                if i == self.press_after {
+                    q.push(session, kind, text, Vec::new(), typed_at);
+                }
+            }
+            if let Some((flag, at)) = self.cancel.clone() {
+                if i == at {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> Vec<Delta> {
+        let args = "{\"path\":\"notes.md\"}";
+        vec![
+            Delta::ToolCallBegin { id: id.into(), name: name.into() },
+            Delta::ToolCallArgs(args.into()),
+            Delta::ToolCallReady { id: id.into(), name: name.into(), arguments: args.into() },
+            Delta::Done(FinishReason::ToolCalls),
+        ]
+    }
+
+    /// An agent wired to the same queue handle a shell would hold, plus the recorder's log of
+    /// every request it was given and the event stream it emitted.
+    fn steered(
+        provider: Recorder,
+        q: crate::steer::Queue,
+        cancel: Arc<AtomicBool>,
+    ) -> (
+        Agent,
+        EngineSink,
+        mpsc::UnboundedReceiver<EngineEvent>,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+    ) {
+        let (etx, erx) = mpsc::unbounded_channel();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let seen = std::sync::Arc::clone(&provider.seen);
+        let cfg = AgentConfig { queue: q, cancel, ..AgentConfig::default() };
+        let agent = Agent::new(
+            std::sync::Arc::new(provider),
+            Registry::new(),
+            ApprovalGate::new(crate::approval::ApprovalMode::Ask, atx),
+            cfg,
+            ToolCtx::default(),
+        );
+        (agent, etx, erx, seen)
+    }
+
+    fn role_of(m: &Message) -> &'static str {
+        match m.role {
+            crate::provider::Role::System => "system",
+            crate::provider::Role::User => "user",
+            crate::provider::Role::Assistant => "assistant",
+            crate::provider::Role::Tool => "tool",
+        }
+    }
+
+    /// The whole point of the feature, graded on the wire rather than on a card: a message typed
+    /// during a tool run must be in the model's **next** request, after that run's tool results and
+    /// before the next answer. Earlier than that is mid-exchange; later than that is a different
+    /// turn, which is what the follow-up is for.
+    #[tokio::test]
+    async fn a_steer_lands_after_the_tool_results_and_before_the_next_request() {
+        let q = crate::steer::Queue::new();
+        let p = Recorder::new(vec![
+            tool_call("c1", "read_file"),
+            vec![Delta::Text("the answer".into()), Delta::Done(FinishReason::Stop)],
+        ])
+        .presses(0, q.clone(), 7, crate::steer::MidTurn::Steer, "stop and read the other file", 1234);
+        let (mut agent, tx, _rx, seen) = steered(p, q, Arc::new(AtomicBool::new(false)));
+        agent.run_turn("read notes", vec![], &tx, 7).await;
+
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "the turn made {} round-trips, not two", reqs.len());
+        assert!(
+            !reqs[0].iter().any(|m| m.content.contains("stop and read the other file")),
+            "the steer arrived in the request that was already on the wire"
+        );
+        let second = &reqs[1];
+        let at = second
+            .iter()
+            .rposition(|m| m.content.contains("stop and read the other file"))
+            .expect("the steer is not in the next request — steering did nothing");
+        let tool_at = second
+            .iter()
+            .rposition(|m| role_of(m) == "tool")
+            .expect("the tool result should still be in the next request");
+        assert!(at > tool_at, "the steer went in before its turn's tool results: {:?}", second.iter().map(role_of).collect::<Vec<_>>());
+        assert_eq!(at, second.len() - 1, "nothing may sit between a steer and the request that carries it");
+        assert!(
+            !second.iter().any(|m| m.content.contains("the answer")),
+            "the second request already holds the answer it is about to produce"
+        );
+    }
+
+    /// Append-only, stamped at the press: the steer is its own user row, and the row's stamp is the
+    /// moment Enter was pressed, so the transcript reads in the order the person typed rather than
+    /// in the order the loop got round to it.
+    #[tokio::test]
+    async fn a_steers_row_is_its_own_user_row_stamped_when_it_was_typed() {
+        let q = crate::steer::Queue::new();
+        let p = Recorder::new(vec![
+            tool_call("c1", "read_file"),
+            vec![Delta::Text("ok".into()), Delta::Done(FinishReason::Stop)],
+        ])
+        .presses(0, q.clone(), 7, crate::steer::MidTurn::Steer, "one word more", 4321);
+        let (mut agent, tx, _rx, _seen) = steered(p, q, Arc::new(AtomicBool::new(false)));
+        agent.run_turn("first", vec![], &tx, 7).await;
+
+        let hist = agent.prompt_mut().history().to_vec();
+        let rows: Vec<&Message> = hist
+            .iter()
+            .filter(|m| matches!(m.role, crate::provider::Role::User))
+            .collect();
+        assert_eq!(rows.len(), 2, "the steer did not become its own user row: {hist:?}");
+        assert_eq!(rows[1].content, "one word more");
+        assert_eq!(rows[1].sent_at, Some(4321), "the row is stamped when it landed, not when it was typed");
+        assert_eq!(rows[0].sent_at, None, "a message sent normally carries no mid-turn stamp");
+        // Append-only: the turn's own rows are still there, in the order they were written, and the
+        // steer went in after the tool exchange rather than replacing anything.
+        assert_eq!(rows[0].content, "first");
+        assert!(hist.iter().any(|m| role_of(m) == "tool"), "the tool result left the history");
+        assert!(rows[1].attachments.is_empty());
+    }
+
+    /// The receipt names the step it landed at, quotes the press, and is emitted with the row — and
+    /// the pending snapshot goes empty at the same moment.
+    #[tokio::test]
+    async fn the_landing_receipt_names_the_step_and_arrives_with_the_row() {
+        let q = crate::steer::Queue::new();
+        let p = Recorder::new(vec![
+            tool_call("c1", "read_file"),
+            vec![Delta::Text("ok".into()), Delta::Done(FinishReason::Stop)],
+        ])
+        .presses(0, q.clone(), 7, crate::steer::MidTurn::Steer, "change course", 99);
+        let (mut agent, tx, mut rx, _seen) = steered(p, q.clone(), Arc::new(AtomicBool::new(false)));
+        agent.run_turn("first", vec![], &tx, 7).await;
+        drop(tx);
+        let mut landed = None;
+        let mut notes = Vec::new();
+        let mut queue_seen = 0;
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                EngineEvent::SteerLanded { id, kind, step, typed_at, text, .. } => {
+                    landed = Some((id, kind, step, typed_at, text))
+                }
+                EngineEvent::Note { message, .. } => notes.push(message),
+                EngineEvent::QueueChanged { .. } => queue_seen += 1,
+                _ => {}
+            }
+        }
+        let (_id, kind, step, typed_at, text) = landed.expect("no landing receipt for a steer that landed");
+        assert_eq!(kind, crate::steer::MidTurn::Steer);
+        assert_eq!(step, 2, "the steer landed at the second round-trip of the turn");
+        assert_eq!(typed_at, 99, "the receipt quotes the press, not the arrival");
+        assert_eq!(text, "change course");
+        let note = notes.iter().find(|n| n.contains("went into this turn")).expect("no receipt sentence");
+        assert!(note.contains("before the next request"), "{note}");
+        assert_eq!(queue_seen, 1, "the queue was announced once, after it drained");
+        assert!(q.snapshot().is_empty(), "a landed message is still listed as pending");
+    }
+
+    /// Taking a steer back before it lands must reach **neither** the model nor the record. A
+    /// withdrawal that left the words in the prompt is a control that says one thing and does
+    /// another, which is how a person stops trusting the button.
+    #[tokio::test]
+    async fn a_withdrawn_steer_reaches_neither_the_model_nor_the_history() {
+        let q = crate::steer::Queue::new();
+        let item = q.push(7, crate::steer::MidTurn::Steer, "take this back", Vec::new(), 55);
+        let p = Recorder::new(vec![
+            tool_call("c1", "read_file"),
+            vec![Delta::Text("ok".into()), Delta::Done(FinishReason::Stop)],
+        ]);
+        let (mut agent, tx, mut rx, seen) = steered(p, q.clone(), Arc::new(AtomicBool::new(false)));
+        assert_eq!(q.withdraw(item.id).map(|i| i.text), Some("take this back".to_string()));
+        agent.run_turn("first", vec![], &tx, 7).await;
+
+        for req in seen.lock().unwrap().iter() {
+            assert!(!req.iter().any(|m| m.content.contains("take this back")), "a withdrawn message went on the wire anyway");
+        }
+        assert!(
+            !agent.prompt_mut().history().iter().any(|m| m.content.contains("take this back")),
+            "a withdrawn message is still in the record"
+        );
+        while let Ok(e) = rx.try_recv() {
+            assert!(!matches!(e, EngineEvent::SteerLanded { .. }), "a withdrawal that then reported a landing is a card lying about the wire");
+        }
+    }
+
+    /// A follow-up is a different promise and the loop keeps it: an answer that ended with no tool
+    /// calls is where pi looks at the follow-up queue, and the run continues rather than stopping.
+    /// The first request must not hold it — that request was the answer, which was already being
+    /// written when the person typed.
+    #[tokio::test]
+    async fn a_follow_up_is_asked_after_the_answer_rather_than_inside_it() {
+        let q = crate::steer::Queue::new();
+        let p = Recorder::new(vec![
+            vec![Delta::Text("the first answer".into()), Delta::Done(FinishReason::Stop)],
+            vec![Delta::Text("and then the follow-up".into()), Delta::Done(FinishReason::Stop)],
+        ])
+        .presses(0, q.clone(), 7, crate::steer::MidTurn::FollowUp, "also summarise it", 21);
+        let (mut agent, tx, mut rx, seen) = steered(p, q, Arc::new(AtomicBool::new(false)));
+        agent.run_turn("write it", vec![], &tx, 7).await;
+
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "the follow-up was never asked: {} round-trips", reqs.len());
+        assert!(!reqs[0].iter().any(|m| m.content.contains("also summarise it")), "a follow-up went into the request that was already answering");
+        assert!(reqs[1].iter().any(|m| m.content.contains("also summarise it")));
+        let mut note = None;
+        while let Ok(e) = rx.try_recv() {
+            if let EngineEvent::Note { message, .. } = e {
+                if message.contains("asked after this turn") {
+                    note = Some(message);
+                }
+            }
+        }
+        let note = note.expect("no follow-up receipt");
+        assert!(!note.contains("into this turn"), "a follow-up worded like a steer: {note}");
+    }
+
+    /// pi polls steering before follow-ups, and so does this loop: one boundary takes the steers and
+    /// leaves the follow-up waiting, rather than answering both in one breath.
+    #[tokio::test]
+    async fn steering_is_polled_before_a_follow_up_at_the_same_boundary() {
+        let q = crate::steer::Queue::new();
+        q.push(7, crate::steer::MidTurn::Steer, "steer first", Vec::new(), 1);
+        q.push(7, crate::steer::MidTurn::FollowUp, "follow later", Vec::new(), 2);
+        let p = Recorder::new(vec![
+            tool_call("c1", "read_file"),
+            vec![Delta::Text("second".into()), Delta::Done(FinishReason::Stop)],
+            vec![Delta::Text("third".into()), Delta::Done(FinishReason::Stop)],
+        ]);
+        let (mut agent, tx, _rx, seen) = steered(p, q.clone(), Arc::new(AtomicBool::new(false)));
+        agent.run_turn("go", vec![], &tx, 7).await;
+
+        let reqs = seen.lock().unwrap().clone();
+        assert!(reqs.len() >= 3, "the run stopped before the follow-up could be asked: {} round-trips", reqs.len());
+        assert!(reqs[1].iter().any(|m| m.content.contains("steer first")), "the steer did not lead");
+        assert!(!reqs[1].iter().any(|m| m.content.contains("follow later")), "the follow-up jumped the queue");
+        assert!(reqs[2].iter().any(|m| m.content.contains("follow later")), "the follow-up was never asked");
+    }
+
+    /// One boundary drains the whole queue, which is why pi is told `set_steering_mode all`: left at
+    /// pi's `one-at-a-time` default, three presses during one tool batch would land one per turn on
+    /// pi and all three here — one gesture, two answers.
+    #[tokio::test]
+    async fn one_boundary_drains_every_steer_because_pi_is_told_the_same_mode() {
+        let q = crate::steer::Queue::new();
+        for (n, t) in ["a", "b", "c"].iter().enumerate() {
+            q.push(7, crate::steer::MidTurn::Steer, (*t).to_string(), Vec::new(), 10 + n as i64);
+        }
+        assert_eq!(crate::steer::PI_QUEUE_MODE, "all");
+        let p = Recorder::new(vec![
+            tool_call("c1", "read_file"),
+            vec![Delta::Text("ok".into()), Delta::Done(FinishReason::Stop)],
+        ]);
+        let (mut agent, tx, _rx, seen) = steered(p, q, Arc::new(AtomicBool::new(false)));
+        agent.run_turn("go", vec![], &tx, 7).await;
+
+        let reqs = seen.lock().unwrap().clone();
+        let second = &reqs[1];
+        let at: Vec<usize> = ["a", "b", "c"]
+            .iter()
+            .map(|t| second.iter().position(|m| m.content == *t).unwrap_or_else(|| panic!("{t} did not reach the next request")))
+            .collect();
+        assert_eq!(at, vec![at[0], at[0] + 1, at[0] + 2], "the steers landed out of typing order: {at:?}");
+    }
+
+    /// A steer typed into another conversation's composer must not be read into this turn — the same
+    /// address rule `Send` carries, for the same reason: two clients writing into each other's
+    /// transcript is how a row appears that nobody typed.
+    #[tokio::test]
+    async fn a_steer_for_another_conversation_is_not_read_into_this_turn() {
+        let q = crate::steer::Queue::new();
+        q.push(9, crate::steer::MidTurn::Steer, "someone else's turn", Vec::new(), 1);
+        let p = Recorder::new(vec![
+            tool_call("c1", "read_file"),
+            vec![Delta::Text("ok".into()), Delta::Done(FinishReason::Stop)],
+        ]);
+        let (mut agent, tx, _rx, seen) = steered(p, q.clone(), Arc::new(AtomicBool::new(false)));
+        agent.run_turn("go", vec![], &tx, 7).await;
+
+        for req in seen.lock().unwrap().iter() {
+            assert!(!req.iter().any(|m| m.content.contains("someone else's turn")));
+        }
+        assert_eq!(q.len(), 1, "another conversation's queue was emptied");
+    }
+
+    /// Stop wins over the queue. A turn somebody stopped does not read their messages on the way
+    /// out: the words stay queued so the host can hand them back to the composer, which is the
+    /// outcome pi documents for its own Esc key.
+    #[tokio::test]
+    async fn a_stopped_turn_does_not_read_the_queue_on_the_way_out() {
+        let q = crate::steer::Queue::new();
+        q.push(7, crate::steer::MidTurn::Steer, "typed while stopping", Vec::new(), 1);
+        let mut p = Recorder::new(vec![
+            tool_call("c1", "read_file"),
+            vec![Delta::Text("ok".into()), Delta::Done(FinishReason::Stop)],
+        ]);
+        // `run_turn` clears the flag on the way in, so Stop has to arrive *during* the turn — which
+        // is what a person pressing Stop actually does. The recorder raises it after the first
+        // round-trip, i.e. while the tool run is live.
+        let cancel = Arc::new(AtomicBool::new(false));
+        p.cancel = Some((Arc::clone(&cancel), 0));
+        let (mut agent, tx, _rx, seen) = steered(p, q.clone(), Arc::clone(&cancel));
+        agent.run_turn("go", vec![], &tx, 7).await;
+
+        assert_eq!(q.len(), 1, "a stopped turn consumed the queue");
+        assert!(
+            !agent.prompt_mut().history().iter().any(|m| m.content.contains("typed while stopping")),
+            "a stopped turn put the words into the record"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "a stopped turn went on making round-trips");
     }
 }

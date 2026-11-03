@@ -328,8 +328,7 @@ impl Tool for DownloadTool {
         {
             return CallRisk {
                 level: Risk::Sensitive,
-                escapes: vec![resolved.display().to_string()],
-            };
+                escapes: vec![resolved.display().to_string()], ..Default::default() };
         }
         if resolved.exists() {
             CallRisk::at(Risk::Workspace)
@@ -372,6 +371,11 @@ impl Tool for DownloadTool {
             ));
         }
 
+        // Taken now, while it still means something: reaching this line means the
+        // destination either did not exist, or `overwrite: true` was passed for a file that
+        // did. Which of the two is the difference between "this turn made the file" and "this
+        // turn replaced it", and after the rename there is nothing left to ask.
+        let made_it = !dest.exists();
         let resp = match self.client.get(url.clone()).send().await {
             Ok(r) => r,
             Err(e) => return ToolResult::err(format!("request failed: {e}")),
@@ -454,11 +458,16 @@ impl Tool for DownloadTool {
             // The placement, not the extension: a reference PDF the model fetched for
             // itself is not a deliverable the person asked for, and the transcript should
             // not put it in the same strip as the file they asked to be built.
-            kind: match place {
-                super::scratch::Place::Scratch => super::FileKind::Scratch,
-                super::scratch::Place::Attach => super::FileKind::Attachment,
-                super::scratch::Place::Keep => super::FileKind::Artifact,
-            },
+            //
+            // And the placement means **where the bytes landed**, not what `place` said. The
+            // kind used to be read off the argument, so a download that named an absolute or
+            // workspace-root `path` with `place: "attach"` was labelled `Attachment` while
+            // sitting outside `.cws/assistant_attachments/` — and the transcript drew the
+            // hand-over container, with its Save control, around a file the hand-over folder
+            // never held. `is_attach_rel` on the destination the tool actually confined is the
+            // same test the transcript and `attachment_path` apply, so one fact decides all three.
+            kind: download_kind(&rel, place),
+            created: made_it,
         };
         let note = super::scratch::place_note(place, &rel);
         ToolResult::ok(format!(
@@ -469,6 +478,29 @@ impl Tool for DownloadTool {
             note
         ))
         .with_file(file)
+    }
+}
+
+/// What a downloaded file *is* to the transcript, from where its bytes landed.
+///
+/// `place` alone used to decide this, which meant a download naming a workspace-root or absolute
+/// `path` with `place: "attach"` was labelled `Attachment` while its bytes sat outside
+/// `.cws/assistant_attachments/`. The transcript drew the dashed hand-over unit around it and
+/// offered a Save control the host then refused — an attachment is a promise about a folder, and
+/// the folder is the only thing that gets to make it.
+///
+/// The order is the placement rule, in the same words as `scratch::is_attach_rel` and
+/// `scratch::attachment_path`: inside the hand-over folder means `Attachment`; a `Keep` outside it
+/// is a deliverable in the person's own tree (`Artifact` — a downloaded file is a deliverable
+/// whatever it is named, since its name came from a URL); anything else is the model's own
+/// working material.
+fn download_kind(rel: &str, place: super::scratch::Place) -> super::FileKind {
+    if super::scratch::is_attach_rel(rel) {
+        super::FileKind::Attachment
+    } else if matches!(place, super::scratch::Place::Keep) {
+        super::FileKind::Artifact
+    } else {
+        super::FileKind::Scratch
     }
 }
 
@@ -1101,6 +1133,50 @@ mod tests {
     use crate::tools::ToolCtx;
     use tokio::sync::mpsc;
 
+    /// The hand-over label follows the bytes, not the argument. This is the bug the transcript
+    /// showed: a download with `place: "attach"` and a root or absolute `path` was called an
+    /// attachment while it sat outside `.cws/assistant_attachments/`, and the unit offered to Save
+    /// a file the host would refuse to hand over.
+    #[test]
+    fn a_download_is_only_an_attachment_if_it_landed_in_the_hand_over_folder() {
+        use super::super::scratch::{destination_for, Place};
+        let cases = [
+            ("report.pdf", Place::Keep, super::super::FileKind::Artifact),
+            ("docs/report.pdf", Place::Keep, super::super::FileKind::Artifact),
+            (".cws/ref.pdf", Place::Scratch, super::super::FileKind::Scratch),
+            (".cws/x/y.bin", Place::Scratch, super::super::FileKind::Scratch),
+            (
+                ".cws/assistant_attachments/report.pdf",
+                Place::Attach,
+                super::super::FileKind::Attachment,
+            ),
+            (
+                ".cws/assistant_attachments/tables/q.xlsx",
+                Place::Attach,
+                super::super::FileKind::Attachment,
+            ),
+        ];
+        for (raw, place, want) in cases {
+            let rel = destination_for(raw, place);
+            assert_eq!(download_kind(&rel, place), want, "`{raw}` with place={place:?} → {rel}");
+        }
+        // What the old code would have answered, and why it was wrong: an absolute destination
+        // with `place: "attach"` used to be labelled Attachment on the strength of the argument.
+        let attach_root = destination_for("/tmp/dl/report.pdf", Place::Attach);
+        assert_eq!(attach_root, ".cws/assistant_attachments/report.pdf", "the write moved");
+        assert_eq!(
+            download_kind(&attach_root, Place::Attach),
+            super::super::FileKind::Attachment,
+            "and it is an attachment because of where it is"
+        );
+        // A destination outside the folder cannot be labelled an attachment by any placement.
+        assert_ne!(
+            download_kind("report.pdf", Place::Attach),
+            super::super::FileKind::Attachment,
+            "the label alone must never make an attachment"
+        );
+    }
+
     /// The verdict has to describe the file the tool will actually write. If risk_for
     /// resolved the destination separately from run(), the card would approve one path and
     /// the tool would create another — and with `.cws` in play that is no longer
@@ -1111,6 +1187,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
         let ctx = ToolCtx {
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: ws.clone(),
             ..ToolCtx::default()
         };
@@ -1154,6 +1232,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
         let ctx = ToolCtx {
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: ws.clone(),
             ..ToolCtx::default()
         };
@@ -1188,7 +1268,7 @@ mod tests {
         mpsc::unbounded_channel().0
     }
     fn ctx() -> ToolCtx {
-        ToolCtx { workspace: ".".into(), max_output_bytes: 4096, ..Default::default() }
+ToolCtx { workspace: ".".into(), max_output_bytes: 4096, ..Default::default() }
     }
 
     // ---- url policy -------------------------------------------------------

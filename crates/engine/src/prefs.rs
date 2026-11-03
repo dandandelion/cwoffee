@@ -52,6 +52,14 @@ pub const UI_PREFS: &[UiPref] = &[
         default: "off",
         values: &["off", "on"],
     },
+    UiPref {
+        key: "notif_place",
+        label: "Where notifications land",
+        hint: "A refusal, an app note or a saved-file confirmation appears in that corner of the window.                The one exception is a note that explains a control you are still looking at - that stays                under the control, because moving it away from the thing it describes is a riddle.",
+        group: "appearance",
+        default: "top-right",
+        values: &["top", "bottom", "top-left", "top-right", "bottom-left", "bottom-right"],
+    },
     // A pref joins this list only once the app acts on it. The second entry I wrote here
     // said "show the time on each message" and nothing in the transcript read it, which is
     // a control that does nothing: cut it rather than ship the promise.
@@ -164,12 +172,14 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
-    fn tmp() -> Store {
-        let path = std::env::temp_dir().join(format!(
-            "cw-prefs-{}-{}.db",
-            std::process::id(),
-            UI_PREFS.len()
-        ));
+    /// One database per test, named by the caller.
+    ///
+    /// This used to derive the name from the process id and the length of the pref list, which gave
+    /// every test in the binary the *same* file: one test's `Store::open` raced another's delete, and
+    /// a check that counted "the rows this store holds" was counting other tests' rows too. Both
+    /// symptoms showed up the moment a third pref made a third row.
+    fn tmp(named: &str) -> Store {
+        let path = std::env::temp_dir().join(format!("cw-prefs-{}-{}.db", std::process::id(), named));
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
         }
@@ -184,13 +194,15 @@ mod tests {
         // gateway_on_exit is read by the window's close path (crates/tauri-app/src/main.rs,
         // which calls gateway_ctl::handoff before the last window goes away). An entry here
         // without a reader on the other side is a switch wired to nothing.
-        assert_eq!(UI_PREFS.len(), 2, "a new pref has to be wired in the app as well");
-        // And a group is a settings page: `ui/src/App.svelte` renders `transcript` under
-        // Appearance and `devices` under Devices. A third group name would be a pref no
-        // screen shows.
+        assert_eq!(UI_PREFS.len(), 3, "a new pref has to be wired in the app as well");
+        // notif_place is read by the chrome that draws the note (ui/src/App.svelte, `notifPlace`,
+        // which becomes a placement class on `.toast`).
+        // And a group is a settings page: `ui/src/App.svelte` renders `transcript` and
+        // `appearance` under Appearance and `devices` under Devices. A group name no page renders
+        // would be a pref that exists nowhere.
         for p in UI_PREFS {
             assert!(
-                matches!(p.group, "transcript" | "devices"),
+                matches!(p.group, "transcript" | "devices" | "appearance"),
                 "{}: group {:?} is not a page any settings screen renders",
                 p.key,
                 p.group
@@ -223,9 +235,39 @@ mod tests {
         }
     }
 
+    /// The notification place is not a free-text position and not a pixel offset: it is one of
+    /// six named corners and edges, and the app's default is the corner a person reads first.
+    #[test]
+    fn the_notification_place_names_six_places_and_nothing_else() {
+        let p = known("notif_place").expect("the notification place is a known pref");
+        assert_eq!(
+            p.values,
+            &["top", "bottom", "top-left", "top-right", "bottom-left", "bottom-right"],
+            "the vocabulary is the six places a window has"
+        );
+        assert_eq!(p.default, "top-right", "one default corner, not one per platform");
+
+        // A value outside it is refused, and the row is not written — a stray `style`-shaped
+        // string must never reach the client that puts this into a class name.
+        let s = tmp("place");
+        let e = set(&s, "notif_place", "middle; position:absolute").unwrap_err();
+        assert!(e.contains("top-right"), "{e}: the refusal names the vocabulary");
+        assert!(s.ui_pref("notif_place").unwrap().is_none(), "a refused write left a row");
+        // The default reads through the view, flagged as the default.
+        let v = view(&s).unwrap();
+        let got = v.iter().find(|x| x.key == "notif_place").unwrap();
+        assert_eq!(got.value, "top-right");
+        assert!(got.is_default);
+        // And the settings screen's own control list stays renderable: six values is the most
+        // any one of these controls has to draw.
+        for q in UI_PREFS {
+            assert!(q.values.len() <= 6, "{}: {} values will not fit one row", q.key, q.values.len());
+        }
+    }
+
     #[test]
     fn a_pref_round_trips_and_an_unknown_key_changes_nothing() {
-        let s = tmp();
+        let s = tmp("roundtrip");
         // Unset first, and the screen reports the default while saying it is the default.
         let v = view(&s).unwrap();
         let vb = v.iter().find(|p| p.key == "verbose_blocks").unwrap();

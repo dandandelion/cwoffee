@@ -94,6 +94,26 @@ pub struct EngineHandle {
     /// through it, so a provider chosen on a phone is still chosen after a restart,
     /// and so both shells write the same file rather than two.
     pub config_path: std::path::PathBuf,
+    /// What the browser tool can do in this start. Watch-role through `browser_status`: a
+    /// person on a phone is asking "will this model open a window on the desktop downstairs,
+    /// and why", which is a question about a machine they are not holding. The answer comes
+    /// from the same policy the tool applies, not from a paraphrase of it.
+    pub browser_cfg: cwoffee_engine::tools::browser::BrowserCfg,
+    /// The MCP hub when this start has one, shared with the desktop. A phone asking
+    /// "is my Jira server running" gets the same answer the desktop page gives, and on
+    /// the pi core it gets the same sentence explaining that this core mounts none.
+    pub mcp: Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>>,
+    /// How a tool call reaches those servers, said rather than implied: this process on the
+    /// Rust core, the app's hub over a socket on the pi core, and a sentence about a hub no
+    /// tool process can reach when the socket did not open. "mounted" alone would tell a
+    /// person their phone can call a server the tool host cannot get to.
+    pub mcp_route: String,
+    /// The kept browser this process holds (or `None` when this start keeps none), plus the
+    /// state mirror a read verb can answer from without waiting on whoever is driving the
+    /// browser, plus how the person configured keeping one.
+    pub browser: Option<std::sync::Arc<tokio::sync::Mutex<cwoffee_engine::browser_hub::Hub>>>,
+    pub browser_state: std::sync::Arc<std::sync::RwLock<cwoffee_engine::browser_hub::Snapshot>>,
+    pub browser_keep: cwoffee_engine::browser_hub::SessionCfg,
 }
 
 impl EngineHandle {
@@ -831,16 +851,35 @@ const AUDITED: &[&str] = &[
     "switch_session",
     "clear_session",
     "rename_session",
+    "edit_message",
+    // Branching writes a conversation and moves this host onto it, so it is a drive verb like the
+    // pencil next to it is: a phone reading a conversation must not be able to start a second one
+    // from it.
+    "branch_conversation",
+    // Moving the leaf moves what the next answer reads, and on the pi core it forks pi's thread, so it
+    // is a drive verb too: a phone reading a conversation must not be able to change which history its
+    // model answers from.
+    "switch_leaf",
+    // Undoing a turn's files writes over the workspace, so it belongs with the verbs that change
+    // what is on disk rather than the ones that only read it.
+    "checkpoint_revert",
+    // Forgetting a conversation's snapshots deletes files from the workspace, and a blob another
+    // conversation shares is not this conversation's to delete - so this is drive-only, audited,
+    // and refuses mid-turn like the revert beside it.
+    "forget_copies",
     "set_session_persona",
     "delete_session",
     "set_model",
     "set_mode",
     "set_reasoning",
     "set_persona",
+    "set_session_web",
+    "provider_set_primary",
     "compact",
     "set_workspace",
     "add_workspace",
     "remove_workspace",
+    "set_workspace_color",
     "respond_approval",
     "respond_question",
     "set_search_backend",
@@ -1153,6 +1192,180 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .map_err(|e| e.to_string())?;
             serde_json::to_value(page).map_err(|e| e.to_string())
         }
+        // The bytes behind one message's attachments, for a reader who opens a picture that arrived
+        // in an earlier conversation. A read, and watch-role like `session_messages`: a device that
+        // can read the text of a conversation can show its pictures too. It is bounded by the row
+        // being asked about, which is why the transcript page itself stays payload-free.
+        "message_attachments" => {
+            let mid = arg_i64(&args, "message_id")?;
+            let atts = h.store.message_attachments(mid).map_err(|e| e.to_string())?;
+            serde_json::to_value(atts).map_err(|e| e.to_string())
+        }
+        // Correct one of your own messages, or take the conversation back to it and send it again.
+        // The same command the desktop answers, with the same rules: everything the verb means lives
+        // in `cwoffee_engine::edit::apply_and_send` — the check, the cut of the record, taking the
+        // host's memory back and the re-send, in that order, because a host that re-sent before it
+        // rewound would answer out of the conversation the person has already cut down.
+        "branch_conversation" => {
+            need_drive(role)?;
+            let req = cwoffee_engine::BranchReq {
+                session: arg_i64(&args, "session")?,
+                message_id: args.get("message_id").and_then(|v| v.as_i64()),
+                from_end: args.get("from_end").and_then(|v| v.as_u64()).map(|n| n as usize),
+                role: args.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string(),
+                shown: arg_str(&args, "shown")?,
+            };
+            // The same function the desktop command calls, so the busy rule, the "which message did
+            // you mean" proof and the note are one text. A phone that could branch a conversation
+            // the desktop refuses would be two answers to one question.
+            let out = cwoffee_engine::branch::apply_and_open(h.store.as_ref(), h.host.as_ref(), &req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
+        // Who is whose parent, where each branch was cut, and which node the next answer reads.
+        // Read-only, so a watch-role tab can draw the tree a drive verb moves. Same function the
+        // desktop calls: one tree, one wording, and the disagreement between the record and pi's thread
+        // reported whichever window asks, not only by the one that happens to be showing it.
+        "session_tree" => {
+            let session = arg_i64(&args, "session")?;
+            let out = cwoffee_engine::tree::read(h.store.as_ref(), h.host.as_ref(), session)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
+        "switch_leaf" => {
+            need_drive(role)?;
+            let req = cwoffee_engine::tree::LeafReq {
+                session: arg_i64(&args, "session")?,
+                message_id: args.get("message_id").and_then(|v| v.as_i64()),
+                from_end: args.get("from_end").and_then(|v| v.as_u64()).map(|n| n as usize),
+                role: args.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string(),
+                shown: arg_str(&args, "shown")?,
+            };
+            // The same entry point the desktop command goes through, so the busy rule and the proof of
+            // which node was meant are one text on both sides of the wire.
+            let out = cwoffee_engine::tree::move_leaf(h.store.as_ref(), h.host.as_ref(), &req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
+        "edit_message" => {
+            need_drive(role)?;
+            let req = cwoffee_engine::EditReq {
+                session: arg_i64(&args, "session")?,
+                message_id: args.get("message_id").and_then(|v| v.as_i64()),
+                from_end: args.get("from_end").and_then(|v| v.as_u64()).map(|n| n as usize),
+                shown: arg_str(&args, "shown")?,
+                next: arg_str(&args, "next")?,
+                resend: args.get("resend").and_then(|v| v.as_bool()).unwrap_or(false),
+            };
+            // Same order, same refusal as the desktop command — and the same trap: serialising the
+            // `Result` would answer a refusal with `{"Err": ...}` shaped nothing like the payload the
+            // client reads, and a phone would report "saved" for an edit that changed no rows.
+            let out = cwoffee_engine::edit::apply_and_send(h.store.as_ref(), h.host.as_ref(), &req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
+        // What undoing a turn's files would do. Read-only, so a watch-role tab can show the
+        // path list a phone is being asked to confirm; pressing it is the drive verb below.
+        "checkpoint_preview" => {
+            let req = cwoffee_engine::checkpoint::RevertReq {
+                session: arg_i64(&args, "session")?,
+                message_id: arg_i64(&args, "message_id")?,
+                through_latest: args
+                    .get("through_latest")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                shown: Vec::new(),
+                overwrite_edited: false,
+            };
+            let out = cwoffee_engine::checkpoint::preview(h.store.as_ref(), &req)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(out))
+        }
+        // Undoing files writes over the workspace, which is why it is drive-only: a phone that is
+        // only watching a conversation must not be able to put files back. The engine re-reads its
+        // own scope, so the confirmation a phone saw is the scope the revert uses.
+        "checkpoint_revert" => {
+            need_drive(role)?;
+            let req = cwoffee_engine::checkpoint::RevertReq {
+                session: arg_i64(&args, "session")?,
+                message_id: arg_i64(&args, "message_id")?,
+                through_latest: args
+                    .get("through_latest")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                shown: args
+                    .get("shown")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| p.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                overwrite_edited: args
+                    .get("overwrite_edited")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            };
+            let out = cwoffee_engine::checkpoint::revert(h.store.as_ref(), h.host.as_ref(), &req)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(out).map_err(|e| e.to_string())
+        }
+        // The whole file story of one conversation: every path any turn touched, grouped by turn,
+        // with what each turn did to it and whether it can still be put back. Read-only, and it
+        // answers while a turn is running, because "what has this conversation done to my folder"
+        // is a question a watcher is allowed to ask mid-turn - the same reason `share_markdown`
+        // and `checkpoint_preview` are watch verbs. The desktop command calls this same function.
+        "files_ledger" => {
+            let out = cwoffee_engine::ledger::read(h.store.as_ref(), arg_i64(&args, "session")?)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(out))
+        }
+        // The stored copy against the bytes on disk, through the same diff the tool card prints and
+        // the same `confine()` the tools read through. Watch-role: it changes no file and moves no
+        // thread, and the row it diffs is named by id so a stale window cannot point it at whatever
+        // that path holds for the newest turn by now.
+        "file_diff" => {
+            let out = cwoffee_engine::ledger::diff_of(
+                h.store.as_ref(),
+                arg_i64(&args, "session")?,
+                arg_i64(&args, "checkpoint")?,
+                &arg_str(&args, "shown")?,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(json!(out))
+        }
+        // What a conversation's copies cost: rows, blobs counted once, and the bytes in the store
+        // that no index row points at. Read-only, and deliberately separate from the ledger - the
+        // two numbers answer different questions, and putting them in one sentence is how a
+        // double-count gets read as a disk usage.
+        "snapshot_stats" => {
+            let out = cwoffee_engine::ledger::stats(h.store.as_ref(), arg_i64(&args, "session")?)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(out))
+        }
+        // Dropping a conversation's snapshots deletes files, so it is drive-only and audited like
+        // the revert next to it. The count the card printed has to match the record, and a running
+        // turn refuses: it is taking copies of files right now, and deleting underneath it would
+        // leave rows pointing at bytes that are gone.
+        "forget_copies" => {
+            need_drive(role)?;
+            let out = cwoffee_engine::ledger::forget(
+                h.store.as_ref(),
+                h.host.as_ref(),
+                arg_i64(&args, "session")?,
+                args
+                    .get("shown")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(json!(out))
+        }
         "migration_notes" => Ok(json!(h.migration_notes)),
 
         // Everything a cold client needs, in one round trip.
@@ -1258,6 +1471,75 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             h.host.cancel();
             Ok(json!(true))
         }
+        // A message typed **during a turn**. Drive-only, like `start_turn`: it changes what the
+        // model is told next. The address assertion is carried through unchanged — the host refuses
+        // a press aimed at a conversation it is not answering, so a stale phone tab cannot steer the
+        // desktop's turn into its transcript.
+        "steer_turn" => {
+            need_drive(role)?;
+            let text = arg_str(&args, "text")?;
+            let session = args.get("session").and_then(|v| v.as_i64());
+            let atts = match arg_attachments(&args) {
+                Ok(a) => a,
+                Err(e) => return Err(e),
+            };
+            if let Err(e) = cwoffee_engine::host::check_attachments(
+                &atts,
+                cwoffee_engine::host::AttachmentLimits::defaults(),
+            ) {
+                return Err(format!("attachment refused: {e}"));
+            }
+            let view = h.host.queue_mid_turn(text, atts, session)?;
+            Ok(serde_json::to_value(view).map_err(|e| e.to_string())?)
+        }
+        // Take a waiting message back before it lands. `Err` when it already landed: a message on
+        // the wire cannot be unsent, and this answers in those words rather than pretending.
+        "withdraw_steer" => {
+            need_drive(role)?;
+            let id = arg_i64(&args, "id")?;
+            let view = h.host.withdraw_queued(id.max(0) as u64)?;
+            Ok(serde_json::to_value(view).map_err(|e| e.to_string())?)
+        }
+        // What is waiting, read-only: a watch tab can show the lines a drive tab can take back.
+        "queue_state" => Ok(serde_json::to_value(h.host.queue_state()).map_err(|e| e.to_string())?),
+        // What the next mid-turn press promises. Stored on the host, so the composer's announcement
+        // and a phone's press are answered by the same value.
+        "set_mid_turn" => {
+            need_drive(role)?;
+            let kind = arg_str(&args, "kind")?;
+            let kind = cwoffee_engine::steer::MidTurn::parse(&kind).ok_or_else(|| {
+                format!("that is not a mid-turn promise: expected steer (into this turn) or follow_up (after it)")
+            })?;
+            h.host.set_mid_turn(kind);
+            Ok(json!(h.host.state().mid_turn))
+        }
+        // The palette the host stores. Drive-only: it writes `config.toml`, which is a fact about
+        // this app and not about one screen — a watch tab must not be able to repaint every other
+        // surface by asking for a colour.
+        "set_theme" => {
+            need_drive(role)?;
+            let kind = arg_str(&args, "kind")?;
+            let kind = cwoffee_engine::theme::Theme::parse(&kind).ok_or_else(|| {
+                format!(
+                    "that is not a palette: expected light, dark or system (system follows this \
+                     client's own colour scheme, live)"
+                )
+            })?;
+            h.host.set_theme(kind);
+            Ok(json!(h.host.state().theme))
+        }
+        // About's line, composed by the engine from the host's stored palette and the override this
+        // client is showing. Read-only, and the override is an argument rather than a write — that
+        // is the whole point: a phone tab's theme must not change the desktop's.
+        "theme_words" => {
+            let window = match args.get("window").and_then(|v| v.as_str()) {
+                Some(w) => Some(cwoffee_engine::theme::Theme::parse(w).ok_or_else(|| {
+                    format!("that is not a palette: expected light, dark or system")
+                })?),
+                None => None,
+            };
+            Ok(json!(h.host.theme_words(window)))
+        }
         "set_mode" => {
             need_drive(role)?;
             let m = match arg_str(&args, "mode")?.as_str() {
@@ -1295,6 +1577,272 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
             // Read-only, and from the registry rather than a copy: the list a client
             // shows is the list the model is offered.
             Ok(json!(h.host.tools_view()))
+        }
+        "provider_set_primary" => {
+            need_drive(role)?;
+            // Repointing the app's endpoint over the network: audited, drive-only, and refused while
+            // a turn runs — the same reason the folder move and the web switch are refused. The token
+            // for an endpoint is written as given and never echoed back in the reply.
+            if h.host.state().busy {
+                return Err(
+                    "a turn is running, and it is being answered by the endpoint it started with.                      Stop it first — repointing the app mid-answer would finish a sentence begun                      somewhere else.".into(),
+                );
+            }
+            let base_url = arg_str(&args, "base_url")?;
+            let api_key = args
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let kind = args
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let said = cwoffee_engine::config::set_primary_endpoint_with(
+                &h.config_path, &base_url, &kind, &api_key,
+            )?;
+            h.host.reload_provider()?;
+            Ok(json!({ "note": said }))
+        }
+        "set_session_web" => {
+            need_drive(role)?;
+            // Grant a chat conversation the two web tools, or take them back. Drive-only and audited:
+            // it decides whether the model process gets network reach. Every check lives in the
+            // engine's `set_conversation_web`, so a phone is refused in exactly the desktop's words.
+            let session = arg_i64(&args, "session")?;
+            // A missing `on` is refused rather than read as false: "turn the web off" is a change of
+            // state, and a client that forgot the key should be told, not obeyed.
+            let on = args
+                .get("on")
+                .and_then(|v| v.as_bool())
+                .ok_or("set_session_web needs `on`: true or false")?;
+            cwoffee_engine::host::set_conversation_web(
+                h.store.as_ref(),
+                h.host.as_ref(),
+                session,
+                on,
+            )
+            .map(|note| json!({ "note": note }))
+        }
+        "tool_inventory" => {
+            // Watch-role: names, no arguments, no schemas. A phone reading which tools the model
+            // was handed is the same question the desktop page asks, and the pi core's refusal is
+            // the same refusal — a zero there would be a claim about a thing this side cannot see.
+            let (declared, hidden) = h.host.tool_inventory().await?;
+            Ok(json!({ "declared": declared, "hidden": hidden }))
+        }
+        "browser_status" => {
+            // Watch-role, and the model is an argument: the answer depends on which model is
+            // answering, and that changes mid-session on either core.
+            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let mut cfg = h.browser_cfg.clone();
+            cfg.vision = match cwoffee_engine::config::vision_in(&h.config_path, &model) {
+                Some(true) => cwoffee_engine::tools::browser::Vision::Yes,
+                Some(false) => cwoffee_engine::tools::browser::Vision::No,
+                None => cwoffee_engine::tools::browser::Vision::Unknown,
+            };
+            // A gateway run has no window of its own, so this is the plain walk's answer: the
+            // ordinary reasons, not the sidebar's.
+            let (headed, why, shot) = cwoffee_engine::tools::browser::decide(&cfg, "", false);
+            Ok(json!({
+                "mounted": cfg.usable(),
+                "driver": cfg.driver.as_ref().map(|p| p.display().to_string()),
+                "node": cfg.node,
+                "headed": headed,
+                "why": why,
+                "screenshot_default": shot,
+                "vision": match cfg.vision {
+                    cwoffee_engine::tools::browser::Vision::Yes => "yes",
+                    cwoffee_engine::tools::browser::Vision::No => "no",
+                    cwoffee_engine::tools::browser::Vision::Unknown => "unknown",
+                },
+                "config_path": h.config_path.display().to_string(),
+                "says": cwoffee_engine::tools::browser::status_line(&cfg, false),
+                // The kept browser too, in the engine's own sentence. The two transports build
+                // this object separately (`config_path` is a transport fact), but neither of
+                // them words it themselves, which is where "mounted"/"kept"/"enabled" used to
+                // mean three different things on one screen.
+                "keep": cwoffee_engine::browser_hub::status_line(&h.browser_keep, &cwoffee_engine::browser_hub::Hub::peek_shared(&h.browser_state)),
+                "keep_idle_secs": h.browser_keep.idle_secs,
+                "keep_writable": false,
+            }))
+        }
+        "mcp_status" => {
+            // What the third-party servers are doing and what `[mcp]` asks for. Read-only from a
+            // phone: the servers run on the machine that started them, and a control there that wrote
+            // that machine's config would be a remote launch of somebody else's program. `writable`
+            // is false in the payload, and the page says what to do instead of showing dead controls.
+            //
+            // Re-read, then re-apply the environment: `[mcp]` in the file and `CWOFFEE_MCP_SERVERS`
+            // describe the same servers, and a page that read only the file would tell a person whose
+            // servers come from a systemd unit that none are configured. The payload itself is built
+            // by the engine, because this transport and the desktop used to assemble it by hand and
+            // had drifted by one field each.
+            let (mut cfg, _) = cwoffee_engine::Config::load(Some(&h.config_path)).unwrap_or_default();
+            cfg.apply_env();
+            let cfg = cfg.mcp_cfg();
+            let core = h.host.core_id().to_string();
+            let file = cwoffee_engine::config::mcp_state_in(&h.config_path);
+            let hub = match &h.mcp {
+                Some(hub) => Some(hub.lock().await),
+                None => None,
+            };
+            Ok(cwoffee_engine::mcp::status_payload(
+                hub.as_deref(),
+                &cfg,
+                &core,
+                &h.config_path,
+                &h.mcp_route,
+                &file,
+                false,
+            ))
+        }
+        // The kept browser, for a tab that is watching. Read-only on this transport by
+        // design, and the payload says so: the browser belongs to the machine that runs the
+        // tools, and a page that shows clickable controls which the transport will refuse is
+        // worse than a page that states which machine it is looking at. (The desktop panel can
+        // drive it; a phone tab can watch it.)
+        "browser_panel" => {
+            use cwoffee_engine::browser_hub as bh;
+            let snap = bh::Hub::peek_shared(&h.browser_state);
+            match h.browser.as_ref() {
+                Some(_) => Ok(bh::status_payload(
+                    &h.browser_keep,
+                    &snap,
+                    true,
+                    false,
+                    "the machine that runs the tools; this tab watches it, it does not drive it",
+                )),
+                None => Ok(serde_json::json!({
+                    "mounted": false,
+                    "alive": false,
+                    "opened": false,
+                    "writable": false,
+                    "url": "",
+                    "why": snap.why,
+                    "says": snap.says(),
+                    "console": [],
+                    "page_errors": [],
+                    "requests_failed": [],
+                    "downloads_blocked": [],
+                    "idle_secs": 0,
+                    "idle_left": null,
+                    "seq": snap.seq,
+                    "route": "no kept browser is mounted in this start",
+                })),
+            }
+        }
+        "browser_frame" => {
+            // A picture only if the caller's copy is behind it. A tab polling over a LAN should not
+            // pay a screenshot every poll — but it does owe any frame the browser drew on its own,
+            // which is how a tab watching a page that is moving keeps up with it.
+            use cwoffee_engine::browser_hub as bh;
+            let since = args.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
+            let snap = bh::Hub::peek_shared(&h.browser_state);
+            if !snap.alive || !snap.opened {
+                return Ok(serde_json::json!({"unchanged": true, "no_page": true, "seq": snap.seq, "frame_pic": snap.frame_pic}))
+            }
+            // Same rule as the desktop, calling the same function: `since` is the id of the tab's
+            // *picture*, and both a page change with no picture of its own and a repaint the browser
+            // volunteered are cases that must not be answered with "nothing newer".
+            let Some(hub) = h.browser.as_ref() else {
+                return Ok(serde_json::json!({"unchanged": true, "seq": snap.seq}))
+            };
+            let (newest_pic, pictures_state) = {
+                let g = hub.lock().await;
+                (g.frame_pic(), g.frame_pictures_state(snap.seq))
+            };
+            if !bh::needs_pic(since, newest_pic, pictures_state) {
+                return Ok(serde_json::json!({"unchanged": true, "seq": snap.seq, "frame_pic": newest_pic}))
+            }
+            let mut g = hub.lock().await;
+            if let Some(f) = g.frame_now() {
+                if f.pic > since {
+                    return Ok(serde_json::json!({
+                        "unchanged": false, "b64": f.b64, "mime": f.mime, "bytes": f.bytes,
+                        "seq": f.seq, "pic": f.pic, "live": f.live
+                    }));
+                }
+            }
+            match g.frame(false).await {
+                Ok(f) => Ok(serde_json::json!({"unchanged": false, "b64": f.b64, "mime": f.mime, "bytes": f.bytes, "seq": f.seq, "pic": f.pic, "live": f.live})),
+                Err(e) => Ok(serde_json::json!({"unchanged": true, "why": e, "seq": snap.seq})),
+            }
+        }
+        "browser_watch" => {
+            // A tab saying whether it is looking, so the browser stops drawing frames for a panel
+            // nobody can see. Watch-role may ask: it costs pixels, never control of the page, and it
+            // does not touch the idle clock — watching a browser is not using one.
+            use cwoffee_engine::browser_hub as bh;
+            let Some(hub) = h.browser.as_ref() else {
+                return Err("no kept browser is mounted in this start".to_string())
+            };
+            let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            // The tab's own box width: a phone showing a 400px panel should not be handed 1280-wide
+            // pictures of the page, and the desktop's column width is not the phone's either.
+            let wide = args.get("max_width").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let out = hub.lock().await.watch(on, wide).await?;
+            let snap = bh::Hub::peek_shared(&h.browser_state);
+            Ok(bh::status_payload(
+                &h.browser_keep,
+                &snap,
+                true,
+                false,
+                "the machine that runs the tools; this tab watches it, it does not drive it",
+            ))
+            .map(|mut v| {
+                v["live"] = serde_json::json!(
+                    out.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)
+                        && out.get("live").and_then(|l| l.as_bool()).unwrap_or(false)
+                );
+                v
+            })
+        }
+        "browser_viewport" => {
+            // Reshaping the page is a write to the page, not to a picture of it, so this stays
+            // drive-role: a watching tab gets the frames at whatever size the desktop asked for.
+            need_drive(role)?;
+            use cwoffee_engine::browser_hub as bh;
+            let Some(hub) = h.browser.as_ref() else {
+                return Err("no kept browser is mounted in this start".to_string())
+            };
+            let w = args.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let hgt = args.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let out = hub.lock().await.set_viewport(w, hgt).await?;
+            if !out.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+                return Err(out.get("why").and_then(|w| w.as_str()).unwrap_or("the page would not resize").to_string())
+            }
+            let snap = bh::Hub::peek_shared(&h.browser_state);
+            Ok(bh::status_payload(
+                &h.browser_keep,
+                &snap,
+                true,
+                false,
+                "the machine that runs the tools; this tab watches it, it does not drive it",
+            ))
+            .map(|mut v| {
+                v["moved"] = out.get("moved").cloned().unwrap_or(serde_json::json!(true));
+                v
+            })
+        }
+        "about" => {
+            // Read-only, and watch-role is enough: what build this is, which core answers, and where
+            // the person's own files live. A phone filing a bug report needs exactly these facts.
+            let (cfg, _) = cwoffee_engine::Config::load(Some(&h.config_path)).unwrap_or_default();
+            let conversations = h.store.conversation_count().unwrap_or(0);
+            let messages = h.store.message_total().unwrap_or(0);
+            let mut a = cwoffee_engine::about::from_config(
+                &cfg,
+                &h.config_path,
+                conversations,
+                messages,
+            );
+            a.core = h.host.core_id().to_string();
+            a.config_path = h.config_path.display().to_string();
+            a.db_path = h.store.db_path();
+            a.thread_store = h.host.thread_store();
+            serde_json::to_value(a).map_err(|e| e.to_string())
         }
         "set_persona" => {
             need_drive(role)?;
@@ -1474,6 +2022,19 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
                 .map_err(|e| e.to_string())?;
             Ok(json!(n > 0))
         }
+        "set_workspace_color" => {
+            need_drive(role)?;
+            let raw = arg_str(&args, "path")?;
+            let color = args.get("color").and_then(|v| v.as_str()).unwrap_or("");
+            // A colour on the sidebar row, spelled #rrggbb or empty to clear. The store refuses
+            // anything else, so a phone cannot put arbitrary text into a style attribute on the
+            // desktop through this door.
+            let n = h
+                .store
+                .set_workspace_color(&raw, color)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(n > 0))
+        }
         "remove_workspace" => {
             need_drive(role)?;
             let raw = arg_str(&args, "path")?;
@@ -1606,6 +2167,7 @@ async fn run_cmd(cmd: &str, args: serde_json::Value, role: Role, h: &EngineHandl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use cwoffee_engine::host::SessionHost;
     use cwoffee_engine::store::Store;
 
@@ -1635,6 +2197,14 @@ mod tests {
             clients: Arc::new(Mutex::new(BTreeMap::new())),
             migration_notes: vec![],
             config_path: PathBuf::from("/nonexistent/cwoffee.toml"),
+            browser_cfg: cwoffee_engine::tools::browser::BrowserCfg::default(),
+            mcp: None,
+            mcp_route: "none - no server is running in this start".to_string(),
+            browser: None,
+            browser_state: std::sync::Arc::new(std::sync::RwLock::new(
+                cwoffee_engine::browser_hub::Snapshot::default(),
+            )),
+            browser_keep: cwoffee_engine::browser_hub::SessionCfg::default(),
         };
         // The state the composer labels itself from, and the sidebar list the phone
         // draws. If either dispatch were wrong this would not link.
@@ -1739,6 +2309,14 @@ mod tests {
             // because the struct says a gateway always knows which file it would
             // write, and a test that cannot answer that is not a gateway.
             config_path: std::env::temp_dir().join("cwoffee-gw-refused-config.toml"),
+            browser_cfg: cwoffee_engine::tools::browser::BrowserCfg::default(),
+            mcp: None,
+            mcp_route: "none - no server is running in this start".to_string(),
+            browser: None,
+            browser_state: std::sync::Arc::new(std::sync::RwLock::new(
+                cwoffee_engine::browser_hub::Snapshot::default(),
+            )),
+            browser_keep: cwoffee_engine::browser_hub::SessionCfg::default(),
         });
         let err = serve(cfg, handle).await.unwrap_err();
         assert!(matches!(err, GatewayError::Refused(_)), "got {err:?}");
@@ -2034,6 +2612,53 @@ mod tests {
         );
     }
 
+    /// The desktop once wrote a folder colour to the store and dropped it on the way out to the
+    /// window. The gateway serialized the engine's own row, so the same press worked from a phone and
+    /// did nothing on the desktop — which is the whole reason the two transports are checked against
+    /// the same fact.
+    #[tokio::test]
+    async fn a_folder_colour_reads_back_on_the_sidebar_list() {
+        let h = test_handle();
+        let dir = unique_dir("colour");
+        run_cmd("add_workspace", serde_json::json!({ "path": &dir }), Role::Drive, &h)
+            .await
+            .expect("adding a folder is a drive act");
+        run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "#3f9a72" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("colouring a folder is a drive act");
+        let out = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("reading the folder list is read-only");
+        let row = out
+            .as_array()
+            .and_then(|a| a.iter().find(|w| w["path"].as_str() == Some(dir.as_str())))
+            .unwrap_or_else(|| panic!("the folder just added is not in the list: {out}"));
+        assert_eq!(row["color"].as_str(), Some("#3f9a72"), "the colour did not reach the list: {row}");
+
+        // Clearing is a value too, not an absent field a client has to guess about.
+        run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("un-colouring a folder is a drive act");
+        let out2 = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("reading the folder list is read-only");
+        let row2 = out2
+            .as_array()
+            .and_then(|a| a.iter().find(|w| w["path"].as_str() == Some(dir.as_str())))
+            .unwrap_or_else(|| panic!("the folder disappeared from the list: {out2}"));
+        assert_eq!(row2["color"].as_str(), Some(""), "clearing a colour must read as empty: {row2}");
+    }
+
     #[tokio::test]
     async fn adding_a_folder_to_the_sidebar_is_drive_only_and_validated() {
         let h = test_handle();
@@ -2104,6 +2729,36 @@ mod tests {
         .await
         .expect("renaming a row the client can see is allowed");
         assert_eq!(ok.as_bool(), Some(true));
+        // A colour is the same class of edit as a rename: it says how the person arranged their
+        // own list, so a driver may write it and a watcher may not.
+        let col = run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "#3d8f6f" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("colouring a row the client can see is allowed");
+        assert_eq!(col.as_bool(), Some(true));
+        let col_watch = run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "#3d8f6f" }),
+            Role::Watch,
+            &h,
+        )
+        .await;
+        assert!(col_watch.is_err(), "a watcher may read the coloured list, not recolour it");
+        let col_bad = run_cmd(
+            "set_workspace_color",
+            serde_json::json!({ "path": &dir, "color": "red; background:url(x)" }),
+            Role::Drive,
+            &h,
+        )
+        .await;
+        assert!(
+            col_bad.is_err(),
+            "a value that is not a colour is refused at the record, not filtered on the way out"
+        );
         let out = run_cmd("list_workspaces", serde_json::json!({}), Role::Watch, &h)
             .await
             .unwrap();
@@ -2380,6 +3035,103 @@ mod tests {
         CONFIG_SEQ.get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
     }
 
+
+    #[tokio::test]
+    async fn the_browser_answer_is_watch_role_and_admits_when_there_is_no_browser() {
+        // A person on a phone is asking about a machine they are not standing in front of:
+        // "will this model put a browser window on the desktop downstairs?" That is watch-role
+        // — a question about a program the app started — and the reply must come from the same
+        // policy the tool applies, because a settings screen that paraphrases a policy is a
+        // screen that eventually contradicts it. Above all it must admit when the tool is not
+        // mounted at all, rather than describing a door that is not there.
+        let h = test_handle();
+        let st = run_cmd("browser_status", serde_json::json!({ "model": "m" }), Role::Watch, &h)
+            .await
+            .expect("a watcher may ask what the browser will do");
+        assert_eq!(st["mounted"], serde_json::json!(false), "this handle has no driver on purpose");
+        let said = st["says"].as_str().unwrap();
+        assert!(said.contains("not mounted"), "{said}");
+        assert!(said.contains("npm --prefix browser install"), "the answer carries the fix: {said}");
+        assert!(said.contains("npx playwright install"), "{said}");
+        assert_eq!(st["headed"], serde_json::json!(false), "an unmounted tool opens nothing anywhere");
+
+        // The chain the mounted answer rests on, graded where it is decided: the config row is
+        // the only place a model's eyes are recorded, and silence from an endpoint is not a
+        // yes. The selftest grades the same sentence through the real UI on a real browser.
+        let cfg_file = std::env::temp_dir().join(format!("cwoffee-gw-browse-{}.toml", std::process::id()));
+        std::fs::write(
+            &cfg_file,
+            "[models.\"seeing-model\"]\nsupports_vision = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cwoffee_engine::config::vision_in(&cfg_file, "seeing-model"),
+            Some(true),
+            "the settings screen writes this file and the browser reads it: one source"
+        );
+        assert_eq!(cwoffee_engine::config::vision_in(&cfg_file, "another-model"), None);
+        let driver = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../browser/driver.mjs");
+        if driver.is_file() {
+            // The driver and the eyes together, which is what the wire reply above assembles
+            // from the same two sources.
+            let seeing = cwoffee_engine::tools::browser::BrowserCfg {
+                driver: Some(driver.clone()),
+                vision: cwoffee_engine::tools::browser::Vision::Yes,
+                ..Default::default()
+            };
+            let (headed, why, shot) = cwoffee_engine::tools::browser::decide(&seeing, "");
+            assert!(headed, "a model that can look gets a real browser");
+            assert!(why.contains("image input"), "{why}");
+            assert_eq!(shot, "viewport");
+            let line = cwoffee_engine::tools::browser::status_line(&seeing, false);
+            assert!(line.contains("mounted"), "{line}");
+            assert!(line.contains("visible window"), "{line}");
+        }
+        let _ = std::fs::remove_file(&cfg_file);
+    }
+
+    #[tokio::test]
+    async fn a_watching_tab_is_refused_the_page_reshaping_before_it_is_told_there_is_no_browser() {
+        // The live view crosses the wire in one direction only. A phone that opens the panel may say
+        // "I am looking, send me pictures" — that costs the browser encoding, never control of the
+        // page, and it does not touch the idle clock. What it may not do is resize the page on the
+        // desktop: the shape of a page belongs to the window that shows it, and a phone putting a
+        // 1600x900 page on a 400px screen is a phone that decided something nobody agreed to.
+        //
+        // This handle has no browser at all, which is what makes the order of the two gates visible:
+        // a watcher's refusal names the *role*, and a driver's names the *missing browser*. Read the
+        // other way round — "no browser" for everybody — a role gate that had been dropped would
+        // look identical, and so would a watcher being told to go away for an unrelated reason.
+        let h = test_handle();
+        let refused = run_cmd(
+            "browser_viewport",
+            serde_json::json!({ "width": 1600, "height": 900 }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watcher cannot reshape the page on the machine it is watching");
+        assert!(refused.contains("drive"), "the refusal names the role: {refused}");
+        let driver = run_cmd(
+            "browser_viewport",
+            serde_json::json!({ "width": 1600, "height": 900 }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("this handle has no kept browser, and the drive path got that far");
+        assert!(driver.contains("kept browser"), "the driver's refusal is about the browser, not the role: {driver}");
+        assert!(!driver.contains("drive-role"), "{driver}");
+
+        // Asking for one's own frames is a watcher's verb: it never reaches the role gate, so on this
+        // handle the only thing wrong with it is the missing browser.
+        let watch = run_cmd("browser_watch", serde_json::json!({ "on": true }), Role::Watch, &h)
+            .await
+            .expect_err("no browser here either");
+        assert!(watch.contains("kept browser"), "a watcher is not refused for watching: {watch}");
+        assert!(!watch.contains("drive"), "{watch}");
+    }
+
     fn test_handle() -> Arc<EngineHandle> {
         test_handle_with_notes(Vec::new())
     }
@@ -2428,6 +3180,14 @@ mod tests {
                 std::process::id(),
                 config_seq().fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             )),
+            browser_cfg: cwoffee_engine::tools::browser::BrowserCfg::default(),
+            mcp: None,
+            mcp_route: "none - no server is running in this start".to_string(),
+            browser: None,
+            browser_state: std::sync::Arc::new(std::sync::RwLock::new(
+                cwoffee_engine::browser_hub::Snapshot::default(),
+            )),
+            browser_keep: cwoffee_engine::browser_hub::SessionCfg::default(),
         })
     }
 
@@ -3012,6 +3772,535 @@ mod tests {
         let _ = std::fs::remove_file(&h.config_path);
     }
 
+    /// Undoing files is a drive verb, and the phone gets the same plan the desktop preview
+    /// shows. A watch token can read the path list it is being asked to confirm but cannot
+    /// press it: the workspace on disk is not something a read-only tab overwrites.
+    #[tokio::test]
+    async fn a_phone_can_see_what_a_revert_would_do_and_only_drive_can_do_it() {
+        use cwoffee_engine::checkpoint::{capture, snapshot_dir, PreState};
+
+        let h = test_handle();
+        let dir = std::env::temp_dir().join(format!("cwoffee_gw_revert_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "the user's notes\n").unwrap();
+        let id = match run_cmd(
+            "new_session",
+            serde_json::json!({ "title": "revert me", "workspace": dir.to_str().unwrap() }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap()
+        {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("new_session returned {other:?}"),
+        };
+        h.store.append_message(id, &cwoffee_engine::provider::Message::user("rewrite")).unwrap();
+        let aid = h
+            .store
+            .append_message(id, &cwoffee_engine::provider::Message::assistant("rewritten"))
+            .unwrap();
+
+        // Turn 1 overwrote the file. This is what the tool host would have recorded.
+        let snaps = snapshot_dir(&dir);
+        let pre = PreState::of(&dir.join("notes.md"));
+        std::fs::write(dir.join("notes.md"), "the model's version\n").unwrap();
+        let mark = capture(
+            Some(&snaps),
+            &dir,
+            &dir.join("notes.md"),
+            &pre,
+            Some(b"the model's version\n"),
+        )
+        .expect("a copy of a file inside the workspace");
+        h.store.record_checkpoints(id, 1, &[mark]).unwrap();
+        h.store.stamp_checkpoints_turn(id, 1, aid).unwrap();
+
+        let preview = run_cmd(
+            "checkpoint_preview",
+            serde_json::json!({ "session": id, "message_id": aid, "through_latest": false }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect("a watcher can read the plan it is being shown");
+        assert_eq!(preview["items"].as_array().unwrap().len(), 1, "{preview}");
+        assert_eq!(preview["items"][0]["path"], "notes.md");
+        assert_eq!(
+            preview["items"][0]["kind"], "modified",
+            "the card has to say it puts a file back, not that it deletes one"
+        );
+
+        let err = run_cmd(
+            "checkpoint_revert",
+            serde_json::json!({ "session": id, "message_id": aid, "through_latest": false }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watcher must not overwrite files");
+        assert!(err.contains("watch"), "unhelpful: {err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+            "the model's version\n",
+            "and nothing moved on disk"
+        );
+
+        let out = run_cmd(
+            "checkpoint_revert",
+            serde_json::json!({ "session": id, "message_id": aid, "through_latest": false, "shown": ["notes.md"] }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect("drive can undo its own turn");
+        assert_eq!(out["report"]["restored"], 1, "{out}");
+        assert!(
+            out["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("The transcript is untouched"),
+            "the phone has to be told the messages did not go with the files: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+            "the user's notes\n",
+            "the file is what it was before that turn"
+        );
+        // The transcript is the record: undoing files must not have edited it.
+        assert_eq!(h.store.message_count(id).unwrap(), 2, "no rows went with the revert");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Branching is a drive verb, and a phone that is allowed to do it gets the same answer the
+    /// desktop gets: a new conversation id it can open, the same note, and the source left whole.
+    /// A watch token cannot start a second conversation out of one it can only read.
+    #[tokio::test]
+    async fn a_phone_can_branch_a_conversation_and_gets_the_new_row_back() {
+        let h = test_handle();
+        let id = match run_cmd("new_session", serde_json::json!({ "title": "branch me" }), Role::Drive, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("new_session returned {other:?}"),
+        };
+        for text in ["first ask", "second ask"] {
+            h.store.append_message(id, &cwoffee_engine::provider::Message::user(text)).unwrap();
+            h.store.append_message(id, &cwoffee_engine::provider::Message::assistant("an answer")).unwrap();
+        }
+
+        let err = run_cmd(
+            "branch_conversation",
+            serde_json::json!({ "session": id, "message_id": null, "from_end": 2, "role": "user", "shown": "first ask" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watcher must not create conversations");
+        assert!(err.contains("watch"), "unhelpful: {err}");
+
+        // The phone's own view has drifted: it still shows the words it painted, and the row now
+        // says something else. The refusal has to be an error, not a payload — this verb used to
+        // serialise `Result`, which answered a refusal with `{"Err": …}` and let a client say
+        // "branched" about a conversation that was never created.
+        let drift = h.store.messages(id).unwrap()[0].id;
+        h.store.edit_message(drift, "someone else's ask").unwrap();
+        let err = run_cmd(
+            "branch_conversation",
+            serde_json::json!({ "session": id, "message_id": drift, "shown": "first ask" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("a drifted window must not get its branch applied to a row it never saw");
+        assert!(err.contains("says something else now"), "{err}");
+        h.store.edit_message(drift, "first ask").unwrap();
+
+        let rows = h.store.messages(id).unwrap();
+        let out = match run_cmd(
+            "branch_conversation",
+            serde_json::json!({ "session": id, "message_id": rows[1].id, "role": "assistant", "shown": "an answer" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap()
+        {
+            serde_json::Value::Object(o) => o,
+            other => panic!("branch returned {other:?}"),
+        };
+        let new_id = out.get("session").and_then(|v| v.as_i64()).expect("the new row's id");
+        assert_eq!(out.get("copied").and_then(|v| v.as_i64()), Some(2), "the copied stretch: {out:?}");
+        let note = out.get("note").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(note.contains("branch"), "the note has to say what it made: {note}");
+        assert!(note.contains(&new_id.to_string()), "and name the conversation it made: {note}");
+        assert_eq!(h.store.messages(id).unwrap().len(), 4, "the source conversation is untouched");
+        assert_eq!(h.store.messages(new_id).unwrap().len(), 2);
+        // The branch is a conversation the person can open, so it is listed.
+        assert!(
+            h.store.list_sessions(50).unwrap().iter().any(|r| r.id == new_id),
+            "the sidebar never learns about the branch"
+        );
+        let _ = std::fs::remove_file(&h.config_path);
+    }
+
+    /// The tree on a phone: the read is a watch-role read, and the move is a drive-role one, so a
+    /// watch tab can draw the leaf without being able to move it. The verbs are the same functions the
+    /// desktop command calls, so this test is also the proof that a phone sees the same tree — and the
+    /// same refusal — as the window next to it.
+    #[tokio::test]
+    async fn a_phone_reads_a_conversations_tree_and_moves_its_leaf() {
+        let h = test_handle();
+        let id = match run_cmd("new_session", serde_json::json!({ "title": "tree me" }), Role::Drive, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("new_session returned {other:?}"),
+        };
+        for text in ["first ask", "second ask"] {
+            h.store
+                .append_message(id, &cwoffee_engine::provider::Message::user(text))
+                .unwrap();
+            h.store
+                .append_message(id, &cwoffee_engine::provider::Message::assistant("an answer"))
+                .unwrap();
+        }
+
+        let tree = match run_cmd("session_tree", serde_json::json!({ "session": id }), Role::Watch, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Object(o) => o,
+            other => panic!("session_tree returned {other:?}"),
+        };
+        assert_eq!(tree.get("core").and_then(|v| v.as_str()), Some("rust"));
+        assert_eq!(tree.get("off_branch").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(tree.get("leaf").and_then(|v| v.as_i64()), Some(4), "the newest row, written on append");
+        assert_eq!(tree.get("nodes").and_then(|v| v.as_array()).map(|a| a.len()), Some(4));
+        assert_eq!(
+            tree.get("nodes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter(|n| n.get("current").and_then(|c| c.as_bool()) == Some(true)).count()),
+            Some(1),
+            "exactly one node is what the next answer reads through: {tree:?}"
+        );
+        let me = tree
+            .get("lineage")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.iter().find(|c| c.get("current").and_then(|x| x.as_bool()) == Some(true)))
+            .expect("the tree names the conversation being read");
+        assert_eq!(me.get("parent"), Some(&serde_json::Value::Null), "a conversation nobody branched is a root");
+        // This engine keeps its memory in the record, and the read has to say that rather than claim a
+        // model thread it never asked.
+        assert_eq!(
+            tree.get("pi").and_then(|v| v.get("consulted")).and_then(|v| v.as_bool()),
+            Some(false),
+            "{tree:?}"
+        );
+        assert!(
+            tree.get("note").and_then(|v| v.as_str()).unwrap_or("").contains("record"),
+            "the note says where it read from: {:?}",
+            tree.get("note")
+        );
+
+        // Watching is not driving.
+        let err = run_cmd(
+            "switch_leaf",
+            serde_json::json!({ "session": id, "message_id": 1, "role": "user", "shown": "first ask" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .expect_err("a watcher must not move what the model reads");
+        assert!(err.contains("watch"), "unhelpful: {err}");
+
+        // A window whose view drifted must not move a leaf on a row it never showed.
+        let drift = 1i64;
+        h.store.edit_message(drift, "someone else's ask").unwrap();
+        let err = run_cmd(
+            "switch_leaf",
+            serde_json::json!({ "session": id, "message_id": drift, "role": "user", "shown": "first ask" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .expect_err("a drifted window must not move a leaf on a row it never saw");
+        assert!(err.contains("says something else now"), "{err}");
+        assert_eq!(h.store.leaf_row(id).unwrap(), Some(4), "the refused move left the leaf where it was");
+        h.store.edit_message(drift, "first ask").unwrap();
+
+        // Stand back at the conversation's own opening ask: the leaf goes in front of every row, the
+        // words come back, and nothing is deleted.
+        let out = match run_cmd(
+            "switch_leaf",
+            serde_json::json!({ "session": id, "message_id": 1, "role": "user", "shown": "first ask" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap()
+        {
+            serde_json::Value::Object(o) => o,
+            other => panic!("switch_leaf returned {other:?}"),
+        };
+        assert_eq!(out.get("leaf").and_then(|v| v.as_i64()), Some(0), "in front of the first row: {out:?}");
+        assert_eq!(out.get("prefill").and_then(|v| v.as_str()), Some("first ask"));
+        assert_eq!(out.get("off_branch").and_then(|v| v.as_i64()), Some(4));
+        assert!(out.get("note").and_then(|v| v.as_str()).unwrap_or("").contains("nothing was deleted"), "{out:?}");
+        assert!(h.store.messages(id).unwrap().is_empty(), "the model is handed nothing to read");
+        assert_eq!(h.store.message_count(id).unwrap(), 4, "the record still holds all four rows");
+
+        // A message sent from there joins that branch, and the rows past it stay on the other one.
+        h.store
+            .append_message(id, &cwoffee_engine::provider::Message::user("third ask"))
+            .unwrap();
+        let branch = h.store.messages(id).unwrap();
+        assert_eq!(branch.len(), 1, "the new row joined the branch the leaf was left on");
+        assert_eq!(branch[0].content, "third ask");
+        assert_eq!(h.store.message_count(id).unwrap(), 5);
+        assert_eq!(h.store.off_branch_rows(id).unwrap(), 4);
+
+        // A child is drawn under its parent, with the row it was cut at quoted back.
+        let kid = match run_cmd(
+            "branch_conversation",
+            serde_json::json!({ "session": id, "message_id": branch[0].id, "role": "user", "shown": "third ask" }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap()
+        {
+            serde_json::Value::Object(o) => o.get("session").and_then(|v| v.as_i64()).expect("the new row's id"),
+            other => panic!("branch returned {other:?}"),
+        };
+        let kid_tree = match run_cmd("session_tree", serde_json::json!({ "session": kid }), Role::Watch, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Object(o) => o,
+            other => panic!("session_tree returned {other:?}"),
+        };
+        // The branch's own entry carries the cut; the parent's entry is drawn above it.
+        let own = kid_tree
+            .get("lineage")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.iter().find(|c| c.get("current").and_then(|x| x.as_bool()) == Some(true)))
+            .expect("the branch's tree names the conversation being read");
+        assert_eq!(own.get("session").and_then(|v| v.as_i64()), Some(kid));
+        assert_eq!(own.get("parent").and_then(|v| v.as_i64()), Some(id), "and who it was cut out of");
+        assert_eq!(own.get("branch_role").and_then(|v| v.as_str()), Some("user"));
+        assert!(own.get("branch_quote").and_then(|v| v.as_str()).unwrap_or("").contains("third ask"), "{own:?}");
+        assert_eq!(own.get("depth").and_then(|v| v.as_i64()), Some(1), "drawn under its parent");
+        let from = kid_tree
+            .get("lineage")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.iter().find(|c| c.get("session").and_then(|x| x.as_i64()) == Some(id)))
+            .expect("the branch draws the conversation it came out of");
+        assert_eq!(from.get("depth").and_then(|v| v.as_i64()), Some(0), "the parent is the root of this tree");
+        let par_tree = match run_cmd("session_tree", serde_json::json!({ "session": id }), Role::Watch, &h)
+            .await
+            .unwrap()
+        {
+            serde_json::Value::Object(o) => o,
+            other => panic!("session_tree returned {other:?}"),
+        };
+        assert!(
+            par_tree
+                .get("lineage")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().any(|c| c.get("session").and_then(|x| x.as_i64()) == Some(kid)))
+                .unwrap_or(false),
+            "the parent never learns about its child: {par_tree:?}"
+        );
+        assert!(
+            par_tree.get("note").and_then(|v| v.as_str()).unwrap_or("").contains("1 branch(es) hang off"),
+            "the parent's note counts its child: {:?}",
+            par_tree.get("note")
+        );
+        let _ = std::fs::remove_file(&h.config_path);
+    }
+
+    /// The ledger is a read over the copy machinery, so the transport question is not "does it
+    /// work" (the engine tests answer that) but "who is allowed to ask": a phone watching a
+    /// conversation can ask what its turns wrote and what that costs, and cannot delete the copies
+    /// — which is the one verb in the group that removes files from a folder.
+    #[tokio::test]
+    async fn the_file_ledger_reads_are_watch_and_forgetting_copies_is_drive_and_audited() {
+        let dir = unique_dir("ledger");
+        let h = test_handle_in(&dir);
+        let ws = std::path::PathBuf::from(&dir);
+        let id = h.store.create_session("files", &dir, "m").unwrap();
+        // Two turns overwriting two different paths with the same prior bytes: one blob, two index
+        // rows, which is the shape that makes a byte total easy to double-count.
+        let snap = cwoffee_engine::checkpoint::snapshot_dir(&ws);
+        for (turn, path) in [(1i64, "a.md"), (2i64, "b.md")] {
+            std::fs::write(ws.join(path), b"shared bytes\n").unwrap();
+            let pre = cwoffee_engine::checkpoint::PreState::Present(b"shared bytes\n".to_vec());
+            let mark = cwoffee_engine::checkpoint::capture(Some(&snap), &ws, &ws.join(path), &pre, Some(b"new\n"))
+                .unwrap();
+            std::fs::write(ws.join(path), "new\n").unwrap();
+            h.store.record_checkpoints(id, turn, &[mark]).unwrap();
+        }
+        h.store
+            .append_message(id, &cwoffee_engine::provider::Message::user("write them"))
+            .unwrap();
+        h.store
+            .append_message(id, &cwoffee_engine::provider::Message::assistant("done"))
+            .unwrap();
+        h.store.stamp_checkpoints_turn(id, 1, 1).unwrap();
+        h.store.stamp_checkpoints_turn(id, 2, 2).unwrap();
+
+        let obj = |v: serde_json::Value| match v {
+            serde_json::Value::Object(o) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+
+        let l = obj(
+            run_cmd("files_ledger", serde_json::json!({ "session": id }), Role::Watch, &h)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(l.get("turns").and_then(|v| v.as_array()).map(|a| a.len()), Some(2));
+        assert_eq!(l.get("files_total").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(l.get("copies").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(l.get("pruned").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(
+            l.get("turns")
+                .and_then(|v| v.as_array())
+                .map(|a| a[0].get("latest").and_then(|x| x.as_bool()) == Some(true)),
+            Some(true),
+            "newest turn first, and the card knows which one is newest: {l:?}"
+        );
+
+        let s = obj(
+            run_cmd("snapshot_stats", serde_json::json!({ "session": id }), Role::Watch, &h)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(s.get("rows").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(s.get("blobs").and_then(|v| v.as_i64()), Some(1), "the same bytes are one file");
+        assert_eq!(s.get("blob_bytes").and_then(|v| v.as_u64()), Some(b"shared bytes\n".len() as u64));
+        assert_eq!(
+            s.get("row_bytes").and_then(|v| v.as_u64()),
+            Some(b"shared bytes\n".len() as u64 * 2),
+            "and the index total is the other number"
+        );
+        assert_eq!(s.get("orphan_blobs").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(s.get("shared").and_then(|v| v.as_i64()), Some(0));
+
+        let ck = l.get("turns").and_then(|v| v.as_array()).unwrap()[0]
+            .get("file_rows")
+            .and_then(|v| v.as_array())
+            .unwrap()[0]
+            .get("checkpoint")
+            .and_then(|v| v.as_i64())
+            .expect("a ledger row names the record it reads");
+        let d = obj(
+            run_cmd(
+                "file_diff",
+                serde_json::json!({ "session": id, "checkpoint": ck, "shown": "b.md" }),
+                Role::Watch,
+                &h,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(d.get("path").and_then(|v| v.as_str()), Some("b.md"));
+        assert_eq!(d.get("can_revert").and_then(|v| v.as_bool()), Some(true));
+        let text = d.get("diff").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        assert!(text.contains("-shared bytes"), "{d:?}");
+        assert!(text.contains("+new"), "{d:?}");
+
+        // The identity guard on the wire: a stale window naming a row it painted as `a.md` gets a
+        // refusal, not whichever copy that path belongs to now.
+        let stale = run_cmd(
+            "file_diff",
+            serde_json::json!({ "session": id, "checkpoint": ck, "shown": "a.md" }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .unwrap_err();
+        assert!(stale.contains("Nothing was diffed"), "{stale}");
+        assert_eq!(std::fs::read(ws.join("a.md")).unwrap(), b"new\n", "the refusal touched no file");
+        assert_eq!(std::fs::read(ws.join("b.md")).unwrap(), b"new\n");
+
+        // Deleting is not a watcher's question.
+        let denied = run_cmd(
+            "forget_copies",
+            serde_json::json!({ "session": id, "shown": 2 }),
+            Role::Watch,
+            &h,
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.contains("watch, not drive"), "{denied}");
+        assert!(AUDITED.contains(&"forget_copies"), "and the verb that deletes files is logged: {AUDITED:?}");
+
+        // A count that is not the record's changes nothing, even from a driver.
+        let stale_forget = run_cmd(
+            "forget_copies",
+            serde_json::json!({ "session": id, "shown": 9 }),
+            Role::Drive,
+            &h,
+        )
+        .await
+        .unwrap_err();
+        assert!(stale_forget.contains("Nothing was forgotten"), "{stale_forget}");
+        assert!(stale_forget.contains("the record says 2"), "{stale_forget}");
+        let s2 = obj(
+            run_cmd("snapshot_stats", serde_json::json!({ "session": id }), Role::Watch, &h)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(s2.get("rows").and_then(|v| v.as_i64()), Some(2), "the refused delete changed nothing");
+
+        let out = obj(
+            run_cmd("forget_copies", serde_json::json!({ "session": id, "shown": 2 }), Role::Drive, &h)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(out.get("dropped").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(
+            out.get("freed_bytes").and_then(|v| v.as_u64()),
+            Some(b"shared bytes\n".len() as u64),
+            "two rows, one blob, so the freed bytes are one file's: {out:?}"
+        );
+        assert_eq!(out.get("kept").and_then(|v| v.as_i64()), Some(0));
+        let s3 = obj(
+            run_cmd("snapshot_stats", serde_json::json!({ "session": id }), Role::Watch, &h)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(s3.get("rows").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(s3.get("blobs").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(s3.get("orphan_blobs").and_then(|v| v.as_i64()), Some(0), "and it left no bytes behind");
+        assert_eq!(h.store.message_count(id).unwrap(), 2, "the transcript is untouched");
+        assert_eq!(std::fs::read(ws.join("a.md")).unwrap(), b"new\n", "the files are untouched");
+        assert_eq!(std::fs::read(ws.join("b.md")).unwrap(), b"new\n");
+
+        let l2 = obj(
+            run_cmd("files_ledger", serde_json::json!({ "session": id }), Role::Watch, &h)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(l2.get("files_total").and_then(|v| v.as_i64()), Some(0));
+        assert!(
+            l2.get("note").and_then(|v| v.as_str()).unwrap_or("").contains("no turn"),
+            "an emptied record says so rather than drawing an empty list silently: {l2:?}"
+        );
+        assert_eq!(
+            l2.get("prune_notes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().any(|n| n.as_str().unwrap_or("").contains("at the person's request"))),
+            Some(true),
+            "and the notice says who removed them: {l2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     #[tokio::test]
     async fn a_phone_can_share_a_conversation_without_touching_the_host() {
         // Sharing is a read: the document comes back over the wire and nothing is
@@ -3241,5 +4530,301 @@ mod tests {
         assert_eq!(headers.get("upgrade").map(|s| s.as_str()), Some("websocket"));
         assert!(find_double_crlf(b"GET / HTTP/1.1\r\nA: b\r\n\r\nrest").is_some());
         assert!(find_double_crlf(b"GET / HTTP/1.1\r\nA: b\r\n").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_watcher_can_ask_what_is_running_and_the_numbers_add_up() {
+        // "Is what I configured actually running?" is the question a phone asks when the desktop
+        // says a server is dead, so `mcp_status` is watch-role. The arithmetic claim matters even
+        // with nothing mounted: a page that prints "0B made of undefinedB + undefinedB" is a page
+        // that reported an answer it never got, and the unmounted branch has to carry the same
+        // three fields the mounted branch does.
+        let h = test_handle();
+        let st = run_cmd("mcp_status", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("a watcher can ask what is running");
+        assert_eq!(st["mounted"], false, "this handle spawned no servers: {st}");
+        let body = st["catalog_body_bytes"].as_u64().expect("body bytes are reported");
+        let lead = st["catalog_lead_bytes"].as_u64().expect("lead bytes are reported");
+        assert_eq!(
+            st["catalog_bytes"].as_u64().unwrap(),
+            body + lead,
+            "the total has to be the two parts a page prints side by side: {st}"
+        );
+        assert_eq!(st["configured"], 0);
+        assert!(
+            st["why"].as_str().unwrap().contains("no [mcp] servers"),
+            "an unmounted status says why: {st}"
+        );
+
+        // Names only, and only what this side can see. This handle has a real registry and nothing
+        // hidden, so it answers with two lists; a core that decides its tools inside the model
+        // process refuses instead of returning two empty lists, which would read as "nothing is
+        // hidden" about a thing it cannot observe.
+        let inv = run_cmd("tool_inventory", serde_json::json!({}), Role::Watch, &h)
+            .await
+            .expect("a watcher can ask which tools were declared");
+        assert!(
+            inv["declared"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n == "exec"),
+            "the declared list is the registry's own: {inv}"
+        );
+        assert_eq!(inv["hidden"].as_array().unwrap().len(), 0, "{inv}");
+    }
+
+    /// A provider that is still answering when the test asks something of it, so a
+    /// mid-turn claim is measured against a turn rather than against an idle host.
+    struct SlowProvider {
+        hold: std::time::Duration,
+        calls: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cwoffee_engine::provider::Provider for SlowProvider {
+        fn id(&self) -> &str {
+            "slow"
+        }
+        fn label(&self) -> &str {
+            "slow"
+        }
+        async fn stream(
+            &self,
+            req: &cwoffee_engine::provider::ChatRequest,
+            sink: &cwoffee_engine::provider::DeltaSink,
+        ) -> Result<(), cwoffee_engine::provider::ProviderError> {
+            let last = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == cwoffee_engine::provider::Role::User)
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            if req.messages.len() == 1
+                && req.messages[0].content.starts_with(cwoffee_engine::titling::TITLE_ASK)
+            {
+                sink.send(cwoffee_engine::provider::Delta::Text("a scripted name".into()))
+                    .map_err(|_| cwoffee_engine::provider::ProviderError::Cancelled)?;
+                sink.send(cwoffee_engine::provider::Delta::Done(
+                    cwoffee_engine::event::FinishReason::Stop,
+                ))
+                .map_err(|_| cwoffee_engine::provider::ProviderError::Cancelled)?;
+                return Ok(());
+            }
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.seen.lock().unwrap().push(last);
+            if n == 0 {
+                tokio::time::sleep(self.hold).await;
+            }
+            sink.send(cwoffee_engine::provider::Delta::Text("the answer".into()))
+                .map_err(|_| cwoffee_engine::provider::ProviderError::Cancelled)?;
+            sink.send(cwoffee_engine::provider::Delta::Done(
+                cwoffee_engine::event::FinishReason::Stop,
+            ))
+            .map_err(|_| cwoffee_engine::provider::ProviderError::Cancelled)?;
+            Ok(())
+        }
+    }
+
+    fn handle_with(host: Arc<dyn HostOps>, store: Arc<dyn StoreOps>) -> EngineHandle {
+        EngineHandle {
+            host,
+            store,
+            events: broadcast::channel(8).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(Mutex::new(BTreeMap::new())),
+            migration_notes: vec![],
+            config_path: PathBuf::from("/nonexistent/cwoffee.toml"),
+            browser_cfg: cwoffee_engine::tools::browser::BrowserCfg::default(),
+            mcp: None,
+            mcp_route: "none - no server is running in this start".to_string(),
+            browser: None,
+            browser_state: std::sync::Arc::new(std::sync::RwLock::new(
+                cwoffee_engine::browser_hub::Snapshot::default(),
+            )),
+            browser_keep: cwoffee_engine::browser_hub::SessionCfg::default(),
+        }
+    }
+
+    async fn call(h: &EngineHandle, cmd: &str, args: serde_json::Value, role: Role) -> serde_json::Value {
+        let raw = serde_json::json!({ "type": "rpc", "cmd": cmd, "args": args, "id": 1 }).to_string();
+        let reply = dispatch(&raw, role, h, "127.0.0.1:test")
+            .await
+            .expect("dispatch answered");
+        serde_json::from_str(&reply).unwrap_or_else(|e| panic!("{cmd} answered unparseably: {e}: {reply}"))
+    }
+
+    fn slow_handle(hold: std::time::Duration) -> (EngineHandle, Arc<SlowProvider>, Arc<Store>) {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p = Arc::new(SlowProvider {
+            hold,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: Default::default(),
+        });
+        let host = Arc::new(SessionHost::spawn(
+            p.clone() as Arc<dyn cwoffee_engine::provider::Provider>,
+            cwoffee_engine::tools::Registry::new(),
+            Arc::clone(&store) as Arc<Store>,
+            cwoffee_engine::host::HostConfig::new("m", std::env::temp_dir()),
+        ));
+        (handle_with(host as Arc<dyn HostOps>, store.clone() as Arc<dyn StoreOps>), p, store)
+    }
+
+    /// A phone that presses Enter while the model is answering: the press goes into the turn, and
+    /// the answer the phone gets back is the pending item — its id is the handle for taking it back,
+    /// and its kind is the promise the composer announced. Watch tokens cannot do this: steering
+    /// changes what the model is told, which is a drive ask.
+    #[tokio::test]
+    async fn a_phone_can_steer_a_running_turn_and_a_watch_tab_cannot() {
+        let (h, provider, _store) = slow_handle(std::time::Duration::from_millis(600));
+        let idle = call(&h, "steer_turn", json!({ "text": "typed too early", "session": 0 }), Role::Drive).await;
+        assert_eq!(idle["ok"].as_bool(), Some(false), "{idle}");
+        assert!(
+            idle["error"].as_str().unwrap_or("").contains("nothing is running"),
+            "an idle steer refused with something else: {idle}"
+        );
+
+        h.host.send_turn_to("write the note".into(), vec![], None);
+        for _ in 0..200 {
+            if h.host.state().busy {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(h.host.state().busy, "the turn never started");
+        let sid = h.host.state().session_id;
+
+        let refused = call(&h, "steer_turn", json!({ "text": "watcher's press", "session": sid }), Role::Watch).await;
+        assert_eq!(refused["ok"].as_bool(), Some(false), "a watch tab steered: {refused}");
+
+        let queued = call(&h, "steer_turn", json!({ "text": "make it shorter", "session": sid }), Role::Drive).await;
+        assert_eq!(queued["ok"].as_bool(), Some(true), "{queued}");
+        let d = &queued["data"];
+        assert_eq!(d["text"].as_str(), Some("make it shorter"));
+        assert_eq!(d["kind"].as_str(), Some("steer"), "the composer announces steer by default: {d}");
+        assert!(d["id"].as_u64().unwrap_or(0) > 0, "no id to withdraw by: {d}");
+
+        let listed = call(&h, "queue_state", json!({}), Role::Watch).await;
+        let items = listed["data"].as_array().cloned().unwrap_or_default();
+        assert_eq!(items.len(), 1, "a watch tab could not see what is waiting: {listed}");
+
+        for _ in 0..400 {
+            if h.host.state().turns >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the steered turn made {} request(s), not two", seen.len());
+        assert!(seen[1].contains("make it shorter"), "the model never received the phone's steer");
+        assert!(!seen[0].contains("make it shorter"));
+    }
+
+    /// The address assertion is carried through, not dropped at the wire: a stale phone tab that
+    /// thinks it is on another conversation is refused rather than appending to the desktop's turn.
+    #[tokio::test]
+    async fn a_stale_phone_tab_is_refused_a_steer_rather_than_given_the_hosts_turn() {
+        let (h, _provider, _store) = slow_handle(std::time::Duration::from_millis(1500));
+        h.host.send_turn_to("desktop question".into(), vec![], None);
+        for _ in 0..200 {
+            if h.host.state().busy {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let here = h.host.state().session_id;
+        let other = h.store.create_session("elsewhere", "/tmp/elsewhere", "m").unwrap();
+        let out = call(&h, "steer_turn", json!({ "text": "aimed somewhere else", "session": other }), Role::Drive).await;
+        assert_eq!(out["ok"].as_bool(), Some(false), "{out}");
+        let err = out["error"].as_str().unwrap_or("");
+        assert!(err.contains(&format!("conversation {other}")), "{err}");
+        assert!(err.contains("cannot move the host"), "{err}");
+        assert_eq!(h.host.state().session_id, here, "the refusal moved the host");
+        assert!(h.host.queue_state().is_empty(), "the refusal queued a message anyway");
+    }
+
+    /// Withdrawal is addressed by cwoffee's id, and an id that is no longer waiting answers in the
+    /// words that say so — never with a success that removed nothing.
+    #[tokio::test]
+    async fn withdrawing_an_id_that_is_not_waiting_says_it_removed_nothing() {
+        let (h, _provider, _store) = slow_handle(std::time::Duration::from_millis(1500));
+        h.host.send_turn_to("write the note".into(), vec![], None);
+        for _ in 0..200 {
+            if h.host.state().busy {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let sid = h.host.state().session_id;
+        let queued = call(&h, "steer_turn", json!({ "text": "take me back", "session": sid }), Role::Drive).await;
+        let id = queued["data"]["id"].as_u64().unwrap_or_else(|| panic!("the queued item carries no id: {queued}"));
+        let back = call(&h, "withdraw_steer", json!({ "id": id as i64 }), Role::Drive).await;
+        assert_eq!(back["ok"].as_bool(), Some(true), "{back}");
+        assert_eq!(back["data"]["text"].as_str(), Some("take me back"));
+        assert!(h.host.queue_state().is_empty());
+        let again = call(&h, "withdraw_steer", json!({ "id": id as i64 }), Role::Drive).await;
+        assert_eq!(again["ok"].as_bool(), Some(false), "{again}");
+        assert!(again["error"].as_str().unwrap_or("").contains("no longer in the queue"));
+        let watch = call(&h, "withdraw_steer", json!({ "id": 1 }), Role::Watch).await;
+        assert_eq!(watch["ok"].as_bool(), Some(false), "a watch tab took a message back: {watch}");
+    }
+
+    /// One setting, one home: the choice is the host's, the wire refuses a word that is not a
+    /// promise, and the composer reads the answer back from the state rather than from its own guess.
+    #[tokio::test]
+    async fn the_mid_turn_choice_is_the_hosts_answer_and_a_strange_word_is_refused() {
+        let (h, _provider, _store) = slow_handle(std::time::Duration::from_millis(50));
+        assert_eq!(h.host.state().mid_turn, cwoffee_engine::steer::MidTurn::Steer);
+        let bad = call(&h, "set_mid_turn", json!({ "kind": "interrupt" }), Role::Drive).await;
+        assert_eq!(bad["ok"].as_bool(), Some(false), "{bad}");
+        assert!(bad["error"].as_str().unwrap_or("").contains("steer"), "{bad}");
+        let ok = call(&h, "set_mid_turn", json!({ "kind": "follow_up" }), Role::Drive).await;
+        assert_eq!(ok["data"].as_str(), Some("follow_up"), "the wire says the same word the config file and pi do: {ok}");
+        assert_eq!(h.host.state().mid_turn, cwoffee_engine::steer::MidTurn::FollowUp);
+        let watch = call(&h, "set_mid_turn", json!({ "kind": "steer" }), Role::Watch).await;
+        assert_eq!(watch["ok"].as_bool(), Some(false), "a watch tab changed the promise: {watch}");
+    }
+
+    /// The palette is one stored value with two homes, and a phone has to be able to tell them
+    /// apart: `set_theme` writes the host's file (drive-only), and `theme_words` answers what *this*
+    /// tab is showing without being allowed to change what anybody else shows.
+    #[tokio::test]
+    async fn the_stored_palette_is_the_hosts_and_a_watch_tab_can_only_ask() {
+        let (h, _provider, _store) = slow_handle(std::time::Duration::from_millis(20));
+        assert_eq!(h.host.state().theme, cwoffee_engine::theme::Theme::System);
+        let bad = call(&h, "set_theme", json!({ "kind": "midnight" }), Role::Drive).await;
+        assert_eq!(bad["ok"].as_bool(), Some(false), "{bad}");
+        assert!(bad["error"].as_str().unwrap_or("").contains("light, dark or system"), "{bad}");
+        let ok = call(&h, "set_theme", json!({ "kind": "light" }), Role::Drive).await;
+        assert_eq!(ok["data"].as_str(), Some("light"), "the wire says the config file's word: {ok}");
+        assert_eq!(h.host.state().theme, cwoffee_engine::theme::Theme::Light);
+        let watch = call(&h, "set_theme", json!({ "kind": "dark" }), Role::Watch).await;
+        assert_eq!(watch["ok"].as_bool(), Some(false), "a watch tab repainted every surface: {watch}");
+        assert_eq!(h.host.state().theme, cwoffee_engine::theme::Theme::Light, "and it did not even write it");
+
+        // The override is an argument for the sentence, never a write: a tab that says "dark here"
+        // must leave the host's stored value where it was.
+        let words = call(&h, "theme_words", json!({ "window": "dark" }), Role::Watch).await;
+        let says = words["data"].as_str().unwrap_or("");
+        assert!(says.contains("dark here as an override"), "{says}");
+        assert!(says.contains("still stores light"), "{says}");
+        assert_eq!(h.host.state().theme, cwoffee_engine::theme::Theme::Light);
+        let plain = call(&h, "theme_words", json!({}), Role::Watch).await;
+        assert!(plain["data"].as_str().unwrap_or("").contains("no override in this window"), "{plain}");
+    }
+
+    /// A press typed against an idle host must say what to do instead, over the wire and on both
+    /// sides of it: "nothing is running" alone leaves the words in the box with no way forward.
+    #[tokio::test]
+    async fn an_idle_steer_names_the_alternative_rather_than_dropping_the_words() {
+        let (h, _provider, _store) = slow_handle(std::time::Duration::from_millis(20));
+        let out = call(&h, "steer_turn", json!({ "text": "hello?" }), Role::Drive).await;
+        let err = out["error"].as_str().unwrap_or("");
+        assert!(err.contains("nothing is running"), "{err}");
+        assert!(err.contains("send it as a message"), "{err}");
     }
 }

@@ -89,6 +89,7 @@ pub fn fake_turn<F: FnMut(EngineEvent)>(turn_id: u64, script: &FakeScript, mut e
             ok: true,
             exit_code: Some(0),
             changes: Vec::new(),
+            checkpoints: Vec::new(),
         });
     }
 

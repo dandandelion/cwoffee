@@ -6,6 +6,7 @@
 //! model to emit a call it shouldn't.
 
 pub mod ask;
+pub mod browser;
 pub mod changes;
 pub mod discover;
 pub mod docs;
@@ -81,6 +82,14 @@ pub struct CallRisk {
     pub level: Risk,
     /// Absolute, already-resolved paths outside the workspace this call needs.
     pub escapes: Vec<String>,
+    /// True when a grant remembered for the conversation must not cover *this* call.
+    ///
+    /// `exec` does not set it: its reach is the workspace plus the sandbox, and "yes to exec for
+    /// this conversation" is a decision a person can make once and mean. An MCP server's reach is
+    /// whatever that program can do — outside the workspace, outside the sandbox, outside
+    /// anything cwoffee described — so remembering one yes for it would turn a single click into
+    /// standing access to a third party's privileges.
+    pub per_call: bool,
 }
 
 impl CallRisk {
@@ -88,7 +97,7 @@ impl CallRisk {
         Self::default()
     }
     pub fn at(level: Risk) -> Self {
-        Self { level, escapes: Vec::new() }
+        Self { level, escapes: Vec::new(), per_call: false }
     }
 }
 
@@ -115,6 +124,17 @@ pub struct ToolResult {
     /// just wrote is the most expensive possible thing to put back in a prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<changes::FileChange>,
+    /// What this call copied before it overwrote, so the turn can be undone. UI metadata
+    /// on the same footing as `files` and `changes` — a snapshot is not a prompt input, and
+    /// its path and hash would be prompt bytes if it travelled with the output.
+    ///
+    /// The tool fills it because the tool is the only thing that saw the file a moment
+    /// before it wrote over it. The **host** turns marks into index rows, because the tool
+    /// does not know which turn is running; that split is what makes the same code cover a
+    /// tool call executed in-process by the Rust core and one executed by `cwtool` on the
+    /// pi core.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<crate::checkpoint::Mark>,
     /// Tools this call made available to the model, named by the registry that owns them.
     /// Only `explore` fills this, and it never reaches the model as text: the extension reads
     /// it to widen the declared tool set, and the transcript card can show what the call
@@ -122,6 +142,16 @@ pub struct ToolResult {
     /// process happens to be hosting the model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activates: Vec<String>,
+    /// Pictures this call wants the **model** to see, as opposed to `files`, which is a
+    /// note for the front end. Only a tool whose host has confirmed that the conversation's
+    /// model takes image input fills this, and the tool that filled it says so in `output`
+    /// rather than leaving the model to wonder whether the picture arrived.
+    ///
+    /// A screenshot is the most expensive thing a tool result can carry into every later
+    /// prompt of the session, which is why it is opt-in per call and per model rather than
+    /// a thing the transcript does whenever a browser runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::provider::Attachment>,
 }
 
 /// A file the agent produced, described for the UI rather than the model.
@@ -139,6 +169,21 @@ pub struct OutputFile {
     /// renderer from a filename.
     #[serde(default)]
     pub kind: FileKind,
+    /// Did this turn *make* the file, as opposed to changing one that was already there?
+    ///
+    /// The transcript needs the fact rather than a guess from a name, because the two want
+    /// different shapes: a file the turn created is something it produced — a card you can
+    /// open — while a file it edited on the way through a codebase is one of many changes and
+    /// belongs in a list. A report that a workspace-root file had been "attached" was really
+    /// this fact missing: the row said only `edit`, so nothing could tell "made this" from
+    /// "touched this", and the renderer was left to read a label as a promise.
+    ///
+    /// It says nothing about hand-over. Only `.cws/assistant_attachments/` is handed over
+    /// (see [`FileKind::Attachment`] and `scratch::attachment_path`); a created file outside
+    /// it is a card with no Save control — a thing you can open, not a thing the model offered
+    /// to copy somewhere you choose.
+    #[serde(default)]
+    pub created: bool,
 }
 
 /// Which kind of file this is, from the reader's point of view.
@@ -249,7 +294,17 @@ impl OutputFile {
             mime: mime_for(path).to_string(),
             bytes,
             kind: kind_for(path),
+            // A path alone cannot say. The tool that looked at the disk first calls
+            // `with_created`; leaving this false is the honest default.
+            created: false,
         }
+    }
+
+    /// Record whether this write made the file. Called only by tools that checked the disk
+    /// before writing, because that is the one place the fact exists.
+    pub fn with_created(mut self, created: bool) -> OutputFile {
+        self.created = created;
+        self
     }
 
     /// A file that arrived from outside the workspace. Its name comes from a URL
@@ -262,6 +317,8 @@ impl OutputFile {
             mime,
             bytes,
             kind: FileKind::Artifact,
+            // A file that arrived from a URL is a file this turn made.
+            created: true,
         }
     }
 }
@@ -309,7 +366,9 @@ impl ToolResult {
             error: None,
             files: Vec::new(),
             changes: Vec::new(),
+            checkpoints: Vec::new(),
             activates: Vec::new(),
+            images: Vec::new(),
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
@@ -322,8 +381,16 @@ impl ToolResult {
             error: Some(m),
             files: Vec::new(),
             changes: Vec::new(),
+            checkpoints: Vec::new(),
             activates: Vec::new(),
+            images: Vec::new(),
         }
+    }
+
+    /// Record what this call captured. Returns self, same as `with_file`.
+    pub fn with_checkpoint(mut self, m: crate::checkpoint::Mark) -> Self {
+        self.checkpoints.push(m);
+        self
     }
 
     /// Attach a produced file. Returns self so call sites read in one chain.
@@ -379,15 +446,45 @@ pub struct ToolCtx {
     /// simply wrong — the descriptions of `web_search` and `exec` are built from these.
     pub search_backend: web::SearchBackend,
     pub exec_cfg: ExecCfg,
+    /// Whether this host keeps turn checkpoints at all.
+    ///
+    /// Off is not a failure: a probe, an example, and a tool host that was never told
+    /// where the database lives all run file calls with nobody able to revert them. The
+    /// mark then says so on the card rather than claiming a turn is undoable.
+    ///
+    /// It is a flag and not a directory, because the directory is derived from
+    /// `workspace`, and a workspace can move (`SetWorkspace`) while the context lives.
+    pub checkpoint_store: bool,
     /// Paths outside the workspace the **user approved for this one call**.
     /// Rebuilt per call by the agent loop; never inherited by the next call, and
     /// never widened by a session-level "allow for session" answer.
+    /// The browser this host can offer: where the driver is, which node runs it, and
+    /// whether the model in this conversation can see images. The last one is a host fact,
+    /// not a prompt fact: whether a window is worth painting on a person's desktop is not
+    /// something the model gets to decide about a person's screen.
+    pub browser: browser::BrowserCfg,
+    /// The **kept** browser, if this app has one: the browser behind the window's sidebar,
+    /// which a person can see and a person can open. `None` means there is no such thing
+    /// here — a probe, an example, a host that mounted no hub — and then `browse` with
+    /// `session: true` says that, in words, instead of quietly opening a second browser.
+    pub browser_route: Option<browser::BrowserRoute>,
     pub permits: Vec<std::path::PathBuf>,
+    /// Tools that exist in this host and are not declared to the model yet — third-party MCP
+    /// tools, waiting for `explore` to name them.
+    ///
+    /// The agent fills this from its own registry on every round-trip rather than letting
+    /// `explore` rebuild a registry. `explore` used to construct one from the config to get the
+    /// exec and search policy right, and a rebuilt registry cannot contain a tool the running
+    /// host registered at startup: an answer of "no MCP server is running" from a host that has
+    /// one running is not a search miss, it is a lie about the app.
+    pub lazy_tools: Vec<LazyTool>,
 }
 
 impl Default for ToolCtx {
     fn default() -> Self {
         Self {
+            browser: browser::BrowserCfg::default(),
+            browser_route: None,
             workspace: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             max_output_bytes: 32 * 1024,
             ask: None,
@@ -399,7 +496,51 @@ impl Default for ToolCtx {
             search_backend: web::SearchBackend::DuckDuckGo,
             exec_cfg: ExecCfg::default(),
             session: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             permits: Vec::new(),
+        }
+    }
+}
+
+impl ToolCtx {
+    /// Where this host's copies live, derived from the workspace it is confined to.
+    ///
+    /// Derived rather than stored: `SetWorkspace` moves the folder a running host works
+    /// in, and copies taken under the old one would otherwise keep being written into a
+    /// folder nobody is reading any more.
+    pub fn snapshot_dir(&self) -> Option<std::path::PathBuf> {
+        self.checkpoint_store.then(|| crate::checkpoint::snapshot_dir(&self.workspace))
+    }
+
+    /// What is on `path` at this moment, as a checkpoint needs it read.
+    ///
+    /// Call this **before** the mutation. A file tool that captured afterwards would be
+    /// copying its own output, which is a checkpoint that reverts to the same file.
+    pub fn pre_state(&self, path: &std::path::Path) -> crate::checkpoint::PreState {
+        crate::checkpoint::PreState::of(path)
+    }
+
+    /// Attach the checkpoint mark for a call that wrote `path`, if the host keeps copies.
+    ///
+    /// Only a successful call is marked: a call that failed has not made the change the
+    /// person would want undone, and offering a revert for it would count a file as
+    /// touched when it was not.
+    pub fn stamp_checkpoint(
+        &self,
+        res: ToolResult,
+        path: &std::path::Path,
+        pre: &crate::checkpoint::PreState,
+    ) -> ToolResult {
+        if !res.ok {
+            return res;
+        }
+        let after = crate::checkpoint::read_bytes(path);
+        match crate::checkpoint::capture(self.snapshot_dir().as_deref(), &self.workspace, path, pre, after.as_deref()) {
+            Some(m) => res.with_checkpoint(m),
+            // Outside the workspace: `resolve` would refuse it on the way back, so there
+            // is no undo to promise and no mark to show.
+            None => res,
         }
     }
 }
@@ -439,6 +580,30 @@ pub trait Tool: Send + Sync {
     fn host_questions(&self, _args: &Value) -> Option<Result<Vec<ask::Question>, String>> {
         None
     }
+
+    /// Who provides this tool, when it is not cwoffee. Shown on the discovery card and the
+    /// approval card, because "a program the user installed" is a fact a reader needs before
+    /// allowing a call — and it is not recoverable from a description the server wrote.
+    fn source(&self) -> Option<String> {
+        None
+    }
+}
+
+/// A tool that exists here and has not been declared to the model, described for a search.
+///
+/// `risk` travels with it because a search that asks the registry about a hidden tool gets
+/// `Risk::default()` back, and the default is `Harmless` — the one answer a third-party tool
+/// must never receive. The `from` line is shown on the card for the same reason the approval
+/// card names a program: a reader cannot otherwise tell cwoffee's `read_file` from a server's.
+#[derive(Debug, Clone)]
+pub struct LazyTool {
+    pub name: String,
+    pub description: String,
+    pub schema: Value,
+    pub risk: Risk,
+    /// `None` for a first-party tool lean mode is withholding; `Some` for a tool that came from
+    /// somewhere else, named.
+    pub from: Option<String>,
 }
 
 /// Exec knobs that come from config. Kept separate from ExecTool so the registry
@@ -470,6 +635,14 @@ pub struct Registry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
     search: Option<Arc<web::WebSearchTool>>,
+    /// Registered but not declared: third-party tools waiting for `explore` to name them.
+    ///
+    /// This is a second reason a tool is absent from `defs()`, kept separate from lean mode's
+    /// "the config withholds it" because the two answer differently: a lean-withheld first-party
+    /// tool is *already callable* (only its declaration is withheld, and that is what pi's
+    /// loadout does), while an unrevealed MCP tool is not callable at all — a tool from someone
+    /// else's program should not be reachable by a name the model guessed.
+    hidden: std::collections::HashSet<String>,
 }
 
 impl Registry {
@@ -503,6 +676,20 @@ impl Registry {
     /// its own defaults and the user's timeout and sandbox settings would be
     /// silently ignored.
     pub fn with_v1_tools_exec(search: web::SearchBackend, exec: ExecCfg) -> Self {
+        Self::with_v1_tools_browser(search, exec, None)
+    }
+
+    /// The same list, plus the browser when this start can offer one.
+    ///
+    /// Gated rather than always mounted: `browse`'s schema is ~1.1 KB of every prompt, and a
+    /// machine with no Playwright driver would pay that to be told "not installed" on the one
+    /// turn the model tries it. A start that *has* a driver mounts it, and the settings page
+    /// says which kind of start this is.
+    pub fn with_v1_tools_browser(
+        search: web::SearchBackend,
+        exec: ExecCfg,
+        browser: Option<browser::BrowserCfg>,
+    ) -> Self {
         let mut r = Self::new();
         // Built from ExecCfg, so a `[sandbox]` key cannot be parsed, validated and
         // then silently dropped on the way into the tool.
@@ -546,6 +733,16 @@ impl Registry {
         // stops declaring all of it. Both are cheap enough to declare in every mode - see
         // `lean_tool_names`, where the price of always being declared is asserted.
         r.register(Box::new(discover::ExploreTool));
+        // Appended last, and only when the host can actually open a browser: the tool is a
+        // suffix in the prompt order like every other addition, and a start without the
+        // driver simply does not pay for it.
+        if browser.is_some() {
+            r.register(Box::new(browser::BrowseTool));
+            // The other half of the same promise: `browse` puts the model inside a page, this reads
+            // what the page said while nobody was looking at it. Registered together, because a
+            // host that can open a page can also have collected what that page printed.
+            r.register(Box::new(browser::PageLogTool));
+        }
         r
     }
 
@@ -575,6 +772,11 @@ impl Registry {
             .collect()
     }
 
+    /// Every name this registry knows, declared or not.
+    pub fn all_names(&self) -> Vec<String> {
+        self.order.clone()
+    }
+
     pub fn register(&mut self, t: Box<dyn Tool>) {
         let n = t.name().to_string();
         self.tools.insert(n.clone(), Arc::from(t));
@@ -587,6 +789,94 @@ impl Registry {
         let n = t.name().to_string();
         self.tools.insert(n.clone(), t);
         self.order.push(n);
+    }
+
+    /// Register a tool that exists but is not declared to the model yet.
+    ///
+    /// Appended to `order` like every other tool, because the order of *declared* tools is
+    /// prefix-cache bytes and a revealed tool must land in the position it was registered in,
+    /// not at the end of the list each time one is discovered.
+    pub fn register_lazy(&mut self, t: Arc<dyn Tool>) {
+        let n = t.name().to_string();
+        self.tools.insert(n.clone(), t);
+        self.order.push(n.clone());
+        self.hidden.insert(n);
+    }
+
+    /// Names that exist and are still waiting to be named to the model.
+    pub fn lazy_names(&self) -> Vec<String> {
+        self.order.iter().filter(|n| self.hidden.contains(n.as_str())).cloned().collect()
+    }
+
+    pub fn is_lazy(&self, name: &str) -> bool {
+        self.hidden.contains(name)
+    }
+
+    /// Declare a hidden tool. True if it was hidden and is now declared.
+    pub fn reveal(&mut self, name: &str) -> bool {
+        self.hidden.remove(name)
+    }
+
+    /// Drop third-party tools the hub no longer offers, and say which ones went.
+    ///
+    /// A server removed from the config stops being a source of tools, but the handles registered for
+    /// it in a running session stay where the model can name them until the next start: it could ask
+    /// for `mcp__jira__create`, be shown an approval card for a program that is no longer configured,
+    /// and be refused only by the hub. That is a card for something that cannot happen.
+    ///
+    /// The `mcp__` prefix is the whole point of the filter: this function cannot take a first-party
+    /// tool away, whatever name set it is handed, because a first-party tool is not the hub's to
+    /// offer. `offered` comes from `Hub::catalog`, which is the same list the env block is built
+    /// from — the hub is the authority on what exists, and a second reader of the config file in this
+    /// loop could disagree with it about what was just written.
+    pub fn forget_stale_mcp(&mut self, offered: &std::collections::HashSet<String>) -> Vec<String> {
+        let stale: Vec<String> = self
+            .tools
+            .keys()
+            .filter(|n| n.starts_with("mcp__") && !offered.contains(n.as_str()))
+            .cloned()
+            .collect();
+        for n in &stale {
+            self.tools.remove(n);
+            self.hidden.remove(n);
+            self.order.retain(|x| x != n);
+        }
+        stale
+    }
+
+    /// The hidden tools as a search can see them: name, description, schema, risk, provider.
+    ///
+    /// Risk comes off the tool rather than off the registry lookup, because the lookup's
+    /// default is `Harmless` and a hidden tool is exactly where a defaulted answer would be a
+    /// free pass for someone else's program.
+    pub fn lazy_views(&self) -> Vec<LazyTool> {
+        self.order
+            .iter()
+            .filter(|n| self.hidden.contains(n.as_str()))
+            .filter_map(|n| self.tools.get(n))
+            .map(|t| LazyTool {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                schema: t.schema(),
+                risk: t.risk(),
+                from: t.source(),
+            })
+            .collect()
+    }
+
+    /// Schemas of the hidden tools, in registration order — what `explore` searches when the
+    /// model asks for something the declared set cannot do.
+    pub fn lazy_defs(&self) -> Vec<crate::provider::ToolDef> {
+        self.order
+            .iter()
+            .filter(|n| self.hidden.contains(n.as_str()))
+            .filter_map(|n| self.tools.get(n))
+            .map(|t| crate::provider::ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.schema(),
+            })
+            .collect()
     }
 
     /// The search tool, typed. Switching providers at runtime goes through this
@@ -610,6 +900,7 @@ impl Registry {
     pub fn defs(&self) -> Vec<crate::provider::ToolDef> {
         self.order
             .iter()
+            .filter(|n| !self.hidden.contains(n.as_str()))
             .filter_map(|n| self.tools.get(n))
             .map(|t| crate::provider::ToolDef {
                 name: t.name().to_string(),
@@ -910,9 +1201,16 @@ mod cfg_tests {
             mime: "text/html".into(),
             bytes: 1,
             kind: FileKind::Attachment,
+            created: true,
         })
         .unwrap();
         assert!(wire.contains("\"kind\":\"attachment\""), "wire form: {wire}");
+        // The transcript reads `created` off this wire on both cores — the pi core's tools run
+        // in the tool host and their rows cross a process boundary — so a field that is not on
+        // the wire is a fact the UI cannot have, however correct the Rust side is.
+        assert!(wire.contains("\"created\":true"), "the created fact must be on the wire: {wire}");
+        let back: OutputFile = serde_json::from_str(&wire).unwrap();
+        assert!(back.created, "and it must survive the round trip");
     }
 
     /// Old rows have no kind. Defaulting them to Artifact or Edit would invent a
@@ -923,12 +1221,16 @@ mod cfg_tests {
         let old = r#"{"path":"notes/x.md","name":"x.md","mime":"text/markdown","bytes":12}"#;
         let f: OutputFile = serde_json::from_str(old).unwrap();
         assert_eq!(f.kind, FileKind::Unknown, "an unlabelled row claimed a kind");
+        // Same rule for the newer fact: a row written before `created` existed must not claim
+        // that a turn made a file it may merely have edited.
+        assert!(!f.created, "an unlabelled row claimed it made the file");
         let wire = serde_json::to_string(&OutputFile {
             path: "p.html".into(),
             name: "p.html".into(),
             mime: "text/html".into(),
             bytes: 1,
             kind: FileKind::Artifact,
+            created: true,
         })
         .unwrap();
         assert!(wire.contains("\"kind\":\"artifact\""), "wire form: {wire}");

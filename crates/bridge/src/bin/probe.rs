@@ -149,11 +149,25 @@ async fn run() -> anyhow::Result<()> {
         model_window: None,
         session_map: agent_dir.join("cwoffee-pi-sessions.json"),
         db_path: None,
+        // No hub for a probe: a tool call in this run reaches no server, and `cwtool` says so
+        // in words rather than reporting a server that is not there.
+        mcp_sock: None,
+        // No kept browser either: a probe has no window to show one in, and `cwtool` says in
+        // words that this run keeps none.
+        browser_sock: None,
         lean_tools: false,
         persona: cwoffee_engine::host::Persona::Cowork,
+        // A chat starts with no network reach; the composer's Web chip grants it per conversation.
+        web: false,
         cfg_path: None,
         max_tool_iters: 0,
         compact_timeout: std::time::Duration::from_secs(1800),
+        // A probe measures what pi answers, not what a person types during a turn; the default
+        // (steer) is what the product ships with, and nothing here presses Enter mid-turn.
+        mid_turn: cwoffee_engine::steer::MidTurn::default(),
+        // The palette is a cwoffee chrome fact, not a pi one: pi paints nothing. A probe still
+        // publishes the same field so the two cores answer the same question.
+        theme: cwoffee_engine::theme::Theme::default(),
     })
     .await?;
     println!("pi {} at {}", host.pi_version, pi_bin.display());
@@ -413,6 +427,9 @@ fn kind_name(e: &EngineEvent) -> String {
         EngineEvent::TurnEnd { .. } => "turnEnd",
         EngineEvent::Note { .. } => "note",
         EngineEvent::Error { .. } => "error",
+        EngineEvent::SteerLanded { .. } => "steerLanded",
+        EngineEvent::QueueChanged { .. } => "queueChanged",
+        EngineEvent::QueueReturned { .. } => "queueReturned",
     }
     .to_string()
 }

@@ -186,11 +186,13 @@ impl ApprovalGate {
         }
         // Session scope is honoured in both prompting modes: it is an explicit
         // user choice ("auto for session" in the composer), not a mode setting.
-        // A session grant is about the *tool*, so it never covers an escape: the
-        // thing being agreed to there is a specific path, and remembering that
-        // for the rest of the session would turn one yes into unlimited access
-        // outside the workspace.
-        if self.session_allowed.contains(tool) && risk.escapes.is_empty() {
+        // Two things it never covers. An escape is one of them: the thing being
+        // agreed to there is a specific path, and remembering that for the rest
+        // of the session would turn one yes into unlimited access outside the
+        // workspace. The other is a call a tool marks `per_call` — MCP calls do,
+        // because a grant remembered for `exec` is a grant about the workspace,
+        // and a server's reach is whatever its own program can do.
+        if self.session_allowed.contains(tool) && risk.escapes.is_empty() && !risk.per_call {
             return GateOutcome::Allow;
         }
 
@@ -329,6 +331,14 @@ fn deny_at(hay: &str, needle: &str) -> bool {
 /// "allow reading /home/me/.ssh/id_ed25519?" can.
 pub fn summarize_with(tool: &str, args: &serde_json::Value, escapes: &[String]) -> String {
     let base = summarize(tool, args);
+    // A third-party call leads with whose program is about to run. The name is the namespace
+    // (`mcp__<server>__<tool>`), but a person reading `mcp__jira__create_issue` should not have
+    // to decode a naming scheme to learn that a program they installed is being asked to act —
+    // and this is the one place both transports render the same sentence.
+    let base = match crate::mcp::server_of(tool) {
+        Some(server) => format!("MCP server {server}: {base}"),
+        None => base,
+    };
     if escapes.is_empty() {
         return base;
     }
@@ -393,6 +403,44 @@ pub fn summarize(tool: &str, args: &serde_json::Value) -> String {
             "fetch: {}",
             crate::tools::repair::field_as_string(args, "url").unwrap_or_else(|| "???".into())
         ),
+        // A browser call gets its own sentence, on purpose. The fallback prints the argument
+        // blob, which for `browse` is a URL and up to forty steps of JSON — the part a person
+        // has to weigh is *which page*, and whether the browser **stays open afterwards in
+        // their own window**. The second fact is the one that changes the answer, and it is
+        // invisible in a blob.
+        "browse" => {
+            let url = crate::tools::repair::field_as_string(args, "url").unwrap_or_else(|| "(no page named)".into());
+            let steps: Vec<String> = args
+                .get("steps")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|st| {
+                            let what = st.get("do").and_then(|d| d.as_str()).unwrap_or("?");
+                            match st.get("target").and_then(|t| t.as_str()) {
+                                Some(t) if !t.is_empty() => format!("{what} \"{t}\""),
+                                _ => what.to_string(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut walk = String::new();
+            if !steps.is_empty() {
+                let shown = steps.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+                let more = if steps.len() > 4 { format!(", +{} more", steps.len() - 4) } else { String::new() };
+                walk = format!(" — then {shown}{more}");
+            }
+            if args.get("session").and_then(|v| v.as_bool()) == Some(true) {
+                format!(
+                    "open {url} in cwoffee's KEPT browser{walk}: this browser stays open in the \
+                     person's sidebar afterwards, and the call clicks inside a browser that may \
+                     be theirs"
+                )
+            } else {
+                format!("open {url} in a throwaway browser{walk}, which closes when the call ends")
+            }
+        }
         other => {
             let s = serde_json::to_string(args).unwrap_or_default();
             let s: String = s.chars().take(120).collect();
@@ -589,6 +637,7 @@ mod tests {
         let esc = CallRisk {
             level: Risk::Sensitive,
             escapes: vec!["/home/me/.ssh/id_ed25519".into()],
+            per_call: false,
         };
         let out = {
             let (mut otx, mut orx) = mpsc::unbounded_channel();

@@ -768,6 +768,8 @@ dependencies = [
  "cwoffee-bridge",
  "cwoffee-engine",
  "cwoffee-gateway",
+ "dpi",
+ "gtk",
  "serde",
  "serde_json",
  "tauri",
@@ -776,6 +778,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tokio",
  "url",
+ "wry",
 ]
 
 [[package]]
@@ -807,6 +810,7 @@ dependencies = [
  "rust_xlsxwriter",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "toml 0.8.2",
@@ -836,6 +840,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "cwoffee-engine",
+ "libc",
  "ratatui",
  "tokio",
 ]

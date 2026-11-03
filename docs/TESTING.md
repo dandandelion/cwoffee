@@ -31,6 +31,11 @@ mock logs every prompt it serves, so you can watch what the engine actually sent
 | Types | `cd ui && npx svelte-check --workspace . --threshold error` | none | the UI compiles against the event wire types |
 | In-app harness | `./scripts/selftest.sh`, or `./scripts/selftest.sh cup code` for one group | **scripted HTTP** | the real webview: reveal, commit, follow, markdown mid-stream, cards, popovers, sessions, gateway |
 | Gateway | `node scripts/gateway-smoke.mjs` | none | auth, roles, workspace rules, boot shape from a phone |
+| The kept browser, in the window | `./target/debug/cwoffee-app --page-probe` (or release) | a display, and this app's own WebKit | no harness: the app opens a page in its own window, asks for a rectangle, and refuses to go on until the widget's **allocation** matches that box — then drives it (open / click / eval / state / frame refused because the page is already on screen / diagnostics / a11y) and walks a second address in the same document, back, and a reload that must not count as a second page. Prints the fixed's real geometry and each child's allocation when a check fails. A step that clicks a link is graded too: the reply has to say it navigated, with the address it left and the one it arrived at, and the page's *own* copy of the address has to agree. The probe writes its page into the folder the conversation is in **now** — the folder the page box confines local pages to — because writing it into the boot folder would grade a guard that refuses a page it should allow. The run registers a scratch folder, so it also proves the other half — `prune_dead_workspaces` at boot forgets registered folders that are gone and hold no sessions, or fourteen probe runs leave a sidebar full of `ws` rows nobody added |
+| The kept browser, live | `node scripts/browser-live-probe.mjs` | **a real Chromium** (Playwright's, already installed for `browser/`) | the built UI bundle over a stubbed Tauri IPC whose browser verbs are answered by the **real** driver process: a page repainting on its own repaints the panel's picture, the picture in the panel is the browser's own pixels at the page's own size, a press on the picture of a known box arrives at that box's page point, the column spans the window's height and the picture area takes the slack, full window reshapes the page to the box it is drawn in, hiding the panel stops the stream, and the idle clock is still on show through all of it. Fourteen claims; see `docs/BROWSER.md` |
+| The terminal itself | group `tui` of `./scripts/selftest.sh`, or `node scripts/tui-gate.mjs` through `cargo-guard` | **scripted HTTP** | the built binary on its own pty: `/files` names a path, `/undo` leaves the file holding the words it held before (read off disk), `/branch` copies and hands the words back without sending, a press beside a live approval card queues and answers nothing, Stop returns the waiting words, `explore mcp:` answers from the store, and `/mcp` reports the hub and the dead server |
+| The light palette | group `theme`, run twice — once per palette (`--theme light`) | **scripted HTTP** | the stored value reaches `config.toml` and the host payload, a window override says the word and rewrites nothing, and every floating surface is graded in both palettes by separation *and* by ink-on-surface contrast |
+| The servers page | group `mcp-ui`, run twice — the board's env arm and the `mcp write` arm (`scripts/selftest.sh mcp`) | **scripted HTTP** | the door above Settings opens the page; the running list is counted against the hub and the file list against the file; an environment-supplied list makes every control `disabled` and says why; in the write arm a server is added, switched off, back on and removed, with each step graded in the host's own `config.toml` **and** in the hub, and its tools withheld from the model throughout |
 | Gateway outliving the window | `node scripts/gateway-handoff.mjs` | **scripted HTTP** | the "keep devices working after this window closes" promise: the standalone gateway takes the port after the app exits, authenticates from the token file (never from argv), gets the session's config/data/state and the pi extension in its unit environment, and the stop sentence the app prints actually stops it. `--core pi`, `--lan`, `--app <installed binary>`; `--omit-ext` is the negative control that proves the environment check has teeth |
 | Search | `node scripts/search-smoke.mjs` | none (HTTP to the search provider) | provider switching and the managed SearXNG container |
 | Sandbox | `./scripts/sandbox-probe.sh` | none | bwrap still isolates after a kernel update |
@@ -212,6 +217,85 @@ cwoffee-app`) before restarting the app.
    claim too — `[sampling]` being off by default is only verifiable if a test can see that no
    key was sent.
 
+## Scripted scenarios: the mock matches the newest message first, so every prompt needs its own
+
+`scenarioFor` walks the conversation's user messages newest-first and serves the first scenario
+whose `match` phrase appears in one. The fallback to older messages is load-bearing — the engine
+appends request-only control lines ("continue where you stopped", "you are out of tool budget") that
+no scenario names, and a matcher that looked only at the newest message would call a perfectly
+scripted turn unscripted.
+
+The fallback has a cost, and `composer-type` paid it: that group steers `What is 6 times 7?` into a
+running turn (spending that scenario's only step) and then, after the answer finished, types
+`answer in one line` and presses. Nothing matched the new words, so the mock fell back to the older
+ask in the same conversation, had no step 1 for it, and answered `400 EXHAUSTED`. The page reported a
+provider error, the group never reached its own assertions, and — because a fatal stops the pass —
+every group after it went unmeasured. The fix is a scenario for the second prompt
+(`one-line-answer`), not a change to the matcher.
+
+The rule for anyone adding a check: **if a group sends more than one prompt in one conversation, each
+prompt needs a scenario of its own**, even a one-line one. The mock's summary at the end of a run
+(`no unmatched prompts: every turn the harness sent had a scenario`) is the place that lies if you
+forget, because an older message matching by accident is not reported as a mismatch at all.
+
+A `match` phrase is a **substring test over every user message in the conversation**, newest-first,
+so it has to belong to exactly one group: a generic phrase like `answer in one line` can sit inside
+another group's prompt and silently answer that group's turn instead. No run has been bitten by that
+yet — the phrase was narrowed before any collision was observed — but the mock cannot report it,
+because a message that matches *some* scenario is not counted as a miss. `composer-type` now types
+`the line typed after the turn`, a phrase no other prompt in the suite contains.
+
+## Two checks that were holding the wrong handle, and what they said instead
+
+**The chrome rule measured two columns when the shell had three.** `chrome-height` asked how much
+window sat below "both the sidebar and the card", which was true of the shell until the browser
+panel arrived as a right-hand column: with a page on screen at the right, the card's 10px gutter was
+read as 43px of window "going to a gap". The rule now takes the bottom-most of *every* column
+(sidebar, card, `[data-browser-pane]`), says which column ends where when it complains, and the group
+opens the panel itself and re-measures — a column that stops short of the window's bottom edge is a
+column with dead paint under it, and that is only visible while the column is open. The group closes
+the panel again, because every later group measured its numbers without it.
+
+**`paste-send` pressed a chip that had already been replaced.** The check reopens a conversation,
+finds the pasted picture's chip and presses it, then waited on `chip.querySelector('img')` — on the
+node it had found. The view is painted from a store read, and a resync (`resync: conversation 53
+looked empty and was not`) can hand the row to a new element between finding it and pressing it: the
+picture then loads into the *live* chip while the check polls a detached one, and the failure claimed
+"the picture is in the record but unreachable from the transcript" — a capability gap that did not
+exist. It now re-queries the chip each attempt, re-presses against the live row, and reports
+`N press(es) on M chip instance(s)` so a genuine dead chip still reads as one.
+
+The underlying fact both checks tripped on is worth recording on its own account: on the Rust core,
+`session_messages(id)` has been read returning **0 rows for a conversation whose turn was in flight
+and had just finished** (`history: 0 row(s) for session 46`, `resync: conversation 53 looked empty and
+was not — 2 row(s) came back on read 2`). The page notices this and has two guards for it —
+`conversation N reads empty while its turn is in flight; keeping what is on screen`, and the resync
+that repaints when rows come back — so the person does not lose the answer. What it means for the
+board is that a check which queries the DOM once, a beat after a turn, is racing a read that has been
+seen to disagree with the host. Re-read, repaint, and look again before blaming the feature; and when
+the second look still says nothing, say which of the two it is (no card, or a record with no rows).
+
+Both are the same lesson: **a check that holds a handle to a painted thing is checking the paint
+cycle, not the feature.** Ask the live DOM what it holds, and put in the failure text what was seen
+(instances, presses, ends) so the next reader can tell a race from a hole.
+
+## A mid-turn press has two clocks, and one sample loses both
+
+`composer-type` presses Enter inside a running turn and used to decide four claims from one
+300 ms sample. It flipped, in different runs, in opposite directions:
+
+* the running turn **ended** inside the sample window, and the check read the host's `turns` counter
+  as "a second turn started" — but `turns` is one counter for the whole app (`state.turns += 1` at
+  turn end in `host.rs`), not per conversation, so any session finishing moves it;
+* the step boundary **took** the queued message before the sample ran, so the waiting line was
+  already gone and the press looked like a lost keystroke.
+
+The group now samples every 20 ms for 1.5 s and keeps what it saw, and it grades "not a second turn"
+off the transcript — a steer lands inside the running turn, so `document.querySelectorAll('.turn')`
+must not grow — rather than off a counter that measures something else. A check that reads a proxy
+for a fact is a check whose failure message is a guess: this one's failure text ("started a second
+turn instead of steering") described a bug that never happened.
+
 ## Scripted scenarios worth knowing about
 
 | scenario | what it forces, and the fault it pins |
@@ -225,6 +309,10 @@ cwoffee-app`) before restarting the app.
 | `sheet-query-csv` | the model writes a delimited file and then totals a column with `sheet_query`. `require` names the engine's own result grid (`West\t26`, the column list), so a query tool that ran but returned nothing useful fails the run. This is the gap that made a real session write a 111-line Python xlsx parser. |
 | `sheet-titled-header` | the model writes a file whose first two rows are a school name and a treasurer's name, then queries it. `require` pins `# header: sheet row 3` and the aggregate (`Books\t250`), so a detector that names columns from a title block - which is what made `sheet_query` useless on the user's real cash-flow workbook - fails the turn. |
 | `conversation-title` | the one-line ask the titler sends (`Title this conversation in under`), answered in 7-character chunks. Pins that the name is asked for in its own context before the answer, that it arrives in several paints rather than swapping in, and - because scenario selection is first `match` wins - that the title request is served by the title scenario even though the same turn later asks the mock a normal question. It is the first scenario in the file for that reason. |
+| `mcp-lazy` | explore → a third-party call → an answer that must quote the server's own words. `require` pins `MCP server fake`, `mcp__fake__write_note`, `wrote ` and the file name in the tool output the model actually saw, so a reveal that declared a name the model could not call, or a call that only produced a plausible card, fails the turn. |
+| `mcp-again` | the same third-party call a second time, after a grant was already given for the conversation. Step 2 requires nothing on purpose: this run's call is the one the check denies, so demanding the server's words here would make the endpoint refuse a turn whose job is to show a refusal. |
+| `mcp-dead` | one call into a server that answered `tools/list` and then exited. `require` pins `MCP server dead` in the tool result, so a call that hung on a closed pipe, or answered with an empty string, fails the turn instead of timing the run out. |
+| `mcp-none` | `explore` with `mcp:` when nothing is mounted — a run with `--no-mcp`, or a hub no tool process can reach. `require` pins `No MCP server is running`, so a `discover()` that rebuilt a registry from config and invented a catalog fails the turn. The harness configures two servers, so the group does not send this prompt; it stays for a run started without them. |
 | `long-turn-past-the-old-cap` | one turn that makes seventeen `read_file` calls and then answers. It cannot complete while any cap below 17 exists, which is exactly how its negative control fails (`only 14 read_file calls reached the transcript`). Also pins that an uncapped turn says once, at the iteration where the old build stopped, that it is uncapped. |
 
 Scenario selection is the `match` substring of the newest user message that has a
@@ -237,6 +325,365 @@ Control lines the engine appends to a request only ("continue where you stopped"
 "you have used up your tool budget") are deliberately not scenario anchors: the
 matcher walks back to the older user message that does match. A matcher that only
 looked at the newest message would report a perfectly scripted turn as unscripted.
+
+## Third-party servers: the fake is a real process, and the claims read the disk
+
+`cargo test -p cwoffee-engine --lib mcp::` also drives the hub's socket, because the pi core's calls
+go through it: one call down two roads must answer identically (a tool body with two arms is one
+behaviour), a server whose process went away must be described in the same sentence either way, a
+request that is not a tool call must be refused by name, a host that is gone must answer in words
+and in under two seconds, and a catalog reached over the socket must still declare nothing until it
+is named. Those tests run their client calls on the blocking pool, which is how `cwtool` uses them;
+running them inline on a single-threaded runtime would park the worker and measure a deadlock
+instead of the feature.
+
+`scripts/fake-mcp-server.mjs` is a stdio JSON-RPC server, not a stubbed client: cwoffee's MCP hub
+spawns it, handshakes it, and calls it over real pipes. It offers `t1..tN`, `boom` (an `isError`
+result), `write_note` (writes a real file), a tool whose name is not a valid tool name, and a block
+that is not text. Flags: `--tools N`, `--writes <dir>`, `--noise` (unrequested lines between
+answers), `--slow <ms>` (never answers), `--dialect <v>` (a protocol version it will not agree to),
+`--die`.
+
+`--die` exits immediately after `tools/list`, with no timer. A delay would let a fast machine win the
+race and report a dead server as live; the exit is what makes "the pipes are closed" deterministic.
+
+The selftest supplies its servers through `CWOFFEE_MCP_SERVERS`, never by writing a config it did not
+own: a run that put `[mcp]` into the reader's real config would leave that person's MCP servers changed
+after a green run. The variable also replaces the file's `[mcp.servers]` list wholesale, which makes the
+servers page read-only in the main run — exactly the state a window with an environment-supplied list
+has to be in, so the main run grades that refusal. The page's **write** path is graded by a separate
+launch (the `mcp write` arm of `scripts/selftest.sh`) whose servers come from a `config.toml` in a
+scratch home the run deletes: an environment arm cannot grade a write, because the file it would write
+is a file that start ignores. `--no-mcp` skips both, which is how the "nothing is running" claim is
+tested. Two servers are configured by default: `fake` (live, writes into the scratch workspace) and
+`dead` (answers the list, then exits).
+
+What the `mcp` group refuses to take on faith:
+
+- **Prompt cost, measured where the core can see it.** On the Rust core `tool_inventory` must show no
+  `mcp__` name in `declared` before anything is looked up, and must show `mcp__fake__t1` in `hidden`.
+  Leaking hidden tools into `Registry::defs()` fails as
+  `hidden MCP tools leaked into the declared list before anything asked: mcp__dead__t1, ...`. The pi
+  core decides its declared list inside the model process, so the same claim is graded on the wire
+  instead — `scripts/gateway-prompt-shape.mjs --core pi` reads the request bodies and fails on any
+  `mcp__` declaration before something asked for it, and on a `<mcp>` block over its ceiling or
+  missing altogether. The desktop group asserts the pi page prints the hub's catalog count rather
+  than a withheld list that core cannot observe.
+- **The catalog's arithmetic, not just its size.** The page's two numbers are compared against the
+  engine's own, and `catalog_bytes == catalog_body_bytes + catalog_lead_bytes` must hold; only the
+  body is held to the 1024-byte budget. An earlier version graded the whole block against the budget
+  and failed a correct engine: `the catalog costs 1051B against a 1024B budget`.
+- **The file, not the card.** After the approval is answered, the group reads `selftest_mcp_note.txt`
+  through the confined harness reader and requires the server's words in it. A tool result that only
+  looked right on screen fails as `the MCP call reported success but ... holds "nothing"`.
+- **The ask is per call.** The card's first answer is *Allow for session*, so the grant genuinely
+  exists; the second call must still ask. Setting `per_call: false` fails as
+  `the second MCP call ran without asking, after a yes for the same tool — a session grant covered a
+  third-party call`. Denying it must leave the file untouched.
+- **A dead server is a sentence, not a hang.** The call into the exited server must come back naming
+  that server within its timeout, and `mcp_status` must then report it as dead rather than keeping
+  the live status it earned at startup.
+- **What a core cannot see, it refuses to report.** On the pi core the same group asserts that
+  `tool_inventory` errors instead of answering with two empty lists — pi decides its declared list
+  inside the model process, and two zeroes would claim nothing is hidden about a thing this side
+  cannot observe. What it does assert positively is the road: `mcp_status.mounted` and the
+  `route` the settings page prints, which must name the app's hub rather than leave a reader to
+  infer that the tool host reaches it over a socket.
+- **The catalog reaches the model, on either core.** `mcp-lazy`'s `require` includes `<mcp>`, and
+  the mock endpoint checks `require` strings against the bytes the app actually sent. A pi-backed
+  run whose extension never asked the hub for the block fails that turn: the model would have no
+  way to know a server exists, and would answer from the config file it was never shown.
+
+## The servers page is graded as an actor, in two arms
+
+Group `mcp-ui` asks what happens when a person *uses* the page, and it is run twice because one launch
+cannot be in both states: the board's run supplies its servers through `CWOFFEE_MCP_SERVERS` (so the
+page must be read-only), and the `mcp write` arm launches a second window whose servers come from a
+`config.toml` in a scratch home (so the page may write).
+
+The write arm's servers are configured the way a person's are — a `[mcp.servers.fake]` table in
+`$XDG_CONFIG_HOME/cwoffee/config.toml`, inside a scratch home the run deletes — not by environment. That
+path matters: the file the app reads at boot is `$XDG_CONFIG_HOME/cwoffee/config.toml`, and a table
+written to `$XDG_CONFIG_HOME/config.toml` is a file nothing reads. The arm then boots with no servers
+while every settings save happily writes to the correct file, and the page's own check reports
+`no running server in the file to point a new entry at` — which reads like a broken page and is a broken
+arm.
+
+Both arms:
+
+- **The door's position is measured.** `compareDocumentPosition` against the Settings entry, not a
+  screenshot: `the MCP door is not above Settings in the sidebar footer`. And `aria-expanded` has to be
+  false before the press and true while the page shows — a door that lies about being open is the same
+  class of bug as a switch that lies about being on.
+- **The two lists are counted against two sources.** `[data-mcp-server]` rows against
+  `mcp_status.servers` (the hub), `[data-mcp-file]` rows against `mcp_status.file.servers` (the file).
+  A single merged list could pass a wrong answer twice; two counts cannot.
+- **The search is a lookup by tool name.** Searching `mcp__fake__t1` must leave exactly one running row,
+  and must add a file row only where the file actually lists that server — inventing a row for a server
+  that came from the environment would be inventing a config entry. A list filtered to nothing has to
+  say it was filtered: `an empty filtered list does not say it is filtered — it reads as "you have no
+  servers"`.
+
+The read-only arm (the board's own run, where `env_lists` is true and `writable` false):
+
+- the page must show the two servers that are running *while the file lists none*: a page that read the
+  file would report "nothing is configured" about servers that are answering right now;
+- the explanation must name `CWOFFEE_MCP_SERVERS`, not just say "read-only";
+- every switch, Edit and Remove on the rows, and the master switch, must be `disabled`, and there must
+  be **no** Add button — `the page offers to add a server to a file this start ignores`.
+
+The write arm:
+
+- **Add** writes the file the next start will read — graded by `selftest_config_text`, which returns the
+  host's *own* path, so the check cannot pass by writing a file it guessed at — and the page's sentence
+  must contain both halves: `written to [mcp.servers.uitest]` and `live (N tool(s))`. A file written
+  beside a program that failed to start is a visible failure, not a green row.
+- **The hub agrees** before the row counts: the new server must read `live` in `mcp_status.servers`, and
+  the running list must show the tool names it offered (`[data-mcp-tools-for]`), because "does it have a
+  write tool?" is not answerable from a count.
+- **Nothing is handed to the model.** On the Rust core, `tool_inventory` must show the new server's
+  names in `hidden` and none of them in `declared` — the whole economy of the feature, measured after a
+  mid-session add rather than only at boot: `adding a server declared its tools to the model without
+  anything asking for them`.
+- **A switch moves two things.** The file must hold `enabled = false` *under that server's table* (a
+  regex over the region, because `enabled` appears in three tables), and the hub must report
+  `off in config` with no tools attached.
+- **An edit keeps what the form never showed.** The row holds environment *names*; the Edit form
+  prefills bare names, and the check first fails if the form prefilled a value
+  (`the edit form prefilled a value (…) — this page does not hold values to show, and saving it back
+  would blank the token`) and then fails if saving an argument change wrote the key back empty
+  (`the edit wrote the environment key without the value the form never showed`). The file is read back
+  for both halves: the new argument line present, the old one gone, and `CWOFFEE_MCP_ARM = "1"` still
+  there. The hub has to say `live` afterwards — a changed command that leaves the program stopped is a
+  file write, not an edit.
+- **Remove needs two presses.** The first must put `armed` on the button, or the check fails with
+  `a single press would un-configure somebody else's program`. Afterwards the file mentions the name
+  nowhere — neither table — the hub has no such server, the withheld list has dropped its names, and the
+  file is back to the server count it started with: `the round trip left the config changed`. That third
+  fact is the one a config-only page would miss, and it is what `Registry::forget_stale_mcp` is for: a
+  server removed while the app runs must stop being callable **in the session that removed it**, not at
+  the next start.
+
+What neither arm claims: no phone is attached to this run, so the gateway's `writable: false` is graded
+by the engine's payload test over the wire (`status_payload` is built once for both transports), not by
+a device. The TUI's `/mcp` door stays read-only and says so in `docs/TUI.md`.
+
+## The browser: the endpoint counts the fetches, so a narrated run cannot pass
+
+`./scripts/selftest.sh browse` sends a real browser at a real page that the scripted endpoint itself
+serves (`GET /selftest-page.html`, plus the script it loads). The scenario `browse-page` has the
+model click a button and evaluate an inline script, and its `require` list makes the endpoint return
+400 unless the tool's own output contains:
+
+* the page's own title (`Cwoffee browse selftest`) — proof the DOM was read, not described;
+* `click "More" ok` — proof the walk happened in the page rather than in the tool's imagination;
+* `eval ok -> 5` — proof a value came back out of the page's JS environment;
+* `uncaught errors` and `Cannot read properties of undefined` — Chrome's own words for the error the
+  page's script throws on purpose, which no paraphrase produces.
+
+Then the check asks the endpoint `GET /selftest-hits`, which counts fetches of the page and its
+script. That counter is the part a tool that only *reported* a browser session cannot move, and it is
+why this group is not graded on the model's summary of the result.
+
+Two branches, both graded. If no driver is installed here, the group instead requires the settings
+line (`browser_status`) to say the tool is **not mounted** and to name both install commands
+(`npm --prefix browser install`, `npx playwright install chromium`) — so a machine without Playwright
+runs a real check rather than skipping, and a machine with one that failed to mount the tool fails.
+Nothing in the suite installs a browser: a ~150 MB download onto this machine is a decision a person
+makes by running a command.
+
+The mode claim is cross-checked, not restated: the card's `browser: headed (a real window)` /
+`browser: headless` must agree with what `browser_status` says this start will do for the model that
+is answering, because that is a claim about a window appearing on the user's desktop and two answers
+would mean two rules. The scenario's URL uses `$base`, which the mock fills with its own origin, so
+the URL stays true whatever `MOCK_PORT` is.
+
+Unit-level rules live in `cargo test -p cwoffee-engine --lib browser::` (the decision table, the
+absence of any `headed` argument, the `file://` confinement including a `file:///etc/hostname` that
+must stay outside, the no-driver answer carrying the fix, and the picture being withheld from a model
+that cannot look) and `provider::` (the picture's placement inside an Anthropic `tool_result` against
+a following `user` message on the OpenAI shape, and a picture-less tool result staying one message).
+`host::tests::the_browsers_mode_follows_the_config_row_and_not_the_boot_snapshot` is the timing case:
+the model row is written *after* the host is up (which is what a probe does), and the host's published
+`browser_vision` and the tool's copy must both move; then the model is switched to one recorded as
+text-only, and both must move back. A value read once at boot fails this test, which is how the
+feature's own selftest found it.
+
+## The kept browser: one page seen twice, and a clock that has to fire
+
+A kept browser is graded in **two shapes**, and a start is one shape or the other: the relayed
+picture column (`browser-panel`, `browser-idle`) and the page painted in this window
+(`browser-inpage`, which boots with `CWOFFEE_BROWSER_PAGE` on). `selftest.sh` says which shape the
+board it launched is grading, and asks for the in-window group on its own — a process cannot be both,
+and a group that graded a picture for a claim about a widget would be measuring the wrong thing.
+
+`./scripts/selftest.sh browser-panel` grades the column on the right of the transcript. The claim it
+exists to protect is the one a screenshot cannot make on its own: **the page in the panel is the page
+the model acted on.** So the group is written as one page, two screens, and a set of comparisons
+between them:
+
+* the button on the transcript card opens a **column**, and the column's bottom edge may not pass the
+  window's — a panel that adds height instead of taking a column of it is the failure mode that
+  `chrome-height` spent a whole run chasing once already, so it is graded here rather than hoped for.
+  The column's top and bottom are then compared against `.panecard` itself: standing beside the
+  transcript means ending on the same two lines, and a column a few pixels out of true reads as one
+  window drawn badly;
+* with nothing ever open the page area **invites a start** — the browser's mark, `Start browsing`, and
+  the other way in — on a page's own surface rather than the desk colour, and the panel does not say
+  "no browser is open" a second time underneath. Where a browser *was* open and was closed, that row
+  stays and names the reason: the invitation replaces the quiet shape, not the news;
+* a person types an address and gets `data-browser-frame="yes"` with `naturalWidth > 8` — an `<img>`
+  with no bytes behind it looks fine and shows nothing, which is this panel's characteristic failure;
+* the page's **own title** has to reach the panel, from the page, not from the prompt;
+* `file:///etc/hostname` is refused, the refusal says what the panel does open, and — graded, because
+  it is the easy mistake — the refused address must not replace the page that was open;
+* a reload by the person is recorded with `data-browser-actor="person"` and takes another picture
+  (`frames_taken` must move); then the model's turn flips it to `model`;
+* the model's turn runs the `browse-session` scenario, whose **second** call names no url at all.
+  That is the load-bearing step: it can only succeed if the browser survived between calls, and the
+  mock refuses the turn unless the tool's own output contains `acted in the browser that was already
+  open at`, `it gave back: cwoffee selftest` and the click's own reply;
+* the panel's url must be a url the transcript's card itself names — the check that the column is
+  not a picture of some other browser;
+* **pointing at the picture points at the page.** The page's own click target sits at a position the
+  server publishes (`aim` on `/selftest-hits`), the check presses the `<img>` at the pixel that
+  position maps to in *that* window, and the witness is a counter the page raises by fetching its own
+  endpoint. A column that scaled its picture by the wrong factor presses the wrong spot and the count
+  never moves. The same argument is then made in the other two ways a person points: a wheel over the
+  picture must move the page's `scrollY` (read out of the browser, not out of the column), and keys
+  typed in the column must appear in the page's own `<input>` after the check clicked that field
+  through the picture. The page's numbers come from the server that served the page, so the check
+  never trusts the harness's own memory of a layout;
+* **the icons still have names.** "Icons instead of words" is only an upgrade if the words exist where
+  a keyboard and a screen reader can reach them, so the group counts the column's icon-only buttons
+  (there must be at least the six it shows), and refuses any that carry no `aria-label` or nothing in
+  `title`. A glyph with no name behind it is a control nobody but a mouse can use;
+* Escape must drop the armed close **and leave the browser open** — a key that answers the question
+  should not also perform the thing the question was about;
+* the middle view has to show what the page said about itself: the fixture page's own script throws
+  once, and the column must repeat that error rather than show a screenshot of a page that is quietly
+  broken;
+* the status line must be the engine's sentence, not one the column wrote. It is compared with the
+  digits normalised: that sentence contains a live countdown, so a fresh read lands a second after the
+  column's last poll and the number moves. Comparing the words and letting the number float is the
+  honest form of this claim — and the number itself is graded by the idle arm, which waits the span
+  out rather than comparing two clocks.
+* closing is two presses: the first arms (`aria-pressed="true"`) and must **not** close, the second
+  closes, and afterwards no `data-browser-frame="yes"` may remain. A frame left above a line saying
+  the browser closed is a page that still exists.
+* once nothing is open, the page area is **a shape, not a hole**: it must draw the outline of a page
+  (`.bpy-sil`) over words that name what is missing. A blank box is read as "the page failed to load",
+  which is a different fact, and this is the one moment in the suite where the empty state is on screen
+  to look at — the claim exists so a later redraw cannot quietly turn it back into a rectangle.
+
+`./scripts/selftest.sh browser-idle` runs in a **second launch** over a scratch `config.toml` holding
+`[browser] idle_secs = 4`, the same shape the `mcp write` arm uses. Two rules it enforces, both about
+not lying to itself:
+
+- it fails if `idle_secs > 30`, because an arm whose scratch config never reached the start would be
+  grading a five-minute wait it did not configure (and the scratch config lives at
+  `$XDG_CONFIG_HOME/cwoffee/config.toml` — the same trap the MCP arm documented);
+- it fails unless the panel's own sentence names **that number** — "closed itself after 4 seconds".
+  A check that accepts "closed itself after 5 minutes" for a four-second wait passes by describing a
+  setting nobody chose.
+
+After the app is ended the arm asks the process table whether any `browser/session.mjs` is still
+alive. An app that closes its browser on a timeout and leaks one on exit has not answered the
+objection that the whole feature has to answer, and "the driver exits when its stdin closes" is only
+worth writing down if something checks it.
+
+`--no-browser` sets the person's own switch (`CWOFFEE_BROWSER_KEEP=no`) and makes `browser-panel`
+give up its happy path for the other arm: the panel must say keeping browsers is switched off and
+name `keep = false`, rather than offer an address box that can only fail. On a machine with no
+`browser/session.mjs` the same group instead insists the panel names the missing file and both
+install commands. Three states, three sentences, one arm each — "no browser" is not one answer.
+
+The unit side is `cargo test -p cwoffee-engine --lib browser_hub::`: real ndjson pipes to a fake
+driver (`scripts/fake-browser-session.mjs`), because a hub tested against a mock object never had to
+deal with a driver that dies mid-line. It grades the open/act actor bookkeeping, the page's own
+events arriving without polling, a page that refuses being reported as the page's refusal, a driver
+that dies answering with a reason instead of hanging the caller, the idle clock firing and saying the
+number, frames being bytes for the watcher, a risk check reading the open session **without awaiting
+a lock**, and the three "why is there no browser" sentences being different from each other.
+
+## The page in the window: the rectangle is the claim
+
+`./scripts/selftest.sh browser-inpage` grades the other shape, and it is written around the fact a
+screenshot cannot establish: **the page is where the panel's box is.** The board boots it with
+`CWOFFEE_BROWSER_PAGE` on, so the page is a widget over this document rather than a picture of one,
+and every later claim is downstream of the rectangle — a working page in the wrong place is still a
+broken panel. What it insists on:
+
+* the panel's `[data-browser-pagearea]` and the widget's **allocation** agree on position and size,
+  and the panel says so out loud if they do not (`[data-browser-placedoff]` has to be absent, after
+  giving the panel and the widget a moment to agree, because the box is re-stated when the panel's own
+  layout changes);
+* the page's own viewport is the size of that box — the page's report, not the request;
+* full window moves the box with the column, and a hidden panel sends a box of none so no page is
+  left floating over the transcript;
+* both sides act on one page: a click by the model is counted by the page's own endpoint
+  (`0 → 1`) and leaves the paragraph saying what only a real click can say, and the panel records the
+  person and the model as the two actors of the same session;
+* what the page reported about itself is in the drawer as records — the arm's own throw and the page's
+  own bug, a network failure and a broken resource, each with its kind, and reading them does not
+  count as using the browser;
+* an address typed at a page that is already open reuses that page: a `#fragment` moves the panel's
+  address without moving the page count, `back` answers only once the page has moved, and a reload is
+  one page and not two;
+* no picture of it anywhere: `frame` refused by name, `live` false, and the column's About view
+  saying "in page" rather than "live".
+
+**The drawer's log is graded in both shapes, and it caught a hole.** The row list is `[data-browser-
+log]`, and the panel's root used to carry an attribute of the same name — so `querySelector('[data-browser-log]')`
+matched the *root*, passed on a drawer that had never opened, and stayed green while the relayed
+browser's log held nothing but the app's own navigation records. The flat vocabulary (`console`,
+`pageerror`, `requestfailed`) filled the panel's bags and never landed a record, so the person saw the
+error and `page_log` said the page was silent. The selector is scoped now (`[data-browser-drawer]
+[data-browser-log]`), the button's `aria-pressed` is graded, and the claim that survives is the one
+that matters: the page's own complaint is in the records in the shape where a real Chromium runs.
+
+## Four things the kept browser checks caught by being written honestly
+
+**The title witness reads the endpoint, not the page.** The panel must show the page's own `<title>`, and
+the self-test page's `<title>` is `cwoffee selftest` while its `<h1>` is `Cwoffee browse selftest`. The
+first version of the check compared the panel against the `<h1>` remembered from the harness and failed a
+panel that was working (`the panel's title is "cwoffee selftest" — the page's own title never got there`).
+The obvious repair — fetch the page and read its `<title>` — failed next, because the app's webview is a
+different origin from the mock and an html body it is not allowed to read comes back as an empty string:
+`the selftest page serves no <title>, so the title check cannot run`. So `mock-llm.mjs` keeps the two
+strings it builds the page from in constants (`SELFTEST_TITLE`, `SELFTEST_H1`) and publishes them on
+`/selftest-hits`, which already carries CORS for exactly this kind of witness. A check that cannot read
+its witness says so rather than reporting the feature broken.
+
+**A reload owes the viewer a picture.** `browser-panel` now *waits* for `frames_taken` to move after a
+person presses Reload, instead of reading the count immediately: the panel pulls on its own schedule and
+only when the page changed, so an immediate read grades the poll's timing rather than the reload. That
+wait found a real bug — the desktop compared the caller's *picture* sequence against the *state*
+sequence, so a reload (state bumped, no picture taken) was answered with "nothing newer" and the panel
+kept drawing the page from before the reload. The rule now lives once in the engine
+(`needs_frame`) with a unit test, and the same check on the same page now passes on both cores.
+
+**A rename can compile and wire the wrong thing.** The panel's error line was fed from `browserErr` — a
+different, same-typed variable that belongs to the Settings browser-status block — after the panel's own
+state was renamed to `paneErr`. `svelte-check` reported nothing, because a string is a string, and the
+group's `file://` refusal check failed with an empty error line twice before the wiring was read rather
+than assumed. When a rename leaves a neighbour of the same type behind, check the *call site* is in the
+diff.
+
+**The board asks for the headless shell, and the reason is the run itself.** `selftest.sh` exports
+`CWOFFEE_BROWSER_SESSION_HEADLESS=1` *and* `CWOFFEE_BROWSER_HEADLESS_ONLY=1`. With full Chromium running
+in its own headless mode, the run's own window stopped being composited: `requestAnimationFrame stayed
+silent for 60400ms`, five geometry checks were skipped, and the verdict said the window had been
+off-screen — a complaint about the desktop, caused by the feature under test. The headless-shell build
+opens no X connection, and the panel still gets its frames, because the panel draws the page's pictures
+rather than a window of its own. `[browser] headed` still wins for a person: this is the harness saying
+"do not paint", not the product changing what it shows.
+
+One related honesty fix came out of the same bad-compositing stretch: a pacing claim (`the table only
+appeared 26ms before turnEnd — that is at turnEnd, not during`) is now written off as a skip when the
+turn delivered almost no paints. "During the turn" is a claim about the frame clock, and a turn nobody
+composited has no clock; the skip is counted in `blindSkips`, so a run that could not see its own window
+still ends red — with the reason being the reason.
 
 ## Machine contention
 
@@ -273,6 +720,19 @@ run that fights the user for the keyboard every five seconds is its own kind of 
 three was tried first and spent all three inside the first minute on a window that had barely lost
 focus during startup, leaving nothing for the silence twenty minutes later - which is the one that
 costs a run its geometry checks.
+
+The board now also refuses to *start* a full pass while another self-test window is up. A run that is
+killed part-way (a Ctrl-C during the build, a shell that dies) leaves its `target/release/cwoffee-app`
+running, and that window - not the desktop - is what takes the compositor from the next run's window.
+The next run then finishes 40 minutes later with `the window was off-screen for most of this run`,
+which reads like a machine complaint and is a stray process. So the first thing the board does after
+resolving its artifacts is look for a `target/release/cwoffee-app` that it did not start, by argv
+(`argv[0..1]`, so the launching shell - which carries this script's text, path included - cannot match
+itself), and die with the pid and the sentence `this script does not end processes it did not start`.
+It looks only at this tree's artifact: a person's installed app under `~/.local/share/cwoffee-desktop`
+is theirs to keep open, and the scratch config, data and state directories are precisely why two
+instances can coexist. A developer running the app by hand from the target dir is allowed to be doing
+that on purpose, which is why the message names a pid instead of reaping one.
 
 `scripts/idlekeep.py` runs beside a self-test and turns the desktop's own blanking off for its
 duration, then puts the setting back on exit, on error and on signal. That is all it does, and the
@@ -342,6 +802,21 @@ when the clipboard is unreachable rather than waiting for a client that no longe
 ## What the newest checks measure
 
 The newest checks exist because a user read a symptom, not because a number moved:
+
+> **Superseded by the inline loader (batch eight).** The transcript no longer carries a cup. The
+> working status is a 20px picture inside the turn's own header
+> (`.blk-run > .blk-head > .run-working`), or a loose one after the last block when a plain answer has
+> no header (`.turn > .run-working.turn-tail`), and the composer's send button carries the same picture
+> inside its own 32×32 box. The cup bullets below stay as the record of why that picture was built and
+> of how a raster animation is measured — the traps in them (the page-wide `img, video { max-width:
+> 100% }` reset resolving against a zero-wide row, re-arming a loop by rewriting the last frame's
+> duration, a still carved out of a delta frame) are traps the loader runs into instead, and it has
+> checks for each: `mark-visible`, `mark-art`, `send-loader`. `cup-art` still grades the opening
+> screen's cup, which is still there. What ships is
+> `ui/public/cwoffee_turn_working_inline_1.webp` (40×40 for a 20px box at DPR 2, 75 frames, a 2500ms
+> lap, infinite) and `ui/public/cwoffee_turn_working_inline_still.webp` (one frame), both written from
+> `assets/mark/cwoffee_turn_working_source_199.webp` by `scripts/mark-resize.py` — one resample for both
+> files, and both verified with an independent decoder rather than only the library that wrote them.
 
 - **A turn says "working" once, in a drawing, not in five dots.** The report was "the dot animation
   and the assistant name are not aligned with the block header", and then "remove the dot on every
@@ -613,7 +1088,10 @@ selected item's own fill otherwise swallows the ring, and the ring is on `:focus
 
 The user's screenshots are the spec; each fix carries the measurement that says it holds.
 
-- **The cup's seat, and the patience of its putting-away.** The picture sits
+- **The cup's seat, and the patience of its putting-away.** *(superseded: the transcript's cup band,
+  `--cup-band`, `--cup-left` and `.transcript-cup` are gone, and the follow/jump checks now fail if the
+  cup comes back; the numbers below are the record of how a pinned picture was measured, which is what
+  the loader's geometry checks inherit.)* The picture sits
   `8px` off the bottom of the transcript pane (`cup band ok (136px picture pinned 8px off the pane's
   bottom, 168px of the pane held out of the text, column-aligned; across 60 streaming frames it
   travelled 0.0px, worst frame 0.0px, 0 reversals, 1 lit/away toggle...)`). The seat is measured
@@ -717,3 +1195,607 @@ exactly the bug, and it used to be silent because `set_thinking_level` reports s
 The Rust core answers the same field without asking anything, and its test keeps three claims apart:
 what this endpoint was *probed* to accept, what the *dialect* documents, and what a dial may therefore
 offer. An unprobed model is not a model that cannot think, and reporting nothing would say that.
+## The chrome row, the folder row a chat does not need, and a dot that is a record comparison
+
+Three checks were added for the batch that shortened the titlebar, removed the chat mode's folder line,
+and fixed unread conversations. Each one is written against the thing the report was actually about.
+
+- **`chrome-height` grades where the height went, not the number on the bar.** The bar is checked against
+  the window's own `--titlebar-h` as the browser resolves it (a token is a real height; matching the
+  literal string in the file would grade the source), its controls are checked to sit inside it — a
+  control a window's decorations clip is a control nobody can press — and then the claim that matters:
+  the sidebar and the pane start on the bar's bottom edge, and nothing sits below both of them. That last
+  number is printed, because "reduce the topbar and give the space to the list and the transcript" is
+  answered by `0px spare below them` and not by `36px`. The card's own 10px gutter inside its pane is
+  deliberately *not* charged to the chrome row; the first draft of this check failed on it. The drawer's
+  narrow-width `top` and the settings dialog's height are read out of the shipped stylesheet and resolved,
+  so a fifth hard-coded number somewhere else is a failure naming both values. And if a band *is* left
+  below them, the check now also lists the shell's loose text nodes: the 96px that once went missing was a
+  `/* … */` comment written in markup, which Svelte turns into a text node, and a text node in a flex
+  column is a box — invisible to `element.children`, and perfectly able to eat the window. See
+  `BUILDRUN.md`, trap 129.
+- **`unread-dot` sets the record, then reads the dot.** The mark is a comparison between a conversation's
+  stored message count and where that conversation was last read, so the check writes the marker through
+  the app's own `SEEN_KEY` at 0 for a conversation whose row says more, and requires the dot. Then it
+  opens the conversation and requires the dot to be gone and the marker to have moved to the row's count,
+  and requires that a refresh of the session list does not put it back. Three things it has to get right
+  or it lies: it looks away first (`showStartScreen()`), because it makes its own conversation with a
+  turn and a turn moves the view to what it grew; it waits for the dot rather than grading the class the
+  instant `viewId` changes, since the view name moves before the transcript lands; and it restores the
+  person's marker and their view in `finally`, because a suite that leaves a read marker moved tells
+  their next start that a conversation they never read had been read. If the sidebar has no conversation
+  with messages, the check makes one rather than reporting "nothing here can be unread" — that sentence
+  would be its own empty world, not a verdict.
+- **`mark-visible` grades two homes.** A working mark lives in a turn's run header, or loose after the
+  last block when the turn is a plain answer with no header at all. The group accepts either, requires
+  never more than one per turn, and grades them differently: the header mark must sit above and clear of
+  the answer's first line, the loose one below it and on the prose column. Both must be a real painted
+  `img` at the declared box (the page-wide `img, video { max-width: 100% }` reset is what made an earlier
+  mark measure `0x56`), must keep their own opacity and layer promotion against `.turn > *`'s entrance
+  animation, and must be gone once the turn lands. If layout was measured but no frames were delivered,
+  the group says it measured geometry only — a timer can prove a box; only paints prove a screen.
+> **Superseded by the gutter (batch ten).** The header mark is no longer in the sentence and the loose
+> one is no longer on the prose column: both hang in the gutter to the left of the block, and the
+> claims below this one grade the band they now live in.
+- **`mark-art` checks the bytes that ship, not the artwork on disk.** The CSS box the loader actually
+  resolves to, the loop's frame count and lap read out of the shipped table, the canvas against that box
+  at this window's DPR, and whether the reduced-motion still decodes in this engine. That last claim
+  exists because Pillow accepted a still carved from a delta frame, `identify` called the same file
+  `corrupt image`, and the app showed nothing for `prefers-reduced-motion`.
+- **Two clocks, for two different questions.** `send-loader` and `reveal` both count real
+  `requestAnimationFrame` paints and sample on a timer. Geometry without paints is a named note, not a
+  pass; a single sample after `frame(150)` is not evidence about a 130ms fade, which is why `reveal` runs
+  its own frame sampler and grades the peak number of mid-fade words rather than one reading.
+
+- **`mark-visible` grades the gutter, not just the box.** The loader hangs left of its block's rule, so
+  the geometry claims are about a band with two edges: the card's own edge clips anything hung too far
+  out, and the block's rule stops it from reading as a glyph in the heading. Both are measured, because
+  the first version of the offset put the mark outside the card and passed a claim that only asked
+  "is it left of the text". Two more claims grade what a screenshot cannot: the header row has to span
+  its own block (it used to inherit a block *label's* 58px column, which clipped the sentence), and the
+  mark must still be the same element after a step lands — a mark removed and rebuilt looks identical
+  to one that kept running, and a rebuilt raster restarts at frame zero. The narrow-width offsets are
+  graded as shipped rules rather than measured, and the receipt says so: a selftest cannot resize the
+  window it is running in.
+- **The loose loader's ordering is graded by the append that adds a node.** Streamed prose continues the
+  block already open — spans and box kept — so appending text adds nothing and proves nothing about
+  order. Files are the mid-turn append that does create nodes, so the check delivers one and requires
+  the mark to be the same element, still below the writing, and still nothing after it: a file strip
+  beneath the mark is a hand-over line sitting under a spinner.
+- **A hover state is graded twice, and the two halves are named.** Nothing in this suite can put a
+  pointer on a button. The runtime half measures the rest state mid-turn (working mark lit, stop glyph
+  at opacity 0, button still 32x32 and still labelled Stop); the reveal half reads the shipped rules for
+  a rest rule that hides the glyph and a rule per reveal (`:hover`, `:focus-visible`) that brings it back
+  *and* takes the mark away. A `:hover`-only reveal would satisfy the pixels and leave a keyboard user
+  with no affordance, and revealing without dimming restacks the two glyphs for whoever hovers.
+- **A claim that a line is gone is a claim about text.** The chat check rejects both the folder control
+  and either sentence anywhere in the pane, because a copy of "Chat has no folder" under a new class name
+  passes a selector check — and the opening screen keeps a second composer that a selector scoped to one
+  of them would miss.
+
+### Branching: two records, two memories, one check
+
+`branch` is the group for a verb whose danger is invisible from the DOM. Copying transcript rows is
+easy and a unit test can do it; the two things that make a branch a branch — the model answering out
+of the copy, and the conversation it was copied from still being whole — are only visible from inside
+a running app, and a rewind-shaped implementation gets both wrong while looking identical in the
+sidebar.
+
+- **The source is measured before and after, row by row.** Not its length: the check compares each
+  row's content too, because a branch that cut the original and left the same count of rows behind
+  would pass a length check. Sabotaging `create_row` to `truncate_from` the source after the copy
+  produces `a branch is not a rewind: conversation 21 held 4 rows before the branch and 0 after it`,
+  and the second claim (`answering in the branch grew conversation 21…`) catches the same bug from the
+  other side — the two paths have to grow apart.
+- **The composer is read from the painted textarea, not from state.** `prefill` is a promise about
+  what the person can now do: branch off your own message and the words come back to be asked again;
+  branch at an answer and nothing comes back, because an answer is not something to send. The view
+  moving and the composer filling are waited for as two claims with two messages, because the handler
+  opens the conversation before it writes the composer and a single predicate would grade whichever
+  of the two settled second.
+- **The host's own sentence is the receipt about memory, and it is graded per core.** A branch is only
+  a branch if the model's memory followed it, and the two engines keep that memory in different
+  places, so each has to say something different: pi names the thread it forked, the Rust core says it
+  answers from the copied history now. The check asks `about` which core is running rather than
+  reading `CWOFFEE_CORE` — the environment says what was asked for, the host says what is running.
+  Emptying the pi arm of `memory_note` fails as
+  `the pi core made a cwoffee row without saying it forked pi's thread, which is the memory that has
+  to follow the copy`. What the check cannot see is whether the fork file's contents match the source
+  branch; the bridge's own unit tests cover the comparison against `get_fork_messages` that guards
+  that, and the receipt says "the core said what it did to the model's memory" rather than claiming
+  the file was read.
+- **The refusal claims measure the population they belong to.** A drifted `shown` must create no
+  conversation *and* change no rows; a mid-turn refusal is measured while the turn is still running,
+  because the running turn is going to grow the conversation by two rows on its own and a claim
+  written as "nothing changed, after the turn" would blame the refusal for the turn. The turn then
+  lands in the conversation it was sent from, which is what the refusal was protecting.
+- **The click has to belong to the conversation the claim names.** Branch controls are painted inside
+  the transcript, so a check that reloads a conversation and clicks "the last answer's branch" can be
+  clicking a control built while a different conversation was on screen. `branch` asserts
+  `transcript.sessionId` equals the conversation it is about to branch before clicking. That
+  assertion is what found a real bug: `loadTranscript` painted a conversation's rows without telling
+  the transcript which conversation they were, so Copy/Edit/Branch under freshly painted rows addressed
+  whatever was on screen before the repaint. Turn actions now read the session at click time for the
+  same reason.
+- **`turn-buttons` keeps the disabled-control rule, pointed at the honest case.** Branch is built, so
+  its button is live — but not under a turn the window streamed, which has no stored row to name.
+  The group now requires that control to be inert *and* to say what it is waiting for
+  (`once it is stored`), which is the same rule it was checking before: a disabled control that
+  explains itself beats one that pretends.
+
+- **The cost of the copy is claimed only when there is a copy.** A branch that carries rows says
+  its first answer is assembled from them; a branch off the first message carries nothing and must
+  not say so. The wording is a count, not "cold cache" — the engine cannot observe the endpoint's
+  cache, and this app has a standing rule (and a test) against notes that assert cache state.
+
+Three new mock scenarios (`branch-stem`, `branch-tail`, `branch-answer`) exist because
+`scripts/mock-llm.mjs` answers an unmatched prompt with a 400, and a check whose turn 400s grades a
+conversation that never ran. (`checkpoint-overwrite` and `checkpoint-slow` were added for the same
+reason: the first is a turn that writes one file three times and edits it once, the second is slow
+enough to still be running when the harness asks for a revert under it.)
+
+### The tree: what a conversation is reading, and what moving that costs
+
+`tree` is the group for a feature that lives in one column of `sessions` and is therefore invisible
+from the DOM. What it has to prove is not that a card paints — it is that the answer the model gives
+next comes from the node the person stood the leaf on, while nothing was copied and nothing was
+deleted. A rewind-shaped implementation passes every selector check and gets that wrong.
+
+- **The record is read as the model reads it, twice, for opposite facts.** After a leaf move the check
+  asks `session_messages` what the next answer would be assembled from (zero rows, standing in front
+  of the first message) and asks the sidebar's `message_count` what the conversation holds (unchanged).
+  Either one alone is a trap: the first is what `truncate_from` also produces, and the second is what a
+  conversation looks like when nothing happened. Sabotaging `set_leaf` to truncate fails as
+  `moving the leaf deleted rows: conversation N held X before and Y after`.
+- **The branch a leaf was left on grows, and the row the leaf left behind stops being read.** The
+  message sent after the move is checked against the *branch* (`2 rows, 1 of them my ask, and not the
+  row the leaf left behind`) and against the *whole record* (`+2 rows`). That is the claim a rewind
+  cannot satisfy and a leaf move must.
+- **Lineage is graded from what the creation wrote, not from what the UI can see.** Two branches cut at
+  the same message are checked for parent id, role, row id, the quote captured *at creation*, and
+  depth — plus the parent drawing both children and counting them. The quote matters as a stored
+  fact: a branch cut at a message that is later edited has no live row matching what its card says, so
+  a check that re-read the row for the quote would grade the wrong thing.
+- **Both cores answer the same verb in different sentences, and each is graded for its own.** `about`
+  which core is running picks the expectation: pi has to consult its thread, the Rust core has to say
+  it read from the record. Emptying the pi arm of the tree note fails as
+  `the pi core drew a tree without consulting pi's own thread, which is the record that says what its
+  model is actually reading`.
+- **The fixture is the pi-side half.** `crates/bridge/tests/fixtures/pi-tree-branched.json` is a
+  captured `get_entries` answer whose *file order* is not its *tree order*: the branch is listed after
+  the straight line and hangs off the first entry. A reader that walked the file would mark the
+  straight line as the branch the model reads, which is the opposite of what pi's `leafId` says. The
+  same fixture holds an entry no cwoffee row answers to, a piece of pi's own bookkeeping, and a branch
+  nobody is reading, and the three are graded as three different facts — a line of the tree, not
+  drift, and off-path. Standing the record's leaf at a node pi is not on has to read as disagreement
+  about where the two records stand, not as an empty tree.
+- **The refusals measure the population they belong to.** A drifted `shown` must move no leaf *and*
+  change no rows; the mid-turn refusal is measured while the turn is still running, then the turn is
+  checked to have landed in the conversation it was sent from. A tree read under the same turn is
+  required to answer, because reading is what a watch tab does while the machine is busy.
+- **`context-menu` now requires the tree control in the conversation's row menu.** It was added there
+  because a conversation is what has a tree; a check that only looked for it on messages would let the
+  sidebar grow a second, different way to open the same card.
+
+Three mock scenarios (`tree-first-ask`, `tree-second-ask`, `tree-branch-ask`) exist for the same reason
+the branch group's do: `scripts/mock-llm.mjs` answers an unmatched prompt with a 400, and a check whose
+turn 400s grades a conversation that never ran — which is exactly how this group failed the first time
+it ran.
+
+### Checkpoints: the file, not the card, is what gets graded
+
+`checkpoints` is the group for a feature whose whole product is a file on disk. Everything the UI can
+report — the plan, the counts, the note — is the app's own arithmetic, so a revert that updated its own
+card and left the folder alone would look correct from inside the app. The group therefore reads the
+bytes through `selftest_file_bytes`, which goes through the same `confine()` the tools use and cannot
+be pointed outside the conversation's folder, and it never takes the app's word for what the disk holds.
+
+- **The turn has to actually write, or every claim below it is noise.** The file is seeded with words
+  the harness wrote, and the first claim after the turn is that the file no longer holds them. A turn
+  that wrote nothing would leave the group grading a change that never happened, which is why that
+  check exists before any revert claim: `the turn wrote nothing: … still holds the words the harness
+  seeded it with`.
+- **`edited_since` is used as a disk witness, from both sides.** Before the revert it must be false —
+  that is the engine saying the live file matches what the turn finished with. After the revert it must
+  be true — the file no longer matches, which is the only way the app itself notices a file moving.
+  Reading it in both directions is what stops a claim that only ever proves the flag is constant.
+- **The card is graded as a decision, not a list.** It must name the one path, sit inside the reading
+  card's clip box, say the transcript is untouched, and offer a button whose label matches the stakes:
+  `Revert` when nothing was edited afterwards, `Revert anyway` when something was. Sabotaging `apply()`
+  to report a restore it never performed fails as
+  `pressing Revert left selftest_checkpoint_note.md holding "model draft two\nthird line\n" instead of
+  the words it held before the turn`.
+- **The messages are counted on both sides of the revert.** Undoing files must not delete the
+  conversation, and the group compares row counts before and after rather than trusting the note that
+  says so.
+- **The mid-turn refusal is measured against a turn that is really running**, and the disk is read
+  before and after the refused call: `the refused revert still moved …` is a different failure from
+  `reverting during a turn answered …`, and the two used to be one claim. Removing the busy guard fails
+  with the second message — and that sabotage is what surfaced a real wording bug in the refusal, which
+  printed "accept that 1 it stay as they are". The engine now agrees in number with what it names, and
+  both branches are unit-tested, because that clause is the one that says what did *not* happen.
+- **A turn that touched no files must refuse rather than offer an empty plan.** The refusal is the same
+  sentence the card would have shown, and the check asserts its wording; an undo control that opens a
+  card with nothing in it reads as a bug in the card.
+- **Scope is one decision per file.** Three writes to one file produce one line, naming the earliest
+  copy, and widening to "this turn and after" still names one path. A per-write list would make a
+  single rewritten file read as three separate things to approve.
+- **The group owns its state.** Reasoning and approval mode are set for speed and restored in a
+  `finally` that runs whether the claims passed or failed; the file it seeded is deleted through the
+  model's own tool so the folder is left as it was found. It creates its own conversation by sending,
+  rather than borrowing the suite's scratch session, because that row is deleted and re-created by the
+  setup — an earlier version got `useSession(3): the host is still on 0` and then graded a turn that
+  never started.
+
+### Typing during a turn: the endpoint is the witness, not the card
+
+`steer` is the group for a feature whose claim is about **a request**. A pending line on screen proves
+the press reached the host; it does not prove the model read it. So the load-bearing assertions live in
+`scripts/mock-llm.mjs`, which answers 400 when the bytes it received disagree with the scenario:
+
+- **`require_steer`** — a needle that must appear in a user message positioned *after the last tool
+  result* of the request that plays that step. That is the whole promise: into this turn, at its next
+  step. A receipt painted for a message that never went out fails the turn, and the error quotes what
+  the request actually held there.
+- **`require_steer_absent`** — a needle that must not appear in any user message of the request at
+  all. This is the withdrawal arm: "the card said it was taken back" is not evidence, and a leaked
+  press makes the endpoint refuse.
+- `/mock/state` now reports `steer_hits`, `steer_misses`, `steer_leaks` and `user_seen` (every user
+  text the server was asked about), and `selftest.sh` prints that line under the activity table — a
+  run that claimed a steer landed while the endpoint never saw one says so in numbers.
+- The first steps of `steer-into-turn` and `steer-withdraw` **stream slowly before the tool call**.
+  A fast first step meant the boundary came round before the harness could press Enter, and the press
+  landed at the end of the answer instead of after the tool results — a scenario that grades the wrong
+  moment. `checkpoint-slow` gained a second step because a steer makes that turn continue, and an
+  exhausted scenario would 400 on the request that carries the pressed words.
+- The card arm has a pi-core condition: the approval mode a pi process obeys is set when it is exec'd
+  (`CWOFFEE_MODE` in the child's environment) and no RPC changes it afterwards, so the arm relaunches
+  through a persona round trip and restores what it found. Without that it would measure a process
+  running Auto and call the absence of a card a pass.
+
+`composer-type` was flipped with the feature, not left beside it. Its mid-turn assertions used to prove
+a refusal ("Enter does not send while cwoffee is answering"); they now prove a press — the placeholder
+names the kind and where the words go, the box empties into a waiting line that says the message has
+not been sent, no second turn starts, and the pressed words become a row of their own in the record.
+The rule that a control must never be `disabled` mid-turn is unchanged, because that is the state that
+made typed words invisible on this WebKitGTK.
+
+### The file row starts where the answer's text starts
+
+`.filestrip` carried `margin-left: 62px` from the layout where a block's label hung in a gutter and
+its body was pushed past it. The gutter is gone — `.blk` is one column now — so the indent aligned
+with nothing, and a turn's file row read as a stray margin while the hand-over line above it was
+already flush-left. `one-attachment` measures the strip's left edge against the answer text's left
+edge and logs the number (`file row aligned: its left edge is 0px from the answer text's left edge`),
+so the claim is a measurement rather than a screenshot someone liked. Same rule for both cores, and
+for both shapes: the card line and the working strip share the prose's edge.
+
+### A made file is a card, and a click resolves through the conversation
+
+Two more claims about the same row, both graded in `one-attachment`:
+
+- **A file the turn created wears the dashed card; a file it changed is a chip.** The fact is
+  `OutputFile::created`, and it can only come from the tool: `write_file` checks the disk before it
+  writes, and afterwards a created file and a replaced one are byte-indistinguishable. `kind_for`
+  says `edit` for both, which is why "is this a delivery?" could not be answered from the label —
+  the argument the screenshots turned into was really a missing fact. Engine test:
+  `a_write_says_whether_it_made_the_file_or_replaced_it` (create → true, overwrite → false, append
+  onto nothing → true, edit → never true). Past `ROLL_FILES_AT` made files the card gives way to the
+  working roll, so one number decides where "a few things I made" stops being a design; the check
+  loads five created files and asserts no card survives.
+- **The Save control is the delivery, and nothing else is.** A card outside
+  `.cws/assistant_attachments/` has no control at all — not a disabled one, because a greyed-out
+  Save is still an offer the host refuses. `data-handover` on the unit is what the check reads, so a
+  passing run proves the difference is visible rather than merely intended.
+- **A click resolves through the conversation's own folder.** `open_file` used to resolve
+  workspace-relative paths against the host's *current* folder, so an app showing a conversation from
+  another workspace answered `three-feature-prompt-3.md no longer exists` about a file sitting intact
+  in that conversation's folder. `scratch::turn_file_path` now tries the conversation's folder, then
+  the host's, and a refusal names both folders it searched instead of claiming anything about
+  whether the file still exists. Tests: `a_turn_file_is_found_in_the_folder_its_conversation_lives_in`,
+  `a_missing_hand_over_says_which_folder_it_searched`.
+
+The system prompt now states the folder rule as the only route to handing a file over
+(`the_prompt_says_the_attachments_folder_is_the_only_way_to_hand_a_file_over`), because the model
+otherwise learns it by being contradicted: the session this all started from wrote a task file at the
+workspace root and had no reason to prefer the folder.
+
+### The hand-over folder, and the label that outran it
+
+README has said for a while that `.cws/assistant_attachments/` holds "the only files the transcript
+offers to **Save…**". It was enforced in exactly one place — `scratch::attachment_path`, which
+refuses a copy request for a path outside the folder — while the *shape* of the row came from
+`FileKind`, and `download_file` set that from the tool's `place` argument rather than from where the
+bytes landed. So `download_file` with `place: "attach"` and `path: "/abs/x.pdf"` (or any root path)
+wrote outside the folder, was labelled `Attachment`, and the transcript drew the dashed unit with a
+Save control whose action the host would refuse. The reader saw a delivery affordance on the model's
+own working file.
+
+Three arms now hold the claim, and `one-attachment` grades all three:
+
+- **The write.** `destination_for(_, Place::Attach)` has no branch that returns a destination
+  outside the folder — an absolute or root `path` keeps its file name and moves in, and `place_note`
+  says so to the model. The unit test walks eight shapes (`report.pdf`, `./x`, `sub/x`, `/tmp/dl/x`,
+  `/etc/passwd`, `.cws/x`, `docs/x`, empty) and asserts every result passes `is_attach_rel`.
+  `Keep` and `Scratch` still hand an absolute path to the confinement layer untouched, because
+  rewriting a destination the person was shown in an approval card is what that card exists to stop;
+  the engine test asserts that half too, in both directions.
+- **The kind.** `download_kind(rel, place)` reads the landed path: inside the folder means
+  `Attachment`; a `Keep` outside it is `Artifact`; anything else is `Scratch`. The old
+  `match place { Attach => Attachment }` is the bug, and the test asserts `download_kind("report.pdf",
+  Attach) != Attachment` so it cannot come back.
+- **The paint.** The transcript re-tests the path before it draws `.attachunit` or `.attach-save`,
+  because rows are re-read from the record and a session written before the fix keeps the label it
+  was given. A mislabelled row becomes a chip — under the scratch group if it is loose in `.cws/`, in
+  the deliverable strip if it is in the person's own folder — plus one `.attach-note` line naming the
+  paths it refused to offer. `one-attachment` loads exactly that fixture: `report.pdf` at the root and
+  `.cws/ref.pdf`, both still claiming `kind: 'attachment'`, and asserts no unit, no Save control, both
+  named in the note, and that a row *inside* the folder keeps both.
+
+The path test mirrors `kind_for` rather than prefix-matching: `.cws` immediately followed by
+`assistant_attachments`, as components. A substring test would call somebody's
+`src/assistant_attachments/` folder hand-over material, which is the mistake the engine's comment on
+`kind_for` already names — a directory of source files presented as things meant to reach you.
+
+### Two pi-core MCP claims that were true on one core only
+
+The first full pi-core pass since the MCP work went in said red twice, and both reds were real
+features rather than harness noise:
+
+- **The card's body.** The bridge wrapped `cwtool check`'s sentence as `"<tool>: <summary>"`, while
+  the Rust core prints the summary alone (`approval::summarize_with`). For a third-party call that
+  put the tool name where the *server* should lead — `mcp__fake__write_note: MCP server fake: …` —
+  and the group's `/^MCP server fake:/i` assertion went red on pi and green on rust. The headline
+  already carries the tool on both cores (`ApprovalRequest::tool`), so the prefix named the call
+  twice on one card. The bridge stopped adding it, and its unit test now asserts the server leads.
+- **The per-call prompt.** `permit_covers` only asked whether the call escaped the workspace, so a
+  yes given once for `mcp__fake__write_note` covered the next one. On the Rust core the gate refuses
+  that (`CallRisk::per_call`); on the pi core the gate is the app answering pi's dialog, and it had
+  no third-party arm. It now refuses any name the engine's own `mcp::server_of` recognises — the
+  naming rule, not a copied `starts_with`.
+
+Both are the same class of bug the pi-core protocol keeps reporting: a claim written from the Rust
+core's shape, true on that core, and unmeasured on the other until a full pass ran there. The
+targeted steer/theme passes this session were green on pi and said nothing about MCP, which is the
+difference between "the group ran" and "the suite ran".
+
+### A self-test run reads its own script as it goes
+
+`bash` does not read a shell script to the end before running it; it reads at a byte offset and
+keeps going. Editing `scripts/selftest.sh` while a run is in flight shifts every offset after the
+edit, and the run then re-parses text it has already passed. Twice in one session that produced
+`syntax error near unexpected token '('` at a line that parsed fine before and after the edit, and
+once it produced a nonsense diagnostic — `cwoffee-app is older than ` with an empty path — which
+looked like a broken artifact proof and was really a run reading a file that had moved under it.
+
+The rule: **no edits to `scripts/`, `crates/` or `ui/dist` while a run is going.** Docs are safe.
+Ending a run by its printed pid is fine — but start the next one only after its cleanup has released
+the mock endpoint, or the new run's fingerprint probe answers from a server that is on its way out
+and the board fails with `list_models returned nothing`. `selftest.sh` now asks that port twice
+before reusing it, and says out loud when the answer went away.
+
+### Theme: two homes, one value each, and a light arm that has to bite
+
+`theme` used to be a key the parser accepted and nobody read, with the palette living in one
+browser's `localStorage` and `prefers-color-scheme` sampled once at boot. The group is written so
+that each half of that failure has a red line:
+
+- **The file is the value's home.** `set_theme` is followed by a read of the config file itself,
+  through the armed-only `selftest_config_text`, which answers the **host's own** path rather than a
+  path the page names: a check that could read any file would be a test that reads the user's.
+  `hostState.theme` alone would not prove this, and neither would the settings row quoting it.
+- **An override rewrites nothing.** The window takes an override, the paint flips, and the config
+  file must still say what the host stores. `theme_words({ window })` composes About's line from the
+  stored value plus the override *as an argument* — that is the distinction, and a client that phrased
+  the sentence itself would be a second answer to "which palette is whose".
+- **Both palettes, by numbers.** Every floating surface (`.pop`, `.toast`, `.approval-card`,
+  `.pv-head`/`.pv-body`, `.revert-card`, `.tree-card`, `.ledger-card`, the narrow drawer) is read with
+  the document painted in that palette, twice per palette: how far it sits from the reading surface
+  behind it, and whether that palette's ink is legible on it (contrast under 4.5:1 fails). Both on one
+  ruler — oklab L scaled to 0..255, because this engine answers a light `color-mix()` as
+  `color(srgb ...)` and the dark palette's as `oklab(...)`, and comparing the two arithmetic systems
+  grades arithmetic instead of ink. Colour names are never asserted: lesson 132 is that "lighter" is
+  not a direction both themes share.
+- **The ink has to be read in the same switch as the surface.** The first version measured the ink
+  after putting the palette back, so the dark loop compared a dark surface against the light palette's
+  ink and printed a `contrast 1.00` failure that meant nothing. Everything for one palette is read
+  inside one `withPalette` switch now, and the failure it produced is the comment in the check.
+- **The light arm bites.** `selftest.sh --theme light|dark|system` sets `CWOFFEE_SELFTEST_THEME`, the
+  armed run reads it from `selftest_config`, and it applies as an *override* — the arm grades a paint,
+  it does not change a setting. One launch paints one palette, so a full pass relaunches the `theme`
+  group in the light palette and folds that arm into the verdict. Sabotage, and the reason the arm
+  exists: `background: #1e1d1b` written into `.pop`'s rule — the dark palette's paper, hard-coded —
+  and the light arm reported `contrast 1.98, under 4.5` on the menu's own surface while the dark run
+  stayed green. Separation alone would have passed it: that surface sits 223 of lightness from a
+  near-white page. A colour-name assertion would have caught none of it.
+- **A repaint waits for a turn.** The reload-painting lesson in this file says a screen that changes
+  mid-answer costs the answer its layout. The group sends a turn, changes the palette during it,
+  asserts the turn is *still running*, asserts the note said the repaint was waiting, and asserts the
+  paint landed when the turn ended.
+- **Live following, when the engine allows it.** The arm dispatches a synthesized
+  `MediaQueryListEvent` and reads the paint; on this machine it arrived, and the ok-line ends with
+  "the media query was observed following". Where it cannot be synthesized, the check prints a skip
+  note, grades the listener's presence (`data-theme-listening`) and the explicit arms, and the
+  ok-line says which half it measured. README carries the same condition rather than a bare promise.
+- **The retired keys.** `theme_loud` and `theme_aggressive` must still refuse, and the refusal must
+  name the key — `prefs.rs`'s table is the whole vocabulary, and a drawer any client can write into
+  is not a setting.
+
+### The terminal: a pty, the disk, and no screen grading
+
+Nothing in this suite used to touch `crates/tui`. It shares the engine, so every feature that grew a
+door in the window grew none in the terminal — and no check could see the difference, because no
+check was looking. Group `tui` is `scripts/tui-gate.mjs`: it drives `target/release/cwoffee` on a pty
+(its own tmux server, on a socket named for the run, so it cannot reach anyone else's) against
+`scripts/mock-llm.mjs`, and `selftest.sh` builds `-p cwoffee-tui` in the same cargo line as the app
+and refuses to run the gate when the binary is older than `crates/tui`.
+
+The rule for this group is that **the screen is not evidence**:
+
+- the turn's file is read off disk before `/undo`, and again after it, and the after-bytes must be the
+  words from *before the turn* — not what the terminal said it restored;
+- `/branch` is graded by the store: one new session row, and the original conversation's rows
+  byte-identical, so a branch that edited instead of copied cannot pass;
+- the mid-turn press is graded by `/mock/state`'s `steer_hits` and by exactly one new user row;
+- `explore`'s MCP answer is graded from the **tool row in the store** — what the model was given —
+  because the viewport may have scrolled past it by the time the gate looks.
+
+The one place the screen *is* the claim: `/files` must name the path, and the composer must hold the
+words `/branch` handed back. Both are read from the listing's own block and the composer's own line.
+Matching the transcript instead would grade the tool card, which quotes the same path in its
+arguments, and would prove nothing about the door.
+
+Three things this group exists because of:
+
+- **tmux spells control keys `C-x`.** `send-keys ctrl-u` types the literal characters `ctrl-u`. The
+  first version of the gate "cleared the composer" and left those bytes in it, so the card's `y`
+  arrived with words in the box and did nothing, and the run graded a denial as an approval. The gate
+  translates the names, and the failure it caused is why the composer assertions read the box rather
+  than trusting that a keypress means a key.
+- **A card that swallows typing is an unreachable queue.** The terminal handed every keystroke to a
+  live approval card, so a message typed during a turn went nowhere — the opposite of the window,
+  where typing goes to the composer and Enter queues beside the card. The gate presses Enter *with*
+  a card up and asserts the card is still up, the press queued, `Ctrl-U` empties the box, and only
+  then does `y` answer.
+- **Engine notes on stderr corrupt a painting terminal.** Observed, not reasoned about: a boot note
+  painted through the header and the pane read `Cwoffee  ccwoffee-mockt ·20sessionn0`. fd 2 is now
+  parked in a log file while the screen is up and printed when the terminal closes.
+
+Two claims the gate declines, recorded rather than assumed: the boot lines are not observable on a
+pty (the alternate screen eats them), so the hub's state is graded from `/mcp`, and the gate prints a
+note saying which half it measured; and there is no `/diff`, so the terminal's file comparison stays
+in README's "Not built" instead of being implied by the door list.
+
+### One scenario-expansion bug that cost a run twelve failures
+
+`$path` expands to the last path-shaped token of the prompt, and the env block ends with `</mcp>` —
+which contains a slash. On a pi-core run with MCP servers configured, `write_file` was handed
+`</mcp>` as its path. The fixture then wrote a file nobody read: the `require` needles failed, chips
+were missing, `read_file` loops stopped early, and the history-fill turns stored four rows instead of
+fifty-six. Twelve failures, seven groups, one cause, and none of it about the change under test.
+`extractPath` now strips `<env>`, `<mcp>` and `<tools>` before looking and refuses any token with
+angle brackets in it. The general rule: **a fixture that reads the whole prompt reads the harness's
+scaffolding as part of the person's words.**
+
+### The file ledger: three ways a copy can be gone, and one byte total that can lie
+
+`ledger` grades the read over the checkpoint machinery — the same index rows, the same
+content-addressed store, the same `line_change` the tool card paints. Reading is the feature, so the
+group's job is to make a ledger that agrees only with itself fail. Like the checkpoints group it reads
+the bytes through `selftest_file_bytes` and never takes the app's word for what the disk holds.
+
+- **Three turns that really write.** Turn 1 creates `selftest_ledger_note.md`, turn 2 edits it, turn 3
+  overwrites `selftest_ledger_twin.md` — which the harness seeded with the *same bytes* the note held.
+  That seeding is the point: turn 2's copy and turn 3's copy are then the same blob, so
+  `snapshot_stats` has a dedupe to get right. `blobs` must be 1 while `row_bytes` is twice
+  `blob_bytes`, and a stats that summed the rows fails as
+  `the store counts 2 blob(s) for two copies of the same bytes`. Without the shared blob the dedupe
+  claim grades nothing.
+- **The kinds are read from the record, not inferred from a diff.** `created` on turn 1 and `modified`
+  on turn 2 for one path, `modified` on turn 3 for the other, both in the payload and on the card as
+  `data-kind` attributes — so a card that drew the flags in the wrong order or folded two turns into
+  one line is caught by the DOM as well as the read.
+- **The diff is graded against bytes the harness knows.** The stored side is what turn 1 wrote and the
+  live side is what turn 2 wrote, both read from disk; the card's `.diff-del` must quote
+  `-the shared bytes` and its `.diff-add` `+the edited bytes`. A `line_change` that diffed a copy
+  against itself, or against the wrong row, fails here rather than looking tidy.
+- **The identity guard is graded on a row the card just listed.** Asking for the note's row under the
+  twin's path must refuse with "Nothing was diffed", and both files must still hold their bytes: a
+  guard that returned the newest copy for that path would answer successfully and lie about which turn
+  it described.
+- **Both refusals that make a one-sided diff are refused, not drawn.** A row that *created* the file
+  and a row whose blob was deleted out of band have one side each; printing the live file as a diff
+  would read as every line being added by somebody. The engine tests cover the out-of-band arm, the
+  cap arm and the forget arm — three reasons a copy is missing, told apart by
+  `checkpoint_prunes.reason` (`cap` / `forget`) and by `copies_missing`, which is computed from the
+  disk. Reaching the cap in the selftest would mean 200 file calls in one turn, so the cap is graded in
+  `ledger::tests::an_evicted_row_leaves_a_line_that_offers_nothing` and the notice line is graded here
+  through the forget path, which renders the same rows.
+- **Deleting is graded as a decision with a witness.** The control needs two presses (`Press again to
+  delete 3 copies`), refuses mid-turn with the record and folder unchanged, and on the second press
+  must free bytes, leave `orphan_blobs` at 0, leave the workspace files holding their bytes, leave the
+  message rows counted, make `checkpoint_preview` refuse, and leave the card reading "Nothing to
+  forget" with a notice saying who removed the copies. Sabotaging `forget_checkpoints` to delete
+  without the reach check fails as `conversation b's copy is still on disk` in
+  `a_blob_another_conversation_points_at_is_not_freed`; summing row bytes instead of blob bytes fails
+  as `two rows, one blob, so the freed bytes are one file's` in the gateway test.
+- **The group owns its state.** Reasoning and approval mode are set for the tool turns and restored in
+  a `finally` that runs whichever way the claims went, and the two files it made are deleted through
+  the model's own `exec` so the folder is left as it was found — a check that leaves files behind in
+  somebody's folder is the check doing the thing the feature exists to prevent.
+
+Four mock scenarios back it (`ledger-write`, `ledger-edit`, `ledger-twin`, `ledger-slow`): the mock
+answers an unmatched prompt with a 400, and a ledger group whose turns 400s would grade a conversation
+that wrote no files at all.
+
+### Looking at the page: how a design pass is actually seen
+
+A suite that grades rectangles never shows anybody what the thing looks like. When the browser
+column was redrawn — icons instead of words, an address field, tabs, an idle ring — the geometry
+checks (`chrome-height`, `browser-panel`) said the column was the right height and every glyph had
+a name; they said nothing about whether the empty state read as an empty page or as a bug.
+
+The way to see it without touching the user's desktop:
+
+```
+node scripts/mock-llm.mjs --port 8795 --model cwoffee-mock &      # probe it a few times before trusting it
+target/release/cwoffee-gateway --port 8199 --url http://127.0.0.1:8795/v1 \
+    --model cwoffee-mock --workspace /tmp/gvis/ws --db /tmp/gvis/data/store.db --mode auto &
+node browser/driver.mjs < request.json      # writes a PNG at screenshot_path
+```
+
+`request.json` is one JSON object: a `url`, a `steps` array (`fill` the composer by its CSS
+selector, `press` Enter, `click` `[data-browser-toggle]`, `wait`), and
+`"screenshot":"full","screenshot_path":"/tmp/gvis/panel.png"`. The driver is the same one-shot
+browser the `browse` tool uses, so the picture is a real browser's rendering of the built page, not
+a mock-up. Typing the scenario phrase into the composer makes the model open a kept browser, and
+the column then holds a real page: header, address row, tabs, idle ring, page pixels.
+
+Two honest caveats, both written down rather than worked around:
+
+* **what this shows is the watcher.** The gateway's `browser_panel` payload sets `writable:false`, so
+  the address field and Go are disabled and the footer says the assistant is the only one who can
+  open a page. That is the phone-tab variant of the same component; the writable variant — address
+  box live, keys row, two-press close — is graded by the board inside the desktop window, which this
+  route cannot reach.
+* **a photograph is not a check.** The PNG is for judgement, not for grading. Nothing in the suite
+  compares pixels; the claims stay the geometry and the verbs, because a screenshot of a window at
+  one size proves nothing about the next one. (There is no way to photograph the desktop window
+  here either: GNOME on Wayland refuses `import -window root` and the Shell's screenshot D-Bus method
+  answers `AccessDenied` for a caller like this. That is why the board measures rather than looks.)
+
+### Typing in the composer: what a suite without pixels can honestly claim
+
+The report was that after a turn ended, typed characters did not appear in the composer while the
+send button still unlocked and the text still sent — words present in the control and in state,
+absent from the screen. `composer-type` grades the state that caused it and everything a page-side
+check can reach, and says what it cannot reach:
+
+- **The control must never enter the state that mis-paints.** `disabled` is gone from the composer;
+  the claim is that no point in the turn finds it disabled, before the turn, during it, and after it.
+  Putting `disabled={busy}` back fails as `the composer went disabled during the turn — typed text is
+  invisible from there`. A claim about a paint bug has to be a claim about the *condition*, because
+  the pixels are not observable here.
+- **DOM and state must agree every keystroke.** Typing is one character at a time with the `input`
+  event a real key produces — assigning `value` once would miss a handler that overwrites the box
+  mid-word — and each step compares `textarea.value` with `draft`. A split is the failure a user
+  describes as "I typed it and nothing happened": `the box holds "abc" and the app holds "" — one of
+  them is lying, and the screen shows the box`.
+- **Layout growth is the closest witness to "drawn".** Six lines must make the box scroll
+  (`scrollHeight > clientHeight`; the passing run reports `150px of 85px`). If the control never laid
+  the words out, nothing could draw them. The numbers are captured at the moment of measurement: an
+  earlier version sampled the emptied box afterwards and printed `85px of 85px` under a claim about
+  six lines.
+- **Mid-turn claims need a turn that is verifiably running.** `busy` is asserted before Enter is
+  pressed, and the group refuses outright if it has already cleared: the first run used a 1.4s
+  scenario, the turn ended during the typing loop, and four mid-turn failures fired against an idle
+  composer.
+- **Enter mid-turn refuses and explains itself.** No turn count change, the words still in `draft`,
+  and a note that says they are kept — `Enter during a turn did nothing and said nothing — that reads
+  as a lost keystroke` is what a silent refusal fails as.
+- **The typed words reach the record.** After the turn the same box is typed into again, Enter sends,
+  and `session_messages` is read: the row must hold exactly the composed text. The card of a send is
+  not evidence; the row is.
+- **Blind is said, not skipped.** A frame clock is run alongside the measurements; when the page was
+  given no frames, the ok line marks the run geometry-only rather than implying it saw the screen.
+

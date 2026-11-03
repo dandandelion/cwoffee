@@ -86,10 +86,35 @@ pub fn to_anthropic_messages(msgs: &[Message]) -> (Vec<Value>, Vec<String>) {
                 continue;
             }
             Role::Tool => {
+                // This provider lets a tool result carry the picture itself, in the block the
+                // call is answered with. (The OpenAI-shaped provider cannot: its `tool` role is
+                // text-only, so that one puts the pixels in a message of their own after it.
+                // Two APIs, two shapes, one rule — what the tool saw reaches a model that can
+                // look at it, and never reaches one that cannot.)
+                let content = if m.attachments.is_empty() {
+                    json!(m.content)
+                } else {
+                    let mut parts: Vec<Value> = m
+                        .attachments
+                        .iter()
+                        .map(|a| {
+                            json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": a.mime,
+                                    "data": a.data_b64,
+                                },
+                            })
+                        })
+                        .collect();
+                    parts.push(json!({ "type": "text", "text": m.content }));
+                    Value::Array(parts)
+                };
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
-                    "content": m.content,
+                    "content": content,
                 });
                 push_block(&mut out, "user", block);
                 continue;
@@ -547,6 +572,8 @@ pub fn assistant_message(
         tool_calls,
         tool_call_id: None,
         changes: Vec::new(),
+        // Nothing was typed mid-turn here: this is an answer the model produced.
+        sent_at: None,
     }
 }
 
@@ -679,6 +706,39 @@ mod tests {
             _ => None,
         });
         assert_eq!(sig.as_deref(), Some("AbC=="));
+    }
+
+        #[test]
+    fn a_tool_result_can_carry_the_picture_the_tool_saw() {
+        // This is the provider where a picture belongs *inside* the tool_result block. The
+        // OpenAI-shaped provider cannot do that (its `tool` role is text-only) and puts the
+        // pixels in a message of their own instead; if this test ever fails because someone
+        // "unified" the two shapes, the unification is the bug.
+        let (out, _) = to_anthropic_messages(&[
+            Message::user("look at the page"),
+            Message {
+                role: Role::Tool,
+                content: "browse: the page rendered".to_string(),
+                tool_call_id: Some("toolu_1".to_string()),
+                attachments: vec![crate::provider::Attachment {
+                    mime: "image/png".to_string(),
+                    data_b64: "aW1hZ2U=".to_string(),
+                    name: Some("shot".to_string()),
+                }],
+                ..Default::default()
+            },
+        ]);
+        // The tool result rides in the same user turn as the question before it; this is about
+        // the block inside it, not about where the turn went.
+        let block = &out[0]["content"][1];
+        assert_eq!(block["type"], "tool_result");
+        let parts = block["content"].as_array().expect("content becomes a block list");
+        assert_eq!(parts[0]["type"], "image");
+        assert_eq!(parts[0]["source"]["type"], "base64");
+        assert_eq!(parts[0]["source"]["media_type"], "image/png");
+        assert_eq!(parts[0]["source"]["data"], "aW1hZ2U=");
+        assert_eq!(parts[1]["type"], "text");
+        assert!(parts[1]["text"].as_str().unwrap().contains("the page rendered"));
     }
 
     #[test]

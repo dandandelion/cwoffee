@@ -46,6 +46,14 @@ pub enum ProviderError {
     #[error("{0} is not supported by this provider")]
     Unsupported(String),
 
+    /// Nobody has pointed this app at a model yet. Its own variant rather than `Shape` or
+    /// `Unsupported`, because on a first run this is the *normal* state of the program and the
+    /// sentence every surface owes the person is an invitation ("add an endpoint"), not a fault
+    /// report. A caller that can offer a way out — the composer, the model menu, the pi launcher —
+    /// matches on this and offers it; a caller that cannot still prints the whole sentence.
+    #[error("no model endpoint is configured: add one under Settings › Models")]
+    NoEndpoint,
+
     #[error("stream cancelled")]
     Cancelled,
 }
@@ -196,6 +204,15 @@ pub struct Message {
     /// cache is keyed on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<crate::tools::changes::FileChange>,
+    /// When the person pressed Enter, if this message arrived mid-turn and landed later.
+    ///
+    /// A steer is stamped at the press and written into the record with that time, so the
+    /// transcript reads in the order it was actually typed rather than in the order the loop got
+    /// round to it. Deliberately **not on the wire**: a per-message clock value in a request body
+    /// would change prompt bytes every turn and throw away the prefix cache, and a changing fact
+    /// belongs in the record, not in what the model is shown.
+    #[serde(skip)]
+    pub sent_at: Option<i64>,
 }
 
 impl Message {
@@ -505,6 +522,38 @@ pub trait Provider: Send + Sync {
         (chars as f64 / 3.6).ceil() as u64
     }
 }
+
+/// The provider used when nobody has configured an endpoint yet.
+///
+/// It exists so the app can *start*. The alternative was to exit at boot when `[provider]` has no
+/// `base_url`, which is exactly what a first run looks like now that the built-in default endpoint is
+/// gone — a window that refuses to appear is not a setup flow. Everything else works: the record
+/// opens, the sidebar fills, the settings screens read the config, a pasted image is stored. The one
+/// thing that cannot work is asking a model something, and that is what this answers, in the same
+/// words, whichever door it is asked through: the composer, the model list, a title ask, a
+/// compaction, or the gateway on a phone.
+///
+/// The composer refuses an empty model before it reaches this (see the UI), so in normal use the
+/// person never sees this string. It stays because "the UI guards it" is not a guarantee for a phone
+/// or a hand-written gateway call.
+pub struct NullProvider;
+
+#[async_trait]
+impl Provider for NullProvider {
+    fn id(&self) -> &str {
+        "none"
+    }
+    fn label(&self) -> &str {
+        "no endpoint"
+    }
+    async fn stream(&self, _req: &ChatRequest, _sink: &DeltaSink) -> Result<(), ProviderError> {
+        Err(ProviderError::NoEndpoint)
+    }
+    async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        Err(ProviderError::NoEndpoint)
+    }
+}
+
 
 /// Map a vendor's stop reason onto ours. Unrecognised values collapse to
 /// `Other`; the enum is Copy and crosses the IPC boundary, so the raw string is

@@ -670,6 +670,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -723,6 +727,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -759,6 +767,10 @@ mod tests {
     async fn the_hosts_budget_is_the_wait_and_names_the_knob_when_it_bites() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: Some(std::time::Duration::from_millis(150)),
@@ -816,6 +828,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -861,6 +877,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -902,6 +922,10 @@ mod tests {
     async fn the_answer_carries_the_question_and_the_offered_options() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -947,6 +971,10 @@ mod tests {
     async fn a_multi_answer_reports_every_choice() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -991,6 +1019,10 @@ mod tests {
     async fn a_typed_answer_is_labelled_as_typed() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1057,6 +1089,10 @@ mod tests {
     async fn an_answer_comes_back_as_the_tool_result() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1104,6 +1140,10 @@ mod tests {
     async fn a_typed_answer_is_reported_as_typed() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1150,6 +1190,10 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<QuestionRx>();
         drop(rx);
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1174,6 +1218,10 @@ mod tests {
     async fn silence_ends_the_wait_with_an_instruction() {
         let (tx, _rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1197,6 +1245,10 @@ mod tests {
     async fn dropping_the_reply_wakes_the_tool_immediately() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1255,6 +1307,10 @@ mod tests {
     async fn a_set_of_questions_arrives_marked_as_one_card() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1304,6 +1360,10 @@ mod tests {
     async fn a_partial_set_keeps_the_answers_that_arrived() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1347,6 +1407,10 @@ mod tests {
     async fn an_unanswered_set_says_so_about_all_of_them() {
         let (tx, _rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1381,6 +1445,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let (etx, mut erx) = mpsc::unbounded_channel::<crate::event::EngineEvent>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1445,6 +1513,10 @@ mod tests {
     async fn a_single_question_keeps_the_shape_clients_already_handle() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,
@@ -1502,6 +1574,10 @@ mod tests {
     async fn an_out_of_range_recommendation_is_ignored() {
         let (tx, mut rx) = mpsc::unbounded_channel::<QuestionRx>();
         let ctx = ToolCtx {
+            browser: Default::default(),
+            browser_route: None,
+            checkpoint_store: false,
+            lazy_tools: Vec::new(),
             workspace: std::env::temp_dir(),
             max_output_bytes: 4096,
             question_timeout: None,

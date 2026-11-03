@@ -33,7 +33,17 @@ while i + 8 <= len(b):
         W = int.from_bytes(dims[0:3], "little") + 1
         H = int.from_bytes(dims[3:6], "little") + 1
     if fourcc == b"ANMF" and payload is None:
-        payload = b[i + 8 : i + 8 + size][16:]  # past X/Y/duration/flags: the frame's own chunks
+        head = b[i + 8 : i + 8 + size]
+        fx, fy = int.from_bytes(head[0:3], "little"), int.from_bytes(head[3:6], "little")
+        if fx or fy:
+            # The frame is a delta: its image data covers part of the canvas at an offset, and the
+            # bytes only mean something inside the animation that composites them onto a canvas.
+            # Carving them into a full-canvas container writes a file whose declared size and its
+            # image data disagree — ImageMagick calls it `corrupt image` and WebKit shows nothing,
+            # which is how a reduced-motion still shipped broken once. Re-size and re-encode
+            # instead (scripts/mark-resize.py builds both files from one resample).
+            sys.exit(f"{src}: frame 0 is a delta at ({fx},{fy}); carving it out would corrupt the still")
+        payload = head[16:]  # past X/Y/duration/flags: the frame's own chunks
     i += 8 + size + (size & 1)
 if payload is None:
     sys.exit("no ANMF chunk")
@@ -58,5 +68,8 @@ out = b"RIFF" + struct.pack("<I", 4 + len(vp8x) + len(body)) + b"WEBP" + vp8x + 
 open(dst, "wb").write(out)
 
 print(f"{src} -> {dst}: {len(out)} bytes (VP8X + {len(body)} bytes of the frame's own image data)")
-print(subprocess.run(["identify", "-format", "%wx%h channels=%[channels] frames=%n\n", dst],
-                     capture_output=True, text=True).stdout.strip())
+check = subprocess.run(["identify", "-format", "%wx%h channels=%[channels] frames=%n\n", dst],
+                       capture_output=True, text=True)
+if check.returncode != 0:
+    sys.exit(f"{dst} is not readable by an independent decoder: {check.stderr.strip()}")
+print(check.stdout.strip())

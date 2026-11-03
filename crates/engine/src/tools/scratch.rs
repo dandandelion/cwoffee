@@ -124,9 +124,18 @@ pub fn is_attach_rel(rel: &str) -> bool {
 /// the tool wrote another — which is exactly the kind of drift a permission prompt is
 /// supposed to make impossible.
 ///
-/// An absolute path is left alone: it is an explicit instruction, and the confinement
-/// layer is the thing that says no to it. Prefixing it with `.cws/` would silently
-/// rewrite a request the user was shown.
+/// An absolute path is left alone for `Keep` and `Scratch`: it is an explicit instruction, and
+/// the confinement layer is the thing that says no to it. Prefixing it with `.cws/` would
+/// silently rewrite a request the user was shown.
+///
+/// **`Attach` is the exception, and it is the folder.** `Place::Attach` is a promise about where
+/// the bytes land — `.cws/assistant_attachments/`, the one place the transcript hands a file over
+/// — so a destination that leaves that folder while still carrying the promise is the bug this
+/// function used to allow: `download_file` with `place: "attach"` and an absolute or workspace-root
+/// `path` wrote `<ws>/report.pdf`, got labelled `FileKind::Attachment` from the *place*, and the
+/// transcript drew the hand-over container with a Save control on a file nobody had agreed to put
+/// in the hand-over folder. An absolute `path` with `place: "attach"` now keeps its file name and
+/// moves into the folder, and `place_note` says it moved.
 pub fn destination_for(raw: &str, place: Place) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -136,6 +145,19 @@ pub fn destination_for(raw: &str, place: Place) -> String {
             Place::Keep => String::new(),
         };
     }
+    if matches!(place, Place::Attach) && Path::new(raw).is_absolute() {
+        // Only the name travels. An absolute path's directory part is somebody else's
+        // arrangement — `/tmp/dl/x.pdf` is not a folder the person chose to hand over from.
+        let name = Path::new(raw)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| raw.to_string());
+        return format!("{}/{name}", attach_prefix());
+    }
+    // `Keep` and `Scratch` still hand an absolute path to the confinement layer untouched:
+    // rewriting a destination the person was shown in an approval card is the thing that prompt
+    // exists to prevent. `Attach` is the one placement whose folder *is* the decision, so it is
+    // the one that re-places instead of trusting the argument.
     if matches!(place, Place::Keep) || Path::new(raw).is_absolute() {
         return raw.to_string();
     }
@@ -147,7 +169,16 @@ pub fn destination_for(raw: &str, place: Place) -> String {
         return rel.to_string();
     }
     if matches!(place, Place::Attach) {
-        return format!("{}/{rel}", attach_prefix());
+        // Already inside the folder (a path typed out in full) stays where it is; anything
+        // else — the workspace proper, another scratch path, a bare name — lands in the
+        // folder. There is no branch of this function that returns `Attach` with a
+        // destination outside it, which is what makes "the transcript attaches from the
+        // folder alone" a fact of the write rather than of the argument.
+        return if is_attach_rel(rel) {
+            rel.to_string()
+        } else {
+            format!("{}/{rel}", attach_prefix())
+        };
     }
     if is_scratch_rel(rel) {
         return rel.to_string();
@@ -284,11 +315,72 @@ pub fn attachment_path(workspace: &Path, rel: &str) -> Result<PathBuf, String> {
         ));
     }
     let full = super::path::confine(workspace, clean).map_err(|e| e.to_string())?;
-    let md = std::fs::metadata(&full).map_err(|_| format!("{rel} no longer exists"))?;
+    let md = std::fs::metadata(&full).map_err(|_| missing_note(rel, workspace, None))?;
     if !md.is_file() {
         return Err(format!("{rel} is not a file"));
     }
     Ok(full)
+}
+
+/// Find a turn's file, and say what was searched when it is not there.
+///
+/// A transcript row is a *record*: the tool wrote the file into the folder the
+/// conversation lived in at the time. The folder the host is working in now can be a
+/// different one — the app restored this conversation from another workspace, or you are
+/// reading an old conversation while a new one is open — and resolving the record against
+/// the current folder then fails on a file that is sitting, unmodified, in the folder the
+/// conversation belongs to. `save_attachment_as` already resolves through the row for
+/// exactly this reason; a click that resolves through the host is the same bug with a
+/// friendlier name, and its old answer was a lie: `{rel} no longer exists`.
+///
+/// So the conversation's own folder is tried first, the host's folder second (a session
+/// moved between folders legitimately, and the file moved with it), and a miss names every
+/// folder searched instead of claiming anything about the file's history.
+pub fn turn_file_path(
+    conversation: Option<&Path>,
+    host: &Path,
+    rel: &str,
+) -> Result<PathBuf, String> {
+    let clean = rel.trim().trim_start_matches("./");
+    if clean.is_empty() || clean.contains('\0') || Path::new(clean).is_absolute() {
+        return Err(if clean.is_empty() {
+            "no file path given".to_string()
+        } else {
+            format!("{rel} is not a workspace-relative path")
+        });
+    }
+    let mut searched: Vec<PathBuf> = Vec::new();
+    for ws in [conversation, Some(host)].into_iter().flatten() {
+        if searched.iter().any(|p| p == ws) {
+            continue;
+        }
+        searched.push(ws.to_path_buf());
+        // `confine` is the whole containment rule: a traversal in a model-authored path
+        // resolves to nothing here rather than to a file outside the folder.
+        if let Ok(full) = super::path::confine(ws, clean) {
+            if full.is_file() {
+                return Ok(full);
+            }
+        }
+    }
+    Err(missing_note(rel, &searched[0], searched.get(1).cloned()))
+}
+
+/// The sentence for a record that points at bytes nobody can find.
+///
+/// It says which folders were searched, in the order they were searched, and it stops at
+/// that. "No longer exists" was the old wording and it was not supportable: the only thing
+/// this function knows is that the folders it was given do not hold the file. The file may
+/// be in a third folder, the conversation may have been moved, or the record may be older
+/// than the disk — the reader's next step is a folder list, not a story about deletion.
+fn missing_note(rel: &str, first: &Path, second: Option<PathBuf>) -> String {
+    let folders = match second {
+        Some(b) => format!("{} or {}", first.display(), b.display()),
+        None => format!("{}", first.display()),
+    };
+    format!(
+        "{rel} is not in {folders} — this conversation's record says a turn wrote it, and the          folders that record could point at do not hold it. It was moved, deleted, or written          while the conversation lived in another folder."
+    )
 }
 
 /// Create `.cws` and its self-ignoring `.gitignore`.
@@ -317,7 +409,7 @@ pub fn ensure_scratch(workspace: &Path) -> Result<(), String> {
 pub fn place_note(place: Place, rel: &str) -> String {
     match place {
         Place::Attach => format!(
-            "{rel} is in .cws/assistant_attachments/ — the transcript attaches it to this \n             turn, and the person chooses where to save it. That is the right place for a file \n             you are handing over. Something you only needed for yourself belongs in .cws/, and a \n             file they asked to have in their own folder belongs there."
+            "{rel} is in .cws/assistant_attachments/ — the transcript attaches it to this \n             turn, and the person chooses where to save it. That is the right place for a file \n             you are handing over. Something you only needed for yourself belongs in .cws/, and a \n             file they asked to have in their own folder belongs there. A `path` outside that \n             folder is moved into it when `place` is `attach`: the folder is the decision to \n             hand the file over, so the placement cannot be a label on a file that stayed elsewhere."
         ),
         Place::Scratch => format!(
             "{rel} is under .cws/ — cwoffee's scratch folder, for files the model fetched \
@@ -350,6 +442,70 @@ mod tests {
             Place::Scratch,
             "an empty place is no decision, and no decision is scratch"
         );
+    }
+
+    /// A transcript row is a record of where a turn wrote something, and the folder the host is
+    /// working in now is not always that folder. Resolving the record against the current one is
+    /// how a click on a file that exists answers `no longer exists`.
+    #[test]
+    fn a_turn_file_is_found_in_the_folder_its_conversation_lives_in() {
+        let root = std::env::temp_dir().join(format!("cw-turnfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let conv = root.join("conversation-folder");
+        let host = root.join("host-folder");
+        std::fs::create_dir_all(conv.join(".cws/assistant_attachments")).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(conv.join("three-feature-prompt-3.md"), b"# Task\n").unwrap();
+
+        // The conversation's own folder wins, even though the host's folder is the one the
+        // process is working in.
+        let got = turn_file_path(Some(&conv), &host, "three-feature-prompt-3.md").unwrap();
+        assert_eq!(got, conv.join("three-feature-prompt-3.md"), "{got:?}");
+
+        // A file that only the host folder holds is still found — a conversation can move
+        // between folders and take its files with it.
+        std::fs::write(host.join("moved.md"), b"moved\n").unwrap();
+        let got = turn_file_path(Some(&conv), &host, "moved.md").unwrap();
+        assert_eq!(got, host.join("moved.md"), "{got:?}");
+
+        // Both folders are the same place: searched once, and the refusal says one folder.
+        let got = turn_file_path(Some(&conv), &conv, "three-feature-prompt-3.md").unwrap();
+        assert_eq!(got, conv.join("three-feature-prompt-3.md"));
+
+        // Nothing found: the sentence names every folder it looked in, and makes no claim about
+        // whether the file still exists anywhere.
+        let err = turn_file_path(Some(&conv), &host, "gone.md").unwrap_err();
+        assert!(err.contains(&conv.display().to_string()), "must name the conversation folder: {err}");
+        assert!(err.contains(&host.display().to_string()), "must name the host folder: {err}");
+        assert!(!err.contains("no longer exists"), "that claim is not what this knows: {err}");
+        let one = turn_file_path(None, &host, "gone.md").unwrap_err();
+        assert!(one.contains(&host.display().to_string()) && !one.contains(&conv.display().to_string()), "{one}");
+        assert!(!one.contains("no longer exists"), "{one}");
+
+        // Containment still holds: a record cannot point outside the folder it resolved in, and
+        // an absolute path in a tool result is not a workspace-relative one.
+        assert!(turn_file_path(Some(&conv), &host, "../../../etc/hostname").is_err());
+        assert!(turn_file_path(Some(&conv), &host, "/etc/hostname").is_err());
+        assert!(turn_file_path(Some(&conv), &host, "   ").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The hand-over rule and the record rule disagree on purpose: `attachment_path` refuses
+    /// anything outside `.cws/assistant_attachments/` before it looks at the disk, because that
+    /// control offers to copy a file out, while a click only opens what the record names.
+    #[test]
+    fn a_missing_hand_over_says_which_folder_it_searched() {
+        let root = std::env::temp_dir().join(format!("cw-attach-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".cws/assistant_attachments")).unwrap();
+        let err =
+            attachment_path(&root, ".cws/assistant_attachments/hand.xlsx").unwrap_err();
+        assert!(err.contains(&root.display().to_string()), "names the folder searched: {err}");
+        assert!(!err.contains("no longer exists"), "{err}");
+        // Still refused before the disk for a path that is not in the folder at all.
+        let refused = attachment_path(&root, "three-feature-prompt-3.md").unwrap_err();
+        assert!(refused.contains("is not under .cws/assistant_attachments"), "{refused}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -405,6 +561,42 @@ mod tests {
         assert!(!is_attach_rel(".cws/x"));
         assert!(!is_attach_rel("src/assistant_attachments/x"));
         assert_eq!(attach_prefix(), ".cws/assistant_attachments");
+    }
+
+    /// `Place::Attach` is a promise about a folder, not a label on a result. Every branch of
+    /// `destination_for` with `Attach` lands inside `.cws/assistant_attachments/`, including the
+    /// ones that used to hand back a workspace-root or absolute destination — which is how a file
+    /// nobody agreed to hand over got a Save control in the transcript.
+    #[test]
+    fn an_attach_destination_never_lands_outside_the_hand_over_folder() {
+        for raw in [
+            "report.pdf",
+            "./report.pdf",
+            "sub/report.pdf",
+            "/tmp/dl/report.pdf",
+            "/etc/passwd",
+            ".cws/report.pdf",
+            "docs/x.html",
+            "",
+        ] {
+            let got = destination_for(raw, Place::Attach);
+            assert!(is_attach_rel(&got), "`{raw}` with place=attach landed at {got}");
+            assert!(!got.contains("//"), "double separator: {got}");
+        }
+        // The name survives; somebody else's directory part does not.
+        assert_eq!(destination_for("/tmp/dl/report.pdf", Place::Attach), ".cws/assistant_attachments/report.pdf");
+        // A path already in the folder is not prefixed twice.
+        assert_eq!(
+            destination_for(".cws/assistant_attachments/x.html", Place::Attach),
+            ".cws/assistant_attachments/x.html"
+        );
+        // `Keep` and `Scratch` still show the person the path they were shown, so the approval
+        // card and the write agree; confinement is what says no.
+        assert_eq!(destination_for("/etc/passwd", Place::Scratch), "/etc/passwd");
+        assert_eq!(destination_for("/etc/passwd", Place::Keep), "/etc/passwd");
+        // And the note says the folder is the decision, so a model that asked for a root path
+        // with place=attach learns where the bytes actually went.
+        assert!(place_note(Place::Attach, ".cws/assistant_attachments/report.pdf").contains("moved into it"));
     }
 
     #[test]

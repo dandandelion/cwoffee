@@ -112,6 +112,60 @@ impl Mock {
         v.get("sampling_seen").cloned()
     }
 
+    /// What the mock was asked, newest first, as the server saw it. When a turn count
+    /// is wrong, the number alone says "something else asked" without saying what; the
+    /// prompt prefixes name the caller, which is the difference between a stray title ask
+    /// and a stray retry.
+    async fn last_prompts(&self) -> Vec<String> {
+        let v: serde_json::Value = match reqwest::get(format!("{}/mock/state", self.base)).await {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+        v.get("last")
+            .and_then(|l| l.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.get("prompt").and_then(|p| p.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Which scripted scenarios the mock served, and how many times each.
+    ///
+    /// This, not a raw request count, is what a test of a turn should assert. A cwoffee turn that
+    /// names its own conversation is **two** round trips — the host asks the endpoint for a title
+    /// before it answers (`crate::titling`; `host.rs` explains why the answer waits for it) — and
+    /// both land on this same server, so a count of "requests" reads a legitimate titling ask as a
+    /// mystery extra call. Naming the scenarios keeps the claim each test means ("the answer was
+    /// asked twice, the title once") and still fails on a real retry or a runaway tool loop, because
+    /// that shows up as a second hit on the *answer* scenario.
+    async fn hits(&self) -> serde_json::Map<String, serde_json::Value> {
+        let v: serde_json::Value = match reqwest::get(format!("{}/mock/state", self.base)).await {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return Default::default(),
+            },
+            Err(_) => return Default::default(),
+        };
+        v.get("hits")
+            .and_then(|h| h.as_object())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// How many times one scripted scenario was served.
+    async fn hit_count(&self, scenario: &str) -> u64 {
+        self.hits()
+            .await
+            .get(scenario)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    }
+
     /// How many turns the mock actually served. A test that thinks it ran a turn
     /// while the mock served nothing is testing a memory.
     async fn turns(&self) -> Option<u64> {
@@ -303,9 +357,14 @@ async fn an_answer_cut_off_at_the_output_limit_is_picked_back_up() {
         "the stored continuation is not what the model said: {assistant:?}"
     );
     assert_eq!(
-        mock.turns().await,
-        Some(2),
-        "the mock should have served exactly two round trips: the cut-off and the continuation"
+        mock.hit_count("truncation-check").await,
+        2,
+        "the mock should have served exactly two answer round trips: the cut-off and the continuation"
+    );
+    assert_eq!(
+        mock.hit_count("conversation-title").await,
+        1,
+        "plus the one titling ask, which is a separate round trip by design"
     );
 }
 
@@ -366,7 +425,16 @@ async fn a_scripted_answer_streams_and_reports_what_the_server_claimed() {
     );
     // A first request has nothing cached; the follow-up in the tool-loop test
     // below is where a cache claim has to appear.
-    assert_eq!(mock.turns().await, Some(1), "the mock did not serve the request");
+    assert_eq!(
+        mock.hit_count("six-times-seven").await,
+        1,
+        "the answer was asked other than once"
+    );
+    assert_eq!(
+        mock.hit_count("conversation-title").await,
+        1,
+        "a new conversation is named before it is answered: exactly one titling ask is due"
+    );
 }
 
 #[tokio::test]

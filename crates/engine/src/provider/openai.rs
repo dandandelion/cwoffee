@@ -113,7 +113,7 @@ impl OpenAiProvider {
     }
 
     pub fn build_body(req: &ChatRequest, flavor: Flavor) -> Value {
-        let messages: Vec<Value> = req.messages.iter().map(to_openai_message).collect();
+        let messages: Vec<Value> = req.messages.iter().flat_map(to_openai_messages).collect();
 
         let mut body = json!({
             "model": req.model,
@@ -195,6 +195,31 @@ impl OpenAiProvider {
 
         body
     }
+}
+
+/// One history message, as one or more wire messages.
+///
+/// Usually one. A tool result that carries a picture is two: the Chat Completions `tool`
+/// role takes a string, and there is no field in it for an image, so the pixels go in a
+/// message of their own right after the answer that produced them. That is not a hack to be
+/// embarrassed about — it is the only shape this API accepts, and the caption says where the
+/// picture came from so the model is not left guessing what it is looking at.
+fn to_openai_messages(m: &crate::provider::Message) -> Vec<Value> {
+    let one = to_openai_message(m);
+    if m.role == Role::Tool && !m.attachments.is_empty() {
+        let mut parts = vec![json!({
+            "type": "text",
+            "text": "[image from the tool result quoted above]"
+        })];
+        for a in &m.attachments {
+            parts.push(json!({ "type": "image_url", "image_url": { "url": a.data_url() } }));
+        }
+        let mut carrier = serde_json::Map::new();
+        carrier.insert("role".into(), json!("user"));
+        carrier.insert("content".into(), Value::Array(parts));
+        return vec![one, Value::Object(carrier)];
+    }
+    vec![one]
 }
 
 fn to_openai_message(m: &crate::provider::Message) -> Value {
@@ -689,6 +714,50 @@ mod tests {
     }
 
     /// Byte-stability of the request body is what makes llama.cpp prefix caching
+        #[test]
+    fn a_tool_picture_travels_in_a_message_of_its_own() {
+        // Chat Completions has no image field on a `tool` message, so the picture follows the
+        // answer that produced it as its own user turn, captioned so the model knows what it is
+        // looking at. The order is the thing being graded: a tool_call left unanswered is a 400
+        // from the endpoint, and a picture with no caption is a picture from nowhere.
+        let msgs = to_openai_messages(&Message {
+            role: Role::Tool,
+            content: "browse: the page rendered".to_string(),
+            tool_call_id: Some("c1".to_string()),
+            attachments: vec![crate::provider::Attachment {
+                mime: "image/png".to_string(),
+                data_b64: "aW1hZ2U=".to_string(),
+                name: None,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(msgs.len(), 2, "the answer and the picture, in that order");
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "c1");
+        assert!(msgs[0]["content"].is_string(), "this role takes text only");
+        assert_eq!(msgs[1]["role"], "user");
+        let parts = msgs[1]["content"].as_array().unwrap();
+        assert!(parts[0]["text"].as_str().unwrap().contains("tool result"));
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,aW1hZ2U=");
+    }
+
+    #[test]
+    fn a_tool_result_with_no_picture_stays_one_plain_message() {
+        // Every non-browser tool, and every browser run on a model that cannot look: the
+        // request must be what it was before a browser existed. A feature that is not in the
+        // conversation must not cost a message.
+        let msgs = to_openai_messages(&Message {
+            role: Role::Tool,
+            content: "1:\\tRegion\\tUnits".to_string(),
+            tool_call_id: Some("c1".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "tool");
+        assert!(msgs[0]["content"].is_string());
+    }
+
     #[test]
     fn an_image_becomes_an_image_url_part() {
         let m = to_openai_message(&Message::user_with(

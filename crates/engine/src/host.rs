@@ -40,6 +40,14 @@ pub struct HostConfig {
     /// remembering what it last asked for, so a second client cannot be shown a
     /// switch that the host did not make.
     pub persona: Persona,
+    /// Whether a chat conversation may reach the web — `web_search` and `web_fetch` mounted, and the
+    /// prompt telling the model they exist. See [`HostState::web`] for why this is the host's fact
+    /// to report rather than the window's to remember.
+    ///
+    /// Off by default in both directions, on purpose: a coworker already has these tools as part of
+    /// its job, and a chat that suddenly grows network reach is a change in what the person agreed
+    /// to. The chip in the composer is what turns it on, per conversation.
+    pub web: bool,
     pub reasoning: Reasoning,
     /// Cap on provider round-trips in one turn; 0 = no cap. See AgentConfig: the
     /// old hardcoded 14 acted as a work budget and cut real tasks short.
@@ -61,6 +69,15 @@ pub struct HostConfig {
     /// ~/Projects told the model it was working in ~/cwoffee-workspace while its
     /// `pwd` said otherwise.
     pub env_override: Option<String>,
+    /// The MCP catalog: third-party servers and the tools they offered at startup, in a few
+    /// hundred bytes. Appended inside `<env>` per turn rather than put in the system prompt,
+    /// because the env block is rewritten every turn anyway (it names the folder and the
+    /// sandbox) while the system prompt is a cache prefix — so turning a server on or off costs
+    /// history bytes, not a permanently edited prompt for every session.
+    ///
+    /// Empty means no servers, and then the block is byte-identical to what it was before MCP
+    /// existed, which is what keeps a machine with no `[mcp]` from paying for a feature it has.
+    pub mcp_catalog: String,
     /// How long an unanswered approval prompt waits before refusing.
     pub approval_timeout: std::time::Duration,
     /// How long an `ask_user` card stays open. `question_timeout_secs` in config.toml.
@@ -94,6 +111,35 @@ pub struct HostConfig {
     /// most confidently wrong sentence in the system prompt: "no network access"
     /// on a product that defaults to an allowlist proxy.
     pub egress: crate::tools::net::NetMode,
+    /// The browser this host can offer, and what it knows about the model's eyes. The
+    /// driver half is the caller's (it is the caller that built the registry, and the two
+    /// have to agree or a card names a tool the prompt never declared); the vision half is
+    /// re-read per turn below, because the model changes and the config file is where the
+    /// answer lives.
+    pub browser: crate::tools::browser::BrowserCfg,
+    /// The **kept** browser this app is holding, if any: the browser behind the window's
+    /// sidebar. `None` means nothing is kept here, and `browse` with `session: true` says so
+    /// rather than opening a second browser the person cannot see.
+    ///
+    /// It is a handle rather than a path because the browser lives in *this* process on the
+    /// Rust core, and on the pi core it lives in the app while the tool host does not — so
+    /// that side passes a socket instead. Both sides carry the same synchronous state mirror
+    /// for the same reason: `risk_for` cannot await.
+    pub browser_route: Option<crate::tools::browser::BrowserRoute>,
+    /// What a message typed during a turn promises: into it, or after it (`crate::steer`).
+    ///
+    /// Stored here rather than remembered per window: the composer says which kind the next press
+    /// is, and a phone tab and the desktop pressing Enter in the same conversation have to be given
+    /// the same answer. The value comes from `mid_turn` in config.toml, and the settings screen
+    /// writes it back through the same field the mode and the thinking default use.
+    pub mid_turn: crate::steer::MidTurn,
+    /// The palette every surface starts from (`crate::theme`). One value, in `config.toml`, read at
+    /// start by the window, a device tab and the terminal.
+    ///
+    /// The host publishes it rather than leaving it in the file because the alternative is what this
+    /// replaced: the key was stored, nobody read it, and the palette lived in one browser's
+    /// `localStorage` — a setting that only one surface remembered.
+    pub theme: crate::theme::Theme,
 }
 
 impl HostConfig {
@@ -103,12 +149,16 @@ impl HostConfig {
             workspace: workspace.into(),
             mode: ApprovalMode::Ask,
             persona: Persona::Cowork,
+            // A chat starts with no network reach; the composer chip is what grants it, per
+            // conversation. Cowork keeps its web tools because they are part of the job.
+            web: false,
             reasoning: Reasoning::XHigh,
             // Uncapped by default; set max_tool_iters in config.toml for a hard stop.
             max_tool_iters: 0,
             max_tokens: None,
             context_budget: None,
             env_override: None,
+            mcp_catalog: String::new(),
             approval_timeout: std::time::Duration::from_secs(300),
             question_timeout: None,
             max_attachments: DEFAULT_MAX_ATTACHMENTS,
@@ -116,7 +166,36 @@ impl HostConfig {
             sampling: crate::provider::Sampling::default(),
             cfg_path: None,
             egress: crate::tools::net::NetCfg::default().mode,
+            // No driver by default: a test host, a probe, and an example do not open
+            // browsers, and the tool says "this start has no browser driver" rather than
+            // pretending. The desktop and the gateway fill this from the config file.
+            browser: crate::tools::browser::BrowserCfg::default(),
+            browser_route: None,
+            mid_turn: crate::steer::MidTurn::default(),
+            theme: crate::theme::Theme::default(),
         }
+    }
+}
+
+/// Whether the model named here takes image input, as the config file records it.
+///
+/// Read per turn rather than remembered, from the same file the settings screen writes: the
+/// model can change mid-session, and a fact that is a turn stale decides whether a window is
+/// painted on a person's desktop. `None` (no config file, or a model nobody probed) is
+/// Unknown, which the browser tool treats as "no pixels, no window" and says out loud.
+/// Shared with the pi core, which needs the same answer for the same reason: `cwtool` decides
+/// headless versus headed from that row, and the host's published state and the settings line have
+/// to agree with what the tool will do. A second copy of this lookup would drift the first time a
+/// model changed mid-session, and the drift would be a window on someone's desktop.
+pub fn model_vision(cfg_path: Option<&std::path::Path>, model: &str) -> crate::tools::browser::Vision {
+    use crate::tools::browser::Vision;
+    let Some(p) = cfg_path else {
+        return Vision::Unknown;
+    };
+    match crate::config::vision_in(p, model) {
+        Some(true) => Vision::Yes,
+        Some(false) => Vision::No,
+        None => Vision::Unknown,
     }
 }
 
@@ -156,7 +235,12 @@ pub fn tool_views() -> Vec<ToolView> {
         .ok()
         .map(|(c, _)| c)
         .unwrap_or_default();
-    let reg = crate::tools::Registry::with_v1_tools_exec(cfg.search_backend(), cfg.exec_cfg());
+    let bc = cfg.browser_cfg();
+    let reg = crate::tools::Registry::with_v1_tools_browser(
+        cfg.search_backend(),
+        cfg.exec_cfg(),
+        bc.usable().then(|| bc.clone()),
+    );
     reg.defs()
         .into_iter()
         .map(|d| ToolView { name: d.name, description: d.description })
@@ -409,6 +493,86 @@ pub fn persist_setting(path: &Option<std::path::PathBuf>, key: &str, toml_value:
     }
 }
 
+/// Take up whatever endpoint the config names now, in the running host.
+///
+/// Queued by [`HostOps::reload_provider`], so it only ever runs between turns — which is the whole
+/// point of putting it in the queue: a stream that changed endpoint mid-answer would be one answer
+/// written by two models, and the transcript would not say so.
+async fn reload_provider_now(
+    agent: &mut crate::agent::Agent,
+    budget_provider: &mut Arc<dyn Provider>,
+    provider_cell: &Arc<Mutex<Arc<dyn Provider>>>,
+    cfg: &HostConfig,
+    state: &Arc<Mutex<HostState>>,
+    gauge: &Arc<Mutex<crate::prompt::ContextGauge>>,
+    budget_pin: Option<usize>,
+    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+) {
+    let cfg_now = crate::config::load_effective(cfg.cfg_path.as_deref());
+    let url = cfg_now.provider.base_url.trim().to_string();
+    if url.is_empty() {
+        // The config says nothing, so the running host keeps whatever it was already answering
+        // with. Saying so is the difference between "the setting did not take" and "the setting said
+        // there is nothing to take".
+        let sess = state.lock().unwrap().session_id;
+        let _ = ev_tx.send(EngineEvent::Note {
+            session: Some(sess),
+            message: format!(
+                "nothing was taken up: {} still names no endpoint, so this app keeps answering from whatever it started with. Add an address under Settings › Models.",
+                cfg.cfg_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the config".into())
+            ),
+        });
+        return;
+    }
+    let built = match cfg_now.build_provider() {
+        Ok(p) => p,
+        Err(e) => {
+            // An `Error` event, not a `Note`: the person asked for an endpoint and did not get one.
+            // The variant carries no session by design — an endpoint failure is not a conversation's.
+            let _ = ev_tx.send(EngineEvent::Error {
+                message: format!("the endpoint in the config was not taken up: {e}"),
+                fatal: false,
+            });
+            return;
+        }
+    };
+    let kind = cfg_now.provider.kind.clone();
+    let model = agent.model();
+    agent.set_provider(Arc::clone(&built));
+    *budget_provider = built;
+    // Swap the shell's handle in its own statement, and do not hold the guard across anything that
+    // can await or ask for the same lock — that exact shape deadlocked this task once before.
+    {
+        let mut cell = provider_cell.lock().unwrap();
+        *cell = Arc::clone(budget_provider);
+    }
+    // Different endpoint, different model's window. The compaction ceiling comes from the window, so
+    // leaving it at the previous endpoint's number is how a fold shows up in a conversation that is
+    // nowhere near full — or never shows up in one that is.
+    apply_context_budget(
+        agent,
+        budget_provider,
+        budget_pin,
+        state,
+        &cfg.sampling,
+        gauge,
+        true,
+        cfg.cfg_path.as_deref(),
+    )
+    .await;
+    let sess = state.lock().unwrap().session_id;
+    let _ = ev_tx.send(EngineEvent::Note {
+        session: Some(sess),
+        message: format!(
+            "this app answers from {url} ({kind}) now, with {model}: {t}",
+            t = context_budget_note(state, &model)
+        ),
+    });
+}
+
 fn context_budget_note(state: &Arc<std::sync::Mutex<HostState>>, model: &str) -> String {    let s = state.lock().unwrap();
     match s.model_window {
         Some(w) => format!(
@@ -420,6 +584,58 @@ fn context_budget_note(state: &Arc<std::sync::Mutex<HostState>>, model: &str) ->
             s.context_budget
         ),
     }
+}
+
+/// Grant or take away web reach for one conversation, on both transports, in one place.
+///
+/// Two doors lead here — the desktop window and the gateway on a phone — and both have to refuse the
+/// same asks for the same reasons, otherwise "the Web chip" means one thing on a laptop and another
+/// on a phone. The record is written here (never by the host), and the host is only told when the
+/// conversation being changed is the one it is holding.
+///
+/// The refusals are the substance:
+///
+///  * **not a chat** — a cowork conversation already has `web_search` and `web_fetch`; writing a
+///    grant for it would put a number on the row that nothing reads, and a stored setting that does
+///    nothing is the start of a UI that lies;
+///  * **mid-turn, for the conversation in hand** — the model was given its tools when the turn
+///    started. Flipping the chip then would show a switch the running turn never had, which is the
+///    same half-applied failure the folder move refuses to make.
+pub fn set_conversation_web(
+    store: &dyn crate::store::StoreOps,
+    host: &dyn HostOps,
+    session: i64,
+    on: bool,
+) -> Result<String, String> {
+    let st = host.state();
+    let held = st.session_id == session;
+    if held && st.busy {
+        return Err(format!(
+            "a turn is running in conversation {session}: it was given the tools it started with. Ask again once it finishes, or stop it first — otherwise the switch says one thing and the model is busy answering with another."
+        ));
+    }
+    let row = store
+        .session(session)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {session} is not in the record"))?;
+    if row.persona != "chat" {
+        return Err(format!(
+            "conversation {session} is a cowork conversation: its coworker already has web_search and web_fetch. The Web switch is a chat thing — a chat starts with no tools at all."
+        ));
+    }
+    store.set_session_web(session, on).map_err(|e| e.to_string())?;
+    if held {
+        host.set_web(on);
+    }
+    Ok(format!(
+        "conversation {session} can {}reach the web{}.",
+        if on { "" } else { "no longer " },
+        if held {
+            " — the model process remounts on the next turn"
+        } else {
+            ", and it will be mounted that way when you open it"
+        }
+    ))
 }
 
 /// The engine's one definition of "a workspace this app will run tools in": an
@@ -547,6 +763,37 @@ impl Persona {
         conversation only: you have no tools and no folder to work in, so never offer to open, \
         run or change anything — say what you think instead.";
 
+    /// The same assistant with the two network tools granted. See [`Persona::chat_prompt`] for when
+    /// each is sent, and the test `the_two_chat_prompts_are_one_assistant` for why the shared opening
+    /// is asserted rather than trusted.
+    pub const CHAT_WEB_PROMPT: &'static str = "You are cwoffee, a helpful assistant. This mode is \
+        conversation only: you have no file tools and no folder to work in, so never offer to open, \
+        run or change anything on this machine — say what you think instead. Two tools are yours: \
+        web_search, which finds pages about a topic, and web_fetch, which reads one. Use them \
+        whenever an answer depends on something only looking can tell you — prices, versions, dates, \
+        anything current — and name the page an answer came from. A search that returns nothing \
+        useful is answered by saying so, not by guessing.";
+
+    /// Written as its own text rather than an appended sentence on the plain one, because the plain
+    /// one spends its first clause denying tools. "…except these two" bolted onto a denial is how a
+    /// model ends up not searching: the two halves answer each other instead of the question. So the
+    /// web text restates the file-and-shell prohibition where the model will read it, because in this
+    /// mode that is still the sentence keeping a chat from promising to fix someone's folder.
+
+    /// The whole instruction a chat gets, in whichever shape the Web switch makes it.
+    ///
+    /// Two texts, chosen here rather than assembled at each call site, so the chip in the composer,
+    /// the tools mounted by the model process and the words the model reads are decided in one place.
+    /// A chat with Web off must never be told about `web_search`; a chat with it on must be told,
+    /// because a tool nobody describes is a tool the model does not reach for.
+    pub fn chat_prompt(web: bool) -> &'static str {
+        if web {
+            Self::CHAT_WEB_PROMPT
+        } else {
+            Self::CHAT_PROMPT
+        }
+    }
+
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "cowork" | "coworker" => Some(Self::Cowork),
@@ -568,6 +815,20 @@ pub enum HostCmd {
     /// this on the pi side: the tool set and the system prompt are decided when the
     /// process starts, so switching is process lifecycle, not a request parameter.
     SetPersona { persona: Persona },
+    /// Grant or take away the two web tools for the chat conversation this host is holding.
+    ///
+    /// Deliberately not a general "set tools" verb: the pair is the whole of what a chat is allowed
+    /// to be given, and a knob that could mount any tool from the wire would be a much larger door
+    /// for a phone to walk through.
+    SetWeb { on: bool },
+    /// Take up the endpoint this app's config now names, without a restart.
+    ///
+    /// The address a turn goes to is written by the model screen; if the running host could not
+    /// accept it, the only honest answer would be "restart the app", and that is a poor price for
+    /// changing one line. On the Rust core this swaps the provider the agent streams through and
+    /// re-reads the window the budget comes from. On the pi core it re-mounts cwoffee's endpoints in
+    /// pi's provider file and closes the model process, which reads that file when it starts.
+    ReloadProvider,
     /// `attachments` are validated at this boundary, before anything reaches the
     /// provider: an unbounded or arbitrary-mime payload from a UI would be a
     /// memory and SSRF-adjacent problem downstream.
@@ -589,6 +850,15 @@ pub enum HostCmd {
         session: Option<i64>,
     },
     SetMode { mode: ApprovalMode },
+    /// "What is declared to the model right now, and what is registered but withheld."
+    ///
+    /// Answered by the host loop rather than by the shells, because the registry lives in the
+    /// agent: a settings page or a check that rebuilt a tool list from config would be grading a
+    /// second, invented registry. Asked and answered on a reply channel like `Branch` for the same
+    /// reason — the caller needs the answer, not an event that may arrive.
+    ToolInventory {
+        reply: oneshot::Sender<Result<(Vec<String>, Vec<String>), String>>,
+    },
     /// Set the thinking effort.
     ///
     /// `persist` says which dial was moved, and the two are different asks:
@@ -618,7 +888,79 @@ pub enum HostCmd {
     ClearSession,
     NewSession { title: String },
     SwitchSession { id: i64 },
+    /// Forget what the host was told after the stored transcript for this conversation now ends.
+    ///
+    /// Ordering is the whole contract: the caller has already cut the store (`crate::edit`), and
+    /// this verb re-syncs the *model's* memory to what the record says. Sent before the re-send, so
+    /// the queue does the ordering for it: rewind, then the new turn.
+    ///
+    /// It is a verb rather than something the caller does, because only the host loop owns the
+    /// memory: on the Rust core that is the agent's in-process history, on the pi core it is a
+    /// JSONL file pi owns. A host that is not holding this conversation has nothing to forget and
+    /// says so in the transcript.
+    Rewind { session: i64 },
+    /// Make a second conversation out of part of this one, and move this host onto it.
+    ///
+    /// Queued with a reply channel because the answer is a new conversation id the caller has to
+    /// open, and only the host loop can make it: on the Rust core that means replaying the copied
+    /// rows into the prompt, on the pi core it means forking pi's session tree and mapping the fork
+    /// file onto the new row. Both cores read [`crate::branch`] for the rules and the wording, so a
+    /// phone and a desktop are refused the same way and told the same thing when it works.
+    Branch {
+        req: crate::branch::BranchReq,
+        reply: oneshot::Sender<Result<crate::branch::BranchOutcome, String>>,
+    },
+    /// Move this conversation's leaf — the node its next answer reads through.
+    ///
+    /// One write, one owner: this loop sets the record's leaf **and** re-seeds the agent's in-process
+    /// history from it. Doing the two separately is what lets a record point at a branch the model is
+    /// not reading. Re-seeded the way [`Self::Rewind`] re-seeds — replayed from the store, with the
+    /// same `persisted_next` bookkeeping so the rows the branch reads are not written a second time.
+    ///
+    /// The reply is the host's own sentence about its memory, which goes into the outcome note. A
+    /// host holding a different conversation answers that it moved the record and had nothing else to
+    /// move: that is a fact the user needs, not an error.
+    MoveLeaf {
+        session: i64,
+        target: crate::tree::LeafTarget,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     Cancel,
+    /// Change what a message typed during a turn promises: `steer` (into this turn, at its next
+    /// step) or `follow_up` (after it).
+    ///
+    /// Queued rather than applied from the shell, because this loop is the one that writes
+    /// `config.toml` — the same reason `SetMode` and `SetReasoning` are queued. A message already
+    /// waiting keeps the kind it was typed as: changing the setting does not re-promise a message
+    /// that is already in the queue.
+    SetMidTurn { kind: crate::steer::MidTurn },
+    /// Change the stored palette. Queued for the same reason `SetMidTurn` is: this loop is the one
+    /// that writes `config.toml`, and a choice that lived only in the running process would be gone
+    /// at the next start — which is the whole complaint `theme` used to be.
+    ///
+    /// This is the **host's** value. A window's override never travels here: it belongs to that
+    /// window's own store, and sending it would let one tab repaint every other surface.
+    SetTheme { kind: crate::theme::Theme },
+    /// The third-party servers just changed: a settings write put new keys in `config.toml` and the
+    /// hub was reconciled, so this conversation's catalog and its withheld tools have to follow.
+    ///
+    /// Answered by the host loop because the registry lives with the agent — a second registry built
+    /// on the command's way in would be prompt bytes the running turn never sees, which is the fault
+    /// `tool_inventory` was moved off of. On the pi core this is a no-op for a reason rather than a
+    /// stub: its tool host fetches the catalog from the hub on every call and the extension re-reads
+    /// the catalog block on every request, so the next request already carries the change.
+    McpRefresh {
+        hub: Arc<tokio::sync::Mutex<crate::mcp::Hub>>,
+    },
+    /// A mid-turn press, already stamped with cwoffee's id and the moment Enter was pressed.
+    ///
+    /// The Rust core never sees this command: its queue is a shared lock, polled by the agent at the
+    /// step boundary, because this loop runs the turn inline and would not read a command until the
+    /// turn was over. The pi core does: its engine is a child process with its own queue, and
+    /// `steer` / `follow_up` are how that queue is filled.
+    SteerQueued { item: crate::steer::Item },
+    /// Take a queued mid-turn message back before it lands, by cwoffee's id.
+    WithdrawQueued { id: u64 },
     Shutdown,
 }
 
@@ -634,6 +976,26 @@ pub struct HostState {
     /// remembering what they last asked for, so a second client is never shown a
     /// switch the host did not make.
     pub persona: Persona,
+    /// Whether the conversation the host is holding can reach the web: whether `web_search` and
+    /// `web_fetch` are mounted for the model, and whether its system prompt says they are.
+    ///
+    /// It lives on the host's state rather than only in the window because it is a fact about what
+    /// the model was told. The chip, the system prompt and the mounted tools are three places that
+    /// have to agree, and a phone watching the same conversation must read the same answer the
+    /// desktop flipped. Defaulted so a client built before the field exists reads "off" rather than
+    /// losing the whole state payload.
+    #[serde(default)]
+    pub web: bool,
+    /// What the running model was actually given, in words: "no tools at all", "web_search,
+    /// web_fetch", "the coworker's set".
+    ///
+    /// This exists because a switch is a promise, and a promise should be checkable. The chip says a
+    /// chat may search; this field is what the process was launched with, and a check can compare the
+    /// two instead of trusting that the code which sets one also sets the other. Empty means "not
+    /// stated" — the Rust core does not fill it today, and an empty string must never be rendered as
+    /// though it said "none".
+    #[serde(default)]
+    pub web_tools: String,
     pub reasoning: Reasoning,
     /// The effort new conversations start at - what the settings screen sets. `reasoning` is what
     /// *this* conversation is using. The two part company the moment the composer dial moves, and a
@@ -676,6 +1038,16 @@ pub struct HostState {
     pub budget_pin: Option<usize>,
     #[serde(default)]
     pub model_window: Option<usize>,
+    /// What the host currently believes about this model's inputs, which is what decides whether
+    /// `browse` paints a window or runs headless.
+    ///
+    /// Published rather than kept in the tool, because the question "will this open something on my
+    /// screen?" is asked from the settings screen and from a phone, and the answer has to come from
+    /// the running host — the same thing that will actually run the browser. `unknown` is a real
+    /// state here, not a synonym for `no`: it means the endpoint never stated its modalities, and
+    /// the tool's own sentence says as much.
+    #[serde(default)]
+    pub browser_vision: crate::tools::browser::Vision,
     /// Seconds before an unanswered approval fails closed. The UI shows this as a
     /// countdown: a turn blocked on a human looks identical to a turn still
     /// working, and that difference is the entire message.
@@ -711,6 +1083,53 @@ pub struct HostState {
     pub workspace_refusal: Option<String>,
     #[serde(default)]
     pub refusal_seq: u64,
+    /// What a message typed during a turn promises — into it, or after it.
+    ///
+    /// On the state rather than only in the config file because the composer announces it, and the
+    /// announcement has to be the host's answer rather than each window's guess: two tabs with two
+    /// different Enter keys is one conversation getting two different promises.
+    #[serde(default)]
+    pub mid_turn: crate::steer::MidTurn,
+    /// The composer's mid-turn line, in the engine's own words (`crate::steer::composer_hint`).
+    ///
+    /// Published rather than written by the page: the placeholder is a claim about what Enter will
+    /// do, and a UI that phrased it on its own would be a second answer to that question — one that
+    /// drifts the moment the host's wording changes.
+    #[serde(default)]
+    pub mid_turn_hint: String,
+    /// What the stored choice means, for the settings screen (`crate::steer::setting_note`).
+    /// Quoted rather than rewritten by the page: one promise, one sentence, on either core.
+    #[serde(default)]
+    pub mid_turn_note: String,
+    /// What a mid-turn press cannot do: answer a card, move the approval mode, change the tools
+    /// this turn started with. The doors obey this list and the settings page prints it, so a
+    /// reader is not told one thing by a refusal and another by a description.
+    #[serde(default)]
+    pub mid_turn_refusal: String,
+    /// What is waiting in the mid-turn queue right now, for the conversation this host holds.
+    ///
+    /// Published so a client that reloaded mid-turn paints the pending lines it missed, rather than
+    /// showing a transcript that lost a message the person typed. Whole rather than incremental,
+    /// for the same reason as `QueueChanged`: a stale line about a message that already landed is
+    /// worse than no line.
+    #[serde(default)]
+    pub queued: Vec<crate::steer::View>,
+    /// The stored palette — the host's answer, not this window's copy of it.
+    #[serde(default)]
+    pub theme: crate::theme::Theme,
+    /// The settings row's sentence about where the choice lives (`crate::theme::setting_note`),
+    /// quoted so a phone and a desktop cannot paraphrase the two homes differently.
+    #[serde(default)]
+    pub theme_note: String,
+    /// About's line: which value is the host's and which is this client's. The client passes its own
+    /// override in when it asks, and this is the sentence the screen prints with it — see
+    /// `crate::theme::about_says`.
+    #[serde(default)]
+    pub theme_about: String,
+    /// How the palette this surface is *showing* got chosen. For a window that is the media query;
+    /// for a terminal it is `COLORFGBG` or the honest absence of one.
+    #[serde(default)]
+    pub theme_resolved: String,
 }
 
 pub struct SessionHost {
@@ -727,13 +1146,33 @@ pub struct SessionHost {
     cancel: Arc<AtomicBool>,
     /// The host keeps a handle so the shell can ask the endpoint questions that
     /// are not turns - the composer's model picker being the obvious one.
-    provider: Arc<dyn Provider>,
+    ///
+    /// Behind a lock because the endpoint is not fixed for the life of the process: the model screen
+    /// can point this app at another address, and a picker that kept listing the old endpoint's
+    /// models after that would be a UI answering from memory. The search tool below already says the
+    /// same thing about itself; this is the rest of the app catching up.
+    provider: Arc<Mutex<Arc<dyn Provider>>>,
     /// And the search tool, typed: the provider can change while the app runs, and
     /// the only safe place to change it is inside the live tool. Rebuilding the
     /// registry would move prompt bytes and drop every prefix cache, and the
     /// settings card would then be a button that costs the next turn a cold prefill
     /// in every session.
     search: Option<Arc<crate::tools::web::WebSearchTool>>,
+    /// The other half of the queue the agent polls. See [`SessionHost::queue_mid_turn`].
+    queue: crate::steer::Queue,
+    /// A sender into the same event stream the shell is reading. The mid-turn queue is pushed from
+    /// the shell's thread — see the note on [`Self::queue`] — and a press has to be announced on the
+    /// stream every client watches, not only in the state a poll would later read.
+    ///
+    /// Handed back on `Shutdown`, because "the events channel closes once the host task returns" is
+    /// how a shell learns the host is gone: a sender held here would keep that channel open after
+    /// the task ended, and a window would wait for an ending that never arrives.
+    ev: Mutex<Option<crate::agent::EngineSink>>,
+    /// The attachment gate, kept here so a mid-turn picture is checked against the same limits a
+    /// turn's own picture is.
+    limits: AttachmentLimits,
+    /// Where a change made through the UI is written down. `None` means this host is ephemeral.
+    cfg_path: Option<PathBuf>,
 }
 
 pub type EventRx = mpsc::UnboundedReceiver<EngineEvent>;
@@ -744,7 +1183,9 @@ impl SessionHost {
         provider: Arc<dyn Provider>,
         registry: Registry,
         store: Arc<Store>,
-        cfg: HostConfig,
+        // `mut`: the loop re-stores the MCP catalog when a server is added while the app is open,
+        // and the env block for the next turn is built from this same binding (see McpRefresh).
+        mut cfg: HostConfig,
     ) -> SessionHost {
         let provider = Arc::clone(&provider);
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<HostCmd>();
@@ -767,12 +1208,25 @@ impl SessionHost {
         // sidebar shows where a brand-new session would write, instead of an
         // empty list until the first message happens to create a row.
         let _ = store.add_workspace(&cfg.workspace.display().to_string());
+        // ...and the list is pruned of rows for folders that no longer exist. Runs that register a
+        // scratch folder and delete it (the probes, a selftest, a moved temp dir) otherwise leave a
+        // row behind forever, and the sidebar fills with folders nobody added.
+        let _ = store.prune_dead_workspaces();
+        // What the browser will do, decided before anything can run: the driver from the caller
+        // (the same value it built the registry from), and the model's recorded inputs from the
+        // config file. Both are re-read at the start of every turn below — a probe can record
+        // modalities after boot, and a model change is a change to this answer.
+        let boot_vision = model_vision(cfg.cfg_path.as_deref(), &cfg.model);
         let state = Arc::new(Mutex::new(HostState {
             session_id: 0,
             workspace: cfg.workspace.display().to_string(),
             model: cfg.model.clone(),
             mode: cfg.mode,
             persona: cfg.persona,
+            web: cfg.web,
+            // Not stated until a process exists to state it. The bridge fills this when it launches
+            // the model; the Rust core's agent loop does not publish a tool list today.
+            web_tools: String::new(),
             reasoning: cfg.reasoning,
             reasoning_default: cfg.reasoning,
             reasoning_overridden: false,
@@ -790,9 +1244,19 @@ impl SessionHost {
             open_reasoning: String::new(),
             workspace_refusal: None,
             refusal_seq: 0,
+            mid_turn: cfg.mid_turn,
+            mid_turn_hint: crate::steer::composer_hint(cfg.mid_turn),
+            mid_turn_note: crate::steer::setting_note(cfg.mid_turn),
+            mid_turn_refusal: crate::steer::card_refusal(),
+            theme: cfg.theme,
+            theme_note: cfg.theme.setting_note(),
+            theme_about: crate::theme::Theme::about_says(cfg.theme, None),
+            theme_resolved: String::new(),
+            queued: Vec::new(),
             context_budget: cfg.context_budget.unwrap_or(FALLBACK_BUDGET),
             budget_pin: cfg.context_budget,
             model_window: None,
+            browser_vision: boot_vision,
         }));
         // What the prompt costs, owned here and written by the agent. `state()`
         // reads from this rather than from the snapshot, so a client that asks
@@ -803,18 +1267,34 @@ impl SessionHost {
             window: None,
             ..Default::default()
         }));
+        // The mid-turn queue, in a handle both this struct and the agent hold.
+        //
+        // Not a mailbox command: the loop below runs the turn *inline*, so a command sent during a
+        // turn is read only after it — which is precisely the behaviour steering replaces. A lock the
+        // agent polls at its step boundary is the one place a press can arrive while the model is
+        // still working, and it is on the same footing as the cancel flag above for the same reason.
+        let queue = crate::steer::Queue::new();
+        let queue_bg = queue.clone();
         let limits = AttachmentLimits {
             max_count: cfg.max_attachments,
             max_bytes: cfg.max_attachment_bytes,        };
 
         let state_bg = Arc::clone(&state);
         let gauge_bg = Arc::clone(&gauge);
+        // Cloned before the task takes them: the shell side needs a sender for queue announcements,
+        // and it needs to know which file a settings change is written to. `limits` is `Copy`.
+        let ev_bg = ev_tx.clone();
+        let cfg_path_bg = cfg.cfg_path.clone();
         // The task takes the provider; the host keeps a second handle for
         // non-turn questions like the model list.
-        let host_provider = Arc::clone(&provider);
+        // The handle the shell asks non-turn questions with, in a cell the loop can move: see
+        // `SessionHost::provider`.
+        let provider_cell = Arc::new(Mutex::new(Arc::clone(&provider)));
         // The loop task needs a handle too: the compaction budget comes from the
         // window the *loaded* model advertises, which is a provider question.
-        let budget_provider = Arc::clone(&provider);
+        let mut budget_provider = Arc::clone(&provider);
+        // A second handle to the same cell for the loop task; the struct keeps the outer one.
+        let loop_cell = Arc::clone(&provider_cell);
 
         // Built here, not inside the task, so the host can hold the agent's own
         // cancel flag. `SessionHost::cancel()` used to set a separate AtomicBool
@@ -823,7 +1303,23 @@ impl SessionHost {
         // sequential and is parked inside run_turn() for the whole turn, so a
         // Cancel command would only be processed after the turn it should stop.
         let gate = ApprovalGate::new(cfg.mode, ap_tx).with_timeout(cfg.approval_timeout);
+        // The browser the tools will actually use. Vision is re-read here rather than
+        // carried from boot: `browse` decides between a real window and a headless run on
+        // this, and the model may have changed since the host started. A driver is only ever
+        // present if the caller that built the registry saw the same driver — see
+        // `HostConfig::browser`.
+
         let ctx = ToolCtx {
+            browser: {
+                let mut b = cfg.browser.clone();
+                b.vision = boot_vision;
+                b
+            },
+            // The kept browser, if this app has one. Without it `browse` still walks a
+            // throwaway page exactly as before; with it, the tool can be pointed at the
+            // browser a person is looking at instead of opening a second one behind their
+            // back. See `BrowserRoute`.
+            browser_route: cfg.browser_route.clone(),
             workspace: cfg.workspace.clone(),
             max_output_bytes: 24 * 1024,
             ask: Some(ask_tx),
@@ -834,6 +1330,17 @@ impl SessionHost {
             // its conversations, so `session` is filled per turn by the agent loop.
             store: Some(Arc::clone(&store)),
             session: None,
+            // Filled per round-trip by the agent from the registry it owns: the tools that exist
+            // and are not declared yet. Empty here means "this host holds nothing back", which is
+            // what a host with no MCP servers has.
+            lazy_tools: Vec::new(),
+            // Turn checkpoints, when there is a store to index them in. The bytes on disk
+            // are useless without rows: a copy is only revertible if something can say
+            // which turn took it and which message row that turn wrote.
+            // A `SessionHost` always has a store — it is a constructor argument — so the
+            // index can always be written. A host without one (a probe, an example) builds
+            // its own `ToolCtx` and leaves this off.
+            checkpoint_store: true,
             // The two settings `explore` needs in order to describe the tool set honestly.
             // They come from config because config is where the mounting is decided — the same
             // file the caller read when it built `registry` — and a card that names the wrong
@@ -859,6 +1366,10 @@ impl SessionHost {
                 max_tokens: cfg.max_tokens,
                 sampling: cfg.sampling.clone(),
                 gauge: gauge.clone(),
+                queue: queue_bg.clone(),
+                // The flag `SessionHost::cancel()` flips, taken back out of the agent below —
+                // one handle, not two, which is the bug this field used to be.
+                cancel: Arc::new(AtomicBool::new(false)),
             },
             ctx,
         );
@@ -1140,8 +1651,341 @@ impl SessionHost {
                             session: Some(sess),
                         });
                     }
+                    HostCmd::ReloadProvider => {
+                        reload_provider_now(
+                            &mut agent,
+                            &mut budget_provider,
+                            &loop_cell,
+                            &cfg,
+                            &state_bg,
+                            &gauge_bg,
+                            budget_pin,
+                            &ev_tx,
+                        )
+                        .await;
+                    }
+                    HostCmd::SetWeb { on } => {
+                        // Nothing to change, and the reason is worth saying out loud: this core has no
+                        // chat mode, and its coworker already has `web_search` and `web_fetch` as part
+                        // of the job. A switch that answers "done" here would be reporting a change
+                        // that could not be observed anywhere.
+                        let sess = state_bg.lock().unwrap().session_id;
+                        let _ = ev_tx.send(EngineEvent::Note {
+                            message: format!(
+                                "the web switch is a chat thing, and chat mode is not available on the rust core:                                  this core's coworker already has web_search and web_fetch. Nothing changed (asked: {}).",
+                                if on { "on" } else { "off" }
+                            ),
+                            session: Some(sess),
+                        });
+                    }
                     HostCmd::Cancel => {
                         agent_cancel.store(true, Ordering::Relaxed);
+                    }
+
+                    HostCmd::SetTheme { kind } => {
+                        // The file is the home of this choice, so the write happens here, in the
+                        // loop that owns `cfg_path`. A palette that only the running process knew
+                        // about is what `theme` used to be.
+                        let mut st = state_bg.lock().unwrap();
+                        st.theme = kind;
+                        st.theme_note = kind.setting_note();
+                        st.theme_about = crate::theme::Theme::about_says(kind, None);
+                        persist_setting(&cfg.cfg_path, "theme", &crate::Config::toml_str(kind.word()));
+                    }
+                    HostCmd::McpRefresh { hub } => {
+                        // The hub is the authority on what is running, so both halves of the answer
+                        // come off it: the tool list the registry should hold and the catalog text
+                        // the env block carries. Nothing here re-reads the config file — the caller
+                        // reconciled the hub with the file before sending this, and a second reader
+                        // in this loop could disagree with it.
+                        let (catalog, block) = {
+                            let h = hub.lock().await;
+                            (h.catalog(), h.catalog_block())
+                        };
+                        let mut added = 0usize;
+                        let dropped;
+                        {
+                            let reg = agent.registry_mut();
+                            // First take away what the hub no longer offers, then add what it newly
+                            // does: a server that was removed and renamed in the same edit should not
+                            // leave the old name callable until the next start.
+                            let offered: std::collections::HashSet<String> =
+                                catalog.iter().map(|t| t.declared.clone()).collect();
+                            dropped = reg.forget_stale_mcp(&offered);
+                            for info in catalog.iter() {
+                                // Only names this registry has never seen. Re-registering a live
+                                // server's tool would replace the handle mid-turn and reset the
+                                // hidden/declared state of a tool the model may already be using.
+                                if reg.get_shared(&info.declared).is_some() {
+                                    continue;
+                                }
+                                reg.register_lazy(Arc::new(crate::mcp::McpTool::new(
+                                    info.clone(),
+                                    Arc::clone(&hub),
+                                )));
+                                added += 1;
+                            }
+                        }
+                        cfg.mcp_catalog = block;
+                        eprintln!(
+                            "[cwoffee] mcp refresh: {added} new tool(s) registered hidden, {} dropped (the hub no longer offers them), catalog re-stored for the next turn",
+                            dropped.len()
+                        );
+                    }
+
+                    HostCmd::SetMidTurn { kind } => {
+                        // Handled here as well as by `SessionHost::set_mid_turn`, which answers the
+                        // composer immediately: this is where the file gets written, and a choice
+                        // that lived only in this process would be gone at the next start.
+                        let mut st = state_bg.lock().unwrap();
+                        st.mid_turn = kind;
+                        st.mid_turn_hint = crate::steer::composer_hint(kind);
+                        st.mid_turn_note = crate::steer::setting_note(kind);
+                        st.mid_turn_refusal = crate::steer::card_refusal();
+                        persist_setting(
+                            &cfg.cfg_path,
+                            "mid_turn",
+                            &crate::Config::toml_str(kind.word()),
+                        );
+                    }
+
+                    HostCmd::SteerQueued { item } => {
+                        // On this core a mid-turn press goes straight into the shared queue, because
+                        // this loop is parked inside `run_turn` and would not read a command until
+                        // the turn was over. Arriving here means it was sent between turns, and the
+                        // queue is the same queue either way — so the press lands rather than being
+                        // dropped by a host that happens to have been addressed the other core's way.
+                        let session = item.session;
+                        queue_bg.push(session, item.kind, item.text, item.atts, item.typed_at);
+                        let _ = ev_tx.send(EngineEvent::QueueChanged {
+                            session,
+                            items: queue_bg.snapshot(),
+                        });
+                    }
+
+                    HostCmd::WithdrawQueued { id } => {
+                        let session = state_bg.lock().unwrap().session_id;
+                        if queue_bg.withdraw(id).is_none() {
+                            // It landed, or somebody else took it back. Say which of the two the
+                            // reader is looking at, in the same words the trait uses.
+                            let _ = ev_tx.send(EngineEvent::Error {
+                                message: crate::steer::withdraw_gone_refusal(),
+                                fatal: false,
+                            });
+                            continue;
+                        }
+                        let _ = ev_tx.send(EngineEvent::QueueChanged {
+                            session,
+                            items: queue_bg.snapshot(),
+                        });
+                    }
+
+                    HostCmd::Rewind { session } => {
+                        // Half of "edit a message and send it again" happened in the store, before
+                        // this was queued. What is left is the part only this loop can do: the
+                        // agent's in-process history still holds the messages the person has just
+                        // cut out of the record, and a turn built from that answers a question that
+                        // is no longer on screen.
+                        //
+                        // Re-seeded from the store rather than spliced by hand, because the store is
+                        // the transcript: it already holds exactly what the conversation now says,
+                        // in the order it says it, and replaying it is the same path a reopened
+                        // conversation takes (see `adopt_view!`), down to the sequence bookkeeping
+                        // that keeps those rows from being persisted a second time.
+                        if session != session_id {
+                            // The host is holding a different conversation, so it was never told
+                            // the one that was edited: there is nothing here to take back. The edit
+                            // itself stands — the record was cut, and that is what the user asked
+                            // for — so this is a note, not an error.
+                            let _ = ev_tx.send(EngineEvent::Note {
+                                session: Some(session),
+                                message: format!(
+                                    "conversation {session} was taken back to that message. This engine is \
+                                     holding conversation {session_id}, so it had not been told anything \
+                                     about the one you edited; the next time you open it, it starts from \
+                                     what the transcript now says."
+                                ),
+                            });
+                            continue;
+                        }
+                        match store.history(session) {
+                            Ok(hist) => {
+                                let n = hist.len() as u64;
+                                agent.prompt_mut().with_history(hist);
+                                agent.prompt_mut().set_first_seq(0);
+                                agent.reset_turn_id();
+                                persisted_next = n;
+                                {
+                                    let mut s = state_bg.lock().unwrap();
+                                    // Whatever folds the old in-memory prompt had been carrying go
+                                    // with it; the replayed history is un-folded.
+                                    s.compactions = 0;
+                                    s.context_tokens = agent.prompt_mut().estimate_tokens("");
+                                    agent.publish_gauge("");
+                                }
+                                let _ = ev_tx.send(EngineEvent::Note {
+                                    session: Some(session),
+                                    message: format!(
+                                        "the model is back to {n} {} in conversation {session}: anything \
+                                         after the message you edited is off its context.",
+                                        if n == 1 { "message" } else { "messages" }
+                                    ),
+                                });
+                            }
+                            Err(e) => {
+                                // The record is cut and the model still remembers: that is worth
+                                // saying out loud, because the two will disagree until this works.
+                                let _ = ev_tx.send(EngineEvent::Error {
+                                    message: format!(
+                                        "the transcript for conversation {session} was cut, but the model \
+                                         could not be re-read from it ({e}) — it is still working from the \
+                                         messages you removed. Reopen the conversation to fix that."
+                                    ),
+                                    fatal: false,
+                                });
+                            }
+                        }
+                    }
+
+                    HostCmd::MoveLeaf { session, target, reply } => {
+                        // One write here, not two: the record's leaf and this loop's memory move
+                        // together, so a failure leaves the conversation where it was instead of
+                        // pointing a record at a branch the model is not reading.
+                        if let Err(e) = store.set_leaf(session, target.leaf) {
+                            let _ = reply.send(Err(format!(
+                                "the leaf of conversation {session} could not be written ({e}), so \
+                                 nothing was moved"
+                            )));
+                            continue;
+                        }
+                        if session != session_id {
+                            let _ = reply.send(Ok(format!(
+                                "This engine is holding conversation {session_id}, so it had not been \
+                                 told anything about conversation {session}: the branch is in the \
+                                 record, and opening it starts the model there."
+                            )));
+                            continue;
+                        }
+                        match store.history(session) {
+                            Ok(hist) => {
+                                let n = hist.len() as u64;
+                                agent.prompt_mut().with_history(hist);
+                                agent.prompt_mut().set_first_seq(0);
+                                agent.reset_turn_id();
+                                persisted_next = n;
+                                {
+                                    let mut s = state_bg.lock().unwrap();
+                                    s.compactions = 0;
+                                    s.context_tokens = agent.prompt_mut().estimate_tokens("");
+                                    agent.publish_gauge("");
+                                }
+                                let through = match target.leaf {
+                                    Some(id) => format!("message {id}"),
+                                    None => "its newest message".to_string(),
+                                };
+                                let _ = ev_tx.send(EngineEvent::Note {
+                                    session: Some(session),
+                                    message: format!(
+                                        "the model is back to {n} {} in conversation {session}, read \
+                                         through {through}: what came after that node is off its \
+                                         context and still in the record.",
+                                        if n == 1 { "message" } else { "messages" }
+                                    ),
+                                });
+                                let _ = reply.send(Ok(
+                                    "This engine re-read the branch from the conversation's messages, \
+                                     so the model reads it from here."
+                                        .to_string(),
+                                ));
+                            }
+                            Err(e) => {
+                                // The leaf is written and the model cannot be re-read: say so,
+                                // because the two records will disagree until this works.
+                                let _ = reply.send(Err(format!(
+                                    "the leaf of conversation {session} was moved in the record, but \
+                                     this engine could not re-read it from there ({e}) — the model is \
+                                     still working from the whole conversation. Reopen it to put the \
+                                     model on the branch."
+                                )));
+                            }
+                        }
+                    }
+
+                    HostCmd::ToolInventory { reply } => {
+                        // Read from the agent's own registry, in the loop that owns it. Nothing
+                        // else in the app can say what the next request would carry.
+                        let (declared, hidden) = agent.tool_inventory();
+                        let _ = reply.send(Ok((declared, hidden)));
+                    }
+
+                    HostCmd::Branch { req, reply } => {
+                        // No busy check here, and one would be dead code: `Send` runs the turn inline
+                        // in this loop, so a branch cannot be read at all until the turn has ended.
+                        // A mid-turn press is the one thing that does reach this loop while it is
+                        // parked — through the shared queue, not through the mailbox, which is why
+                        // `crate::steer::Queue` is a handle and `SteerQueued` is only the pi road.
+                        // The refusal that matters is the one in `crate::branch::apply_and_open`,
+                        // which runs before the command is queued — the same gate a phone goes
+                        // through, so neither device can branch a conversation mid-answer.
+                        //
+                        // Row first, then the model. If the copy or the adoption fails there is no
+                        // half-made conversation left to find in the sidebar: the row is deleted
+                        // before the error goes back, because a row whose prompt the host could not
+                        // load is a transcript that looks branched and answers like a fresh one.
+                        let rows = match store.messages(req.session) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = reply.send(Err(format!(
+                                    "conversation {} could not be read ({e}), so nothing was branched",
+                                    req.session
+                                )));
+                                continue;
+                            }
+                        };
+                        let point = match crate::branch::resolve(&rows, &req) {
+                            Ok(p) => p,
+                            Err(reason) => {
+                                let _ = reply.send(Err(reason));
+                                continue;
+                            }
+                        };
+                        let (new_id, title, copied) = match crate::branch::create_row(&*store, req.session, &point) {
+                            Ok(v) => v,
+                            Err(reason) => {
+                                let _ = reply.send(Err(reason));
+                                continue;
+                            }
+                        };
+                        // The adoption is the branch: `adopt_view!` replays the copied rows into the
+                        // prompt, rebinds where the next turn is persisted, moves the tools to the
+                        // folder the new row names, and takes the conversation's thinking effort with
+                        // it — which is exactly what "this conversation continues from there" needs
+                        // the model to be told. Marking it announced first keeps the usual
+                        // "reopened with N messages" note off a conversation that was never reopened:
+                        // it was made, one turn ago, in this loop.
+                        resume_announced.insert(new_id);
+                        if !adopt_view!(new_id) {
+                            let _ = store.delete_session(new_id);
+                            let _ = reply.send(Err(format!(
+                                "the branch's row ({new_id}) was created but this engine could not take \
+                 it up, so it was removed: nothing was branched and conversation {} is unchanged",
+                                req.session
+                            )));
+                            continue;
+                        }
+                        let note = crate::branch::outcome_note(req.session, &point, new_id, copied, &title);
+                        // Say what happened to the model's memory as well as to the record: this
+                        // engine has no thread file, and `adopt_view!` above is what makes the
+                        // copied rows the prompt it answers from.
+                        let note = format!("{note} {}", crate::branch::memory_note("rust", None));
+                        let _ = ev_tx.send(EngineEvent::Note { session: Some(new_id), message: note.clone() });
+                        let _ = reply.send(Ok(crate::branch::BranchOutcome {
+                            session: new_id,
+                            title,
+                            copied,
+                            prefill: point.ask,
+                            note,
+                        }));
                     }
 
                     HostCmd::ClearSession => {
@@ -1457,11 +2301,39 @@ impl SessionHost {
                         // the workspace the host settled on a moment ago - after
                         // any adoption, draft creation or workspace move - rather
                         // than from anything captured at startup.
-                        let env = cfg.env_override.clone()
-                            .unwrap_or_else(|| {
-                                default_env_block(agent.workspace(), "linux", cfg.egress)
-                            });
+                        let env = cfg.env_override.clone().unwrap_or_else(|| {
+                            // Read the mirror, not the hub: this runs inside the turn loop, and
+                            // waiting on whoever is driving the browser would let a page click
+                            // stall a model's prompt.
+                            let open = cfg
+                                .browser_route
+                                .as_ref()
+                                .map(|r| r.peek())
+                                .filter(|s| s.alive && s.opened);
+                            env_block_live(
+                                agent.workspace(),
+                                "linux",
+                                cfg.egress,
+                                &cfg.mcp_catalog,
+                                open.as_ref(),
+                            )
+                        });
                         agent.prompt_mut().set_env(env);
+                        // The browser's mode is a volatile fact on the same footing as the env
+                        // block: it is decided from the config file, and it can change inside a
+                        // session — the model changes, or a probe records modalities that were
+                        // unknown at boot. Reading it here rather than once at spawn is what keeps
+                        // "the settings page says this start runs headed" and "the card ran headed"
+                        // from being two answers to one question. The selftest's `browse` group
+                        // grades exactly that pair, and it caught the spawn-time version.
+                        let vision = model_vision(cfg.cfg_path.as_deref(), &agent.model());
+                        agent.set_browser_vision(vision);
+                        {
+                            // Written next to the agent's own copy so a reader of `state()` and the
+                            // tool that runs cannot disagree about what the next browser call will do.
+                            let mut s = state_bg.lock().unwrap();
+                            s.browser_vision = vision;
+                        }
 
                         set_busy(&state_bg, true);
                         // The window is the one fact the whole budget is derived
@@ -1581,6 +2453,21 @@ impl SessionHost {
                         }
                         persisted_next = agent.prompt_mut().next_seq();
 
+                        // Name the answer row this turn's copies belong to, so the
+                        // transcript can offer "revert files from this turn" against a row
+                        // id instead of a guess. Done next to the file stamps for the same
+                        // reason: the row only exists once the answer is finished, and a
+                        // control addressed at a row that is not there yet is a control
+                        // that has to say it is waiting.
+                        if let Some(id) = last_assistant {
+                            if let Err(e) = store.stamp_checkpoints_turn(session_id, agent.turn() as i64, id) {
+                                let _ = ev_tx.send(EngineEvent::Error {
+                                    message: format!("failed to index that turn's file checkpoints: {e}"),
+                                    fatal: false,
+                                });
+                            }
+                        }
+
                         let files = agent.take_turn_files();
                         if !files.is_empty() {
                             if let Some(id) = last_assistant {
@@ -1611,6 +2498,24 @@ impl SessionHost {
                             s.busy = false;
                             s.turns += 1;
                         }
+
+                        // The turn is over. Anything still queued for this conversation made a
+                        // promise about *this* turn, and this turn ended without taking it — Stop,
+                        // an error, or words typed after the last step boundary. They go back to the
+                        // composer rather than migrating into whichever turn comes next, which would
+                        // be a different promise than the one the person typed against.
+                        let back = queue_bg.take_session(session_id);
+                        if !back.is_empty() {
+                            let views: Vec<crate::steer::View> = back.iter().map(|i| i.view()).collect();
+                            let _ = ev_tx.send(EngineEvent::QueueReturned {
+                                session: session_id,
+                                items: views,
+                            });
+                            let _ = ev_tx.send(EngineEvent::Note {
+                                session: Some(session_id),
+                                message: crate::steer::returned_note(back.len()),
+                            });
+                        }
                     }
                 }
             }
@@ -1624,8 +2529,12 @@ impl SessionHost {
             state,
             gauge,
             cancel,
-            provider: host_provider,
+            provider: provider_cell,
             search: search_tool,
+            queue,
+            ev: Mutex::new(Some(ev_bg)),
+            limits,
+            cfg_path: cfg_path_bg,
         }
     }
 
@@ -1638,14 +2547,19 @@ impl SessionHost {
         if !self.state().model.trim().is_empty() {
             return None;
         }
-        let first = self.provider.list_models().await.ok()?.into_iter().next()?;
+        // Read the handle out and drop the guard before the await: a lock held across a network call
+        // is how this app has deadlocked before (see the session-id note in the command loop).
+        let provider = self.provider();
+        let first = provider.list_models().await.ok()?.into_iter().next()?;
         self.send(HostCmd::SetModel { model: first.clone(), persist: false });
         Some(first)
     }
 
-    /// Handle to the endpoint, for shell-level queries that are not turns.
-    pub fn provider(&self) -> &Arc<dyn Provider> {
-        &self.provider
+    /// Handle to the endpoint, for shell-level queries that are not turns. Cloned out rather than
+    /// borrowed: the handle can be moved by the loop the moment the person changes endpoint, and a
+    /// borrow would be a promise that it stays there.
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.provider.lock().unwrap())
     }
 
     /// What search is currently doing, in one line ("DuckDuckGo (keyless HTML
@@ -1698,7 +2612,20 @@ impl SessionHost {
     }
 
     pub fn send(&self, cmd: HostCmd) {
+        if matches!(cmd, HostCmd::Shutdown) {
+            // Give up our sender before the task ends, so the receivers see the stream close.
+            let _ = self.ev.lock().unwrap().take();
+        }
         let _ = self.cmd.send(cmd);
+    }
+
+    /// Announce something the shell's thread caused, on the stream every client reads. Silent when
+    /// the sender is gone: after Shutdown there is no stream to announce on, and nothing to announce
+    /// *to* either.
+    fn announce(&self, ev: EngineEvent) {
+        if let Some(tx) = self.ev.lock().unwrap().as_ref() {
+            let _ = tx.send(ev);
+        }
     }
 
     pub fn submit(&self, text: impl Into<String>) {
@@ -1730,6 +2657,18 @@ impl SessionHost {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// Park the host in the busy state without running a turn.
+    ///
+    /// `checkpoint::tests` uses it to grade the revert's "a turn is running, so nothing
+    /// was touched" refusal: that refusal is the thing being tested, and making it wait
+    /// for a scripted turn to be mid-flight would grade the fixture's timing instead.
+    /// Whether a real turn sets the flag at all is graded elsewhere — by the host's own
+    /// tests and by the selftest's mid-turn claim.
+    #[cfg(test)]
+    pub(crate) fn set_busy_for_test(&self, busy: bool) {
+        set_busy(&self.state, busy);
+    }
+
     pub fn state(&self) -> HostState {
         let mut s = self.state.lock().unwrap().clone();
         // The gauge outranks the snapshot for these four: it is written by the
@@ -1740,6 +2679,10 @@ impl SessionHost {
         s.context_budget = g.budget;
         s.model_window = g.window;
         s.compactions = g.compactions;
+        // Read from the queue itself rather than kept in step by every push and drain: the agent
+        // drains it at its own step boundary, on a thread that would otherwise have to remember to
+        // publish, and a snapshot that lags shows a line for a message the model already read.
+        s.queued = self.queue.snapshot().into_iter().filter(|i| i.session == s.session_id).collect();
         s
     }
 
@@ -1833,8 +2776,191 @@ pub trait HostOps: Send + Sync {
     /// Stop the running turn and release whatever it is parked on.
     fn cancel(&self);
 
+    /// Take a conversation back to an earlier message.
+    ///
+    /// The stored transcript has already been cut by the caller — see [`crate::edit`]. This is the
+    /// other half: the host has been told things the record no longer contains, and unless it is
+    /// brought back too, the next turn is answered from a conversation the user cannot see any more.
+    ///
+    /// Queued like every other verb here, so it lands in the host's own loop where that memory
+    /// lives, and it arrives ahead of the re-send that follows it.
+    fn rewind(&self, session: i64) {
+        self.send(HostCmd::Rewind { session })
+    }
+
+    /// Make a second conversation out of part of this one, and start holding it.
+    ///
+    /// Unlike [`Self::rewind`] this cannot be fire-and-forget: the caller has to be told which
+    /// conversation now exists, because that is the row it opens and the conversation the branch
+    /// note belongs in. So it waits for the host loop's own answer, and `Err` means nothing was
+    /// created — no row in the sidebar, no thread in pi's directory, the original untouched.
+    ///
+    /// The default refuses in words, for a host with no way to fork its own memory. A client that
+    /// hears that says it out loud rather than showing a conversation that only looks branched.
+    async fn branch(&self, req: &crate::branch::BranchReq) -> Result<crate::branch::BranchOutcome, String> {
+        let _ = req;
+        Err(
+            "this engine cannot branch a conversation yet: the model host has no way to fork its own \
+             memory, and a copied transcript the model has not read is not a branch"
+                .to_string(),
+        )
+    }
+
+    /// Move this conversation's leaf — the node its next answer reads through — and say what this
+    /// host did to **its own** memory.
+    ///
+    /// The record's leaf is already moved by the time a host is asked (see [`crate::tree::move_leaf`]),
+    /// because every read path in this crate follows that column and an idle conversation should open
+    /// on the branch it was left on. What only the host can do is move the memory a live model is
+    /// reading: the agent's in-process history here, pi's session tree over there.
+    ///
+    /// It answers with a sentence rather than a bool on purpose. "pi moved its leaf" and "this engine
+    /// re-read the messages" and "this host is holding another conversation" are three different
+    /// facts, and the one the person has to know is whether the model moved with the record.
+    async fn move_leaf(&self, session: i64, target: &crate::tree::LeafTarget) -> Result<String, String> {
+        let _ = (session, target);
+        Err(
+            "this host has no memory of its own to move: the record's leaf moved, and the model was \
+             not told".to_string(),
+        )
+    }
+
+    /// This conversation's node list as **pi** holds it, or `None` when there is no pi tree to read.
+    ///
+    /// Read from the live child and not by parsing its session file: what decides the next answer is
+    /// the tree the running process holds, and a file replaced underneath it should come back as a
+    /// disagreement between the two records — which is what the caller reports rather than hiding.
+    ///
+    /// `None` is not "an empty tree". It means this host is not holding this conversation, or has no
+    /// child at all, and the read says so instead of drawing a thread nobody read.
+    async fn pi_tree(&self, session: i64) -> Option<crate::tree::PiTree> {
+        let _ = session;
+        None
+    }
+
+    /// "What is declared to the model right now, and what is registered but withheld."
+    ///
+    /// The default says plainly that this core cannot answer, rather than answering with two empty
+    /// lists: `[]` hidden and `[]` declared look exactly like "nothing is withheld", which on the
+    /// pi core is a falsehood — that list is decided inside the model process. A check grading an
+    /// invented answer would pass while the real thing stayed unmeasured.
+    async fn tool_inventory(&self) -> Result<(Vec<String>, Vec<String>), String> {
+        Err("this core decides its tool list inside the model process, so it cannot report one".to_string())
+    }
+
+    /// Grant or take away web reach for the chat conversation this host holds. Queued like every
+    /// other verb here: the tools live in the model process, and only its own loop can re-make it.
+    ///
+    /// The default refuses in words, on the Rust core, where a chat does not exist and the coworker's
+    /// web tools are part of its job rather than a switch — see [`set_conversation_web`], which is
+    /// where the check that this is a chat at all lives.
+    fn set_web(&self, on: bool) {
+        self.send(HostCmd::SetWeb { on })
+    }
+
+    /// Re-read the endpoint and start answering from it. Queued, so it waits for the turn like every
+    /// other verb here; it answers `Err` when the config names no usable address, so the caller can
+    /// say which half of the setup is missing instead of pointing at a transcript that stayed empty.
+    fn reload_provider(&self) -> Result<String, String> {
+        self.send(HostCmd::ReloadProvider);
+        Ok("the endpoint was handed to the model host".into())
+    }
+
+    /// A message typed **while a turn is running**, queued with whatever promise this host's stored
+    /// choice makes: into this turn at its next step, or after it.
+    ///
+    /// The returned [`crate::steer::View`] carries cwoffee's own id, which is the handle for taking
+    /// it back — pi's queue is a list of plain strings and names nothing, so an id assigned here is
+    /// the only withdrawal handle that exists on either core.
+    ///
+    /// The default refuses in words. A host with nowhere to put a mid-turn press says so rather than
+    /// dropping the words, which is the failure this feature exists to remove.
+    fn queue_mid_turn(
+        &self,
+        text: String,
+        attachments: Vec<crate::provider::Attachment>,
+        session: Option<i64>,
+    ) -> Result<crate::steer::View, String> {
+        let _ = (text, attachments, session);
+        Err(
+            "this host has no mid-turn queue, so a message typed during a turn has nowhere to go"
+                .to_string(),
+        )
+    }
+
+    /// Take a queued message back before it lands.
+    ///
+    /// `Err` means it is no longer waiting: it went into the conversation, and a message already on
+    /// the wire cannot be unsent — the row stays and the card says so.
+    fn withdraw_queued(&self, id: u64) -> Result<crate::steer::View, String> {
+        let _ = id;
+        Err("this host has no mid-turn queue, so there is nothing here to take back".to_string())
+    }
+
+    /// What is waiting right now, in the order it was typed. A client that reloaded mid-turn paints
+    /// these lines rather than showing a transcript that lost what the person typed.
+    fn queue_state(&self) -> Vec<crate::steer::View> {
+        Vec::new()
+    }
+
+    /// Change what the next mid-turn press promises. Queued, because this loop is the one that
+    /// writes the config file — the same reason [`Self::set_web`] is queued.
+    fn set_mid_turn(&self, kind: crate::steer::MidTurn) {
+        self.send(HostCmd::SetMidTurn { kind })
+    }
+
+    /// Change the **stored** palette, in the config file every surface reads at start.
+    ///
+    /// Deliberately not the way a window repaints itself: a per-window override is a client fact and
+    /// never reaches the host, because a phone tab that could rewrite `theme` would change the
+    /// desktop's colours. The screen that sets an override says the word *override*
+    /// (`crate::theme::override_says`), and the About line names both homes.
+    fn set_theme(&self, kind: crate::theme::Theme) {
+        self.send(HostCmd::SetTheme { kind })
+    }
+
+    /// Tell this core that the third-party servers changed, so what the model is told about them and
+    /// what it can be offered follow the file.
+    ///
+    /// Default is a no-op, and the reason is stated rather than implied: on the pi core the tool host
+    /// reads the hub's catalog per call and the catalog block is re-read per request, so there is
+    /// nothing stale to push. The Rust core builds the prompt's catalog from a value it stored at
+    /// boot, so it has to be told.
+    fn mcp_refresh(&self, _hub: Arc<tokio::sync::Mutex<crate::mcp::Hub>>) {}
+
+    /// The About sentence for **this** client: the host's stored palette plus whatever the window is
+    /// overriding it with. Asked of the host so the wording is the engine's on every surface, and
+    /// read-only by design — the override is passed in for the sentence and never stored, because a
+    /// phone tab that could write `theme` would repaint the desktop.
+    fn theme_words(&self, window: Option<crate::theme::Theme>) -> String {
+        crate::theme::Theme::about_says(self.state().theme, window)
+    }
+
     /// Snapshot for status lines and the composer's current-state labels.
     fn state(&self) -> HostState;
+
+    /// Which engine is answering, in one word: `rust` for the in-process agent, `pi` for a
+    /// `pi --mode rpc` child.
+    ///
+    /// Asked of the host rather than read from `CWOFFEE_CORE` by whoever is rendering a page, because
+    /// the environment is how the core is *chosen*, not evidence of what is running: a gateway started
+    /// standalone, a desktop launched by a wrapper script, and a test harness all set that variable
+    /// differently, and an About page that guessed wrong is a bug report filed against the wrong core.
+    fn core_id(&self) -> &'static str {
+        "rust"
+    }
+
+    /// Where this core keeps **the model's** copy of a conversation, for the About page.
+    ///
+    /// Empty means "there is no second copy: the record above is the whole of it", which is true of
+    /// the Rust core — its history is rebuilt from the SQLite rows. The pi core overrides this,
+    /// because on that core the model genuinely does keep its own thread files, in a directory this
+    /// app owns and the person cannot find from the settings screen. A page that says "your
+    /// conversations live in one file" to a pi-core user is a page that tells them where *not* to
+    /// look.
+    fn thread_store(&self) -> String {
+        String::new()
+    }
 
     /// Move the tools to another workspace, refusing anything the checks reject.
     async fn set_workspace_checked(&self, path: &str) -> Result<String, String>;
@@ -1979,8 +3105,116 @@ impl HostOps for SessionHost {
     fn cancel(&self) {
         SessionHost::cancel(self)
     }
+    /// Ask this host's own loop to make a branch and wait for the conversation it made.
+    ///
+    /// Waiting is the point: the caller has to open the new row, and a fire-and-forget verb would
+    /// leave a client watching for a conversation whose id it was never given. The loop is a task of
+    /// its own, so awaiting here does not stall it — and on a single-threaded runtime the await is
+    /// what lets the loop run at all.
+    async fn branch(&self, req: &crate::branch::BranchReq) -> Result<crate::branch::BranchOutcome, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(HostCmd::Branch { req: req.clone(), reply: tx })
+            .map_err(|_| "the model host is gone; nothing was branched".to_string())?;
+        rx.await.map_err(|_| "the model host ended without answering the branch".to_string())?
+    }
+    async fn move_leaf(&self, session: i64, target: &crate::tree::LeafTarget) -> Result<String, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(HostCmd::MoveLeaf { session, target: target.clone(), reply: tx })
+            .map_err(|_| "the model host is gone; the leaf was not moved".to_string())?;
+        rx.await.map_err(|_| "the model host ended without answering the leaf move".to_string())?
+    }
+    async fn tool_inventory(&self) -> Result<(Vec<String>, Vec<String>), String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(HostCmd::ToolInventory { reply: tx })
+            .map_err(|_| "the model host is gone; nothing was read".to_string())?;
+        rx.await.map_err(|_| "the model host ended without answering".to_string())?
+    }
     fn state(&self) -> HostState {
         SessionHost::state(self)
+    }
+    /// Queue a mid-turn press. Straight into the shared queue, not into the mailbox: this host's
+    /// loop is parked inside `run_turn` for the whole turn, so a command sent now would be read
+    /// after the turn — which is the behaviour steering replaces. See [`crate::steer`].
+    fn queue_mid_turn(
+        &self,
+        text: String,
+        attachments: Vec<crate::provider::Attachment>,
+        session: Option<i64>,
+    ) -> Result<crate::steer::View, String> {
+        let st = self.state();
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Err("nothing was typed, so nothing was queued".to_string());
+        }
+        crate::steer::checked_attachments(&attachments, self.limits)?;
+        if !st.busy {
+            return Err(crate::steer::idle_refusal());
+        }
+        let here = st.session_id;
+        // The same address rule `Send` runs, and the same refusal: a mismatch is refused rather than
+        // rerouted. `Some(0)` is "I am on a draft", which mid-turn cannot be true of the
+        // conversation this host is answering — moving the host is not a steering act.
+        if let Some(want) = session {
+            if want != here {
+                return Err(crate::steer::wrong_session_refusal(want, here));
+            }
+        }
+        let item = self
+            .queue
+            .push(here, st.mid_turn, text, attachments, crate::steer::now_secs());
+        let view = item.view();
+        self.announce(EngineEvent::QueueChanged { session: here, items: self.queue.snapshot() });
+        Ok(view)
+    }
+
+    fn withdraw_queued(&self, id: u64) -> Result<crate::steer::View, String> {
+        let st = self.state();
+        match self.queue.withdraw(id) {
+            Some(item) => {
+                let view = item.view();
+                self.announce(EngineEvent::QueueChanged { session: st.session_id, items: self.queue.snapshot() });
+                Ok(view)
+            }
+            None => Err(crate::steer::withdraw_gone_refusal()),
+        }
+    }
+
+    fn queue_state(&self) -> Vec<crate::steer::View> {
+        self.state().queued
+    }
+
+    /// Write the choice to the file and to the live state, on the spot.
+    ///
+    /// Not queued behind the turn: the composer announces this value, and a dial that keeps saying
+    /// the old promise until the answer finishes reads as a control that did nothing. The already-
+    /// queued messages keep the kind they were typed as, which is what the settings note says.
+    fn set_theme(&self, kind: crate::theme::Theme) {
+        // Answered immediately as well as queued: the settings row shows what is stored now, and a
+        // row that kept its old value until the loop got round would read as a control that did
+        // nothing — the complaint `theme` arrived with.
+        let mut st = self.state.lock().unwrap();
+        st.theme = kind;
+        st.theme_note = kind.setting_note();
+        st.theme_about = crate::theme::Theme::about_says(kind, None);
+        persist_setting(&self.cfg_path, "theme", &crate::Config::toml_str(kind.word()));
+        self.send(HostCmd::SetTheme { kind });
+    }
+
+    fn mcp_refresh(&self, hub: Arc<tokio::sync::Mutex<crate::mcp::Hub>>) {
+        // Queued rather than answered here: the registry belongs to the agent this loop owns, and
+        // answering from outside it is how a second, invented registry gets built — the fault
+        // `tool_inventory` was moved off of for the same reason.
+        self.send(HostCmd::McpRefresh { hub });
+    }
+    fn set_mid_turn(&self, kind: crate::steer::MidTurn) {
+        let mut st = self.state.lock().unwrap();
+        st.mid_turn = kind;
+        st.mid_turn_hint = crate::steer::composer_hint(kind);
+        st.mid_turn_note = crate::steer::setting_note(kind);
+        st.mid_turn_refusal = crate::steer::card_refusal();
+        persist_setting(&self.cfg_path, "mid_turn", &crate::Config::toml_str(kind.word()));
     }
     async fn set_workspace_checked(&self, path: &str) -> Result<String, String> {
         SessionHost::set_workspace_checked(self, path).await
@@ -2128,6 +3362,65 @@ pub fn default_env_block(workspace: &std::path::Path, os: &str, egress: crate::t
     )
 }
 
+/// `default_env_block` with the MCP catalog folded in, before the closing tag.
+///
+/// A separate function rather than a parameter on `default_env_block`, because the bridge and
+/// every caller that has no servers keeps the three-argument form — and a signature that makes
+/// everyone pass an empty string to mean "no third-party tools" is how a feature that is not
+/// running still shows up in the prompt.
+pub fn env_block_with_mcp(
+    workspace: &std::path::Path,
+    os: &str,
+    egress: crate::tools::net::NetMode,
+    catalog: &str,
+) -> String {
+    let base = default_env_block(workspace, os, egress);
+    if catalog.trim().is_empty() {
+        return base;
+    }
+    match base.rfind("</env>") {
+        Some(i) => format!("{}\n{}\n</env>", &base[..i], catalog.trim_end()),
+        None => format!("{base}\n{catalog}"),
+    }
+}
+
+/// The env block with the things about *this* start that are not fixed: the third-party tool
+/// catalog, and — while one is open — the browser sitting in the person's sidebar.
+///
+/// The browser line belongs in the env block rather than the system prompt for the reason
+/// everything volatile does: the system prompt is written once and must stay true for the whole
+/// session, while "is a browser open?" changes between turns and even between calls. A model
+/// that is never told cannot use the page the person is looking at, and a prompt line claiming
+/// a browser when none is open is the other half of the same mistake.
+///
+/// The line states four things the model would otherwise guess: where the page is, who opened
+/// it, that acting in it is an explicit choice (`session: true`), and that it does not last.
+pub fn env_block_live(
+    workspace: &std::path::Path,
+    os: &str,
+    egress: crate::tools::net::NetMode,
+    catalog: &str,
+    session: Option<&crate::browser_hub::Snapshot>,
+) -> String {
+    let base = env_block_with_mcp(workspace, os, egress, catalog);
+    let Some(s) = session.filter(|s| s.alive && s.opened) else {
+        return base;
+    };
+    let line = format!(
+        "a browser is open at {} — {} opened it, last touched by {}; `browse` with \"session\": \
+         true acts on that page instead of opening another browser, and the person watching the \
+         sidebar sees it. It is not permanent: it closes itself after {} of nobody touching it.",
+        s.url,
+        s.opened_by.words(),
+        s.last_actor.words(),
+        crate::browser_hub::idle_words(s.idle_secs),
+    );
+    match base.rfind("</env>") {
+        Some(i) => format!("{}\n{line}\n</env>", &base[..i]),
+        None => format!("{base}\n{line}"),
+    }
+}
+
 /// Attachment guardrails, checked before anything reaches a provider.
 #[derive(Debug, Clone, Copy)]
 pub struct AttachmentLimits {
@@ -2208,7 +3501,7 @@ pub fn check_attachments(atts: &[crate::provider::Attachment], limits: Attachmen
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// The dial's steps have to be the levels this model answers for.
     ///
     /// Three claims, deliberately kept apart here: what this endpoint was **probed** to accept, what
@@ -2302,6 +3595,10 @@ mod tests {
         seen_attachments: Arc<AtomicUsize>,
         /// The user message the endpoint actually received, env block included.
         seen_wire: std::sync::Mutex<Vec<String>>,
+        /// How many messages each request carried. What a conversation's own prompt was
+        /// seeded with is otherwise invisible from the outside, and "a branch is a
+        /// conversation the model has read" is exactly the claim that needs seeing.
+        seen_prompt: std::sync::Mutex<Vec<usize>>,
     }
 
     #[async_trait]
@@ -2357,6 +3654,7 @@ mod tests {
             {
                 self.seen_wire.lock().unwrap().push(last_user.content.clone());
             }
+            self.seen_prompt.lock().unwrap().push(req.messages.len());
             let n = self.calls.fetch_add(1, Ordering::Relaxed);
             let reply = self
                 .replies
@@ -2393,6 +3691,34 @@ mod tests {
     }
 
     fn host(replies: Vec<String>) -> (SessionHost, Arc<Store>) {
+        let (h, store, _p) = host_with(replies);
+        (h, store)
+    }
+
+    /// The same host, with the endpoint kept in hand. A branch is not only a copied
+    /// transcript: the model has to be answering out of the copy, and that is only
+    /// checkable by asking the endpoint what it was given.
+    /// A host for another module's tests, without the endpoint handle: `Scripted` is a
+    /// private type, and a caller that only needs to ask a host whether it is busy should
+    /// not have to see the fixture's provider.
+    #[cfg(test)]
+    pub(crate) fn host_for_test(replies: Vec<String>) -> SessionHost {
+        let (h, _store, _p) = host_with(replies);
+        h
+    }
+
+    /// The same host, with the record it reads from.
+    ///
+    /// `crate::tree` tests need both halves: the tree is the conversation's rows read next to what
+    /// the host's memory says, and a test that could only see one of them cannot check the sentence
+    /// the two are supposed to produce together.
+    #[cfg(test)]
+    pub(crate) fn host_for_test_with_store(replies: Vec<String>) -> (SessionHost, Arc<Store>) {
+        let (h, store, _p) = host_with(replies);
+        (h, store)
+    }
+
+    fn host_with(replies: Vec<String>) -> (SessionHost, Arc<Store>, Arc<Scripted>) {
         let store = Arc::new(Store::in_memory().unwrap());
         let p = Arc::new(Scripted {
             replies: std::sync::Mutex::new(replies),
@@ -2402,14 +3728,91 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
-            p,
+            p.clone(),
             Registry::new(),
             Arc::clone(&store),
             HostConfig::new("test-model", std::env::temp_dir()),
         );
-        (h, store)
+        (h, store, p)
+    }
+
+    /// `theme` used to be a key the parser accepted and nobody read: the settings screen wrote it,
+    /// the file held it, and the palette lived in one browser's `localStorage`. This is the claim
+    /// that the value reaches the payload a surface actually reads — a config test alone cannot tell
+    /// "parsed" from "published", which is exactly how the old key looked green while doing nothing.
+    #[tokio::test]
+    async fn the_stored_theme_reaches_the_payload_the_ui_reads() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_theme_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            // `theme` is top-level, so it goes before the first `[table]` header — the same trap
+            // `table_hint` exists to explain, and a test that wrote it inside `[provider]` would be
+            // testing the parser's error instead of the setting.
+            "theme = \"dark\"\n[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let (appcfg, loaded) = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.as_deref(), Some(path.as_path()), "the file was not the one read");
+        assert_eq!(appcfg.theme(), crate::theme::Theme::Dark);
+
+        let mut cfg = HostConfig::new("test-model", std::env::temp_dir());
+        cfg.theme = appcfg.theme();
+        cfg.cfg_path = Some(path.clone());
+        let p = Arc::new(Scripted {
+            replies: std::sync::Mutex::new(vec![]),
+            window: None,
+            window_from_call: 0,
+            asks: std::sync::atomic::AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            seen_attachments: Arc::new(AtomicUsize::new(0)),
+            seen_wire: Default::default(),
+            seen_prompt: Default::default(),
+        });
+        let h = SessionHost::spawn(p, Registry::new(), Arc::new(Store::in_memory().unwrap()), cfg);
+        let st = h.state();
+        assert_eq!(st.theme, crate::theme::Theme::Dark);
+        assert!(st.theme_note.contains("theme = \"dark\""), "{}", st.theme_note);
+
+        // The payload, spelled the way the client reads it: a field the UI cannot deserialize is a
+        // field that died in the config file.
+        let v = serde_json::to_value(&st).unwrap();
+        assert_eq!(v["theme"].as_str(), Some("dark"), "{v}");
+        assert!(v["theme_note"].as_str().unwrap().contains("config file"));
+        assert!(v["theme_about"].as_str().unwrap().contains("no override"));
+
+        // And the way back: a change answers on the state and lands in the file.
+        h.set_theme(crate::theme::Theme::Light);
+        let after = h.state();
+        assert_eq!(after.theme, crate::theme::Theme::Light);
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(file.contains("theme = \"light\""), "{file}");
+        let (reread, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(reread.theme(), crate::theme::Theme::Light, "the next start would not see the change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A word that is not a palette is refused in words, not defaulted. `theme_loud` and
+    /// `theme_aggressive` are retired keys and stay refused.
+    #[test]
+    fn a_theme_word_that_is_not_one_is_refused_in_words() {
+        let mut c = Config::default();
+        c.theme = Some("midnight".to_string());
+        let e = c.theme_checked().unwrap_err();
+        assert!(e.contains("theme = \"midnight\""), "{e}");
+        assert!(e.contains("light, dark or system"), "{e}");
+        for word in ["light", "dark", "system", "follow"] {
+            c.theme = Some(word.to_string());
+            assert!(c.theme_checked().is_ok(), "{word}");
+        }
+        c.theme = Some("theme_loud".to_string());
+        assert!(c.theme_checked().is_err());
+        c.theme = None;
+        assert_eq!(c.theme(), crate::theme::Theme::System, "absent means follow");
     }
 
     #[tokio::test]
@@ -2433,6 +3836,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
             Arc::clone(&p) as Arc<dyn Provider>,
@@ -2682,6 +4086,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -2705,7 +4110,78 @@ mod tests {
     /// only in the running process is re-read from the file by the next client,
     /// so the app contradicts the user. This drives the host the way the UI does
     /// and reads the file back.
-    #[tokio::test]
+        #[tokio::test]
+    async fn the_browsers_mode_follows_the_config_row_and_not_the_boot_snapshot() {
+        use crate::tools::browser::Vision;
+        // Whether `browse` paints a window on a person's desktop is decided from the config file's
+        // model row. Freezing that at spawn was wrong twice over in ordinary use: a probe that
+        // records modalities after boot, and a model change in the middle of a conversation. Both
+        // are graded here — the first by writing the row after the host is up, the second by
+        // switching to a model whose row says something different.
+        let dir = std::env::temp_dir().join(format!("cwoffee_browsemode_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\n").unwrap();
+
+        let mut cfg = HostConfig::new("blind-model", dir.join("ws"));
+        cfg.cfg_path = Some(path.clone());
+        let h = SessionHost::spawn(
+            Arc::new(Scripted {
+                replies: std::sync::Mutex::new(vec![]),
+                window: Some(262_144),
+                window_from_call: 0,
+                asks: std::sync::atomic::AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                seen_attachments: Arc::new(AtomicUsize::new(0)),
+                seen_wire: Default::default(),
+                seen_prompt: Default::default(),
+            }),
+            Registry::new(),
+            Arc::new(Store::in_memory().unwrap()),
+            cfg,
+        );
+        assert_eq!(
+            h.state().browser_vision,
+            Vision::Unknown,
+            "no row at boot, so nobody has established what the model can see"
+        );
+
+        // The model screen probes, and the row lands. Nothing else tells the host.
+        std::fs::write(
+            &path,
+            "[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\n\n[models.\"blind-model\"]\nsupports_vision = true\n\n[models.\"text-only\"]\nsupports_vision = false\n",
+        )
+        .unwrap();
+        h.send(HostCmd::Send {
+            text: "one".into(),
+            attachments: vec![],
+            session: None,
+        });
+        wait_for("the turn ran".into(), || h.state().turns >= 1).await;
+        assert_eq!(
+            h.state().browser_vision,
+            Vision::Yes,
+            "the row written after boot has to reach the tool that runs"
+        );
+
+        // And a model change is a change to the answer, not to a remembered value.
+        h.send(HostCmd::SetModel { model: "text-only".into(), persist: false });
+        h.send(HostCmd::Send {
+            text: "two".into(),
+            attachments: vec![],
+            session: None,
+        });
+        wait_for("the second turn ran".into(), || h.state().turns >= 2).await;
+        assert_eq!(
+            h.state().browser_vision,
+            Vision::No,
+            "a model recorded as text-only gets no window and no pixels"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+#[tokio::test]
     async fn a_mode_chosen_through_the_host_is_written_down() {
         let dir = std::env::temp_dir().join(format!("cwoffee_cfg_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2728,6 +4204,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 seen_attachments: Arc::new(AtomicUsize::new(0)),
                 seen_wire: Default::default(),
+            seen_prompt: Default::default(),
             }),
             Registry::new(),
             Arc::new(Store::in_memory().unwrap()),
@@ -2781,6 +4258,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 seen_attachments: Arc::new(AtomicUsize::new(0)),
                 seen_wire: Default::default(),
+            seen_prompt: Default::default(),
             }),
             Registry::new(),
             Arc::new(Store::in_memory().unwrap()),
@@ -2847,6 +4325,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 seen_attachments: Arc::new(AtomicUsize::new(0)),
                 seen_wire: Default::default(),
+            seen_prompt: Default::default(),
             }),
             Registry::new(),
             Arc::new(Store::in_memory().unwrap()),
@@ -2923,6 +4402,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 seen_attachments: Arc::new(AtomicUsize::new(0)),
                 seen_wire: Default::default(),
+            seen_prompt: Default::default(),
             }),
             Registry::new(),
             Arc::new(Store::in_memory().unwrap()),
@@ -2958,6 +4438,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -2992,6 +4473,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let mut cfg = HostConfig::new("test-model", std::env::temp_dir());
         cfg.context_budget = Some(12_000);
@@ -3017,6 +4499,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let mut h = SessionHost::spawn(
             p,
@@ -3392,6 +4875,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::clone(&seen),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let h = SessionHost::spawn(
             p,
@@ -3703,6 +5187,182 @@ mod tests {
         assert_eq!(hist[5].content, "three ");
     }
 
+    /// A branch is a conversation the model answers from, not a transcript that only looks
+    /// copied. So this checks the host moved, the record moved, and — through the endpoint's own
+    /// record of what it was handed — that the branch's prompt was seeded from the branch's rows.
+    #[tokio::test]
+    async fn a_branch_moves_the_host_and_answers_from_its_own_history() {
+        let (h, store, p) = host_with(vec![
+            "first answer".into(),
+            "second answer".into(),
+            "answered in the branch".into(),
+        ]);
+        ready(&h).await;
+        h.submit("first ask");
+        turns_done(&h, 1).await;
+        h.submit("second ask");
+        turns_done(&h, 2).await;
+        let original = h.state().session_id;
+        let rows = store.messages(original).unwrap();
+
+        // Branch from the person's second message: everything before it travels, and the message
+        // itself comes back as something to ask again rather than being written twice.
+        let out = h
+            .branch(&crate::branch::BranchReq {
+                session: original,
+                message_id: Some(rows[2].id),
+                from_end: None,
+                role: String::new(),
+                shown: "second ask".into(),
+            })
+            .await
+            .expect("the branch was asked at a message this window can name");
+        assert_eq!(out.copied, 2, "the first exchange travelled into the branch");
+        assert_eq!(out.prefill.as_deref(), Some("second ask"), "the ask comes back for the composer");
+        assert_eq!(h.state().session_id, out.session, "the host is answering in the branch now");
+        assert_eq!(store.messages(original).unwrap().len(), 4, "a branch is not a rewind");
+
+        // What the endpoint is handed proves the adoption. The host installs one message beyond the
+        // conversation on every request — the env block naming the folder the tools run in — so the
+        // envelope is measured from this test's own first turn rather than guessed at.
+        let envelope = *p
+            .seen_prompt
+            .lock()
+            .unwrap()
+            .first()
+            .expect("the first turn reached the endpoint")
+            - 1;
+        h.submit("asked again, worded differently");
+        turns_done(&h, 3).await;
+        let seen = p.seen_prompt.lock().unwrap().last().cloned().unwrap_or(0);
+        assert_eq!(
+            seen,
+            out.copied + envelope + 1,
+            "the branch's prompt is its own {} rows plus this message, got {seen}",
+            out.copied
+        );
+        let wire = p.seen_wire.lock().unwrap().last().cloned().unwrap_or_default();
+        assert!(wire.contains("asked again, worded differently"), "{wire}");
+        assert_eq!(store.messages(original).unwrap().len(), 4, "the original still has its own tail");
+        let rows = store.messages(out.session).unwrap();
+        assert_eq!(rows.len(), 4, "two copied, one asked again, one answered");
+        assert_eq!(rows[2].content, "asked again, worded differently");
+
+        // The event the transcript shows names both conversations, so a person who loses the row
+        // in the sidebar can still tell which one is which.
+        let note = store.messages(out.session).unwrap();
+        assert_eq!(note.len(), 4);
+    }
+
+    /// Branching at an answer carries that answer and stops: asked at the newest answer, that is
+    /// a copy of the whole conversation, and the original is still whole underneath it.
+    #[tokio::test]
+    async fn branching_at_an_answer_carries_it_and_leaves_the_original_whole() {
+        let (h, store, p) = host_with(vec!["a".into(), "b".into(), "continued".into()]);
+        ready(&h).await;
+        h.submit("q1");
+        turns_done(&h, 1).await;
+        h.submit("q2");
+        turns_done(&h, 2).await;
+        let original = h.state().session_id;
+        let rows = store.messages(original).unwrap();
+
+        let out = h
+            .branch(&crate::branch::BranchReq {
+                session: original,
+                message_id: Some(rows[3].id),
+                from_end: None,
+                role: "assistant".into(),
+                shown: rows[3].content.clone(),
+            })
+            .await
+            .expect("branching at the last answer is a copy of everything");
+        assert_eq!(out.copied, 4);
+        assert!(out.prefill.is_none(), "an answer is not something to ask again");
+        assert_eq!(store.messages(original).unwrap().len(), 4);
+
+        h.submit("from here");
+        turns_done(&h, 3).await;
+        let envelope = *p
+            .seen_prompt
+            .lock()
+            .unwrap()
+            .first()
+            .expect("the first turn reached the endpoint")
+            - 1;
+        let seen = p.seen_prompt.lock().unwrap().last().cloned().unwrap_or(0);
+        assert_eq!(
+            seen,
+            out.copied + envelope + 1,
+            "the copy holds all {} rows and then the new ask, got {seen}",
+            out.copied
+        );
+    }
+
+    /// A refused branch creates nothing at all — no row, no host move, no note. The proof of which
+    /// message was meant is the whole point of the verb, so a refusal must be as clean as a success.
+    #[tokio::test]
+    async fn a_branch_that_cannot_prove_which_message_it_means_creates_nothing() {
+        let (h, store) = host(vec!["a".into(), "b".into()]);
+        ready(&h).await;
+        h.submit("q1");
+        turns_done(&h, 1).await;
+        let original = h.state().session_id;
+        let before = store.list_sessions(50).unwrap().len();
+        let rows = store.messages(original).unwrap();
+
+        let e = h
+            .branch(&crate::branch::BranchReq {
+                session: original,
+                message_id: Some(rows[0].id),
+                from_end: None,
+                role: String::new(),
+                shown: "words this window never saw".into(),
+            })
+            .await
+            .expect_err("the row says something else, so the branch is refused");
+        assert!(e.contains("says something else now"), "{e}");
+        assert_eq!(store.list_sessions(50).unwrap().len(), before, "no row was created");
+        assert_eq!(h.state().session_id, original, "the host stayed where it was");
+        assert_eq!(store.messages(original).unwrap().len(), 2, "and nothing was copied or cut");
+    }
+
+    /// A phone can branch a conversation the desktop is not working on. The host takes it up first
+    /// and then branches it, which is the same adopt-then-act the pi core has to do — a core that
+    /// could only branch its own conversation would answer the phone with a refusal the desktop
+    /// never gets.
+    #[tokio::test]
+    async fn a_branch_of_a_conversation_this_host_is_not_on_is_adopted_first() {
+        let (h, store) = host(vec!["a".into(), "b".into(), "c".into()]);
+        ready(&h).await;
+        h.submit("in the first one");
+        turns_done(&h, 1).await;
+        let first = h.state().session_id;
+        h.send(HostCmd::NewSession { title: "second".into() });
+        wait_for("a new conversation".into(), || h.state().session_id != first).await;
+        h.submit("in the second one");
+        turns_done(&h, 2).await;
+
+        let rows = store.messages(first).unwrap();
+        let out = h
+            .branch(&crate::branch::BranchReq {
+                session: first,
+                message_id: Some(rows[0].id),
+                from_end: None,
+                role: String::new(),
+                shown: "in the first one".into(),
+            })
+            .await
+            .expect("branching a conversation this host is not holding");
+        assert_eq!(h.state().session_id, out.session);
+        assert_eq!(store.messages(first).unwrap().len(), 2, "the source is untouched");
+        // The branch is filed where its source lives, not wherever the host happened to be.
+        assert_eq!(
+            store.session(out.session).unwrap().unwrap().workspace,
+            store.session(first).unwrap().unwrap().workspace
+        );
+    }
+
     #[tokio::test]
     async fn new_session_starts_a_clean_prompt_but_keeps_the_old_one() {
         let (h, store) = host(vec!["a".into(), "b".into()]);
@@ -3838,6 +5498,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen_attachments: Arc::new(AtomicUsize::new(0)),
             seen_wire: Default::default(),
+            seen_prompt: Default::default(),
         });
         let mut reg = Registry::new();
         reg.register(Box::new(ExecTool::new(&crate::tools::ExecCfg {
@@ -3926,6 +5587,65 @@ mod tests {
     }
 
     #[test]
+    fn the_env_block_names_an_open_browser_and_how_to_act_in_it() {
+        let snap = crate::browser_hub::Snapshot {
+            alive: true,
+            opened: true,
+            url: "http://127.0.0.1:8090/selftest-page.html".to_string(),
+            opened_by: crate::browser_hub::Who::Person,
+            last_actor: crate::browser_hub::Who::Model,
+            idle_secs: 300,
+            ..Default::default()
+        };
+        let b = env_block_live(
+            std::path::Path::new("/home/u/ws"),
+            "linux",
+            crate::tools::net::NetMode::Proxy,
+            "",
+            Some(&snap),
+        );
+        assert!(b.contains("a browser is open at http://127.0.0.1:8090/selftest-page.html"), "{b}");
+        assert!(b.contains("you opened it"), "{b}");
+        assert!(b.contains("last touched by the model"), "{b}");
+        assert!(b.contains("\"session\": true"), "the line has to say how to use it: {b}");
+        assert!(b.contains("closes itself after 5 minutes"), "and that it does not last: {b}");
+        // Still one env block, still the last thing before the closing tag.
+        assert_eq!(b.matches("<env>").count(), 1, "{b}");
+        assert!(b.trim_end().ends_with("</env>"), "{b}");
+    }
+
+    #[test]
+    fn the_env_block_says_nothing_about_a_browser_that_is_not_open() {
+        // A prompt line claiming a browser is the mistake in the other direction: the model
+        // passes `session: true`, and the call has to explain a mismatch the prompt invented.
+        let closed = crate::browser_hub::Snapshot {
+            alive: false,
+            why: "nobody touched it for 5 minutes, so it closed itself".to_string(),
+            ..Default::default()
+        };
+        let b = env_block_live(
+            std::path::Path::new("/home/u/ws"),
+            "linux",
+            crate::tools::net::NetMode::Proxy,
+            "",
+            Some(&closed),
+        );
+        assert!(!b.contains("a browser is open"), "{b}");
+        let none = env_block_live(std::path::Path::new("/home/u/ws"), "linux", crate::tools::net::NetMode::Proxy, "", None);
+        assert_eq!(b, none, "a closed session and no session cost the same bytes");
+        // And the catalog still arrives when both are present.
+        let both = env_block_live(
+            std::path::Path::new("/home/u/ws"),
+            "linux",
+            crate::tools::net::NetMode::Proxy,
+            "third-party tools: mcp__fake__write_note",
+            Some(&crate::browser_hub::Snapshot { alive: true, opened: true, url: "http://x".into(), idle_secs: 60, ..Default::default() }),
+        );
+        assert!(both.contains("mcp__fake__write_note") && both.contains("a browser is open"), "{both}");
+        assert_eq!(both.matches("</env>").count(), 1, "{both}");
+    }
+
+    #[test]
     fn env_block_names_the_sandbox_so_the_model_does_not_guess() {
         use crate::tools::net::NetMode as N;
         let b = default_env_block(std::path::Path::new("/home/u/ws"), "linux", N::Off);
@@ -3954,5 +5674,317 @@ mod tests {
         let r = default_env_block(std::path::Path::new("/tmp/cwoffee-project"), "linux", N::Proxy);
         assert!(r.contains("workspace: /tmp/cwoffee-project"), "{r}");
         assert!(!r.contains("none"), "{r}");
+    }
+
+    // ---- mid-turn steering -------------------------------------------------------------
+
+    /// A turn that is **still answering** when the test presses Enter. `Scripted` finishes inside
+    /// one poll, so a mid-turn claim measured against it is measured against an idle host — the
+    /// same mistake the page-side composer check made on its first run.
+    struct Held {
+        reply: String,
+        hold: std::time::Duration,
+        calls: AtomicUsize,
+        seen: std::sync::Mutex<Vec<Vec<crate::provider::Message>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Held {
+        fn id(&self) -> &str {
+            "held"
+        }
+        fn label(&self) -> &str {
+            "held"
+        }
+        fn wants_reasoning(&self) -> bool {
+            false
+        }
+        async fn stream(
+            &self,
+            req: &crate::provider::ChatRequest,
+            sink: &crate::provider::DeltaSink,
+        ) -> Result<(), ProviderError> {
+            // The naming ask is not the conversation's turn; see `Scripted` for why it is kept out
+            // of the audit.
+            if req.messages.len() == 1
+                && req.messages[0].role == crate::provider::Role::User
+                && req.messages[0].content.starts_with(crate::titling::TITLE_ASK)
+            {
+                sink.send(Delta::Text("a scripted name".into()))
+                    .map_err(|_| ProviderError::Cancelled)?;
+                sink.send(Delta::Done(FinishReason::Stop))
+                    .map_err(|_| ProviderError::Cancelled)?;
+                return Ok(());
+            }
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            self.seen.lock().unwrap().push(req.messages.clone());
+            if n == 0 {
+                // The window a person types into.
+                tokio::time::sleep(self.hold).await;
+            }
+            for chunk in self.reply.split(' ') {
+                sink.send(Delta::Text(format!("{chunk} ")))
+                    .map_err(|_| ProviderError::Cancelled)?;
+            }
+            sink.send(Delta::Done(FinishReason::Stop))
+                .map_err(|_| ProviderError::Cancelled)?;
+            Ok(())
+        }
+        async fn list_models_info(&self) -> Result<Vec<crate::provider::ModelInfo>, ProviderError> {
+            Ok(vec![crate::provider::ModelInfo { id: "test-model".into(), ..Default::default() }])
+        }
+    }
+
+    fn held_host(reply: &str, hold: std::time::Duration) -> (SessionHost, Arc<Store>, Arc<Held>) {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p = Arc::new(Held {
+            reply: reply.into(),
+            hold,
+            calls: AtomicUsize::new(0),
+            seen: Default::default(),
+        });
+        let h = SessionHost::spawn(
+            p.clone() as Arc<dyn Provider>,
+            Registry::new(),
+            Arc::clone(&store),
+            HostConfig::new("test-model", std::env::temp_dir()),
+        );
+        (h, store, p)
+    }
+
+    /// A press with nothing running is refused, in words that name the alternative. Queueing a
+    /// message nothing will ever drain is how a typed sentence goes missing: pi's queues are only
+    /// polled by a run, and the Rust core's boundary only comes round inside one.
+    #[tokio::test]
+    async fn a_mid_turn_press_with_nothing_running_is_refused_and_says_why() {
+        let (h, _store, _p) = held_host("an answer", std::time::Duration::from_millis(50));
+        let err = h
+            .queue_mid_turn("typed too early".into(), vec![], None)
+            .expect_err("idle host must not queue a steer");
+        assert!(err.contains("nothing is running"), "{err}");
+        assert!(err.contains("send it as a message"), "the refusal must name the alternative: {err}");
+        assert!(h.state().queued.is_empty(), "the refusal still queued something");
+    }
+
+    /// The address rule `Send` carries, applied to a mid-turn press: a mismatch is refused, not
+    /// rerouted, and nothing moves. A steer that could move the host would be a session switch
+    /// wearing a message.
+    #[tokio::test]
+    async fn a_mid_turn_press_naming_another_conversation_is_refused_and_moves_nothing() {
+        let (mut h, store, p) = held_host("an answer", std::time::Duration::from_millis(400));
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        h.send_turn_to("first question", vec![], None);
+        wait_for("busy".into(), || h.state().busy).await;
+        let here = h.state().session_id;
+        let other = store.create_session("elsewhere", &std::env::temp_dir().display().to_string(), "test-model").unwrap();
+
+        let err = h
+            .queue_mid_turn("aimed somewhere else".into(), vec![], Some(other))
+            .expect_err("a press aimed at another conversation must be refused");
+        assert!(err.contains(&format!("conversation {other}")), "{err}");
+        assert!(err.contains(&format!("on {here}")), "{err}");
+        assert!(err.contains("cannot move the host"), "{err}");
+        assert!(h.state().queued.is_empty());
+        assert_eq!(h.state().session_id, here, "the refusal moved the host anyway");
+
+        // And a `draft` claim is a mismatch too: mid-turn, the host is on a real conversation.
+        let err = h
+            .queue_mid_turn("claims a draft".into(), vec![], Some(0))
+            .expect_err("a draft claim during a live turn is a mismatch");
+        assert!(err.contains("conversation 0"), "{err}");
+        turns_done(&h, 1).await;
+        assert_eq!(p.seen.lock().unwrap().len(), 1, "a refused press reached the model");
+        let _ = drain_events(&mut ev).await;
+    }
+
+    /// The press lands: the *next* request carries it, the record grows by exactly one user row,
+    /// and the row is the person's own words. This is the claim the selftest's `steer` group makes
+    /// against the mock endpoint, graded here against the request the provider was handed.
+    #[tokio::test]
+    async fn a_steered_turn_carries_the_message_and_grows_by_one_user_row() {
+        let (mut h, store, p) = held_host("the answer", std::time::Duration::from_millis(400));
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        h.send_turn_to("write the note", vec![], None);
+        wait_for("busy".into(), || h.state().busy).await;
+        let sid = h.state().session_id;
+
+        let view = h
+            .queue_mid_turn("make it shorter".into(), vec![], Some(sid))
+            .expect("a press during a live turn is queued");
+        assert_eq!(view.kind, crate::steer::MidTurn::Steer, "the default promise is a steer");
+        assert_eq!(h.state().queued.len(), 1, "the host does not list what is waiting");
+        assert_eq!(h.state().queued[0].id, view.id);
+
+        turns_done(&h, 1).await;
+        let reqs = p.seen.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "the steered turn did not make a second request: {}", reqs.len());
+        assert!(
+            reqs[1].iter().any(|m| m.content.contains("make it shorter")),
+            "the model never received the steer"
+        );
+        assert!(!reqs[0].iter().any(|m| m.content.contains("make it shorter")));
+
+        let rows = store.messages(sid).unwrap();
+        let users: Vec<&str> = rows.iter().filter(|r| r.role == "user").map(|r| r.content.as_str()).collect();
+        assert_eq!(users.len(), 2, "the steer did not become its own row: {users:?}");
+        assert!(users.contains(&"make it shorter"));
+        // Exactly one user row more than a turn without a steer would leave: the question, the
+        // steer, and two answers — one per request. Anything else means a row was duplicated or
+        // the steering wrote the transcript twice.
+        let assistants = rows.iter().filter(|r| r.role == "assistant").count();
+        assert_eq!(assistants, 2, "the steered turn wrote {assistants} answer rows for two round-trips");
+        assert_eq!(
+            rows.len(),
+            4,
+            "the turn holds {} rows: question, answer, steer, answer to the steer — the record \
+             grew by exactly the one user row the press added",
+            rows.len()
+        );
+        assert!(h.state().queued.is_empty(), "a landed message is still listed as pending");
+
+        let evs = drain_events(&mut ev).await;
+        assert!(
+            evs.iter().any(|e| matches!(e, EngineEvent::SteerLanded { .. })),
+            "no landing receipt on the event stream"
+        );
+        let note = evs.iter().find_map(|e| match e {
+            EngineEvent::Note { message, .. } if message.contains("went into this turn") => Some(message.clone()),
+            _ => None,
+        });
+        assert!(note.is_some(), "no receipt sentence: {:?}", evs.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>());
+    }
+
+    /// Withdrawal before it lands: the pending line goes, and the words reach neither the model nor
+    /// the record. A second withdrawal says so rather than claiming to have taken something back.
+    #[tokio::test]
+    async fn withdrawing_a_steer_before_it_lands_keeps_it_off_the_wire() {
+        let (mut h, store, p) = held_host("the answer", std::time::Duration::from_millis(400));
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        h.send_turn_to("write the note", vec![], None);
+        wait_for("busy".into(), || h.state().busy).await;
+        let sid = h.state().session_id;
+        let view = h.queue_mid_turn("take me back".into(), vec![], Some(sid)).expect("queued mid-turn");
+        assert_eq!(h.state().queued.len(), 1);
+
+        let back = h.withdraw_queued(view.id).expect("the withdrawal took it back");
+        assert_eq!(back.text, "take me back");
+        assert!(h.state().queued.is_empty(), "the pending line survived the withdrawal");
+        assert!(
+            h.withdraw_queued(view.id).expect_err("a second withdrawal takes nothing").contains("no longer in the queue"),
+            "the second withdrawal should say it removed nothing"
+        );
+
+        turns_done(&h, 1).await;
+        for req in p.seen.lock().unwrap().iter() {
+            assert!(!req.iter().any(|m| m.content.contains("take me back")), "a withdrawn steer reached the model");
+        }
+        assert!(
+            !store.messages(sid).unwrap().iter().any(|r| r.content.contains("take me back")),
+            "a withdrawn steer is in the record"
+        );
+        let evs = drain_events(&mut ev).await;
+        assert!(
+            !evs.iter().any(|e| matches!(e, EngineEvent::SteerLanded { .. })),
+            "the stream reported a landing for a message that was taken back"
+        );
+    }
+
+    /// Stop gives the words back. This is the half that loses a person's typing if it is designed
+    /// badly: a queued message whose turn was stopped has nowhere else to go, and dropping it is a
+        /// silent loss with a card on top of it.
+    #[tokio::test]
+    async fn stopping_a_turn_hands_the_queued_words_back_to_the_composer() {
+        let (mut h, store, p) = held_host("the answer", std::time::Duration::from_millis(1200));
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        h.send_turn_to("write the note", vec![], None);
+        wait_for("busy".into(), || h.state().busy).await;
+        let sid = h.state().session_id;
+        let view = h.queue_mid_turn("words that were never sent".into(), vec![], Some(sid)).expect("queued mid-turn");
+
+        h.cancel();
+        turns_done(&h, 1).await;
+
+        let evs = drain_events(&mut ev).await;
+        let returned = evs.iter().find_map(|e| match e {
+            EngineEvent::QueueReturned { items, .. } if !items.is_empty() => Some(items.clone()),
+            _ => None,
+        });
+        let items = returned.expect("no QueueReturned for a turn stopped with a message waiting");
+        assert_eq!(items[0].id, view.id);
+        assert_eq!(items[0].text, "words that were never sent");
+        assert!(
+            evs.iter().any(|e| matches!(e, EngineEvent::Note { message, .. } if message.contains("back in the composer"))),
+            "the transcript never said where the words went"
+        );
+        assert!(h.state().queued.is_empty(), "the queue still lists a message handed back");
+        for req in p.seen.lock().unwrap().iter() {
+            assert!(!req.iter().any(|m| m.content.contains("words that were never sent")), "a stopped turn sent it anyway");
+        }
+        assert!(
+            !store.messages(sid).unwrap().iter().any(|r| r.content.contains("words that were never sent")),
+            "the stopped turn wrote the words into the record"
+        );
+    }
+
+    /// The choice is stored, not remembered per window: the composer announces it, and the file is
+    /// what the next start reads. A phone tab and the desktop pressing the same Enter have to be
+    /// given the same promise.
+    #[tokio::test]
+    async fn the_mid_turn_choice_reaches_the_file_the_next_start_reads() {
+        let dir = std::env::temp_dir().join(format!("cwoffee_midturn_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "mode = \"ask\"\n").unwrap();
+
+        let store = Arc::new(Store::in_memory().unwrap());
+        let p = Arc::new(Held {
+            reply: "ok".into(),
+            hold: std::time::Duration::from_millis(10),
+            calls: AtomicUsize::new(0),
+            seen: Default::default(),
+        });
+        let mut cfg = HostConfig::new("test-model", std::env::temp_dir());
+        cfg.cfg_path = Some(path.clone());
+        let h = SessionHost::spawn(p as Arc<dyn Provider>, Registry::new(), store, cfg);
+        assert_eq!(h.state().mid_turn, crate::steer::MidTurn::Steer);
+
+        h.set_mid_turn(crate::steer::MidTurn::FollowUp);
+        assert_eq!(h.state().mid_turn, crate::steer::MidTurn::FollowUp, "the live host did not take the choice up");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("mid_turn = \"follow_up\""), "the file says: {text}");
+
+        let (again, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(again.mid_turn(), crate::steer::MidTurn::FollowUp, "the next start would not read it back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A follow-up is not a steer: the host's stored choice decides which promise the press makes,
+    /// and the announcement the composer quotes has to match it.
+    #[tokio::test]
+    async fn the_hosts_choice_decides_which_promise_a_press_makes() {
+        let (mut h, _store, p) = held_host("the answer", std::time::Duration::from_millis(300));
+        let (mut ev, _ap) = h.take_receivers().expect("receivers");
+        h.set_mid_turn(crate::steer::MidTurn::FollowUp);
+        h.send_turn_to("write the note", vec![], None);
+        wait_for("busy".into(), || h.state().busy).await;
+        let sid = h.state().session_id;
+
+        let view = h.queue_mid_turn("ask it afterwards".into(), vec![], Some(sid)).expect("queued mid-turn");
+        assert_eq!(view.kind, crate::steer::MidTurn::FollowUp);
+        assert!(crate::steer::MidTurn::FollowUp.announce().contains("after this turn"));
+
+        turns_done(&h, 1).await;
+        let reqs = p.seen.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "the follow-up was never asked");
+        assert!(reqs[1].iter().any(|m| m.content.contains("ask it afterwards")));
+        let evs = drain_events(&mut ev).await;
+        assert!(
+            evs.iter().any(|e| matches!(e, EngineEvent::SteerLanded { kind: crate::steer::MidTurn::FollowUp, .. })),
+            "the receipt did not say it was a follow-up"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, EngineEvent::Note { message, .. } if message.contains("asked after this turn"))),
+            "a follow-up landed with a steer's sentence"
+        );
     }
 }

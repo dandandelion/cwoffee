@@ -245,11 +245,13 @@ async function stream(turns: number) {
     op(() => t.apply({ kind: 'turnEnd', d: { turn_id: turn + 1, finish: 'stop' } }))
   }
   let i = 0
-  // Where the cup sits on screen, frame by frame, measured against the viewport rather than the
-  // document. The report is about the picture *moving while lines arrive*: a number in document
-  // coordinates would simply follow the scroll and say nothing. A picture carried along by growth
-  // travels one way; a picture that jumps back and forth reverses direction, and the reversal count
-  // is what separates the two.
+  // Where the turn's working loader sits on screen, frame by frame, measured against the viewport
+  // rather than the document. This used to sample the conversation's cup, and the question it asked
+  // carries over to the loader: a mark that rides the content travels one way, a mark that jumps
+  // back and forth reverses direction, and the reversal count is what separates "carried along by
+  // growth" from "the layout is jumping under the reader". The loader answers it differently now —
+  // it is a static box in the run header or after the last block, not a pinned picture — so the
+  // expected result is monotonic travel and no reversals at all.
   const cupMove: number[] = []
   let cupPrev: number | null = null
   let cupDir = 0
@@ -257,10 +259,10 @@ async function stream(turns: number) {
   let cupTravel = 0
   let cupFrames = 0
   const sampleCup = () => {
-    const img = document.querySelector('.transcript-cup') as HTMLElement | null
-    // A picture the transcript has put away (`.bare` for an empty page, `.cup-out` for a reader who
-    // is mid-page) has no box at all; sampling it would report a 1,300px jump out of nothing.
-    if (!img || img.classList.contains('bare') || img.classList.contains('cup-out')) {
+    const img = document.querySelector('.transcript .run-working') as HTMLElement | null
+    // Between turns there is no loader at all: `dropWorking` takes it away. Sampling through that
+    // gap would report a jump out of nothing, so an absent mark resets the chain.
+    if (!img) {
       cupPrev = null
       return
     }
@@ -294,20 +296,23 @@ async function stream(turns: number) {
     if (i % 400 < 3) say(`probe: live ${i}/${q.length} ops`)
   }
   say(
-    `probe cup motion: ${cupFrames} frames sampled, per-frame step p50=${pct(cupMove, 0.5).toFixed(1)}px ` +
+    `probe loader motion: ${cupFrames} frames sampled, per-frame step p50=${pct(cupMove, 0.5).toFixed(1)}px ` +
       `p95=${pct(cupMove, 0.95).toFixed(1)}px max=${Math.max(...cupMove, 0).toFixed(1)}px, ` +
       `total travel ${Math.round(cupTravel)}px, direction reversals ${cupReversals}` +
       (shell ? ` ; scroller scrollTop=${Math.round(shell.scrollTop)}/${Math.round(shell.scrollHeight - shell.clientHeight)}` : ''),
   )
-  // The band, stated in absolute numbers rather than as motion: how far the picture sits from its
-  // containing block's bottom edge, and how that block relates to the pane. Written out because the
-  // same claim measured in the app returned a seat of 524px, and "the cup is in the wrong place" does
-  // not say whether the picture, its parent or the pane is the element that moved.
+  // The mark's box, stated in absolute numbers rather than as motion, and why each number is here:
+  // `max-width: none` (the page-wide `img` reset once turned a declared 56px mark into 0x56), the
+  // computed position (it must be `static` — a `sticky` or `absolute` mark is a mark that leaves the
+  // line it describes and needs a clip box to survive), and the scroller's own bottom padding, which
+  // used to be a 168px band reserved for a pinned picture and is now an ordinary edge. The old line
+  // named a "seat of 524px" and could not say whether the picture, its parent or the pane had moved;
+  // these three facts can.
   {
-    const img = document.querySelector('.transcript-cup') as HTMLElement | null
+    const img = document.querySelector('.transcript .run-working') as HTMLElement | null
     shell.scrollTop = shell.scrollHeight
     await frame()
-    if (!img) say('probe cup band: no cup on the page')
+    if (!img) say('probe loader box: no loader on the page (turns have landed; the mark exists only while one runs)')
     else {
       const cs = getComputedStyle(img)
       const b = img.getBoundingClientRect()
@@ -315,10 +320,10 @@ async function stream(turns: number) {
       const hb = host.getBoundingClientRect()
       const col = document.querySelector('.scroller > div > .transcript') as HTMLElement | null
       say(
-        `probe cup band: parent .${host.className} rect=${Math.round(hb.left)},${Math.round(hb.top)} ${Math.round(hb.width)}x${Math.round(hb.height)}; ` +
-          `cup rect=${Math.round(b.left)},${Math.round(b.top)} ${Math.round(b.width)}x${Math.round(b.height)} ` +
-          `computed pos=${cs.position} disp=${cs.display} top=${cs.top} bottom=${cs.bottom} left=${cs.left} --cup-left="${cs.getPropertyValue('--cup-left').trim()}"; ` +
-          `seat=${Math.round(hb.bottom - b.bottom)}px, left-vs-column=${col ? Math.round(b.left - col.getBoundingClientRect().left) : 'n/a'}px; ` +
+        `probe loader box: parent .${host.className} rect=${Math.round(hb.left)},${Math.round(hb.top)} ${Math.round(hb.width)}x${Math.round(hb.height)}; ` +
+          `loader rect=${Math.round(b.left)},${Math.round(b.top)} ${Math.round(b.width)}x${Math.round(b.height)} ` +
+          `computed pos=${cs.position} disp=${cs.display} maxW=${cs.maxWidth} anim=${cs.animationName}; ` +
+          `left-vs-column=${col ? Math.round(b.left - col.getBoundingClientRect().left) : 'n/a'}px; ` +
           `scroller padB=${getComputedStyle(shell).paddingBottom} ${Math.round(shell.scrollTop)}/${shell.scrollHeight}x${shell.clientHeight}; ` +
           `view=${window.innerWidth}x${window.innerHeight} dpr=${window.devicePixelRatio}`,
       )

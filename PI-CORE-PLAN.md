@@ -75,10 +75,15 @@ phone / browser client over /ws              ├── Rust **pi-host bridge** �
   the self-test fixture (`scripts/mock-llm.mjs` drove pi **unmodified** — see S0.1).
 - "Coworker, not coder" is a switch, not a fork: launch pi with its built-in coding tools
   **off** and only our tools on (`--tools "-read,-bash,-edit,-write,+sheet_query,..."`).
-- Free on arrival (all unfinished in `PLAN.md`, done in pi): MCP, skills, prompt
-  templates, session tree/branching, compaction, HTML export, model discovery, and
-  `/llama` (pi drives the llama.cpp router: GGUF discovery + on-demand load), which is
-  what `CWOFFEE_URL` hand-rolls today.
+- Free on arrival (all unfinished in `PLAN.md`, done in pi): skills, prompt templates,
+  session tree/branching, compaction, HTML export, model discovery, and `/llama` (pi drives
+  the llama.cpp router: GGUF discovery + on-demand load), which is what `CWOFFEE_URL`
+  hand-rolls today. **MCP is not free on arrival** and was never going to be: an MCP server is
+  a long-lived child, and this core's tool host is one process per call, so a server pi mounts
+  there would restart on every call. cwoffee's own third-party tool rules (hidden until
+  `explore`, per-call approval, capped catalog) are the reason we mount them ourselves; see
+  `docs/MCP-SERVERS.md` for the hub the app owns on both cores and the socket the tool host
+  asks it through.
 
 ## NON-GOALS
 
@@ -2271,6 +2276,73 @@ was the light-theme icon; and go on with the harness plus the parity list.
     `~/.cargo/env`. `setup.sh` probes `$HOME/.cargo/bin/cargo` *before* editing `PATH`, so it can say
     "it is installed, your shell cannot see it, add this line" instead of reporting a missing
     toolchain. Ordering matters: after `export PATH=…` the fact is unobservable.
+168. **pi's `get_tree` answer is a nested copy, and a real conversation is too deep to parse.**
+    `get_tree` returns `{tree: [{entry, children: […]}]}`, one JSON level per entry, so a sixty-message
+    conversation is over a hundred levels deep and the bridge's JSONL reader refused the whole record:
+    `[bridge] unparseable record from pi (recursion limit exceeded at line 1 column 56463)`. The tree
+    card then drew the cwoffee rows and said nothing about what pi's model was told, which is the one
+    question the card exists to answer. `get_entries` answers the same facts as a flat list with
+    `parentId` plus `leafId`, and rebuilding the tree on the Rust side has no depth to overflow —
+    `pi_entries_from_json` walks up from `leafId`, which is also what marks the branch pi is reading.
+    The same run showed the second half of the lesson: the tree read sits on the page's every-open path
+    (`readLeafLine` in `App.svelte`), so an expensive read there queues behind the host's loop and the
+    ceiling pin in the settings panel timed out waiting for it. A read the composer makes on every
+    conversation open has to be the cheap one.
+169. **pi's RPC has no `set_leaf`, and the primitive that can move the leaf is a fork.** `navigateTree`
+    exists in an extension context — not reachable from the RPC parent — and asked mid-turn it answers
+    *"Wait for the current response to finish before navigating the session tree."* So
+    `switch_leaf` on the pi core forks the prefix (`fork` before the target user entry, `fork` before
+    the entry after the target answer, `clone` when the target is an answer at the leaf), which is what
+    `branch_conversation` already does. Two consequences worth writing down: the old thread is **not**
+    deleted, so the receipt says the previous thread remains and holds the off-path messages; and the
+    record's leaf is written only after pi accepted the fork, with a switch back if the write or the
+    state read fails, because a record pointing at a path pi is not reading is the failure this verb
+    exists to avoid.
+170. **`copy_through` copied by row id across the whole file, and after a leaf move that is not the
+    conversation.** `WHERE session_id = ? AND id <= ?` was correct while a conversation had one path.
+    With two, it handed someone who pressed Branch on the branch they were reading a new conversation
+    built from the rows the leaf had walked past — rows their transcript never showed. It now copies
+    the source's branch chain up to the cut, and `branching_at_the_first_message_of_the_branch_copied_4_row(s)`
+    is what said so. The same distinction is why `messages()`/`history()` walk the chain: the
+    conversation *is* its branch, and `crate::tree` is where the other rows are still shown.
+171. **What the record is expected to answer to is narrower than what pi's thread holds.** A fork taken
+    at a conversation's opening message leaves pi's new thread holding the entry that recorded the
+    model, the thinking-level entry, and the **system prompt** pi assembled — no message at all. The
+    record stores user messages, answers and tool results and never stores the prompt the engine built.
+    Treating those as disagreements put a warning on the card, and a composer line claiming the two
+    records would disagree, on a conversation whose next answer genuinely starts from nothing. They are
+    nodes of the thread and not drift; the disagreement claim belongs to a *message* one side has and
+    the other does not.
+
+## Journal — session 29 (a tree, and what moving a leaf actually moves)
+
+From `three-feature-prompt-2.md`, feature 1, kept in its own words:
+
+> *Branching made siblings; nothing says who is whose parent… One tree must be readable no matter
+> which core made the branch.*
+> *Move the leaf: a `switch_leaf` verb. It changes what the next answer reads; it copies nothing and
+> deletes nothing… Refused mid-turn… if pi's RPC cannot move the leaf, the pi arm ships lineage + tree
+> visibility only… no half-ship.*
+> *Watch-role reads the tree; it cannot move anything.*
+
+It did not half-ship: pi's RPC cannot set a leaf, but it can fork, and a fork is a leaf move that
+leaves the old thread intact. The whole feature is four columns (`parent`, `branch_role`, `branch_row`,
+`leaf_row` on sessions; `parent_row` on messages, schema v16), one read function
+(`cwoffee_engine::tree::read`) that the desktop command and the gateway verb both call, and one drive
+verb (`switch_leaf`, in `AUDITED`) that refuses while a turn runs and refuses a row whose words the
+window never showed.
+
+What it changed underneath, which is the part a later reader needs: `messages()` and `history()` now
+return the branch the leaf sits on rather than every row the file holds, `truncate_from` resolves a
+leaf by walking the leaf's own chain instead of taking `MAX(id)`, and `copy_through` copies that chain
+instead of `id <= cut`. Three assumptions removed at once, all of them invisible until a conversation
+has two paths through it — which is what the `tree` group now runs on both cores.
+
+The card says, per core, which memory it read. That sentence is the honesty half of the feature: the
+rust core has no process to ask and says it read the record; the pi core asks its own thread and says
+which thread it is on. `TreeNode.current` belongs to the record and `TreeNode.pi_current` to pi, and
+when they differ the card says "the two records are at different nodes" instead of painting two
+answers as one.
 
 ## Journal — session 28 (one command from a clone, and a gateway that stays when the window goes)
 

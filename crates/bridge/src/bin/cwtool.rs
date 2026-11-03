@@ -67,19 +67,54 @@ fn args_from_stdin() -> Value {
 /// search backend come from the same file the Rust core reads. If the config cannot be
 /// read, say so loudly on stderr and fall back — a silently defaulted sandbox is the
 /// failure mode this has to avoid.
+/// The browser this tool call can offer, read the same way the Rust core reads it.
+///
+/// The config file is the single source: the driver lookup, the person's `[browser] headed`
+/// override, and — through the model row — whether this conversation's model takes image
+/// input. That last one is what decides headless versus headed, so a pi-core session that
+/// read a *different* source would paint a window on the user's desktop for a model that
+/// cannot see it, or withhold pixels from one that can. `CWOFFEE_MODEL` is the model this
+/// call belongs to, set by the bridge when it starts the tool process.
+fn browser_cfg() -> cwoffee_engine::tools::browser::BrowserCfg {
+    let mut b = match Config::load(None) {
+        Ok((cfg, _)) => cfg.browser_cfg(),
+        Err(_) => cwoffee_engine::tools::browser::BrowserCfg::from_env(),
+    };
+    if b.vision == cwoffee_engine::tools::browser::Vision::Unknown {
+        if let Ok(model) = std::env::var("CWOFFEE_MODEL") {
+            let cfg_path = Config::default_path();
+            b.vision = match cwoffee_engine::config::vision_in(&cfg_path, model.trim()) {
+                Some(true) => cwoffee_engine::tools::browser::Vision::Yes,
+                Some(false) => cwoffee_engine::tools::browser::Vision::No,
+                None => cwoffee_engine::tools::browser::Vision::Unknown,
+            };
+        }
+    }
+    b
+}
+
 fn registry() -> Registry {
+    let browser = browser_cfg();
     match Config::load(None) {
         Ok((cfg, path)) => {
             if let Some(p) = &path {
                 eprintln!("[cwtool] config {} | search: {}", p.display(), cfg.search_backend().describe());
             }
-            Registry::with_v1_tools_exec(cfg.search_backend(), cfg.exec_cfg())
+            Registry::with_v1_tools_browser(
+                cfg.search_backend(),
+                cfg.exec_cfg(),
+                browser.usable().then(|| browser.clone()),
+            )
         }
         Err(e) => {
             // Loud, because a silently defaulted sandbox or net policy is the one
             // divergence a user cannot see from the transcript.
             eprintln!("[cwtool] config could not be read ({e}); engine defaults, search DuckDuckGo - this session may differ from the Rust core");
-            Registry::with_v1_tools_exec(SearchBackend::DuckDuckGo, ExecCfg::default())
+            Registry::with_v1_tools_browser(
+                SearchBackend::DuckDuckGo,
+                ExecCfg::default(),
+                browser.usable().then(|| browser.clone()),
+            )
         }
     }
 }
@@ -163,6 +198,51 @@ fn cfg_for_tools() -> ExecCfg {
     c.exec_cfg()
 }
 
+/// Whether this tool host keeps turn checkpoints, and who says so.
+///
+/// The bridge turns it on for the pi child it starts, alongside `CWOFFEE_DB`: a copy that
+/// no index row points at is a private file in the workspace nobody can find or undo, so
+/// taking one without a store to write the row in would be worse than taking none.
+fn checkpoints_enabled() -> bool {
+    matches!(
+        std::env::var("CWOFFEE_CHECKPOINTS").unwrap_or_default().trim(),
+        "1" | "true" | "yes"
+    )
+}
+
+/// Where the host's MCP hub answers, when this process was told. `None`, or a path that
+/// does not answer, means no third-party tool is mounted here — and the tools that would
+/// have used it say so instead of inventing a server.
+///
+/// The hub cannot live in this process: it owns long-lived children whose pipes carry
+/// JSON-RPC frames, and this binary is one tool call. Asking the host is the only way a
+/// pi-backed session can reach a server at all.
+fn mcp_sock() -> Option<PathBuf> {
+    let raw = std::env::var("CWOFFEE_MCP_SOCK").unwrap_or_default();
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// The catalog the host is holding, and whether it could be read at all.
+///
+/// `Err` is not "no servers": it is "there is a hub somewhere and this process could not
+/// reach it", which is a different thing to say to a model and to a log.
+fn mcp_catalog() -> Option<Vec<cwoffee_engine::mcp::ToolInfo>> {
+    let sock = mcp_sock()?;
+    match cwoffee_engine::mcp::socket::catalog(&sock) {
+        Ok(list) => Some(list),
+        Err(e) => {
+            eprintln!(
+                "[cwtool] the app's MCP hub could not be read ({e}); no third-party tool is mounted in this call"
+            );
+            None
+        }
+    }
+}
+
 fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
     let store = store_handle();
     let search_backend = {
@@ -170,6 +250,8 @@ fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
         c.search_backend()
     };
     ToolCtx {
+        browser: browser_cfg(),
+        checkpoint_store: checkpoints_enabled(),
         workspace: workspace(),
         // The Rust core's host uses 24 KiB (`SessionHost`'s ToolCtx). Match it exactly:
         // a tool dump is prompt bytes, so a second core that lets three times as much in
@@ -181,10 +263,62 @@ fn ctx(permits: Vec<PathBuf>) -> ToolCtx {
         question_timeout: None,
         store,
         session: asking_session(),
+        // What `explore` can find but has not named yet. On this core the third-party tools
+        // come from the host's hub over a socket (see `mcp_catalog`): this process is one
+        // tool call and cannot own a server, so the catalog is read rather than held.
+        lazy_tools: mcp_lazy(),
         search_backend,
         exec_cfg: cfg_for_tools(),
         permits,
+        // The kept browser, if the app is holding one: the browser behind the window's
+        // sidebar. This process reaches it over a socket for the same reason it reaches the
+        // MCP hub over one — a browser started here would be a new browser per call, and a
+        // page the person in the window is watching would not be the page being clicked.
+        //
+        // The state mirror is refreshed once, here, rather than inside `peek`: a risk answer
+        // is synchronous, and a risk answer that asked the app on every call would let a
+        // network round trip sit inside a security check.
+        browser_route: browser_route(),
     }
+}
+
+/// The route to the app's kept browser, or `None` when this start keeps none.
+fn browser_route() -> Option<cwoffee_engine::tools::browser::BrowserRoute> {
+    let sock = std::env::var("CWOFFEE_BROWSER_SESSION_SOCK")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)?;
+    if !sock.exists() {
+        // The app said it had a browser and the door is not there. Saying nothing would let
+        // the tool claim "no kept browser" as if that were the config; the tool's own error
+        // path is where the mismatch becomes visible.
+        return None
+    }
+    let route = cwoffee_engine::tools::browser::BrowserRoute::over_socket(
+        sock,
+        std::sync::Arc::new(std::sync::RwLock::new(cwoffee_engine::browser_hub::Snapshot::default())),
+    );
+    route.refresh_blocking();
+    Some(route)
+}
+
+/// The hidden third-party tools, as `explore` sees them: name, the server's own words, its
+/// schema, and where they came from. Same construction the Rust core's agent builds from its
+/// own registry, so a tool card on either core describes the same server.
+fn mcp_lazy() -> Vec<cwoffee_engine::tools::LazyTool> {
+    let Some(catalog) = mcp_catalog() else {
+        return Vec::new();
+    };
+    catalog
+        .iter()
+        .map(|t| cwoffee_engine::tools::LazyTool {
+            name: t.declared.clone(),
+            description: t.description.clone(),
+            schema: t.schema.clone(),
+            risk: cwoffee_engine::mcp::risk_of(t),
+            from: Some(format!("MCP server {}", t.server)),
+        })
+        .collect()
 }
 
 #[tokio::main]
@@ -213,7 +347,37 @@ async fn main() -> std::process::ExitCode {
             }
         }
     }
-    let reg = registry();
+    let mut reg = registry();
+    // Third-party tools, mounted as hidden entries the same way the desktop's registry does
+    // it: callable once `explore` names them, and no prompt bytes until then. The route is
+    // the socket, because the hub belongs to the host process; the risk, the escapes and the
+    // per-call rule are the same code the Rust core runs.
+    let mcp_hidden: Vec<Value> = match (mcp_sock(), mcp_catalog()) {
+        (Some(sock), Some(catalog)) => {
+            cwoffee_engine::mcp::install_socket_into(&mut reg, &catalog, &sock);
+            catalog
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.declared,
+                        "description": format!(
+                            "[MCP] From server {}: {}{}",
+                            t.server,
+                            t.description,
+                            if t.says_read_only {
+                                " (the server says it only reads; cwoffee still asks, once per call)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        "parameters": t.schema,
+                        "host_ask": false,
+                    })
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
 
     match sub.as_str() {
         "specs" => {
@@ -246,9 +410,14 @@ async fn main() -> std::process::ExitCode {
             let discoverable = reg.discoverable_tool_names();
             out(json!({
                 "ok": true,
-                "count": list.len(),
+                "count": list.len() + mcp_hidden.len(),
                 "lean": lean,
                 "discoverable": discoverable,
+                // The third-party tools, withheld from the prompt by design. The host that
+                // registers them must keep them *out of the declared list* until `explore`
+                // names one — which is a different rule from `lean`, and applies in full
+                // mode too, because a server nobody uses must not tax every turn.
+                "hidden": mcp_hidden,
                 "tools": list,
             }));
             std::process::ExitCode::SUCCESS

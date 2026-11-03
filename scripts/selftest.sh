@@ -20,6 +20,7 @@
 # Usage:
 #   scripts/selftest.sh                 build UI+app, run, print verdict
 #   scripts/selftest.sh --no-build      use the binaries as they are
+#   scripts/selftest.sh --no-browser    no kept browser: the panel grades its honest "no browser" line
 #   scripts/selftest.sh --speed 2       mock streams 2x faster
 #   scripts/selftest.sh --keep          leave the temp dirs and the log behind
 #   scripts/selftest.sh --list          name the check groups
@@ -39,29 +40,62 @@ MOCK_PORT=${MOCK_PORT:-8190}
 GW_PORT=${GW_PORT:-8199}
 SPEED=1
 NO_BUILD=0
+# `--no-mcp` starts no third-party server. The `mcp` group needs both halves of its claim — a
+# live server and a dead one — so turning this off is for debugging runs that have nothing to do
+# with MCP, not for a cheaper green.
+NO_MCP=0
+# `--no-browser` starts no kept browser at all. The `browser-panel` group then grades the other
+# half of the feature — the panel explaining, in words, that there is no browser here and what
+# would put one back — so this is not a cheaper green, it is the second arm.
+NO_BROWSER=0
 KEEP=0
 REAL=""
 ONLY=""
 LIST=0
+# Which palette this run paints. Declared empty because the script runs under `set -u`: a flag nobody
+# passed has to read as an empty value rather than an unbound variable, which is how a plain
+# `./scripts/selftest.sh` died on its own theme check.
+THEME=""
+prev_arg=""
 for a in "$@"; do
   case "$a" in
     --no-build) NO_BUILD=1 ;;
+    --no-mcp) NO_MCP=1 ;;
+    --no-browser) NO_BROWSER=1 ;;
     --keep) KEEP=1 ;;
-    --speed) : ;;
+    --speed) prev_arg="--speed" ; continue ;;
     --speed=*) SPEED=${a#--speed=} ;;
-    --only) : ;;
+    --only) prev_arg="--only" ; continue ;;
     --only=*) ONLY=${a#--only=} ;;
     --list) LIST=1 ;;
-    --real-endpoint) : ;;
+    --real-endpoint) prev_arg="--real-endpoint" ; continue ;;
     --real-endpoint=*) REAL=${a#--real-endpoint=} ;;
-    --mock-port) : ;;
+    --mock-port) prev_arg="--mock-port" ; continue ;;
     --mock-port=*) MOCK_PORT=${a#--mock-port=} ;;
+    --gateway-port) prev_arg="--gateway-port" ; continue ;;
+    --gateway-port=*) GW_PORT=${a#--gateway-port=} ;;
+    --theme) prev_arg="--theme" ; continue ;;
+    --theme=*) THEME=${a#--theme=} ;;
     -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     --*) ;;
     # A bare word is a check group, which is what you type on a normal day: the section's own label
     # is what you remember ("cup"), not an id you have to look up. `--only cup code` works too.
-    *) ONLY="${ONLY:+$ONLY,}$a" ;;
+    # A word that is the *value* of the flag before it is not a group: `--theme light` used to add a
+    # group called "light" to the filter, so the run announced itself as TARGETED [theme,light] when
+    # it had been asked for one thing.
+    *)
+      case "$prev_arg" in
+        --theme) prev_arg=""; THEME="$a" ;;
+        --speed) prev_arg=""; SPEED="$a" ;;
+        --only) prev_arg=""; ONLY="${ONLY:+$ONLY,}$a" ;;
+        --mock-port) prev_arg=""; MOCK_PORT="$a" ;;
+        --gateway-port) prev_arg=""; GW_PORT="$a" ;;
+        --real-endpoint) prev_arg=""; REAL="$a" ;;
+        *) ONLY="${ONLY:+$ONLY,}$a" ;;
+      esac
+      ;;
   esac
+  prev_arg=""
 done
 if [ "$LIST" = 1 ]; then
   echo "check groups (scripts/selftest.sh <id-or-word> ...):"
@@ -69,6 +103,17 @@ if [ "$LIST" = 1 ]; then
     tr -d "\"" | sed -e 's/^want(.//' -e "s/', '/  /" -e "s/.'$//" | sort -u
   exit 0
 fi
+case "$THEME" in
+  light|dark|system) ;;
+  "") ;;
+  *) die "--theme must be light, dark or system (got '$THEME')" ;;
+esac
+if [ -n "$THEME" ]; then
+  # Named on the board's own line: a green run graded in one palette says nothing about the other,
+  # and a reader who cannot tell which palette ran would read it as both.
+  export CWOFFEE_SELFTEST_THEME="$THEME"
+fi
+
 # `--real-endpoint <url>` (space-separated) as well as `=` form
 if [ -z "$REAL" ]; then
   prev=""
@@ -114,8 +159,22 @@ else
   if [ -n "$state" ]; then
     got=$(fp_of "$state")
     if [ -n "$got" ] && [ "$got" = "$want" ]; then
-      note "port ${MOCK_PORT} answers as a mock-llm with the CURRENT scenarios.json (fingerprint $got) - reusing it"
-      MOCK_REUSED=1
+      # Ask twice. A run that is being ended right now still answers its first probe, then its
+      # server goes away with its parent's cleanup - and the next run, having "reused" it, fails on
+      # the first model list with `list_models returned nothing`. Measured twice in one afternoon,
+      # both times caused by ending a run by its pid and starting another four seconds later.
+      sleep 1
+      state2=$(curl -fsS "http://127.0.0.1:${MOCK_PORT}/mock/state" 2>/dev/null || true)
+      # Three probes over ~2.5s, because a server that is draining answers while it dies. Anything
+      # that stops answering in the middle of that window is not ours to reuse.
+      sleep 1.5
+      state3=$(curl -fsS "http://127.0.0.1:${MOCK_PORT}/mock/state" 2>/dev/null || true)
+      if [ "$(fp_of "$state2")" = "$want" ] && [ "$(fp_of "$state3")" = "$want" ]; then
+        note "port ${MOCK_PORT} answers as a mock-llm with the CURRENT scenarios.json (fingerprint $got) - reusing it"
+        MOCK_REUSED=1
+      else
+        note "port ${MOCK_PORT} answered once and then stopped answering - that server was on its way out; starting our own"
+      fi
     else
       pid=$(ss -ltnp "sport = :${MOCK_PORT}" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
       die "port ${MOCK_PORT} answers as a mock-llm with a stale or unknown scenario set (it says ${got:-no fingerprint}, the file says $want). End that one server by its pid (${pid:-not found from ss}) — do not pattern-kill by name, something else may answer to it — or set MOCK_PORT=…"
@@ -171,11 +230,71 @@ if [ -z "$REAL" ]; then
   export XDG_STATE_HOME="$SCRATCH/state"
   export CWOFFEE_PI_AGENT_DIR="$SCRATCH/pi"
   export CWOFFEE_WORKSPACE="$SCRATCH/ws"
+  # A third-party MCP server for the `mcp` group, and it is deliberately *this* run's own:
+  # scripts/fake-mcp-server.mjs is cwoffee's test double, and `--writes` points at the scratch
+  # workspace so a group can read the file the server wrote off disk instead of trusting a card.
+  # `dead` is the second one: it answers tools/list and exits, so the catalog is real and the
+  # *call* is what fails — which is the state a real server reaches when it crashes later.
+  # Env rather than the config file, so the suite never has to write a config just to get a
+  # server - and because the variable replaces the file's [mcp.servers] list wholesale, it makes
+  # the servers page read-only, which is what a window whose list comes from the environment has to
+  # be. The page's write path is graded by the "mcp write" arm below, in its own scratch config.
+  # With neither the app starts no servers, so nothing outside this scratch run can inherit them.
+  if [ "$NO_MCP" = 0 ]; then
+    export CWOFFEE_MCP_SERVERS=$(python3 -c "
+import json, os
+print(json.dumps({
+    'fake': {'command': 'node', 'args': ['$ROOT/scripts/fake-mcp-server.mjs', '--tools', '3', '--writes', '$SCRATCH/ws'], 'enabled': True},
+    'dead': {'command': 'node', 'args': ['$ROOT/scripts/fake-mcp-server.mjs', '--tools', '2', '--die'], 'enabled': True},
+}))")
+  fi
   TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 else
   SCRATCH=""
   TOKEN=${CWOFFEE_GATEWAY_TOKEN:-}
   [ -n "$TOKEN" ] || die "--real-endpoint runs against your real config; set CWOFFEE_GATEWAY_TOKEN to reuse the running gateway, or unset CWOFFEE_GATEWAY_PORT"
+fi
+# The kept browser runs **headless** on this board. Not because the panel needs headless — a
+# screenshot comes from the page either way — but because a run that measures window geometry has
+# no business putting a second real window on the desktop and then explaining the numbers it got.
+# On a person's desktop the same feature opens a real window; `browser_status`/`browser_panel` say
+# which mode a start is in, so the board is not pretending.
+export CWOFFEE_BROWSER_SESSION_HEADLESS=1
+# ...and ask for the headless-shell build rather than full Chromium in its headless mode: the
+# shell build never opens an X connection, so a kept browser cannot disturb the compositing of the
+# very window this run is measuring. `[browser] headed` still wins for a person; this is the
+# harness saying "do not paint".
+export CWOFFEE_BROWSER_HEADLESS_ONLY=1
+# `--no-browser` turns keeping one off, in the person's own switch (`[browser] keep = false`),
+# which is the arm that grades the panel saying so instead of offering a box that can only fail.
+if [ "$NO_BROWSER" = 1 ]; then export CWOFFEE_BROWSER_KEEP=no; fi
+# The kept browser has two shapes, and one process can only be in one of them: a column showing
+# pictures of a browser that runs in another process, or a page this app paints into the panel's own
+# box. The groups name which they grade — `browser-panel` the first, `browser-inpage` the second — so
+# the board starts the shape the requested groups need and says which it chose. A full pass runs the
+# column shape on the main board and relaunches a second board for the in-page arm, the same way the
+# idle arm gets a config of its own.
+INPAGE_ONLY=0
+if [ -n "$ONLY" ]; then
+  other=0; inpage=0
+  for g in $ONLY; do case "$g" in browser-inpage) inpage=1 ;; *) other=1 ;; esac; done
+  [ "$inpage" = 1 ] && [ "$other" = 0 ] && INPAGE_ONLY=1
+fi
+if [ "$NO_BROWSER" = 0 ] && [ "$INPAGE_ONLY" = 1 ]; then
+  export CWOFFEE_BROWSER_PAGE=yes
+else
+  export CWOFFEE_BROWSER_PAGE=no
+  # ... and this launch stands down the in-page group, whatever else it was asked for. Failing it
+  # here was the accident that made a full pass red and then skipped the relaunch below, which is
+  # the launch that actually grades it: a check cannot be allowed to fail a shape it was never
+  # started in.
+  INPAGE_WANT=0
+  if [ -n "$ONLY" ]; then
+    for g in $ONLY; do case "$g" in browser-inpage) INPAGE_WANT=1 ;; esac; done
+  else
+    INPAGE_WANT=1
+  fi
+  if [ "$INPAGE_WANT" = 1 ]; then export CWOFFEE_SELFTEST_SKIP=browser-inpage; fi
 fi
 export CWOFFEE_URL="$ENDPOINT"
 export CWOFFEE_MODEL=cwoffee-mock
@@ -187,6 +306,11 @@ export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
 export __GLX_VENDOR_LIBRARY_NAME=mesa
 
 note "endpoint   : $ENDPOINT"
+if [ "$NO_MCP" = 0 ]; then
+  note "mcp servers: fake (live, writes into $SCRATCH/ws) + dead (answers the list, then exits)"
+else
+  note "mcp servers: none (--no-mcp; the mcp group grades the honest no-server path only)"
+fi
 note "config dir : ${XDG_CONFIG_HOME:-$HOME/.config}"
 note "data dir   : ${XDG_DATA_HOME:-$HOME/.local/share}"
 note "state dir  : ${XDG_STATE_HOME:-$HOME/.local/share}"
@@ -203,12 +327,28 @@ note "gateway    : 127.0.0.1:${GW_PORT} (not 8099: the running app keeps its gat
 # loud when the pi core has no toolhost: without cwtool the model is told "tool not found"
 # for every call, and half the board turns into a core-shape accident.
 note "core       : ${CWOFFEE_CORE:-rust} (from the environment; check /proc/<app>/environ if unsure)"
+if [ "$NO_BROWSER" = 0 ]; then
+  if [ "${CWOFFEE_BROWSER_PAGE:-no}" = yes ]; then
+    note "browser    : this board keeps the page **in the window** (CWOFFEE_BROWSER_PAGE=yes). 'browser-panel' would be grading a picture column that is not running here; run it separately."
+  else
+    note "browser    : this board keeps a browser in another process and shows its pictures. The page-in-the-window shape is graded by 'browser-inpage', which gets its own launch; this launch stands it down rather than failing it."
+  fi
+fi
 if [ "${CWOFFEE_CORE:-rust}" = pi ] && [ -z "${CWOFFEE_CWTOOL:-}" ]; then
   note "toolhost   : not set — this run will build and use its own target/release/cwtool"
 elif [ "${CWOFFEE_CORE:-rust}" = pi ]; then
   note "toolhost   : ${CWOFFEE_CWTOOL} (from the environment; this run does NOT rebuild it)"
 fi
 note "log        : $log"
+# Which palette this run paints, said on the header. One run can only be in one palette, so "the
+# floating surfaces are graded in both" is two arms: the detached probes inside the `theme` group
+# resolve both palettes' tokens in either run, and the *live* paint claim needs the run to be in the
+# palette it is asserting. A full pass therefore launches the light arm of that group afterwards.
+if [ -n "$THEME" ]; then
+  note "palette    : this run paints '$THEME' (CWOFFEE_SELFTEST_THEME); the live-paint claims are about that palette only"
+elif [ -z "$ONLY" ]; then
+  note "palette    : this run paints whatever the host stores; the light arm of the surface groups runs afterwards as its own launch"
+fi
 if [ -n "$ONLY" ]; then
   export CWOFFEE_SELFTEST_ONLY="$ONLY"
   note "checks     : TARGETED [$ONLY] - the other groups are NOT running, so a green here covers these groups only"
@@ -231,6 +371,17 @@ cleanup() {
   fi
   [ -n "${APP_PID:-}" ] && kill "$APP_PID" >/dev/null 2>&1
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" >/dev/null 2>&1
+  # Wait for the mock this run started. It drains in-flight requests before exiting, so the port can
+  # keep answering for a moment after the kill - and the next run's fingerprint probe then "reuses"
+  # a server that is on its way out, launches an app, and fails on the first model list with
+  # `list_models returned nothing`. Seen twice: both times a run was ended by its pid and another
+  # started seconds later.
+  if [ -n "${MOCK_PID:-}" ]; then
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$MOCK_PID" >/dev/null 2>&1 || break
+      sleep 0.3
+    done
+  fi
   # The clipboard goes back before anything is deleted: a test that quietly eats
   # what you had copied is a test that costs you an afternoon of work.
   if [ "${CLIP_ARMED:-0}" = 1 ] && [ -d "${SCRATCH:-}/clip" ]; then
@@ -322,6 +473,10 @@ esac
 # ignoring a package that really does feed an artifact hides a stale one. These are the
 # packages each binary is linked from, plus the UI bundle the app embeds at build time.
 app_inputs() { printf '%s\n' crates/tauri-app crates/gateway crates/bridge crates/engine Cargo.toml Cargo.lock ui/dist; }
+# The terminal is a third artifact, and the gate below runs *this tree's* binary: the same stale
+# -artifact trap that once made a board grade hours-old bridge code would make a TUI gate grade
+# whatever `cwoffee` was left in target/release.
+tui_inputs() { printf '%s\n' crates/tui crates/engine Cargo.toml Cargo.lock; }
 tool_inputs() { printf '%s\n' crates/bridge crates/engine Cargo.toml Cargo.lock; }
 newer_than() {
   local a=$1 f
@@ -346,7 +501,9 @@ if [ "$NO_BUILD" = 0 ]; then
   # whatever cwoffee-app was left in the target dir by an older build. That is how a board
   # graded a three-hour-old bridge while the tree had moved on. Build the packages, all of
   # their targets, and let the proof below check the artifacts.
-  CARGO_BUILD_JOBS=1 ./scripts/cargo-guard.sh --max-mb 3000 cargo build --release -p cwoffee-app -p cwoffee-gateway -p cwoffee-bridge -j 1 >>"$log" 2>&1 \
+  # `cwoffee-tui` rides along: the `tui` group drives target/release/cwoffee, and a board that
+  # builds only the app would grade whatever terminal binary an older run left in the target dir.
+  CARGO_BUILD_JOBS=1 ./scripts/cargo-guard.sh --max-mb 3000 cargo build --release -p cwoffee-app -p cwoffee-gateway -p cwoffee-bridge -p cwoffee-tui -j 1 >>"$log" 2>&1 \
     || die "cargo build failed (see $log)"
   # "Finished" is not evidence. Cargo has been seen to recompile the engine and the bridge
   # and leave `cwoffee-app` alone, so the app keeps an embedded bridge from hours ago and the
@@ -356,7 +513,7 @@ if [ "$NO_BUILD" = 0 ]; then
   if [ -n "$stale" ]; then
     note "target/release/cwoffee-app is older than $stale — the build said finished without relinking the app; forcing one relink"
     touch crates/tauri-app/src/main.rs
-    CARGO_BUILD_JOBS=1 ./scripts/cargo-guard.sh --max-mb 3000 cargo build --release -p cwoffee-app -p cwoffee-gateway -p cwoffee-bridge -j 1 >>"$log" 2>&1 \
+    CARGO_BUILD_JOBS=1 ./scripts/cargo-guard.sh --max-mb 3000 cargo build --release -p cwoffee-app -p cwoffee-gateway -p cwoffee-bridge -p cwoffee-tui -j 1 >>"$log" 2>&1 \
       || die "cargo rebuild failed (see $log)"
     stale=$(newer_than target/release/cwoffee-app $(app_inputs))
     [ -z "$stale" ] || die "target/release/cwoffee-app is STILL older than $stale: this board would be running an artifact it did not build. Any red it prints belongs to that older code, not to this tree."
@@ -388,6 +545,61 @@ fi
 
 note "artifacts  : app $(date -r target/release/cwoffee-app '+%m-%d %H:%M:%S'), target dir $tgt (built from this tree)"
 
+# ---- group tui: the terminal's own gate -------------------------------------
+# The board above grades a window. The terminal shares the same engine and had no check of any
+# kind, which is how `checkpoint_store: true` came to mean "this turn copies files nobody can list"
+# and `[mcp]` came to mean "read by nobody in the TUI". `scripts/tui-gate.mjs` drives the built
+# binary over its own pty and grades the disk, the store and the mock endpoint's request log.
+#
+# Is the filter asking for it? A bare word matches the group, and a full pass runs it too.
+TUI_WANT=1
+if [ -n "$ONLY" ]; then
+  case ",$ONLY," in
+    *,*tui*,*) TUI_WANT=1 ;;
+    *) TUI_WANT=0 ;;
+  esac
+fi
+TUI_FAIL=0
+if [ "$TUI_WANT" = 1 ]; then
+  [ -x target/release/cwoffee ] || die "no target/release/cwoffee for the tui group (built above, in the same line as the app)"
+  stale=$(newer_than target/release/cwoffee $(tui_inputs))
+  [ -z "$stale" ] || die "target/release/cwoffee is older than $stale: the gate would grade a terminal this tree did not build. Rebuild: cargo build --release -p cwoffee-tui"
+  note "tui binary : $(date -r target/release/cwoffee '+%m-%d %H:%M:%S') ($PWD/target/release/cwoffee)"
+  note "tui gate   : driving target/release/cwoffee on its own pty against its own mock endpoint on $((MOCK_PORT + 40)) (never 8090; the board's mock on ${MOCK_PORT} is left alone)"
+  if [ "$NO_MCP" = 1 ]; then
+    note "           : --no-mcp, so the gate grades the no-servers arm only and says so"
+  fi
+  tui_out=$(CWOFFEE_MCP_SERVERS="" CWOFFEE_GATEWAY_PORT="" CWOFFEE_GATEWAY_TOKEN="" \
+    CARGO_BUILD_JOBS=1 ./scripts/cargo-guard.sh --max-mb 3000 \
+    node scripts/tui-gate.mjs --bin "$PWD/target/release/cwoffee" --mock "$((MOCK_PORT + 40))" \
+      --db /tmp/cwoffee-tui-gate.$$ --speed "$SPEED" 2>&1)
+  printf '%s\n' "$tui_out" >>"$log"
+  if printf '%s\n' "$tui_out" | grep -q '^TUI GATE ok$'; then
+    note "tui gate   : ok - $(printf '%s\n' "$tui_out" | grep -c '^  ok: ') claim(s) graded (the lines are in $log)"
+  else
+    TUI_FAIL=1
+    printf '\033[31m[selftest.sh] tui gate FAILED:\033[0m\n' >&2
+    printf '%s\n' "$tui_out" | grep -E '^  FAIL:|^TUI GATE' >&2
+  fi
+  # `tui` alone means "grade the terminal", and nothing else on this board says anything about it.
+  # Launching a window to print a verdict about groups that were not selected would take minutes
+  # and report on code the run was never asked to exercise.
+  if [ -n "$ONLY" ]; then
+    page_only=1
+    for tok in $(printf '%s' "$ONLY" | tr ',' ' '); do
+      case "$tok" in *tui*) ;; *) page_only=0 ;; esac
+    done
+    if [ "$page_only" = 1 ]; then
+      if [ "$TUI_FAIL" = 0 ]; then
+        note "verdict: tui ok (the page groups did not run; this says nothing about the window)"
+        exit 0
+      fi
+      note "verdict: tui FAILED (the page groups did not run)"
+      exit 1
+    fi
+  fi
+fi
+
 # No pkill here: this run owns its own config, data dir, workspace and gateway
 # port, so it coexists with an app the user already has open.
 
@@ -416,6 +628,42 @@ if command -v gsettings >/dev/null 2>&1; then
   [ -n "$KEEPER_PID" ] && note "idle keeper: pid $KEEPER_PID (ended by that number, and it puts idle-delay back on the way out)"
 else
   note "idle keeper: no gsettings on this desktop; the session's own blanking is left alone"
+fi
+
+# One desktop, one visible window. The app re-activates its own window when it loses focus during
+# a self-test (docs/TESTING.md), and on Wayland no script can raise another client's window - so a
+# `target/release/cwoffee-app` left running by an earlier, killed run keeps the compositor, and
+# this run ends 40 minutes later with "N geometry checks were skipped: the window was off-screen
+# for most of this run". That message blames the desktop for somebody's stray process, so the
+# process gets named here instead, before the run spends 40 minutes on it.
+#
+# Only this tree's own artifact is looked for. A person's installed app
+# (~/.local/share/cwoffee-desktop/bin/cwoffee-app) is theirs to keep open, and the board is built
+# to coexist with it - the scratch config, data and state dirs are why two instances can run at
+# once. And nothing here is *killed*: a process this script did not start is not this script's to
+# end, and a developer running the app by hand from the target dir is doing exactly that on purpose.
+leftover=$(python3 - <<'PYS' 2>/dev/null
+import os
+me, out = os.getpid(), []
+for e in os.listdir('/proc'):
+    if not e.isdigit() or int(e) == me:
+        continue
+    try:
+        argv = open('/proc/%s/cmdline' % e, 'rb').read().split(b'\0')
+    except OSError:
+        continue
+    # argv[0..1] only: the launching shell carries this script's text - including this very path -
+    # in its own command line, and scanning the whole line would find that and report itself.
+    for a in argv[:2]:
+        v = a.decode(errors='replace')
+        if v.endswith('target/release/cwoffee-app'):
+            out.append(int(e))
+            break
+print(' '.join(str(x) for x in sorted(set(out))))
+PYS
+)
+if [ -n "$leftover" ]; then
+  die "an app from target/release is already running (pid ${leftover// /, }) and this run did not start it. Two self-test windows on one desktop cannot both be the painted one: the other window holds the compositor, and this run would end with 'the window was off-screen for most of this run' and no layout proved. End that pid (kill ${leftover%% *}) or point the board at another desktop; this script does not end processes it did not start."
 fi
 
 note "launching the app"
@@ -536,6 +784,16 @@ if [ -z "$REAL" ]; then
         }
         const hits=Object.entries(j.hits??{}).sort((a,b)=>b[1]-a[1]);
         console.log(`  requests ${j.requests}, turns served ${j.turns}, thinking-off ${j.thinking_off}, thinking-on ${j.thinking_on}`);
+        // The mid-turn witness: what the app actually put in front of the model as a user row, and
+        // what the steer assertions found. A green `steer` group means these moved; a run that
+        // claimed a steer landed while the endpoint never saw one shows up here.
+        console.log(
+          `  mid-turn presses: ${j.steer_hits?.length ?? 0} landed, ` +
+            `${j.steer_misses?.length ?? 0} required and missing, ${j.steer_leaks?.length ?? 0} withdrawn-but-sent, ` +
+            `${j.user_seen?.length ?? 0} user message(s) seen`
+        );
+        for (const m of j.steer_misses ?? []) console.log(`    STEER MISSING: ${m}`);
+        for (const l of j.steer_leaks ?? []) console.log(`    STEER LEAKED: ${l}`);
         for (const [n,c] of hits) console.log(`  ${String(c).padStart(3)}x ${n}`);
         if ((j.misses??[]).length) { console.log(`  MISSES (${j.misses.length}):`); for (const m of j.misses) console.log(`    - ${m}`); }
         else console.log("  no unmatched prompts: every turn the harness sent had a scenario");
@@ -544,6 +802,300 @@ if [ -z "$REAL" ]; then
 fi
 
 echo
+# ---- the light arm of the surface groups ------------------------------------
+# One launch paints one palette. The `theme` group resolves both palettes' tokens from detached
+# probes in either run, but its live-paint claim — the one a hard-coded dark token fails — needs the
+# window to actually be painted in the palette it asserts. So a full pass, and a pass that asked for
+# neither palette, gets a second launch narrowed to that group in the light palette.
+THEME_FAIL=0
+if [ -z "$THEME" ] && [ -z "$ONLY" ] && [ -x target/release/cwoffee-app ]; then
+  # The main app goes first, by the pid this script printed. Two instances would share the scratch
+  # config, the scratch record and the scratch gateway port, and the second one would be graded
+  # against a store the first is still writing to.
+  if [ -n "${APP_PID:-}" ]; then
+    kill "$APP_PID" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8; do kill -0 "$APP_PID" >/dev/null 2>&1 || break; sleep 0.5; done
+    note "theme arm  : the board's app (pid $APP_PID) is ended; the light arm needs the scratch homes to itself"
+  fi
+  note "theme arm  : relaunching for the light palette, group 'theme' only (one run paints one palette)"
+  tllog=/tmp/cwoffee-selftest-theme-light-$$.log
+  # Its own scratch homes, and its own gateway port. Pointing the arm at the board's directories
+  # makes it inherit ~68 conversations from the run that just ended, and the chain's unnamed setup
+  # blocks - history fill, the loop case, the sheet turns - then fail on a store they did not
+  # start: `history fill pass 1 stored 3 rows (expected ~56): session 69 holds 3 rows total`. That
+  # is not a red about the light palette; it is an arm graded against somebody else's record.
+  ARM=$(mktemp -d /tmp/cwoffee-theme-arm.XXXXXX)
+  mkdir -p "$ARM/config" "$ARM/data" "$ARM/state" "$ARM/ws" "$ARM/pi"
+  XDG_CONFIG_HOME="$ARM/config" XDG_DATA_HOME="$ARM/data" XDG_STATE_HOME="$ARM/state" \
+    CWOFFEE_WORKSPACE="$ARM/ws" CWOFFEE_PI_AGENT_DIR="$ARM/pi" \
+    CWOFFEE_GATEWAY_PORT=$((GW_PORT + 1)) CWOFFEE_MCP_SERVERS="" \
+    CWOFFEE_SELFTEST=1 CWOFFEE_SELFTEST_ONLY=theme CWOFFEE_SELFTEST_THEME=light \
+    WEBKIT_DISABLE_COMPOSITING_MODE=1 ./target/release/cwoffee-app >>"$tllog" 2>&1 &
+  THEME_PID=$!
+  tv=""
+  # The pi core takes longer to boot a model process and to run a group's turns than the in-process
+  # engine does, so the arm's clock is the core's, not a constant. A timeout here is reported as a
+  # red arm, and a red that is really "too slow to finish" is the failure this script already refuses
+  # to print in the board's own verdict path.
+  arm_wait=120
+  [ "${CWOFFEE_CORE:-rust}" = pi ] && arm_wait=300
+  for _ in $(seq 1 "$arm_wait"); do
+    grep -q "SELFTEST ok\|SELFTEST FAILED" "$tllog" 2>/dev/null && { tv=$(grep -o "SELFTEST ok\|SELFTEST FAILED" "$tllog" | head -1); break; }
+    kill -0 "$THEME_PID" 2>/dev/null || { tv="gone"; break; }
+    sleep 1
+  done
+  kill "$THEME_PID" 2>/dev/null
+  for i in 1 2 3 4 5 6; do kill -0 "$THEME_PID" >/dev/null 2>&1 || break; sleep 0.5; done
+  # Ended by the pid the script printed, and the arm's log stays in /tmp for the reader.
+  if [ "$tv" = "SELFTEST ok" ]; then
+    note "theme arm  : ok - the light palette holds its own numbers ($(grep -c 'selftest note' "$tllog") note(s) in $tllog)"
+  else
+    THEME_FAIL=1
+    printf '\033[31m[selftest.sh] the light palette arm %s (log: %s):\033[0m\n' "${tv:-timed out}" "$tllog" >&2
+    grep -E "SELFTEST FAIL|theme ok|selftest note" "$tllog" | tail -8 >&2
+  fi
+  # Keep the log when the arm went red: the line above quotes the tail, and the reader needs the
+  # whole thing to tell "the light palette is wrong" from "the arm never finished".
+  if [ "$THEME_FAIL" = 0 ]; then rm -f "$tllog"; fi
+  # The arm's scratch is its own, so it goes away here rather than waiting for cleanup(). Kept with
+  # --keep, the same way the board's scratch is kept.
+  [ "$KEEP" = 0 ] && rm -rf "$ARM"
+fi
+
+if [ "$THEME_FAIL" = 1 ] && [ "$verdict" = ok ]; then
+  verdict=fail
+  note "the page board is green, but the light-palette arm is red - see the 'theme arm' lines above"
+fi
+
+# The terminal's gate is part of the verdict and not a footnote: a board that printed "ok" while
+# /undo left a file holding the turn's words would be a board grading one shell and calling it two.
+if [ "$TUI_FAIL" = 1 ] && [ "$verdict" = ok ]; then
+  verdict=fail
+  note "the page board is green, but group tui is red - see the 'tui gate FAILED' lines above"
+fi
+
+# ---- the write arm of the servers page --------------------------------------
+#
+# The board's own run names its MCP servers through CWOFFEE_MCP_SERVERS, because the suite should not
+# have to write a config file to get a server. That is the right choice for the `mcp` group - and it
+# makes the servers page read-only *on purpose*: the variable replaces the file's [mcp.servers] list
+# wholesale, so a form that wrote the file would report a success the next start ignores. The page has
+# to refuse, and the main run grades that refusal.
+#
+# Which leaves the write path ungraded, and it is the half a person touches: add, switch off, switch
+# on, remove. Those need a window whose servers come from a file, so a full pass (and any pass that
+# asked for the servers by name) gets a second launch: its own scratch homes, its own gateway port,
+# and a config.toml listing the same two test doubles. Everything it writes lands in a scratch tree
+# that is deleted when the run ends - never in the config of whoever ran this script.
+#
+# What it grades is the pair, not one of them: the file the next start will read (read back through
+# the host's own path) and the hub that answers a call, after each step. A page that only rewrote a
+# file, and a page that only poked a running set, both fail it.
+MCP_FAIL=0
+mcp_want=0
+if [ -z "$ONLY" ]; then mcp_want=1; else
+  for g in $ONLY; do case "$g" in mcp*) mcp_want=1 ;; esac; done
+fi
+if [ "$NO_MCP" = 0 ] && [ "$mcp_want" = 1 ] && [ -x target/release/cwoffee-app ]; then
+  if [ -n "${APP_PID:-}" ]; then
+    kill "$APP_PID" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8; do kill -0 "$APP_PID" >/dev/null 2>&1 || break; sleep 0.5; done
+    note "mcp write  : the board's app (pid $APP_PID) is ended; the write arm needs its own config and record"
+  fi
+  mllog=/tmp/cwoffee-selftest-mcp-write-$$.log
+  MARM=$(mktemp -d /tmp/cwoffee-mcp-arm.XXXXXX)
+  # Named once the directory exists: the script runs with `set -u`, and a note that quotes $MARM
+  # before it is assigned kills the whole run at that line.
+  note "mcp write  : relaunching with the servers in a scratch config, so the page may write (group 'mcp-ui' only)"
+  # XDG_CONFIG_HOME, then the app's own folder inside it: the file the app reads at boot is
+  # $XDG_CONFIG_HOME/cwoffee/config.toml, and the same one every settings write goes back to. Put it
+  # anywhere else and the arm boots with no servers while still writing a file the *next* start reads
+  # - which is a red that looks like a broken page instead of a broken arm.
+  mkdir -p "$MARM/config/cwoffee" "$MARM/data" "$MARM/state" "$MARM/ws" "$MARM/pi"
+  cat > "$MARM/config/cwoffee/config.toml" <<TOML
+# scripts/selftest.sh wrote this for the servers-page write arm, in a scratch home it deletes on
+# exit. The board's own run uses CWOFFEE_MCP_SERVERS and grades the read-only arm; this one exists so
+# the page's add / switch / remove path has a file to write that is not anybody's real config.
+[mcp]
+enabled = true
+timeout_secs = 20
+
+[mcp.servers.fake]
+command = "node"
+args = ["$ROOT/scripts/fake-mcp-server.mjs", "--tools", "3", "--writes", "$MARM/ws"]
+enabled = true
+
+[mcp.servers.dead]
+command = "node"
+args = ["$ROOT/scripts/fake-mcp-server.mjs", "--tools", "2", "--die"]
+enabled = true
+TOML
+  note "mcp write  : $MARM/config/cwoffee/config.toml lists fake (live) and dead (answers, then exits); the same doubles the board's run supplies by environment"
+  XDG_CONFIG_HOME="$MARM/config" XDG_DATA_HOME="$MARM/data" XDG_STATE_HOME="$MARM/state" \
+    CWOFFEE_WORKSPACE="$MARM/ws" CWOFFEE_PI_AGENT_DIR="$MARM/pi" \
+    CWOFFEE_GATEWAY_PORT=$((GW_PORT + 2)) CWOFFEE_MCP_SERVERS="" \
+    CWOFFEE_SELFTEST=1 CWOFFEE_SELFTEST_ONLY=mcp-ui \
+    WEBKIT_DISABLE_COMPOSITING_MODE=1 ./target/release/cwoffee-app >>"$mllog" 2>&1 &
+  MCP_PID=$!
+  mv=""
+  # No turns in this group: it is verbs, page clicks and a round trip through a file. The clock is
+  # still the core's, because the pi core boots a model process before it will run a group at all.
+  mwait=150
+  [ "${CWOFFEE_CORE:-rust}" = pi ] && mwait=300
+  for _ in $(seq 1 "$mwait"); do
+    grep -q "SELFTEST ok\|SELFTEST FAILED" "$mllog" 2>/dev/null && { mv=$(grep -o "SELFTEST ok\|SELFTEST FAILED" "$mllog" | head -1); break; }
+    kill -0 "$MCP_PID" 2>/dev/null || { mv="gone"; break; }
+    sleep 1
+  done
+  kill "$MCP_PID" 2>/dev/null
+  for i in 1 2 3 4 5 6; do kill -0 "$MCP_PID" >/dev/null 2>&1 || break; sleep 0.5; done
+  if [ "$mv" = "SELFTEST ok" ]; then
+    note "mcp write  : ok - $(grep -c 'mcp page ok' "$mllog") arm(s) of the servers page graded against a config file it wrote ($(grep -o 'mcp page ok ([^)]*' "$mllog" | head -1))"
+  else
+    MCP_FAIL=1
+    printf '\033[31m[selftest.sh] the servers write arm %s (log: %s):\033[0m\n' "${mv:-timed out}" "$mllog" >&2
+    grep -E "SELFTEST FAIL|mcp page ok|selftest note" "$mllog" | tail -10 >&2
+  fi
+  [ "$MCP_FAIL" = 0 ] && rm -f "$mllog"
+  [ "$KEEP" = 0 ] && rm -rf "$MARM"
+fi
+
+# ---------------------------------------------------------------------------
+# The kept browser's idle clock, in its own launch.
+#
+# The span is a person's setting — `[browser] idle_secs`, 5 minutes if they say nothing — and a
+# check that waits five minutes is a check nobody runs. So this arm boots a second window over a
+# scratch config file that says four seconds, and grades what the panel says when the clock runs
+# out: that it closed itself, naming the number the config file holds, and that the picture goes
+# with it. The main run cannot grade this, because the board's own config is not this run's to
+# rewrite — and "it closes itself" is exactly the claim that has to be graded, since the whole
+# answer to "will this leave a browser running on my machine?" is that clock.
+#
+# After it ends, the arm asks the process table the same question in the other direction: is any
+# `browser/session.mjs` still alive? An app that closes its browser on a timeout and leaks one on
+# exit has not answered the objection.
+# ---------------------------------------------------------------------------
+BR_FAIL=0
+br_want=0
+if [ -z "$ONLY" ]; then br_want=1; else
+  for g in $ONLY; do case "$g" in browser*) br_want=1 ;; esac; done
+fi
+# These arms get a start of their own, which is also why they do not wait for the main verdict: a
+# board that went red for an unrelated reason (a window that spent the run off-screen) used to cancel
+# every arm below it, and a suite that quietly skips its arms is a suite whose green means less than
+# its red. Each arm reports its own result; the final line adds them up.
+# The in-page arm needs a board whose page **is** the window. The main board is the column shape (it
+# is the one `browser-panel` and the geometry groups are calibrated against), so this arm gets its
+# own launch with the one switch that changes the shape — the same reason the idle arm gets a config
+# with a short span in it.
+INPAGE_WANT=0
+if [ -z "$ONLY" ]; then INPAGE_WANT=1; else
+  for g in $ONLY; do case "$g" in browser-inpage) INPAGE_WANT=1 ;; esac; done
+fi
+if [ "$NO_BROWSER" = 0 ] && [ "$INPAGE_WANT" = 1 ] && [ "${CWOFFEE_BROWSER_PAGE:-no}" != yes ] && [ -x target/release/cwoffee-app ]; then
+  if [ -n "${APP_PID:-}" ]; then
+    kill "$APP_PID" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8; do kill -0 "$APP_PID" >/dev/null 2>&1 || break; sleep 0.5; done
+    note "in-page arm: the board's app (pid $APP_PID) is ended; the arm needs a start of its own shape"
+  fi
+  plog=/tmp/cwoffee-selftest-inpage-$$.log
+  PARM=$(mktemp -d /tmp/cwoffee-inpage-arm.XXXXXX)
+  mkdir -p "$PARM/config/cwoffee" "$PARM/data" "$PARM/state" "$PARM/ws" "$PARM/pi"
+  note "in-page arm: relaunching with CWOFFEE_BROWSER_PAGE=yes (group 'browser-inpage' only)"
+  XDG_CONFIG_HOME="$PARM/config" XDG_DATA_HOME="$PARM/data" XDG_STATE_HOME="$PARM/state" \
+    CWOFFEE_WORKSPACE="$PARM/ws" CWOFFEE_PI_AGENT_DIR="$PARM/pi" \
+    CWOFFEE_GATEWAY_PORT=$((GW_PORT + 5)) \
+    CWOFFEE_BROWSER_PAGE=yes \
+    CWOFFEE_SELFTEST=1 CWOFFEE_SELFTEST_ONLY=browser-inpage CWOFFEE_SELFTEST_SKIP= \
+    WEBKIT_DISABLE_COMPOSITING_MODE=1 ./target/release/cwoffee-app >>"$plog" 2>&1 &
+  PG_PID=$!
+  pver=""
+  for _ in $(seq 1 200); do
+    grep -q "SELFTEST ok\|SELFTEST FAILED" "$plog" 2>/dev/null && { pver=$(grep -o "SELFTEST ok\|SELFTEST FAILED" "$plog" | head -1); break; }
+    kill -0 "$PG_PID" 2>/dev/null || { pver="gone"; break; }
+    sleep 1
+  done
+  kill "$PG_PID" 2>/dev/null
+  for i in 1 2 3 4 5 6; do kill -0 "$PG_PID" >/dev/null 2>&1 || break; sleep 0.5; done
+  if [ "$pver" = "SELFTEST ok" ]; then
+    note "in-page arm: ok - $(grep -o 'the page in the window is .*' "$plog" | head -1)"
+  else
+    PAGE_FAIL=1
+    printf '\033[31m[selftest.sh] the page-in-the-window arm %s (log: %s):\033[0m\n' "${pver:-timed out}" "$plog" >&2
+    grep -E "SELFTEST FAIL|the page in the window is|selftest note" "$plog" | tail -12 >&2
+  fi
+  [ "$PAGE_FAIL" = 0 ] && rm -f "$plog"
+  [ "$KEEP" = 0 ] && rm -rf "$PARM"
+fi
+
+if [ "$NO_BROWSER" = 0 ] && [ "$br_want" = 1 ] && [ -x target/release/cwoffee-app ]; then
+  if [ -n "${APP_PID:-}" ]; then
+    kill "$APP_PID" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8; do kill -0 "$APP_PID" >/dev/null 2>&1 || break; sleep 0.5; done
+    note "browser idle: the board's app (pid $APP_PID) is ended; the idle arm needs its own config"
+  fi
+  blog=/tmp/cwoffee-selftest-browser-idle-$$.log
+  BARM=$(mktemp -d /tmp/cwoffee-browser-arm.XXXXXX)
+  mkdir -p "$BARM/config/cwoffee" "$BARM/data" "$BARM/state" "$BARM/ws" "$BARM/pi"
+  cat > "$BARM/config/cwoffee/config.toml" <<TOML
+# scripts/selftest.sh wrote this for the kept-browser idle arm, in a scratch home it deletes on
+# exit. idle_secs is the point of the file: the arm is grading the clock, so it has to be a start
+# whose own config names a short span. Every other [browser] value stays at its default, including
+# the driver, which is found beside the one-shot driver the board already uses.
+[browser]
+idle_secs = 4
+TOML
+  note "browser idle: relaunching over $BARM/config/cwoffee/config.toml, which sets idle_secs = 4 (group 'browser-idle' only)"
+  XDG_CONFIG_HOME="$BARM/config" XDG_DATA_HOME="$BARM/data" XDG_STATE_HOME="$BARM/state" \
+    CWOFFEE_WORKSPACE="$BARM/ws" CWOFFEE_PI_AGENT_DIR="$BARM/pi" \
+    CWOFFEE_GATEWAY_PORT=$((GW_PORT + 3)) \
+    CWOFFEE_SELFTEST=1 CWOFFEE_SELFTEST_ONLY=browser-idle \
+    WEBKIT_DISABLE_COMPOSITING_MODE=1 ./target/release/cwoffee-app >>"$blog" 2>&1 &
+  BR_PID=$!
+  bver=""
+  bwait=150
+  [ "${CWOFFEE_CORE:-rust}" = pi ] && bwait=300
+  for _ in $(seq 1 "$bwait"); do
+    grep -q "SELFTEST ok\|SELFTEST FAILED" "$blog" 2>/dev/null && { bver=$(grep -o "SELFTEST ok\|SELFTEST FAILED" "$blog" | head -1); break; }
+    kill -0 "$BR_PID" 2>/dev/null || { bver="gone"; break; }
+    sleep 1
+  done
+  kill "$BR_PID" 2>/dev/null
+  for i in 1 2 3 4 5 6; do kill -0 "$BR_PID" >/dev/null 2>&1 || break; sleep 0.5; done
+  # Give a driver that is shutting down a moment to finish: the check below asks whether anything
+  # is left, and "still on its way out" is a different answer from "still running".
+  sleep 2
+  leaked=$(pgrep -a -f "browser/session.mjs" 2>/dev/null | grep -v "^$BR_PID" | head -3)
+  if [ "$bver" = "SELFTEST ok" ]; then
+    if [ -n "$leaked" ]; then
+      BR_FAIL=1
+      printf '\033[31m[selftest.sh] the idle arm passed, but a session driver is still running:\033[0m\n%s\n' "$leaked" >&2
+    fi
+    note "browser idle: ok - $(grep -o 'browser idle ok ([^)]*' "$blog" | head -1)"
+  else
+    BR_FAIL=1
+    printf '\033[31m[selftest.sh] the kept-browser idle arm %s (log: %s):\033[0m\n' "${bver:-timed out}" "$blog" >&2
+    grep -E "SELFTEST FAIL|browser idle ok|selftest note" "$blog" | tail -10 >&2
+  fi
+  [ "$BR_FAIL" = 0 ] && rm -f "$blog"
+  [ "$KEEP" = 0 ] && rm -rf "$BARM"
+fi
+
+if [ "${PAGE_FAIL:-0}" = 1 ] && [ "$verdict" = ok ]; then
+  verdict=fail
+  note "the page board is green, but the page-in-the-window arm is red - see the 'in-page arm' lines above"
+fi
+
+if [ "$BR_FAIL" = 1 ] && [ "$verdict" = ok ]; then
+  verdict=fail
+  note "the page board is green, but the kept-browser idle arm is red - see the 'browser idle' lines above"
+fi
+
+if [ "$MCP_FAIL" = 1 ] && [ "$verdict" = ok ]; then
+  verdict=fail
+  note "the page board is green, but the servers write arm is red - see the 'mcp write' lines above"
+fi
+
 case $verdict in
   ok)
     grep -E "SELFTEST ok" "$log" | tail -1
@@ -566,6 +1118,10 @@ case $verdict in
     tail -12 "$log" >&2
     exit 1 ;;
   *)
-    grep -E "SELFTEST FAIL|selftest note" "$log" | tail -30 >&2
+    # The page board said FAILED. Say so in the same words the other branches use: a reader
+    # grepping for "verdict" must not conclude the run never finished. It did finish; it lost.
+    note "verdict: FAILED - the page board's own summary follows"
+    grep -E "SELFTEST FAILED" "$log" | tail -2 >&2
+    grep -E "SELFTEST FAIL" "$log" | tail -25 >&2
     exit 1 ;;
 esac

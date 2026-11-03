@@ -12,7 +12,7 @@ description = "Cwoffee agent engine: providers, tool loop, storage. Zero UI know
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "fs"] }
+tokio = { workspace = true, features = ["process", "io-util", "fs", "net"] }
 reqwest.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
@@ -23,6 +23,10 @@ toml.workspace = true
 rust_xlsxwriter = "0.99"
 quick-xml = "0.42"
 pulldown-cmark = { version = "0.13", default-features = false }
+# Content-addressing for turn checkpoints. Already in the dependency tree (via the TLS
+# stack), so this adds no download — and a hash a *revert* keys on wants to be a real hash,
+# not a std hasher whose output is only stable within one toolchain.
+sha2 = "0.10"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
