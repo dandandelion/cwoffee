@@ -768,6 +768,8 @@ dependencies = [
  "cwoffee-bridge",
  "cwoffee-engine",
  "cwoffee-gateway",
+ "dpi",
+ "gtk",
  "serde",
  "serde_json",
  "tauri",
@@ -776,6 +778,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tokio",
  "url",
+ "wry",
 ]
 
 [[package]]
@@ -837,6 +840,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "cwoffee-engine",
+ "libc",
  "ratatui",
  "tokio",
 ]

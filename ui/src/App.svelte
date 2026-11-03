@@ -8,7 +8,11 @@
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import type {
     ApprovalAnswer,
+    AttachmentMeta,
     EngineEvent,
+    MidTurn,
+    HostTheme,
+    QueuedItem,
     ExecStream,
     HostState,
     ModelInfo,
@@ -18,11 +22,25 @@
     Session,
     StoredMessage,
     WorkspaceRow,
+    BrowserPanel,
+    BrowserLog,
+    DiagRecord,
   } from './lib/events'
   import { Rolling, statsFromTurn, fmt } from './lib/live'
   import { Transcript, linkProbe, subjectFor, riskHeadline, WORKING_ART } from './lib/transcript'
-  import type { AttachmentView, RevertPreview } from './lib/transcript'
+  import type {
+    AttachmentView,
+    RevertPreview,
+    TreeRead,
+    TreePoint,
+    LeafMoveOut,
+    LedgerRead,
+    SnapshotStats as SnapshotStatsRead,
+    FileDiffRead,
+    ForgetCopiesOut,
+  } from './lib/transcript'
   import { describeLoop, LoopWatch } from './lib/loop'
+  import { drawnRect, picturePoint } from './lib/pagefit'
   import { LoopHold, IDLE_HOLD, aniFrames, armedFromUrl, assetBytes } from './lib/anipause'
   import { installContextMenu } from './lib/ctxmenu'
   import { pageLog } from './lib/pagelog'
@@ -32,6 +50,8 @@
   import Segmented from './lib/settings/Segmented.svelte'
   import Switch from './lib/settings/Switch.svelte'
   import Choices from './lib/settings/Choices.svelte'
+  import BrowserPane from './lib/BrowserPane.svelte'
+  import Icon from './lib/Icon.svelte'
 
   // ---- state --------------------------------------------------------------
   let rootEl: HTMLDivElement | undefined = $state()
@@ -48,14 +68,49 @@
   let model = $state('')
   let draft = $state('')
   /**
-   * Whether this turn has already been told "Enter does not send while cwoffee is answering".
+   * Where this conversation is being read from, when that is not its newest message.
    *
-   * The composer stopped being `disabled` mid-turn — see `onKey` — so a press of Enter during a
-   * turn is now a keystroke that changes nothing. Silent is the failure the user just reported
-   * about typing, so the first press says once why nothing happened, and later presses in the
-   * same turn stay quiet rather than filling the notices strip.
+   * Null means the leaf has never been moved, which is the common case and needs no line. It is
+   * painted above the composer rather than in the transcript because it changes what the *next send*
+   * means: the words typed here join the branch the leaf is on, and the messages already past that
+   * node stay in the record on the branch that is not being read. The host's own sentence is the text
+   * — one copy of the fact, from the process that moved it.
    */
-  let busyEnterTold = $state(false)
+  let leafLine = $state<string | null>(null)
+  /**
+   * What a message typed during a turn promises: `steer` (into it, at its next step) or
+   * `follow_up` (after it). Read from the host's state, never decided here.
+   *
+   * The composer announces this before the press, and a phone tab and the desktop window press the
+   * same Enter into the same conversation: two client-side guesses would be two promises, and one
+   * of them would be wrong. `hostState.mid_turn` is the one home, and its `mid_turn_hint` is the
+   * sentence the placeholder prints — the claim about what Enter will do belongs to the process
+   * that will carry the message, not to the window showing it.
+   */
+  let midTurn = $state<MidTurn>('steer')
+  /**
+   * The mid-turn queue, as the host last reported it — whole snapshots, from `queueChanged` and
+   * from the state read, so a missed event cannot leave a line painted for a message that has
+   * already landed or been taken back.
+   */
+  let queued = $state<QueuedItem[]>([])
+  /**
+   * The waiting messages **this window** typed, with the picture bytes it still holds.
+   *
+   * The queue snapshot carries a count of attachments and never the bytes — it rides every status
+   * read — so the picture a landing paints has to come from the window that attached it. A message
+   * typed on another device is listed as a line and withdrawn as a line, without its words being
+   * copied into this composer, which would be typing something nobody typed here.
+   */
+  const myQueue = new Map<number, { text: string; atts: AttachmentMeta[] }>()
+  /**
+   * Steers that have landed in the turn in flight.
+   *
+   * The Rust core writes a turn's rows when the turn ends, so a reload mid-answer has to replay
+   * these from here; the pi core writes the row as it delivers, and the store's own page is what
+   * paints that one — see the check in `resyncView`.
+   */
+  let landedSteers: { text: string; atts: AttachmentMeta[] }[] = []
   let mode = $state<'ask' | 'session' | 'auto'>('ask')
   let thinking = $state<ReasoningLevel>('xhigh')
   /** What the settings screen says a *new* conversation starts at. `thinking` is what this
@@ -94,6 +149,14 @@
   /** Every app-level note this window has shown, oldest first. The checks read this
       instead of scraping the transcript, because notes are no longer in the transcript. */
   const noteLog: string[] = []
+  /**
+   * The engine's notes for the turn in flight, oldest first.
+   *
+   * A note is a live sentence: it is shown while the turn runs and is not a stored row, so a check
+   * that reads the transcript after the turn ends sees a repaint that never contained it. This is
+   * the record those checks read — the words are still the engine's, copied rather than paraphrased.
+   */
+  const liveNotes: string[] = []
   /** Read the current toast text. Reading `toast` directly inside a long async
       block lets TS narrow the $state to `null` after an assignment and then call
       the next read `never`. */
@@ -309,7 +372,7 @@
      keys got their own entry rather than staying a tail on Appearance because a person looking for
      "what are the shortcuts" scans for a word they would say out loud, and "Appearance" is not it.
      */
-  type SetPage = 'models' | 'workspace' | 'devices' | 'conversation' | 'appearance' | 'help' | 'about'
+  type SetPage = 'models' | 'workspace' | 'servers' | 'devices' | 'conversation' | 'appearance' | 'help' | 'about'
   const SET_PAGES: { kind: SetPage; label: string; title: string; desc: string; icon: string }[] = [
     {
       kind: 'models',
@@ -324,6 +387,16 @@
       title: 'Workspace',
       desc: 'What the coworker can do here, what it may do without asking, which folders its files may go in, and how it reaches the web.',
       icon: 'M2.5 5.6A1.6 1.6 0 0 1 4.1 4h2.5l1.2 1.7h5.6A1.6 1.6 0 0 1 13.5 7.3v4.1A1.6 1.6 0 0 1 11.9 13H4.1a1.6 1.6 0 0 1-1.6-1.6z',
+    },
+    {
+      kind: 'servers',
+      label: 'MCP',
+      title: 'Third-party tools (MCP)',
+      desc: "Programs other people wrote, started by this app over a pipe: what is running, what the config file allows, and what you can add, switch off or take away.",
+      // A plug: two prongs, a body, and the cord down. Chosen over a gear-with-arrow because
+      // Settings already owns the cog in this app's chrome, and two cogs a hand's width apart in
+      // the same rail read as one being a shortcut to the other.
+      icon: 'M9 3v3.5M15 3v3.5M7.5 6.5h9v3a4.5 4.5 0 0 1-9 0zM12 14v3.5a2.5 2.5 0 0 0 2.5 2.5h1',
     },
     {
       kind: 'devices',
@@ -387,6 +460,12 @@
     context: ['models', 'ceiling'],
     workspace: ['workspace', 'tools'],
     tools: ['workspace', 'tools'],
+    // Third-party servers moved to their own page; the old names stay valid, because a `#mcp` link
+    // written down last month should land on the thing it named rather than on Workspace.
+    mcp: ['servers', 'mcp'],
+    servers: ['servers', 'mcp'],
+    'third-party': ['servers', 'mcp'],
+    thirdparty: ['servers', 'mcp'],
     mode: ['workspace', 'approvals'],
     approvals: ['workspace', 'approvals'],
     ws: ['workspace', 'folders'],
@@ -423,6 +502,23 @@
    * running?" — and only the process that started the servers can answer, because a config
    * file says what was intended and a status says what happened.
    */
+  interface McpToolRow {
+    declared: string
+    description: string
+  }
+  /** What one server's *file* row holds — what may be started, as opposed to what answered. */
+  interface McpFileRow {
+    name: string
+    command: string
+    args: string[]
+    enabled: boolean
+    /** The names of its environment keys. Never the values: a page that echoed a token back would
+        put a secret in a screenshot somebody posts. */
+    env: string[]
+    running: boolean
+    says: string
+    tools: number
+  }
   interface McpStatus {
     core: string
     mounted: boolean
@@ -434,11 +530,29 @@
     catalog_lead_bytes: number
     catalog_budget: number
     tools: number
-    servers: { name: string; says: string }[]
+    /// How many are answering **now**, as opposed to how many the file lists. A server can be in the
+    /// file and switched off, or listed and dead; one number would let "you have 3 servers" stand in
+    /// for "3 programs are running on this machine".
+    running: number
+    servers: { name: string; says: string; tools?: McpToolRow[] }[]
     configured: number
-    /// The file `[mcp]` belongs in. Named on the row because the answer to "why is nothing
-    /// running" is often "because you wrote it somewhere else".
+    /// What the **file** lists, which is not always what this start resolved (`CWOFFEE_MCP_SERVERS`
+    /// replaces the file's list wholesale, and that difference is the whole reason a write gets refused).
+    file_configured: number
+    env_lists: boolean
+    /// Whether *this* window may change any of it. The servers run on the machine that started them,
+    /// so a phone tab reads the same page with the controls absent and the reason in their place.
+    writable: boolean
+    file: {
+      enabled: boolean
+      timeout_secs: number
+      /// What the reader refused to accept, verbatim. A block that does not parse has to be said;
+      /// an empty list would claim the person has no servers.
+      problem: string
+      servers: McpFileRow[]
+    }
     config_path: string
+    route: string
     why: string
   }
   let mcpNow = $state<McpStatus | null>(null)
@@ -466,13 +580,610 @@
       mcpErr = String(e)
     }
   }
+
+  /* The page's own working state.
+     `mcpSearch` filters both lists at once — server names, the command and arguments, and the tool
+     names a running server offered — because the question that sends someone here is usually "what
+     did that thing called jira give me?". `mcpNote` holds the engine's own sentence after a write
+     rather than a local "saved": a write is two facts (what the file holds, what is answering) and
+     the case where the file was written and the program refused to start has to be visible. */
+  let mcpSearch = $state('')
+  let mcpBusy = $state(false)
+  let mcpNote = $state<{ text: string; bad: boolean } | null>(null)
+  let mcpForm = $state<{ name: string; command: string; args: string; env: string; on: boolean; editing: boolean } | null>(null)
+  /** Two-step removal, like the session list: the first press names what it will do, the second does
+      it. A third-party program is somebody else's code, so deleting its entry is not a single click. */
+  let mcpArm = $state('')
+
+  /* ------------------------------------------------------------------
+     The kept browser: the panel, and what the panel knows.
+
+     The state comes from the app (`browser_panel`), never assembled here. The panel is a
+     window onto a browser this process holds; the moment a screen starts inventing its own
+     idea of "is a page open", it can be wrong in a way nobody downstream can see.
+
+     Frames are pulled, not pushed, and only while the panel is on screen: each pull asks "is
+     there a newer picture than the one I am drawing?" and the answer is usually no bytes. What
+     makes it a *live* view rather than a slideshow is on the other side of that pipe: the panel
+     asks the app for the browser's own screencast (`browser_watch`), so the newest picture is
+     one the browser drew when the page repainted — an animation, a video, the model's scroll —
+     and not one somebody had to think of asking for. The pull is just the delivery.
+     ------------------------------------------------------------------ */
+  let browserOpen = $state(readBrowserOpen())
+  /** The panel at full window: the page is the screen. Not a wider column — the conversation
+      goes behind it, because a page you are reading deserves more than a sidebar's width. */
+  let browserWide = $state(false)
+  let paneNow = $state<BrowserPanel | null>(null)
+  let paneErr = $state('')
+  /** Which kind of failure `paneErr` holds: a state read that failed (transient — the next good read
+      clears it) or a refusal the person caused by acting (kept until they do something else).
+      Without this split, the poll that follows a refusal wipes it off the panel about a second
+      later, and the sentence explaining why the box said no is gone before anyone can read it. */
+  let paneErrKind = $state<'' | 'read' | 'act'>('')
+  let browserFrame = $state('')
+  let browserFrameAt = $state(0)
+  /** The id of the *picture* this window is drawing — not the page state's sequence, and not the
+      same number twice. An act (a reload, a click) changes the page without drawing anything, and
+      the live view draws several pictures of one state (the page animated on its own). A client
+      that compared either counter to the other gets told there is nothing new to draw and keeps
+      showing the page as it was before the movement. */
+  let browserFramePic = $state(0)
+  /** Whether this window asked the browser to push its own frames. The app stops the screencast
+      when nothing is looking, so an unwatched session pays nothing for pixels. */
+  let browserWatching = $state(false)
+  let browserBusy = $state(false)
+  /** The pane follows a browser the model starts — that is what "controllable by the LLM"
+      means for a person: the page they asked for shows up. `browserDismissed` is the part of
+      that which must not run over the person: hide the pane while a page is open and it stays
+      hidden until this browser closes and another one starts. */
+  let browserWasAlive = $state(false)
+  let browserDismissed = $state(false)
+
+  function readBrowserOpen(): boolean {
+    try {
+      return localStorage.getItem('cwoffee.browserpane') === 'open'
+    } catch {
+      return false
+    }
+  }
+  function writeBrowserOpen(open: boolean) {
+    try {
+      localStorage.setItem('cwoffee.browserpane', open ? 'open' : 'closed')
+    } catch {
+      /* a window that cannot store its own layout is a window that reopens the pane next time */
+    }
+  }
+
+  function setBrowserPane(open: boolean) {
+    browserOpen = open
+    writeBrowserOpen(open)
+    if (!open) {
+      if (paneNow?.alive) browserDismissed = true
+      browserWide = false
+      browserFrame = ''
+      browserFramePic = 0
+      void askWatch(false)
+      // The page in the window goes out of the way with the pane: it is not a widget that gets to
+      // keep floating over the chat because a browser is still open somewhere.
+      void reportBox(true)
+    } else {
+      void readBrowserState().then(() => {
+        void fitPage()
+        return reportBox(true)
+      })
+      void pullFrame()
+      void askWatch(true)
+    }
+  }
+
+  /** Tell the app whether this window is looking. A screencast is work for the browser process,
+   *  so it runs while a panel is on screen and stops when the panel closes, when the window is
+   *  hidden, and when the pane goes behind a full-screen one. It is not a touch: the idle clock
+   *  that closes a browser nobody used is deliberately untouched by watching. */
+  async function askWatch(on: boolean) {
+    const want = on && browserOpen && !!paneNow?.alive && !document.hidden
+    // A page that is in the window has no stream: there is no picture of a page the person is
+    // already looking at, and asking for one would be the panel volunteering a claim ("live") that
+    // the app has already said it is not making.
+    if (paneNow?.native) {
+      if (browserWatching) browserWatching = false
+      return
+    }
+    // The width this window can actually show. A 1280-wide page sent to a 400px column is a hundred
+    // kilobytes of JPEG per picture for a box that draws a third of it, so the ask carries the box.
+    const boxW = watchHint()
+    if (want === browserWatching && (!want || boxW === lastWatchW)) return
+    if (!paneNow?.mounted || paneNow?.keep_off) return
+    browserWatching = want
+    lastWatchW = boxW
+    try {
+      const st = (await invoke('browser_watch', { on: want, max_width: boxW })) as BrowserPanel
+      if (st && typeof st === 'object' && 'alive' in st) paneNow = st
+    } catch {
+      // A driver with no screencast answers with a reason and still serves stills; the panel says
+      // which kind of view it is drawing rather than claiming one it is not keeping.
+    }
+  }
+
+  let lastWatchW = 0
+  /** The panel's own box, in CSS pixels: what the live stream is sized to. Zero means "no hint" —
+   *  the pane is not on screen, so the app should hand out the page's own width. */
+  function watchHint(): number {
+    const el = document.querySelector('[data-browser-stage]') as HTMLElement | null
+    const w = el?.clientWidth ?? 0
+    return w > 0 ? Math.round(w) : 0
+  }
+
+  /* The page in the window: where its box is.
+
+     For this kind of browser there is no picture to size and there is a rectangle to place. The page
+     is a native widget the app paints over this document, and this document is the only thing that
+     knows where the panel's box is - so the panel measures the area it left empty and tells the app,
+     in CSS pixels from the top left of the window. A box nobody measured is a page that lands on top
+     of the transcript, which is the failure this whole seam exists to prevent.
+
+     A zero-size box is not "no change": it is the panel saying there is nowhere to put it, and the
+     app hides the widget. Hiding the pane, closing the page, or a stage with no height all take the
+     page out of the way rather than leaving it floating over the chat. */
+  let lastBox = { x: 0, y: 0, w: 0, h: 0 }
+  async function reportBox(force = false) {
+    const el = document.querySelector('[data-browser-pagearea]') as HTMLElement | null
+    /* Whether the area exists, not whether a page happens to be open in it. The panel's box is a
+       fact about this window's layout, and a page opened a moment later needs the box the moment it
+       is created — a panel that waited to hear "a page is open" before saying where the page would
+       go opened it into no box at all, which is an empty frame with a caption underneath. Only a
+       panel that is closed, or a browser this window knows is not a page in itself, has no area. */
+    const on = browserOpen && paneNow?.native !== false
+    const r = el?.getBoundingClientRect()
+    const x = Math.round(r?.left ?? 0)
+    const y = Math.round(r?.top ?? 0)
+    const w = on ? Math.round(r?.width ?? 0) : 0
+    const h = on ? Math.round(r?.height ?? 0) : 0
+    if (!force && x === lastBox.x && y === lastBox.y && w === lastBox.w && h === lastBox.h) return
+    lastBox = { x, y, w, h }
+    // What this window last told the app, on the body where a self-test can read it. The panel's box
+    // is the only thing that decides where a page in the window sits, and "the panel asked for a zero
+    // box" is a claim worth grading rather than a fact the suite has to take on trust.
+    document.body.dataset.cwoffeePagebox = `${x} ${y} ${w} ${h}`
+    try {
+      await invoke('browser_view_rect', { x, y, width: w, height: h })
+    } catch {
+      /* a window that cannot say where its box is still shows the panel, and the page stays out of
+         the way rather than guessing at a place for itself */
+    }
+  }
+
+  /* The page's own record of what it said, threw and failed to load.
+
+     Collected by the app whether or not this box is open - a drawer is a window onto a log, not the
+     switch that turns logging on. So this poll runs only while somebody is looking at it, and the
+     header badge comes from the counts in the panel payload, which arrive on the state poll anyway. */
+  let browserLog = $state(false)
+  let browserRecords = $state<DiagRecord[]>([])
+  let browserLogErr = $state('')
+  async function askLog() {
+    if (!browserLog) return
+    try {
+      const got = (await invoke('browser_log', { since: 0, kind: null, level: null, limit: 120 })) as BrowserLog
+      if (!got || typeof got !== 'object') return
+      browserRecords = got.records ?? []
+      browserLogErr = ''
+    } catch (e) {
+      browserLogErr = `${e}`
+    }
+  }
+  function setBrowserLog(open: boolean) {
+    browserLog = open
+    if (open) void askLog()
+    // The box moved: a drawer that just opened took height from the page area, so the page has to be
+    // told where it is now.
+    void renderTick().then(() => reportBox(true))
+  }
+
+  /** Full window, or the sidebar column. When the page has the whole rectangle it is also asked to
+   *  take the shape of it — a 1280x800 page inside a tall panel is a letterbox, which is the empty
+   *  space arriving by the back door. The column keeps the page's own shape and lets the picture sit
+   *  in its frame instead: reflowing a page behind a person's back to fit a 460px column is an edit
+   *  to their page that nobody asked for. */
+  function setBrowserWide(on: boolean) {
+    browserWide = on
+    // The box has to be measured *after* the layout moved: asking on the same tick as the state
+    // change hands `fitPage` the old, narrow stage rectangle, and the page gets reshaped to a box it
+    // is no longer in — which is a letterbox with extra steps.
+    void renderTick().then(() => {
+      lastFit = { w: 0, h: 0 }
+      return fitPage()
+    })
+  }
+
+  let lastFit = { w: 0, h: 0 }
+  async function fitPage() {
+    // For a page in the window, the box *is* the viewport: nobody reflows it to fit a column, and
+    // what the panel owes the app is the rectangle, not a size request.
+    if (paneNow?.native) {
+      void reportBox(true)
+      return
+    }
+    // The box this window shows may have changed since the stream was asked for, and the stream is
+    // sized to that box — so every path that measures the box re-states the ask. `askWatch` guards on
+    // the width it already sent, so a resize that did not change the column's width costs nothing.
+    if (browserWatching) void askWatch(true)
+    if (!browserWide) {
+      // Back to the column: the page keeps whatever shape it was given, and the next full-window
+      // ask has to be able to move it again.
+      lastFit = { w: 0, h: 0 }
+      return
+    }
+    if (!browserOpen || !paneNow?.alive || !paneNow.opened) return
+    const stage = document.querySelector('[data-browser-stage]') as HTMLElement | null
+    if (!stage) return
+    const r = stage.getBoundingClientRect()
+    // The page is asked for at the box's own size; a very wide panel gets the browser's ceiling
+    // and the picture scales down to fit, which is the part that stays legible.
+    const w = Math.min(1920, Math.max(320, Math.round(r.width)))
+    const h = Math.min(1440, Math.max(240, Math.round(r.height)))
+    if (!w || !h) return
+    if (Math.abs(w - lastFit.w) < 24 && Math.abs(h - lastFit.h) < 24) return
+    lastFit = { w, h }
+    try {
+      const st = (await invoke('browser_viewport', { width: w, height: h })) as BrowserPanel
+      if (st && typeof st === 'object' && 'alive' in st) {
+        paneNow = st
+        // The resize drew a new picture of the new size; the one on screen is of the old one.
+        browserFramePic = Math.min(browserFramePic, Math.max(0, Number(st.frame_pic ?? 1) - 1))
+      }
+      await pullFrame()
+    } catch {
+      /* a page that would not resize is still a page; the panel shows it at the size it is */
+    }
+  }
+
+  async function readBrowserState() {
+    try {
+      const st = (await invoke('browser_panel', {})) as BrowserPanel
+      const wasAlive = browserWasAlive
+      paneNow = st
+      browserWasAlive = st.alive
+      if (st.alive && !wasAlive) {
+        // A new browser. If the person is not deliberately hiding the pane, show it.
+        browserDismissed = false
+        if (!browserOpen && transportKind === 'tauri') setBrowserPane(true)
+      }
+      if (!st.alive) {
+        browserDismissed = false
+        browserWide = false
+        // No picture of a browser that is gone. A frame left up reads as "this page still
+        // exists" next to a line saying it closed.
+        browserFrame = ''
+        browserFramePic = 0
+        browserWatching = false
+      } else if (browserOpen) {
+        // A browser that appeared while the panel was open still owes it the live view.
+        void askWatch(true)
+      }
+      if (paneErrKind === 'read') {
+        paneErr = ''
+        paneErrKind = ''
+      }
+    } catch (e) {
+      paneErr = String(e)
+      paneErrKind = 'read'
+    }
+  }
+
+  async function pullFrame() {
+    if (paneNow?.native) return
+    if (!browserOpen || !paneNow?.alive || !paneNow.opened) return
+    try {
+      const r = (await invoke('browser_frame', { since: browserFramePic })) as {
+        unchanged?: boolean
+        b64?: string
+        mime?: string
+        seq?: number
+        pic?: number
+        frame_pic?: number
+        live?: boolean
+        why?: string
+      }
+      if (!r.unchanged && r.b64 && r.mime) {
+        browserFrame = `data:${r.mime};base64,${r.b64}`
+        browserFrameAt = Date.now()
+      }
+      // Track the *picture* id, and take the newest the app reports even when it answered with no
+      // bytes: another window may have drawn one this one never saw, and a client that stayed
+      // behind would pay for a screenshot it does not need.
+      const next = typeof r.pic === 'number' ? r.pic : typeof r.frame_pic === 'number' ? r.frame_pic : undefined
+      if (next !== undefined) browserFramePic = Math.max(browserFramePic, next)
+    } catch {
+      /* a failed picture is not a failed session; the state line says what is open */
+    }
+  }
+
+  async function browserDo(verb: string, args: Record<string, unknown>) {
+    browserBusy = true
+    // A new action replaces the previous refusal: two refusals in a row is a state the panel has
+    // no way to show, and the person is looking at whatever they tried last.
+    paneErr = ''
+    paneErrKind = ''
+    try {
+      const st = (await invoke(verb, args)) as BrowserPanel
+      if (st && typeof st === 'object' && 'alive' in st) {
+        paneNow = st
+        browserWasAlive = st.alive
+        // Not `browserFramePic = st.seq`: this payload describes the page, and the picture in the
+        // pane still describes whatever it was last told to draw. Pretending otherwise is how a
+        // reload leaves the old page on the screen.
+      }
+      await pullFrame()
+    } catch (e) {
+      // The app's own words, in the panel. The url box refusing a `file://` address and the
+      // driver refusing to start a browser are different problems, and a single generic
+      // "failed" would send a person to fix the wrong one.
+      paneErr = String(e)
+      paneErrKind = 'act'
+      await readBrowserState()
+    } finally {
+      browserBusy = false
+    }
+  }
+
+  const browserFrameAge = $derived(
+    browserFrameAt ? `${Math.max(1, Math.round((Date.now() - browserFrameAt) / 1000))}s ago` : '',
+  )
+
+  // The clock the panel shows is the app's clock, so the panel keeps reading it while open.
+  // A closed pane still asks, on the desktop, because "the model opened a browser and nothing
+  // appeared" is a worse failure than a 3-second local read of a small object.
+  $effect(() => {
+    if (transportKind === 'gateway' && !browserOpen) return
+    const t = setInterval(() => {
+      void readBrowserState()
+      if (browserOpen) void pullFrame()
+    }, browserOpen ? 1500 : 3000)
+    return () => clearInterval(t)
+  })
+
+  /* The live view runs on its own clock: the state line can wait a second and a half, a page that
+     is moving cannot. The pull is cheap when nothing changed — one small "no" over the pipe — so
+     the rate is set by what a person can see, not by what the transport can carry. It stops when
+     the window is hidden (a background tab that nobody is looking at should not cost a browser its
+     frames) and when the pane is closed. */
+  $effect(() => {
+    if (!browserOpen) return
+    const tick = () => {
+      if (document.hidden || !paneNow?.alive) return
+      void pullFrame()
+    }
+    const t = setInterval(tick, 260)
+    const vis = () => {
+      void askWatch(!document.hidden)
+      if (!document.hidden) void pullFrame()
+    }
+    document.addEventListener('visibilitychange', vis)
+    return () => {
+      clearInterval(t)
+      document.removeEventListener('visibilitychange', vis)
+    }
+  })
+
+  /* The page in the window follows its box. The box moves when the window is dragged, when the
+     transcript scrolls a bar in or out, when the drawer opens, when the pane goes full-window and
+     when the pane closes; `reportBox` guards on the numbers it already sent, so this costs a
+     measurement and not a call. The 400ms is the window-drag case: a widget that only moves when the
+     drag ends is a widget that slides off the panel and comes back. */
+  $effect(() => {
+    // The box is measured as soon as the panel is on screen, whether or not a page is open yet: a
+    // page opened by the model needs somewhere to be, and it is created into whatever box was last
+    // reported. Waiting for the panel to learn a page exists is how the page gets no box.
+    if (!browserOpen) return
+    void reportBox()
+    const t = setInterval(() => void reportBox(), 400)
+    const onResize = () => void reportBox()
+    window.addEventListener('resize', onResize)
+    return () => {
+      clearInterval(t)
+      window.removeEventListener('resize', onResize)
+    }
+  })
+
+  // A page that has just opened is a page whose area has just changed shape: with nothing open the
+  // panel's stage is a short box, and a page created into that box arrives short and grows 400ms
+  // later. Re-measuring on the state change takes the flicker out, and leaves the timer to catch the
+  // cases no state change announces — a dragged window edge, a drawer opening.
+  $effect(() => {
+    if (!browserOpen) return
+    void paneNow?.opened
+    void paneNow?.native
+    void renderTick().then(() => reportBox(true))
+  })
+
+  // The drawer. Records are collected whether or not this is open; this is only the asking.
+  $effect(() => {
+    if (!browserLog || !browserOpen) return
+    void askLog()
+    const t = setInterval(() => void askLog(), 1200)
+    return () => clearInterval(t)
+  })
+
+  // A panel that went full-window is a page that should change shape with it: the difference between
+  // a tall panel showing a tall page and one showing a wide page with ground above and below it is
+  // the letterbox, which is the empty space wearing a border. The 24px guard in `fitPage` is what
+  // keeps a drag of the window edge from reflowing a page more than once a second.
+  $effect(() => {
+    if (!browserWide) return
+    let t: ReturnType<typeof setTimeout> | null = null
+    const onResize = () => {
+      if (t) clearTimeout(t)
+      t = setTimeout(() => {
+        t = null
+        void fitPage()
+      }, 500)
+    }
+    window.addEventListener('resize', onResize)
+    return () => {
+      if (t) clearTimeout(t)
+      window.removeEventListener('resize', onResize)
+    }
+  })
+
+  onDestroy(() => {
+    /* The browser is the app's and closes itself; the panel has no business killing one the model
+       is still using. What this window does own is its request for frames — so the app is left
+       holding no screencast for a panel that no longer exists. */
+    if (browserWatching) void askWatch(false)
+  })
+
+  /** The file's rows, filtered. A row matches on its name, its command, its arguments, or on a tool
+      name one of its servers answered with — so searching "write_note" finds the server that has it. */
+  const mcpFileRows = $derived.by(() => {
+    const st = mcpNow
+    if (!st) return [] as (McpFileRow & { tools_named: string[] })[]
+    const named = new Map(st.servers.map((sv) => [sv.name, (sv.tools ?? []).map((t) => `${t.declared} ${t.description}`)]))
+    const rows = st.file.servers.map((r) => ({ ...r, tools_named: named.get(r.name) ?? [] }))
+    const q = mcpSearch.trim().toLowerCase()
+    if (!q) return rows
+    return rows.filter((r) =>
+      [r.name, r.command, r.args.join(' '), r.env.join(' '), ...r.tools_named].join(' ').toLowerCase().includes(q),
+    )
+  })
+
+  /** The running set, filtered the same way. */
+  const mcpLiveRows = $derived.by(() => {
+    const st = mcpNow
+    if (!st) return [] as { name: string; says: string; tools: McpToolRow[] }[]
+    const rows = st.servers.map((sv) => ({ name: sv.name, says: sv.says, tools: sv.tools ?? [] }))
+    const q = mcpSearch.trim().toLowerCase()
+    if (!q) return rows
+    return rows.filter((r) =>
+      [r.name, r.says, ...r.tools.map((t) => `${t.declared} ${t.description}`)].join(' ').toLowerCase().includes(q),
+    )
+  })
+
+  /** Servers the file lists, switched on, and not answering: what "re-read the file" would start.
+      Named as a number on the button so the control says what pressing it does. */
+  const mcpPending = $derived((mcpNow?.file.servers ?? []).filter((r) => r.enabled && !r.running).length)
+  /** How many file rows the search hides, so a filtered list cannot read as "you have no servers". */
+  const mcpHiddenBySearch = $derived(
+    mcpNow ? mcpNow.file.servers.length - mcpFileRows.length : 0,
+  )
+
+  /** One write, one answer. The engine's sentence is what goes on the page — it says both what the
+      file now holds and what is answering, and a local "saved" would drop the second half. */
+  async function mcpDo(label: string, run: () => Promise<string>) {
+    if (mcpBusy) return
+    mcpBusy = true
+    mcpNote = null
+    mcpArm = ''
+    try {
+      mcpNote = { text: await run(), bad: false }
+    } catch (e) {
+      mcpNote = { text: `${e}`, bad: true }
+    }
+    // Re-read rather than paint what was sent: the host's answer is what the file and the process
+    // hold now, and a refused write would otherwise leave a row shaped like a success.
+    await loadMcp()
+    mcpBusy = false
+  }
+
+  function openMcpForm(name: string | null) {
+    const row = name ? (mcpNow?.file.servers ?? []).find((r) => r.name === name) : undefined
+    mcpArm = ''
+    // The environment comes back as **bare names**: the payload carries names by design, and a
+    // prefill of `KEY=` would write empty values over somebody's token on a save that only meant to
+    // change the command. A bare name is what the engine reads as "keep this one".
+    mcpForm = row
+      ? { name: row.name, command: row.command, args: row.args.join('\n'), env: row.env.join('\n'), on: row.enabled, editing: true }
+      : { name: '', command: '', args: '', env: '', on: true, editing: false }
+    // Pressing Edit on a row has to be visibly *something*. The form lives in the section below the
+    // rows, so without this the press looks like a dead button until someone scrolls. Instant rather
+    // than smooth: a check that measures where the form landed should not be racing an animation, and
+    // the Add button needs no help because the form appears where the button was.
+    if (row) {
+      void renderTick().then(() => document.querySelector('[data-mcp-form]')?.scrollIntoView({ block: 'start' }))
+    }
+  }
+
+  function saveMcpForm() {
+    const f = mcpForm
+    if (!f) return
+    void mcpDo(f.editing ? `${f.name}` : `${f.name || '(unnamed)'}`, () =>
+      invoke<string>('mcp_add_server', {
+        name: f.name,
+        command: f.command,
+        args: f.args.split('\n'),
+        env: f.env.split('\n'),
+        on: f.on,
+      }),
+    ).then(() => {
+      // The form closes only on the reload it just asked for; a form that vanished on a refused
+      // write would take the person's typing with it.
+      if (!mcpNote?.bad) mcpForm = null
+    })
+  }
+
+  /** The form's own switch and its Cancel, as named functions rather than inline assignments: the
+      form renders inside a narrowed branch, and an assignment in a closure would have to re-prove the
+      form is still open at the moment the click lands. */
+  function setFormOn(v: boolean) {
+    if (mcpForm) mcpForm.on = v
+  }
+  function closeMcpForm() {
+    mcpForm = null
+  }
+
+  function removeMcpServer(name: string) {
+    if (mcpArm !== name) {
+      mcpArm = name
+      mcpNote = {
+        text:
+          `Removing ${name} takes its entry out of the config file, its environment keys with it, ` +
+          'and stops it if it is running. Press Remove again to do that.',
+        bad: false,
+      }
+      return
+    }
+    void mcpDo(name, () => invoke<string>('mcp_remove_server', { name })).then(() => {
+      if (mcpForm?.name === name && !mcpNote?.bad) mcpForm = null
+    })
+  }
+
   let toolsErr = $state('')
+  /**
+   * What the browser tool will actually do in this start, in the engine's own words.
+   *
+   * Asked per model rather than remembered from boot: whether a run paints a window on this
+   * desktop is decided by the model that is answering, and that changes mid-session. The
+   * sentence comes from the tool's own policy (`status_line`) instead of being written here,
+   * because a screen that paraphrases a policy is a screen that eventually contradicts it —
+   * and "headed" is a claim about a window appearing on a person's machine.
+   */
+  type BrowserStatus = {
+    mounted: boolean
+    driver: string | null
+    node: string
+    headed: boolean
+    why: string
+    screenshot_default: string
+    vision: string
+    says: string
+  }
+  let browserNow = $state<BrowserStatus | null>(null)
+  let browserErr = $state('')
   async function loadTools() {
     try {
       toolViews = await invoke<{ name: string; description: string }[]>('tools_view')
       toolsErr = ''
     } catch (e) {
       toolsErr = String(e)
+    }
+    try {
+      browserNow = await invoke<BrowserStatus>('browser_status', { model })
+      browserErr = ''
+    } catch (e) {
+      // Named rather than swallowed: the tools list above is still true, and this line is a
+      // fact about this start that the screen has to admit it could not get.
+      browserErr = String(e)
+      browserNow = null
     }
   }
   /** Tool descriptions run long — they are written for a model. The screen shows the
@@ -961,12 +1672,12 @@
     }
     if (page === 'workspace') {
       if (!toolViews.length) void loadTools()
-      // Fetched when the page is opened, not at boot: a server's answer is about a process the
-      // app started, and this page is where someone goes to find out whether it is alive.
-      void loadMcp()
       void loadWorkspaces()
       if (!webSearch) void loadWebSearch()
     }
+    // Fetched when the page is opened, not at boot: a server's answer is about a process the app
+    // started, and this is the page someone goes to in order to find out whether it is alive.
+    if (page === 'servers') void loadMcp()
     if (page === 'devices') void loadGateway()
     if (page === 'conversation') void refreshState()
     if (page === 'about') void loadAbout()
@@ -1939,6 +2650,26 @@
     await removeSession(id)
   }
 
+  /**
+   * The row menu's tree control: look at this conversation's lineage and where its leaf is.
+   *
+   * Opening the conversation first is the whole job — the card hangs on a stored row, so a row of a
+   * conversation this window is not showing has nothing to paint a tree onto. Pressing the card's own
+   * control rather than building a second one is deliberate: two ways to open a tree are two ways to
+   * disagree about which node is current.
+   */
+  async function treeFromMenu(id: number) {
+    menu = null
+    confirmDeleteId = null
+    if (viewId !== id) await openSession(id)
+    for (let i = 0; i < 40; i++) {
+      if ((transcript?.sessionId ?? 0) === id && transcript?.showTree()) return
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    // A conversation with nothing stored has no row to hang the card on, and that is worth saying.
+    say('this conversation has no stored message yet, so its tree has nothing to name', true)
+  }
+
   const SEEN_KEY = 'cwoffee.seenCounts.v1'
 
   /**
@@ -2808,6 +3539,7 @@
       // guesses it from what happens to be on screen. Stamping from `viewId` was how
       // the note announcing a switch got filed under the conversation the reader was
       // leaving, and then dropped by the repaint of the one they were entering.
+      liveNotes.push(ev.d.message)
       transcript?.showNote(
         ev.d.message,
         ev.d.session ?? viewId ?? undefined,
@@ -2876,7 +3608,13 @@
           runningSessions = next
         }
         busy = true
-        busyEnterTold = false
+        // A new turn starts with nothing waiting of its own: messages typed into the previous turn
+        // were either delivered into it or handed back, and carrying the lines over would claim
+        // they are still waiting for a turn that has finished.
+        queued = []
+        myQueue.clear()
+        landedSteers = []
+        liveNotes.length = 0
         if (edgeWatch && !edgeWatch.turnStart) edgeWatch.turnStart = performance.now()
         turnStartTs = performance.now()
         turnMs = 0
@@ -2998,6 +3736,8 @@
         liveBuf = []
         sentDraft = null
         approval = null
+        landedSteers = []
+        queued = []
         if (tick !== undefined) {
           window.clearInterval(tick)
           tick = undefined
@@ -3012,6 +3752,41 @@
         void refreshState()
         void loadSessions()
         break
+      case 'queueChanged': {
+        // The whole queue, and only the conversation on screen: the host holds one conversation,
+        // and lines about a queue nobody is looking at would read as messages missing from this
+        // transcript.
+        queued = ev.d.session === viewId ? ev.d.items : []
+        break
+      }
+      case 'steerLanded': {
+        // The words went into the prompt the next request is built from. Paint the row now; the
+        // receipt sentence arrives as a `note` right behind this, so the message and where it
+        // landed appear in the same breath.
+        if (ev.d.session !== viewId) break
+        const mine = myQueue.get(ev.d.id)
+        myQueue.delete(ev.d.id)
+        queued = queued.filter((q) => q.id !== ev.d.id)
+        landedSteers.push({ text: ev.d.text, atts: mine?.atts ?? [] })
+        transcript?.addUser(ev.d.text, mine?.atts ?? [])
+        pageLog(`steer ${ev.d.id} (${ev.d.kind}) landed at step ${ev.d.step}`)
+        break
+      }
+      case 'queueReturned': {
+        // Stop, or a turn that ended without taking them. Only the words this window typed go back
+        // into this composer; the engine's own note says what happened to all of them.
+        let restored = 0
+        for (const it of ev.d.items) {
+          const mine = myQueue.get(it.id)
+          if (!mine) continue
+          myQueue.delete(it.id)
+          restored += 1
+          draft = draft ? `${draft}\n${mine.text}` : mine.text
+        }
+        queued = queued.filter((q) => !ev.d.items.some((i) => i.id === q.id))
+        if (restored) pageLog(`queue returned ${restored} message(s) to this composer`)
+        break
+      }
       case 'error':
         if (ev.d.fatal) pageLog(`fatal: ${ev.d.message}`)
         // Most engine errors are notes the transcript already shows. Three are
@@ -3147,18 +3922,130 @@
   let theme = $state<'light' | 'dark'>('light')
   let attachErr = $state('')
 
+  /**
+   * The palette, and the **two homes** a choice about it lives in.
+   *
+   * `theme` in `config.toml` is the host's value: one choice that the window, a device tab on the
+   * gateway and the terminal all start from, because a value only one surface remembers is not a
+   * setting. `themeOverride` is this window's own ask, kept in this window's store, and it is only
+   * ever said out loud as an override — it never writes the host's value, because a phone tab that
+   * could repaint the desktop is the bug this split exists to prevent.
+   *
+   * `system` is not a third palette: it is a subscription. `systemDark` follows the media query
+   * live (the same shape `reducedMotion` uses), and `themeSource` records which home decided the
+   * paint on screen so the chrome can say it and a check can read it.
+   */
   const THEME_KEY = 'cwoffee.theme.v1'
+  let themeOverride = $state<'light' | 'dark' | null>(null)
+  let systemDark = $state(false)
+  /** Whether the live `prefers-color-scheme` listener is attached — the claim `system` makes. */
+  let themeListening = $state(false)
+  let themeSource = $state<'host' | 'override' | 'system'>('host')
+  /** Which palette this check run asked for, and therefore which arm of the surface groups it is. */
+  let themeRun = $state<'' | 'light' | 'dark'>('')
+  /** About's palette line, composed by the engine from the stored value and this window's override. */
+  let themeAbout = $state('')
+  /** Set while a turn is running: the repaint waits, and the note says it did. */
+  let themeDeferred = $state('')
 
-  // Explicit choice wins; otherwise follow the OS. Applied to the document
-  // element rather than a class on a component, because the palette lives on
-  // :root and every utility reads it from there.
-  function applyTheme(t: 'light' | 'dark') {
+  const storedTheme = $derived<HostTheme>((hostState?.theme as HostTheme | undefined) ?? 'system')
+
+  function resolvePalette(): { t: 'light' | 'dark'; src: 'host' | 'override' | 'system' } {
+    if (themeOverride) return { t: themeOverride, src: 'override' }
+    if (storedTheme === 'light' || storedTheme === 'dark') return { t: storedTheme, src: 'host' }
+    return { t: systemDark ? 'dark' : 'light', src: 'system' }
+  }
+
+  /**
+   * Paint the palette. Applied to the document element rather than a class on a component, because
+   * the palette lives on `:root` and every utility reads it from there.
+   *
+   * A repaint is a re-layout, and this WebKitGTK re-lays out the streaming pane: the
+   * reload-painting lesson in `docs/TESTING.md` is about a screen that changed while a turn was
+   * being watched. So a repaint asked for mid-turn is deferred to the end of the turn and *named*
+   * rather than silently skipped — a theme that quietly failed to apply reads as a broken theme.
+   */
+  /** Returns true when the paint was held back for a turn — the caller's notice has to say the
+   * waiting sentence in that case, because the strip shows one thing at a time and "your palette is
+   * waiting" is the sentence a person needs while it is waiting. */
+  function paintTheme(): boolean {
+    const { t, src } = resolvePalette()
+    if (busy) {
+      if (document.documentElement.dataset.theme !== t || themeSource !== src) {
+        themeDeferred = t
+        // The wait is a fact a check can read without competing with whatever else is on the notice
+        // strip — a streaming turn can raise a loop note of its own, and a check that reads
+        // `.toast` text would then be grading the loop detector. The note is for the person; the
+        // attribute is for the claim.
+        document.documentElement.dataset.themeDeferred = t
+        say(`Theme change waits for this turn to finish; the palette is a repaint and a repaint\ncosts a streaming transcript its layout. (${t === 'dark' ? 'Dark' : 'Light'} will be applied when it ends.)`)
+        return true
+      }
+      return false
+    }
+    // A second ask while one is already waiting does not replace it: the paint that lands at the end
+    // of the turn is the one this window asked for first, and a silent overwrite here would make the
+    // deferred marker and the actual paint disagree about what was promised.
+    if (themeDeferred && themeDeferred !== t) return false
+    themeDeferred = ''
+    delete document.documentElement.dataset.themeDeferred
     theme = t
+    themeSource = src
     document.documentElement.dataset.theme = t
+    document.documentElement.dataset.themeSource = src
+    return false
+  }
+
+  /** This window's ask. Local on purpose: nothing here goes to the host. */
+  function setWindowOverride(t: 'light' | 'dark' | null) {
+    themeOverride = t
     try {
-      localStorage.setItem(THEME_KEY, t)
+      if (t === null) localStorage.removeItem(THEME_KEY)
+      else localStorage.setItem(THEME_KEY, t)
     } catch {
       /* non-fatal */
+    }
+    // One engine sentence for the change, refreshed with the new override rather than phrased here:
+    // the same words the About page prints, so a toast and a page cannot describe the two homes
+    // differently. When the paint had to wait for a turn, that sentence is the one the strip keeps:
+    // only one notice shows, and "your palette is waiting for this turn" is the thing a person needs
+    // to read while it is.
+    const waited = paintTheme()
+    void readThemeWords().then(() => {
+      if (!waited) say(themeAbout)
+    })
+  }
+
+  /**
+   * The stored choice — the one every surface reads. Written through the host, which is the only
+   * thing that owns `config.toml`, and refused in words if the word is not a palette.
+   */
+  async function pickStoredTheme(t: HostTheme) {
+    if (t === storedTheme) return
+    try {
+      await invoke('set_theme', { kind: t })
+      await refreshState()
+      // The note is the engine's (`theme_note`, written by `crate::theme::Theme::setting_note`), so
+      // a phone's row and this one cannot paraphrase where the value lives.
+      const note = (hostState?.theme_note ?? `The host now stores ${t}.`).replace(/\n/g, ' ')
+      await readThemeWords()
+      say(note)
+    } catch (e) {
+      say(cleanErr(e), true)
+      pageLog(`set_theme failed: ${e}`)
+    }
+  }
+
+  /**
+   * About's line, from the host. The override is sent as an argument for the *sentence* and stored
+   * nowhere: that is the whole distinction, and the engine is the one that words it.
+   */
+  async function readThemeWords() {
+    try {
+      themeAbout = await invoke<string>('theme_words', { window: themeOverride })
+    } catch (e) {
+      themeAbout = ''
+      pageLog(`theme_words failed: ${e}`)
     }
   }
 
@@ -3169,12 +4056,41 @@
     } catch {
       /* non-fatal */
     }
-    const t = saved === 'light' || saved === 'dark'
-      ? saved
-      : matchMedia('(prefers-color-scheme: dark)').matches
-        ? 'dark'
-        : 'light'
-    applyTheme(t)
+    // Read as an override, which is what it always was in practice: an explicit choice made in one
+    // window. It no longer pretends to be the app's setting.
+    themeOverride = saved === 'light' || saved === 'dark' ? saved : null
+    void readThemeWords()
+    paintTheme()
+  }
+
+  $effect(() => {
+    // Any of the three inputs can move the paint: the host's stored value (a phone changed it),
+    // this window's override, or the OS underneath `system`.
+    void storedTheme
+    void themeOverride
+    void systemDark
+    paintTheme()
+  })
+  $effect(() => {
+    // The turn ended; flush a repaint that had to wait for it.
+    if (!busy && themeDeferred) paintTheme()
+  })
+  {
+    // `system` follows, live — the same shape as the reduced-motion query above. Without this
+    // listener `system` means "whatever the OS said when the window opened", which is a snapshot
+    // and not a subscription, and the settings row would be claiming something the app does not do.
+    const mq = matchMedia('(prefers-color-scheme: dark)')
+    systemDark = mq.matches
+    const syncTheme = () => {
+      systemDark = mq.matches
+      paintTheme()
+    }
+    mq.addEventListener('change', syncTheme)
+    themeListening = true
+    onDestroy(() => {
+      mq.removeEventListener('change', syncTheme)
+      themeListening = false
+    })
   }
 
   // Paste is the path people actually reach for with screenshots, and drag in
@@ -3774,6 +4690,18 @@
     return false
   }
 
+  /** Until the host says a turn is running. `busy` flips on the turn's first event, which lands
+   * after the endpoint's first delay, so a same-tick read calls a running turn "idle" — which is the
+   * false refusal the repaint arm hit on its first run. */
+  async function waitTurnStart(budgetMs = 8000): Promise<boolean> {
+    const dl = performance.now() + budgetMs
+    while (performance.now() < dl) {
+      if (busy) return true
+      await new Promise((r) => setTimeout(r, 60))
+    }
+    return false
+  }
+
   async function waitTurnDone(prevTurns: number, budgetMs = 240000): Promise<boolean> {
     const endsBefore = turnEnds
     const dl = performance.now() + budgetMs
@@ -4045,6 +4973,130 @@
     }
   }
 
+  /**
+   * Enter during a turn: a mid-turn press, not a second turn.
+   *
+   * What it promises is the host's answer (`mid_turn`), not this window's guess, and the words stay
+   * in the box if the host refuses — an idle host, a conversation this host is not answering, a
+   * picture over the limit. Losing the typing was the old failure; a refusal that eats it would be
+   * the same failure with a toast on top.
+   */
+  async function sendMidTurn() {
+    const text = draft.trim()
+    if (!text && pending.length === 0) return
+    if (!modelReady) {
+      openSetup(
+        'There is no model to answer with, so nothing was sent. Point Cwoffee at an endpoint and pick ' +
+          'one of its models; the conversation stays exactly as it was.',
+      )
+      return
+    }
+    if (viewId === null) {
+      // Nothing is running in this window: the press is not a steer, and queueing it would put the
+      // words somewhere no turn will ever read them.
+      say('Nothing is running here yet — send it as a message and it starts a turn.', true)
+      return
+    }
+    const atts = pending.map((a) => ({ mime: a.mime, data_b64: a.b64, name: a.name }))
+    const shown: AttachmentMeta[] = pending.map((a) => ({
+      mime: a.mime,
+      name: a.name,
+      bytes: a.bytes,
+      // This window still has the bytes, so the row a landing paints can show the picture. The
+      // composer's blob URL is not used: `clearAttachments` below revokes those.
+      url: `data:${a.mime};base64,${a.b64}`,
+    }))
+    try {
+      const view = await invoke<QueuedItem>('steer_turn', {
+        text,
+        attachments: atts,
+        session: viewId,
+      })
+      myQueue.set(view.id, { text: view.text, atts: shown })
+      draft = ''
+      clearAttachments()
+      // Paint immediately rather than waiting for the host's event, so the line appears in the same
+      // breath as the press. The `queueChanged` snapshot arrives and replaces the list wholesale —
+      // and it can arrive *before* this promise resolves, so the id is checked: appending a second
+      // copy of one key is how Svelte's duplicate-key error ended a run.
+      if (!queued.some((q) => q.id === view.id)) queued = [...queued, view]
+      pageLog(`mid-turn press queued: ${view.kind} id ${view.id} (${view.label})`)
+    } catch (e) {
+      const why = cleanErr(e)
+      say(why, true)
+      pageLog(`mid-turn press refused: ${why}`)
+    }
+  }
+
+  /**
+   * Take a waiting message back before it lands.
+   *
+   * The refusal is the honest half: once the words are in a request there is no unsending them, and
+   * the card keeps saying what happened rather than offering a control that cannot do it.
+   */
+  async function withdrawSteer(id: number) {
+    const mine = myQueue.get(id)
+    try {
+      await invoke<QueuedItem>('withdraw_steer', { id })
+      queued = queued.filter((q) => q.id !== id)
+      myQueue.delete(id)
+      if (mine) {
+        draft = draft ? `${draft}\n${mine.text}` : mine.text
+        say('Taken back — those words were never sent.')
+      } else {
+        say('Taken back — that message was typed in another window, so its words are not copied here.')
+      }
+      pageLog(`steer ${id} withdrawn`)
+    } catch (e) {
+      const why = cleanErr(e)
+      say(why, true)
+      pageLog(`withdrawal refused: ${why}`)
+    }
+  }
+
+  /**
+   * Move the mid-turn dial. The host answers, writes it to `config.toml`, and the composer's line
+   * changes with it — this window keeps no copy of the choice, because a second window must not be
+   * promised a different Enter.
+   *
+   * A message already waiting keeps the kind it was typed as: re-promising a message that is already
+   * in the queue would be a claim about a press that already happened.
+   */
+  async function pickMidTurn(kind: MidTurn) {
+    if (kind === midTurn) return
+    try {
+      await invoke('set_mid_turn', { kind })
+      await refreshState()
+      say(
+        kind === 'steer'
+          ? 'A message typed during a turn now goes into that turn, at its next step.'
+          : 'A message typed during a turn is now asked after it, as its own turn.',
+      )
+    } catch (e) {
+      say(cleanErr(e), true)
+      pageLog(`set_mid_turn failed: ${e}`)
+    }
+  }
+
+  /**
+   * The composer's own line while a turn is running.
+   *
+   * The sentence is the host's (`mid_turn_hint`, written by `crate::steer::composer_hint`), because
+   * it is a claim about what the next request will carry. This window only adds the count of what is
+   * already waiting, which is a fact about its own screen.
+   */
+  function composerPlaceholder(): string {
+    if (!busy) return 'Ask something. Enter to send, Shift+Enter for a newline.'
+    const hint =
+      hostState?.mid_turn_hint ??
+      (midTurn === 'steer'
+        ? 'Steering this turn — Enter puts your message into it at the next step'
+        : 'Follow-up: Enter queues your message for after this turn')
+    return queued.length
+      ? `${hint} · ${queued.length} waiting — take them back before they land`
+      : hint
+  }
+
   async function answer(a: ApprovalAnswer) {
     if (!approval) return
     const id = approval.id
@@ -4179,6 +5231,19 @@
     }
   }
 
+  /**
+   * Take the mid-turn promise and the waiting queue off a host snapshot.
+   *
+   * One function, because the state is read from three places (bootstrap, the composer's poll, and
+   * the resync after a turn ends) and a promise announced in two of them and not the third is a
+   * composer that changes its own mind mid-turn.
+   */
+  function syncMidTurn(st: HostState | null) {
+    if (!st) return
+    midTurn = st.mid_turn ?? 'steer'
+    queued = (st.queued ?? []).filter((q) => q.session === st.session_id)
+  }
+
   async function refreshState(force = false) {
     // The pill says "on :8099 · 2 devices"; a value cached at boot would be a
     // guess within a minute. Cheap local read, so refresh it with the rest.
@@ -4191,6 +5256,7 @@
         thinkingDefault = hostState.reasoning_default ?? thinking
         model = hostState.model
         syncBusy(hostState, force)
+        syncMidTurn(hostState)
       }
     } catch (e) {
       ipc = { ok: false, msg: String(e).slice(0, 140) }
@@ -4246,6 +5312,7 @@
         thinkingDefault = hostState.reasoning_default ?? thinking
         model = hostState.model
         syncBusy(hostState, force)
+        syncMidTurn(hostState)
       }
       sessions = b.sessions ?? []
       recordSeen(sessions)
@@ -4387,7 +5454,7 @@
     if (!repaint) transcript?.clear('resync: navigating to another conversation')
     let rows: StoredMessage[] = []
     try {
-      rows = await loadTranscript(id, keepRows)
+      rows = await loadTranscript(id, keepRows, () => mySeq !== resyncSeq)
     } catch (e) {
       pageLog(`session_messages failed: ${e}`)
     }
@@ -4409,7 +5476,16 @@
      * created by the very send being loaded is not in this window's list at all.
      */
     if (rows.length === 0) {
-      const expected = sessions.find((x) => x.id === id)?.message_count ?? 0
+      let expected = sessions.find((x) => x.id === id)?.message_count ?? 0
+      if (expected === 0) {
+        // The counter is the hint for how long to wait, and this window's copy of it is a snapshot
+        // from before the turn. A conversation that the finished turn *created* is not in that
+        // snapshot at all, so the guard would take its 150 ms and paint a page wiped of a turn that
+        // streamed on screen. One refreshed read of the list is cheap, and it is the store's own
+        // count rather than a guess about how long persistence takes.
+        await loadSessions().catch(() => {})
+        expected = sessions.find((x) => x.id === id)?.message_count ?? 0
+      }
       const until = Date.now() + (expected > 0 ? Math.min(2400, 300 + expected * 120) : 150)
       let again: StoredMessage[] = rows
       let tries = 0
@@ -4417,12 +5493,13 @@
         tries += 1
         await new Promise((r) => setTimeout(r, 150))
         try {
-          again = await loadTranscript(id, keepRows)
+          again = await loadTranscript(id, keepRows, () => mySeq !== resyncSeq)
         } catch (e) {
           pageLog(`session_messages retry ${tries} failed: ${e}`)
           break
         }
       }
+      if (mySeq !== resyncSeq) return
       if (again.length)
         pageLog(
           `resync: conversation ${id} looked empty and was not — ${again.length} row(s) came back on read ` +
@@ -4447,11 +5524,69 @@
       // it back. See `storeHoldsSentDraft`.
       if (sentDraft && !storeHoldsSentDraft(rows))
         transcript?.addUser(sentDraft.text, sentDraft.atts)
+      // A steer that landed in the turn in flight: the Rust core has not written its row yet, so a
+      // reload would lose a message the person typed and the model already read. On the pi core the
+      // row is written as it is delivered, and the store's page paints it — the witness is the row
+      // in the record, not a guess about which core is answering.
+      for (const st of landedSteers) {
+        if (rows.some((r) => r.role === 'user' && r.content === st.text)) continue
+        transcript?.addUser(st.text, st.atts)
+      }
       for (const e of liveBuf) transcript?.apply(e)
     }
     await refreshState()
     // Reading it is reading it. The session list is refreshed on a tick; this is the click.
     markViewRead()
+    // What the composer would join, if that is not the newest message. Read from the record rather
+    // than remembered, so a conversation reopened after a leaf move says so again, and a
+    // conversation nobody ever switched says nothing.
+    void readLeafLine(id)
+  }
+
+  /**
+   * The one line the composer carries about where this conversation is being read from.
+   *
+   * A conversation whose leaf has never moved reads its newest message and gets no line: the marker
+   * exists to say that the next send does *not* join the end of what is on screen. If the read fails
+   * — an unsaved conversation, a host that is not holding it — the line is cleared rather than kept
+   * from an older conversation, because a stale position marker is a claim about the wrong send.
+   */
+  async function readLeafLine(id: number) {
+    if (!id) {
+      leafLine = null
+      return
+    }
+    try {
+      const t = await invoke<TreeRead>('session_tree', { session: id })
+      if (t.leaf === null && t.off_branch === 0) {
+        leafLine = null
+        return
+      }
+      const here = t.nodes.find((n) => n.current)
+      // On the pi core there are two records, and their leaves can sit on different nodes. The line
+      // is about what the *record* will read next, because that is what the composer's send is
+      // addressed to - but saying only that, while pi's thread is on a message the record is not
+      // reading, is half the truth. pi's own bookkeeping (the entry that recorded the model) is not
+      // such a message: a thread ending there is reading no message, which is what the record says
+      // too when its leaf sits in front of the first row.
+      // What counts as a message of the conversation, as opposed to something the engine wrote for
+      // its own request: pi's thread carries the system prompt it assembled, and the record never
+      // stores that.
+      const speaks = (n: TreePoint) => ['user', 'assistant', 'toolResult', 'tool'].includes(n.role)
+      const theirs = t.nodes.find((n) => n.pi_current && speaks(n) && n.row !== here?.row)
+      const rest = t.off_branch
+        ? ` · ${t.off_branch} row${t.off_branch === 1 ? '' : 's'} still in the record, on a branch that is not being read`
+        : ''
+      leafLine = here
+        ? `Reading from “${here.quote}”${rest}`
+        : 'Reading from before its first message — nothing in this conversation is being read'
+      if (theirs)
+        leafLine += theirs.row === null
+          ? " · pi's thread is on a message the record has no row for"
+          : ` · pi's thread reads from “${theirs.quote}” instead, and the two will disagree on the next answer`
+    } catch {
+      leafLine = null
+    }
   }
 
   /**
@@ -4607,7 +5742,11 @@
   /** Ceiling on a repaint that has to preserve an already-loaded window. */
   const RESYNC_MAX_ROWS = 1200
 
-  async function loadTranscript(id: number, atLeastRows = 0): Promise<StoredMessage[]> {
+  async function loadTranscript(
+    id: number,
+    atLeastRows = 0,
+    stale?: () => boolean,
+  ): Promise<StoredMessage[]> {
     // Not zeroed on the way in: `viewMsgCount` is what the app uses to decide whether there is a
     // conversation on screen at all, so blanking it before the read is a second way for the screen
     // to go empty while a page is merely being fetched. It is assigned from the page below.
@@ -4633,6 +5772,15 @@
      * painting it costs the conversation's first message for a second or two.
      */
     const hold = page.messages.length === 0 && turnSessionId === id
+    // A read that went out for one conversation and lands after the person has moved to another is
+    // the one page that must not paint: it would wipe the conversation now on screen, and on the pi
+    // core a queued switch announces itself late enough that this happens as a matter of course.
+    // The caller's own guard runs after this function, which is why the check is here as well — the
+    // paint happens inside, and a screen wiped by a stale read is never painted back.
+    if (stale?.()) {
+      pageLog(`history: a newer view change took over; session ${id}'s page is not painted`)
+      return page.messages
+    }
     if (hold) {
       pageLog(`history: conversation ${id} reads empty while its turn is in flight; keeping what is on screen`)
     } else {
@@ -4981,6 +6129,7 @@
     // the code at the moment it does it.
     Transcript.reportClears = true
     let fails = 0
+    let summaryPrinted = false
     // Counting failures matters: a harness that logs FAIL and then prints "ok"
     // is worse than no harness, because the last line is the one you read.
     const fail = (m: string) => {
@@ -5002,21 +6151,51 @@
      * for the chain, so those always run.
      */
     let onlyTerms: string[] = []
-    const groups = { ran: 0, skipped: [] as string[] }
+    // Named by the launcher: a group this shape of start cannot grade, so it is stood down rather
+    // than failed. The launcher runs the other shape in a launch of its own.
+    let skipIds: string[] = []
+    // `last` is which group was entered most recently. It exists because a group can bail the whole
+    // run with `return`, and the reader of the final line deserves to know where the run stopped
+    // rather than that it stopped.
+    const groups = { ran: 0, skipped: [] as string[], last: '' }
     try {
-      const cfg = await invoke<{ only?: string[] }>('selftest_config')
+      const cfg = await invoke<{ only?: string[]; skip?: string[]; theme?: string | null }>('selftest_config')
       onlyTerms = (cfg?.only ?? []).map((t) => String(t).trim().toLowerCase()).filter(Boolean)
+      skipIds = (cfg?.skip ?? []).map((t) => String(t).trim().toLowerCase()).filter(Boolean)
+      // The palette this run paints. One run can only be in one of the two, which is why
+      // `selftest.sh --theme light` is an arm of the surface groups rather than a bonus pass: a
+      // floating surface whose colour is hard-coded dark passes the dark run and fails the light one.
+      const forced = (cfg?.theme ?? '').trim().toLowerCase()
+      if (forced === 'light' || forced === 'dark') {
+        themeRun = forced
+        // An override, and named as one: the run is grading the window's paint, not rewriting the
+        // host's stored choice, and the difference is the whole feature.
+        setWindowOverride(forced)
+      } else if (forced) {
+        pageLog(`selftest note: CWOFFEE_SELFTEST_THEME=${forced} is not a palette word; this run paints whatever the host stores`)
+      }
     } catch (e) {
       pageLog(`selftest note: could not read the check filter (${e}); running every group`)
     }
+    if (skipIds.length)
+      pageLog(
+        `selftest note: stood down by the launcher, not failed: [${skipIds.join(', ')}]. ` +
+          'This start is not the shape those groups grade; the launcher runs them in a start that is.',
+      )
     const want = (id: string, label: string) => {
+      if (skipIds.includes(id.toLowerCase())) {
+        groups.skipped.push(`${id} (not this shape of start)`)
+        return false
+      }
       if (!onlyTerms.length) {
         groups.ran++
+        groups.last = id
         return true
       }
       const hay = `${id} ${label}`.toLowerCase()
       if (onlyTerms.some((t) => hay.includes(t))) {
         groups.ran++
+        groups.last = id
         return true
       }
       groups.skipped.push(id)
@@ -5753,6 +6932,9 @@
           else {
             const items = [...pop.querySelectorAll('.pop-item')].map((i) => i.textContent!.trim())
             if (!items.includes('Rename')) fail(`row menu missing Rename: ${items.join(', ')}`)
+            // The lineage control lives here too: a person who wants the conversation's tree wants it
+            // from the conversation's row, not from one of its messages.
+            if (!items.includes('Tree')) fail(`row menu missing Tree: ${items.join(', ')}`)
             if (!items.some((i) => i.startsWith('Delete')))
               fail(`row menu missing Delete: ${items.join(', ')}`)
             const r = pop.getBoundingClientRect()
@@ -8315,6 +9497,54 @@
               fail(`file chip path wrong: ${JSON.stringify(paths)}`)
             if (!chips[0].textContent?.includes('selftest-note.md'))
               fail(`file chip has no file name: ${JSON.stringify(chips[0].textContent)}`)
+
+            // **The live path carries the same two facts as the record.** Everything above is a
+            // re-render of what was stored; this is the turn as it streamed, which is the shape a
+            // person actually sees and the one that used to be a label. What the row says it is
+            // decides what is asserted, so a model that placed the file somewhere else fails the
+            // matching rule instead of being excused.
+            const row = page.messages
+              .map((m) => (m.files ?? []).find((f: any) => (f.path ?? '').includes('selftest-note.md')))
+              .find(Boolean) as any
+            if (!row) {
+              pageLog('selftest note: the turn wrote the file without a recorded row, so the card rule was not graded')
+            } else if (row.kind === 'scratch') {
+              if (document.querySelector('.attachunit'))
+                fail(`a scratch file (${row.path}) wore the file card — the model kept it for itself, so nothing is being handed over`)
+              pageLog(`made-file live ok (${row.path} is scratch: a chip, no card, no control)`)
+            } else if (row.created === true) {
+              const unit = [...document.querySelectorAll('.attachunit')].find((u) =>
+                (u.querySelector('.filechip') as HTMLElement)?.dataset.path?.includes('selftest-note.md'),
+              ) as HTMLElement | undefined
+              if (!unit) fail(`a file this turn made (${row.path}) is not shown as a card on the live turn`)
+              else {
+                const hasControl = !!unit.querySelector('.attach-save')
+                const inFolder = (row.path ?? '').includes('.cws/assistant_attachments/')
+                const says = JSON.stringify({ path: row.path, kind: row.kind, created: row.created })
+                if (row.kind === 'attachment' || inFolder) {
+                  // In the hand-over folder: the card must carry the control, or the row is a
+                  // delivery the person cannot take.
+                  if (!hasControl)
+                    fail(`a file in the hand-over folder (${row.path}) lost its Save control on the live turn — ${says}`)
+                  else if (unit.dataset.handover !== 'yes')
+                    fail(`the hand-over card says data-handover=${unit.dataset.handover} for ${row.path}`)
+                  pageLog(`made-file live ok (${row.path}: dashed card WITH Save — it is in the hand-over folder; ${says})`)
+                } else {
+                  // Outside it: a card with nothing to hand over. A control here is the exact lie
+                  // this whole rule exists to stop, and a greyed-out one would be the same lie.
+                  if (hasControl)
+                    fail(`a file outside .cws/assistant_attachments/ (${row.path}) was offered a Save control on the live turn — ${says}`)
+                  if (unit.dataset.handover === 'yes')
+                    fail(`the live card claimed hand-over for ${row.path} — ${says}`)
+                  const title = (unit.querySelector('.filechip') as HTMLElement)?.title ?? ''
+                  if (!title.startsWith('Open '))
+                    fail(`the live card's tooltip should say what it opens, reads ${JSON.stringify(title.slice(0, 60))}`)
+                  pageLog(`made-file live ok (${row.path}: dashed card, no Save control, tooltip opens it where it sits; ${says})`)
+                }
+              }
+            } else {
+              fail(`a file the turn wrote reported created=${JSON.stringify(row.created)} — the tool looks at the disk before it writes, so a new file must say it was made`)
+            }
           }
         }
       }
@@ -10527,6 +11757,25 @@
           } else if (inStream) {
             fail('an app-level note is painted inside the transcript: it belongs in the chrome now')
           } else if (!answerBody) {
+            // "No answer block" is a symptom. What a reader needs is which conversation the screen
+            // was actually holding, because this check switches twice and a view that lands on the
+            // session it left is a different bug from a transcript that painted nothing.
+            const rowsHere = await invoke<{ messages: unknown[] }>('session_messages', {
+              id: sessN,
+              before: null,
+              limit: 400,
+            }).catch(() => null)
+            const rowsAway = await invoke<{ messages: unknown[] }>('session_messages', {
+              id: away,
+              before: null,
+              limit: 400,
+            }).catch(() => null)
+            pageLog(
+              `notes: viewId=${viewId}, transcript on ${transcript?.sessionId}, host on ` +
+                `${hostState?.session_id}, sessN=${sessN} holds ${rowsHere?.messages.length ?? '?'} row(s), ` +
+                `away=${away} holds ${rowsAway?.messages.length ?? '?'} row(s), ` +
+                `blocks user=${document.querySelectorAll('.blk-user').length} answer=${document.querySelectorAll('.blk-answer').length}`,
+            )
             fail('no answer block on screen to compare a note against')
           } else {
             const nCs = getComputedStyle(noteEl)
@@ -10734,6 +11983,21 @@
           } else if (headingAt === null)
             fail(`the heading never became a heading :: ${trace.slice(-8).join(' :: ')}`)
           else if (tableAt === null) fail('the table never became a table; the answer stayed text')
+          else if (lastTurnFrames < 4 && ago(tableAt) < 60) {
+            // "During the turn, not at the end" is a claim about *when on the frame clock* the
+            // structure appeared. A turn that delivered fewer than four paints has no when: one
+            // late paint explains it, whether the app parsed markdown at turnEnd or the compositor
+            // simply never told the page to draw. Grading it anyway put a failure (26ms before
+            // turnEnd) in an arm whose window was not being composited at all. Writing it off is
+            // not the same as passing: it counts as a blind skip, so a run that could not see its
+            // own window still ends red.
+            blindSkips++
+            pageLog(
+              `selftest note: wrote off the "the table appeared during the turn, not at turnEnd" claim: ` +
+              `the turn delivered ${lastTurnFrames} paint(s) and the table settled ${ago(tableAt)}ms before ` +
+              'the end, which one late paint explains. Keep the window visible and this bites.',
+            )
+          }
           else if (ago(tableAt) < 60)
             fail(`the table only appeared ${ago(tableAt)}ms before turnEnd - that is at turnEnd, not during`)
           else if (rows !== 4) fail(`the table has ${rows} rows (header counted), expected 4`)
@@ -13290,6 +14554,239 @@
               )
           }
         }
+          // **A claim is not a location.** Load the same turn again with the file sitting at the
+          // workspace root and another loose inside `.cws/`, both still labelled `attachment` — the
+          // shape a session written before the placement rule was fixed carries, and the shape a
+          // `download_file` with `place: "attach"` and a root `path` used to produce. Neither may
+          // get the dashed hand-over unit or its Save control: the control offers to copy a file
+          // nobody agreed to put in the hand-over folder, and the host refuses it anyway. What they
+          // do get is the chip strip, and one line saying why.
+          transcript?.loadHistory([
+            {
+              id: 90_110,
+              session_id: 0,
+              role: 'user',
+              content: 'fetch the reference sheet',
+              reasoning: '',
+              tool_call_id: null,
+              tool_calls_json: '',
+              reasoning_signature: '',
+              reasoning_ms: 0,
+              files: [],
+              created_at: 0,
+              attachments: [],
+            },
+            {
+              id: 90_111,
+              session_id: 0,
+              role: 'assistant',
+              content: 'two files, neither in the hand-over folder',
+              reasoning: '',
+              tool_call_id: null,
+              tool_calls_json: '',
+              reasoning_signature: '',
+              reasoning_ms: 0,
+              created_at: 0,
+              attachments: [],
+              files: [
+                { path: 'report.pdf', name: 'report.pdf', mime: 'application/pdf', bytes: 4096, kind: 'attachment' },
+                { path: '.cws/ref.pdf', name: 'ref.pdf', mime: 'application/pdf', bytes: 2048, kind: 'attachment' },
+              ],
+            },
+          ])
+          const misUnits = [...document.querySelectorAll('.attachunit')]
+          if (misUnits.length)
+            fail(
+              `${misUnits.length} hand-over unit(s) were drawn for files outside .cws/assistant_attachments/: ` +
+                `${misUnits.map((u) => u.textContent?.trim().slice(0, 30)).join(' | ')}`,
+            )
+          if (document.querySelector('.attach-save'))
+            fail('a Save control was offered for a file the hand-over folder does not hold')
+          const misChips = [...document.querySelectorAll('.filestrip .filechip')].map((c) => c.textContent ?? '')
+          if (!misChips.some((c) => c.includes('report.pdf'))) fail('the root file vanished from the transcript instead of becoming a chip')
+          const misNote = document.querySelector('.attach-note')?.textContent ?? ''
+          if (!misNote.includes('outside .cws/assistant_attachments'))
+            fail(`nothing said why these files have no Save control; the note reads ${JSON.stringify(misNote.slice(0, 80))}`)
+          if (!misNote.includes('report.pdf') || !misNote.includes('.cws/ref.pdf'))
+            fail(`the note does not name the paths it refused to hand over: ${JSON.stringify(misNote.slice(0, 120))}`)
+          // The hand-over folder itself still attaches: the guard is about the location, not about
+          // trusting the label less.
+          transcript?.loadHistory([
+            {
+              id: 90_112,
+              session_id: 0,
+              role: 'assistant',
+              content: 'the one that belongs',
+              reasoning: '',
+              tool_call_id: null,
+              tool_calls_json: '',
+              reasoning_signature: '',
+              reasoning_ms: 0,
+              created_at: 0,
+              attachments: [],
+              files: [{ ...sheet, path: '.cws/assistant_attachments/hand.xlsx' }],
+            },
+          ])
+          if (document.querySelectorAll('.attachunit').length !== 1)
+            fail('a file inside .cws/assistant_attachments/ lost its hand-over unit — the guard is the location, not the label')
+          if (!document.querySelector('.attach-save')) fail('the hand-over unit lost its Save control')
+
+          // **And the shape the report actually showed.** The screenshot was a turn that ran
+          // `write_file` with no `place` at all: the file landed at the workspace root
+          // (`three-feature-prompt-3.md`, kind `edit` — which is what the store recorded), and the
+          // row wore the dashed hand-over box with a Save control anyway, because an older shell
+          // called every turn file an "attachment". Plain working files get a plain chip: two lines
+          // (mime · size), a tooltip naming the path, no unit, no control, no note.
+          transcript?.loadHistory([
+            {
+              id: 90_113,
+              session_id: 0,
+              role: 'assistant',
+              content: 'wrote the task file at the root',
+              reasoning: '',
+              tool_call_id: null,
+              tool_calls_json: '',
+              reasoning_signature: '',
+              reasoning_ms: 0,
+              created_at: 0,
+              attachments: [],
+              files: [
+                {
+                  path: 'three-feature-prompt-3.md',
+                  name: 'three-feature-prompt-3.md',
+                  mime: 'text/markdown',
+                  bytes: 9546,
+                  kind: 'edit',
+                },
+              ],
+            },
+          ])
+          if (document.querySelector('.attachunit')) fail('a workspace-root file wore the hand-over box')
+          if (document.querySelector('.attach-save')) fail('a workspace-root file was offered for saving')
+          if (document.querySelector('.attach-note')) fail('a row that never claimed to be an attachment was apologised for')
+          const rootChip = [...document.querySelectorAll('.filestrip .filechip')].find((c) =>
+            (c.querySelector('.file-name')?.textContent ?? '').includes('three-feature-prompt-3.md'),
+          ) as HTMLElement | undefined
+          if (!rootChip) fail('the workspace-root file is not in the transcript at all')
+          else {
+            if (rootChip.classList.contains('one-line'))
+              fail('a working file was painted in the one-line attachment shape')
+            const sub = rootChip.querySelector('.file-sub')?.textContent ?? ''
+            if (!sub.includes('markdown') || !sub.includes('9.3'))
+              fail(`a working chip should say what it is and how big, and reads ${JSON.stringify(sub)}`)
+            const title = rootChip.title ?? ''
+            if (!title.startsWith('Open ') || !title.includes('three-feature-prompt-3.md'))
+              fail(`the chip's tooltip should name the path it opens, and reads ${JSON.stringify(title.slice(0, 60))}`)
+            // The row this file sits on starts where the answer's text starts. The strip used to
+            // carry a 62px left indent left over from the label-gutter layout, which read as a
+            // stray margin on the file row while the hand-over line above it was flush-left.
+            const strip = rootChip.closest('.filestrip') as HTMLElement | null
+            if (!strip) fail('the working file is not on a strip of its own')
+            else {
+              // Whatever wraps this row — a live turn or a history block — the prose to align
+              // against is the answer text in the same container.
+              const holder = (strip.parentElement ?? document.body) as HTMLElement
+              const body = (holder.querySelector('.blk-answer .blk-body') ??
+                holder.querySelector('.blk-body')) as HTMLElement | null
+              if (!body) fail(`no prose in ${holder.className || holder.tagName} to align the file row against`)
+              else {
+                const sr = strip.getBoundingClientRect()
+                const br = body.getBoundingClientRect()
+                if (Math.abs(sr.left - br.left) > 2)
+                  fail(`the file row starts ${Math.round(sr.left - br.left)}px in from where the answer's text starts`)
+                if (sr.right > br.right + 2)
+                  fail(`the file row hangs ${Math.round(sr.right - br.right)}px past the text column`)
+                pageLog(`file row aligned: its left edge is ${Math.round(sr.left - br.left)}px from the answer text's left edge (was 62px under the old label-gutter margin)`)
+              }
+            }
+          }
+          pageLog('attach guard ok (a row claiming `attachment` outside the folder gets a chip and a note, not a Save control; a row inside it keeps both; a plain working file is a plain chip)')
+
+          // **A file the turn made is a card.** The report was about a workspace-root `.md`:
+          // the row could not say "I made this" (kind alone says `edit` for a created file and
+          // for a replaced one), so it was rendered as a working chip and the conversation became
+          // about borders. Now the tool says whether it made the file — the only moment that is
+          // knowable — and the transcript gives a made file the same dashed card the hand-over
+          // file wears. What it does not get is the Save control: that stays inside
+          // `.cws/assistant_attachments/`, because it is the part that promises a copy out.
+          transcript?.loadHistory([
+            {
+              id: 90_114,
+              session_id: 0,
+              role: 'assistant',
+              content: 'made the task file at the root',
+              reasoning: '',
+              tool_call_id: null,
+              tool_calls_json: '',
+              reasoning_signature: '',
+              reasoning_ms: 0,
+              created_at: 0,
+              attachments: [],
+              files: [
+                {
+                  path: 'three-feature-prompt-3.md',
+                  name: 'three-feature-prompt-3.md',
+                  mime: 'text/markdown',
+                  bytes: 9546,
+                  kind: 'edit',
+                  created: true,
+                },
+              ],
+            },
+          ])
+          const madeUnit = document.querySelector('.attachunit') as HTMLElement | null
+          if (!madeUnit) fail('a file this turn made was not shown as a card')
+          else {
+            if (madeUnit.dataset.handover !== 'no')
+              fail(`a made file claimed to be handed over (data-handover=${madeUnit.dataset.handover})`)
+            if (madeUnit.querySelector('.attach-save'))
+              fail('a made file outside .cws/assistant_attachments/ was offered a Save control')
+            if (!madeUnit.closest('.attachline')) fail('the made card is not on the file line')
+            const edge = getComputedStyle(madeUnit).borderStyle
+            if (edge.split(' ')[0] !== 'dashed')
+              fail(`the made card's edge is ${edge}, not the dashed edge a file card wears`)
+            const opened = (madeUnit.querySelector('.filechip') as HTMLElement | null)?.title ?? ''
+            if (!opened.startsWith('Open ') || !opened.includes('three-feature-prompt-3.md'))
+              fail(`a made card's tooltip should name the path it opens, and reads ${JSON.stringify(opened.slice(0, 60))}`)
+            const sub = madeUnit.querySelector('.file-sub')?.textContent ?? ''
+            if (!sub.includes('markdown') || !sub.includes('9.3'))
+              fail(`a made card should still say what the file is and how big, reads ${JSON.stringify(sub)}`)
+            if (document.querySelectorAll('.filestrip .filechip').length)
+              fail('the made file was shown twice — as a card and as a working chip')
+          }
+
+          // Five made files is a build, not a delivery: past the same `ROLL_FILES_AT` number that
+          // rolls a pile of edits, made files go back to the working strip so one rule decides
+          // where "a few things I made" stops being a design and starts being a wall.
+          const five = Array.from({ length: 5 }, (_, i) => ({
+            path: `gen/thing-${i}.md`,
+            name: `thing-${i}.md`,
+            mime: 'text/markdown',
+            bytes: 200 + i,
+            kind: 'edit' as const,
+            created: true,
+          }))
+          transcript?.loadHistory([
+            {
+              id: 90_115,
+              session_id: 0,
+              role: 'assistant',
+              content: 'made five files',
+              reasoning: '',
+              tool_call_id: null,
+              tool_calls_json: '',
+              reasoning_signature: '',
+              reasoning_ms: 0,
+              created_at: 0,
+              attachments: [],
+              files: five,
+            },
+          ])
+          if (document.querySelectorAll('.attachunit').length)
+            fail(`${document.querySelectorAll('.attachunit').length} card(s) for five made files — the roll rule applies here too`)
+          const rolled = document.querySelector('.fileroll') ?? document.querySelector('.filestrip')
+          if (!rolled) fail('five made files vanished instead of going to the working strip')
+          pageLog('made-file card ok (a created file wears the dashed card with no Save control; five of them roll)')
         transcript?.clear()
       }
 
@@ -13437,29 +14934,31 @@
           + `${boxW}px box, nothing animating the picture in CSS, nothing drawn over it, ` + onShow + ')')
       }
 
-      // --- a finished turn offers copy, share, and two honest buttons ----------
+      // --- a finished turn offers copy, share, and four honest buttons ----------
       //
-      // Four controls, and the count is a claim about the row, not a constant: a turn row that
+      // Six controls, and the count is a claim about the row, not a constant: a turn row that
       // quietly gains or loses one means a reader's muscle memory points at the wrong thing.
-      // Two of the four are honest-disabled on a turn this window streamed, because both address
+      // Four of the six are honest-disabled on a turn this window streamed, because each addresses
       // a stored row and this turn has none yet.
-      if (want('turn-buttons', 'a finished turn offers copy, share, and two honest buttons')) {
+      if (want('turn-buttons', 'a finished turn offers copy, share, and four honest buttons')) {
         transcript?.clear()
         transcript?.apply({ kind: 'turnStart', d: { turn_id: 1, model: 'selftest', session_id: 0 } })
         transcript?.apply({ kind: 'text', d: 'the answer to copy' })
         transcript?.apply({ kind: 'turnEnd', d: { turn_id: 1, finish: 'stop' } })
         await new Promise((r) => setTimeout(r, 60))
         const acts = [...document.querySelectorAll('.turn-acts .tact')] as HTMLButtonElement[]
-        if (acts.length !== 4)
+        if (acts.length !== 6)
           fail(
-            `expected four turn actions - Copy, Share as Markdown, Branch, Undo files - found ` +
+            `expected six turn actions - Copy, Share as Markdown, Branch, Tree, Files, Undo files - found ` +
               `${acts.length}: ${acts.map((a) => a.className).join(', ')}`,
           )
         const copy = acts.find((a) => a.classList.contains('copy'))
         const share = acts.find((a) => a.classList.contains('share'))
         const branch = acts.find((a) => a.classList.contains('branch'))
+        const treeBtn = acts.find((a) => a.classList.contains('treebtn'))
+        const filesBtn = acts.find((a) => a.classList.contains('filesbtn'))
         const undo = acts.find((a) => a.classList.contains('revert'))
-        if (!copy || !share || !branch || !undo)
+        if (!copy || !share || !branch || !treeBtn || !filesBtn || !undo)
           fail(`turn actions are mislabelled: ${acts.map((a) => a.className).join(', ')}`)
         else {
           if (!copy.querySelector('svg.tact-glyph')) fail('turn actions use a non-SVG icon')
@@ -13474,6 +14973,24 @@
             )
           if (!/once it is stored/i.test(branch.title))
             fail(`a disabled button should say why: ${branch.title}`)
+          // The tree control is the third one that addresses a stored row: reading a tree is harmless,
+          // but pressing it has to name a node of the record, and a streamed turn has none.
+          if (!treeBtn.disabled)
+            fail(
+              'a turn this window streamed offers a tree control that claims to work; it can only name ' +
+                'a message that has been written down',
+            )
+          if (!/stored/i.test(treeBtn.title))
+            fail(`the disabled tree control does not say what it is waiting for: ${treeBtn.title}`)
+          // Files reads the record's file index, which is written when the turn is persisted — the
+          // same seam as Branch and Undo, and the same reason it is inert here.
+          if (!filesBtn.disabled)
+            fail(
+              'a turn this window streamed offers a Files control that claims to work; the file record ' +
+                'names a turn only once that turn is written down',
+            )
+          if (!/stored/i.test(filesBtn.title))
+            fail(`the disabled Files control does not say what it is waiting for: ${filesBtn.title}`)
           // Undoing files is the same kind of claim as branching: it names the row a turn wrote,
           // so on a turn that has not been written down it says so rather than reverting a guess.
           if (!undo.disabled)
@@ -14107,6 +15624,464 @@
         showStartScreen()
       }
 
+      // --- the conversation's tree: where it came from, and what the next answer reads ----
+      //
+      // A rewind deletes. A branch copies. The third thing a conversation needs is neither: stand
+      // somewhere else in the same conversation and answer from there, keeping every row. That is a
+      // leaf, and it is the one piece of state a person cannot see from the transcript alone — the
+      // rows are all still on screen, and the model is reading a subset of them.
+      //
+      // Both cores are graded by the same claims, because the person is not meant to be able to tell
+      // which one they are on. What differs, and has to be said rather than hidden, is which memory
+      // moved: the rust core re-seeds its prompt from the record, the pi core forks pi's own thread.
+      // A card that promised "the model now reads this" without asking the process would be a claim
+      // about a machine it cannot see.
+      if (want('tree', 'the conversation tree shows lineage and the leaf, and moving the leaf moves what the model reads')) {
+        const rowsOf = async (sid: number) =>
+          (
+            await invoke<{ messages: { id: number; role: string; content: string }[] }>('session_messages', {
+              id: sid,
+              before: null,
+              limit: 400,
+            })
+          ).messages
+        const core = (await invoke<{ core: string }>('about').catch(() => null))?.core ?? ''
+        const treeOf = (sid: number) => invoke<TreeRead>('session_tree', { session: sid })
+        const held = (sid: number) => sessions.find((r) => r.id === sid)?.message_count ?? -1
+        /**
+         * Read the record until it holds what the last turn was supposed to write.
+         *
+         * The host writes a turn's rows when the turn ends, so the idle flag can go false a beat
+         * before the rows are there. Reading once and grading the difference would blame the leaf
+         * control for the host's own ordering.
+         */
+        const pollRows = async (sid: number, need: number, ms = 9000) => {
+          const dl = Date.now() + ms
+          let r = await rowsOf(sid)
+          while (r.length < need && Date.now() < dl) {
+            await new Promise((res) => setTimeout(res, 150))
+            r = await rowsOf(sid)
+          }
+          return r
+        }
+        const seen = new Set<string>()
+        const collect = () => {
+          for (const t of [toastText(), ...noteLog]) if (t) seen.add(t)
+        }
+
+        newSession()
+        const askA = 'Selftest tree one: reply with the single word one.'
+        const askB = 'Selftest tree two: reply with the single word two.'
+        draft = askA
+        await send()
+        let sid = 0
+        for (let i = 0; i < 40 && !sid; i++) {
+          const st = await invoke<{ session_id: number }>('session_state').catch(() => null)
+          sid = viewId ?? transcript?.sessionId ?? st?.session_id ?? 0
+          if (!sid) await new Promise((r) => setTimeout(r, 100))
+        }
+        if (!sid) fail('the first send did not open a conversation, so there is no tree to read')
+        else if (!(await settleTurn('the first answer'))) fail('the first turn never ended')
+        else {
+          draft = askB
+          await send()
+          if (!(await settleTurn('the second answer'))) fail('the second turn never ended')
+          else {
+            await loadTranscript(sid)
+            const rows = await pollRows(sid, 4)
+            if (rows.length < 4)
+              fail(
+                `the conversation to read (${sid}) holds ${rows.length} row(s), not two turns: ` +
+                  `${JSON.stringify(rows.map((m) => `${m.role}:${m.content.slice(0, 24)}`))} ` +
+                  `(sessions=${sessions.length}, viewId=${viewId}, on screen=` +
+                  `${document.querySelectorAll('.transcript .turn').length})`,
+              )
+            else {
+              // The read on a conversation nobody has touched: a root, its newest row current, and
+              // nothing off the path. "Unknown" is not an answer here — a conversation with no parent
+              // came out of nothing, and saying so is the fact.
+              const t0 = await treeOf(sid)
+              if (t0.core !== core) fail(`the tree says core ${JSON.stringify(t0.core)} while the app says ${JSON.stringify(core)}`)
+              const me0 = t0.lineage.find((c) => c.current)
+              if (!me0) fail('the tree names no conversation as this one')
+              else if (me0.parent !== null)
+                fail(`a conversation nobody branched says it was cut out of ${me0.parent}; it is a root`)
+              if (!t0.nodes.some((n) => n.current))
+                fail(`nobody has moved the leaf, so its newest row is what is read — and the card marks nothing`)
+              if (t0.nodes[t0.nodes.length - 1] && t0.off_branch !== 0)
+                fail(`a straight conversation reports ${t0.off_branch} rows it is not reading`)
+              // Which memory was read is a fact the card has to state per core: the rust core has no
+              // process to ask, and the pi core has one and must say whether it answered.
+              if (core === 'pi') {
+                if (!t0.pi.consulted)
+                  fail(`on the pi core the tree never asked pi's own process: ${JSON.stringify(t0.pi.why)}`)
+                else if (t0.pi.entries < 2 || !t0.pi.leaf_entry)
+                  fail(`pi answered ${t0.pi.entries} entries and leaf ${JSON.stringify(t0.pi.leaf_entry)}`)
+              } else if (t0.pi.consulted)
+                fail(`the rust core claims it read a model thread: ${JSON.stringify(t0.pi)}`)
+              else if (!/record/.test(t0.note))
+                fail(`the rust core's tree note does not say where it read from: ${JSON.stringify(t0.note.slice(0, 120))}`)
+
+              // The control, pressed the way a person presses it.
+              const treeBtns = [
+                ...document.querySelectorAll('.blk-user .user-acts .tact.treebtn, .turn .tacts .tact.treebtn'),
+              ] as HTMLButtonElement[]
+              if (!treeBtns.length) fail('a stored message offers no tree control at all')
+              else if (treeBtns.some((b) => b.disabled))
+                fail('a stored message offers a tree control that says it is disabled')
+              else {
+                treeBtns[0].click()
+                const painted = await waitFor(
+                  'the tree card to paint its nodes',
+                  () => document.querySelectorAll('.tree-card .tree-node').length > 0,
+                  15000,
+                )
+                if (!painted) fail('the tree control opened a card with no nodes in it')
+                else {
+                  const flags = [...document.querySelectorAll('.tree-card .tree-flag')].map((e) => e.textContent ?? '')
+                  if (!flags.some((f) => /read through/.test(f)))
+                    fail(`the card does not say which node the next answer reads through: ${JSON.stringify(flags.slice(0, 6))}`)
+                  // Stand back at the conversation's own opening ask. This is the ask that leaves the
+                  // leaf in front of everything: nothing is read, nothing is deleted.
+                  const first = [...document.querySelectorAll('.tree-card .tree-node')].find((n) =>
+                    (n.querySelector('.tree-quote')?.textContent ?? '').includes('Selftest tree one'),
+                  )
+                  const go = first?.querySelector('.tree-go') as HTMLButtonElement | null
+                  if (!go) fail('the card gives no way to stand at my own first message')
+                  else {
+                    const rowsBefore = rows.length
+                    const heldBefore = held(sid)
+                    go.click()
+                    const ta0 = document.querySelector('textarea.composer') as HTMLTextAreaElement | null
+                    const back = await waitFor(
+                      'the moved leaf to hand the opening ask back to the composer',
+                      () => (ta0?.value ?? '').trim() === askA.trim(),
+                      20000,
+                    )
+                    collect()
+                    const said = [...seen].join(' | ')
+                    if (!back)
+                      fail(
+                        `standing at your own message does not hand the words back to the composer; it holds ` +
+                          `${JSON.stringify((ta0?.value ?? '').slice(0, 60))} and said ${JSON.stringify(said.slice(0, 140))}`,
+                      )
+                    else if (!/nothing was deleted|not read|still in the record|off its context/i.test(said))
+                      fail(`the receipt for moving the leaf never said the later rows stay: ${JSON.stringify(said.slice(0, 160))}`)
+                    else if (!/leaf moved/i.test(said))
+                      fail(`the receipt does not say the leaf moved: ${JSON.stringify(said.slice(0, 160))}`)
+                    else {
+                      // What the model reads is now nothing, and what the record holds is unchanged.
+                      const read = await rowsOf(sid)
+                      if (read.length !== 0)
+                        fail(
+                          `the leaf sits in front of the first message and the record still handed the model ` +
+                            `${read.length} message(s) to read`,
+                        )
+                      await loadSessions()
+                      if (held(sid) !== heldBefore)
+                        fail(
+                          `moving the leaf changed how many rows conversation ${sid} holds (${heldBefore} before, ` +
+                            `${held(sid)} now) — moving a leaf is not a deletion`,
+                        )
+                      const t1 = await treeOf(sid)
+                      if (t1.leaf !== 0)
+                        fail(`the tree says the leaf is ${JSON.stringify(t1.leaf)}, not before its first message`)
+                      if (t1.off_branch !== heldBefore)
+                        fail(`the tree reports ${t1.off_branch} rows not being read, and the conversation holds ${heldBefore}`)
+                      const speaks = (n: TreePoint) => ['user', 'assistant', 'toolResult', 'tool'].includes(n.role)
+                      if (t1.nodes.some((n) => n.on_branch && (n.row !== null || speaks(n))))
+                        fail(
+                          'something is drawn as being read while the leaf sits in front of everything: ' +
+                            `${JSON.stringify(t1.nodes.filter((n) => n.on_branch).map((n) => `${n.role}/${n.row ?? n.pi_entry}`))}`,
+                        )
+                      const line = document.querySelector('.leaf-line')
+                      if (!line || !/before its first message/.test(line.textContent ?? ''))
+                        fail(
+                          `the composer does not say what the next send joins: ${JSON.stringify(
+                            (line?.textContent ?? '').slice(0, 90),
+                          )}`,
+                        )
+                      // And the row that was read through before this click is drawn as off-path,
+                      // rather than missing: the rows are still there, on a branch nobody is reading.
+                      if (!t1.nodes.some((n) => !n.on_branch && n.role === 'assistant'))
+                        fail('the answer the leaf left behind is not drawn at all')
+                      // On the pi core a leaf move is a fork of pi's thread, so the two records move
+                      // together and the card must stop claiming a disagreement. If pi's thread had
+                      // been left where it was, this is where that shows up: a node marked as pi's leaf
+                      // that the record is not reading, and a composer line saying the two will disagree.
+                      if (core === 'pi') {
+                        if (t1.nodes.some((n) => n.pi_current && (n.row !== null || speaks(n))))
+                          fail(
+                            `after the move pi's thread is still marked on a message the record is not reading: ` +
+                              `${JSON.stringify(t1.nodes.filter((n) => n.pi_current).map((n) => `${n.role}/${n.row ?? n.pi_entry}`))}`,
+                          )
+                        else if (/instead|no row for/.test((document.querySelector('.leaf-line')?.textContent ?? '')))
+                          fail(
+                            `the composer still claims the two records disagree: ${JSON.stringify(
+                              (document.querySelector('.leaf-line')?.textContent ?? '').slice(0, 100),
+                            )}`,
+                          )
+                      }
+
+                      // The point of the whole control: a message sent now joins that branch, and the
+                      // rows past it stay in the record on the other one.
+                      draft = 'Selftest tree three: reply with the single word three.'
+                      await send()
+                      if (!(await settleTurn('the answer on the branch')))
+                        fail('the turn sent from the moved leaf never ended')
+                      else {
+                        // The sidebar's count is the record's whole row count, which is what proves
+                        // nothing was deleted; refresh it rather than grade a stale list.
+                        await loadSessions()
+                        const joined = await pollRows(sid, 2)
+                        const mine = joined.filter((m) => m.role === 'user')
+                        if (joined.length !== 2 || mine.length !== 1)
+                          fail(
+                            `the message sent from the moved leaf joined ${joined.length} row(s) with ` +
+                              `${mine.length} of my messages; it should join its own branch of two`,
+                          )
+                        else if (!/Selftest tree three/.test(mine[0].content))
+                          fail(`the branch the leaf was left on answers a different ask: ${JSON.stringify(mine[0].content.slice(0, 60))}`)
+                        else if (joined.some((m) => /Selftest tree two/.test(m.content)))
+                          fail('the row the leaf left behind is being read again')
+                        else if (held(sid) !== heldBefore + 2)
+                          fail(
+                            `conversation ${sid} holds ${held(sid)} rows after the branch grew; expected ` +
+                              `${heldBefore + 2} — nothing was deleted and one turn was added`,
+                          )
+                        else {
+                          const t2 = await treeOf(sid)
+                          if (t2.off_branch !== heldBefore)
+                            fail(`after the new turn the tree reports ${t2.off_branch} rows not being read, expected ${heldBefore}`)
+                          const cur = t2.nodes.find((n) => n.current)
+                          if (!cur || cur.role !== 'assistant')
+                            fail('the new answer is not the node the next answer reads through')
+
+                          // Two paths out of one message, and the tree has to say who is whose parent
+                          // and where each was cut — which is the whole reason the lineage exists: the
+                          // sidebar shows both branches as unrelated rows otherwise.
+                          //
+                          // The two cuts are deliberately different nodes. One is the first message of
+                          // the branch the leaf was left on: a cut takes everything strictly before that
+                          // message, and on the branch being read there is nothing before it, so that
+                          // branch copies no rows and gets the ask back to be asked again. The other is
+                          // the answer the leaf is standing on: that one carries the branch and none of
+                          // the rows the leaf walked past.
+                          const kids: { session: number; title: string; copied: number; prefill: string | null }[] = []
+                          const tip = joined[joined.length - 1]
+                          for (const pt of [mine[0], tip]) {
+                            const cut = await invoke<{
+                              session: number
+                              title: string
+                              copied: number
+                              prefill: string | null
+                            }>('branch_conversation', {
+                              session: sid,
+                              message_id: pt.id,
+                              from_end: null,
+                              role: pt.role,
+                              shown: pt.content,
+                            }).catch((e) => null)
+                            if (!cut)
+                              fail(
+                                `branching the ${pt.role} row ${pt.id} of the branch the leaf was left on made no conversation`,
+                              )
+                            else kids.push(cut)
+                          }
+                          if (kids.length !== 2) fail('two branches from one message made fewer than two conversations')
+                          else if (kids[0].copied !== 0)
+                            fail(
+                              `branching at the first message of the branch copied ${kids[0].copied} row(s); a cut takes ` +
+                                `everything before that message and there is nothing before it on the branch being read`,
+                            )
+                          else if (!kids[0].prefill || !kids[0].prefill.includes(mine[0].content.slice(0, 40)))
+                            fail(`the branch cut at my message did not hand the ask back: ${JSON.stringify(kids[0].prefill ?? '')}`)
+                          else if (kids[1].copied !== 2)
+                            fail(
+                              `branching at the node the leaf stands on copied ${kids[1].copied} row(s), expected the ` +
+                                `branch's two and nothing from the branch the leaf left behind`,
+                            )
+                          else if (kids[1].prefill !== null)
+                            fail(
+                              `branching at an answer handed back ${JSON.stringify((kids[1].prefill ?? '').slice(0, 40))}; ` +
+                                `an answer is not something to ask again`,
+                            )
+                          else {
+                            // What each new conversation actually holds: one empty, one carrying only
+                            // the branch it was cut from.
+                            const first = await rowsOf(kids[0].session)
+                            const second = await rowsOf(kids[1].session)
+                            if (first.length !== 0)
+                              fail(
+                                `the branch cut in front of my message holds ${first.length} row(s), expected none — ` +
+                                  `its ask is in a composer, not in a record`,
+                              )
+                            else if (second.length !== 2 || !second.some((m) => /Selftest tree three/.test(m.content)))
+                              fail(
+                                `the branch cut at the leaf's node holds ${JSON.stringify(second.map((m) => m.role))}, ` +
+                                  `expected my message and its answer`,
+                              )
+                            else if (second.some((m) => /Selftest tree (one|two)/.test(m.content)))
+                              fail(`branch ${kids[1].session} carries a row the leaf had left behind`)
+                            else {
+                              // Lineage for both, read from each branch's own entry rather than off the
+                              // parent: a conversation that was never cut from anything has no entry of
+                              // its own to grade.
+                              const wants = [
+                                { role: 'user', row: mine[0].id, quote: /Selftest tree three/ },
+                                { role: 'assistant', row: tip.id, quote: /three/ },
+                              ]
+                              for (let i = 0; i < kids.length; i++) {
+                                const cut = kids[i]
+                                const want = wants[i]
+                                const kid = await treeOf(cut.session)
+                                const own = kid.lineage.find((c) => c.current)
+                                const from = kid.lineage.find((c) => c.session === sid)
+                                if (!from)
+                                  fail(`branch ${cut.session} does not draw the conversation it came out of`)
+                                else if (!own || own.session !== cut.session || own.parent !== sid)
+                                  fail(
+                                    `branch ${cut.session} does not name the conversation it was cut out of: ${JSON.stringify(
+                                      own ?? null,
+                                    )}`,
+                                  )
+                                else if (own.branch_role !== want.role)
+                                  fail(
+                                    `branch ${cut.session} says it was cut from ${JSON.stringify(own.branch_role)}, not from ${want.role}`,
+                                  )
+                                else if (!want.quote.test(own.branch_quote))
+                                  fail(
+                                    `branch ${cut.session} does not quote the row it was cut at: ${JSON.stringify(
+                                      own.branch_quote.slice(0, 60),
+                                    )}`,
+                                  )
+                                else if (!own.parent_gone && own.branch_row !== want.row)
+                                  fail(
+                                    `branch ${cut.session} names row ${own.branch_row} as its cut, and I pressed ${want.row}`,
+                                  )
+                                else if (own.depth !== from.depth + 1)
+                                  fail(`branch ${cut.session} is drawn at depth ${own.depth}, its parent at ${from.depth}`)
+                              }
+                              const par = await treeOf(sid)
+                              const drawn = kids.filter((k) =>
+                                par.lineage.some((c) => c.session === k.session && c.parent === sid),
+                              ).length
+                              if (drawn !== 2)
+                                fail(
+                                  `the parent draws ${drawn} of its 2 children: ${JSON.stringify(
+                                    par.lineage.map((c) => c.session),
+                                  )}`,
+                                )
+                              else if (!/2 branch\(es\) hang off/.test(par.note))
+                                fail(`the parent's note does not count its children: ${JSON.stringify(par.note.slice(0, 140))}`)
+                              else if (!par.lineage.some((c) => c.session === sid && c.children >= 2))
+                                fail(
+                                  `the parent's own row does not say it has two branches: ${JSON.stringify(par.lineage)}`,
+                                )
+                            }
+                          }
+
+                          // A window that has drifted must not move a leaf on a row it never showed,
+                          // and nothing may move while a turn is being written.
+                          const before = await rowsOf(sid)
+                          const heldNow = held(sid)
+                          let refused = ''
+                          try {
+                            await invoke('switch_leaf', {
+                              session: sid,
+                              message_id: mine[0].id,
+                              from_end: null,
+                              role: 'user',
+                              shown: 'words no window ever painted',
+                            })
+                          } catch (e) {
+                            refused = String(e)
+                          }
+                          if (!/says something else/i.test(refused))
+                            fail(
+                              `a leaf move addressed to a row whose words have changed answered ${refused || 'with no error'}; ` +
+                                'it has to refuse and move nothing',
+                            )
+                          if ((await rowsOf(sid)).length !== before.length || held(sid) !== heldNow)
+                            fail('the refused leaf move changed the conversation it was refused on')
+
+                          draft = 'Count out loud from one to fifteen, one number per line.'
+                          await send()
+                          let running = false
+                          for (let i = 0; i < 40 && !running; i++) {
+                            running = busy
+                            if (!running) await new Promise((r) => setTimeout(r, 100))
+                          }
+                          let busyRefused = ''
+                          try {
+                            await invoke('switch_leaf', {
+                              session: sid,
+                              message_id: mine[0].id,
+                              from_end: null,
+                              role: 'user',
+                              shown: mine[0].content,
+                            })
+                          } catch (e) {
+                            busyRefused = String(e)
+                          }
+                          if (!/turn is running/i.test(busyRefused))
+                            fail(
+                              `moving the leaf during a turn answered ${busyRefused || 'with no error'} (the turn was ` +
+                                `running when asked: ${running})`,
+                            )
+                          // What a refusal is responsible for is the leaf and the rows, not the turn's
+                          // own writes. The pi core stores your message before it asks the model, so a
+                          // conversation legitimately grows while a turn runs; comparing the record to
+                          // itself mid-turn would blame the refusal for the core's ordering. What proves
+                          // the refusal is where the conversation ends up reading: the turn lands on the
+                          // branch the leaf was left on, and nothing of the row the leaf walked past
+                          // comes back.
+                          await settleTurn('the counting turn')
+                          const afterRefusal = await rowsOf(sid)
+                          if (afterRefusal.length !== before.length + 2)
+                            fail(
+                              `the turn sent around the refusal left conversation ${sid} reading ` +
+                                `${afterRefusal.length} row(s) where it had ${before.length}; the turn adds ` +
+                                `its own two and the refusal moves nothing`,
+                            )
+                          else if (!afterRefusal.some((m) => /Selftest tree three/.test(m.content)))
+                            fail(
+                              'the refused mid-turn move put the conversation on another branch: the branch ' +
+                                'the leaf was left on is no longer the one being read',
+                            )
+                          else if (!/Count out loud/.test(afterRefusal[afterRefusal.length - 2]?.content ?? ''))
+                            fail(
+                              `the counting turn did not land on the branch it was sent from: ` +
+                                `${JSON.stringify(afterRefusal.slice(-2).map((m) => m.role))}` +
+                                ` under ${JSON.stringify((afterRefusal.at(-1)?.content ?? '').slice(0, 40))}`,
+                            )
+                          else {
+                            const afterTree = await treeOf(sid)
+                            const tipRow = afterRefusal[afterRefusal.length - 1]
+                            if (afterTree.leaf !== tipRow.id)
+                              fail(
+                                `after the turn the leaf is ${JSON.stringify(afterTree.leaf)} and the branch's ` +
+                                  `newest row is ${tipRow.id} — the next answer should read through the turn`,
+                              )
+                            pageLog(
+                              `tree ok (root read, leaf moved to before the first ask, a turn joined that branch, ` +
+                                `a child drew its cut, and two refusals moved nothing)`,
+                            )
+                          }
+                        }
+                      }
+                    }
+                    draft = ''
+                  }
+                }
+              }
+            }
+          }
+        }
+        draft = ''
+        showStartScreen()
+      }
+
       // --- a turn's file changes, copied before they happen, and put back ----------
       //
       // "Undo that answer" has always meant the transcript, but a cowork turn wrote into the
@@ -14291,7 +16266,19 @@
                 'instead of the words it held before the turn',
             )
           }
-          const said = toastText()
+          // The revert's own sentence is what says the messages stayed. It arrives when the command
+          // returns, which is *after* the bytes are back on disk — so reading the toast the instant
+          // `waitBytes` succeeds can catch the note that was already on screen, and grade the
+          // revert against somebody else's notice. Poll the sentence, keep the claim.
+          let said = toastText()
+          const toastDeadline = Date.now() + 2500
+          while (
+            !/transcript is untouched|back to how (?:it|they) were/i.test(said) &&
+            Date.now() < toastDeadline
+          ) {
+            await new Promise((r) => setTimeout(r, 150))
+            said = toastText()
+          }
           if (!/transcript is untouched|back to how (?:it|they) were/i.test(said))
             return fail(
               `the revert did not say what it did to the messages; it said ${JSON.stringify(said.slice(0, 120))}`,
@@ -14425,6 +16412,1748 @@
         if (okLine) pageLog(okLine)
       }
 
+      // --- the browser: a model opens a page and reads what the page itself said ---------
+      //
+      // `exec` can start a dev server and `read_file` can read the source; neither can say whether
+      // the page renders, whether the button works, or whether the console is on fire. That gap is
+      // where "I tested it" means "it compiled". So this sends a real browser at a real page the
+      // mock endpoint is already serving, and grades the report against things only a real browser
+      // could have seen: the page's own title, a click landing, an inline script's value, and the
+      // TypeError its own code threw. The scenario's `require` list makes the mock refuse a turn
+      // whose tool output lacks those strings, so a tool that merely described a run fails at the
+      // endpoint rather than passing on the model's say-so.
+      if (want('browse', 'the browser tool opens a page and reports what the page itself said')) {
+        type BrStatus = {
+          mounted: boolean
+          driver: string | null
+          node: string
+          headed: boolean
+          why: string
+          window_is_browser: boolean
+          screenshot_default: string
+          vision: string
+          says: string
+        }
+        const reasoningWas = hostState?.reasoning ?? ''
+        const modeWas = hostState?.mode ?? ''
+        let okLine = ''
+        const run = async () => {
+          // Asked with the model that is answering, because that is what decides the mode. A
+          // settings line read once at boot would be describing a start that stopped existing the
+          // moment someone picked another model.
+          const st0 = (await invoke<BrStatus>('browser_status', { model }).catch((e) => ({
+            error: String(e),
+          }))) as BrStatus & { error?: string }
+          if (st0.error) return fail(`browser_status refused: ${st0.error}`)
+
+          if (!st0.mounted) {
+            // The branch a machine without Playwright takes. It is not a skip: the page has to
+            // say the tool is missing, in words that carry the command that would install it,
+            // because an agent handed a bare "no browser" tries harder in ways that are worse.
+            if (!/not mounted/i.test(st0.says))
+              return fail(`the browser line says ${JSON.stringify(st0.says.slice(0, 120))} while no driver is mounted`)
+            if (!st0.says.includes('npm --prefix browser install') || !st0.says.includes('npx playwright install'))
+              return fail(`the browser line does not say how to install what is missing: ${JSON.stringify(st0.says.slice(0, 200))}`)
+            okLine = 'no browser driver in this start, and the settings page says so out loud with the install commands'
+            return
+          }
+
+          await invoke('set_reasoning', { level: 'off', persist: true })
+          await invoke('set_mode', { mode: 'auto' })
+          newSession()
+          const t = await turnCount()
+          draft = 'Selftest browse: open the page the endpoint is serving at /selftest-page.html, click the button, tell me what the page does'
+          await send()
+          if (!(await waitTurnDone(t))) return fail('the browse turn never ended')
+
+          const card = document.querySelector('.blk-tool[data-tool="browse"]') as HTMLElement | null
+          if (!card) {
+            const names = [...document.querySelectorAll<HTMLElement>('.blk-tool')]
+              .map((e) => e.dataset.tool ?? '?')
+              .join(', ')
+            const said = toast?.text ?? ''
+            return fail(
+              `no browse tool card on the page; cards are [${names}], the notice on screen says ` +
+                `${JSON.stringify(String(said).slice(0, 200))}, and the model answered ` +
+                `${JSON.stringify((document.querySelector('.blk-text')?.textContent ?? '').slice(0, 160))}`,
+            )
+          }
+          const out = (card.querySelector('.tool-out')?.textContent ?? '').trim()
+          if (!out) return fail('the browse card opened with no output to read')
+          for (const needle of [
+            'Cwoffee browse selftest',
+            'uncaught errors',
+            'Cannot read properties of undefined',
+            'click "More" ok',
+            'eval ok -> "5"',
+          ]) {
+            if (!out.includes(needle))
+              return fail(
+                `the browse card never reports ${JSON.stringify(needle)}; it says ${JSON.stringify(out.slice(0, 500))}`,
+              )
+          }
+
+          // One policy, asked twice: what the tool did in the transcript has to agree with what
+          // the settings page claims this start will do. Two answers means two rules, and the
+          // rule here is a claim about a window appearing on a person's desktop.
+          const cardHeaded = /headed \(a real window\)/.test(out)
+          if (st0.window_is_browser) {
+            // In a window that already holds a browser there is no second browser to be headed or
+            // headless about, so the card must not claim either — and what it does claim is the
+            // page in the sidebar. This is the whole feature: asked to look at a page, the model got
+            // the one the person can see instead of a Chromium window on their desktop.
+            if (cardHeaded)
+              return fail(
+                `the card ran a real window while this window already holds the browser; the page should have opened `
+                + `in the sidebar: ${JSON.stringify(out.slice(0, 240))}`,
+              )
+            if (!out.includes('keeping open'))
+              return fail(
+                `the card never says the page opened in the browser cwoffee is keeping open: ${JSON.stringify(out.slice(0, 240))}`,
+              )
+          } else {
+            if (cardHeaded !== st0.headed)
+              return fail(
+                `the card ran ${cardHeaded ? 'headed' : 'headless'} while the settings page says this start runs ` +
+                  `${st0.headed ? 'headed' : 'headless'} (${st0.vision} vision): ${JSON.stringify(out.slice(0, 200))}`,
+              )
+            // The reason is the same string the settings page reports, not a paraphrase of it: one
+            // policy printing one sentence in two places. An earlier version of this check looked for
+            // the word "because", which the card does not use, and failed a run that had explained
+            // itself correctly — a check that grades its own wording rather than the claim.
+            if (!st0.why || !out.includes(st0.why))
+              return fail(
+                `the card does not give the reason the settings page gives (${JSON.stringify(st0.why)}); it says ` +
+                  `${JSON.stringify(out.slice(0, 240))}`,
+              )
+          }
+          // A page picture is only promised when this start would take one. A text-only model gets
+          // no picture sentence at all, and grading for one would fail a run that said nothing false.
+          if (st0.screenshot_default !== 'none' && !out.includes('screenshot'))
+            return fail(`the card does not say what happened to the page picture: ${JSON.stringify(out.slice(0, 240))}`)
+
+          // The independent witness. The page the browser was sent to asks for a script, and the
+          // server serving both counts every fetch. A tool that only narrated a browser session
+          // cannot make that counter move.
+          const prov = await invoke<{ chosen_base_url?: string }>('provider_status').catch(() => null)
+          const base = (prov?.chosen_base_url ?? '').replace(/\/+$/, '').replace(/\/v1$/, '')
+          if (!base) return fail('the check cannot ask the endpoint how many page requests it saw: no base url')
+          const hits = await fetch(`${base}/selftest-hits`)
+            .then((r) => r.json() as Promise<{ page_hits?: number }>)
+            .catch(() => null)
+          if (!hits || typeof hits.page_hits !== 'number')
+            return fail(`the endpoint's page-hit counter did not answer (fetch to ${base}/selftest-hits failed)`)
+          if (hits.page_hits < 2)
+            return fail(
+              `the server was fetched ${hits.page_hits} time(s) by anything claiming to be a browser, while the ` +
+                `card claims it opened the page and its script: ${JSON.stringify(out.slice(0, 200))}`,
+            )
+
+          okLine =
+            `browse ok (a real ${
+              st0.window_is_browser ? 'page in this window' : st0.headed ? 'window' : 'headless run'
+            } opened the page${st0.window_is_browser ? '' : ` because ${st0.why}`}, ` +
+            `reported the click, the inline value and the page's own TypeError, and the server it loaded from ` +
+            `counted ${hits.page_hits} fetches)`
+        }
+        try {
+          await run()
+        } finally {
+          await invoke('set_reasoning', { level: reasoningWas || 'medium', persist: true }).catch(() => {})
+          await invoke('set_mode', { mode: modeWas || 'auto', persist: true }).catch(() => {})
+          toast = null
+        }
+        if (okLine) pageLog(okLine)
+      }
+
+      // --- the browser panel: a window onto the browser the model is acting on ------
+      if (want('browser-panel', 'the browser panel shows the page the model is acting on, and a person can open, drive and close the same browser')) {
+        /* One claim, graded from three directions: the transcript says the model acted on a page,
+           the panel shows a page, and the *app's* payload says which browser it is. A screenshot
+           in the panel proves the panel works; it does not prove it is the browser the model
+           clicked — that agreement is what the url and actor comparisons are for.
+
+           The panel is graded as a window, not as a picture: a panel that shows a page nobody can
+           reach is decoration, and a panel that offers controls the transport refuses is a lie. */
+        const reasoningWas = hostState?.reasoning ?? ''
+        const modeWas = hostState?.mode ?? ''
+        let okLine = ''
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+        const until = async (fn: () => boolean, ms: number, what: string) => {
+          const t0 = Date.now()
+          while (Date.now() - t0 < ms) {
+            if (fn()) return true
+            await sleep(300)
+          }
+          return fail(`${what} did not happen within ${ms}ms`)
+        }
+        const run = async () => {
+          await invoke('set_reasoning', { level: 'off', persist: true })
+          await invoke('set_mode', { mode: 'auto' })
+
+          await readBrowserState()
+          const st0 = paneNow
+          if (!st0) return fail('browser_panel did not answer at all')
+          if (!st0.mounted || st0.keep_off) {
+            // The two arms where there is no browser to show, graded rather than skipped: a
+            // panel that says "no browser" without saying why, or that offers a url box that can
+            // only fail, is the failure mode this whole feature has to be honest about. One is a
+            // switch a person turned (`keep = false`, which `--no-browser` sets on this board);
+            // the other is a machine where the driver was never installed.
+            if (st0.keep_off && !st0.says.includes('keep = false'))
+              return fail(
+                `kept browsers are switched off, but the panel does not name the switch it has to change: ${JSON.stringify(st0.says.slice(0, 200))}`,
+              )
+            if (!st0.keep_off) {
+              if (!/not mounted|session driver|npm --prefix browser install/.test(st0.says))
+                return fail(`the panel says ${JSON.stringify(st0.says.slice(0, 200))} with no session driver here — it should say what to install`)
+              if (!st0.says.includes('npx playwright install chromium'))
+                return fail(`the panel does not say how to put the browser back: ${JSON.stringify(st0.says.slice(0, 220))}`)
+            }
+            setBrowserPane(true)
+            // A tick before reading the DOM: Svelte renders on the microtask after the state change,
+            // and a check that queries in the same task is grading a pane that has not been drawn.
+            await renderTick()
+            await sleep(60)
+            const pane = document.querySelector('[data-browser-pane]') as HTMLElement | null
+            if (!pane) return fail('the panel did not render with no browser mounted')
+            if (pane.dataset.browserAlive !== 'no')
+              return fail(`the panel claims alive=${pane.dataset.browserAlive} with no browser mounted`)
+            const says = document.querySelector('[data-browser-says]')?.textContent ?? ''
+            if (!says.trim()) return fail('the panel says nothing about why there is no browser')
+            setBrowserPane(false)
+            await renderTick()
+            await sleep(60)
+            if (document.querySelector('[data-browser-pane]'))
+              return fail('hiding the panel with nothing open left the column on screen')
+            const toggle2 = document.querySelector('[data-browser-toggle]') as HTMLElement | null
+            if (!toggle2) return fail('with no kept browser the card took away the button that explains why')
+            okLine = `no kept browser in this start (${st0.keep_off ? 'switched off by the person' : 'no driver installed'}), and the panel says why: ${says.slice(0, 110)}`
+            return
+          }
+
+          // ---- the door: one button, and it opens a panel rather than a browser ----
+          const toggle = document.querySelector('[data-browser-toggle]') as HTMLElement | null
+          if (!toggle) return fail('no browser button on the transcript card')
+          setBrowserPane(false)
+          await sleep(60)
+          if (document.querySelector('[data-browser-pane]')) return fail('the panel is open before the button was pressed')
+          if (toggle.getAttribute('aria-pressed') !== 'false')
+            return fail('the browser button claims to be pressed while the panel is closed')
+          // The pane is state, and state repaints on the next microtask — not inside `click()`.
+          // Every DOM read below waits, because "the control works" and "the DOM had changed yet"
+          // are different claims and only the second one is what a check can read.
+          toggle.click()
+          await sleep(40)
+          if (!document.querySelector('[data-browser-pane]')) return fail('pressing the browser button opened nothing')
+          if (toggle.getAttribute('aria-pressed') !== 'true')
+            return fail('the browser button does not report that the panel is open')
+          const closePane = document.querySelector('[data-browser-close-pane]') as HTMLElement | null
+          if (!closePane) return fail('the panel has no way for the person to hide it')
+          closePane.click()
+          await sleep(40)
+          if (document.querySelector('[data-browser-pane]')) return fail('the panel stayed after its own close button')
+          toggle.click()
+          await sleep(40)
+          const pane = document.querySelector('[data-browser-pane]') as HTMLElement
+          if (!pane) return fail('the browser button opened nothing the second time')
+          if (pane.dataset.browserOpen !== 'yes') return fail('the open panel does not say it is open')
+
+          // Nothing has been open in this column, so it invites a start rather than reporting a
+          // missing thing — and it does not say the same sentence twice, once in the page area and
+          // once under it.
+          if (!document.querySelector('[data-browser-empty-cta]'))
+            return fail('with nothing ever open, the page area offers no way to start')
+          if (!/start browsing/i.test(document.querySelector('[data-browser-empty-cta]')?.textContent ?? ''))
+            return fail('the empty page area does not invite a start')
+          if (document.querySelector('[data-browser-says]'))
+            return fail('with nothing ever open, the panel repeats "no browser is open" under the page area')
+
+          // The column and the card it stands beside end on the same two lines. The column used to
+          // run a few pixels above the card's top and below its bottom, which reads as one window
+          // being slightly out of true.
+          const card = document.querySelector('.panecard') as HTMLElement | null
+          if (!card) return fail('there is no transcript card to measure the column against')
+          {
+            const cr = card.getBoundingClientRect()
+            const pr = pane.getBoundingClientRect()
+            if (Math.abs(cr.top - pr.top) > 1.5)
+              return fail(
+                `the browser column starts ${Math.round(pr.top - cr.top)}px off the transcript card's top edge`,
+              )
+            if (Math.abs(cr.bottom - pr.bottom) > 1.5)
+              return fail(
+                `the browser column ends ${Math.round(pr.bottom - cr.bottom)}px off the transcript card's bottom edge`,
+              )
+          }
+
+          // The geometry, in the same terms the chrome check uses: a column that adds height to
+          // the window is a bug nobody notices until the transcript is shorter than the screen.
+          const shell = document.querySelector('.app-shell') as HTMLElement | null
+          const paneRect = pane.getBoundingClientRect()
+          if (shell) {
+            const shellRect = shell.getBoundingClientRect()
+            if (paneRect.bottom > shellRect.bottom + 1.5)
+              return fail(
+                `the browser column hangs ${Math.round(paneRect.bottom - shellRect.bottom)}px below the window — it adds ` +
+                  `height instead of taking a column of it`,
+              )
+          }
+
+          // ---- the person opens a page from the panel ------------------
+          const prov = await invoke<{ chosen_base_url?: string }>('provider_status').catch(() => null)
+          const base = (prov?.chosen_base_url ?? '').replace(/\/+$/, '').replace(/\/v1$/, '')
+          if (!base) return fail('no endpoint base url to open in the browser')
+          const pageUrl = `${base}/selftest-page.html`
+          const box = document.querySelector('[data-browser-urlbox]') as HTMLInputElement | null
+          const goBtn = document.querySelector('[data-browser-go]') as HTMLButtonElement | null
+          if (!box || !goBtn) return fail('the panel has no address box')
+          if (!writableCheck(pane)) return fail('the panel says it may drive the browser, but its controls are disabled')
+          box.value = pageUrl
+          box.dispatchEvent(new Event('input', { bubbles: true }))
+          await sleep(50)
+          goBtn.click()
+          await until(() => (document.querySelector('[data-browser-pane]') as HTMLElement)?.dataset.browserAlive === 'yes', 30_000, 'the browser starting')
+          await until(() => document.querySelector('[data-browser-frame="yes"]') !== null, 20_000, 'a picture of the page arriving in the panel')
+          const shown = document.querySelector('[data-browser-url]') as HTMLElement | null
+          if (!shown) return fail('the panel shows no url for the page it just opened')
+          if (!shown.textContent!.includes('selftest-page.html'))
+            return fail(`the panel's url line says ${JSON.stringify(shown.textContent)}`)
+          const shot = document.querySelector('[data-browser-frame="yes"]') as HTMLImageElement
+          if (!shot.src.startsWith('data:image/')) return fail('the panel shows an empty picture element')
+          if (shot.naturalWidth < 8) return fail('the panel shows a picture with no pixels in it')
+          // The title, against the title the **server** says the page has. The page's `<h1>` and
+          // its `<title>` differ on purpose: an earlier version of this check matched the heading,
+          // and the panel was correctly showing `document.title`. A check written against the wrong
+          // field of a page fails a feature that works, so the witness here is the served HTML, not
+          // a string remembered from the harness source.
+          // Read from the server that serves the page, not from the page itself: the webview is a
+          // different origin, and an html body it is not allowed to read would leave this check with
+          // nothing to compare. The endpoint publishes both strings it builds the page from.
+          const served = await fetch(`${base}/selftest-hits`)
+            .then(
+              (r) =>
+                r.json() as {
+                  page_title?: string
+                  page_h1?: string
+                  page_clicks?: number
+                  aim?: { x: number; y: number; w: number; h: number }
+                  inp?: { x: number; y: number; w: number; h: number }
+                },
+            )
+            .catch(() => null)
+          const servedTitle = (served?.page_title ?? '').trim()
+          if (!servedTitle) return fail('the endpoint does not publish the title it serves, so the title check cannot run')
+          const shownTitle = (
+            (document.querySelector('[data-browser-title]') as HTMLElement | null)?.getAttribute('data-browser-title') ?? ''
+          ).trim()
+          if (shownTitle !== servedTitle)
+            return fail(
+              `the panel titles the page ${JSON.stringify(shownTitle)} while the page as served is titled ` +
+                `${JSON.stringify(servedTitle)} — the title in the column did not come from the page`,
+            )
+
+          // ---- what the panel is *not* allowed to open ------------------
+          // The narrow rule, graded: a page box has no per-call path approval, so a `file://`
+          // address is refused here even though the model's own file rule may allow a path
+          // inside the conversation's folder. Refusing is the honest answer; opening it is not.
+          box.value = 'file:///etc/hostname'
+          box.dispatchEvent(new Event('input', { bubbles: true }))
+          await sleep(50)
+          ;(document.querySelector('[data-browser-go]') as HTMLButtonElement).click()
+          await until(() => document.querySelector('[data-browser-err]') !== null, 8000, 'the panel refusing a file:// address')
+          const why = document.querySelector('[data-browser-err]')?.textContent ?? ''
+          if (!/http/.test(why))
+            return fail(`the panel refused a file:// address without saying what it does open: ${JSON.stringify(why.slice(0, 200))}`)
+          if (!(document.querySelector('[data-browser-url]') as HTMLElement)?.textContent?.includes('selftest-page.html'))
+            return fail('the refused address replaced the page that was open')
+
+          // ---- a person's click, recorded as theirs ----------------------
+          const before = paneNow?.frames_taken ?? 0
+          const reload = document.querySelector('[data-browser-reload]') as HTMLButtonElement | null
+          if (!reload) return fail('the panel has no reload control')
+          reload.click()
+          await until(() => (document.querySelector('[data-browser-pane]') as HTMLElement)?.dataset.browserAlive === 'yes', 15_000, 'the reload landing')
+          await until(() => (document.querySelector('[data-browser-actor]') as HTMLElement)?.dataset.browserActor === 'person', 12_000, 'the panel recording the click as a person\'s')
+          // The new picture arrives on the panel's next pull, and only because the page changed:
+          // between changes the panel asks "anything newer than seq N?" and gets no bytes back. So
+          // the wait is the check — a count read immediately after the click would grade the poll's
+          // schedule rather than the reload.
+          await until(() => (paneNow?.frames_taken ?? 0) > before, 12_000, 'the panel taking a new picture after the reload')
+
+          /* ---- Back is one step; Reload is not --------------------------
+             The session driver used to answer `back`, `forward` and `reload` from one branch that
+             called `goBack()` for all three. On a page with no history that is invisible — going
+             back does nothing, and the reload that followed leaves the page looking reloaded. A
+             page with history in it is the only way to see it, so the panel is made to have some:
+             two fragment addresses, one Back, one Reload, and the url compared after each. */
+          const openIn = async (u: string) => {
+            const b = document.querySelector('[data-browser-urlbox]') as HTMLInputElement
+            b.value = u
+            b.dispatchEvent(new Event('input', { bubbles: true }))
+            await sleep(50)
+            ;(document.querySelector('[data-browser-go]') as HTMLButtonElement).click()
+          }
+          const urlNow = () => (document.querySelector('[data-browser-url]') as HTMLElement | null)?.textContent ?? ''
+          await openIn(`${pageUrl}#first`)
+          await until(() => urlNow().includes('#first'), 15_000, 'the first address showing in the panel')
+          await openIn(`${pageUrl}#second`)
+          await until(() => urlNow().includes('#second'), 15_000, 'the second address showing in the panel')
+          ;(document.querySelector('[data-browser-back]') as HTMLButtonElement).click()
+          await until(() => urlNow().includes('#first') && !urlNow().includes('#second'), 15_000, 'Back taking one step back')
+          ;(document.querySelector('[data-browser-reload]') as HTMLButtonElement).click()
+          await sleep(1200)
+          if (!urlNow().includes('#first'))
+            return fail(
+              `Reload took the page off #first (it is at ${JSON.stringify(urlNow())}) — a reload re-reads the page ` +
+                `that is open; it does not walk the history`,
+            )
+
+          /* ---- pointing at the picture, with the page's own numbers ----
+             The column shows the page as a picture and lets a person aim at it. The claim is not
+             that a click handler exists — it is that the click lands on the page, at the place the
+             picture showed. So the box's position comes from the server that served the page, the
+             press is made on the <img> at the pixel that position maps to in this window, and the
+             witness is a counter only the page itself can raise. A panel that scaled its own
+             picture by the wrong factor misses the box, and the count stays where it was. */
+          const aim = served?.aim as { x: number; y: number } | undefined
+          const inpBox = served?.inp as { x: number; y: number } | undefined
+          if (!aim || !inpBox)
+            return fail(
+              'the page server does not say where its own clickable box and text field are, so nothing here can be aimed at it',
+            )
+          const st2 = (await invoke('browser_panel', {})) as BrowserPanel
+          const vp = st2.viewport
+          if (!vp?.width || !vp.height)
+            return fail('the column never learned the page\'s own size, so a picture click cannot be scaled')
+          const shotBox = shot.getBoundingClientRect()
+          /* The picture is drawn to fit its box, so the *drawn page* is a rectangle inside the
+             element rather than the element itself: aiming at the element is aiming at the ground
+             beside the page whenever the aspects differ. This is the same mapping the column's own
+             click arithmetic goes through — `pagefit` holds it once, so a check and the thing it
+             checks cannot disagree about where a picture pixel is. */
+          const drawn = drawnRect(shotBox, vp) ?? shotBox
+          if (drawn.width < 40 || drawn.height < 40)
+            return fail(`the picture is drawn ${Math.round(drawn.width)}x${Math.round(drawn.height)} px — too small to aim at`)
+          const pxOf = (pageX: number, pageY: number) =>
+            picturePoint(shotBox, vp, pageX, pageY) ?? {
+              x: shotBox.left + (pageX / vp.width) * shotBox.width,
+              y: shotBox.top + (pageY / vp.height) * shotBox.height,
+            }
+          const endpoint = async () =>
+            ((await fetch(`${base}/selftest-hits`).then((r) => r.json()) as { page_clicks?: number }).page_clicks ?? -1)
+          const clicksBefore = await endpoint()
+          const at = pxOf(aim.x, aim.y)
+          shot.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: at.x, clientY: at.y }))
+          let clicksAfter = clicksBefore
+          for (let i = 0; i < 40 && clicksAfter <= clicksBefore; i++) {
+            await sleep(250)
+            clicksAfter = await endpoint()
+          }
+          if (clicksAfter <= clicksBefore)
+            return fail(
+              `a press on the picture at ${Math.round(at.x)},${Math.round(at.y)} — page ${aim.x},${aim.y} of a ` +
+                `${vp.width}x${vp.height} viewport — never reached the page: the page's own click count is still ` +
+                `${clicksAfter}, while the picture is drawn ${Math.round(shotBox.width)}x${Math.round(shotBox.height)} px. ` +
+                `The arithmetic between picture pixels and page pixels is the suspect.`,
+            )
+          // And the column must say, in the engine's own words, where that press landed: a person
+          // looking at the activity line should be able to see the point the browser was handed.
+          await until(
+            () => /clicked at \(/.test((document.querySelector('[data-browser-actor]') as HTMLElement)?.textContent ?? ''),
+            8000,
+            'the column naming the point a picture click landed on',
+          )
+
+          /* …and the same mapping has to refuse the ground it is not the page. The picture is drawn
+             to fit, so when the box's aspect and the page's differ there is ground on two sides — a
+             rectangle the person can see but that stands for no part of the page. A press there must
+             not become a page click (a click on nothing looks like success), and it must not be
+             silent either: the panel that declines has to say what it declined. */
+          const groundAt =
+            drawn.left > shotBox.left + 3
+              ? { x: shotBox.left + 2, y: shotBox.top + shotBox.height / 2 }
+              : drawn.top > shotBox.top + 3
+                ? { x: shotBox.left + shotBox.width / 2, y: shotBox.top + 2 }
+                : null
+          if (!groundAt)
+            return fail(
+              `the picture box and the ${vp.width}x${vp.height} page have the same aspect, so this check cannot reach the ` +
+                `ground beside the page — the mapping's refusal half goes ungraded. The column's box changed shape; look at it.`,
+            )
+          const beforeGround = await endpoint()
+          shot.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: groundAt.x, clientY: groundAt.y }))
+          await until(
+            () => !!document.querySelector('[data-browser-beside]'),
+            4000,
+            'the column saying a press beside the page was not a press on the page',
+          )
+          await sleep(700)
+          const afterGround = await endpoint()
+          if (afterGround !== beforeGround)
+            return fail(
+              `a press in the ground beside the page at ${Math.round(groundAt.x)},${Math.round(groundAt.y)} (the page is drawn ` +
+                `${Math.round(drawn.left)},${Math.round(drawn.top)} ${Math.round(drawn.width)}x${Math.round(drawn.height)} inside a ` +
+                `${Math.round(shotBox.width)}x${Math.round(shotBox.height)} box) reached the page anyway: its click count went ` +
+                `${beforeGround} → ${afterGround}`,
+            )
+
+          /* The wheel over the picture is the other half of pointing: a person scrolls the part of
+             the page they are looking at. The page's own scroll position is the witness, read out of
+             the browser rather than out of the column. */
+          shot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 320, clientX: at.x, clientY: at.y }))
+          const readPage = async (code: string) =>
+            ((await invoke('browser_act', { act: { do: 'eval', code } })) as { act_value?: string })?.act_value ?? ''
+          let scrolled = '0'
+          for (let i = 0; i < 14 && !(Number(scrolled) > 0); i++) {
+            await sleep(500)
+            scrolled = await readPage('Math.round(window.scrollY)')
+          }
+          if (!(Number(scrolled) > 0))
+            return fail(
+              `the wheel over the picture never scrolled the page: it says scrollY ${JSON.stringify(scrolled)}. ` +
+                `Scrolling the column's own list instead of the page is the failure this catches.`,
+            )
+
+          /* The keyboard row is only honest if the keys reach the field the person pointed at. So:
+             click the page's own input through the picture, type into the row, and read the page's
+             input value back out of the browser. */
+          const atIn = pxOf(inpBox.x, inpBox.y)
+          shot.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: atIn.x, clientY: atIn.y }))
+          await sleep(700)
+          const keysRow = document.querySelector('[data-browser-keys]') as HTMLInputElement | null
+          if (!keysRow) return fail('the column has no keyboard row for the page')
+          if (keysRow.disabled)
+            return fail('the column disables its keyboard row while a page is open, while still offering the picture to click')
+          keysRow.value = 'typed from the panel'
+          keysRow.dispatchEvent(new Event('input', { bubbles: true }))
+          keysRow.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+          let field = ''
+          for (let i = 0; i < 16 && !field.includes('typed from the panel'); i++) {
+            await sleep(400)
+            field = await readPage("document.getElementById('inp').value")
+          }
+          if (!field.includes('typed from the panel'))
+            return fail(
+              `the column's keyboard row never reached the page's own field, which holds ${JSON.stringify(field.slice(0, 60))}`,
+            )
+
+          /* ---- the picture is live while the column is open ----
+             The page is made to repaint with nothing acting on it — a timer in the page, a div it
+             adds every 150ms. Then two reads of the picture, a second and a bit apart, with no act
+             and no screenshot request between them. If the panel drew one still and then polled, or
+             if the frames the browser volunteers were dropped on the floor, the two reads match and
+             this fails. The *mark* is graded from the app's payload rather than from the column's own
+             ask: a stream Chromium refused must not be advertised as a running view. */
+          await readPage(
+            "window.__ticks=0;setInterval(()=>{const d=document.createElement('div');" +
+              "d.textContent='repaint '+(window.__ticks++);d.style.cssText='position:fixed;left:6px;top:6px;" +
+              "font:28px monospace;background:#fff;color:#000;z-index:99999';document.body.appendChild(d)},150)",
+          )
+          await sleep(600)
+          await readBrowserState()
+          if (!paneNow?.live)
+            return fail(
+              `the column is open and the driver says live=${JSON.stringify(paneNow?.live)}. ` +
+                `The live mark reads the driver's answer, not the column's ask, so this is the stream not running.`,
+            )
+          const srcOf = () => (document.querySelector('[data-browser-frame="yes"]') as HTMLImageElement | null)?.getAttribute('src') ?? ''
+          const picBefore = paneNow?.frame_pic ?? 0
+          const srcBefore = srcOf()
+          if (!srcBefore) return fail('the column has no picture of the page to compare against')
+          await sleep(1400)
+          await readBrowserState()
+          const srcAfter = srcOf()
+          // Read once, here, into a name: `paneNow` keeps moving while the group runs, and an ok-line
+          // that interpolates it at the end reports whatever the last arm left there.
+          const picAfter = paneNow?.frame_pic ?? 0
+          if (srcAfter === srcBefore)
+            return fail(
+              `the picture did not change in 1.4s while the page was repainting every 150ms with nothing acting on it ` +
+                `(frame_pic ${picBefore} → ${picAfter}). A panel that draws one screenshot and polls is what this catches.`,
+            )
+          if (picAfter <= picBefore)
+            return fail(
+              `the picture on screen changed but the app still reports its newest picture as ${picAfter} — ` +
+                `frames the browser volunteers are reaching the column without being counted, so a slow viewer cannot tell what it is missing`,
+            )
+
+          /* ---- full window: the page takes the rectangle, not a band of it ----
+             The complaint this exists for is empty space, so both halves are graded: the rectangle the
+             column occupies, and the size the page itself has. A 1280x800 page drawn in a 1200x600 box
+             is a page with slack above and below it, which is the thing that was wrong; the aspect
+             comparison is how "it filled the column but not the window" fails rather than passing. */
+          const wideBtn = pane.querySelector<HTMLButtonElement>('[data-browser-wide-btn]')
+          if (!wideBtn) return fail('the column has no full-window control')
+          wideBtn.click()
+          await until(() => pane.dataset.browserWide === 'yes', 6000, 'the column going full window')
+          await sleep(1500)
+          const wideBox = pane.getBoundingClientRect()
+          if (Math.abs(wideBox.width - innerWidth) > 8 || Math.abs(wideBox.bottom - innerHeight) > 14 || wideBox.top < 0)
+            return fail(
+              `full window gives ${Math.round(wideBox.width)}x${Math.round(wideBox.height)} from ${Math.round(wideBox.top)} to ${Math.round(wideBox.bottom)} in a ${innerWidth}x${innerHeight} window`,
+            )
+          const stage = document.querySelector('[data-browser-stage]')?.getBoundingClientRect()
+          if (!stage || stage.height < 240)
+            return fail(`the picture area in full window is ${stage ? Math.round(stage.height) : 0}px tall — the column grew and the page did not`)
+          await readBrowserState()
+          const vpNow = paneNow?.viewport
+          if (!vpNow?.width || !vpNow?.height) return fail('the app stopped reporting the size the page actually has')
+          const wantA = stage.width / stage.height
+          const gotA = vpNow.width / vpNow.height
+          if (Math.abs(gotA - wantA) / wantA > 0.25)
+            return fail(
+              `the page is ${vpNow.width}x${vpNow.height} for a picture box of ${Math.round(stage.width)}x${Math.round(stage.height)} — ` +
+                `aspect ${gotA.toFixed(2)} against the box's ${wantA.toFixed(2)}: the empty space is back, as a letterbox`,
+            )
+          pane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+          await until(() => pane.dataset.browserWide !== 'yes', 6000, 'Escape giving the column back')
+
+          /* ---- the controls are icons, and every icon has a name ----
+             "Icons instead of words" is only an improvement if the words still exist where a
+             keyboard, a screen reader and a tooltip can reach them. A column narrowed to a glyph is
+             a column whose buttons cannot be asked about. */
+          const btns = [...pane.querySelectorAll<HTMLButtonElement>('button')]
+          const iconOnly = btns.filter((b) => !(b.textContent ?? '').trim())
+          if (iconOnly.length < 6)
+            return fail(
+              `the column has ${iconOnly.length} icon-only control(s), fewer than the six it should (back, forward, ` +
+                `reload, open, hide, close browser): ${btns.map((b) => JSON.stringify((b.textContent ?? '').trim())).join(', ')}`,
+            )
+          const unnamed = iconOnly.filter((b) => !(b.getAttribute('aria-label') ?? '').trim())
+          if (unnamed.length)
+            return fail(`${unnamed.length} icon button(s) in the column have no accessible name`)
+          const silent = iconOnly.filter((b) => !(b.getAttribute('title') ?? '').trim())
+          if (silent.length)
+            return fail(`${silent.length} icon button(s) in the column have nothing to say when asked what they do`)
+
+          /* Escape answers the question, not the browser. The close button arms on the first press;
+             Escape must drop that arm and leave the browser open. */
+          const closeB = document.querySelector('[data-browser-close-browser]') as HTMLButtonElement | null
+          if (!closeB) return fail('the column has no control that closes the browser')
+          closeB.click()
+          await sleep(120)
+          if ((document.querySelector('[data-browser-close-browser]') as HTMLButtonElement).getAttribute('aria-pressed') !== 'true')
+            return fail('the first press on "close the browser" did not arm it')
+          ;(document.querySelector('[data-browser-pane]') as HTMLElement).dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+          )
+          await sleep(150)
+          if ((document.querySelector('[data-browser-close-browser]') as HTMLButtonElement).getAttribute('aria-pressed') === 'true')
+            return fail('Escape left the close armed — Escape is meant to drop the question, not to hold it open')
+          if ((document.querySelector('[data-browser-pane]') as HTMLElement).dataset.browserAlive !== 'yes')
+            return fail('Escape closed the browser as well as the question')
+
+          /* What the page said about itself belongs in the column: the mock page's own script throws
+             once, and the column is where a person would see that. */
+          const actTab = document.querySelector('[data-browser-logbtn]') as HTMLButtonElement | null
+          if (!actTab) return fail('the column has no control for what the page reported')
+          actTab.click()
+          // The rows, not the column: the column carries an attribute of the same name, and a
+          // selector that matches the panel root passes on a drawer that never opened.
+          await until(
+            () => !!document.querySelector('[data-browser-drawer] [data-browser-log]'),
+            8000,
+            'the page\'s own log opening in the drawer',
+          )
+          if ((document.querySelector('[data-browser-logbtn]') as HTMLButtonElement).getAttribute('aria-pressed') !== 'true')
+            return fail('the log button did not become pressed when the drawer opened')
+          const log = document.querySelector('[data-browser-drawer] [data-browser-log]')?.textContent ?? ''
+          if (!/Cannot read properties of undefined/.test(log))
+            return fail(
+              `the column does not show what the page reported about itself; it says ${JSON.stringify(log.slice(0, 180))}`,
+            )
+          const back = document.querySelector('[data-browser-dtabbtn="page"]') as HTMLButtonElement | null
+          if (!back) return fail('the drawer has no way back to the page')
+          back.click()
+          await sleep(100)
+          if (back.getAttribute('aria-pressed') !== 'true')
+            return fail('the drawer\'s page tab did not become the view it shows')
+
+          /* The status line is the engine's sentence, not one the column wrote for itself. The
+             countdown inside that sentence is read *now*, so the two reads — the column's last poll
+             and this fresh one — land a second apart, and the number moves. Words are what this
+             claim grades; the number is graded by the idle arm, which waits the span out. */
+          const saysLine = (document.querySelector('[data-browser-says]')?.textContent ?? '').trim()
+          const unroll = (s: string) => s.replace(/\d+/g, '#')
+          if (!saysLine || unroll(saysLine) !== unroll((st2.says ?? '').trim()))
+            return fail(
+              `the column's status line is ${JSON.stringify(saysLine.slice(0, 140))} while the engine says ` +
+                `${JSON.stringify((st2.says ?? '').slice(0, 140))}`,
+            )
+
+          // ---- the model acts in the same browser -----------------------
+          newSession()
+          const t = await turnCount()
+          draft = 'Selftest kept browser: open the page the endpoint is serving in the browser panel and click its button, then tell me the page title'
+          await send()
+          if (!(await waitTurnDone(t))) return fail('the kept-browser turn never ended')
+          // Two calls, so two cards, and each carries its own half of the story: the walk that
+          // opened the page says the browser is being kept, and the walk that named no url says it
+          // acted in a browser that was already open. Reading only the first card would let a
+          // second call that opened a *fresh* browser pass on the first call's wording.
+          const cards = [...document.querySelectorAll<HTMLElement>('.blk-tool[data-tool="browse"]')]
+          if (cards.length < 2)
+            return fail(
+              `the kept-browser turn made ${cards.length} browse card(s), not two: [${cards
+                .map((c) => (c.querySelector('.tool-out')?.textContent ?? '').slice(0, 40))
+                .join(' | ')}]`,
+            )
+          const outs = cards.map((c) => (c.querySelector('.tool-out')?.textContent ?? '').trim())
+          const out = outs.join('\n')
+          for (const needle of ['in the browser cwoffee is keeping open', 'Cwoffee browse selftest', 'step click "More" ok', 'acted in the browser that was already open']) {
+            if (!out.includes(needle))
+              return fail(`the browse cards never say ${JSON.stringify(needle)}; they say ${JSON.stringify(out.slice(0, 420))}`)
+          }
+          // Ordering is the fact: the walk that opened the page comes first, and the walk that
+          // named no url comes after it, in a card of its own. Searching by index rather than by
+          // content would grade the renderer's card order instead of the turn's.
+          const openedAt = outs.findIndex((t) => /opened \S+ .*keeping open/.test(t))
+          if (openedAt < 0)
+            return fail(`no browse card says a page was opened in the kept browser; they say ${JSON.stringify(outs.join(' | ').slice(0, 400))}`)
+          const after = outs.slice(openedAt + 1)
+          if (!after.some((t) => /already open/.test(t) && !/opened https?:\/\//.test(t)))
+            return fail(
+              `no browse card after the one that opened the page says it acted in a browser that was already open; later cards say ${JSON.stringify(after.join(' | ').slice(0, 400))}`,
+            )
+          // The agreement between the two screens, measured: the transcript's page and the
+          // panel's page are the same page, or the panel is a picture of something else.
+          await until(() => (document.querySelector('[data-browser-actor]') as HTMLElement)?.dataset.browserActor === 'model', 15_000, 'the panel recording the model as the last one to touch it')
+          const modelUrl = (document.querySelector('[data-browser-url]') as HTMLElement)?.textContent ?? ''
+          if (!modelUrl.includes('selftest-page.html'))
+            return fail(`the model's turn left the panel showing ${JSON.stringify(modelUrl.slice(0, 120))}`)
+          if (!out.includes(modelUrl.trim()))
+            return fail(
+              `the panel is at ${JSON.stringify(modelUrl.slice(0, 120))} while the card's own words never name that page: ${JSON.stringify(out.slice(0, 300))}`,
+            )
+
+          // The clock is stated, not implied, and it is the configured span.
+          const clock = document.querySelector('[data-browser-clock]')?.textContent ?? ''
+          if (!/closes in/.test(clock))
+            return fail(`the panel does not say when the browser closes itself: ${JSON.stringify(clock)}`)
+          if (!st0.idle_secs || st0.idle_secs < 4) return fail(`the panel reports an idle span of ${st0.idle_secs}s`)
+
+          // ---- closing it: two presses, because it is somebody else's browser ----
+          const closeBtn = document.querySelector('[data-browser-close-browser]') as HTMLButtonElement | null
+          if (!closeBtn) return fail('the panel cannot close the browser')
+          if (closeBtn.getAttribute('aria-pressed') !== 'false') return fail('the close button starts armed')
+          closeBtn.click()
+          await sleep(120)
+          const armed = document.querySelector('[data-browser-close-browser]') as HTMLButtonElement
+          if (armed.getAttribute('aria-pressed') !== 'true') return fail('the first press did not arm the close button')
+          if ((document.querySelector('[data-browser-pane]') as HTMLElement).dataset.browserAlive !== 'yes')
+            return fail('one press closed the browser; a single click should not do that')
+          armed.click()
+          await until(() => (document.querySelector('[data-browser-pane]') as HTMLElement).dataset.browserAlive === 'no', 15_000, 'the browser closing')
+          if (document.querySelector('[data-browser-frame="yes"]'))
+            return fail('the panel still shows a picture of a browser that is closed')
+          // Nothing open is a starting point, not a hole. A blank box reads as a page that failed to
+          // load, and a sentence about what is *missing* reads as a failure log; the shape invites
+          // the person in instead, on a page's own surface rather than the desk colour.
+          const empty = document.querySelector('[data-browser-frame="none"]')
+          if (!empty) return fail('with nothing open, the page area does not say what is there')
+          if (!empty.querySelector('[data-browser-empty-glyph]'))
+            return fail('the empty page area has no browser mark of its own')
+          const cta = empty.querySelector('[data-browser-empty-cta]')?.textContent ?? ''
+          if (!/start browsing/i.test(cta))
+            return fail(`the empty page area does not invite a start: ${JSON.stringify(cta.slice(0, 60))}`)
+          const sub = empty.querySelector('[data-browser-empty-sub]')?.textContent ?? ''
+          if (!/ask cwoffee/i.test(sub))
+            return fail(`the empty page area does not name the other way in: ${JSON.stringify(sub.slice(0, 60))}`)
+          // The surface: a page's own, not the desk's. Resolved through a throwaway element so the
+          // comparison is between two painted colours, not between `#ffffff` and `rgb(255, 255, 255)`.
+          const probe = document.createElement('span')
+          probe.style.color = getComputedStyle(document.documentElement).getPropertyValue('--color-raise')
+          document.body.appendChild(probe)
+          const desk = getComputedStyle(probe).color
+          probe.remove()
+          const painted = getComputedStyle(document.querySelector('[data-browser-stage]') as HTMLElement).backgroundColor
+          if (painted && painted === desk)
+            return fail('with nothing open the page area still wears the desk colour, not a page surface')
+          // ...but this is not the quiet shape: a browser was open here and somebody shut it, so the
+          // row stays and says why. The invitation only replaces it where nothing has happened.
+          const said = document.querySelector('[data-browser-says]')?.textContent ?? ''
+          if (!/closed/i.test(said)) return fail(`the panel does not say the browser was closed: ${JSON.stringify(said.slice(0, 160))}`)
+
+          // The column takes width from the transcript, and the rest of the suite's geometry and
+          // cadence numbers were calibrated without it. A group that leaves a panel open silently
+          // changes what every later group measures - the same kind of debt the harness pays back
+          // for the clipboard and the desktop's idle-delay - so this group hides its own column and
+          // checks that it hid.
+          const hide = document.querySelector('[data-browser-close-pane]') as HTMLButtonElement | null
+          if (!hide) return fail('the panel has no control to hide itself')
+          hide.click()
+          await sleep(80)
+          if (document.querySelector('[data-browser-pane]'))
+            return fail(
+              'the group could not put its panel away: a column left open here narrows the transcript ' +
+              'for every group that follows, and their numbers were measured without it',
+            )
+
+          okLine =
+            `browser panel ok (the button opens a column, ${(paneNow?.frames_taken ?? 0)} pictures of a page the person opened and the model clicked in, ` +
+            `the same url on both screens, a file:// address refused by name, the click recorded as the person's and the model's, ` +
+            `a press on the picture at page ${aim?.x},${aim?.y} of a ${vp?.width}x${vp?.height} viewport raising the page's own click count to ${clicksAfter}, ` +
+            `a wheel over the picture taking the page to scrollY ${scrolled}, keys typed in the column arriving in the page's own field as ` +
+            `${JSON.stringify(field.slice(0, 30))}, a press in the ground beside the page refused and named, ` +
+            `${iconOnly.length} icon control(s) each carrying its own name, Escape dropping the armed close without ` +
+            `closing the browser, the page's own thrown error on show, a picture that changed by itself while the page repainted ` +
+            `(picture ${picBefore} → ${picAfter}, no act between the two reads), full window ` +
+            `${Math.round(wideBox.width)}x${Math.round(wideBox.height)} with the page itself at ${vpNow?.width}x${vpNow?.height} for a ` +
+            `${Math.round(stage.width)}x${Math.round(stage.height)} box, a two-press close that leaves no picture behind, and an empty column that ` +
+            `draws the outline of a page rather than a blank box)`
+        }
+        // The panel's writability, read the way the panel reads it: the controls are enabled
+        // exactly where the app says this window may drive the browser.
+        function writableCheck(el: HTMLElement): boolean {
+          if (el.dataset.browserWritable !== 'yes') return true
+          const box = el.querySelector('[data-browser-urlbox]') as HTMLInputElement | null
+          return !!box && !box.disabled
+        }
+        try {
+          await run()
+        } finally {
+          // Leave no browser behind: the next group runs on the same app, and a page left open
+          // in a kept browser is exactly the state the idle clock exists to avoid.
+          await invoke('browser_close', {}).catch(() => {})
+          setBrowserPane(false)
+          await invoke('set_reasoning', { level: reasoningWas || 'medium', persist: true }).catch(() => {})
+          await invoke('set_mode', { mode: modeWas || 'auto', persist: true }).catch(() => {})
+          toast = null
+        }
+        if (okLine) pageLog(okLine)
+      }
+
+      // --- the kept browser's own clock closes it ---------------------------------
+
+      /* ------------------------------------------------------------------
+         browser-inpage: the page **is** a page in this window.
+
+         This is the other shape of the same session: not a column showing pictures of a browser in
+         another process, but a document this app paints into the box the panel leaves empty. So the
+         claims are different claims, and the one that matters most is the one no screenshot can
+         make: the page is *where the box is*. Everything else here is downstream of that — if the
+         rectangle is wrong, a working page is still in the wrong place.
+
+         It runs in a start of its own (the board's own process keeps the picture path), because a
+         page that is a widget cannot be graded from the same window that is also grading a picture.
+         ------------------------------------------------------------------ */
+      if (want('browser-inpage', 'the page in the window is placed at the panel box, driven by both sides, and reports itself')) {
+        let okLine = ''
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+        const until = async (fn: () => boolean, ms: number, what: string) => {
+          const t0 = Date.now()
+          while (Date.now() - t0 < ms) {
+            if (fn()) return true
+            await sleep(250)
+          }
+          return fail(`${what} did not happen within ${ms}ms`)
+        }
+        const run = async () => {
+          await invoke('set_mode', { mode: 'auto' })
+          await readBrowserState()
+          const st0 = paneNow
+          if (!st0) return fail('browser_panel did not answer at all')
+          if (!st0.native)
+            return fail(
+              `this start has no page in the window (native=${JSON.stringify(st0.native)}, route ${JSON.stringify(st0.route)}). ` +
+                `The in-page arm grades a page the app paints itself; a start without one cannot be graded by it.`,
+            )
+
+          // ---- the box exists before the page does, and says so ----
+          setBrowserPane(true)
+          await renderTick()
+          await sleep(80)
+          const pane = document.querySelector('[data-browser-pane]') as HTMLElement | null
+          if (!pane) return fail('the panel did not render')
+          if (pane.dataset.browserInpage !== 'yes')
+            return fail(`the panel does not say the page is in the window (inpage=${JSON.stringify(pane.dataset.browserInpage)})`)
+          const area = (): HTMLElement | null => document.querySelector('[data-browser-pagearea]')
+          if (!area()) return fail('the panel leaves no area for the page to be painted into')
+
+          // ---- the person opens a page from the address box ----
+          const prov = await invoke<{ chosen_base_url?: string }>('provider_status').catch(() => null)
+          const base = (prov?.chosen_base_url ?? '').replace(/\/+$/, '').replace(/\/v1$/, '')
+          if (!base) return fail('no endpoint base url to open in the browser')
+          const pageUrl = `${base}/selftest-page.html`
+          const box = document.querySelector('[data-browser-urlbox]') as HTMLInputElement | null
+          if (!box) return fail('the panel has no address box')
+          box.value = pageUrl
+          box.dispatchEvent(new Event('input', { bubbles: true }))
+          await sleep(50)
+          ;(document.querySelector('[data-browser-go]') as HTMLButtonElement).click()
+          await until(() => (document.querySelector('[data-browser-pane]') as HTMLElement)?.dataset.browserAlive === 'yes', 30_000, 'the page opening')
+          await until(() => (document.querySelector('[data-browser-url]') as HTMLElement | null)?.textContent?.includes('selftest-page.html') ?? false, 20_000, 'the page showing in the panel')
+
+          /* ---- the page is the box, in the panel's own numbers ----
+             The claim in the terms the app makes it: the page reports its own size, and the panel
+             reports the area it left empty. If those differ, the page is somewhere else — over the
+             transcript, or in a corner — however well it loads. This is the check the whole feature
+             turned on: the first attempts at this placed a page that answered every command and sat
+             in the wrong rectangle. */
+          /* The box the panel left and the box the widget got have to agree — and they are allowed a
+             moment to come round, because opening a page changes the panel's own layout: the stage
+             that held a placeholder is a different height from the stage that holds a page. What may
+             not happen is a page that stays in the old box, so the wait is bounded and the numbers are
+             quoted when it does. */
+          await sleep(900)
+          let st1 = (await invoke('browser_panel', {})) as BrowserPanel
+          let a0 = area()?.getBoundingClientRect()
+          let a: DOMRect | undefined = a0
+          const agrees = (st: BrowserPanel, a?: DOMRect) => {
+            const pl = st?.placed
+            if (!a || !pl) return false
+            return (
+              Math.abs(pl.x - a.left) <= 8 &&
+              Math.abs(pl.y - a.top) <= 8 &&
+              Math.abs(pl.width - a.width) <= 8 &&
+              Math.abs(pl.height - a.height) <= 8
+            )
+          }
+          for (let i = 0; i < 24 && !agrees(st1, a0); i++) {
+            await sleep(250)
+            st1 = (await invoke('browser_panel', {})) as BrowserPanel
+            a0 = area()?.getBoundingClientRect()
+          }
+          const vp = st1.viewport
+          a = a0
+          if (!a || a.width < 60 || a.height < 60)
+            return fail(`the panel's page area is ${a ? Math.round(a.width) : 0}x${a ? Math.round(a.height) : 0} px — there is no box to place anything in`)
+          if (!vp?.width || !vp?.height)
+            return fail('the app does not report the size the page in the window has')
+          if (Math.abs(vp.width - a.width) > 6 || Math.abs(vp.height - a.height) > 6)
+            return fail(
+              `the page is ${vp.width}x${vp.height} and the panel's box is ${Math.round(a.width)}x${Math.round(a.height)} — ` +
+                `the page is not the box, so it is somewhere else in the window`,
+            )
+          /* And where the widget is, not merely how big the page thinks it is. A page can report the
+             right viewport while its widget sits over the transcript, or has never been shown at all:
+             the size agreement alone cannot see that, and an empty frame with a "the page is here"
+             caption under it is the failure a person notices first. */
+          const pl = st1.placed
+          if (!pl)
+            return fail('the app does not report where the page widget is in the window')
+          if (pl.width < 4 || pl.height < 4)
+            return fail(
+              `the page widget has a ${pl.width}x${pl.height} box at ${pl.x},${pl.y} while the panel left ` +
+                `${Math.round(a.width)}x${Math.round(a.height)} for it — the frame is empty`,
+            )
+          if (!pl.shown)
+            return fail(`the page widget has a box (${pl.width}x${pl.height}) and is not shown — nothing paints`)
+          if (
+            Math.abs(pl.x - a.left) > 8 ||
+            Math.abs(pl.y - a.top) > 8 ||
+            Math.abs(pl.width - a.width) > 8 ||
+            Math.abs(pl.height - a.height) > 8
+          )
+            return fail(
+              `the page widget is ${pl.width}x${pl.height} at ${pl.x},${pl.y} and the panel's box is ` +
+                `${Math.round(a.width)}x${Math.round(a.height)} at ${Math.round(a.left)},${Math.round(a.top)} — ` +
+                `the page is not over the area the panel left for it`,
+            )
+          // The panel's own complaint about the same disagreement. It reads the payload from its poll,
+          // so it is allowed one poll's worth of lag behind the numbers above; what it may not do is
+          // go on saying the page is misplaced once the app has said otherwise.
+          const offGone = await until(() => !document.querySelector('[data-browser-placedoff]'), 6000, 'the panel stopping say the page is out of its box')
+          if (!offGone) {
+            const offLine = document.querySelector('[data-browser-placedoff]')
+            return fail(`the panel says the page is not in its box: ${(offLine?.textContent ?? '').trim()}`)
+          }
+          const boxSent = document.body.dataset.cwoffeePagebox ?? ''
+          if (!/^[\d. ]+$/.test(boxSent) || boxSent.trim().split(/\s+/)[2] === '0')
+            return fail(`the panel told the app the page box is ${JSON.stringify(boxSent)} while a page is open`)
+
+          /* ---- there is no picture of a page that is on screen ----
+             The panel used to ask for frames. For this kind of browser the answer is a refusal and a
+             reason, and a column that drew a live mark anyway would be advertising a stream that was
+             never started. */
+          if (document.querySelector('[data-browser-frame="yes"]'))
+            return fail('the column draws a picture of a page that is in the window itself')
+          if (document.querySelector('[data-browser-live-mark]'))
+            return fail('the column claims a live view of a page that is the page')
+          if (st1.live) return fail('the app reports a live stream for a page that is on screen')
+          const keysRow = document.querySelector('.bpy-keys') as HTMLElement | null
+          if (keysRow && !keysRow.classList.contains('gone'))
+            return fail('the column offers a keyboard row for sending keys to a page the person can type into directly')
+
+          /* ---- the page reports itself, without being asked twice ----
+             The page is made to speak, throw, fail a request and fail an image. None of that is
+             polled for: it is collected while the page sits there. Then the drawer is opened and the
+             rows are read out of the column — which is the same store the model's `page_log` reads,
+             so a person and a model cannot be looking at different numbers. */
+          const talk = async (code: string) => {
+            await invoke('browser_act', { act: { do: 'eval', code } })
+          }
+          await talk("console.log('a line from the page'); console.warn('a warning from the page')")
+          await talk('setTimeout(function(){ null.BoomHere }, 0)')
+          await talk("fetch('/no-such-path.json').catch(function(){})")
+          await talk("var i=document.createElement('img'); i.src='/no-such-image.png'; document.body.appendChild(i)")
+          await sleep(1200)
+          const logBtn = document.querySelector('[data-browser-logbtn]') as HTMLButtonElement | null
+          if (!logBtn) return fail('the column has no control for the page’s own log')
+          if (document.querySelector('[data-browser-drawer]'))
+            return fail('the page log is open before it was asked for — it used to be a permanent band under the page')
+          logBtn.click()
+          await until(() => !!document.querySelector('[data-browser-drawer]'), 4000, 'the drawer opening')
+          await until(() => (document.querySelector('[data-browser-dbody]')?.textContent ?? '').includes('a line from the page'), 8000, 'the page’s own console line reaching the drawer')
+          const rows = [...document.querySelectorAll<HTMLElement>('[data-browser-diag]')]
+          if (rows.length < 3)
+            return fail(`the drawer shows ${rows.length} record(s); the page printed twice, threw once and failed twice`)
+          const kinds = rows.map((r) => r.querySelector('[data-browser-diagkind]')?.textContent ?? '')
+          for (const k of ['console', 'error', 'network'])
+            if (!kinds.includes(k)) return fail(`the drawer has no ${k} record; it has ${JSON.stringify(kinds)}`)
+          /* Two error records are expected, and they are different claims: one is a throw the arm
+             asked for, and says what was undefined; the other is the page's own bug, which arrived
+             without anybody asking and carries the file and line it happened on. */
+          const errRows = rows.filter((r) => (r.querySelector('[data-browser-diagkind]')?.textContent ?? '') === 'error')
+          if (errRows.length < 2)
+            return fail(`the drawer holds ${errRows.length} error record(s); the page threw on its own and the arm threw too`)
+          if (!errRows.some((r) => /BoomHere/.test(r.textContent ?? '')))
+            return fail(`no error record names what the arm made throw: ${JSON.stringify(errRows.map((r) => (r.textContent ?? '').slice(0, 90)))}`)
+          if (!errRows.some((r) => /\.js:\d+/.test(r.textContent ?? '')))
+            return fail(
+              `no error record says where in the page it happened — the page's own throw should carry its file and line: ` +
+                `${JSON.stringify(errRows.map((r) => (r.textContent ?? '').slice(0, 90)))}`,
+            )
+          const netRow = rows.find((r) => r.querySelector('[data-browser-diagkind]')?.textContent === 'network')
+          if (!netRow || !(netRow.textContent ?? '').includes('no-such-path'))
+            return fail(`the failed request is not shown with its url: ${JSON.stringify((netRow?.textContent ?? '').slice(0, 160))}`)
+          // A console message is not a failure. The badge counts failures; the chips count kinds.
+          const sum = document.querySelector('[data-browser-diagsum]')?.textContent ?? ''
+          if (!/went wrong/.test(sum))
+            return fail(`the drawer's own summary does not separate what went wrong from what the page said: ${JSON.stringify(sum.slice(0, 120))}`)
+          const chip = document.querySelector('[data-browser-chip="network"]') as HTMLButtonElement | null
+          if (!chip) return fail('the drawer has no filter by kind')
+          chip.click()
+          await sleep(250)
+          const only = [...document.querySelectorAll<HTMLElement>('[data-browser-diag]')]
+          if (only.length === 0 || only.some((r) => r.querySelector('[data-browser-diagkind]')?.textContent !== 'network'))
+            return fail(`the network filter left ${only.length} row(s) of other kinds`)
+
+          /* ---- reading the log does not keep the page alive ----
+             The idle clock is the whole discipline of a kept browser. A drawer that polled the *page*
+             would hold a person's session open by looking at it, so the span must only ever go down
+             while nobody acts. */
+          const left0 = (await invoke('browser_panel', {}) as BrowserPanel).idle_left ?? -1
+          await invoke('browser_log', { since: 0, limit: 20 })
+          await invoke('browser_log', { since: 0, limit: 20 })
+          const left1 = (await invoke('browser_panel', {}) as BrowserPanel).idle_left ?? -1
+          if (!(left1 > 0 && left0 > 0 && left1 <= left0))
+            return fail(`reading the page's log moved the idle clock from ${left0}s to ${left1}s — looking is not using`)
+
+          // ---- the model drives the page the person is looking at ----
+          const hits = async () =>
+            ((await fetch(`${base}/selftest-hits`).then((r) => r.json()) as { page_clicks?: number }).page_clicks ?? -1)
+          const readPage = async (code: string) =>
+            ((await invoke('browser_act', { act: { do: 'eval', code } })) as { act_value?: string })?.act_value ?? ''
+          const before = await hits()
+          // The aim box is the witness, because only the page's own script raises the count: the
+          // server counts knocks that the page makes when it is clicked. A click the model made in a
+          // *different* page — a second webview, a throwaway browser — leaves the count alone.
+          const acted = (await invoke('browser_act', { act: { do: 'click', target: 'aim here' } })) as { ok?: boolean; why?: string; hit?: string }
+          if (acted?.ok === false) return fail(`the model's click was refused: ${JSON.stringify(acted).slice(0, 200)}`)
+          let after = before
+          for (let i = 0; i < 30 && after <= before; i++) {
+            await sleep(300)
+            after = await hits()
+          }
+          if (after <= before)
+            return fail(
+              `the model clicked ${JSON.stringify(acted?.hit)} in the page in the window and the page's own counter stayed at ` +
+                `${after} (it was ${before}) — the person is looking at one page and the model is driving another`,
+            )
+          // ...and the page visibly changed for the person looking at it: the paragraph the button
+          // rewrites is read back out of the document, not out of the click's own answer.
+          await invoke('browser_act', { act: { do: 'click', target: 'More' } })
+          let para = ''
+          for (let i = 0; i < 20 && para !== 'after'; i++) {
+            await sleep(300)
+            para = await readPage("document.getElementById('p').textContent")
+          }
+          if (para !== 'after')
+            return fail(`a click by the model left the page's paragraph reading ${JSON.stringify(para)} — it should say "after"`)
+          // The panel's own controls are a person's hands: the app records the click as theirs, not
+          // as the model's, even though the same wire carries both. A session a person is watching has
+          // to be able to say who moved it last.
+          await until(
+            () => (document.querySelector('[data-browser-actor]') as HTMLElement)?.dataset.browserActor === 'person',
+            8000,
+            "the panel recording the click as a person's",
+          )
+
+          /* ---- the model drives the page the person is looking at ----
+             The same page, through the tool rather than through the panel. This is the claim the
+             whole design rests on: not two browsers agreeing, one browser shared. The card's words
+             and the panel's page have to name the same document, and the actor line has to change
+             from person to model without the page moving anywhere. */
+          newSession()
+          const t0turn = await turnCount()
+          draft = 'Selftest kept browser: open the page the endpoint is serving in the browser panel and click its button, then tell me the page title'
+          await send()
+          if (!(await waitTurnDone(t0turn))) return fail('the kept-browser turn never ended')
+          const cards = [...document.querySelectorAll<HTMLElement>('.blk-tool[data-tool="browse"]')]
+          if (cards.length < 2)
+            return fail(`the model made ${cards.length} browse card(s), not two`)
+          const outs = cards.map((c) => (c.querySelector('.tool-out')?.textContent ?? '').trim()).join('\n')
+          if (!outs.includes('in the browser cwoffee is keeping open'))
+            return fail(`no card says the browser is being kept: ${JSON.stringify(outs.slice(0, 300))}`)
+          await until(
+            () => (document.querySelector('[data-browser-actor]') as HTMLElement)?.dataset.browserActor === 'model',
+            12_000,
+            'the panel recording the model as the one who moved it',
+          )
+          const pageNowUrl = (document.querySelector('[data-browser-url]') as HTMLElement)?.textContent ?? ''
+          if (!pageNowUrl.includes('selftest-page.html'))
+            return fail(`the model's turn left the window showing ${JSON.stringify(pageNowUrl.slice(0, 120))}`)
+          // The model's click step rewrites the page's paragraph. Read out of the document, not out
+          // of the card: the card can describe a click; only the page can have felt it.
+          let para2 = ''
+          for (let i = 0; i < 20 && para2 !== 'after'; i++) {
+            await sleep(300)
+            para2 = await readPage("document.getElementById('p').textContent")
+          }
+          if (para2 !== 'after')
+            return fail(`the model clicked through the tool and the page's paragraph still reads ${JSON.stringify(para2)}`)
+          const saidBy = (document.querySelector('[data-browser-actor]')?.textContent ?? '').trim()
+          if (!saidBy) return fail('the panel does not say what the last thing done in the page was')
+
+          /* ---- the model reads what the page said, without looking at it ----
+             A page in the window has no picture of itself, so a model driving it cannot fall back on
+             pixels. The records the drawer shows the person have to reach the model as an answer: the
+             tool's own reply naming the page, counting what it holds and giving the kind is what proves
+             it — a model narrating a log it never read would say none of those. */
+          const tLog = await turnCount()
+          draft = 'Selftest page log: tell me what the page complained about'
+          await send()
+          if (!(await waitTurnDone(tLog))) return fail('the page-log turn never ended')
+          const logCards = [...document.querySelectorAll<HTMLElement>('.blk-tool[data-tool="page_log"]')]
+          if (!logCards.length)
+            return fail('the model never reached for the page’s own log: no `page_log` card in the turn')
+          const logSaid = (logCards[logCards.length - 1].querySelector('.tool-out')?.textContent ?? '').trim()
+          for (const needle of ['selftest-page.html', 'held:', 'error']) {
+            if (!logSaid.includes(needle))
+              return fail(
+                `the page's log as the model read it never says ${JSON.stringify(needle)}; it says ` +
+                  `${JSON.stringify(logSaid.slice(0, 400))}`,
+              )
+          }
+          if (!/page \d+ of this session/.test(logSaid))
+            return fail(`the model's answer to itself does not say which page of the session these records are from: ${JSON.stringify(logSaid.slice(0, 300))}`)
+
+          /* ---- Back is one step; Reload is not ----
+             Same check the picture column runs, because it is the same promise: the panel's buttons
+             walk the page's history, and a reload re-reads the page that is open. */
+          const openIn = async (u: string) => {
+            // Named lookups, because a missing control is a finding of its own and a TypeError out of
+            // a minified bundle is not: the arm has to say which control the panel failed to offer.
+            const b = document.querySelector('[data-browser-urlbox]') as HTMLInputElement | null
+            if (!b) return fail('the panel has no address box (`[data-browser-urlbox]`) to type into')
+            b.value = u
+            b.dispatchEvent(new Event('input', { bubbles: true }))
+            await sleep(50)
+            const go = document.querySelector('[data-browser-go]') as HTMLButtonElement | null
+            if (!go) return fail('the panel has no go button (`[data-browser-go]`) next to its address box')
+            go.click()
+          }
+          const urlNow = () => (document.querySelector('[data-browser-url]') as HTMLElement | null)?.textContent ?? ''
+          await openIn(`${pageUrl}#first`)
+          await until(() => urlNow().includes('#first'), 15_000, 'the first address showing in the panel')
+          await openIn(`${pageUrl}#second`)
+          await until(() => urlNow().includes('#second'), 15_000, 'the second address showing in the panel')
+          const press = (sel: string) => {
+            const el = document.querySelector(sel) as HTMLElement | null
+            if (!el) return `the panel offers no ${sel} control to press`
+            el.click()
+            return ''
+          }
+          // Named lookups before pressing: a control the panel did not render is a finding about the
+          // panel, and a TypeError out of a minified bundle says nothing about which one was missing.
+          let missing = press('[data-browser-back]')
+          if (missing) return fail(missing)
+          await until(() => urlNow().includes('#first') && !urlNow().includes('#second'), 15_000, 'Back taking one step back')
+          missing = press('[data-browser-reload]')
+          if (missing) return fail(missing)
+          await sleep(1500)
+          if (!urlNow().includes('#first'))
+            return fail(`Reload took the page off #first (it is at ${JSON.stringify(urlNow())})`)
+
+          /* ---- full window: the page takes the rectangle ----
+             For a page in the window this is not a resize request, it is a placement: the panel
+             measures the new box and tells the app. The page's own size is the witness. */
+          const wideBtn = pane.querySelector<HTMLButtonElement>('[data-browser-wide-btn]')
+          if (!wideBtn) return fail('the column has no full-window control')
+          wideBtn.click()
+          await until(() => pane.dataset.browserWide === 'yes', 6000, 'the column going full window')
+          await sleep(1400)
+          const wideArea = area()?.getBoundingClientRect()
+          const stWide = (await invoke('browser_panel', {})) as BrowserPanel
+          if (!wideArea || wideArea.width < innerWidth - 24)
+            return fail(`full window leaves a page area ${wideArea ? Math.round(wideArea.width) : 0}px wide in a ${innerWidth}px window`)
+          if (stWide?.viewport?.width && Math.abs(stWide.viewport.width - wideArea.width) > 8)
+            return fail(
+              `in full window the page is ${stWide.viewport.width}x${stWide.viewport.height} and the box is ` +
+                `${Math.round(wideArea.width)}x${Math.round(wideArea.height)} — the panel moved and the page did not`,
+            )
+          pane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+          await until(() => pane.dataset.browserWide !== 'yes', 6000, 'Escape giving the column back')
+          await sleep(900)
+          const backArea = area()?.getBoundingClientRect()
+          const stBack = (await invoke('browser_panel', {})) as BrowserPanel
+          if (backArea && stBack?.viewport?.width && Math.abs(stBack.viewport.width - backArea.width) > 8)
+            return fail(
+              `giving the column back left the page at ${stBack.viewport.width}x${stBack.viewport.height} for a box of ` +
+                `${Math.round(backArea.width)}x${Math.round(backArea.height)}`,
+            )
+
+          /* ---- hiding the panel takes the page out of the way ----
+             The page is a widget over this document, so a panel that stops reporting its box while a
+             browser stays open leaves a page floating on top of the conversation. The witness is the
+             box the panel last reported: a zero box means the app was told there is nowhere to put it,
+             which is what hides the widget. */
+          setBrowserPane(false)
+          await sleep(700)
+          const sent = (document.body.dataset.cwoffeePagebox ?? '').trim().split(/\s+/)
+          if (sent[2] !== '0' || sent[3] !== '0')
+            return fail(
+              `the panel hid itself but told the app the page box is still ${document.body.dataset.cwoffeePagebox} — ` +
+                `the page would be left over the transcript with no panel asking for it`,
+            )
+          await readBrowserState()
+          if (!paneNow?.alive)
+            return fail('hiding the panel closed the browser as well — the person hid a column, not a page')
+
+          // The About view says which kind of view this is, in the app's words rather than the
+          // column's: "live" here would be a promise this start is not keeping.
+          setBrowserPane(true)
+          // Wait for the column's own header to come back rather than for a moment to pass: the About
+          // view is read out of the drawer, and a drawer reached through a column that has not painted
+          // yet is a null control and a TypeError instead of a finding.
+          await until(() => !!document.querySelector('[data-browser-logbtn]'), 12_000, 'the panel coming back with its header controls')
+          const about = document.querySelector('[data-browser-logbtn]') as HTMLButtonElement | null
+          if (!about) return fail('the re-opened panel has no control for the page’s own log (`[data-browser-logbtn]`)')
+          if (!document.querySelector('[data-browser-drawer]')) about.click()
+          await sleep(200)
+          const aboutTab = document.querySelector('[data-browser-dtabbtn="about"]') as HTMLButtonElement | null
+          if (!aboutTab) return fail('the drawer has no about view')
+          aboutTab.click()
+          await sleep(200)
+          const view = document.querySelector('[data-browser-view]') as HTMLElement | null
+          if (!view || view.getAttribute('data-browser-view') !== 'in page')
+            return fail(`the column calls its view ${JSON.stringify(view?.getAttribute('data-browser-view'))} for a page that is in the window`)
+          if (!/no picture of it/.test(view.textContent ?? ''))
+            return fail(`the about view does not say there is no picture: ${JSON.stringify((view.textContent ?? '').slice(0, 140))}`)
+          const stEnd = (await invoke('browser_panel', {})) as BrowserPanel
+          const saysLine = (document.querySelector('[data-browser-says]')?.textContent ?? '').trim()
+          const unroll = (s: string) => s.replace(/\d+/g, '#')
+          if (!saysLine || unroll(saysLine) !== unroll((stEnd.says ?? '').trim()))
+            return fail(
+              `the column's status line is ${JSON.stringify(saysLine.slice(0, 140))} while the engine says ` +
+                `${JSON.stringify((stEnd.says ?? '').slice(0, 140))}`,
+            )
+          if (!/in this window/.test(stEnd.says ?? ''))
+            return fail(`the engine's own sentence does not say the page is in this window: ${JSON.stringify((stEnd.says ?? '').slice(0, 160))}`)
+
+          // The column hides, so every later group measures the window it was calibrated against.
+          setBrowserPane(false)
+          await sleep(120)
+          if (document.querySelector('[data-browser-pane]')) return fail('the group left its column on screen')
+          okLine =
+            `the page in the window is ${stWide?.viewport?.width}x${stWide?.viewport?.height} where the panel's box is; ` +
+            `${rows.length} record(s) of its own in the drawer (${kinds.join(', ')}), a click by the model counted by the page (${before} → ${after}), ` +
+            `and no picture of it anywhere`
+          return true
+        }
+        try {
+          await run()
+        } finally {
+          // No page left behind, and the column back out of the way: a later group measures the
+          // window it was calibrated against, and an open page in this window is a widget over it.
+          await invoke('browser_close', {}).catch(() => {})
+          setBrowserPane(false)
+          await sleep(120)
+        }
+        if (okLine) pageLog(okLine)
+      }
+      if (want('browser-idle', 'a browser nobody touches closes itself, and the panel says after how long')) {
+        /* Two arms, and which one runs is decided by what this start was booted with, not by a
+           flag the check hopes for.
+
+           The arm launch (`scripts/selftest.sh`'s "browser idle" block) boots over a scratch
+           config file that sets `[browser] idle_secs = 4`; there the group waits the clock out and
+           grades the sentence the panel prints. The board's own run cannot wait five minutes, and
+           must not pretend to: there the group grades what the panel *states* about the span the
+           person configured, and its ok-line says which of the two it did — so a log line can never
+           read as "the clock fired" on a run that never watched one. */
+        let okLine = ''
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+        try {
+          await readBrowserState()
+          const st0 = paneNow
+          if (!st0) fail('browser_panel did not answer')
+          else if (!st0.mounted || st0.keep_off)
+            fail(`the idle arm found no browser to time out: ${JSON.stringify(st0.says.slice(0, 200))}`)
+          else {
+            setBrowserPane(true)
+            const prov = await invoke<{ chosen_base_url?: string }>('provider_status').catch(() => null)
+            const base = (prov?.chosen_base_url ?? '').replace(/\/+$/, '').replace(/\/v1$/, '')
+            const box = document.querySelector('[data-browser-urlbox]') as HTMLInputElement | null
+            if (!base || !box) fail('the idle arm has no address box or no endpoint to open')
+            else {
+              box.value = `${base}/selftest-page.html`
+              box.dispatchEvent(new Event('input', { bubbles: true }))
+              await sleep(60)
+              ;(document.querySelector('[data-browser-go]') as HTMLButtonElement).click()
+              const t0 = Date.now()
+              while (Date.now() - t0 < 20_000 && (document.querySelector('[data-browser-pane]') as HTMLElement)?.dataset.browserAlive !== 'yes')
+                await sleep(300)
+              if ((document.querySelector('[data-browser-pane]') as HTMLElement)?.dataset.browserAlive !== 'yes')
+                fail('the idle arm never got a browser open')
+              else {
+                const clock = () => document.querySelector('[data-browser-clock]')?.textContent ?? ''
+                if (!/closes in/.test(clock())) fail(`the panel shows no countdown: ${JSON.stringify(clock())}`)
+                if (st0.idle_secs > 30) {
+                  // The board's own run. What is graded here is the *statement*: the panel counts
+                  // down from the span this start configured, which is the fact a person reads to
+                  // decide whether to keep looking at the page.
+                  const shown = clock()
+                  const secs = st0.idle_secs
+                  // The component renders 300 as "5m00s" and 45 as "45s"; either spelling of the
+                  // configured span is acceptable, a different number is not. (`needles`, not
+                  // `want`: `want` is the group filter's own function, and shadowing it inside a
+                  // group is a trap for whoever edits this next.)
+                  const needles = [`${Math.floor(secs / 60)}m`, `${secs}s`]
+                  if (!needles.some((w) => shown.includes(w)))
+                    fail(
+                      `the panel counts down with ${JSON.stringify(shown)} while this start's [browser] idle_secs is ${secs}s — ` +
+                        `the countdown and the configured span are two different numbers`,
+                    )
+                  okLine =
+                    `browser idle stated (idle_secs = ${secs}s is the span this start configured, so the clock was read and not waited out: ` +
+                    `the panel counts ${JSON.stringify(shown.trim())}; the wait itself is graded in the arm launch)`
+                } else {
+                  // The arm. Nobody touches it: the app's clock closes it, and the panel says so in
+                  // the unit the person configured, with the number that configured it.
+                  const closedAt = Date.now()
+                  while (Date.now() - closedAt < (st0.idle_secs + 20) * 1000 && (document.querySelector('[data-browser-pane]') as HTMLElement)?.dataset.browserAlive === 'yes')
+                    await sleep(500)
+                  const waited = Math.round((Date.now() - closedAt) / 1000)
+                  const pane = document.querySelector('[data-browser-pane]') as HTMLElement
+                  if (pane.dataset.browserAlive !== 'no')
+                    fail(`a browser nobody touched was still alive ${waited}s after the last action (idle_secs = ${st0.idle_secs})`)
+                  const said = document.querySelector('[data-browser-says]')?.textContent ?? ''
+                  if (!/closed itself/i.test(said))
+                    fail(`the panel does not say the browser closed itself: ${JSON.stringify(said.slice(0, 200))}`)
+                  if (!said.includes(String(st0.idle_secs)))
+                    fail(
+                      `the panel says ${JSON.stringify(said.slice(0, 200))} — it does not name the ${st0.idle_secs}s the person configured, ` +
+                        `which is the number that tells a timeout from a crash`,
+                    )
+                  if (document.querySelector('[data-browser-frame="yes"]'))
+                    fail('the panel still shows a picture of the page after the browser closed')
+                  okLine =
+                    `browser idle ok (nobody touched it and it shut ${waited}s after the last action with idle_secs = ${st0.idle_secs}; ` +
+                    `the panel says so in the configured unit and drops the picture with it)`
+                }
+              }
+            }
+          }
+        } finally {
+          await invoke('browser_close', {}).catch(() => {})
+          setBrowserPane(false)
+        }
+        if (okLine) pageLog(okLine)
+      }
+
+      // --- the file ledger: the whole file story of a conversation -----------------
+      //
+      // A turn's revert card answers "put this turn's files back". It has never answered "what
+      // files has this conversation written", which is the question a person asks when they are not
+      // undoing anything. Like the checkpoints group, every claim here reads the bytes on disk
+      // through `selftest_file_bytes` rather than the app's report of them: a ledger that only
+      // agreed with itself would look identical from inside the app.
+      if (want('ledger', 'the file ledger tells the whole file story of a conversation')) {
+        const note = 'selftest_ledger_note.md'
+        const twin = 'selftest_ledger_twin.md'
+        const shared = 'the shared bytes\n'
+        const edited = 'the edited bytes\n'
+        const other = 'a different line\n'
+        const bytesOf = async (path: string) =>
+          await invoke<{ text: string; bytes: number }>('selftest_file_bytes', { path }).catch(() => null)
+        const waitText = async (path: string, want: string, budgetMs = 15000) => {
+          const dl = performance.now() + budgetMs
+          while (performance.now() < dl) {
+            const b = await bytesOf(path)
+            if (b && b.text === want) return b
+            await new Promise((r) => setTimeout(r, 100))
+          }
+          return null
+        }
+        // Refusals come back as errors, so each read is graded as either a payload or a reason.
+        type Err<T> = T & { error?: string }
+        const ledgerOf = async (sid: number): Promise<Err<LedgerRead>> =>
+          (await invoke<LedgerRead>('files_ledger', { session: sid }).catch((e) => ({ error: String(e) }))) as Err<LedgerRead>
+        const statsOf = async (sid: number): Promise<Err<SnapshotStatsRead>> =>
+          (await invoke<SnapshotStatsRead>('snapshot_stats', { session: sid }).catch((e) => ({ error: String(e) }))) as Err<SnapshotStatsRead>
+        const diffOf = async (sid: number, ck: number, shown: string): Promise<Err<FileDiffRead>> =>
+          (await invoke<FileDiffRead>('file_diff', { session: sid, checkpoint: ck, shown }).catch((e) => ({
+            error: String(e),
+          }))) as Err<FileDiffRead>
+        const previewOf = async (sid: number, mid: number): Promise<RevertPreview & { error?: string }> =>
+          (await invoke<RevertPreview>('checkpoint_preview', {
+            session: sid,
+            message_id: mid,
+            through_latest: false,
+          }).catch((e) => ({ error: String(e) }))) as RevertPreview & { error?: string }
+        const waitShown = async (sel: string, budgetMs = 8000) => {
+          const dl = performance.now() + budgetMs
+          while (performance.now() < dl) {
+            const e = document.querySelector(sel)
+            if (e) return e as HTMLElement
+            await new Promise((r) => setTimeout(r, 100))
+          }
+          return null
+        }
+
+        // Three writing turns plus one slow one: reasoning off and Auto mode keep them free of an
+        // approval round trip each. Both are shared state, so both go back in the `finally`.
+        const reasoningWas = hostState?.reasoning ?? ''
+        const modeWas = hostState?.mode ?? ''
+        let okLine = ''
+        let sid = 0
+
+        const run = async () => {
+          await invoke('set_reasoning', { level: 'off', persist: true })
+          await invoke('set_mode', { mode: 'auto' })
+
+          newSession()
+          // The twin starts as the bytes the note will also hold, so the two paths share one blob
+          // and the stats have a dedupe to get right: the index counts that blob twice, the store
+          // holds it once, and a card printing one number as "disk usage" would be wrong.
+          await invoke('selftest_write_file', { path: twin, text: shared })
+          const seeded = await bytesOf(twin)
+          if (!seeded || seeded.text !== shared)
+            return fail(`the harness could not seed ${twin}: ${JSON.stringify(seeded)}`)
+
+          let t = await turnCount()
+          draft = 'Selftest ledger: write the note file'
+          await send()
+          for (let i = 0; i < 60 && !sid; i++) {
+            const st = await invoke<{ session_id: number }>('session_state').catch(() => null)
+            sid = viewId ?? transcript?.sessionId ?? st?.session_id ?? 0
+            if (!sid) await new Promise((r) => setTimeout(r, 100))
+          }
+          if (!sid) return fail('the ledger turn never produced a conversation to read a file record from')
+          if (!(await waitTurnDone(t))) return fail('the ledger write turn never ended')
+          if (!(await waitText(note, shared))) {
+            const b = await bytesOf(note)
+            return fail(`turn 1 left ${note} holding ${JSON.stringify(b?.text ?? 'nothing')} instead of the bytes it wrote`)
+          }
+
+          t = await turnCount()
+          draft = 'Selftest ledger: edit the note file'
+          await send()
+          if (!(await waitTurnDone(t))) return fail('the ledger edit turn never ended')
+          if (!(await waitText(note, edited))) {
+            const b = await bytesOf(note)
+            return fail(`turn 2 left ${note} holding ${JSON.stringify(b?.text ?? 'nothing')} instead of the edited bytes`)
+          }
+
+          t = await turnCount()
+          draft = 'Selftest ledger: overwrite the twin file'
+          await send()
+          if (!(await waitTurnDone(t))) return fail('the ledger twin turn never ended')
+          if (!(await waitText(twin, other))) {
+            const b = await bytesOf(twin)
+            return fail(`turn 3 left ${twin} holding ${JSON.stringify(b?.text ?? 'nothing')} instead of the new bytes`)
+          }
+
+          // The ledger, read from the record — not from what the three turns assumed.
+          const L = await ledgerOf(sid)
+          if (L.error) return fail(`files_ledger refused: ${L.error}`)
+          if (L.turns.length !== 3)
+            return fail(
+              `the ledger lists ${L.turns.length} turn(s) of file work after three writing turns; turns: ` +
+                JSON.stringify(L.turns.map((x) => ({ turn: x.turn, files: x.files, kinds: x.file_rows.map((f) => f.kind) }))),
+            )
+          const byTurn = new Map(L.turns.map((x) => [x.turn, x]))
+          const kindsOf = (path: string) =>
+            L.turns.flatMap((x) => x.file_rows.filter((f) => f.path === path).map((f) => `${x.turn}:${f.kind}`))
+          const noteKinds = kindsOf(note)
+          if (!noteKinds.includes('created') && !noteKinds.some((k) => k.endsWith(':created')))
+            return fail(`the ledger never says ${note} was created; it reads ${JSON.stringify(noteKinds)}`)
+          if (!noteKinds.some((k) => k.endsWith(':modified')))
+            return fail(`the ledger never says ${note} was modified; it reads ${JSON.stringify(noteKinds)}`)
+          const twinKinds = kindsOf(twin)
+          if (!twinKinds.some((k) => k.endsWith(':modified')))
+            return fail(`the ledger reads ${twin} as ${JSON.stringify(twinKinds)} instead of modified`) 
+          if (byTurn.size !== 3) return fail(`the ledger folded the three turns into ${byTurn.size}`)
+          if (L.files_total !== 3)
+            return fail(`the ledger counts ${L.files_total} file row(s) for three turns of file work`)
+          if (L.copies !== 2)
+            return fail(
+              `the ledger counts ${L.copies} kept cop${L.copies === 1 ? 'y' : 'ies'}; the created file has no copy ` +
+                'by design and the two overwrites have one each',
+            )
+          if (L.pruned !== 0 || L.copies_missing !== 0)
+            return fail(`a conversation that never hit a limit reads pruned=${L.pruned} missing=${L.copies_missing}`)
+          // The created row is revertable even though it has no copy: reverting it deletes the file.
+          const createdRow = L.turns.flatMap((x) => x.file_rows).find((f) => f.path === note && f.kind === 'created')
+          if (!createdRow) return fail('no created row for the note in the ledger')
+          if (!createdRow.can_revert || createdRow.copy_present)
+            return fail(
+              `the created row reads can_revert=${createdRow.can_revert} copy_present=${createdRow.copy_present}; ` +
+                'undoing a file this conversation wrote deletes it, and there was nothing to copy',
+            )
+          if (!/delete the file/i.test(createdRow.says))
+            return fail(`the created row says ${JSON.stringify(createdRow.says)} instead of what undoing it does`)
+
+          // The diff: the stored copy against the bytes on disk, both read from disk here.
+          const modRow = L.turns.flatMap((x) => x.file_rows).find((f) => f.path === note && f.kind === 'modified')
+          if (!modRow) return fail('no modified row for the note in the ledger')
+          const D = await diffOf(sid, modRow.checkpoint, note)
+          if (D.error) return fail(`file_diff refused on a row the ledger just listed: ${D.error}`)
+          if (!D.stored_present || !D.live_exists)
+            return fail(`the diff reads stored=${D.stored_present} live=${D.live_exists}; both sides exist on disk`)
+          if (!D.diff) return fail('file_diff printed no diff for a file that changed on both sides')
+          if (!D.diff.includes('-the shared bytes'))
+            return fail(`the diff does not quote the stored copy's own line: ${JSON.stringify(D.diff.slice(0, 160))}`)
+          if (!D.diff.includes('+the edited bytes'))
+            return fail(`the diff does not quote the live bytes: ${JSON.stringify(D.diff.slice(0, 160))}`)
+          if (D.added < 1 || D.removed < 1)
+            return fail(`the diff counts +${D.added} -${D.removed} for a line that changed`)
+          if (!D.can_revert)
+            return fail('a row whose copy exists and whose turn is written down says it cannot be reverted')
+
+          // The identity guard: the same row, named with the other file's path. Nothing is read.
+          const stale = await diffOf(sid, modRow.checkpoint, twin)
+          if (!stale.error)
+            return fail(
+              `file_diff answered for record ${modRow.checkpoint} under the path ${twin}; the guard exists so a ` +
+                'stale window cannot diff a copy it never painted',
+            )
+          if (!/Nothing was diffed/i.test(stale.error))
+            return fail(`the stale-path refusal says ${JSON.stringify(stale.error.slice(0, 120))} instead of what it did`)
+          const stillNote = await bytesOf(note)
+          const stillTwin = await bytesOf(twin)
+          if (stillNote?.text !== edited || stillTwin?.text !== other)
+            return fail('the refused diff changed a file on disk')
+
+          // The two numbers, kept apart: the index counts a shared blob once per row, the store
+          // holds it once. Grading this is how a byte total that double-counts goes red.
+          const S = await statsOf(sid)
+          if (S.error) return fail(`snapshot_stats refused: ${S.error}`)
+          if (S.rows !== 3) return fail(`snapshot_stats indexes ${S.rows} row(s) for three turns of file work`)
+          if (S.blobs !== 1)
+            return fail(
+              `snapshot_stats counts ${S.blobs} blob(s) for two copies of the same bytes — content-addressing ` +
+                'means those are one file on disk',
+            )
+          if (S.blob_bytes !== shared.length)
+            return fail(`the store reports ${S.blob_bytes} B where the shared bytes are ${shared.length} B`)
+          if (S.row_bytes !== shared.length * 2)
+            return fail(`the index reports ${S.row_bytes} B where two rows of ${shared.length} B add to ${shared.length * 2}`)
+          if (S.orphan_blobs !== 0)
+            return fail(`${S.orphan_blobs} blob file(s) in the store point at no index row`) 
+          if (S.shared !== 0)
+            return fail(
+              `another conversation is said to point at these copies (${S.shared}), and none exists yet — ` +
+                'sharing is graded against a second conversation, not assumed',
+            )
+
+          // Repaint from the record before pressing anything. A streamed answer carries no row id
+          // until the store's rows are read back — that is the seam every row-addressing control
+          // waits on — and pressing a control that has no row behind it is a different failure from
+          // the control being honest about not having one.
+          await resyncView(sid)
+
+          // The control on the turn card: one press, and the whole conversation's file history is
+          // on screen beside the answer it was opened from. The row id lands a moment after the host
+          // marks itself idle, so the wait is the honest question — "did it ever become pressable" —
+          // rather than "is it pressable in this frame".
+          const waitFilesBtn = async (budgetMs = 14000) => {
+            const dl = performance.now() + budgetMs
+            for (;;) {
+              const b = [...document.querySelectorAll<HTMLButtonElement>('.tact.filesbtn')].pop()
+              if (b && !b.disabled) return b
+              if (performance.now() > dl) return null
+              await new Promise((r) => setTimeout(r, 150))
+            }
+          }
+          const filesBtn = await waitFilesBtn()
+          if (!filesBtn) {
+            const last = [...document.querySelectorAll<HTMLButtonElement>('.tact.filesbtn')].pop()
+            return fail(
+              `the Files control stayed inert on a stored turn: ${JSON.stringify(last?.title ?? 'no Files control at all')}`,
+            )
+          }
+          filesBtn.click()
+          const card = await waitShown('.ledger-card')
+          if (!card) return fail('pressing Files drew no ledger card')
+          // The card is appended empty and filled when the read answers, so the wait is for the
+          // rows, not for the card: grading it in the frame it appeared would grade an empty list.
+          if (!(await waitShown('.ledger-card .ledger-file', 14000))) {
+            const shown = await ledgerOf(sid)
+            return fail(
+              `the ledger card drew no file rows; it says ` +
+                `${JSON.stringify(card.querySelector('.ledger-said')?.textContent ?? '')}, its row is ` +
+                `${card.dataset.row}, this window is on ${sid} and the transcript on ${transcript?.sessionId}, ` +
+                `and the record read ${shown.error ?? `${shown.turns.length} turn(s) / ${shown.files_total} row(s)`}`,
+            )
+          }
+          const cardRows = [...card.querySelectorAll<HTMLElement>('.ledger-file')]
+          if (cardRows.length !== 3) {
+            const shown = await ledgerOf(sid)
+            return fail(
+              `the card draws ${cardRows.length} file row(s) for three turns of file work; it says ` +
+                `${JSON.stringify(card.querySelector('.ledger-said')?.textContent ?? '')}, the head says ` +
+                `${JSON.stringify(card.querySelector('.ledger-turn-h')?.textContent ?? '')}, its row is ` +
+                `${card.dataset.row}, this window is on ${sid} and the transcript on ${transcript?.sessionId}, ` +
+                `and the record read ${shown.error ?? `${shown.turns.length} turn(s) / ${shown.files_total} row(s)`}`,
+            )
+          }
+          const cardKinds = cardRows.map((r) => `${r.dataset.kind}:${(r.querySelector('.ledger-path')?.textContent ?? '').trim()}`)
+          if (!cardKinds.some((k) => k === `created:${note}`) || !cardKinds.some((k) => k === `modified:${note}`))
+            return fail(`the card reads ${JSON.stringify(cardKinds)} instead of the note created then modified`)
+          const cardDiffs = [...card.querySelectorAll<HTMLButtonElement>('.ledger-diff-btn')]
+          if (cardDiffs.length !== 2)
+            return fail(
+              `the card offers ${cardDiffs.length} diff button(s); the created file has a live side to compare, ` +
+                'and every row here has one of the two sides',
+            )
+          const modBtn = cardRows
+            .filter((r) => r.dataset.kind === 'modified' && (r.querySelector('.ledger-path')?.textContent ?? '') === note)
+            .map((r) => r.querySelector('.ledger-diff-btn') as HTMLButtonElement | null)
+            .find(Boolean)
+          if (!modBtn) return fail('the modified row on the card has no Diff button')
+          modBtn.click()
+          const diffEl = await waitShown('.ledger-surface .tool-diff')
+          if (!diffEl) return fail('pressing Diff drew nothing into the preview surface')
+          const dels = [...diffEl.querySelectorAll('.diff-del')].map((e) => e.textContent ?? '')
+          const adds = [...diffEl.querySelectorAll('.diff-add')].map((e) => e.textContent ?? '')
+          if (!dels.some((l) => l.includes('-the shared bytes')))
+            return fail(`the card's diff shows no line removed: ${JSON.stringify(dels.slice(0, 4))}`)
+          if (!adds.some((l) => l.includes('+the edited bytes')))
+            return fail(`the card's diff shows no line added: ${JSON.stringify(adds.slice(0, 4))}`)
+
+          // Forgetting copies deletes files, so it refuses while a turn is taking copies. The press
+          // happens on the card that is already open, mid-turn, and the refusal has to leave the
+          // record and the folder exactly as they were.
+          const slowTurn = await turnCount()
+          await invoke('start_turn', { text: 'Selftest ledger: count slowly', session: sid })
+          for (let i = 0; i < 40 && !busy; i++) await new Promise((r) => setTimeout(r, 100))
+          if (!busy) return fail('the slow ledger turn never started, so the mid-turn refusal has nothing to refuse')
+          // The honest-disabled half of this control — inert on an answer that is not written down,
+          // saying what it waits for — is graded in `turn-buttons`, against a turn painted with no
+          // stored row. Grading it here would depend on which frame the streaming block is drawn in.
+          toast = null
+          const forgetBtn = card.querySelector('.ledger-forget') as HTMLButtonElement | null
+          if (!forgetBtn) return fail('the ledger card has no copies control')
+          forgetBtn.click()
+          if (!forgetBtn.dataset.armed)
+            return fail('the first press of the copies control did not arm it; deleting files needs two presses')
+          if (!/Press again/.test(forgetBtn.textContent ?? ''))
+            return fail(`the armed control reads ${JSON.stringify(forgetBtn.textContent ?? '')} instead of naming the delete`)
+          forgetBtn.click()
+          for (let i = 0; i < 40 && !/turn is running/i.test(toastText()); i++) await new Promise((r) => setTimeout(r, 100))
+          if (!/turn is running/i.test(toastText()))
+            return fail(
+              `forgetting copies mid-turn said ${JSON.stringify(toastText().slice(0, 120))} instead of refusing`,
+            )
+          const mid = await statsOf(sid)
+          if (mid.error || mid.rows !== 3)
+            return fail(`the mid-turn refusal changed the record: ${mid.error ?? `${mid.rows} row(s)`}`)
+          if (!(await waitTurnDone(slowTurn))) return fail('the slow ledger turn never ended')
+
+          // And the same two presses when nothing is running: the folder empties, the messages and
+          // the files stay, and the next preview has nothing to offer.
+          toast = null
+          const again = card.querySelector('.ledger-forget') as HTMLButtonElement | null
+          if (!again) return fail('the copies control vanished after its refusal')
+          again.click()
+          again.click()
+          for (let i = 0; i < 60 && !/forgotten/i.test(toastText()); i++) await new Promise((r) => setTimeout(r, 100))
+          if (!/forgotten/i.test(toastText()))
+            return fail(`pressing the copies control said ${JSON.stringify(toastText().slice(0, 140))}`)
+          if (!/freed/i.test(toastText()))
+            return fail(`the receipt does not say what it freed: ${JSON.stringify(toastText().slice(0, 140))}`)
+          const after = await statsOf(sid)
+          if (after.error) return fail(`snapshot_stats after forgetting refused: ${after.error}`)
+          if (after.rows !== 0 || after.blobs !== 0)
+            return fail(`after forgetting, the record still indexes ${after.rows} row(s) and ${after.blobs} blob(s)`)
+          if (after.orphan_blobs !== 0)
+            return fail(
+              `${after.orphan_blobs} blob file(s) survive in the store with no index row pointing at them — ` +
+                'forgetting a conversation has to leave orphan bytes at zero',
+            )
+          const keptNote = await bytesOf(note)
+          const keptTwin = await bytesOf(twin)
+          if (keptNote?.text !== edited || keptTwin?.text !== other)
+            return fail(
+              `forgetting copies moved a file: ${note} holds ${JSON.stringify(keptNote?.text ?? 'nothing')} and ` +
+                `${twin} holds ${JSON.stringify(keptTwin?.text ?? 'nothing')}` +
+                ' — the copies went, the files stay',
+            )
+          const rowsAfter = await invoke<{ messages: unknown[] }>('session_messages', { id: sid, before: null, limit: 400 })
+            .catch(() => null)
+          if (!rowsAfter || rowsAfter.messages.length < 6)
+            return fail(
+              `forgetting copies took ${rowsAfter?.messages.length ?? 0} message row(s); the file history went and ` +
+                'the conversation stayed',
+            )
+          const answerRow = rowsAfter.messages
+            .map((m) => m as { id: number; role: string })
+            .filter((m) => m.role === 'assistant')
+            .pop()
+          if (!answerRow) return fail('no answer row to ask a preview of')
+          const gone = await previewOf(sid, answerRow.id)
+          if (!gone.error)
+            return fail(
+              `checkpoint_preview still offers a plan for a conversation whose copies were forgotten: ` +
+                `${JSON.stringify(gone.items ?? []).slice(0, 120)}`,
+            )
+          if (!/nothing to revert|no copy|not in this conversation/i.test(gone.error))
+            return fail(`the preview refusal says ${JSON.stringify(gone.error.slice(0, 120))}`)
+          const L2 = await ledgerOf(sid)
+          if (L2.error || L2.files_total !== 0)
+            return fail(`the ledger after forgetting reads ${L2.error ?? `${L2.files_total} row(s)`}`)
+          if (!/no turn/i.test(L2.note))
+            return fail(`the emptied ledger says ${JSON.stringify(L2.note.slice(0, 120))} instead of what it found`)
+          if (card.querySelector('.ledger-forget')?.textContent?.trim() !== 'Nothing to forget')
+            return fail(
+              `the card's copies control reads ${JSON.stringify(card.querySelector('.ledger-forget')?.textContent ?? '')} ` +
+                'after the record it reads is empty',
+            )
+          if (!card.querySelector('.ledger-prune'))
+            return fail('the card does not say where the copies went — the notice the engine logged')
+
+          okLine =
+            `file ledger ok (3 turns on 2 paths with created/modified flags, a diff quoting both sides' real ` +
+            `bytes, ${S.blobs} deduped blob of ${S.blob_bytes} B against an index of ${S.row_bytes} B, ` +
+            'a stale-path refusal that read nothing, a mid-turn refusal that changed nothing, and a forget that ' +
+            'emptied the store and left the files and messages alone)'
+        }
+
+        try {
+          await run()
+        } finally {
+          await invoke('set_reasoning', { level: reasoningWas || 'medium', persist: true }).catch(() => {})
+          await invoke('set_mode', { mode: modeWas || 'auto', persist: true }).catch(() => {})
+          if (sid) {
+            // The two files the check made go back through the model's own tool, in the folder it
+            // works in: a check that leaves files behind in the person's folder is the check doing
+            // the thing the feature exists to prevent.
+            const cleanTurns = await turnCount()
+            await invoke('start_turn', {
+              text: `Delete the files ${note} and ${twin} using exec with: rm -f ${note} ${twin}. Reply with the single word done.`,
+              session: sid,
+            })
+            if (!(await waitTurnDone(cleanTurns))) pageLog('selftest: the ledger cleanup turn did not finish')
+          }
+          toast = null
+        }
+        if (okLine) pageLog(okLine)
+      }
+
       if (want('mcp', 'third-party servers stay out of the prompt until explore names them')) {
         // MCP is a cost feature and a safety feature at once: somebody else's program runs on
         // this machine, and its tool schemas would be prompt bytes on every turn. So the group
@@ -14527,6 +18256,21 @@
           await invoke('set_persona', { persona: 'cowork' }).catch(() => null)
           await invoke('set_reasoning', { level: 'off', persist: true })
           await invoke('set_mode', { mode: 'ask' })
+          if (core === 'pi') {
+            // Which approval mode a pi process obeys is decided when it is exec'd - `CWOFFEE_MODE`
+            // is in the child's environment, and no RPC changes it afterwards. The suite pins
+            // `auto` for speed before the chain runs, and `set_mode('ask')` above therefore moves
+            // the host's state and not the process that decides whether a third-party call asks.
+            // A persona round trip is the one door that relaunches it, so the arm takes it here
+            // rather than measuring a child running Auto and calling the absence of a card a pass.
+            // The steer group already does this for the same reason; the first pi-core full pass
+            // is what made this group say it out loud too.
+            await invoke('set_persona', { persona: 'chat' }).catch(() => null)
+            await invoke('set_persona', { persona: 'cowork' }).catch(() => null)
+            await refreshState()
+            if (hostState?.mode !== 'ask')
+              return fail(`the pi arm could not put the model process in ask mode (the host says ${JSON.stringify(hostState?.mode)}); the per-call card would be measured against a process that never asks`)
+          }
 
           const st = await invoke<McpStatus>('mcp_status').catch(() => null)
           if (!st) return fail('mcp_status answered nothing: nothing can say whether a server is running')
@@ -14546,12 +18290,12 @@
 
           // The settings page answers "is it running?" from the same seam the app started servers
           // in, so a page reading the config file could not claim a server the process lost.
-          openSettings('tools')
+          openSettings('mcp')
           await new Promise((r) => setTimeout(r, 700))
           const sect = document.querySelector('[data-set-section="mcp"]')
           if (!sect) {
             closeSettings()
-            return fail('Settings › Workspace has no third-party tools section')
+            return fail('the servers page has no running-now section')
           }
           const pageServers = Array.from(sect.querySelectorAll('[data-mcp-server]')).map(
             (e) => (e as HTMLElement).dataset.mcpServer ?? '',
@@ -14561,48 +18305,38 @@
           const unmounted = sect.querySelector('[data-mcp-unmounted]')?.textContent?.trim() ?? ''
           closeSettings()
 
+          // Both cores mount the servers. The pi core cannot own them in its own tool host —
+          // one process per call, so a server spawned there would restart on every call — so the
+          // app owns the hub and the tool process asks it over a socket. What is graded below is
+          // one behaviour on either core: withheld until asked for, asked once per call, and a
+          // server whose process went away named rather than hung on.
+          if (!st.mounted)
+            return fail(`no third-party server is mounted on the ${core || 'running'} core: ${JSON.stringify(st.why)}`)
+          const routeTxt = sect.querySelector('[data-mcp-route]')?.textContent?.trim() ?? ''
+          if (!routeTxt) return fail('the MCP section never says how a tool call reaches these servers')
+          if (core === 'pi' && !/hub|socket/i.test(routeTxt))
+            return fail(
+              `the pi core's route line says ${JSON.stringify(routeTxt.slice(0, 90))} instead of naming the app's hub`,
+            )
           if (core === 'pi') {
-            // The pi core's tool host is one process per call, so a server it started would be a
-            // new server on every call. The claim here is that the app says so instead of showing
-            // an empty list, and that a model on that core is not told about servers it cannot use.
-            if (st.mounted)
-              return fail('mcp_status says the pi core mounted MCP tools; it cannot — cwtool is one process per call')
-            if (!/pi core|this core does not mount/i.test(st.why))
-              return fail(`the unmounted page says ${JSON.stringify(st.why)} instead of naming the core and why`)
-            if (!unmounted) return fail('the MCP settings section draws no explanation of why nothing is mounted')
-            if (st.configured > 0 && !/listed in the config file|config file/i.test(sect.textContent ?? ''))
-              return fail('two servers are configured and the page says nothing about them being unmounted')
-            if (!(pageServers.length === 0 && pageBytes === ''))
-              return fail(
-                `an unmounted core draws ${pageServers.length} server row(s) and a ${pageBytes || '0B'} byte readout`,
-              )
+            // Which tools are *declared* is decided inside the model process on this core, so the
+            // desktop cannot read it, and saying so beats printing two zeroes that would read as
+            // "nothing is hidden".
             const invPi = await invOf()
             if (!invPi.error)
               return fail(
-                `tool_inventory answered ${JSON.stringify(invPi)} on the pi core, where the model process decides the list; ` +
-                  'empty lists would read as "nothing is hidden"',
+                `tool_inventory answered ${JSON.stringify(invPi)} on the pi core, where the model process decides the list`,
               )
             if (!/model process|cannot report/i.test(invPi.error))
               return fail(`the pi core's inventory refusal says ${JSON.stringify(invPi.error)}`)
-
-            if (!(await firstTurn('MCP NONE: look up a third-party tool')))
-              return fail('the pi-core "no MCP server" turn never ended')
-            // The scenario's `require` strings are checked by the mock endpoint against the bytes
-            // this app put into the request, so a red there means the engine's own refusal never
-            // reached the model — which is the failure that would leave it inventing a server.
-            const out = await waitOut('explore', /No MCP server is running|tool\(s\) fit/)
-            if (!/No MCP server is running/.test(out))
-              return fail(`explore on the pi core said ${JSON.stringify(out.slice(0, 120))} instead of saying nothing is running`)
-            okLine =
-              `mcp ok (${core || 'running'} core: ${st.configured} servers are configured and nothing is mounted, ` +
-              `the page says why in ${JSON.stringify(st.why.slice(0, 46))}… rather than showing an empty list, ` +
-              `the inventory refuses instead of answering with two empty lists, and explore told the model ` +
-              'there is no server to look up'
-            return ''
+            // What it can state is the hub's catalog, and the page has to use that number rather
+            // than a withheld list it cannot see.
+            if (pageHidden !== String(st.tools))
+              return fail(
+                `the page says ${pageHidden} tool name(s) are withheld and the hub's catalog holds ${st.tools}`,
+              )
           }
 
-          if (!st.mounted)
-            return fail(`the rust core did not mount the two configured servers: ${JSON.stringify(st.why)}`)
           const names = st.servers.map((s) => s.name).sort()
           if (names.join(',') !== 'dead,fake') return fail(`the servers the app reports are ${names.join(', ')}`)
           if (!pageServers.sort().join(',').includes('fake'))
@@ -14623,13 +18357,13 @@
           // server tools exist and are withheld, and the declared list carries no MCP name until
           // someone asks. If `defs()` leaked hidden tools this is the claim that goes red.
           const inv0 = await invOf()
-          if (inv0.error) return fail(`tool_inventory refused on the rust core: ${inv0.error}`)
-          const leaked = inv0.declared.filter((n) => n.startsWith('mcp__'))
+          if (core !== 'pi' && inv0.error) return fail(`tool_inventory refused on the rust core: ${inv0.error}`)
+          const leaked = core === 'pi' ? [] : inv0.declared.filter((n) => n.startsWith('mcp__'))
           if (leaked.length)
             return fail(`hidden MCP tools leaked into the declared list before anything asked: ${leaked.join(', ')}`)
-          if (!inv0.hidden.some((n) => n.startsWith('mcp__fake__t1')))
+          if (core !== 'pi' && !inv0.hidden.some((n) => n.startsWith('mcp__fake__t1')))
             return fail(`the withheld list holds ${inv0.hidden.slice(0, 4).join(', ')} and not mcp__fake__t1`)
-          if (pageHidden !== String(inv0.hidden.length))
+          if (core !== 'pi' && pageHidden !== String(inv0.hidden.length))
             return fail(`the page says ${pageHidden} tools are withheld and the registry says ${inv0.hidden.length}`)
 
           if (await bytesOf(noteFile)) return fail(`${noteFile} already exists before the turn; the run is not clean`)
@@ -14671,13 +18405,43 @@
             )
           const cardTxt = await waitOut('mcp__fake__write_note', /wrote /)
           if (!/wrote /.test(cardTxt)) {
+            // A missing card has two very different causes, and the DOM cannot tell them apart: the
+            // server said nothing, or this page stopped painting the conversation its turn went to
+            // (a view change mid-turn leaves `history: a newer view change took over` in the log and
+            // a transcript with no cards in it). So re-read the record and repaint, and look again
+            // before deciding the server is at fault. The row read uses this verb's own argument
+            // names — `id`/`before`, not `session`/`offset` — because a diagnostic that throws
+            // answers "holds ? row(s)" and leaves the next reader with the same mystery.
+            const page1 = await invoke<{ messages: { role: string }[] }>('session_messages', {
+              id: sid,
+              before: null,
+              limit: 200,
+            }).catch((e) => {
+              pageLog(`selftest note: the record read for conversation ${sid} failed: ${String(e)}`)
+              return null
+            })
+            await loadTranscript(sid)
+            const again = await waitOut('mcp__fake__write_note', /wrote /, 4000)
             const all = Array.from(document.querySelectorAll<HTMLElement>('.blk-tool[data-tool="mcp__fake__write_note"]')).map(
               (e) => `${e.className}:${(e.querySelector('.tool-out')?.textContent ?? '-').replace(/\s+/g, ' ').slice(0, 40)}`,
             )
-            return fail(
-              `the tool card says ${JSON.stringify(cardTxt.slice(0, 80))} instead of the server's own line; ` +
-                `cards in the page: [${all.join(' | ')}], turns=${document.querySelectorAll('.turn').length}`,
-            )
+            const stt = await invoke<{ session_id: number }>('session_state').catch(() => null)
+            if (/wrote /.test(again)) {
+              pageLog(
+                `selftest note: the MCP card was missing until the record was re-read and the transcript ` +
+                  `repainted; the turn is in the record (${page1?.messages?.length ?? '?'} row(s)) and the card ` +
+                  `says ${JSON.stringify(again.slice(0, 60))} after the repaint - a view change during the turn, not a silent server`,
+              )
+            } else {
+              return fail(
+                `the tool card says ${JSON.stringify((cardTxt || again).slice(0, 80))} instead of the server's own line; ` +
+                  `cards in the page: [${all.join(' | ')}], turns=${document.querySelectorAll('.turn').length}, ` +
+                  `host on ${stt?.session_id ?? '?'}, this conversation ${sid} holds ` +
+                  `${page1 === null ? '?' : (page1?.messages?.length ?? 0)} row(s)` +
+                  (page1 ? ` [${(page1.messages ?? []).map((r) => r.role).join(',')}]` : '') +
+                  ` — the file on disk said: ${wrote.text.slice(0, 40)}`,
+              )
+            }
           }
           if (!/third-party · fake/.test(nameOf('mcp__fake__write_note')))
             return fail(`the card header reads ${JSON.stringify(nameOf('mcp__fake__write_note'))} and hides which server ran`)
@@ -14685,12 +18449,12 @@
           // And the ask made it callable in the same conversation: the declared list now carries
           // the name, which is what the next round trip would send to the endpoint.
           const inv1 = await invOf()
-          if (inv1.error) return fail(`tool_inventory refused after the reveal: ${inv1.error}`)
-          if (!inv1.declared.includes('mcp__fake__write_note'))
+          if (core !== 'pi' && inv1.error) return fail(`tool_inventory refused after the reveal: ${inv1.error}`)
+          if (core !== 'pi' && !inv1.declared.includes('mcp__fake__write_note'))
             return fail(
               `explore named mcp__fake__write_note and the declared list is still ${inv1.declared.length} tools with no MCP name in it`,
             )
-          if (!inv1.hidden.includes('mcp__fake__t1'))
+          if (core !== 'pi' && !inv1.hidden.includes('mcp__fake__t1'))
             return fail('revealing one tool withheld the whole server: the rest of its tools left the withheld list')
 
           // Per call, even after a yes for the same tool. This is the one place a remembered grant
@@ -14742,7 +18506,8 @@
             return fail('one dead server unmounted the whole hub: the live server is gone from the status')
 
           okLine =
-            `mcp ok (${core || 'running'} core: two servers started and their ${inv0.hidden.length} tools stay withheld ` +
+            `mcp ok (${core || 'running'} core: two servers started and their ` +
+            `${core === 'pi' ? st.tools : inv0.hidden.length} tools stay withheld ` +
             `while the declared list carries no MCP name, the catalog's tool list is ${st.catalog_body_bytes}B under ` +
             `its ${st.catalog_budget}B ceiling (${st.catalog_bytes}B on every prompt with the sentence around it), ` +
             `the card led with "MCP server fake" and the file the server wrote ` +
@@ -14767,6 +18532,899 @@
         if (okLine) pageLog(okLine)
       }
 
+
+      // --- the servers page: adding, switching and removing a program ---------------------------
+      //
+      // Four claims, none of them about the page looking right:
+      //
+      //   * the door is where a person looks, above Settings, and it opens the page rather than a
+      //     popup that hides what is running behind it;
+      //   * a write lands in the **file** — graded from the host's own config text, through the
+      //     host's own path, not a path this page invented — and in the **running set**, graded from
+      //     the hub, in the same act. That pair is what the old read-only page could only describe;
+      //   * the page's sentence is the engine's, so "written to [mcp.servers.x]" and "live (N
+      //     tool(s))" arrive together, and a file written next to a program that refused to start is
+      //     visible as that rather than as a green row;
+      //   * a removal leaves nothing: no row, no table, no environment table, no server in the hub,
+      //     and the config file back to the size it started at.
+      //
+      // The desktop transport only. A phone tab gets `writable: false` from the same payload and the
+      // page shows why instead of controls that would be refused — and that arm is graded by the
+      // engine's own payload test, because no phone is attached to this run.
+      if (want('mcp-ui', 'the servers page: the door, two lists that answer two questions, and a write that reaches the file and the process')) {
+        // Its own async function, because everything in here bails with `return` and these group
+        // blocks live inside one long function: a bare `return` from a group would end the run and
+        // skip the verdict line. Here a bail records one failure and the suite still finishes.
+        await (async () => {
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+        const setv = (el: HTMLInputElement | HTMLTextAreaElement, v: string) => {
+          el.value = v
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+        }
+        // The host's own file, read back through the host's own path — not a copy this page keeps.
+        // The question is whether the app wrote the file the next start will read.
+        const fileText = async () =>
+          (await invoke<{ text?: string }>('selftest_config_text').catch(() => null))?.text ?? ''
+        const core = (await invoke<{ core: string }>('about').catch(() => null))?.core ?? ''
+        const bail = (m: string) => {
+          closeSettings()
+          return fail(m)
+        }
+        const NAME = 'uitest'
+
+        // ---- the door: above Settings, and it opens a page rather than a popup ----
+        const door = document.querySelector('[data-mcp-entry]') as HTMLElement | null
+        if (!door) return fail('the sidebar has no door for the third-party servers')
+        const foot = door.closest('.side-foot')
+        const settingsBtn = [...(foot?.querySelectorAll('.side-item') ?? [])].find((b) =>
+          (b.textContent ?? '').includes('Settings'),
+        )
+        if (!settingsBtn) return fail('the sidebar footer has no Settings entry to sit beside')
+        if (!(settingsBtn.compareDocumentPosition(door) & Node.DOCUMENT_POSITION_PRECEDING))
+          return bail('the MCP door is not above Settings in the sidebar footer')
+        if (door.getAttribute('aria-expanded') === 'true')
+          return bail('the door says it is open before anything was pressed')
+        door.click()
+        await sleep(900)
+        if (document.querySelector('.set-body')?.getAttribute('data-set-page') !== 'servers')
+          return bail('the door did not open the servers page')
+        if (door.getAttribute('aria-expanded') !== 'true')
+          return bail('the door does not say it is open while its page is showing')
+        for (const id of ['mcp', 'mcp-config', 'mcp-add'])
+          if (!document.querySelector(`[data-set-section="${id}"]`))
+            return bail(`the servers page has no "${id}" section`)
+
+        const st0 = await invoke<McpStatus>('mcp_status')
+        if (!st0) return bail('mcp_status answered nothing')
+        // The two lists are counted by what the hub and the file actually hold. A merged list could
+        // pass this by being wrong twice.
+        if (document.querySelectorAll('[data-mcp-server]').length !== st0.servers.length)
+          return bail(`the running list shows ${document.querySelectorAll('[data-mcp-server]').length} rows; the hub names ${st0.servers.length}`)
+        if (document.querySelectorAll('[data-mcp-file]').length !== st0.file.servers.length)
+          return bail(`the file list shows ${document.querySelectorAll('[data-mcp-file]').length} rows; the file lists ${st0.file.servers.length}`)
+        if (!document.querySelector('[data-mcp-summary]'))
+          return bail('the page has no count of what is answering against what is listed')
+
+        // ---- the search: it answers "what does that server give me?" ----
+        const search = document.querySelector('[data-mcp-search]') as HTMLInputElement | null
+        if (!search) return bail('the page has no search over servers and their tool names')
+        const withTools = st0.servers.find((x) => (x.tools?.length ?? 0) > 0)
+        if (withTools) {
+          const term = withTools.tools![0].declared
+          setv(search, term)
+          await sleep(250)
+          if (document.querySelectorAll('[data-mcp-server]').length !== 1)
+            return bail(`searching ${term} leaves ${document.querySelectorAll('[data-mcp-server]').length} running rows; a tool name should find the one server that has it`)
+          // The file row has to follow the same word when the file lists that server; when the file
+          // does not list it — which is what an environment-supplied list looks like — adding a row
+          // would be inventing a config entry.
+          const listed = st0.file.servers.some((x) => x.name === withTools.name)
+          const rows = document.querySelectorAll('[data-mcp-file]').length
+          if (rows !== (listed ? 1 : 0))
+            return bail(`searching ${term} leaves ${rows} file row(s); the file ${listed ? 'lists that server, so its row should show' : 'does not list it, so no row should appear'}`)
+          setv(search, 'zz-nothing-matches-this')
+          await sleep(250)
+          if (document.querySelectorAll('[data-mcp-server]').length)
+            return bail('a search that matches nothing still lists servers')
+          if (![...document.querySelectorAll('[data-mcp-none]')].some((e) => (e.textContent ?? '').includes('matches')))
+            return bail('an empty filtered list does not say it is filtered — it reads as "you have no servers"')
+          setv(search, '')
+          await sleep(200)
+        }
+
+        // ---- a window that cannot write has to say so instead of offering controls ----
+        if (!st0.writable) {
+          const why = document.querySelector('[data-mcp-readonly]')
+          if (!why)
+            return bail(`this window may not change the servers (${st0.why}) but the page still offers controls it would be refused for`)
+          if (st0.env_lists && !(why.textContent ?? '').includes('CWOFFEE_MCP_SERVERS'))
+            return bail('the list comes from CWOFFEE_MCP_SERVERS and the page does not say so')
+          // The honesty this shape exists for: the file lists none of these and the hub is running
+          // them. A page that read the file would report "nothing is configured" about servers that
+          // are answering right now.
+          if (st0.env_lists && st0.servers.length) {
+            if (st0.file.servers.length)
+              return bail(`the environment names the servers and the file also lists ${st0.file.servers.length}; the payload should say which one the app used`)
+            if (document.querySelectorAll('[data-mcp-server]').length !== st0.servers.length)
+              return bail(`the page hides the ${st0.servers.length} servers that come from the environment`)
+          }
+          const controls = [...document.querySelectorAll('.mcprow2 [data-switch], .mcprow2 [data-mcp-edit], .mcprow2 [data-mcp-remove], [data-mcp-master] [data-switch]')]
+          if (controls.some((e) => !(e as HTMLButtonElement).disabled))
+            return bail('a control this window would be refused for is not disabled')
+          if (document.querySelector('[data-mcp-add]'))
+            return bail('the page offers to add a server to a file this start ignores')
+          pageLog(
+            `mcp page ok (door above Settings opens the page; the file lists ${st0.file.servers.length} and the hub is running ${st0.servers.length}, ` +
+              `and the page says why this window cannot write (${st0.env_lists ? 'CWOFFEE_MCP_SERVERS' : st0.why}) rather than showing controls that would be refused — ` +
+              'the add/switch/remove round trip is graded by the write arm, whose servers come from a config file)',
+          )
+          closeSettings()
+          return
+        }
+
+        // ---- add: the form, the file, the process, the withheld tools ----
+        // Reuse a server this run already configured and started, so the new entry points at a program
+        // that exists on this machine rather than at one the check invented.
+        const donor =
+          st0.file.servers.find((r) => r.running && r.name === 'fake') ??
+          st0.file.servers.find((r) => r.running && r.command)
+        if (!donor) return bail('no running server in the file to point a new entry at; the write arm configures one')
+        const add = document.querySelector('[data-mcp-add]') as HTMLElement | null
+        if (!add) return bail('the servers page offers no way to add a server')
+        add.click()
+        await sleep(150)
+        const fName = document.querySelector('[data-mcp-f-name]') as HTMLInputElement | null
+        const fCmd = document.querySelector('[data-mcp-f-command]') as HTMLInputElement | null
+        const fArgs = document.querySelector('[data-mcp-f-args]') as HTMLTextAreaElement | null
+        const fEnv = document.querySelector('[data-mcp-f-env]') as HTMLTextAreaElement | null
+        if (!fName || !fCmd || !fArgs || !fEnv) return bail('the add form is missing a field')
+        setv(fName, NAME)
+        setv(fCmd, donor.command)
+        setv(fArgs, donor.args.join('\n'))
+        setv(fEnv, 'CWOFFEE_MCP_ARM=1')
+        await sleep(150)
+        const save = document.querySelector('[data-mcp-save]') as HTMLElement | null
+        if (!save) return bail('the add form has no Save')
+        save.click()
+        await sleep(5000)
+        const said = [...document.querySelectorAll('[data-mcp-note]')].map((n) => n.textContent ?? '').join(' ')
+        if (!said.trim()) return bail('adding a server produced no sentence: the page changed something and said nothing')
+        if (!said.includes(`written to [mcp.servers.${NAME}]`))
+          return bail(`the add sentence does not name the table it wrote: ${JSON.stringify(said.slice(0, 160))}`)
+        if (!/live \(\d+ tool/.test(said))
+          return bail(`the add sentence does not say the program came up: ${JSON.stringify(said.slice(0, 200))}`)
+        if (!(await fileText()).includes(`[mcp.servers.${NAME}]`))
+          return bail(`the host's own config file has no [mcp.servers.${NAME}] — the page wrote somewhere else`)
+        if (!(await fileText()).includes('[mcp.servers.uitest.env]'))
+          return bail('the environment table the form named was not written with the server')
+        const st1 = await invoke<McpStatus>('mcp_status')
+        const live1 = st1.servers.find((x) => x.name === NAME)
+        if (!live1 || !/live/.test(live1.says))
+          return bail(`the hub says ${JSON.stringify(st1.servers.map((x) => `${x.name}:${x.says}`))}; the server the page added is not answering`)
+        if (st1.file.servers.length !== st0.file.servers.length + 1)
+          return bail(`the file now holds ${st1.file.servers.length} servers, started from ${st0.file.servers.length}`)
+        if (!document.querySelector(`[data-mcp-file="${NAME}"]`))
+          return bail('the new server is not a row on the page')
+        if (!document.querySelector(`[data-mcp-tools-for="${NAME}"]`))
+          return bail('the running list does not show what the new server offered — a counted row cannot answer "does it have a write tool?"')
+        if (st1.file.servers.find((x) => x.name === NAME)?.env.join(',') !== 'CWOFFEE_MCP_ARM')
+          return bail('the row does not report the environment key the form wrote (the values stay out of the page; the names belong there)')
+        if (core !== 'pi') {
+          // The whole economy of the feature, re-measured after a mid-session add: the tools exist,
+          // and the model has not been handed them.
+          const inv = await invoke<{ declared: string[]; hidden: string[] }>('tool_inventory').catch(() => null)
+          if (inv && !inv.hidden.some((n) => n.startsWith(`mcp__${NAME}__`)))
+            return bail(`the added server's tools are not withheld: ${JSON.stringify(inv.hidden.slice(0, 6))}`)
+          if (inv && inv.declared.some((n) => n.startsWith(`mcp__${NAME}__`)))
+            return bail('adding a server declared its tools to the model without anything asking for them')
+        }
+
+        // ---- switch off: the file says so, and so does the process ----
+        const swSel = `[data-switch="Server ${NAME} enabled"]`
+        const sw = document.querySelector(swSel) as HTMLElement | null
+        if (!sw) return bail('the row has no switch on it')
+        sw.click()
+        await sleep(4000)
+        const row = document.querySelector(`[data-mcp-file="${NAME}"]`) as HTMLElement | null
+        if (row && row.dataset.mcpFileEnabled !== 'no')
+          return bail('the switch did not reach the file: the row still reports itself enabled')
+        const st2 = await invoke<McpStatus>('mcp_status')
+        const offRow = st2.file.servers.find((x) => x.name === NAME)
+        if (!offRow || offRow.enabled) return bail('the file still has the server switched on')
+        if (!/off in config/.test(st2.servers.find((x) => x.name === NAME)?.says ?? ''))
+          return bail('the hub does not report it as off in config')
+        if (st2.servers.find((x) => x.name === NAME)?.tools?.length)
+          return bail('a switched-off server is still offering tools')
+        if (!(await fileText()).match(/\[mcp\.servers\.uitest\][^[]*enabled = false/))
+          return bail('the file does not hold `enabled = false` under the server it switched off')
+
+        // ---- back on, then two presses to remove ----
+        ;(document.querySelector(swSel) as HTMLElement)?.click()
+        await sleep(4000)
+        const backOn = (await invoke<McpStatus>('mcp_status')).servers.find((x) => x.name === NAME)
+        if (!backOn || !/live/.test(backOn.says)) return bail('switching it back on did not start it again')
+        const toolsBefore = backOn.tools?.length ?? 0
+        // ---- edit: the form shows names, so a value it never saw has to survive ----
+        // This is the write that a "saved" toast would lie about. The row on the page holds no token,
+        // so an edit that re-sent the field it prefilled would blank the value the server needs, and
+        // the sentence would still say the file was written.
+        const edit = document.querySelector(`[data-mcp-edit="${NAME}"]`) as HTMLElement | null
+        if (!edit) return bail('the row has no Edit')
+        edit.click()
+        await sleep(300)
+        const eArgs = document.querySelector('[data-mcp-f-args]') as HTMLTextAreaElement | null
+        const eEnv = document.querySelector('[data-mcp-f-env]') as HTMLTextAreaElement | null
+        if (!eArgs || !eEnv) return bail('the edit form is missing a field')
+        // The press has to be visible: the form sits in the section after the rows, and a check that
+        // only asserts the form exists would pass a button that appears to do nothing.
+        const formEl = document.querySelector('[data-mcp-form]') as HTMLElement | null
+        const bodyEl = document.querySelector('.set-body') as HTMLElement | null
+        if (formEl && bodyEl && bodyEl.getBoundingClientRect().height > 0) {
+          const fr = formEl.getBoundingClientRect()
+          const br = bodyEl.getBoundingClientRect()
+          if (fr.top > br.bottom - 24)
+            return bail(`the edit form opened ${Math.round(fr.top - br.bottom)}px past the bottom of the settings body — pressing Edit looked like nothing happened`)
+        }
+        if (!eEnv.value.includes('CWOFFEE_MCP_ARM'))
+          return bail('the edit form does not list the key this server has — a person cannot see what an edit will keep')
+        if (eEnv.value.includes('='))
+          return bail(`the edit form prefilled a value (${JSON.stringify(eEnv.value)}) — this page does not hold values to show, and saving it back would blank the token`)
+        if (eArgs.value !== donor.args.join('\n'))
+          return bail(`the edit form's arguments read ${JSON.stringify(eArgs.value)} instead of what the file holds`)
+        // One argument per line is the form's rule, so the check changes the count the way a person
+        // would: the line after `--tools`, not a substring of a joined string.
+        const lines = donor.args.join('\n').split('\n')
+        const at = lines.indexOf('--tools')
+        if (at < 0 || lines[at + 1] !== '3')
+          return bail(`the arm's fake server does not carry a --tools 3 pair to change: ${JSON.stringify(lines)}`)
+        lines[at + 1] = '2'
+        setv(eArgs, lines.join('\n'))
+        await sleep(150)
+        ;(document.querySelector('[data-mcp-save]') as HTMLElement)?.click()
+        await sleep(4500)
+        const edited = await fileText()
+        const region = edited.slice(edited.indexOf(`[mcp.servers.${NAME}]`))
+        if (!/"--tools",\s*"2"/.test(region))
+          return bail(`the edited arguments never reached the file: ${region.split('\n').slice(0, 4).join(' | ')}`)
+        if (/"--tools",\s*"3"/.test(region))
+          return bail('the old argument is still in the file next to the new one')
+        if (!region.includes('CWOFFEE_MCP_ARM = \"1\"'))
+          return bail(
+            `the edit wrote the environment key without the value the form never showed: ${region.split('\n').filter((l) => l.includes('CWOFFEE_MCP_ARM')).join(' | ')}`,
+          )
+        if (document.querySelector('[data-mcp-form]'))
+          return bail('the edit form stayed open after a write that succeeded — the typing it holds is now stale')
+        const afterEdit = (await invoke<McpStatus>('mcp_status')).servers.find((x) => x.name === NAME)
+        if (!afterEdit || !/live/.test(afterEdit.says))
+          return bail('the edited server was left stopped: the file changed and the running set did not')
+        if ((afterEdit.tools?.length ?? 0) >= toolsBefore)
+          return bail(`the arguments changed and the running server still offers ${afterEdit.tools?.length} tool(s) — the process never followed the file`)
+        if (core !== 'pi') {
+          // The name the edit took away has to go with it: this is the pruning rule, reached through
+          // the page rather than through a cargo test.
+          const inv3 = await invoke<{ hidden: string[] }>('tool_inventory').catch(() => null)
+          if (inv3 && inv3.hidden.some((n) => n === `mcp__${NAME}__t3`))
+            return bail('the tool the edit argued out of existence is still withheld from this conversation')
+        }
+
+        const rm = document.querySelector(`[data-mcp-remove="${NAME}"]`) as HTMLElement | null
+        if (!rm) return bail('the row has no Remove')
+        rm.click()
+        await sleep(250)
+        const armed = document.querySelector(`[data-mcp-remove="${NAME}"]`) as HTMLElement | null
+        if (!armed || !armed.classList.contains('armed'))
+          return bail('the first Remove press did not arm; a single press would un-configure somebody else\'s program')
+        armed.click()
+        await sleep(3000)
+        if (document.querySelector(`[data-mcp-file="${NAME}"]`)) return bail('the row is still on the page after Remove')
+        const text3 = await fileText()
+        if (text3.includes(NAME))
+          return bail(`the config file still mentions ${NAME}: ${text3.split('\n').filter((l) => l.includes(NAME)).join(' | ')}`)
+        const st3 = await invoke<McpStatus>('mcp_status')
+        if (st3.servers.some((x) => x.name === NAME)) return bail('the hub still knows a server the file no longer lists')
+        if (st3.file.servers.length !== st0.file.servers.length)
+          return bail(`the file holds ${st3.file.servers.length} servers and started with ${st0.file.servers.length} — the round trip left the config changed`)
+        if (core !== 'pi') {
+          const inv2 = await invoke<{ hidden: string[] }>('tool_inventory').catch(() => null)
+          if (inv2 && inv2.hidden.some((n) => n.startsWith(`mcp__${NAME}__`)))
+            return bail('the removed server is still withholding tool names from this conversation')
+        }
+        pageLog(
+          `mcp page ok (${NAME} added, started, switched off, back on and removed: the file and the hub followed every step, ` +
+            `the tools stayed withheld until asked, and the config file came back to the ${st0.file.servers.length} server(s) it started with)`,
+        )
+        closeSettings()
+        })()
+      }
+
+      // --- mid-turn steering: what you type during a turn, and where it lands ----
+      //
+      // Four claims, all of them graded against something a UI cannot invent:
+      //
+      //   * the press reaches the model's **next request**, after that turn's tool results and
+      //     before its answer — `require_steer` in `steer-into-turn` is checked by the scripted
+      //     endpoint against the bytes the app sent, so a card that lied fails the turn with a 400;
+      //   * the transcript grows by exactly one user row, stamped as a message of its own;
+      //   * a withdrawn press reaches neither the model (`require_steer_absent` 400s if it does) nor
+      //     the record, and its words are back in the composer;
+      //   * Stop hands back what had not landed, and says so — the failure to design against is a
+      //     typed sentence that disappears.
+      //
+      // The card arm grades what steering does *not* unlock: a press cannot answer an approval card.
+      // Both cores run the same script; the pi arm additionally reads the queue back from the host,
+      // because on that core the pending line's life and death are driven by pi's `queue_update`.
+      if (want('steer', 'what you type during a turn lands in the model’s next request')) {
+        const ta = () => document.querySelector<HTMLTextAreaElement>('textarea.composer')
+        const core = (await invoke<{ core: string }>('about').catch(() => null))?.core ?? ''
+        const usersOf = async (id: number) =>
+          (await invoke<{ messages: StoredMessage[] }>('session_messages', { id, before: null, limit: 200 })
+            .catch(() => ({ messages: [] as StoredMessage[] })))
+            .messages.filter((m) => m.role === 'user')
+            .map((m) => m.content)
+        // The receipt and the stop note are transcript notes, so the pane is the witness; the toast
+        // strip is checked too, because a refusal that only reached a toast is still a sentence the
+        // reader has to be able to find.
+
+        const pressEnter = () =>
+          ta()?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+        // The words go in as one draft and Enter is pressed straight after: a per-character typing
+        // loop here would spend half the turn's first step before the press, and the claim is about
+        // a press that beats the step boundary. `composer-type` grades the keystroke-by-keystroke
+        // agreement of the box and the state; this group grades where a press goes.
+        const typeAndPress = async (text: string) => {
+          const el = ta()
+          if (!el) return false
+          draft = text
+          el.value = text
+          el.dispatchEvent(new InputEvent('input', { bubbles: true }))
+          await new Promise((r) => setTimeout(r, 60))
+          pressEnter()
+          await new Promise((r) => setTimeout(r, 250))
+          return true
+        }
+        const waiting = () => document.querySelector('[data-queue-kind]')
+        const takeBack = async () => {
+          const btn = document.querySelector<HTMLButtonElement>('[data-queue] .queue-x')
+          if (!btn) return false
+          btn.click()
+          await new Promise((r) => setTimeout(r, 300))
+          return true
+        }
+        const waitBusy = async (ms = 6000) => {
+          const dl = performance.now() + ms
+          while (performance.now() < dl) {
+            if (busy) return true
+            await new Promise((r) => setTimeout(r, 60))
+          }
+          return false
+        }
+        const queueOf = async () =>
+          await invoke<QueuedItem[]>('queue_state').catch(() => [] as QueuedItem[])
+
+        // Auto approvals for the two write arms (this group spends five turns), Ask for the card
+        // arm, which needs a real card. Both are host-wide, so both go back in the `finally`.
+        const reasoningWas = hostState?.reasoning ?? ''
+        const modeWas = hostState?.mode ?? ''
+        const personaWas = hostState?.persona ?? ''
+        let okLine = ''
+        const seen: string[] = []
+        const run = async () => {
+          await invoke('set_reasoning', { level: 'off', persist: false }).catch(() => null)
+          await invoke('set_mode', { mode: 'auto' }).catch(() => null)
+          await refreshState()
+
+          // ---- 1. a press during a tool turn lands in the next request ----------
+          const t1 = await turnCount()
+          newSession()
+          draft = 'Selftest steer: write the note then answer slowly'
+          await send()
+          const sid1 = (await invoke<{ session_id: number }>('session_state').catch(() => null))?.session_id ?? viewId ?? 0
+          if (!(await waitBusy())) return fail('the steer turn never reported itself running — the press would be measured against an idle host')
+          if (!(await typeAndPress('Selftest steer midword'))) fail('no composer to press into')
+          if (draft !== '') fail(`the press left its words in the box: ${JSON.stringify(draft.slice(0, 30))}`)
+          if (!waiting()) fail('the press reached the host but no waiting line was painted')
+          if (waiting()?.getAttribute('data-queue-kind') !== 'steer')
+            fail(`the waiting line says ${waiting()?.getAttribute('data-queue-kind')}, not steer`)
+          if (!waiting()?.textContent?.includes('not sent to the model yet'))
+            fail('the waiting line claims the model already has the message')
+          // The host's own snapshot, not this window's copy: on the pi core this list is kept
+          // against pi's `queue_update`, which carries text and no ids, so cwoffee's mirror is what
+          // a second client sees and what a reload repaints from.
+          const q1 = await queueOf()
+          if (q1.length !== 1) fail(`the host says ${q1.length} message(s) are waiting, not 1`)
+          if (core === 'pi' && q1[0] && !q1[0].id) fail('the pi core listed a pending line with no id to withdraw by')
+          if (!(await waitTurnDone(t1 + 1)))
+            fail(
+              'the steered turn never finished: if the endpoint refused its second request, the steer never ' +
+                'reached the model — `require_steer` in scenario steer-into-turn is that claim',
+            )
+          const answerTxt = document.querySelector('.transcript')?.textContent ?? ''
+          if (!answerTxt.includes('Answered after taking the mid-turn message'))
+            fail(
+              'the turn ended without the answer that only plays when the model was given the mid-turn ' +
+                'message in its second request',
+            )
+          // The Rust core persists a turn's rows when it ends, so "grew by exactly one user row" is
+          // read off the finished record: the question, and the press — nothing else.
+          const usersAfter = await usersOf(sid1)
+          const extra = usersAfter.filter((u) => !u.startsWith('Selftest steer: write the note'))
+          if (extra.length !== 1 || !extra[0].includes('Selftest steer midword'))
+            fail(
+              `the conversation holds ${usersAfter.length} user row(s) (${JSON.stringify(usersAfter)}); a press is ` +
+                'promised exactly one row of its own, beside the question it answered',
+            )
+          if (!liveNotes.some((n) => n.includes('went into this turn')))
+            fail(
+              `no receipt said where the message landed. Notes this turn: ${JSON.stringify(liveNotes.slice(0, 6))}`,
+            )
+          const receipt = liveNotes.find((n) => n.includes('went into this turn')) ?? ''
+          if (!receipt.includes('before the next request'))
+            fail(`the receipt says ${JSON.stringify(receipt.slice(0, 90))} — it must name the request that carries it`)
+          if ((await queueOf()).length !== 0 || document.querySelector('[data-queue]'))
+            fail('the waiting line survived the landing — pi said the queue was empty and this page did not')
+          seen.push('landed in the next request, one user row, receipt said the step')
+
+          // ---- 2. withdrawn before it lands: nowhere on the wire, back in the box ----------
+          const t2 = await turnCount()
+          newSession()
+          draft = 'Selftest steer: write then take the press back'
+          await send()
+          const sid2 = (await invoke<{ session_id: number }>('session_state').catch(() => null))?.session_id ?? viewId ?? 0
+          if (!(await waitBusy())) fail('the withdrawal turn was not running when Enter was pressed')
+          if (!(await typeAndPress('Selftest steer withdrawn'))) fail('no composer to press into')
+          if (!waiting()) fail('the press was queued but nothing was listed as waiting')
+          const idBack = waiting()?.getAttribute('data-queue-id') ?? ''
+          if (!(await takeBack())) fail('no Take back control on the waiting line')
+          if (!draft.includes('Selftest steer withdrawn'))
+            fail(`taking it back did not put the words in the composer: ${JSON.stringify(draft.slice(0, 30))}`)
+          if (document.querySelector('[data-queue]')) fail('the waiting line stayed painted after the withdrawal')
+          if ((await queueOf()).length !== 0) fail('the host still lists a message that was taken back')
+          draft = ''
+          if (!(await waitTurnDone(t2 + 1)))
+            fail(
+              'the turn ended without its scripted answer: scenario steer-withdraw 400s if the withdrawn ' +
+                'words appear in any request, so this is a leak rather than a slow endpoint',
+            )
+          const rows2 = await usersOf(sid2)
+          if (rows2.some((r) => r.includes('Selftest steer withdrawn')))
+            fail('a withdrawn message is in the record')
+          seen.push('withdrawn before landing: not in a request, not in the record, back in the composer')
+
+          // ---- 3. Stop gives the words back, and says so -------------------------------
+          const t3 = await turnCount()
+          newSession()
+          draft = 'Selftest steer: answer slowly and get stopped'
+          await send()
+          if (!(await waitBusy())) fail('the stop arm measured an idle composer')
+          if (!(await typeAndPress('Selftest steer never sent'))) fail('no composer to press into')
+          if (!waiting()) fail('nothing was listed as waiting before Stop')
+          const stopBtn = document.querySelector<HTMLButtonElement>('.cbtn.go')
+          if (stopBtn?.getAttribute('aria-label') !== 'Stop')
+            fail(`the busy send button is labelled ${JSON.stringify(stopBtn?.getAttribute('aria-label') ?? '')}, not Stop`)
+          stopBtn?.click()
+          await new Promise((r) => setTimeout(r, 900))
+          if (!draft.includes('Selftest steer never sent'))
+            fail(
+              `Stop dropped the waiting words instead of returning them: the box holds ${JSON.stringify(draft.slice(0, 30))}`,
+            )
+          if (!liveNotes.some((n) => n.includes('back in the composer')))
+            fail(
+              `nothing said what happened to the messages that had not landed. Notes this turn: ` +
+                `${JSON.stringify(liveNotes.slice(0, 6))}`,
+            )
+          if ((await queueOf()).length !== 0 || document.querySelector('[data-queue]'))
+            fail('a message handed back to the composer is still listed as waiting')
+          draft = ''
+          await waitTurnDone(t3 + 1)
+          seen.push('Stop returned the waiting words to the composer and said it')
+
+          // ---- 4. a press cannot answer a card ------------------------------------------
+          await invoke('set_mode', { mode: 'ask' }).catch(() => null)
+          if (core === 'pi') {
+            // Which approval mode a pi process obeys is decided when it is exec'd — `CWOFFEE_MODE`
+            // is in the child's environment, and no RPC changes it afterwards (see the note in
+            // `crates/bridge/src/host.rs`). A persona round trip is the one door that relaunches it,
+            // so the pi arm takes that and the mode it just asked for is the mode the call is judged
+            // under. Without this the arm would measure a process running Auto and call that a card.
+            await invoke('set_persona', { persona: 'chat' }).catch(() => null)
+            await invoke('set_persona', { persona: 'cowork' }).catch(() => null)
+            await refreshState()
+          }
+          const t4 = await turnCount()
+          newSession()
+          draft = 'Selftest steer: read outside the workspace while a card is up'
+          await send()
+          const sid4 = (await invoke<{ session_id: number }>('session_state').catch(() => null))?.session_id ?? viewId ?? 0
+          let cardUp = false
+          for (let i = 0; i < 120 && !cardUp; i++) {
+            cardUp = !!document.querySelector('.approval-card')
+            if (!cardUp) await new Promise((r) => setTimeout(r, 60))
+          }
+          if (!cardUp) fail('no approval card to protect — the arm that grades "a steer cannot answer a card" has nothing to measure')
+          const wasId = approval?.id ?? null
+          if (!(await typeAndPress('Selftest steer beside the card'))) fail('no composer to press into')
+          if (approval === null)
+            fail('the mid-turn press answered the approval card — a typed message is not an answer for a person')
+          if (document.querySelector('.approval-card') === null)
+            fail('the card left the screen while the press was queued')
+          if ((await queueOf()).length !== 1) fail('the press did not queue beside the waiting card')
+          const allow = document.querySelector<HTMLButtonElement>('.approval-card .btn-go')
+          if (!allow) fail('the card has no Allow button to answer it with')
+          allow?.click()
+          await new Promise((r) => setTimeout(r, 400))
+          if (approval !== null && wasId === approval?.id)
+            fail('pressing Allow on the card did not resolve it')
+          if (!(await waitTurnDone(t4 + 1))) fail('the turn parked on the card never finished')
+          const rows4 = await usersOf(sid4)
+          if (!rows4.some((r) => r.includes('Selftest steer beside the card')))
+            fail('the press beside the card never became its own row')
+          seen.push('a press queued beside a card and answered nothing')
+
+          okLine = `steer ok (${core || 'rust'} core: a press during a turn reached the model's next request ` +
+            `after the tool results, the transcript grew by exactly one user row, a withdrawn press reached ` +
+            `neither the endpoint nor the record and came back to the composer, Stop handed back what had not ` +
+            `landed and said so, and a press could not answer the approval card (${seen.length} arms)`
+        }
+
+        try {
+          await run()
+        } finally {
+          if (reasoningWas) await invoke('set_reasoning', { level: reasoningWas, persist: true }).catch(() => null)
+          if (modeWas) await invoke('set_mode', { mode: modeWas }).catch(() => null)
+          // The card arm relaunched the pi process through a persona round trip; the suite's own
+          // mode goes back here, and `personaWas` is what this run found it on.
+          if (personaWas) await invoke('set_persona', { persona: personaWas }).catch(() => null)
+          // The turn wrote a file in the scratch folder; a check that leaves its own litter does the
+          // thing the file ledger exists to make visible.
+          const ws = (await invoke<{ workspace: string }>('session_state').catch(() => null))?.workspace ?? ''
+          if (ws.includes('cwoffee-selftest.')) {
+            await invoke('selftest_write_file', { path: 'selftest_steer_note.md', text: '' }).catch(() => null)
+          }
+          draft = ''
+          toast = null
+        }
+        if (okLine) pageLog(okLine)
+      }
+
+      // --- theme: one stored choice, two homes, and both palettes graded -------
+      //
+      // README used to admit that `theme` was "stored and not fully wired", and it was right: the key
+      // was parsed, the settings screen wrote it, nothing read it, and the palette lived in one
+      // browser's `localStorage` while `prefers-color-scheme` was read once at boot with no listener.
+      // One choice, one home, and both themes real — which is what this group holds the shells to.
+      //
+      // The luminance comparisons are the point. A check that asserts "the panel is dark" grades one
+      // palette and lets the other drift; PI-CORE-PLAN lesson 132 is that a floating surface needs its
+      // own token and that "lighter" is not a direction both themes share. So every claim here is a
+      // *number either palette can be held to*, read from what the engine resolves.
+      if (want('theme', 'the stored palette reaches every surface, and both themes are graded by numbers')) {
+        const core = (await invoke<{ core: string }>('about').catch(() => null))?.core ?? ''
+        const cfgPath = (await invoke<{ config_path?: string }>('about').catch(() => null))?.config_path ?? ''
+        const readConfig = async (): Promise<string> => {
+          const r = await invoke<{ text?: string; path?: string }>('selftest_config_text').catch((e) => {
+            failOnce(`selftest_config_text refused: ${e}`)
+            return null
+          })
+          return r?.text ?? ''
+        }
+        let failed = false
+        const failOnce = (m: string) => {
+          if (!failed) {
+            failed = true
+            fail(m)
+          }
+        }
+
+        /** Lightness on one scale, from whatever this engine answers. See the note on the same
+         * helper in the open-row check: a comparison that becomes NaN compares nothing. */
+        const lumOf = (c: string): number | null => {
+          const t = c.trim()
+          let rgb: number[] | null = null
+          const m = t.match(/^rgba?\(([^)]+)\)/)
+          if (m) {
+            const p = m[1].split(/[ ,\/]+/).map((x) => parseFloat(x))
+            if (p.length >= 3 && p.slice(0, 3).every(Number.isFinite)) rgb = p.slice(0, 3).map((x) => x / 255)
+          } else {
+            const ok = t.match(/^oklab\(([^)]+)\)/)
+            if (ok) {
+              const p = ok[1].split(/[ ,\/]+/).map((x) => parseFloat(x))
+              if (p.length >= 3 && p.slice(0, 3).every(Number.isFinite)) {
+                // oklab L is already a 0..1 lightness; scale it to the same 0..255 ruler as sRGB.
+                return Math.round(Math.max(0, Math.min(1, p[0])) * 255)
+              }
+            }
+            const srgb = t.match(/^color\(srgb[^ ]* ([^)]+)\)/)
+            if (srgb) {
+              const p = srgb[1].split(/[ ,\/]+/).map((x) => parseFloat(x))
+              if (p.length >= 3 && p.slice(0, 3).every(Number.isFinite)) rgb = p.slice(0, 3)
+            }
+          }
+          if (!rgb) return null
+          const lin = (v: number) => (v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4))
+          const Y = 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+          return Math.round(Math.max(0, Math.min(1, Y)) * 255)
+        }
+
+        /**
+         * Measure with the document painted in a named palette, then put the paint back.
+         *
+         * A detached wrapper carrying `data-theme` does **not** work here, and it is worth saying why:
+         * the light tokens are declared at `:root` and the dark ones are an override on the root
+         * element, and custom properties inherit. A nested `data-theme='light'` div inside a dark root
+         * therefore resolves the *dark* values, so a probe built that way grades the palette the run is
+         * already in twice and reports both. The switch happens at the root — the same attribute the
+         * app's own paint sets — and the palette is restored afterwards through `paintTheme()`, so the
+         * window ends where the run asked it to end.
+         */
+        async function withPalette<T>(palette: 'light' | 'dark', body: () => T): Promise<T> {
+          const was = document.documentElement.dataset.theme
+          const wasSource = document.documentElement.dataset.themeSource
+          document.documentElement.dataset.theme = palette
+          // One paint pass, so `getComputedStyle` sees the switched tokens rather than the previous
+          // frame's values. Nothing in this arm is frame-paced, so a timeout is enough.
+          await new Promise((r) => setTimeout(r, 120))
+          try {
+            return body()
+          } finally {
+            if (was) document.documentElement.dataset.theme = was
+            if (wasSource) document.documentElement.dataset.themeSource = wasSource
+            paintTheme()
+          }
+        }
+
+        /** The floating surfaces, by the class the app actually wears. Every one of them is a thing
+         * laid over something else, so every one owes the reader a step away from the surface behind
+         * it — in both palettes, by a number, not by a colour name. */
+        const SURFACES: [string, string][] = [
+          ['.pop', 'the footer menu'],
+          ['.toast', 'a notice'],
+          ['.revert-card', 'the revert card'],
+          ['.tree-card', 'the tree panel'],
+          ['.ledger-card', 'the file ledger'],
+          ['.approval-card', 'the approval card'],
+        ]
+        const measured: string[] = []
+        const unread: string[] = []
+        for (const palette of ['light', 'dark'] as const) {
+          // The probe goes on `document.body`, not in an off-screen wrapper, because the tokens
+          // resolve off the root — see `withPalette`. Everything for one palette is read inside a
+          // single switch: measuring the ink after the palette has been put back compares this run's
+          // ink against the other palette's surface, which is a contrast failure that means nothing
+          // (and it is exactly what the first run of this loop reported: `ink rgb(43,42,39) on
+          // rgb(44,42,36)` in the dark palette, where the light palette's ink was being used).
+          const probe = (cls: string, decl?: string) => {
+            const el = document.createElement('div')
+            if (cls) el.className = cls
+            el.style.position = 'absolute'
+            el.style.left = '-9999px'
+            el.style.top = '-9999px'
+            if (decl) el.style.background = decl
+            document.body.append(el)
+            const cs = getComputedStyle(el)
+            const out = { bg: cs.backgroundColor, shadow: (cs.boxShadow ?? 'none').trim(), border: cs.borderTopColor ?? '' }
+            el.remove()
+            return out
+          }
+          const seen = await withPalette(palette, () => ({
+            paper: probe('', 'var(--color-paper)'),
+            ink: probe('', 'var(--color-ink)'),
+            surfaces: SURFACES.map(([sel]) => [sel, probe(sel.slice(1))] as [string, ReturnType<typeof probe>]),
+          }))
+          const behind = lumOf(seen.paper.bg)
+          const inkLum = lumOf(seen.ink.bg)
+          if (behind === null) unread.push(`${palette}: cannot read the reading surface (${seen.paper.bg})`)
+          if (inkLum === null) unread.push(`${palette}: cannot read this palette's ink (${seen.ink.bg})`)
+          for (const [sel, got] of seen.surfaces) {
+            const what = SURFACES.find(([x]) => x === sel)?.[1] ?? sel
+            const lum = lumOf(got.bg)
+            const shadow = got.shadow
+            const border = got.border
+            if (lum === null || behind === null || inkLum === null) {
+              unread.push(`${palette}: ${sel} resolves ${got.bg}, which this check cannot put on the lightness scale`)
+              continue
+            }
+            const gap = Math.abs(lum - behind)
+            // Two numbers, because a floating surface owes the reader two separate things.
+            //
+            // One: it separates from the surface behind it — a step in lightness, or a lift the theme
+            // declares. A surface with neither is a surface the reader cannot tell from the page.
+            //
+            // Two: this palette's ink is readable on it. The second is what catches a hard-coded
+            // token: `background: #1e1d1b` written into a light-palette rule separates *beautifully*
+            // from a near-white page and ruins the text drawn on it, because that palette's ink is a
+            // near-black. Contrast is the number that catches a surface wearing the other theme, and
+            // neither half of this is a colour name — which is the whole of lesson 132.
+            const hi = Math.max(lum, inkLum)
+            const lo = Math.min(lum, inkLum)
+            const ratio = (hi + 0.05) / (lo + 0.05)
+            if (ratio < 4.5)
+              failOnce(
+                `${sel} (${what}) puts the ${palette} palette's ink (${seen.ink.bg}, L=${inkLum}) on ${got.bg} — contrast ${ratio.toFixed(2)}, under 4.5. ` +
+                  'A floating surface wearing the other theme reads as a bug in the theme, not as a surface.',
+              )
+            else measured.push(`${palette}: ${sel} ink-on-surface ${ratio.toFixed(1)}:1`)
+            if (gap < 6 && shadow === 'none')
+              failOnce(`${sel} (${what}) sits ${gap.toFixed(1)} of lightness from the surface behind it in the ${palette} palette and declares no shadow — a floating surface that separates from nothing`)
+            else measured.push(`${palette}: ${sel} ${lum} vs paper ${behind} (${gap.toFixed(0)} apart${shadow === 'none' ? ', no lift' : ', lifted'})`)
+            if (shadow === 'none')
+              failOnce(`${sel} (${what}) has no shadow token in the ${palette} palette: the lift is a theme token because a black drop is a direction one palette has and the other does not`)
+            if (!border)
+              failOnce(`${sel} (${what}) declares no border colour to separate its edge in the ${palette} palette`)
+          }
+        }
+        if (unread.length)
+          failOnce(`in one palette this check cannot read a colour it was asked to grade: ${unread.slice(0, 4).join('; ')} — grade what the engine answers, not what is assumed`)
+
+        // The arm this run is in: the live paint must match the palette the run asked for, which is
+        // the half a detached probe cannot prove — a hard-coded dark token in a surface rule passes
+        // the probe above and fails here.
+        const live = document.documentElement.dataset.theme
+        if (themeRun && live !== themeRun)
+          failOnce(`this run asked for the ${themeRun} palette and the document paints ${live || 'nothing'}`)
+        const liveLum = lumOf(getComputedStyle(document.documentElement).getPropertyValue('--color-paper'))
+          ?? lumOf(getComputedStyle(document.body).backgroundColor)
+        if (liveLum === null) failOnce(`the live reading surface resolves to something unreadable: ${getComputedStyle(document.body).backgroundColor}`)
+        else if (live === 'light' && liveLum < 150)
+          failOnce(`the light palette's reading surface measures ${liveLum} of 255 — that is a dark theme painted under a light name, and the light arm is what catches it`)
+        else if (live === 'dark' && liveLum > 110)
+          failOnce(`the dark palette's reading surface measures ${liveLum} of 255 — the dark theme is not dark`)
+
+        // The settings screen: two rows, because there are two homes.
+        openSettings('appearance')
+        await new Promise((r) => setTimeout(r, 260))
+        const hostRow = document.querySelector('[data-theme-host-row]')
+        const winRow = document.querySelector('[data-theme-window-row]')
+        const listening = document.querySelector('[data-theme-listening]')
+        if (!hostRow || !winRow)
+          failOnce(`the Appearance page has ${hostRow ? 'only the host row' : winRow ? 'only the window row' : 'no theme rows'} — one control cannot describe two homes, which is the mistake this replaced`)
+        else {
+          const note = hostRow.querySelector('[data-theme-note]')?.textContent ?? ''
+          if (!note.includes('config file'))
+            failOnce(`the stored row says ${JSON.stringify(note.slice(0, 80))} and does not name the file the value lives in`)
+          if (!note.includes('override'))
+            failOnce(`the stored row says ${JSON.stringify(note.slice(0, 80))} and never mentions the window override`)
+          if (!winRow.querySelector('[data-theme-override]'))
+            failOnce('the window row carries no override marker: a control that looks like the setting and is not it is the failure the split exists to avoid')
+        }
+
+        // The host's own value, and the file under it.
+        const storedWas = hostState?.theme ?? ''
+        if (storedWas !== 'light' && storedWas !== 'dark' && storedWas !== 'system')
+          failOnce(`the host answers theme=${JSON.stringify(storedWas)}; expected light, dark or system`)
+        const about = await invoke<{ text?: string }>('selftest_config_text').catch(() => null)
+        const cfgBefore = about?.text ?? ''
+        if (!cfgPath) failOnce('about() names no config file, so the check cannot prove where a choice is stored')
+
+        await invoke('set_theme', { kind: 'dark' }).catch((e) => failOnce(`set_theme dark refused: ${e}`))
+        await refreshState()
+        if (hostState?.theme !== 'dark') failOnce(`the host still answers ${JSON.stringify(hostState?.theme)} after being told dark`)
+        const cfgAfter = await readConfig()
+        if (!cfgAfter.includes('theme = "dark"'))
+          failOnce(`the settings write did not reach the file every surface reads at start; ${cfgPath || 'the config file'} holds ${JSON.stringify(cfgAfter.slice(0, 90))}`)
+        measured.push(`stored: the host answers dark and ${cfgPath || 'config.toml'} says theme = "dark"`)
+
+        // A bad word is refused in words, not quietly made the default — the old key's whole failure
+        // was that an unread word and a typo looked the same from outside.
+        const bad = await invoke('set_theme', { kind: 'midnight' }).catch((e) => String(e))
+        if (typeof bad !== 'string' || !bad.includes('light, dark or system'))
+          failOnce(`set_theme("midnight") answered ${JSON.stringify(String(bad).slice(0, 80))} instead of refusing in words`)
+        if (hostState?.theme !== 'dark') failOnce('a refused word still changed the stored palette')
+
+        // The override: this window, and nothing else.
+        setWindowOverride('light')
+        await new Promise((r) => setTimeout(r, 160))
+        if (document.documentElement.dataset.theme !== 'light')
+          failOnce(`the window override asked for light and the document paints ${document.documentElement.dataset.theme}`)
+        if (document.documentElement.dataset.themeSource !== 'override')
+          failOnce(`an override painted the window without saying so: data-theme-source=${document.documentElement.dataset.themeSource}`)
+        const cfgHeld = await readConfig()
+        if (!cfgHeld.includes('theme = "dark"'))
+          failOnce(`a window override rewrote the host's stored choice: the file now says ${JSON.stringify(cfgHeld.slice(0, 120))} — a phone tab must not change the desktop's palette`)
+        const words = await invoke<string>('theme_words', { window: 'light' }).catch((e) => `refused: ${e}`)
+        if (typeof words !== 'string' || !words.includes('override') || !words.includes('still stores dark'))
+          failOnce(`About's palette line says ${JSON.stringify(String(words).slice(0, 110))}; it has to name both homes`)
+        // The About page, which is where the line belongs: a row that only renders on that page is
+        // not in the DOM while the Appearance page is showing, and reading it from there would fail
+        // for the wrong reason.
+        openSettings('about')
+        await new Promise((r) => setTimeout(r, 260))
+        const aboutLine = document.querySelector('[data-theme-about]')?.getAttribute('data-theme-about') ?? ''
+        if (!aboutLine.includes('override'))
+          failOnce(`the About page prints ${JSON.stringify(aboutLine.slice(0, 110))} while this window is overriding — the page that says what this install is has to say which palette is whose`)
+        if (!aboutLine.includes('still stores dark'))
+          failOnce(`the About page prints ${JSON.stringify(aboutLine.slice(0, 110))} without naming what the host still stores`)
+
+        // Back to the host, then to the subscription.
+        setWindowOverride(null)
+        await new Promise((r) => setTimeout(r, 160))
+        if (document.documentElement.dataset.themeSource !== 'host')
+          failOnce(`with no override the paint is decided by ${document.documentElement.dataset.themeSource}, not the host's stored value`)
+        if (document.documentElement.dataset.theme !== 'dark')
+          failOnce(`following the host should paint dark and the document paints ${document.documentElement.dataset.theme}`)
+
+        await invoke('set_theme', { kind: 'system' }).catch(() => null)
+        await refreshState()
+        if (document.documentElement.dataset.themeSource !== 'system')
+          failOnce(`the host stores system and this window reports ${document.documentElement.dataset.themeSource}; system is a subscription and the chrome has to say it is following`)
+        if (listening?.getAttribute('data-theme-listening') !== '1')
+          failOnce(`the theme rows do not report a live media-query listener (found: ${listening ? listening.getAttribute('data-theme-listening') : 'no row'})`)
+
+        // The live following itself. WebKitGTK has no way to synthesize a `MediaQueryListEvent`, so
+        // this arm grades what it can and says out loud what it did not observe — README does not
+        // claim live following on this engine, and a claim a check cannot enforce stays unclaimed.
+        let synthesized = false
+        try {
+          const mq = matchMedia('(prefers-color-scheme: dark)')
+          mq.dispatchEvent(new MediaQueryListEvent('change', { matches: !mq.matches, media: mq.media }))
+          await new Promise((r) => setTimeout(r, 200))
+          synthesized = document.documentElement.dataset.theme === (mq.matches ? 'dark' : 'light')
+        } catch (e) {
+          pageLog(`selftest note: this engine cannot synthesize a MediaQueryListEvent (${e}); the listener's presence is graded, live following is not observed`)
+        }
+        if (!synthesized) blindSkips++
+
+        // Retired keys stay retired. `theme_loud` and `theme_aggressive` are not vocabulary, and a
+        // drawer any client can write into is a drawer, not a setting.
+        for (const retired of ['theme_loud', 'theme_aggressive']) {
+          // Two shapes, because the desktop rejects the promise and the gateway answers a frame: the
+          // refusal has to arrive either way, and it has to name the key it refused.
+          const r = await invoke<{ ok?: boolean; error?: string }>('set_ui_pref', { key: retired, value: 'on' }).then(
+            (v) => ({ refused: false, error: '', shape: v }),
+            (e) => ({ refused: true, error: String(e), shape: null }),
+          )
+          const err = r.refused ? r.error : (r.shape?.error ?? '')
+          if (!r.refused && r.shape?.ok !== false)
+            failOnce(`${retired} was accepted as a preference: ${JSON.stringify(r.shape)}`)
+          if (!err.includes(retired))
+            failOnce(`${retired} was refused with ${JSON.stringify(err.slice(0, 80))}, which does not name the key it refused`)
+        }
+
+        // A turn must survive a repaint: the reload-painting lesson in docs/TESTING.md is about a
+        // screen that changed while a person was watching an answer arrive.
+        // A turn long enough to still be running when the repaint is asked for: the slow-streaming
+        // scenario the steer group uses for the same reason.
+        const tTurn = await turnCount()
+        newSession()
+        draft = 'Selftest steer: answer slowly and get stopped'
+        await send()
+        if (!(await waitTurnStart()))
+          failOnce('the repaint arm has no turn to land in — the scenario did not report a running turn')
+        const target = live === 'dark' ? 'light' : 'dark'
+        setWindowOverride(target)
+        // Read on this tick. `paintTheme` is synchronous, so "the repaint is waiting" is a fact of
+        // the same moment the ask happened, and reading it later would read the state after the
+        // deferred paint landed — which is exactly what the first run of this arm did, and it looked
+        // like a missing deferral.
+        const deferredNow = document.documentElement.dataset.themeDeferred ?? ''
+        const paintNow = document.documentElement.dataset.theme
+        if (deferredNow !== target)
+          failOnce(`the repaint did not register as waiting: data-theme-deferred=${JSON.stringify(deferredNow)} while the document paints ${paintNow}`)
+        if (paintNow !== live)
+          failOnce(`a repaint asked for mid-turn went through anyway: ${live} -> ${paintNow} during a running turn`)
+        // The sentence the person sees, read from the notice state rather than the DOM: rendering is
+        // asynchronous on a window this desktop is not compositing, and the strip was holding an
+        // unrelated loop note when the first run scraped it.
+        await new Promise((r) => setTimeout(r, 240))
+        if (!toast || !toast.text.includes('Theme change waits for this turn'))
+          failOnce(`nothing said out loud that the repaint was waiting; the notice reads ${JSON.stringify(toast?.text ?? '(nothing)')}`)
+        if (!busy) failOnce('a palette change ended the turn it was supposed to wait for')
+        if (!(await waitTurnDone(tTurn + 1))) failOnce('the turn a repaint landed in never finished')
+        const painted = document.documentElement.dataset.theme
+        if (painted !== target)
+          failOnce(`the deferred repaint did not land when the turn ended: the document paints ${painted}, asked for ${target}`)
+        if (document.documentElement.dataset.themeDeferred)
+          failOnce(`the deferral marker outlived the repaint: data-theme-deferred=${document.documentElement.dataset.themeDeferred}`)
+
+        // Put the run's own choices back: a check that leaves the host on `system` and the window on
+        // an override is a check that changed what the next group sees.
+        setWindowOverride(themeRun || null)
+        await invoke('set_theme', { kind: storedWas || 'system' }).catch(() => null)
+        await refreshState()
+        if (!failed)
+          pageLog(
+            `theme ok (${core || 'rust'} core: the host stores the palette in ${cfgPath ? cfgPath.split('/').pop() : 'config.toml'} and answers it on the wire, a window override says the word and rewrites nothing, About names both homes, ${SURFACES.length} floating surfaces graded by lightness and lift in both palettes, the light arm holds the reading surface to a number, the retired keys still refuse, and a repaint waited for a turn${synthesized ? ' and the media query was observed following' : '; live following not observed on this engine'})`,
+          )
+      }
 
       // --- typing in the composer, during a turn and after it -----------------
       //
@@ -14873,43 +19531,86 @@
           if (mid?.disabled) fail('the composer went disabled during the turn — typed text is invisible from there')
           if (mid?.dataset.busy !== '1')
             fail(`during the turn the composer announces ${JSON.stringify(mid?.dataset.busy ?? '')} instead of busy`)
-          // The copy is the affordance now. A box that is typeable but silent about the turn is a
-          // box whose Enter appears broken.
-          if (!/answering/i.test(mid?.placeholder ?? ''))
+          // The copy is the affordance, and since mid-turn steering it names a **promise** rather
+          // than a refusal: which kind the next press is, and where those words will go. A
+          // placeholder that still said "Enter sends when it finishes" would be describing the old
+          // behaviour — the second turn a typed message used to become.
+          if (!/steer|follow-up/i.test(mid?.placeholder ?? ''))
             fail(
               `during the turn the placeholder reads ${JSON.stringify(mid?.placeholder ?? '')} — it does not ` +
-                'say the turn is running, so Enter that refuses looks like a lost key',
+                'say which kind the next press is, so Enter that queues something looks like Enter that refuses',
+            )
+          if (/sends when it finishes/i.test(mid?.placeholder ?? ''))
+            fail(
+              `the mid-turn placeholder still promises a later send: ${JSON.stringify(mid?.placeholder ?? '')}`,
+            )
+          if (!/next step|after this turn/i.test(mid?.placeholder ?? ''))
+            fail(
+              `the mid-turn placeholder does not say where a pressed message goes: ${JSON.stringify(mid?.placeholder ?? '')}`,
             )
           const sendable = 'What is 6 times 7?'
           await typeIn(sendable)
           agree('typed while cwoffee was answering')
           if (draft !== sendable) fail(`the words typed mid-turn became ${JSON.stringify(draft.slice(0, 30))}`)
 
-          // Enter mid-turn must not send, and must not swallow the words silently either.
-          // Measured against a turn that is verifiably still running: a refusal sampled after the
-          // turn settled is a claim about an idle composer, which is the mistake this group made
-          // on its first run (the short scenario finished during the typing loop).
+          // Enter mid-turn is a **press**, not a refusal and not a second turn: the words leave the
+          // box into the queue, and the host's snapshot shows them waiting. Measured against a turn
+          // that is verifiably still running — the mistake this group made on its first run was
+          // sampling an idle composer and calling it mid-turn.
           if (!busy)
             return fail(
-              'the turn had already ended by the time Enter was pressed — the mid-turn refusal was ' +
+              'the turn had already ended by the time Enter was pressed — the mid-turn press was ' +
                 'measured against an idle composer, not a turn in flight',
             )
-          const toastWas = toastText()
+          const turnsShown = document.querySelectorAll('.turn').length
           pressEnter()
-          await new Promise((r) => setTimeout(r, 250))
-          if ((await turnCount()) !== turnsBefore)
-            fail('Enter sent a message while cwoffee was still answering')
-          if (draft !== sendable)
-            fail(`Enter during a turn took the words away: draft is ${JSON.stringify(draft.slice(0, 30))}`)
-          if (toastText() === toastWas)
-            fail('Enter during a turn did nothing and said nothing — that reads as a lost keystroke')
-          if (!/kept|answering/i.test(toastText()))
-            fail(`Enter during a turn explained itself as ${JSON.stringify(toastText().slice(0, 80))}`)
+          // The waiting line lives until the running turn takes the message at its next step
+          // boundary, and that boundary is the model's clock, not this page's. One 300 ms sample used
+          // to decide all four claims below, and it lost both races: a boundary that landed before the
+          // sample ran left no line to find, and a turn that *finished* inside the window moved the
+          // host's turn counter — which counts for the whole app, so an unrelated session finishing
+          // moves it too. Sample for a while and keep what was seen.
+          let sawQueue = false
+          let sawLine = ''
+          let turnsAfter = turnsShown
+          const pressAt = Date.now()
+          while (Date.now() - pressAt < 1500) {
+            await new Promise((r) => setTimeout(r, 20))
+            turnsAfter = document.querySelectorAll('.turn').length
+            if (document.querySelector('[data-queue]')) sawQueue = true
+            const l = document.querySelector('[data-queue-kind]')
+            if (l?.textContent?.trim()) sawLine = l.textContent.trim()
+            if (draft === '' && sawQueue && sawLine) break
+          }
+          // "Not a second turn", read off the transcript rather than off a counter: a steer lands
+          // *inside* the turn that is running, so no new turn is painted; a message that became a turn
+          // of its own paints one.
+          if (turnsAfter > turnsShown)
+            fail(
+              `Enter during a turn painted ${turnsAfter - turnsShown} new turn block(s) (${turnsShown} -> ` +
+                `${turnsAfter}) instead of steering the one that was running`,
+            )
+          if (draft !== '')
+            fail(`Enter during a turn left the words in the box: ${JSON.stringify(draft.slice(0, 30))}`)
+          if (!sawQueue)
+            fail(
+              'the press reached the queue but no waiting line was painted within 1.5s — it reads as a ' +
+                'lost keystroke (a turn that took the message in under 20ms would be the other answer, ' +
+                'and the sample above would still have caught the line: it samples every 20ms)',
+            )
+          if (!sawLine)
+            fail('a waiting line was painted with nothing written on it — the press is unexplained on screen')
+          else if (!sawLine.includes('not sent to the model yet'))
+            fail(
+              `the waiting line says ${JSON.stringify(sawLine.slice(0, 90))} — it must not claim ` +
+                'the model holds a message no request has carried yet',
+            )
 
           if (!(await waitTurnDone(turnsBefore))) fail('the first turn never ended')
 
-          // The moment the user described: the turn is over, the composer is live, and the words
-          // they typed during it are still there and still the words the box shows.
+          // The turn is over, the composer is live again, and the words typed during it are no
+          // longer in the box — they went into the conversation, which is what the press promised.
+          // `steer` grades what reached the model and the record; this group grades the box.
           const after = ta()
           if (!after) fail('the composer left the document when the turn ended')
           else {
@@ -14917,13 +19618,22 @@
             if (after.dataset.busy === '1') fail('the composer still announces a turn that has ended')
             if (!/Ask something/.test(after.placeholder ?? ''))
               fail(`after the turn the placeholder still reads ${JSON.stringify(after.placeholder ?? '')}`)
-            if (after.value !== sendable)
+            if (after.value !== '')
               fail(
-                `the words typed during the turn are gone from the box at its end: ${JSON.stringify(after.value.slice(0, 30))}`,
+                `the box still holds what was pressed during the turn: ${JSON.stringify(after.value.slice(0, 30))} — ` +
+                  'a press that leaves its words in two places is a press that will send them twice',
               )
+            if (document.querySelector('[data-queue]'))
+              fail('a waiting line is still painted after the turn ended and its message landed')
             agree('at the end of the turn')
             // Keep typing after the end — this is the exact gesture the report describes.
-            await typeIn(' — answer in one line')
+            // A phrase this group owns. The mock picks a scenario by asking whether a `match`
+            // phrase is a substring of *some* user message in the conversation, newest first - so a
+            // generic phrase here would also be readable inside another group's prompt and steal that
+            // group's scenario (which is exactly what 'answer in one line' did to the `steer` group's
+            // setup turn: it answered instantly, the turn was over before the mid-turn press, and the
+            // press became a second turn).
+            await typeIn('the line typed after the turn')
             agree('typed after the turn ended')
             const go = document.querySelector<HTMLButtonElement>('.cbtn.go')
             if (go?.disabled) fail('the send button stayed disabled after the turn ended')
@@ -14934,11 +19644,15 @@
             const page = await invoke<{ messages: StoredMessage[] }>('session_messages', { id: sid, limit: 20 })
               .catch(() => null)
             const mine = (page?.messages ?? []).filter((m) => m.role === 'user').map((m) => m.content)
-            const wanted = sendable + ' — answer in one line'
+            const wanted = 'the line typed after the turn'
             if (!mine.includes(wanted))
               fail(
                 `the words typed into the box never reached the record: rows are ${JSON.stringify(mine.slice(-2))} ` +
                   `and the composer held ${JSON.stringify(wanted)}`,
+              )
+            if (!mine.includes(sendable))
+              fail(
+                `the message pressed during the turn never became a row of its own: ${JSON.stringify(mine.slice(-3))}`,
               )
             // Paint is honestly unmeasured here: screenshots are refused by this session's
             // compositor. What is graded is that the control is never in the state that mis-paints,
@@ -14948,8 +19662,8 @@
             okLine =
               `composer typing ok: the box is never a disabled control, six lines grew it to ` +
               `${tallScroll}px of ${tallClient}px, words typed mid-turn stayed in the box and ` +
-              `in the app, Enter mid-turn sent nothing and said why once, and the words typed after the turn ` +
-              `are the words the record holds${blind}`
+              `in the app, Enter mid-turn queued them and painted the waiting line, and the words typed ` +
+              `after the turn are the words the record holds${blind}`
           }
           draft = ''
           if (okLine) pageLog(okLine)
@@ -15092,12 +19806,40 @@
                           `the record kept ${pasted.name} and the transcript lost it`,
                       )
                     else {
-                      chip.click()
-                      const shown = await waitFor('the picture to load into its chip', () => !!chip.querySelector('img'), 6000)
+                      // Press, and then watch the **live** chip rather than the node found a moment
+                      // ago. This view is painted from a store read, and a resync can hand the row
+                      // over to a new element (`resync: conversation 53 looked empty and was not` is
+                      // the churn this has been seen to do mid-check): a held node from a replaced
+                      // generation takes the picture nowhere a reader can see, so holding one grades
+                      // the paint cycle instead of the picture. The press is re-issued against the
+                      // current chip, and what was seen is reported, so a real "the chip does nothing"
+                      // still reads as that.
+                      const liveChip = () =>
+                        ([...document.querySelectorAll('.blk-user .tatt')] as HTMLElement[]).find((c) =>
+                          (c.textContent ?? '').includes(pasted.name),
+                        ) ?? null
+                      let shown = false
+                      let presses = 0
+                      let instances = 1
+                      let seen = chip
+                      while (presses < 3 && !shown) {
+                        presses++
+                        const now = liveChip()
+                        if (now && now !== seen) {
+                          instances++
+                          seen = now
+                        }
+                        (now ?? seen)?.click()
+                        shown = await waitFor('the picture to load into its chip', () => !!liveChip()?.querySelector('img'), 4000)
+                      }
                       const big = document.querySelector('.picview-img') as HTMLImageElement | null
                       const src = big?.getAttribute('src') ?? ''
                       if (!shown || !big)
-                        fail('pressing the attachment chip opened nothing: the picture is in the record but unreachable from the transcript')
+                        fail(
+                          `pressing the attachment chip opened nothing (${presses} press(es) on ${instances} chip ` +
+                            `instance(s), last chip ${JSON.stringify((seen?.textContent ?? '').trim().slice(0, 40))}): ` +
+                            'the picture is in the record but unreachable from the transcript',
+                        )
                       else if (!src.startsWith('data:image/png;base64,'))
                         fail(`the opened picture arrived as ${src.slice(0, 32) || 'nothing'}, not the PNG that was sent`)
                       else {
@@ -17415,9 +22157,74 @@
                 `the card starts ${Math.round(cr.top - br.bottom)}px below the chrome row, past the gutter it is given inside its pane`,
               )
           }
-          const below = vr.bottom - Math.max(sr.bottom, cr.bottom)
-          if (below > 24)
-            verdict.push(`${Math.round(below)}px of window sits below both the sidebar and the card — the height is going to a gap, not to the list or the transcript`)
+          // A band of empty window is usually something *else* taking the height, and the something
+          // most often written into this file by accident is a C-style comment out here in the markup:
+          // Svelte turns it into a text node, the text node becomes an anonymous flex item, and the
+          // columns shrink by however many lines the prose wrapped to. Name it, or the next reader
+          // spends an afternoon on the flex algorithm.
+          const stray = [...shell.childNodes]
+            .filter((n) => n.nodeType === 3 && (n.textContent ?? '').trim().length > 0)
+            .map((n) => `"${(n.textContent ?? '').trim().slice(0, 60)}…"`)
+          if (stray.length)
+            verdict.push(
+              `the shell holds ${stray.length} loose text node(s), which paint and take height: ${stray.join(' | ')} — a comment in markup is <!-- like this -->, not /* like this */`,
+            )
+
+          // The window's columns, not the two that happened to exist when this rule was written.
+          // The browser panel is a third column on the right: open, it takes the width and height the
+          // transcript gives up, and a rule that measures only the card calls a page on screen a band
+          // of empty window. So the rule asks the honest question — does the *lowest* thing in the
+          // shell reach its bottom edge? — and names every column when it answers that it does not.
+          const asked: [string, HTMLElement | null][] = [
+            ['the sidebar', side],
+            ['the card', card],
+            ['the browser column', document.querySelector<HTMLElement>('[data-browser-pane]')],
+          ]
+          const cols = asked.filter(
+            (c): c is [string, HTMLElement] => !!c[1] && c[1].getBoundingClientRect().height > 0,
+          )
+          const lowest = Math.max(sr.bottom, cr.bottom, ...cols.map(([, el]) => el.getBoundingClientRect().bottom))
+          const below = vr.bottom - lowest
+          if (below > 24) {
+            const where = cols.map(([w, el]) => `${w} ends ${Math.round(vr.bottom - el.getBoundingClientRect().bottom)}px above it`).join(', ')
+            verdict.push(
+              `${Math.round(below)}px of window sits below every column of the shell (${where}) — the height is going ` +
+                `to a gap, not to the list, the transcript or the browser${stray.length ? ' (the shell has loose text in it, named above)' : ''}`,
+            )
+          }
+          // The third column, measured with its column actually on screen: a column that stops short
+          // of the window's bottom edge is a column with a strip of dead paint under it, which is the
+          // defect this rule was written to catch, and it is only visible while the column is open.
+          const btoggle = document.querySelector('[data-browser-toggle]') as HTMLElement | null
+          if (!btoggle) {
+            verdict.push('the transcript offers no browser button, so the right-hand column was never measured')
+          } else {
+            btoggle.click()
+            await new Promise((r) => setTimeout(r, 150))
+            const bp = document.querySelector('[data-browser-pane]') as HTMLElement | null
+            if (!bp) {
+              verdict.push('the browser button opened no column, so the right-hand column could not be measured')
+            } else {
+              const bpr = bp.getBoundingClientRect()
+              if (bpr.bottom > vr.bottom + 1.5)
+                verdict.push(
+                  `the browser column hangs ${Math.round(bpr.bottom - vr.bottom)}px past the window's bottom edge ` +
+                    '— the column is taller than the window, so its bottom controls are unreachable',
+                )
+              if (bpr.top < br.bottom - 1.5)
+                verdict.push(`the browser column starts ${Math.round(br.bottom - bpr.top)}px above the chrome row's bottom edge`)
+              if (vr.bottom - bpr.bottom > 24)
+                verdict.push(
+                  `the browser column stops ${Math.round(vr.bottom - bpr.bottom)}px above the window's bottom edge — ` +
+                    'a strip of empty paint under a page that is being kept open',
+                )
+              // Put the column away: every later group measured its numbers without it open.
+              ;(document.querySelector('[data-browser-close-pane]') as HTMLElement | null)?.click()
+              await new Promise((r) => setTimeout(r, 80))
+              if (document.querySelector('[data-browser-pane]'))
+                verdict.push('the browser column stayed open after the chrome check closed it, so the next group measures a narrower window')
+            }
+          }
           // The drawer and the dialog are the other two readers. The drawer rule only applies at
           // narrow widths, so its declaration is read from the shipped stylesheet and resolved,
           // rather than measured on a window that is not narrow.
@@ -18244,6 +23051,7 @@
         )
       }
       await restoreSettings()
+      summaryPrinted = true
       pageLog(
         `${fails === 0 ? 'SELFTEST ok' : `SELFTEST FAILED (${fails})`}: ` +
           `sessions ${before.length}->${after.length}, fts-safe query -> ` +
@@ -18254,8 +23062,21 @@
       )
     } catch (e) {
       fail(String(e))
+      summaryPrinted = true
       pageLog(`SELFTEST FAILED (${fails}): aborted before the summary`)
       await restoreSettings()
+    } finally {
+      // The verdict always arrives. A group that bails with `return` leaves this block without
+      // reaching the summary line above, and the harness sat through its whole board timeout and
+      // then reported *no verdict* for a run that had failed at the second minute — a red that names
+      // nothing and costs ten. Here the run ends at once, names the group it stopped in, and refuses
+      // to print the baseline numbers it never got to measure.
+      if (!summaryPrinted) {
+        pageLog(
+          `SELFTEST FAILED (${fails}): a group returned inside "${groups.last}" before the summary; the sessions/models figures below the groups were never measured, so they are not quoted`,
+        )
+        void restoreSettings()
+      }
     }
   }
 
@@ -18481,7 +23302,10 @@
         },
         openFile: async (path) => {
           try {
-            await invoke<string>('open_file', { path })
+            // The conversation this row belongs to, not whichever one the host is working
+            // in: the path in a transcript row is relative to the folder that conversation
+            // lives in. Same reason `onDeliver` below sends `session`.
+            await invoke<string>('open_file', { path, session: transcript?.sessionId ?? 0 })
           } catch (e) {
             say(`could not open ${path}: ${e}`, true)
           }
@@ -18557,7 +23381,11 @@
       }
       transcript.onOpenFile = async (path) => {
         try {
-          const opened = await invoke<string>('open_file', { path })
+          // `session`, not the host's current folder: a row is a record of where the turn
+          // wrote the file, and the app can be showing a conversation from another
+          // workspace. Resolved against the wrong folder the answer used to be a lie —
+          // `no longer exists`, about a file that was there the whole time.
+          const opened = await invoke<string>('open_file', { path, session: transcript?.sessionId ?? 0 })
           pageLog(`opened file: ${opened}`)
         } catch (e) {
           pageLog(`open_file failed: ${e}`)
@@ -18635,6 +23463,82 @@
           setTimeout(() => composerEl?.focus(), 0)
         }
         return out?.note ?? `branched into “${out.title}”`
+      }
+
+      // The tree: the record's lineage, its nodes, and which node the next answer reads through.
+      // `cwoffee_engine::tree::read` answers for both cores, and the phone's gateway serves the same
+      // verb, so a phone opening this card sees the same tree the desktop does — including pi's own
+      // thread, which the card reports separately from the record rather than merging into it.
+      transcript.onTree = async (session) => {
+        if (!session) throw new Error('that conversation is not saved yet, so it has no tree to read')
+        return await invoke<TreeRead>('session_tree', { session })
+      }
+
+      // Moving the leaf is the one control here that changes anything, and it moves two things at
+      // once: the record's leaf and the model's own memory of the conversation. The engine's sentence
+      // is the receipt, and on the pi core it names the thread it forked to, because that thread is
+      // where the next answer comes from.
+      //
+      // The rows on screen are stale after it: `session_messages` returns the branch the leaf is on,
+      // so a conversation whose leaf moved back shows fewer rows than it did. Repainting from the
+      // record is the only honest way to show that, and nothing was deleted to make it happen.
+      transcript.onLeafMove = async (m) => {
+        const session = m.session || (transcript?.sessionId ?? 0)
+        if (!session) throw new Error('that conversation is not saved yet, so there is no leaf to move')
+        const out = await invoke<LeafMoveOut>('switch_leaf', {
+          session,
+          message_id: m.id,
+          from_end: null,
+          role: m.role,
+          shown: m.shown,
+        })
+        void loadSessions()
+        await resyncView(out.session)
+        if (out.prefill) {
+          draft = out.prefill
+          setTimeout(() => composerEl?.focus(), 0)
+        }
+        await readLeafLine(out.session)
+        return out
+      }
+
+      // The file ledger: every path this conversation's turns touched, grouped by turn, with the
+      // flags the revert card already builds — widened to the whole conversation. Same engine
+      // function as the gateway's `files_ledger`, so a phone and a desktop read one answer to
+      // "what did this conversation write". Reading it touches nothing, which is why it is a watch
+      // verb on the phone and answers while a turn is running.
+      transcript.onLedger = async (session) => {
+        if (!session) throw new Error('that conversation is not saved yet, so it has written no files this app copied')
+        return await invoke<LedgerRead>('files_ledger', { session })
+      }
+
+      // Two numbers on purpose: what the index adds up to and what the store holds are different
+      // questions, and printing one of them as "disk usage" is how a shared blob gets counted twice.
+      transcript.onLedgerStats = async (session) => {
+        if (!session) throw new Error('that conversation is not saved yet, so it keeps no copies')
+        return await invoke<SnapshotStatsRead>('snapshot_stats', { session })
+      }
+
+      // The copy is named by index row and the path is repeated back, so a window that has been open
+      // through two more turns cannot diff whatever that path belongs to by now.
+      transcript.onFileDiff = async (q) => {
+        if (!q.session) throw new Error('that conversation is not saved yet, so no copy of its files was taken')
+        return await invoke<FileDiffRead>('file_diff', {
+          session: q.session,
+          checkpoint: q.checkpoint,
+          shown: q.shown,
+        })
+      }
+
+      // Deleting files, so the engine refuses a stale count and refuses mid-turn. The toast is the
+      // engine's sentence: it says what was freed and what stayed because another conversation
+      // shares it, which is the part a person would otherwise assume.
+      transcript.onForgetCopies = async (session, shown) => {
+        if (!session) throw new Error('that conversation is not saved yet, so there is nothing to forget')
+        const out = await invoke<ForgetCopiesOut>('forget_copies', { session, shown })
+        void loadSessions()
+        await readLeafLine(session)
+        return out
       }
 
       // The revert card asks the engine what it would do before it does anything, and the
@@ -18802,18 +23706,14 @@
       // send button unlocked and the text arrived — while nothing was drawn. A control that never
       // enters the disabled state cannot be re-painted wrong.
       //
-      // Typing during a turn is also what people want: the answer is reading while they compose
-      // the next question. What stays refused is sending mid-turn, and the refusal is said out
-      // loud once, because Enter that does nothing and Enter that lost your keystroke look the
-      // same from the chair.
+      // Typing during a turn is what people want, and now sending it is too: Enter mid-turn is a
+      // **mid-turn press**, which the host queues as a steer or a follow-up — whichever promise
+      // `mid_turn` says — rather than waiting for the whole answer and then starting a second turn.
+      // What still refuses mid-turn is the list on the other doors: branch, leaf switch, workspace
+      // move, revert, forget, and any card that is waiting on a person. A steer changes what the
+      // model is told next; it does not answer for somebody, and it does not move a gate.
       if (busy) {
-        if (!busyEnterTold) {
-          busyEnterTold = true
-          toast = {
-            text: 'Cwoffee is answering. Your words are kept — send them when it finishes.',
-            bad: false,
-          }
-        }
+        void sendMidTurn()
         return
       }
       void send()
@@ -18861,12 +23761,16 @@
       <span class="tb-title" title={viewTitle} data-tauri-drag-region>{viewTitle}</span>
     {/if}
 
+    <!-- The window's own controls, at the right end of the row. The browser's door used to sit
+         here and has moved into the card it opens — a button that belongs to the conversation
+         should be on the conversation's paper, not on the strip that drags the window. -->
+    <div class="ml-auto flex items-center gap-1">
     {#if transportKind === 'tauri'}
       <!-- Minimise / maximise / close belong to the frameless desktop window, and only
            there. In a browser tab they had nothing to act on: `win` is never resolved
            outside Tauri, so all three buttons were inert decorations whose handlers
            could only log a failure. They are drawn where they work. -->
-      <div class="ml-auto flex items-center gap-1">
+      <span class="flex items-center gap-1">
         <button class="wbtn" onclick={minimize} aria-label="Minimize">
           <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 6h8" stroke="currentColor" stroke-width="1.3"/></svg>
         </button>
@@ -18876,8 +23780,9 @@
         <button class="wbtn" onclick={closeWin} aria-label="Close">
           <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.3"/></svg>
         </button>
-      </div>
+      </span>
     {/if}
+    </div>
   </div>
 
   <!-- ============================= body ============================== -->
@@ -19236,6 +24141,24 @@
         <!-- Pinned to the end of the sidebar, outside the scrolling list: a control that
              scrolls away with the conversations is not a control you can find when the
              list is what you are lost in. -->
+        <!-- The door to the third-party servers, pinned just above Settings because that is where
+             the same list used to live: a person hunting for "is my server running" should land on it
+             in one press, not in two (Settings, then scroll). `aria-expanded` is true only while that
+             page is what is showing, so the rail and the door agree about what is open. -->
+        <button
+          class="side-item"
+          data-mcp-entry
+          aria-expanded={settings?.page === 'servers'}
+          onclick={() => openSettings('mcp')}
+        >
+          <!-- A plug, and the same glyph the rail uses for this page: one shape, one meaning, so the
+               door and the page cannot look like two different features. -->
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 3v3.5M15 3v3.5M7.5 6.5h9v3a4.5 4.5 0 0 1-9 0zM12 14v3.5a2.5 2.5 0 0 0 2.5 2.5h1"/>
+          </svg>
+          <span>MCP servers</span>
+        </button>
+
         <button class="side-item" aria-expanded={settings != null} onclick={() => openSettings()}>
           <!-- A cog, not a sun. The old glyph was a circle with rays, which is the shape
                every UI in the world uses for brightness — so in dark theme this button
@@ -19304,9 +24227,15 @@
             </button>
             <button
               class="iconbtn sfi thm"
-              aria-label="Toggle light or dark theme"
-              title="Toggle light / dark"
-              onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}
+              data-theme-source={themeSource}
+              data-theme-stored={storedTheme}
+              aria-label={themeSource === 'override'
+                ? 'This window\u2019s palette (an override): switch to the other one'
+                : 'Palette of this window \u2014 this turns it into an override of the host\u2019s stored theme'}
+              title={themeSource === 'override'
+                ? `This window only: ${theme}. ${themeAbout}`
+                : `The host stores ${storedTheme}. Pressing this makes ${theme === 'dark' ? 'light' : 'dark'} an override for this window alone.`}
+              onclick={() => setWindowOverride(theme === 'dark' ? 'light' : 'dark')}
             >
               <!-- Both glyphs are in the page, and which one is lit is a CSS state keyed off the
                    theme. With `{#if}` there was nothing to animate: the old glyph left the DOM and
@@ -19351,6 +24280,35 @@
            The connection note above stays outside: it is a banner about the window, not part of a
            conversation. -->
       <div class="panecard">
+      <!-- The row the conversation's own buttons live in. It is a row rather than a floating
+           button over the paper: a control painted over the transcript would be a control the
+           transcript can scroll underneath, and the first line of an answer would run behind it.
+           The row takes its height off the top of the card, so nothing has to be guessed about
+           what sits under it.
+
+           The browser's door is one button, and it opens a panel; it does not start a browser.
+           That distinction is the whole design: clicking here is choosing to *look*, and the
+           browser itself only exists because somebody — the model or that same person — opened a
+           page in it. The dot says a browser is alive while the panel is closed, so "the model
+           opened something I am not seeing" is answerable without opening anything. -->
+      <div class="cardtools" data-card-tools>
+        <button
+          class="iconbtn bpy-toggle"
+          data-browser-toggle
+          aria-pressed={browserOpen}
+          aria-expanded={browserOpen}
+          aria-label={paneNow?.alive ? 'Browser panel — a browser is open' : 'Browser panel'}
+          title={paneNow?.alive
+            ? `cwoffee's browser is open: ${(paneNow.url || 'no page').slice(0, 80)}${paneNow.idle_left != null ? ' — it closes itself in ' + Math.round(paneNow.idle_left) + 's of nobody touching it' : ''}`
+            : paneNow && !paneNow.mounted
+              ? 'no kept browser in this start: ' + (paneNow.says || 'the browser tool has no session driver')
+              : 'show the browser panel'}
+          onclick={() => setBrowserPane(!browserOpen)}
+        >
+          <Icon name="browser" size={16} decorative />
+          {#if paneNow?.alive && !browserOpen}<span class="bpy-dot" data-browser-alive-dot></span>{/if}
+        </button>
+      </div>
       {#if showEmpty}
         <!-- Sibling of the composer, not a wrapper around it: the card centres
              them as one group in empty mode. Spacer divs would absorb the free
@@ -19550,13 +24508,30 @@
                  instead — an attribute cannot put the control into that paint state. The mid-turn
                  guidance lives in the placeholder, which is readable exactly when the box is empty;
                  one sentence in one place, because a copy in a `title` would drift. -->
+            {#if leafLine}<div class="leaf-line">{leafLine}</div>{/if}
+            <!-- What is waiting, and where it will go. Both sentences are the engine's own —
+                 `label` and `note` come from `crate::steer::MidTurn`, so a phone card and a desktop
+                 card say the same thing about the same promise. Nothing here claims the model has
+                 the message: until `steerLanded` arrives, the line says it has not been sent. -->
+            {#if queued.length}
+              <div class="queue-list" data-queue>
+                {#each queued as q (q.id)}
+                  <div class="queue-item" data-queue-kind={q.kind} data-queue-id={q.id}>
+                    <span class="queue-kind">{q.label}</span>
+                    <span class="queue-text">{q.text}</span>
+                    <span class="queue-note">
+                      {q.note}{q.attachments ? ` · ${q.attachments} picture(s)` : ''}
+                    </span>
+                    <button class="queue-x" onclick={() => void withdrawSteer(q.id)}>Take back</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
             <textarea
               class="composer"
               bind:this={composerEl}
               rows="3"
-              placeholder={busy
-                ? 'Cwoffee is answering — keep typing, and Enter sends when it finishes.'
-                : 'Ask something. Enter to send, Shift+Enter for a newline.'}
+              placeholder={composerPlaceholder()}
               bind:value={draft}
               onkeydown={onKey}
               data-busy={busy ? '1' : '0'}
@@ -19747,6 +24722,30 @@
       </div>
       <!-- /panecard -->
     </main>
+
+    <!-- The browser column, to the right of the transcript. It is a column, not an overlay: the
+         conversation does not move when it opens. Nothing about a browser belongs on top of the
+         answer a person is reading. -->
+    {#if browserOpen}
+      <BrowserPane
+        panel={paneNow}
+        frame={browserFrame}
+        frameAt={browserFrameAt}
+        frameAge={browserFrameAge}
+        busy={browserBusy}
+        err={paneErr}
+        wide={browserWide}
+        log={browserLog}
+        records={browserRecords}
+        logErr={browserLogErr}
+        onopen={(url) => void browserDo('browser_open', { url })}
+        onact={(act) => void browserDo('browser_act', { act })}
+        onclose={() => void browserDo('browser_close', {})}
+        onwide={() => setBrowserWide(!browserWide)}
+        onlog={(open) => setBrowserLog(open)}
+        onclosePane={() => setBrowserPane(false)}
+      />
+    {/if}
   </div>
 
   <!-- ================================================================
@@ -19774,64 +24773,315 @@
     </p>
   {/snippet}
 
+  <!-- Two lists, on purpose, because they answer two different questions and the app has been asked
+       about the difference before: "is it running?" (the hub, which is the only thing that can answer
+       it) and "what does my file allow?" (the config, which is what a switch writes). One merged list
+       would have to pick a word for a server that is listed but not answering, and every word available
+       — "configured", "installed", "enabled" — says something the app does not know.
+
+       Written as an HTML comment, not a `/* ... */` one: a C-style comment out here in the markup is
+       not a comment at all, it is a text node, and this one painted six lines of prose across the
+       bottom of the window and quietly took 96px of height with it. `chrome-height` is what caught it,
+       and the check now names the text node rather than just the band. -->
   {#snippet mcpBody()}
     {#if mcpErr}
       <div class="smsg bad" data-mcp-error>{mcpErr}</div>
     {/if}
     {#if mcpNow}
-      {#if mcpNow.mounted}
-        <div class="mcpsum" data-mcp-summary>
-          <span class="mcp-n" data-mcp-tools>{mcpNow.tools}</span>
-          tool{mcpNow.tools === 1 ? '' : 's'} from
-          <span class="mcp-n">{mcpNow.servers.length}</span>
-          server{mcpNow.servers.length === 1 ? '' : 's'}. The list of names costs
-          <span class="mcp-n" data-mcp-bytes>{mcpNow.catalog_body_bytes}B</span> of the
-          {mcpNow.catalog_budget}B it is allowed to take, and
-          <span class="mcp-n">{mcpNow.catalog_bytes}B</span> goes into every prompt with the
-          sentence that says how to use it.
-        </div>
-        <div class="mcprows" data-mcp-rows>
-          {#each mcpNow.servers as sv (sv.name)}
-            <div class="mcprow" data-mcp-server={sv.name}>
-              <code class="mcp-name">{sv.name}</code>
-              <span class="mcp-says">{sv.says}</span>
-            </div>
-          {:else}
-            <div class="smsg">Nothing configured, so nothing was started.</div>
-          {/each}
-        </div>
-        {#if mcpInv}
-          <div class="mcpsum" data-mcp-inventory>
-            <span class="mcp-n" data-mcp-hidden>{mcpInv.hidden.length}</span> of the
-            {mcpInv.hidden.length + mcpInv.declared.length} tool names this core knows are
-            withheld from the model until `explore` names them
-            {mcpInv.hidden.length ? ` (${mcpInv.hidden.slice(0, 3).join(', ')}${mcpInv.hidden.length > 3 ? ', …' : ''})` : ''}.
+      <div class="mcpsum" data-mcp-summary>
+        <span class="mcp-n" data-mcp-running>{mcpNow.running}</span>
+        server{mcpNow.running === 1 ? '' : 's'} answering now, out of
+        <span class="mcp-n" data-mcp-configured>{mcpNow.env_lists ? mcpNow.configured : mcpNow.file.servers.length}</span>
+        {mcpNow.env_lists
+          ? 'named by CWOFFEE_MCP_SERVERS — the config file lists none, and that variable replaces the file\'s list wholesale, which is why nothing on this page can add to it.'
+          : 'listed in the config file.'}
+        Their
+        <span class="mcp-n" data-mcp-tools>{mcpNow.tools}</span>
+        tool name{mcpNow.tools === 1 ? '' : 's'} cost
+        <span class="mcp-n" data-mcp-bytes>{mcpNow.catalog_body_bytes}B</span> of the
+        {mcpNow.catalog_budget}B the list is allowed to take, and
+        <span class="mcp-n">{mcpNow.catalog_bytes}B</span> goes into every prompt with the sentence
+        that says how to use it.
+      </div>
+
+      <label class="mcpsearch" for="cw-mcp-search">
+        <input
+          class="sinp"
+          id="cw-mcp-search"
+          data-mcp-search
+          type="search"
+          bind:value={mcpSearch}
+          placeholder="Search a server, its command, or a tool name"
+          aria-label="Search third-party servers, commands and tool names"
+        />
+      </label>
+
+      <div class="mcprows" data-mcp-rows>
+        {#each mcpLiveRows as sv (sv.name)}
+          <div class="mcprow" data-mcp-server={sv.name}>
+            <code class="mcp-name">{sv.name}</code>
+            <span class="mcp-says" data-mcp-says={sv.name}>{sv.says}</span>
+            {#if sv.tools?.length}
+              <!-- What this server actually gives the model. Read off the same list the catalog is
+                   built from, so the page cannot offer a tool the hub never heard of. -->
+              <div class="mcp-tools" data-mcp-tools-for={sv.name}>
+                {#each sv.tools as t (t.declared)}
+                  <div class="mcp-tool">
+                    <code>{t.declared}</code>
+                    {#if t.description}<span>{toolBlurb(t.description)}</span>{/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
           </div>
-        {/if}
-        <p class="set-note">
-          The list above is what each server answered when it was started, not what the config file
-          asked for. A server that did not answer is listed as dead with the reason it gave, and a
-          call into it says so instead of waiting. Servers are declared as
-          <span class="mono">[mcp.servers.&lt;name&gt;]</span> in
-          <span class="mono">{mcpNow.config_path}</span>. This page reads them; it does not start or
-          stop them — a program somebody else wrote should not be launched by a click on a settings
-          row, and a server whose process is gone is not something a button can bring back.
-        </p>
-      {:else}
-        <div class="smsg" data-mcp-unmounted>
-          {mcpNow.why || 'No third-party server is running in this start.'}
+        {:else}
+          <div class="smsg" data-mcp-none>
+            {mcpSearch
+              ? `Nothing running matches ${JSON.stringify(mcpSearch)}.`
+              : 'No third-party program is answering in this start.'}
+          </div>
+        {/each}
+      </div>
+
+      {#if mcpInv}
+        <div class="mcpsum" data-mcp-inventory>
+          <span class="mcp-n" data-mcp-hidden>{mcpInv.hidden.length}</span> of the
+          {mcpInv.hidden.length + mcpInv.declared.length} tool names this core knows are
+          withheld from the model until `explore` names them
+          {mcpInv.hidden.length ? ` (${mcpInv.hidden.slice(0, 3).join(', ')}${mcpInv.hidden.length > 3 ? ', …' : ''})` : ''}.
         </div>
-        {#if mcpNow.configured > 0}
-          <p class="set-note">
-            {mcpNow.configured} server{mcpNow.configured === 1 ? ' is' : 's are'} listed in the
-            config file and none is mounted here. Nothing calls them, and the model is not told
-            about them — a catalog naming servers nobody started would have the model reach for
-            tools that cannot answer.
-          </p>
-        {/if}
+      {:else if mcpNow.tools}
+        <div class="mcpsum" data-mcp-inventory>
+          <span class="mcp-n" data-mcp-hidden>{mcpNow.tools}</span> tool name
+          {mcpNow.tools === 1 ? 'is' : 's'} coming from a server and stay out of the prompt until
+          `explore` names the{mcpNow.tools === 1 ? 'm' : ' one'}. This core decides its declared list
+          inside the model process, so that list cannot be read from here; this count is the hub's
+          catalog, which is what is withheld.
+        </div>
+      {/if}
+
+      <p class="set-note" data-mcp-route>
+        A tool call reaches them through {mcpNow.route || 'the process that started them'}. On either
+        core the servers belong to this app: the pi core's tool host is one process per call and cannot
+        hold a server, so it asks the hub here rather than starting one of its own.
+      </p>
+      {#if mcpNow.why}
+        <div class="smsg" data-mcp-unmounted>{mcpNow.why}</div>
       {/if}
     {:else}
       <div class="smsg">Reading it from the engine…</div>
+    {/if}
+  {/snippet}
+
+  {#snippet mcpConfigBody()}
+    {#if mcpNow}
+      {#if mcpNow.file.problem}
+        <!-- A block the reader refused is said as a refusal, with the row still on the page. An empty
+             list here would claim the person has no servers, and they would go looking in the wrong
+             place: the file has one, it is unreadable. -->
+        <div class="smsg bad" data-mcp-problem>{mcpNow.file.problem}</div>
+      {/if}
+
+      {#if !mcpNow.writable}
+        <div class="smsg" data-mcp-readonly>
+          {mcpNow.env_lists
+            ? 'CWOFFEE_MCP_SERVERS names the servers for this app, and it replaces the file\'s [mcp.servers] list wholesale — so nothing on this page is editable. Change that variable, or unset it and let the file answer.'
+            : 'This window reads the list; it does not change it. The programs run on the machine that started them, so add, switch or remove one there — Settings \u203a MCP.'}
+        </div>
+      {/if}
+
+      <div class="srow" data-mcp-master>
+        <div>
+          <div class="srow-t">Let third-party programs run in this app</div>
+          <div class="srow-h">
+            Off means nothing is started at boot, nothing is offered to the model, and a call that
+            names one is refused. The key that says it is `enabled` inside `mcp` — the servers
+            themselves stay in the file.
+          </div>
+        </div>
+        <div class="srow-c">
+          <Switch
+            on={mcpNow.file.enabled}
+            disabled={!mcpNow.writable || mcpBusy}
+            aria="Third-party servers allowed in this app"
+            onpick={(v) => void mcpDo('third-party servers', () => invoke<string>('mcp_set_enabled', { on: v }))}
+          />
+        </div>
+      </div>
+
+      <div class="mcpgroup" data-mcp-file-rows>
+        {#each mcpFileRows as r (r.name)}
+          <div
+            class="mcprow2"
+            data-mcp-file={r.name}
+            data-mcp-file-enabled={r.enabled ? 'yes' : 'no'}
+            data-mcp-file-running={r.running ? 'yes' : 'no'}
+          >
+            <div class="mcplead">
+              <code class="mcp-name">{r.name}</code>
+              <span class="mcp-says" data-mcp-filesays={r.name}>{r.says}</span>
+            </div>
+            <div class="mcp-cmd mono" title={r.command}>
+              {r.command}
+              {#if r.args.length}<span class="mcp-args">{r.args.join(' ')}</span>{/if}
+            </div>
+            {#if r.env.length}
+              <!-- Names only. The values are a token somebody typed to keep out of a screenshot. -->
+              <div class="mcp-env">environment: {r.env.join(', ')}</div>
+            {/if}
+            <div class="pvacts">
+              <Switch
+                on={r.enabled}
+                disabled={!mcpNow.writable || mcpBusy}
+                aria={`Server ${r.name} enabled`}
+                onpick={(v) => void mcpDo(r.name, () => invoke<string>('mcp_set_server_enabled', { name: r.name, on: v }))}
+              />
+              <button
+                class="set-btn"
+                data-mcp-edit={r.name}
+                disabled={!mcpNow.writable || mcpBusy}
+                onclick={() => openMcpForm(r.name)}
+              >
+                Edit
+              </button>
+              <button
+                class="set-btn {mcpArm === r.name ? 'armed' : ''}"
+                data-mcp-remove={r.name}
+                disabled={!mcpNow.writable || mcpBusy}
+                onclick={() => removeMcpServer(r.name)}
+              >
+                {mcpArm === r.name ? 'Confirm' : 'Remove'}
+              </button>
+            </div>
+          </div>
+        {:else}
+          <div class="smsg" data-mcp-none>
+            {mcpSearch
+              ? `Nothing in the file matches ${JSON.stringify(mcpSearch)}.${mcpHiddenBySearch ? ` ${mcpHiddenBySearch} row(s) are hidden by the search.` : ''}`
+              : 'Nothing is listed under [mcp.servers], so nothing is started and the model is not told about any.'}
+          </div>
+        {/each}
+      </div>
+
+      {#if mcpNow.writable}
+        <div class="pvacts">
+          <button class="set-btn" data-mcp-reload disabled={mcpBusy} onclick={() => void mcpDo('the config file', () => invoke<string>('mcp_reconcile'))}>
+            Re-read the file{mcpPending ? ` and start ${mcpPending} more` : ''}
+          </button>
+        </div>
+        <p class="set-note">
+          A switch on this page writes the file and starts or stops the program in the same act. For an
+          edit made in an editor instead, this button is what makes the running set match what you just
+          typed — the app does not watch the file, and a page that never offered anything but its own
+          form would leave a hand edit invisible until the next boot.
+        </p>
+      {/if}
+
+      <p class="set-note" data-mcp-path>
+        The file: <span class="mono">{mcpNow.config_path}</span>. A server the app could not start
+        stays listed with the reason it gave, and a call into it says so instead of waiting.
+      </p>
+
+      {#if mcpNote}
+        <div class="smsg {mcpNote.bad ? 'bad' : ''}" data-mcp-note>{mcpNote.text}</div>
+      {/if}
+    {:else}
+      <div class="smsg">Reading it from the engine…</div>
+    {/if}
+  {/snippet}
+
+  {#snippet mcpFormBody()}
+    {#if mcpNow && !mcpNow.writable}
+      <div class="smsg">
+        Nothing can be added from this window. The programs run on the machine that started them —
+        {mcpNow.env_lists ? 'and this one\'s list comes from CWOFFEE_MCP_SERVERS.' : 'add or change a server there, under Settings \u203a MCP on that machine.'}
+      </div>
+    {:else if !mcpForm}
+      <div class="pvacts">
+        <button class="set-btn" data-mcp-add onclick={() => openMcpForm(null)}>Add a server…</button>
+      </div>
+      <p class="set-note">
+        A server is a program on this machine that speaks MCP over a pipe. This app starts it, asks it
+        which tools it has, and registers them **hidden**: the model is shown the names and can only
+        call one after `explore` names it, and every call asks you. Adding one writes
+        `[mcp.servers.&lt;name&gt;]` in the config file and starts it in the same act — and the sentence that
+        comes back says whether it came up, not just that the file was written.
+      </p>
+    {:else}
+      <div class="mcpform" data-mcp-form data-mcp-editing={mcpForm.editing ? 'yes' : 'no'}>
+        <Field
+          label="Name"
+          forId="cw-mcp-name"
+          hint={mcpForm.editing
+            ? undefined
+            : 'What every tool it offers is filed under: mcp__name__tool. Lowercase letters, digits, underscore and dash; 2-32 characters; never two underscores in a row, because that is the separator.'}
+        >
+          <input
+            class="sinp mono"
+            id="cw-mcp-name"
+            data-mcp-f-name
+            type="text"
+            spellcheck="false"
+            bind:value={mcpForm.name}
+            disabled={mcpForm.editing}
+            placeholder="jira"
+          />
+          {#if mcpForm.editing}
+            <p class="set-note">
+              The name is the key the whole entry hangs off, so it does not change here. To rename one,
+              add the new name and remove the old — that way nothing is left pointing at a program that
+              is no longer configured under that name.
+            </p>
+          {/if}
+        </Field>
+
+        <Field label="Command" forId="cw-mcp-cmd" hint="The program to run: an absolute path, or a name found on this machine's PATH.">
+          <input
+            class="sinp mono"
+            id="cw-mcp-cmd"
+            data-mcp-f-command
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            bind:value={mcpForm.command}
+            placeholder="/usr/local/bin/jira-mcp"
+          />
+        </Field>
+
+        <Field label="Arguments" forId="cw-mcp-args" hint="One argument per line — nothing here splits quotes, so an argument with a space in it gets one line and no quoting.">
+          <textarea class="sinp mono mcptext" id="cw-mcp-args" data-mcp-f-args rows="3" spellcheck="false" bind:value={mcpForm.args} placeholder="--stdio"></textarea>
+        </Field>
+
+        <Field
+          label="Environment"
+          forId="cw-mcp-env"
+          hint={mcpForm.editing
+            ? 'The keys this server has, one per line — their values are not shown here and are not changed unless you type one. Leave a name as it is to keep its value, write KEY=value to set a new one, and delete the line to take the key away from this server.'
+            : 'One KEY=value per line. These go to this server only, never to the rest of the app; the values are written to the file and never shown back here.'}
+        >
+          <textarea class="sinp mono mcptext" id="cw-mcp-env" data-mcp-f-env rows="2" spellcheck="false" bind:value={mcpForm.env} placeholder="JIRA_TOKEN=..."></textarea>
+        </Field>
+
+        <div class="srow" data-mcp-f-on-row>
+          <div>
+            <div class="srow-t">Start it now</div>
+            <div class="srow-h">Off keeps the entry in the file and starts nothing — the honest way to park a server.</div>
+          </div>
+          <div class="srow-c">
+            <Switch on={mcpForm.on} aria="Start this server now" onpick={setFormOn} />
+          </div>
+        </div>
+
+        <div class="pvacts">
+          <button class="set-btn primary" data-mcp-save disabled={mcpBusy} onclick={saveMcpForm}>
+            {mcpBusy ? 'Working…' : mcpForm.editing ? 'Save changes' : 'Add and start'}
+          </button>
+          <button class="set-btn" data-mcp-cancel disabled={mcpBusy} onclick={closeMcpForm}>Cancel</button>
+        </div>
+        {#if mcpNote}
+          <div class="smsg {mcpNote.bad ? 'bad' : ''}" data-mcp-note>{mcpNote.text}</div>
+        {/if}
+      </div>
     {/if}
   {/snippet}
 
@@ -20505,6 +25755,7 @@
       {:else}
         {@const sid = menu.sessionId ?? -1}
         <div class="pop-title">{titleOf(sid)}</div>
+        <button class="pop-item" onclick={() => void treeFromMenu(sid)} role="menuitem">Tree</button>
         <button class="pop-item" onclick={() => renameFromMenu(sid)} role="menuitem">Rename</button>
         {#if confirmDeleteId === sid}
           <div class="pop-sub pad">Delete this session? Its messages go with it.</div>
@@ -21107,19 +26358,25 @@
                   </div>
                 {/each}
               </div>
+              {#if browserErr}
+                <div class="smsg bad" data-browser-error>{browserErr}</div>
+              {:else if browserNow}
+                <p class="set-note" data-browser-status>
+                  {browserNow.says}
+                  {#if browserNow.mounted}
+                    The choice is yours either way: `[browser] headed = true` opens a window even
+                    for a model that cannot see the page, and `headed = false` keeps every run
+                    headless whatever the model can do. The model is not offered that switch — a
+                    tool call is the one place a model gets to act, and a window on your desktop is
+                    not a thing it should be able to ask for.
+                  {/if}
+                </p>
+              {/if}
               <p class="set-note">
                 Nothing here is switchable yet. Per-tool permission is not wired into either core, and
                 a control that changed nothing would be worse than no control. What may run without
                 asking is set below, and where files may be written is set by the folder.
               </p>
-            </Section>
-
-            <Section
-              id="mcp"
-              title="Third-party tools (MCP)"
-              desc="Programs other people wrote, started by this app, speaking MCP over a pipe. Their tools are registered but hidden: the model sees a short list of names, and a tool is only declared and callable after `explore` names it. Each call asks you, and a session grant never covers one."
-            >
-              {@render mcpBody()}
             </Section>
 
             <Section
@@ -21259,6 +26516,30 @@
             >
               {@render webBody()}
             </Section>
+          {:else if settings.page === 'servers'}
+            <Section
+              id="mcp"
+              title="Running now"
+              desc="What this app started, and what each one answered with. A server that is not here is not answering, whatever the config file says."
+            >
+              {@render mcpBody()}
+            </Section>
+
+            <Section
+              id="mcp-config"
+              title="In the config file"
+              desc="What this app is allowed to start. A switch here writes the file and starts or stops the program in the same act."
+            >
+              {@render mcpConfigBody()}
+            </Section>
+
+            <Section
+              id="mcp-add"
+              title="Add or change a server"
+              desc="The program to run, the arguments, and the environment it needs. Nothing is downloaded, installed or contacted: this names a program that is already on this machine."
+            >
+              {@render mcpFormBody()}
+            </Section>
           {:else if settings.page === 'devices'}
             <Section
               id="gateway"
@@ -21305,6 +26586,44 @@
                   </div>
                 </div>
               </div>
+            </Section>
+
+            <Section
+              id="steer"
+              title="Typing during a turn"
+              desc="What Enter does while cwoffee is answering, and where those words go."
+            >
+              <div class="srow">
+                <div>
+                  <div class="srow-t">The next press is</div>
+                  <!-- The sentence is the host's (`mid_turn_note`, written by `crate::steer`), so the
+                       dial and the promise it describes cannot drift apart, and so a phone tab reading
+                       the same host sees the same words. -->
+                  <div class="srow-h" data-midturn-note={hostState?.mid_turn_note ?? ''}>
+                    {hostState?.mid_turn_note ??
+                      'A message typed while a turn is running is steered into that turn at its next step. It is stored on the host, so every window that sends into this conversation is given the same promise; a message already waiting keeps the kind it was typed as.'}
+                  </div>
+                </div>
+                <div class="srow-c">
+                  <Segmented
+                    aria="Typing during a turn"
+                    value={midTurn}
+                    options={[
+                      { value: 'steer', label: 'Into this turn' },
+                      { value: 'follow_up', label: 'After it' },
+                    ]}
+                    onpick={(v) => void pickMidTurn(v as MidTurn)}
+                  />
+                </div>
+              </div>
+              <p class="set-note" data-steer-limits>
+                {hostState?.mid_turn_refusal ??
+                  'a mid-turn message cannot answer an approval card or a question, cannot change the approval mode, and cannot change the tools this turn started with.'}
+                Branching, moving where the conversation is read from, changing the folder, undoing a
+                turn's files and forgetting its copies all still refuse while a turn runs — steering
+                opens no door, it only changes what the model is told next. A message that has landed
+                cannot be unsent: the row stays in the record.
+              </p>
             </Section>
 
             <Section
@@ -21419,26 +26738,62 @@
             <Section
               id="theme"
               title="Theme"
-              desc="The palette of the window you are looking at."
+              desc="One choice stored on this host, and one ask that belongs to this window."
             >
-              <div class="srow">
+              <!-- Two rows, because there are two homes, and the old single control could only
+                   describe one of them. The first writes `config.toml`, which every surface reads at
+                   start; the second changes this screen and says the word *override* while it does. -->
+              <div class="srow" data-theme-host-row>
                 <div>
-                  <div class="srow-t">Colours</div>
-                  <div class="srow-h">
-                    Kept per window: a desktop and a browser opened against the same app can disagree,
-                    because this is a fact about the screen rather than about the conversation. With no
-                    choice saved, the app follows what the system asks for.
+                  <div class="srow-t">Colours, stored on this host</div>
+                  <div class="srow-h" data-theme-note={hostState?.theme_note ?? ''}>
+                    {hostState?.theme_note ??
+                      'Stored in the config file, which the window, a device tab and the terminal all read at start.'}
                   </div>
                 </div>
                 <div class="srow-c">
                   <Segmented
-                    aria="Theme"
-                    value={theme}
-                    options={[{ value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]}
-                    onpick={(v) => applyTheme(v === 'dark' ? 'dark' : 'light')}
+                    aria="Theme stored on this host"
+                    value={storedTheme}
+                    options={[
+                      { value: 'light', label: 'Light' },
+                      { value: 'dark', label: 'Dark' },
+                      { value: 'system', label: 'Follow system' },
+                    ]}
+                    onpick={(v) => void pickStoredTheme(v as HostTheme)}
                   />
                 </div>
               </div>
+              <div class="srow" data-theme-window-row>
+                <div>
+                  <div class="srow-t">This window only</div>
+                  <div class="srow-h" data-theme-override={themeOverride ?? 'none'} data-theme-source={themeSource}>
+                    {themeOverride
+                      ? `An override: this screen shows ${themeOverride} and the host still stores ${storedTheme}. Another window keeps the stored choice, and a device tab cannot change this one.`
+                      : `No override here: this window follows what the host stores (${storedTheme}). Setting one changes this screen and nothing else.`}
+                  </div>
+                </div>
+                <div class="srow-c">
+                  <Segmented
+                    aria="This window's palette"
+                    value={themeOverride ?? 'follow'}
+                    options={[
+                      { value: 'follow', label: 'Follow the host' },
+                      { value: 'light', label: 'Light' },
+                      { value: 'dark', label: 'Dark' },
+                    ]}
+                    onpick={(v) => setWindowOverride(v === 'follow' ? null : (v as 'light' | 'dark'))}
+                  />
+                </div>
+              </div>
+              <!-- The claim `system` makes is a subscription, so the screen says whether the listener
+                   is actually attached. `system` in the stored choice means "each surface follows its
+                   own system", and a phone and a desktop can therefore disagree while both obey it. -->
+              <p class="set-note" data-theme-listening={themeListening ? '1' : '0'}>
+                {storedTheme === 'system'
+                  ? `Following this system's colour scheme, live${themeListening ? '' : ' — listener not attached, so a change will not repaint this window'}. Right now this screen reads ${theme}, decided by ${themeSource}.`
+                  : `This window reads ${theme}, decided by ${themeSource}. A change made while a turn is running waits for the turn to end, because a repaint costs a streaming transcript its layout.`}
+              </p>
             </Section>
           {:else if settings.page === 'help'}
             <!-- The keys used to be the last section on Appearance, where nobody looked for them and
@@ -21491,6 +26846,18 @@
                 this app, <b>pi</b> runs a <b>pi --mode rpc</b> process beside it. Everything else on
                 this page is the same either way.
               </p>
+              <!-- The palette is the one setting with two homes, so the page that says what this
+                   install is has to say which of the two it is looking at. The sentence is the
+                   engine's (`crate::theme::Theme::about_says`), sent back with this window's override
+                   as an argument — an argument, never a write. -->
+              <div class="srow" data-about="Palette">
+                <div>
+                  <div class="srow-t">Palette</div>
+                </div>
+                <div class="srow-c about-v" data-theme-about={themeAbout}>
+                  {themeAbout || `the host stores ${storedTheme}; this window shows ${theme}`}
+                </div>
+              </div>
             </Section>
 
             <Section

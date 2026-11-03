@@ -6,6 +6,7 @@
 //! model to emit a call it shouldn't.
 
 pub mod ask;
+pub mod browser;
 pub mod changes;
 pub mod discover;
 pub mod docs;
@@ -141,6 +142,16 @@ pub struct ToolResult {
     /// process happens to be hosting the model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activates: Vec<String>,
+    /// Pictures this call wants the **model** to see, as opposed to `files`, which is a
+    /// note for the front end. Only a tool whose host has confirmed that the conversation's
+    /// model takes image input fills this, and the tool that filled it says so in `output`
+    /// rather than leaving the model to wonder whether the picture arrived.
+    ///
+    /// A screenshot is the most expensive thing a tool result can carry into every later
+    /// prompt of the session, which is why it is opt-in per call and per model rather than
+    /// a thing the transcript does whenever a browser runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::provider::Attachment>,
 }
 
 /// A file the agent produced, described for the UI rather than the model.
@@ -158,6 +169,21 @@ pub struct OutputFile {
     /// renderer from a filename.
     #[serde(default)]
     pub kind: FileKind,
+    /// Did this turn *make* the file, as opposed to changing one that was already there?
+    ///
+    /// The transcript needs the fact rather than a guess from a name, because the two want
+    /// different shapes: a file the turn created is something it produced — a card you can
+    /// open — while a file it edited on the way through a codebase is one of many changes and
+    /// belongs in a list. A report that a workspace-root file had been "attached" was really
+    /// this fact missing: the row said only `edit`, so nothing could tell "made this" from
+    /// "touched this", and the renderer was left to read a label as a promise.
+    ///
+    /// It says nothing about hand-over. Only `.cws/assistant_attachments/` is handed over
+    /// (see [`FileKind::Attachment`] and `scratch::attachment_path`); a created file outside
+    /// it is a card with no Save control — a thing you can open, not a thing the model offered
+    /// to copy somewhere you choose.
+    #[serde(default)]
+    pub created: bool,
 }
 
 /// Which kind of file this is, from the reader's point of view.
@@ -268,7 +294,17 @@ impl OutputFile {
             mime: mime_for(path).to_string(),
             bytes,
             kind: kind_for(path),
+            // A path alone cannot say. The tool that looked at the disk first calls
+            // `with_created`; leaving this false is the honest default.
+            created: false,
         }
+    }
+
+    /// Record whether this write made the file. Called only by tools that checked the disk
+    /// before writing, because that is the one place the fact exists.
+    pub fn with_created(mut self, created: bool) -> OutputFile {
+        self.created = created;
+        self
     }
 
     /// A file that arrived from outside the workspace. Its name comes from a URL
@@ -281,6 +317,8 @@ impl OutputFile {
             mime,
             bytes,
             kind: FileKind::Artifact,
+            // A file that arrived from a URL is a file this turn made.
+            created: true,
         }
     }
 }
@@ -330,6 +368,7 @@ impl ToolResult {
             changes: Vec::new(),
             checkpoints: Vec::new(),
             activates: Vec::new(),
+            images: Vec::new(),
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
@@ -344,6 +383,7 @@ impl ToolResult {
             changes: Vec::new(),
             checkpoints: Vec::new(),
             activates: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -418,6 +458,16 @@ pub struct ToolCtx {
     /// Paths outside the workspace the **user approved for this one call**.
     /// Rebuilt per call by the agent loop; never inherited by the next call, and
     /// never widened by a session-level "allow for session" answer.
+    /// The browser this host can offer: where the driver is, which node runs it, and
+    /// whether the model in this conversation can see images. The last one is a host fact,
+    /// not a prompt fact: whether a window is worth painting on a person's desktop is not
+    /// something the model gets to decide about a person's screen.
+    pub browser: browser::BrowserCfg,
+    /// The **kept** browser, if this app has one: the browser behind the window's sidebar,
+    /// which a person can see and a person can open. `None` means there is no such thing
+    /// here — a probe, an example, a host that mounted no hub — and then `browse` with
+    /// `session: true` says that, in words, instead of quietly opening a second browser.
+    pub browser_route: Option<browser::BrowserRoute>,
     pub permits: Vec<std::path::PathBuf>,
     /// Tools that exist in this host and are not declared to the model yet — third-party MCP
     /// tools, waiting for `explore` to name them.
@@ -433,6 +483,8 @@ pub struct ToolCtx {
 impl Default for ToolCtx {
     fn default() -> Self {
         Self {
+            browser: browser::BrowserCfg::default(),
+            browser_route: None,
             workspace: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             max_output_bytes: 32 * 1024,
             ask: None,
@@ -624,6 +676,20 @@ impl Registry {
     /// its own defaults and the user's timeout and sandbox settings would be
     /// silently ignored.
     pub fn with_v1_tools_exec(search: web::SearchBackend, exec: ExecCfg) -> Self {
+        Self::with_v1_tools_browser(search, exec, None)
+    }
+
+    /// The same list, plus the browser when this start can offer one.
+    ///
+    /// Gated rather than always mounted: `browse`'s schema is ~1.1 KB of every prompt, and a
+    /// machine with no Playwright driver would pay that to be told "not installed" on the one
+    /// turn the model tries it. A start that *has* a driver mounts it, and the settings page
+    /// says which kind of start this is.
+    pub fn with_v1_tools_browser(
+        search: web::SearchBackend,
+        exec: ExecCfg,
+        browser: Option<browser::BrowserCfg>,
+    ) -> Self {
         let mut r = Self::new();
         // Built from ExecCfg, so a `[sandbox]` key cannot be parsed, validated and
         // then silently dropped on the way into the tool.
@@ -667,6 +733,16 @@ impl Registry {
         // stops declaring all of it. Both are cheap enough to declare in every mode - see
         // `lean_tool_names`, where the price of always being declared is asserted.
         r.register(Box::new(discover::ExploreTool));
+        // Appended last, and only when the host can actually open a browser: the tool is a
+        // suffix in the prompt order like every other addition, and a start without the
+        // driver simply does not pay for it.
+        if browser.is_some() {
+            r.register(Box::new(browser::BrowseTool));
+            // The other half of the same promise: `browse` puts the model inside a page, this reads
+            // what the page said while nobody was looking at it. Registered together, because a
+            // host that can open a page can also have collected what that page printed.
+            r.register(Box::new(browser::PageLogTool));
+        }
         r
     }
 
@@ -739,6 +815,33 @@ impl Registry {
     /// Declare a hidden tool. True if it was hidden and is now declared.
     pub fn reveal(&mut self, name: &str) -> bool {
         self.hidden.remove(name)
+    }
+
+    /// Drop third-party tools the hub no longer offers, and say which ones went.
+    ///
+    /// A server removed from the config stops being a source of tools, but the handles registered for
+    /// it in a running session stay where the model can name them until the next start: it could ask
+    /// for `mcp__jira__create`, be shown an approval card for a program that is no longer configured,
+    /// and be refused only by the hub. That is a card for something that cannot happen.
+    ///
+    /// The `mcp__` prefix is the whole point of the filter: this function cannot take a first-party
+    /// tool away, whatever name set it is handed, because a first-party tool is not the hub's to
+    /// offer. `offered` comes from `Hub::catalog`, which is the same list the env block is built
+    /// from — the hub is the authority on what exists, and a second reader of the config file in this
+    /// loop could disagree with it about what was just written.
+    pub fn forget_stale_mcp(&mut self, offered: &std::collections::HashSet<String>) -> Vec<String> {
+        let stale: Vec<String> = self
+            .tools
+            .keys()
+            .filter(|n| n.starts_with("mcp__") && !offered.contains(n.as_str()))
+            .cloned()
+            .collect();
+        for n in &stale {
+            self.tools.remove(n);
+            self.hidden.remove(n);
+            self.order.retain(|x| x != n);
+        }
+        stale
     }
 
     /// The hidden tools as a search can see them: name, description, schema, risk, provider.
@@ -1098,9 +1201,16 @@ mod cfg_tests {
             mime: "text/html".into(),
             bytes: 1,
             kind: FileKind::Attachment,
+            created: true,
         })
         .unwrap();
         assert!(wire.contains("\"kind\":\"attachment\""), "wire form: {wire}");
+        // The transcript reads `created` off this wire on both cores — the pi core's tools run
+        // in the tool host and their rows cross a process boundary — so a field that is not on
+        // the wire is a fact the UI cannot have, however correct the Rust side is.
+        assert!(wire.contains("\"created\":true"), "the created fact must be on the wire: {wire}");
+        let back: OutputFile = serde_json::from_str(&wire).unwrap();
+        assert!(back.created, "and it must survive the round trip");
     }
 
     /// Old rows have no kind. Defaulting them to Artifact or Edit would invent a
@@ -1111,12 +1221,16 @@ mod cfg_tests {
         let old = r#"{"path":"notes/x.md","name":"x.md","mime":"text/markdown","bytes":12}"#;
         let f: OutputFile = serde_json::from_str(old).unwrap();
         assert_eq!(f.kind, FileKind::Unknown, "an unlabelled row claimed a kind");
+        // Same rule for the newer fact: a row written before `created` existed must not claim
+        // that a turn made a file it may merely have edited.
+        assert!(!f.created, "an unlabelled row claimed it made the file");
         let wire = serde_json::to_string(&OutputFile {
             path: "p.html".into(),
             name: "p.html".into(),
             mime: "text/html".into(),
             bytes: 1,
             kind: FileKind::Artifact,
+            created: true,
         })
         .unwrap();
         assert!(wire.contains("\"kind\":\"artifact\""), "wire form: {wire}");

@@ -9,11 +9,17 @@
 //! Two asks share this menu item, and both are honest about what they take:
 //!
 //! * **Branch from one of your messages.** The new conversation holds everything *before* that
-//!   message, and the message itself goes back into the composer instead of into the record: the
-//!   point is to ask it again and get somewhere different. The original keeps every later message.
+//!   message **on the path the source is reading**, and the message itself goes back into the
+//!   composer instead of into the record: the point is to ask it again and get somewhere different.
+//!   The original keeps every later message.
 //! * **Branch at an answer.** The new conversation holds that answer and everything before it, and
 //!   stops there — which, asked at the last answer, is a copy of the whole conversation. Take that
 //!   one somewhere else (a different folder, a different question) without touching the original.
+//!
+//! "The path it is reading" matters as soon as a leaf has been moved ([`crate::tree`]): a conversation
+//! can hold rows on two branches, and only one of them is what its transcript shows and what its model
+//! answers from. Copying by row id across the whole file would hand someone a conversation of rows they
+//! never saw, branched from a path they were not standing on.
 //!
 //! What a branch is **not**: a rewind. The original conversation is never cut. If it were, this
 //! would be [`crate::edit`]'s save-and-send-again with an extra step.
@@ -316,6 +322,19 @@ pub fn create_row(
     store
         .set_session_web(new_id, source.web_on)
         .map_err(|e| e.to_string())?;
+    // Who this conversation was cut out of, and which row it was cut at. The session tree is drawn
+    // from these columns, so a branch that records nothing is a conversation nobody branched from as
+    // far as every window that asks — including the one that just pressed Branch.
+    //
+    // Recorded before any row is copied, and the new row is taken back if the write fails: a branch
+    // in the list with no parent is the one thing the tree cannot reconstruct later, and leaving it
+    // there would be a claim about the conversation's history that nothing can correct.
+    if let Err(e) = store.set_lineage(new_id, from, &point.role, Some(point.row_id)) {
+        let _ = store.delete_session(new_id);
+        return Err(format!(
+            "the branch's parent could not be recorded ({e}), so nothing was branched"
+        ));
+    }
     let copied = if point.keep_through >= 1 {
         store
             .copy_through(from, new_id, point.keep_through)
@@ -421,6 +440,77 @@ mod tests {
         assert_eq!(row.workspace, "/tmp", "and the folder it lives in");
     }
 
+    /// The branch records the conversation it came out of and the row it was cut at.
+    ///
+    /// This is not bookkeeping for a debug view: the session tree is drawn from these columns, so a
+    /// branch that records nothing is, to every window that asks, a conversation nobody ever cut —
+    /// including the window that pressed the control a moment ago.
+    #[test]
+    fn a_branch_records_where_it_came_from_and_where_it_was_cut() {
+        let (s, c, ids) = seeded();
+        let mine = s.messages(c).unwrap();
+        let p = resolve(
+            &mine,
+            &BranchReq { session: c, message_id: Some(ids[2]), shown: "second ask".into(), ..Default::default() },
+        )
+        .unwrap();
+        let (new_id, _, _) = create_row(&s, c, &p).unwrap();
+        let row = s.session(new_id).unwrap().unwrap();
+        assert_eq!(row.parent, Some(c), "the tree has to be able to name its parent");
+        assert_eq!(row.branch_role, "user");
+        assert_eq!(row.branch_row, Some(ids[2]), "and the row it was cut at");
+        assert_eq!(
+            s.children_of(c).unwrap().iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![new_id],
+            "the parent's own row list must draw the child under it"
+        );
+
+        // Cut from an answer: the answer is inside the branch, so the recorded cut names the answer.
+        let q = resolve(
+            &mine,
+            &BranchReq { session: c, message_id: Some(ids[1]), shown: "first answer".into(), ..Default::default() },
+        )
+        .unwrap();
+        let (kid2, _, _) = create_row(&s, c, &q).unwrap();
+        let row2 = s.session(kid2).unwrap().unwrap();
+        assert_eq!(row2.branch_role, "assistant");
+        assert_eq!(row2.branch_row, Some(ids[1]));
+        assert_eq!(s.children_of(c).unwrap().len(), 2, "two paths out of one conversation");
+    }
+
+    /// A branch carries the path the source is reading, not every row its file holds.
+    ///
+    /// This is the case where "everything before that row" and "the conversation" come apart: the leaf
+    /// was moved in front of everything, two rows were sent on that branch, and the four rows the leaf
+    /// walked past are still in the record. A copy taken by row id alone would hand the person a
+    /// conversation of rows they never saw in that conversation, answering out of a path they were not
+    /// on — while the transcript they branched from showed two rows.
+    #[test]
+    fn a_branch_carries_the_branch_being_read_and_none_of_what_the_leaf_walked_past() {
+        let (s, c, _) = seeded();
+        s.set_leaf(c, Some(0)).unwrap();
+        let ask = s.append_message(c, &Message::user("third ask")).unwrap();
+        let ans = s.append_message(c, &Message::assistant("third answer")).unwrap();
+        assert_eq!(s.messages(c).unwrap().len(), 2, "the conversation reads its branch");
+        assert_eq!(s.off_branch_rows(c).unwrap(), 4, "and reports the rest as off the path");
+
+        let p = resolve(
+            &s.messages(c).unwrap(),
+            &BranchReq { session: c, message_id: Some(ans), shown: "third answer".into(), ..Default::default() },
+        )
+        .unwrap();
+        let (kid, _, copied) = create_row(&s, c, &p).unwrap();
+        assert_eq!(copied, 2, "the branch's two rows, not the four the leaf left behind");
+        assert_eq!(
+            s.messages(kid).unwrap().iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            vec!["third ask", "third answer"],
+            "and in reading order, so the copy answers from the branch it was cut from"
+        );
+        assert_eq!(s.message_count(kid).unwrap(), 2, "nothing off-path was inserted");
+        assert_eq!(s.message_count(c).unwrap(), 6, "the source keeps every row it held");
+        let _ = ask;
+    }
+
     /// Branching at the last answer is a copy of the whole conversation; branching at an earlier
     /// answer carries that answer and drops what followed.
     #[test]
@@ -499,6 +589,7 @@ mod tests {
             mime: "text/markdown".into(),
             bytes: 120,
             kind: crate::tools::FileKind::Artifact,
+            created: true,
         }])
         .unwrap();
 

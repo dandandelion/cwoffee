@@ -291,8 +291,28 @@ if [[ $check_only -eq 1 ]]; then
   command -v desktop-file-validate >/dev/null 2>&1 && {
     desktop-file-validate "$entry" && echo "  desktop-file-validate: clean"
   }
+  # The two browser paths are Node scripts looked up *beside the binary*, never in the source
+  # tree. Nothing else in the launch check touches them, so an install that lost one reports a
+  # working window and a model that is told the browser is unavailable.
+  bdrv=0
+  for f in driver.mjs session.mjs; do
+    if [[ -f "$root/browser/$f" ]]; then
+      echo "  browser driver: $f present"
+    else
+      echo "  browser driver: $f MISSING - $root/browser/$f is where the app looks for it"
+      bdrv=1
+    fi
+  done
+  command -v node >/dev/null 2>&1 && echo "  node for the drivers: $(command -v node)" \
+    || echo "  node for the drivers: none on PATH - the browser paths cannot start"
   launch_check_run
-  exit $?
+  rc=$?
+  if [[ $rc -eq 0 && $bdrv -ne 0 ]]; then
+    echo "launch check: the window paints, but a browser driver is missing (see above) - re-run"
+    echo "  this script to install it, or the app will report browsing as unavailable"
+    rc=1
+  fi
+  exit $rc
 fi
 
 # ---- what gets installed -------------------------------------------------------------
@@ -393,6 +413,30 @@ if [[ "$core" == "pi" ]]; then
   fi
 fi
 
+# ---- the browser drivers ---------------------------------------------------------------
+# Both browser paths are Node scripts the app finds *beside the binary*: `driver.mjs` is the
+# one-shot walk the `browse` tool drives, `session.mjs` is the kept browser behind the panel.
+# Playwright is vendored next to them, because the app runs `node .../driver.mjs` with no install
+# step of its own. A window that paints and a model told "no browser" is exactly the gap this
+# script exists to close, so the drivers are part of the install and part of the check.
+if [[ -d "$here/browser" ]]; then
+  mkdir -p "$root/browser"
+  for f in driver.mjs session.mjs package.json; do
+    if [[ -f "$here/browser/$f" ]]; then
+      cp "$here/browser/$f" "$root/browser/$f"
+    else
+      echo "WARNING: $here/browser/$f is not in the source tree; the installed app cannot $([[ $f == session* ]] && echo "keep a browser open" || echo "browse")"
+    fi
+  done
+  if [[ -d "$here/browser/node_modules" ]]; then
+    rm -rf "$root/browser/node_modules"
+    cp -a "$here/browser/node_modules" "$root/browser/node_modules"
+  fi
+  echo "installed browser drivers -> $root/browser ($(cd "$root/browser" && ls -1 | tr '\n' ' '))"
+else
+  echo "NOTE: no browser/ beside this script: the installed app will report browsing as unavailable."
+fi
+
 # ---- the launcher -------------------------------------------------------------------
 # Why this file exists: an app started from the apps menu gets the session environment,
 # not your login shell's. `scripts/run-pi-app.sh` exports five things a menu launch cannot
@@ -410,6 +454,11 @@ fi
   echo "# the path baked into it at build time is gone. Point at the installed copy: it is the"
   echo "# one thing that cannot be deleted by a cargo build."
   echo "export CWOFFEE_UI_DIST=\"$root/ui/dist\""
+  # This copy is an install, not a build tree. The app uses that to decide whether a browser driver
+  # sitting next to it should be the same age it is: in an install the two are copied together in one
+  # second, so a driver older than the binary means an install that moved one half and left the other.
+  # In a source tree the drivers are sources and older by nature, so saying so there is noise.
+  echo "export CWOFFEE_INSTALLED=1"
   if [[ "$core" == "pi" ]]; then
     echo "# The pi core: the model process, the extension that mounts cwoffee's tools, and the"
     echo "# Rust tool host behind them. Without the extension the model is told \"tool not"

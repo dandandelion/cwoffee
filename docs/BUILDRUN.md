@@ -2444,3 +2444,500 @@ because for a second the closing window and the starting gateway hold the same s
 `crates/gateway/src/main.rs` now takes its token, core and pi paths from the environment as well as
 from flags (flag > env > file), which is what lets a launcher-started hand-off serve the engine that
 launcher was built for. `ps` is why the token is the one exception: it comes from a file, never argv.
+
+
+### Trap 127: an install can be green and still ship last week's page
+
+A fix shipped, tested on both cores, and then reported back as "still here". It was still there,
+because *nothing the user runs had been rebuilt from it*. Three traps stacked on top of each other,
+and none of them prints an error:
+
+1. **The launcher runs an installed copy, not the build tree.**
+   `~/.local/share/applications/cwoffee.desktop` Execs
+   `~/.local/share/cwoffee-desktop/cwoffee`, which execs
+   `~/.local/share/cwoffee-desktop/bin/cwoffee-app` — a *copy* (see Trap 125: a launcher aimed at
+   `target/release` is a launcher that does nothing for the minutes a build takes). So
+   `cargo build --release` changes nothing about the app in the dock, and a running window keeps the
+   binary and the page it was started with. `scripts/install-desktop.sh` is the step that moves a
+   build into the app, and it says so in the launcher it writes.
+2. **The desktop window's page is embedded at compile time, and cargo does not notice that
+   `ui/dist` changed.** `tauri-build` emits `cargo:rerun-if-changed` for the crate's own `src` and
+   for `tauri.conf.json`, not for the built frontend. Rebuild `ui/dist` at 10:31 and run
+   `cargo build --release -p cwoffee-app` at 10:32 and you get `Finished in 0.11s`, an untouched
+   binary, and an installer that cheerfully reports `installed 21M binary` + `launch check: OK` —
+   installing the old page. The check cannot catch it either: a window that paints proves the
+   binary opens, not which bundle is inside it. Read the binary instead — the asset keys are stored
+   in the plain and must be the files you just built:
+
+   ```sh
+   strings -n 12 target/release/cwoffee-app | grep -oE 'assets/index-[A-Za-z0-9_-]+\.(js|css)' | sort -u
+   ls ui/dist/assets
+   ```
+
+   Two names that disagree is the whole diagnosis. `touch crates/tauri-app/src/main.rs` is what makes
+   cargo rebuild; `cargo clean -p cwoffee-app` works too and costs a link.
+3. **`--bin` restricts the whole invocation, not the package you meant.**
+   `cargo build --release -p cwoffee-app -p cwoffee-gateway -p cwoffee-bridge --bin cwtool` compiles
+   `cwtool` and *nothing else* — the other two packages have no bin by that name, and cargo does not
+   say so; it ends in `Finished` and leaves both binaries exactly as old as they were. Ask for the
+   bins in separate commands.
+
+The related trap in the same area, already guarded: the board leaves `ui/dist` carrying the self-test
+bundle, and `install-desktop.sh` refuses it unless `--allow-test-bundle` is passed. Do not pass it —
+that bundle drives the endpoint, the config file and the session store when armed, so installing it
+as the daily driver makes the desktop app's behaviour depend on the last board run. Build the
+production page with a plain `cd ui && npx vite build` first.
+
+So the honest sequence after any change the user will look at is: production `vite build` → build
+each binary *without* a stray `--bin` → compare the embedded asset keys with `ui/dist` →
+`scripts/install-desktop.sh` → say out loud that the app has to be restarted, because a running
+window is not the install.
+### Trap 128: a check group that `return`s ends the run without saying anything
+
+The in-app harness is one long async function with its groups inlined as
+`if (want('mcp', '…')) { … }` blocks, and the line the harness greps for —
+`SELFTEST ok` or `SELFTEST FAILED (n)` — is printed at the **end of that function**. Several groups
+bail out of their own body with `return fail('…')`. That records the failure and leaves the function,
+so the summary line never prints, and `scripts/selftest.sh` sits through its whole `BOARD_WAIT`
+before reporting `no verdict in 900s`. The red is real, but it names nothing, costs ten minutes, and
+reads like the window was left covered.
+
+Two rules for anyone adding a group:
+
+* If the group's body bails with `return`, put the body in its own async closure —
+  `await (async () => { … })()` — so a bail ends the **group**, the suite carries on, and the
+  summary prints with the failure counted.
+* Never treat `return` as reporting. `fail(msg)` is what increments the counter; `return` only stops
+  things, and stopping silently is the failure mode this trap is about.
+
+The runner now prints a verdict in a `finally` as well: if the summary was never reached, it says
+`SELFTEST FAILED (n): a group returned inside "<last group id>" before the summary…` instead of
+quoting session and model numbers the run never got to measure. So the symptom to watch for is gone
+from new runs — but it is still what a bare `return` from a group used to look like, and an older
+branch will still do it.
+
+### Trap 129: a comment written `/* … */` in markup is a text node, and it eats window height
+
+`chrome-height` went red with `96px of window sits below both the sidebar and the card`. The check was
+right and the change that caused it was a paragraph explaining why the MCP servers page has two lists —
+written in the template as `/* … */`, because that is how comments look everywhere else in the file.
+Svelte has no such comment: out in the markup those characters are **text**, so the page grew a child of
+`.app-shell` holding six lines of prose — which painted across the bottom of the window and, being an
+anonymous flex item in a definite-height column, took 96px from the columns row.
+
+The reading that matters: the failing element had `flex: 1 1 0%` inside a `760px` column and measured
+`628px`, which looks like the flex algorithm misbehaving. It was behaving. The 96px was a *sibling box*
+that `element.children` cannot see, because it is a text node.
+
+Six harness runs (~4½ minutes each, cargo relink included) produced nothing; one webview probe produced
+the answer in about ten seconds:
+
+```
+python3 -m http.server 8199 -d ui/dist        # the built page; the browser build boots to the start screen
+python3 scripts/webview-rect.py http://127.0.0.1:8199/ --expr "JSON.stringify((()=>{
+  const sh=document.querySelector('.app-shell');
+  return {innerH: window.innerHeight, row: Math.round(sh.children[1].getBoundingClientRect().height),
+          stray: [...sh.childNodes].filter(n => n.nodeType === 3 && n.textContent.trim().length > 0)
+                  .map(n => n.textContent.trim().slice(0, 40))};
+})())"
+```
+
+`scripts/webview-rect.py` opens the URL in **the same WebKitGTK the app links**, runs arbitrary JS, and
+prints JSON — so a layout question gets asked of the real renderer without cargo, without a mock, and
+without the rest of the board. Ask it for the loose text nodes before theorising about CSS.
+
+Three things came out of it:
+
+* **Markup comments are `<!-- … -->`.** A `//` or `/* */` outside `<script>` is content. The same class
+  of slip once painted a CSS comment's prose on the start screen; the fence is the difference.
+* **The distance between cause and symptom is not a hint.** The text node lived in the shell, so it stole
+  height on every screen — including a run of `chrome-height` alone, with the settings page never opened.
+  "the failing group is nowhere near the change" ruled nothing out.
+* **`chrome-height` now names the culprit**: it fails with `the shell holds N loose text node(s), which
+  paint and take height: "Two lists, on purpose, because…" — a comment in markup is <!-- like this -->,
+  not /* like this */`, instead of reporting a band of empty window and leaving the next reader to the
+  flex algorithm.
+
+### Trap 130: a `serve()` that runs its accept loop inline leaves an app that mounts and never comes up
+
+The kept browser lives in the app, and on the pi core the tool processes reach it over
+`agent_dir/cwoffee-browser.sock`. The first version of `browser_hub::socket::serve` bound the socket,
+printed `kept browser answers on …`, and then ran `loop { listener.accept().await }` **in the caller**.
+Both shells call `serve(...).await` while putting the start together, so the app finished mounting its
+browser and stopped there: it never reached the line the board reads to learn which core it is grading,
+and the run ended with
+
+```
+[selftest.sh] no 'core pi ... up' in the log after 15 s: the board cannot tell what core it is
+grading, so its verdict would mean nothing
+```
+
+Nothing in that message names the browser, and nothing in the log looks like a hang — the last line is
+a perfectly healthy `kept browser answers on /tmp/.../cwoffee-browser.sock`. That is what makes this
+trap worth writing down: the failure appears in a *different component* than the one that caused it,
+several seconds later, and only on one core. The Rust core never noticed, because it uses
+`BrowserRoute::in_process` and never mounts that socket at all.
+
+`mcp::socket::serve` already had the right shape — bind, `tokio::spawn` the accept loop, return — and
+for the same reason: handing out a door is not standing in it. The fix is one `spawn`, and the doc
+comment on `serve` now says the caller must get control back. Two checks that came out of it:
+
+* the socket helper's own comment states that a caller which awaits it never comes up;
+* `docs/PI-CORE-PROTOCOL.md` lists it as a protocol fact for the pi core, next to `peek()` not
+  awaiting, because both are the same rule seen from opposite ends: **nothing on the path of a risk
+  check, a tool call, or a start may wait on a loop that has no end.**
+
+### Trap 131: a rename that compiles can wire a same-typed neighbour, and the check that fails looks like a missing feature
+
+The browser panel keeps its own state (`paneNow`, `paneErr`) beside the older Settings-side browser
+status state (`browserNow`, `browserErr`) — different payloads, same types. A rename pass renamed the
+declarations and the functions, and left the component call site reading `err={browserErr}`. That
+compiles, `svelte-check` says `0 errors and 0 warnings`, and the panel renders: it just shows the wrong
+variable, which for an error line means *no* line, because nothing ever writes the Settings variable.
+
+The self-test failure was `the panel refusing a file:// address did not happen within 8000ms` followed
+by `... without saying what it does open: ""` — which reads like the app's refusal is missing or the
+DOM attribute is missing. Both were fine: `browser_open` returned its refusal, `paneErr` held it, and
+the panel was never told about it. Two fixes, both needed:
+
+* `err={paneErr}` at the call site, and the group now also asserts the refusal *sentence*, not just the
+  attribute;
+* the panel's failure state records **which kind** of failure it is (`paneErrKind: 'read' | 'act'`).
+  A failed state *read* is transient and the next good read clears it; a refusal the person caused by
+  acting stays until they do something else. Without that split, the 1.5-second poll wiped the refusal
+  off the panel about a second after it appeared, so even a correctly wired panel showed the sentence
+  for less than a second — and a check that reads "is there an explanation?" at the wrong moment fails
+  a feature that works.
+
+The general rule: when a rename leaves a neighbour of the same type behind, the diff must include the
+call site, and a green type-check is not evidence about which variable is wired.
+
+### Trap 132: an install can paint a window and still have no browser beside it
+
+`install-desktop.sh` copied the binary, the gateway, the tool host and the page, and its launch
+check confirmed the window painted. Nothing it copied, or checked, was `browser/driver.mjs` — the
+one-shot walk — and nothing had heard of `browser/session.mjs`, the kept browser behind the panel.
+Both are looked up **beside the binary** (`../browser/…`), never in the source tree, so an install
+that skips them is an app whose `browse` tool and browser panel answer "no driver", with a healthy
+window, a green launch check, and a Settings row saying the browser is unavailable that nobody reads.
+
+The install now copies `driver.mjs`, `session.mjs`, `package.json` and the vendored `node_modules`
+into `$root/browser`, and `--check-only` names each driver it finds or is missing (a missing one
+fails the check even when the window paints, because the window is not the only thing installed).
+
+Check it by hand with:
+
+```sh
+ls ~/.local/share/cwoffee-desktop/browser        # driver.mjs session.mjs node_modules …
+```
+
+### Trap 133: a red board that prints no verdict looks exactly like a run that never finished
+
+The fail branch of `scripts/selftest.sh` grepped the log for `SELFTEST FAIL` lines and exited 1 —
+without ever printing the `verdict:` line every other branch prints. Two runs were then read as
+"no verdict in 1500s", i.e. as a hang, and the search for a missing feature began. The runs had
+finished; they had lost. The branch now says `verdict: FAILED - the page board's own summary
+follows` before quoting the failures. A script that goes silent on its failure path turns a red
+result into a mystery, and mysteries cost more than red.
+
+### Trap 134: a check that compares a live countdown against a fresh read is grading a clock race
+
+The browser column's status line is the engine's sentence, and the claim written to prove it said:
+read the panel's line, read `browser_panel`'s `says`, require them equal. It failed on
+
+```
+"a browser is open at …/selftest-page.html#first… closes itself in 300s of "
+                                     vs "…closes itself in 299s of "
+```
+
+Nothing was wrong. That sentence contains a countdown read *now*, and the two reads happen a moment
+apart — the column's from its last poll, the check's from a fresh verb. The claim was comparing two
+clocks. It now compares the sentence with the digits normalised, and the number itself is graded
+elsewhere, by the idle arm, which *waits the span out* instead of reading it twice. A check that
+insists two live values match is a check that fails whenever time passes, which is to say always.
+
+### Trap 135: redrawing a component can drop a hook the board reads, and the failure names no culprit
+
+The browser column was rewritten with icons, tabs and a picture you can click. One run later the board
+said `the open panel does not say it is open`: the old root carried `data-browser-open="yes"`, the new
+one did not, and the check reads that attribute. Nothing in the failure says "an attribute is missing" —
+it reads like a panel that forgot it was open.
+
+The cheap guard, worth running after any rewrite of a graded component: diff the hooks it exposes
+against the version in `HEAD`.
+
+```sh
+git show HEAD:ui/src/lib/BrowserPane.svelte | grep -oE 'data-[a-z-]+' | sort -u > /tmp/old.attrs
+grep -oE 'data-[a-z-]+' ui/src/lib/BrowserPane.svelte | sort -u > /tmp/new.attrs
+diff /tmp/old.attrs /tmp/new.attrs        # anything on the left that is not on the right is a check about to fail
+```
+
+The attributes are not styling. They are the interface the board speaks, and a redesign that keeps the
+look while renaming the hooks is a redesign that silently un-tests the feature.
+
+
+### Trap 136: a `pkill -f` pattern that matches your own command line ends your own shell
+
+`pkill -f "cwoffee-gateway --port 8199"` was typed into a shell whose own `bash -c` line contained
+that exact text. The pattern matched the shell running the command, so the shell died with status
+143 halfway through the line — the gateway was killed, the replacement gateway never started, and the
+next command in the sequence ran against nothing. It reads as a mystery ("the server vanished") and it
+is one command away from repeating.
+
+**Rule: end background processes by the pid they printed.** `pgrep -af <binary path>` first, then
+`kill <pid>`. A pattern-match is a shotgun pointed at the whole process table, and your own invocation
+is in that table — usually containing the pattern verbatim.
+
+### Trap 137: a design pass that only touches CSS is still graded by the geometry groups, not by the eye
+
+The redraw of the browser column changed markup and stylesheet only: no engine verb, no payload key.
+It still moved a whole column's height and started a new flex child in the shell, which is exactly
+what `chrome-height` measures (the lowest visible column must not hang below the window, and must
+start on the chrome row's bottom edge). A CSS-only change is a layout change.
+
+**Rule: after any visual pass, run `chrome-height` plus the group whose component changed — and diff
+the `data-*` hooks against the previous version before trusting a green** (Trap 135). Then look at a
+photograph of it: the geometry suite passed on the first version of this column, and the empty state
+in that version was a blank white box that read as a bug.
+### Trap 138: a self-test arm that reads the DOM in the same task as the state change grades a render that never happened
+
+The switched-off arm of `browser-panel` (`scripts/selftest.sh --no-browser browser-panel`) does
+`setBrowserPane(true)` and then looks for `[data-browser-pane]`. Svelte 5 renders on the microtask
+*after* the state change, so in the same task the element is not there — and the arm failed with "the
+panel did not render with no browser mounted" while the panel was perfectly capable of rendering.
+
+It had been passing, which is the interesting part: in the runs where the column was already open
+from the persisted setting, `setBrowserPane(true)` changed nothing and the element was already on
+screen. The arm was grading a leftover, not its own action. A check whose pass depends on what the
+previous state happened to be is a check that goes red whenever the state is honest.
+
+**Rule: after a state change in an in-app arm, `await renderTick()` (and a short sleep where layout
+matters) before querying.** And when an arm asserts something about the *previous* render, say so:
+the arm used to assert "the panel reports alive=no" immediately after hiding the panel, which was
+only ever true because the hide had not been drawn yet. It now asserts what it means — hiding the
+column with nothing open takes the column away, and the titlebar button that explains why is still
+there.
+
+### Trap 139: a second webview in a Tauri window does not take a position, and breaks the first one
+
+The browser panel was asked to be **a real page in the window** rather than pictures of a browser in
+a child process. The driving part was easy and works: `initialization_script` installs a bridge in
+the page before its own scripts run, `eval_with_callback` runs a step and reads the answer back, and
+a model's click changes the page for the person looking at it. What did not work is the part that
+makes it a *panel*:
+
+* `Window::add_child` (Tauri 2.12, `unstable`) puts a webview **inside** the window — but on GTK its
+  position and size are ignored, so the page comes up covering the entire window. And once the window
+  holds two webviews, `app.get_webview_window("main")` stops resolving, which silently switches off
+  the window controls, the self-test harness and every command that reaches for `"main"`.
+* A borderless **child window** (`WebviewWindowBuilder::parent(&main)`) does take a size — and
+  `set_position` / `set_size` afterwards do nothing on this desktop. No error, no move. The page sits
+  at the window's corner. Unparented behaves the same.
+
+**Rule: settle the geometry before believing the feature.** The probe (`--page-probe`) exists to
+answer this in one run: it opens a page, asks for a 300x200 box, and prints what the page reports for
+`innerWidth`/`innerHeight` and where the window says it sits. A page that drives perfectly and is in
+the wrong place is still a broken panel, and only an assertion like that catches the difference
+before it is called a feature.
+
+**What settled it, and what the rule cost.** The page is now built as a GTK child of a `gtk::Fixed`
+overlay above the window's own view (`crates/tauri-app/src/page_embed.rs`), which is the container
+that honours exact bounds, and the rectangle comes from the panel's CSS — `[data-browser-pagearea]`,
+measured while the column is open. The claim is graded by reading the widget's **allocation** back off
+GTK and comparing it with the box the panel asked for, in the probe and in the panel itself: a page in
+the wrong rectangle now says so in the column rather than being admired in a screenshot.
+
+### Trap 140: a webview's minimum height is its page's height, so a band next to it eats the row
+
+The page was asked for 365x497 and allocated 365x120, while the log band beside it was given
+everything left. GTK was not ignoring the request: a `WebKitWebView`'s *minimum* size is the natural
+size of the document inside it, and a 1180px-wide page has a natural height of hundreds of pixels, so
+the 120px the panel's CSS allowed was refused. Two boxes were involved and only one was lying: the
+band's `flex-basis: 0` had collapsed to its CSS minimum, which is what squeezed the page.
+
+**Rule: pin the wrapper, not the webview, and never let a flexible band size itself by its content.**
+The webview is wrapped in a `GtkBox` with `set_size_request(-1, 0)`, so the request travels from the
+box that is placed; and the panel refuses any page band under 45% of its own height, because a page
+that is 120px tall is not a page. The check reads both facts — the band's height and the widget's
+allocation — rather than trusting either component's CSS.
+
+### Trap 141: `Fixed::add` stacks above the window's first child, and a hidden widget keeps its old box
+
+Two GTK defaults pointed the wrong way. `GtkFixed` puts children it adds **above** what was already
+there, so the page widget covered the app's own view and the clicks meant for the transcript were
+being served by the page — which looked like a working panel and a broken app until it was measured.
+And `set_visible(false)` freezes a widget's allocation: a hidden page kept reporting the rectangle it
+had while it was shown, so "the page is where the box is" was true for a page that was not on screen
+at all.
+
+**Rule: report allocation *and* visibility, and raise the thing that should be on top after creating
+the new one.** `placed` carries `shown`; the probe refuses to grade a page that is not visible; and
+the app's own webview is raised after the page is built.
+
+### Trap 142: a page counts its records from one every document, so ids the app hands out must be the app's
+
+The drawer keys its rows by a record's id. The hub had been taking the page's counter, and a new
+document starts at 1 — so after a navigation two records shared an id and WebKit threw
+`each_key_duplicate` inside the harness, which surfaced as a null control in a minised bundle rather
+than as the collision it was. The same reset cursor made the driver decide a new page's first records
+were already seen, so the drawer quietly stopped filling after a navigation.
+
+**Rule: anything used as an identity or as a "newer than" cursor belongs to the app, not to the
+thing being counted.** The hub stamps its own sequence on every record and keeps the page's number for
+the page's bookkeeping; the driver resets its cursor when the boot token says a new document arrived.
+`records_from_two_documents_never_arrive_with_the_same_id` is the check.
+
+### Trap 143: a self-test group that `return`s from the runner leaves a red that names nothing
+
+`if (!(await run())) return` inside a group looked hygienic and was not: it returns from the whole
+self-test runner, so the summary never printed and the verdict came out
+`SELFTEST FAILED (0)` with no finding attached — a failure that spends the whole board timeout and
+then says nothing about what went wrong.
+
+**Rule: a group records its findings and falls through.** `try { await run() } finally { put the
+window back }` and `if (okLine) pageLog(okLine)`; the harness's `finally` prints the verdict even when
+a group bails. Related: a check that presses `document.querySelector(...) as X).click()` crashes on a
+missing control with a TypeError from the minified bundle — take the element by name, fail with the
+name, then press it.
+### Trap 144: editing a bash script while it is running edits the run
+
+A full suite was in flight and the script was polished mid-flight. Bash reads a script as it goes, by
+byte offset, so the running interpreter resumed at an offset that no longer meant what it said:
+`line 757: iring: command not found`, then `syntax error near unexpected token 'done'`, and a board
+that died halfway with its arms unrun.
+
+**Rule: a script that is running is a file you may read and must not write.** Either finish the run or
+kill it first, then edit — and if a run dies with a syntax error in a file you know parsed, look at
+the clock against your own edits before believing the file is broken. Related: the same applies to the
+UI bundle and the release binary the suite launches; source edits during a run change nothing in it,
+which is a quieter way to be misled about what was measured.
+
+### Trap 145: a group graded in a shape it was not started in makes a full pass red and hides its own arm
+
+A kept browser is one shape per process — a relayed picture column, or a page painted in this window.
+The full pass runs the column, so the in-page group ran there and honestly said "this start has no
+page in the window". Honest, and wrong: it failed a start that was never meant to grade it, and because
+the launcher only runs the in-page arm when the main verdict was clean, the failure also cancelled the
+launch that *does* grade it. A red that names nothing, and an arm nobody saw.
+
+And the same run hid a second thing: the launcher only ran its own arms — the in-page start, the
+short-span idle config, the light palette, the MCP second board — when the main board's verdict was
+clean. One environmental failure (a window that spent the run off-screen) cancelled every arm below it,
+so a red at the top turned into a run that measured less than it said it did.
+
+**Rule: an arm that starts its own process reports its own result.** It does not wait for the main
+verdict, because the main verdict is the reason it exists separately. The final line adds them up.
+`CWOFFEE_SELFTEST_SKIP` names the groups this launch must not grade; the harness says so in its own
+note, lists them among the not-run, and the launcher's second start — with the switch that changes the
+shape — runs them. A group that cannot be graded here is a group that did not run, not a group that
+failed.
+
+### Trap 146: a state attribute and a content attribute can share a selector name, and the check passes on the wrong element
+
+The panel's root carried `data-browser-log="yes"` (is the drawer open?) and the drawer's row list
+carried `data-browser-log`. A check written as `querySelector('[data-browser-log]')` therefore
+matched the **panel root** — an ancestor that appears first in document order — and read its whole
+`textContent` as if it were the log. It passed while the drawer was shut, and later passed with the
+log rows missing, because the root's text happened to include other panels' strings.
+
+The check that this hid: with the selector fixed, the picture-column browser turned out to have **no
+records at all** in its drawer except the app's own.
+
+**Rule: a state attribute is named for the state.** `data-browser-log-open` for the flag, and the
+content selector keeps one meaning. When a check waits for an element, it waits for the element whose
+contents it then grades — `[data-browser-drawer] [data-browser-log]`, not a bare name that anything
+upstream can answer.
+
+### Trap 147: two vocabularies for one fact, and the model's tool reads the quiet one
+
+The child-process driver says `console` / `pageerror` / `requestfailed`; the page-in-the-window driver
+says `diag`. The hub filled the panel's bags from the first and its record list from the second. The
+person saw the error in the drawer, `page_log` said the page had said nothing, and a model asked to
+explain a failing page answered from a page it believed was silent — the complaint in the transcript
+that started this whole change.
+
+**Rule: the record is the fact; a bag is a view of it.** Every event that reaches the hub lands a
+`Diag` (`note_flat`), with the app's id and a `source` marking who said it — empty for the page's own
+words, `hub` for what only the app could know (a document arriving, an address moving inside one
+page). "The page logged nothing" and "nothing happened" are different answers, and a reader who cannot
+tell them apart stops trusting the log.
+
+### Trap 148: a click that navigates answers from the page it left
+
+WebKit keeps the old document scriptable for a few hundred milliseconds after a link click. The step
+answered `location.href` correctly — about a page that no longer existed — and `url_after` named the
+old address, so the model concluded the click had failed and tried it again. Comparing the boot id
+straight after the step did not catch it: the new document had not started yet.
+
+**Rule: when the step was meant to leave, wait for the leaving.** The bridge marks a click on an
+`<a href>` or a submit as `may_navigate`; the driver then polls the document id for `NAV_WAIT`
+(1.6s) before answering, and says `navigated` / `url_from` / `url_after` when the page moved. The
+tool prints which page the words above came from. Proved by a `--page-probe` check that goes red when
+the marking is stubbed out.
+
+### Trap 149: a probe that registers a workspace registers it in the person's database
+
+Every `--page-probe` run added `/tmp/page-probe.XXXX/ws` to the `workspaces` table of the **real**
+store. Fourteen runs later the sidebar was a screen of folders named `ws`, each holding nothing, and
+the user called it a leak — which is what it was.
+
+**Rule: a scratch folder is deleted from the list as well as from the disk.** `prune_dead_workspaces`
+runs at boot: a registered path is forgotten when the folder is not there to open *and* no session
+says it lives there. A folder with history is never dropped (an unmounted drive should not cost the
+person its label and colour), and a folder that exists is never dropped.
+
+### Trap 150: a guard that holds the folder the app *booted* in refuses the folder the person is in
+
+The page box confines local pages to the working folder, and it held a `PathBuf` copied at startup.
+The conversation can move — the person opens another conversation, or moves this one to another
+folder — while the window, the page box and its guard stay exactly where they are. So opening
+`Downloads/driving-scene.html`, a page sitting in the folder the person was standing in, was refused
+as "a link out of the workspace", naming a folder they were not in, and the model concluded the
+browser was broken.
+
+**Rule: confine to an answer, not to a value.** `page_embed::WsOf` is `Arc<dyn Fn() -> PathBuf>`,
+asked of the engine at navigation time; the address box asks the same question (`live_workspace`).
+Anything else is a second copy of live state, and it goes stale on the first switch. The test flips
+the folder between two calls and grades both directions — the new folder allows, the folder it left
+refuses — because "it allows the folder it started with" was already true and was the bug.
+
+### Trap 151: a refusal that names nothing, and a `wait_for` treated like a click
+
+Two sentences in the browser cost the model a turn each. `2 elements match "Capybara"` with no
+candidates is one: the model cannot write a narrower selector than the page can show it, so it
+guesses again. `wait_for` shared `locate`'s refusal, so "has it appeared?" came back as an error
+about a page the model had already read — waiting touches nothing, and four matches answer the
+question just as well as one.
+
+**Rule: the refusal carries the other side's vocabulary, and looking is not acting.** An ambiguous
+target lists the candidates (tag, id, classes, placeholder, words inside) and says nothing was
+touched; `locate(target, {any: true})` is what the look-only verbs use, and the answer says how many
+matched. Same shape for a refused local page: name the folder it is confined to, not just the word
+"outside".
+
+### Trap 152: two clocks in one walk, and a message that was never formatted
+
+A `browse` walk with `timeout_secs: 10` ended with two sentences and no page report: the tool said
+*"the browser did not answer within 10s"* and the page box said *"the page did not answer within
+{}s"*. Both are true and neither explains the other.
+
+**Rule: the caller's deadline is the only deadline, and a number in a message has to be a number.**
+`act` carries `timeout_ms`; `step_budget` clamps it (0.5s floor so a step is never guaranteed to
+fail, 25s ceiling so an answer can still arrive inside the caller's own wait) and the box waits on
+that, not on a constant of its own. The tool's timeout sentence now names the seconds it had, the
+seconds the walk was given, how far it got and which step was running, and leads the partial report
+with `health` — the finding that survives a timeout. The `{}` was `json!` with no `format!` behind
+it: a model can read a brace, but it cannot act on one.
+
+### Trap 153: a missing picture said nothing, so the model asked for a picture again
+
+Every `session: true` call in one transcript asked for `screenshot: "viewport"` and got neither
+pixels nor a word about them. The code had a branch for "the browser sent no bytes" that pushed
+nothing into the report. The model, having no reason, did the only thing it could: asked again, three
+calls in a row, each costing a turn and an approval card.
+
+**Rule: an absence is a sentence.** `no_pixels_words` renders the browser's own reason (a page that
+is already on screen has no picture of itself) and points at the verbs that do work there — `text`,
+`snapshot`, `a11y`, `eval`. A picture over the result ceiling says that too, with both numbers. The
+rule is not browser-specific: any branch that ends with "and so we said nothing" is a branch a model
+will walk into repeatedly.

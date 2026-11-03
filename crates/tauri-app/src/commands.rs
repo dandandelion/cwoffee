@@ -32,6 +32,32 @@ pub struct AppState {
     /// verb the window uses is on the trait, which is the whole point of Move 0.
     pub host: Arc<dyn HostOps>,
     pub store: Arc<Store>,
+    /// What the browser tool can do in this start, and how the person configured it. The
+    /// settings screen reads it through `browser_status` rather than describing it from the
+    /// UI's own guess: whether a run will paint a window on this desktop is a claim about the
+    /// person's machine, and a screen that paraphrases that policy is a screen that drifts.
+    pub browser_cfg: cwoffee_engine::tools::browser::BrowserCfg,
+    /// The browser this app is **keeping**: one browser, held by this process, which the
+    /// window's sidebar shows and the model's `browse` calls can act inside. `None` only when
+    /// the kept browser is switched off or its driver is missing — and then the panel says
+    /// that, rather than showing an empty frame and inviting a click that cannot work.
+    pub browser: Option<std::sync::Arc<tokio::sync::Mutex<cwoffee_engine::browser_hub::Hub>>>,
+    /// A synchronous read of the same browser's state, for verbs that only report it.
+    pub browser_state: std::sync::Arc<std::sync::RwLock<cwoffee_engine::browser_hub::Snapshot>>,
+    /// Set while `--page-probe` is checking where the page in the window sits. Two things can place
+    /// that one widget — the panel's own layout and the probe — and whichever reported last wins, so a
+    /// geometry claim would otherwise flake on whether the panel happened to redraw during it. The
+    /// panel is not deafened permanently, only for the seconds the check runs.
+    pub probe_holds_box: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// How this start was configured for kept browsers (driver path, idle clock, whether the
+    /// person switched them off). Held here as well as inside the hub so a status verb can
+    /// describe the *policy* without taking the lock a browser call is holding.
+    pub browser_keep: cwoffee_engine::browser_hub::SessionCfg,
+    /// Which folder a local page may be opened from, for the panel's address box. The workspace is
+    /// the boundary the model's file tools already use, so the box uses it too — and it is asked of
+    /// the engine rather than copied at startup, because the folder moves when the person switches
+    /// conversation and this window does not. See `live_workspace`.
+    pub host_for_browser: std::sync::Arc<dyn cwoffee_engine::host::HostOps>,
     /// A note straight into the webview queue. The quit-while-busy refusal uses it,
     /// and it is the only way to say something to the window without editing the UI:
     /// notes are already a rendered concept.
@@ -67,14 +93,429 @@ pub struct AppState {
     /// mounted, and the status command says that rather than reporting zero servers as if the
     /// configuration were empty.
     pub mcp: Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>>,
+    /// How a tool call reaches those servers. This process on the Rust core; the app's hub
+    /// over a socket on the pi core; and a sentence about a hub no tool process can reach when
+    /// the socket did not open. A row reading "mounted" while no call can get there is exactly
+    /// the claim this prevents.
+    pub mcp_route: String,
 }
 
-/// What the third-party servers are doing, in the words a settings row needs: which core is
-/// running, whether servers are mounted here, what each one answered at startup, and how many
-/// bytes the catalog costs every prompt.
+/// What the browser tool will do in this start, in the tool's own words.
 ///
-/// Watch-role on both transports. A reader is asking "is what I configured actually running?",
-/// which is a question about a program the app started, not a change to make.
+/// The model is an argument because the answer depends on it: whether the run paints a window
+/// on the person's desktop is decided by that model's modalities, and the model can change
+/// mid-session. A settings screen that asked once at boot would be describing a start that is
+/// no longer happening.
+#[tauri::command]
+pub async fn browser_status(
+    state: tauri::State<'_, AppState>,
+    model: String,
+) -> Result<serde_json::Value, String> {
+    let mut cfg = state.browser_cfg.clone();
+    let path = state.config_path.clone();
+    cfg.vision = match cwoffee_engine::config::vision_in(&path, model.trim()) {
+        Some(true) => cwoffee_engine::tools::browser::Vision::Yes,
+        Some(false) => cwoffee_engine::tools::browser::Vision::No,
+        None => cwoffee_engine::tools::browser::Vision::Unknown,
+    };
+    // Whether this start has a page of its own to show. It changes the answer about a window: with
+    // the sidebar holding the browser, no walk paints one on this desktop, and a screen that said
+    // otherwise would be describing a start that is not happening.
+    let window = state
+        .browser_state
+        .read()
+        .map(|g| g.native)
+        .unwrap_or(false);
+    let (headed, why, shot) = cwoffee_engine::tools::browser::decide(&cfg, "", window);
+    Ok(serde_json::json!({
+        "mounted": cfg.usable(),
+        "driver": cfg.driver.as_ref().map(|p| p.display().to_string()),
+        "node": cfg.node,
+        "headed": headed,
+        "why": why,
+        // True when the page in this window *is* the browser a `browse` call gets. The settings row
+        // has to say that, because "it will run headless" means something quite different once there
+        // is no second browser to be headless about.
+        "window_is_browser": window,
+        "screenshot_default": shot,
+        "vision": match cfg.vision {
+            cwoffee_engine::tools::browser::Vision::Yes => "yes",
+            cwoffee_engine::tools::browser::Vision::No => "no",
+            cwoffee_engine::tools::browser::Vision::Unknown => "unknown",
+        },
+        "says": cwoffee_engine::tools::browser::status_line(&cfg, window),
+        // The kept browser gets the engine's own sentence, not a paraphrase: a settings row
+        // that invents its own wording for "does a browser stay open here" is how the panel
+        // and the file eventually disagree.
+        "keep": cwoffee_engine::browser_hub::status_line(
+            &cwoffee_engine::browser_hub::SessionCfg::from_browser_cfg(&cfg),
+            &cwoffee_engine::browser_hub::Hub::peek_shared(&state.browser_state),
+        ),
+        "keep_idle_secs": cwoffee_engine::browser_hub::SessionCfg::from_browser_cfg(&cfg).idle_secs,
+    }))
+}
+
+/// The kept browser, as the sidebar sees it: what is open, who opened it, who touched it last,
+/// how much of the idle clock is left, and what the page's own code complained about.
+///
+/// The payload is built by the engine (`browser_hub::status_payload`) for the same reason the
+/// MCP payload is: the desktop and a phone tab hand-assembling one status object is how two
+/// screens end up answering one question differently.
+#[tauri::command]
+pub async fn browser_panel(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    Ok(browser_payload(&state))
+}
+
+fn browser_payload(state: &tauri::State<'_, AppState>) -> serde_json::Value {
+    use cwoffee_engine::browser_hub as bh;
+    let snap = bh::Hub::peek_shared(&state.browser_state);
+    match state.browser.as_ref() {
+        // No lock taken: the state mirror exists so that reporting a browser never waits on
+        // whoever is driving it, and the config half of the payload is held beside it. A
+        // status verb that queued behind a page load would show a stale panel and call it live.
+        Some(_) => bh::status_payload(&state.browser_keep, &snap, true, true, "this window's own browser"),
+        None => serde_json::json!({
+            "mounted": false,
+            "alive": false,
+            "opened": false,
+            "writable": false,
+            "url": "",
+            "why": snap.why,
+            "says": snap.says(),
+            "console": [],
+            "page_errors": [],
+            "requests_failed": [],
+            "downloads_blocked": [],
+            "idle_secs": 0,
+            "idle_left": null,
+            "seq": snap.seq,
+            "route": "no kept browser is mounted in this start",
+        }),
+    }
+}
+
+/// Which browser a page would open in, and why a panel might refuse to open one at all.
+fn kept_hub(
+    state: &tauri::State<'_, AppState>,
+) -> Result<std::sync::Arc<tokio::sync::Mutex<cwoffee_engine::browser_hub::Hub>>, String> {
+    match state.browser.as_ref() {
+        Some(h) if state.browser_keep.off_reason.is_none() => Ok(std::sync::Arc::clone(h)),
+        Some(_) => Err("kept browsers are switched off in this start ([browser] keep = false), \
+                        so there is no browser to open a page in. The one-shot browser tool \
+                        still works."
+            .to_string()),
+        None => Err("no kept browser is mounted here: `browser/session.mjs` is missing, so the \
+                     panel has nothing to show. It comes with cwoffee; its dependencies come \
+                     from `npm --prefix browser install` and a browser build from \
+                     `npx playwright install chromium`."
+            .to_string()),
+    }
+}
+
+/// Open a page in the kept browser, on the person's own say-so.
+///
+/// No approval card: this is the person acting, not the model. What the person is entitled to
+/// is the panel saying plainly whose browser it is and where the page went.
+/// What the panel's address box means, turned into an address the browser can be held to.
+///
+/// A person types `example.com`, or `/home/me/site/index.html`, or `notes/todo.md` next to the
+/// workspace, and expects the page to open. So a bare host gets a scheme, a path gets `file://`,
+/// and a local page is only allowed **inside the workspace** — the same boundary the model's tool
+/// enforces by approval. Refusing every local address made the box useless for the local pages
+/// people actually write; refusing every address made it a way to read a home directory off a
+/// text field. Both were the wrong side of the same line.
+fn panel_target(raw: &str, workspace: &std::path::Path) -> Result<(String, bool), String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("nothing was typed".to_string());
+    }
+    let scheme = t.find("://").map(|i| (&t[..i]).to_lowercase());
+    match scheme.as_deref() {
+        Some("http") | Some("https") => Ok((t.to_string(), false)),
+        Some("file") => {
+            let path = std::path::PathBuf::from(t.trim_start_matches("file://"));
+            confine_local(&path, workspace).map(|_| (t.to_string(), true))
+        }
+        Some(other) => Err(format!(
+            "{t} is not a page this browser opens ({other}): addresses are http, https, or a file inside the workspace"
+        )),
+        None => {
+            if t.starts_with('/') || t.starts_with('.') {
+                let path = if t.starts_with('/') {
+                    std::path::PathBuf::from(t)
+                } else {
+                    workspace.join(t)
+                };
+                confine_local(&path, workspace)?;
+                Ok((format!("file://{}", path.display()), true))
+            } else if t.contains('.') || t == "localhost" || t.starts_with("www.") {
+                Ok((format!("https://{t}"), false))
+            } else {
+                Err(format!(
+                    "{t} is not an address: type a site (example.com) or a file inside the workspace"
+                ))
+            }
+        }
+    }
+}
+
+/// A local page has to be inside the workspace, and the refusal names both sides of that line.
+fn confine_local(path: &std::path::Path, workspace: &std::path::Path) -> Result<(), String> {
+    let root = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let here = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if here.starts_with(&root) {
+        Ok(())
+    } else {
+        Err(format!(
+            concat!(
+                "{} is outside the workspace ({}). This box opens a web address — example.com, or https://… — ",
+                "or a page inside the workspace folder; a file elsewhere needs a server of your own"
+            ),
+            here.display(),
+            root.display()
+        ))
+    }
+}
+
+/// Open a page in the kept browser, on the person's say-so.
+#[tauri::command]
+/// The folder the conversation is in, right now, for the panel's address box and the page box's
+/// guard. One question to the engine that owns the answer; a copy taken at startup goes stale the
+/// first time the person opens a conversation in another folder.
+fn live_workspace(state: &tauri::State<'_, AppState>) -> std::path::PathBuf {
+    std::path::PathBuf::from(state.host_for_browser.state().workspace)
+}
+
+#[tauri::command]
+pub async fn browser_open(state: tauri::State<'_, AppState>, url: String) -> Result<serde_json::Value, String> {
+    let workspace = live_workspace(&state);
+    let (target, allow_file) = panel_target(&url, &workspace)?;
+    let hub = kept_hub(&state)?;
+    let out = {
+        let mut h = hub.lock().await;
+        h.open(&target, cwoffee_engine::browser_hub::Who::Person, allow_file).await
+    };
+    match out {
+        Ok(_) => Ok(browser_payload(&state)),
+        Err(e) => Err(e),
+    }
+}
+
+/// A click, a keystroke, a scroll — from the person, into the kept browser.
+#[tauri::command]
+pub async fn browser_act(
+    state: tauri::State<'_, AppState>,
+    act: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let hub = kept_hub(&state)?;
+    let out = {
+        let mut h = hub.lock().await;
+        h.act(act, cwoffee_engine::browser_hub::Who::Person).await
+    };
+    match out {
+        Ok(v) => {
+            let mut payload = browser_payload(&state);
+            // The step's own answer travels with the state, so the panel can say "clicked
+            // More" and mean it, rather than inferring it from what the page looks like after.
+            payload["act_ok"] = v.get("ok").cloned().unwrap_or(serde_json::json!(true));
+            if let Some(w) = v.get("why") {
+                payload["act_why"] = w.clone();
+            }
+            // What the act answered, when it answered with something. The panel does not paint a
+            // raw page dump, but it does say "the page gave back N" for a read, and a check that
+            // wants the page's own words (did my click land? did my keys arrive?) asks the page
+            // rather than trusting the panel's picture.
+            if let Some(val) = v.get("value") {
+                payload["act_value"] = val.clone();
+            }
+            if let Some(at) = v.get("at") {
+                payload["act_at"] = at.clone();
+            }
+            Ok(payload)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A picture of the page, only if there is a newer one than the caller already holds.
+///
+/// The `since` comparison is the whole design of this verb: a panel that polls every second
+/// should not pay a screenshot every second, and a screenshot of a page nobody changed is
+/// bytes for a picture of the same pixels. What it does owe is any frame the browser drew on its
+/// own — that is the live view, and a caller learns about it by holding an older picture id.
+#[tauri::command]
+pub async fn browser_frame(
+    state: tauri::State<'_, AppState>,
+    since: u64,
+) -> Result<serde_json::Value, String> {
+    use cwoffee_engine::browser_hub as bh;
+    let hub = kept_hub(&state)?;
+    let snap = bh::Hub::peek_shared(&state.browser_state);
+    if !snap.alive || !snap.opened {
+        return Ok(serde_json::json!({"unchanged": true, "seq": snap.seq, "frame_pic": snap.frame_pic, "no_page": true}))
+    }
+    // Two numbers the caller must not confuse: `since` is the id of the *picture* this window is
+    // drawing, `snap.seq` counts page state. A reload bumps the state without drawing anything, so
+    // a caller that compared its picture against the state alone is told there is nothing newer —
+    // while still showing the page as it was before the reload. `needs_pic` is the engine's rule
+    // for both halves of that, and the gateway tab calls the same function.
+    let (newest_pic, pictures_state) = {
+        let h = hub.lock().await;
+        (h.frame_pic(), h.frame_pictures_state(snap.seq))
+    };
+    if !bh::needs_pic(since, newest_pic, pictures_state) {
+        return Ok(serde_json::json!({"unchanged": true, "seq": snap.seq, "frame_pic": newest_pic}))
+    }
+    let mut h = hub.lock().await;
+    // A frame the browser volunteered is already here, so handing it over beats paying for a second
+    // picture of the same pixels. That is what makes polling fast a sane thing to do.
+    if let Some(f) = h.frame_now() {
+        if f.pic > since {
+            return Ok(serde_json::json!({
+                "unchanged": false, "b64": f.b64, "mime": f.mime, "bytes": f.bytes,
+                "seq": f.seq, "pic": f.pic, "live": f.live
+            }));
+        }
+    }
+    let png = false;
+    match h.frame(png).await {
+        Ok(f) => Ok(serde_json::json!({"unchanged": false, "b64": f.b64, "mime": f.mime, "bytes": f.bytes, "seq": f.seq, "pic": f.pic, "live": f.live})),
+        Err(e) => Ok(serde_json::json!({"unchanged": true, "why": e, "seq": snap.seq})),
+    }
+}
+
+/// Ask the kept browser for its live view — its own screencast, sent as the page repaints — or
+/// stop asking.
+///
+/// A load note, not a permission: a screencast is work for the browser process, so it runs while a
+/// panel is on screen and stops when the panel closes or the window is hidden. It does not touch
+/// the idle clock, either: watching a browser is not the same as using one, and a session that
+/// closes itself after `[browser] idle_secs` of nobody acting in it is meant to keep doing that
+/// while somebody admires the page.
+#[tauri::command]
+pub async fn browser_watch(
+    state: tauri::State<'_, AppState>,
+    on: bool,
+    max_width: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let hub = kept_hub(&state)?;
+    let out = {
+        let mut h = hub.lock().await;
+        h.watch(on, max_width).await
+    }?;
+    let mut payload = browser_payload(&state);
+    // Reported from the driver's answer, not from the ask: a Chromium with no screencast makes
+    // "live" a promise this build cannot keep, and the panel has to say which view it is drawing.
+    payload["live"] = serde_json::json!(
+        out.get("live").and_then(|l| l.as_bool()).unwrap_or(false) && out.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)
+    );
+    Ok(payload)
+}
+
+/// Where the panel's box is, in CSS pixels from the top left of the window. Only meaningful for a
+/// browser that is a page **in this window**: the page is a native rectangle, and the app's own
+/// layout is the only thing that knows where the panel is. The panel measures itself and calls
+/// this; nothing else decides where the page sits.
+#[tauri::command]
+pub async fn browser_view_rect(
+    state: tauri::State<'_, AppState>,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<serde_json::Value, String> {
+    if state.probe_holds_box.load(std::sync::atomic::Ordering::SeqCst) {
+        // The probe is asking where the page sits; a panel layout tick is not.
+        return Ok(serde_json::json!({
+            "ok": true,
+            "ignored": "a page probe is holding the box for the duration of its geometry check"
+        }));
+    }
+    let hub = kept_hub(&state)?;
+    let out = {
+        let mut h = hub.lock().await;
+        h.view_rect(x, y, width, height).await
+    }?;
+    Ok(out)
+}
+
+/// What the page printed, threw, and failed to load — read from the hub's own record.
+///
+/// The page is watched the whole time it is open, so this is a memory read: it does not ask the page
+/// anything, and it does not reset the idle clock. A drawer that polled the page would keep a
+/// person's session alive by looking at it, which is the opposite of what the clock is for.
+#[tauri::command]
+pub async fn browser_log(
+    state: tauri::State<'_, AppState>,
+    since: Option<i64>,
+    kind: Option<String>,
+    level: Option<String>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let snap = cwoffee_engine::browser_hub::Hub::peek_shared(&state.browser_state);
+    Ok(snap.diagnostics_value(
+        since.unwrap_or(0),
+        kind.as_deref(),
+        level.as_deref(),
+        limit.unwrap_or(80) as usize,
+    ))
+}
+
+/// Reshape the page to the box it is being looked at, so a panel that spans the window gets a page
+/// that spans the window instead of a letterbox. The size the browser reports is the size the
+/// panel's click arithmetic has to use, which is why this answers with the panel payload rather
+/// than with the number it was handed.
+///
+/// For a page that lives in the window the window owns the size: the panel's box *is* the viewport,
+/// and the answer says so instead of resizing something the person is looking at.
+#[tauri::command]
+pub async fn browser_viewport(
+    state: tauri::State<'_, AppState>,
+    width: u32,
+    height: u32,
+) -> Result<serde_json::Value, String> {
+    use cwoffee_engine::browser_hub as bh;
+    let hub = kept_hub(&state)?;
+    let out = {
+        let mut h = hub.lock().await;
+        h.set_viewport(width, height).await
+    }?;
+    if !out.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+        return Err(out
+            .get("why")
+            .and_then(|w| w.as_str())
+            .unwrap_or("the page would not resize")
+            .to_string());
+    }
+    let mut payload = browser_payload(&state);
+    // The panel owes itself the frame that shows the page at the new size, so the picture id it
+    // holds has to be behind the one this resize just drew.
+    payload["frame_pic"] = serde_json::json!(bh::Hub::peek_shared(&state.browser_state).frame_pic);
+    payload["moved"] = out.get("moved").cloned().unwrap_or(serde_json::json!(true));
+    payload["viewport"] = out.get("viewport").cloned().unwrap_or(serde_json::json!(null));
+    Ok(payload)
+}
+
+/// Close the browser now, rather than waiting for the idle clock to do it. The reason is
+/// recorded, because "why is there no page in the panel?" deserves an answer better than a
+/// blank frame.
+#[tauri::command]
+pub async fn browser_close(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let hub = kept_hub(&state)?;
+    {
+        let mut h = hub.lock().await;
+        h.close("closed from the panel").await;
+    }
+    Ok(browser_payload(&state))
+}
+
+/// What the third-party servers are doing and what the file says about them: which core is
+/// running, whether a hub is mounted here, what each server answered, what `[mcp.servers]` asks
+/// for, and how many bytes the catalog costs every prompt.
+///
+/// Read-only, and the object is assembled by the engine (`mcp::status_payload`) rather than here:
+/// the desktop and a phone tab used to build this by hand and had already drifted by one field each,
+/// which is the same fault the theme payload test exists to catch.
 #[tauri::command]
 pub async fn mcp_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
     let core = state.host.core_id().to_string();
@@ -85,49 +526,150 @@ pub async fn mcp_status(state: tauri::State<'_, AppState>) -> Result<serde_json:
     let (mut cfg, _) = cwoffee_engine::Config::load(Some(&state.config_path)).unwrap_or_default();
     cfg.apply_env();
     let cfg = cfg.mcp_cfg();
+    let file = cwoffee_engine::config::mcp_state_in(&state.config_path);
+    let hub = match &state.mcp {
+        Some(h) => Some(h.lock().await),
+        None => None,
+    };
+    Ok(cwoffee_engine::mcp::status_payload(
+        hub.as_deref(),
+        &cfg,
+        &core,
+        &state.config_path,
+        &state.mcp_route,
+        &file,
+        // This window runs the servers, so this window may change them.
+        true,
+    ))
+}
+
+/// Why a write is refused when the environment names the servers.
+///
+/// `CWOFFEE_MCP_SERVERS` replaces `[mcp.servers]` wholesale. A page that wrote the file in that
+/// situation would report success and change nothing the next start reads — so the refusal names the
+/// variable instead of pretending the form worked.
+fn mcp_env_refusal() -> String {
+    "CWOFFEE_MCP_SERVERS names the third-party servers for this app, and it replaces [mcp.servers]      wholesale: writing the file would say it worked and change nothing the next start reads. Change      that variable, or unset it and let [mcp.servers] in the file answer."
+        .to_string()
+}
+
+/// The tail every write shares: re-read the file the write just changed, make the running hub match
+/// it, tell the core that what the model is offered has changed, and put the two sentences together.
+///
+/// Two sentences because they are two facts — what the file now holds, and what is answering — and a
+/// single "saved" would hide the case where the file was written and the program refused to start.
+async fn mcp_after_write(state: &AppState, file_says: String) -> String {
+    let (mut cfg, _) = cwoffee_engine::Config::load(Some(&state.config_path)).unwrap_or_default();
+    cfg.apply_env();
+    let mcfg = cfg.mcp_cfg();
+    let live_says = match &state.mcp {
+        Some(hub) => {
+            let said = cwoffee_engine::mcp::reconcile(hub, &mcfg).await;
+            // The Rust core builds the prompt's catalog from a value stored at boot, so it has to be
+            // told. The pi core's tool host and its catalog block are both re-read from the hub, and
+            // its `mcp_refresh` is empty for that reason rather than by omission.
+            state.host.mcp_refresh(Arc::clone(hub));
+            said
+        }
+        None => "no hub is mounted in this app, so nothing was started".to_string(),
+    };
+    format!("{file_says} {live_says}")
+}
+
+/// Add or update one third-party server, start it, and say what happened to both the file and the
+/// process. Refusals come back as errors so the row goes red rather than green with a complaint in
+/// its body text.
+#[tauri::command]
+pub async fn mcp_add_server(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    command: String,
+    args: Vec<String>,
+    env: Vec<String>,
+    on: bool,
+) -> Result<String, String> {
+    if cwoffee_engine::mcp::listed_from_env() {
+        return Err(mcp_env_refusal());
+    }
+    // The form shows environment **names**, never values, so a bare `KEY` line means "keep what is
+    // there". Resolving it here against the file's own row is what stops an edit of the command from
+    // writing empty values over somebody's token — and the refusal of a name the server never had is
+    // the part that cannot be guessed at later.
+    let held = cwoffee_engine::config::mcp_state_in(&state.config_path)
+        .servers
+        .iter()
+        .find(|(n, _)| *n == name.trim())
+        .map(|(_, c)| c.env.clone())
+        .unwrap_or_default();
+    let row = cwoffee_engine::mcp::McpServerCfg {
+        command,
+        args: cwoffee_engine::mcp::McpServerCfg::args_from_lines(&args),
+        enabled: on,
+        env: cwoffee_engine::mcp::McpServerCfg::env_keep_lines(&held, &env)?,
+    };
+    let file_says = cwoffee_engine::config::add_server_with(&state.config_path, &name, &row);
+    if file_says.starts_with("not saved") {
+        return Err(file_says);
+    }
+    Ok(mcp_after_write(&state, file_says).await)
+}
+
+/// Switch one server that is already in the file. The switch cannot invent one — a name the file
+/// never had is not something a toggle gets to make runnable.
+#[tauri::command]
+pub async fn mcp_set_server_enabled(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    on: bool,
+) -> Result<String, String> {
+    if cwoffee_engine::mcp::listed_from_env() {
+        return Err(mcp_env_refusal());
+    }
+    let file_says = cwoffee_engine::config::set_server_enabled_with(&state.config_path, &name, on);
+    if file_says.starts_with("not changed") {
+        return Err(file_says);
+    }
+    Ok(mcp_after_write(&state, file_says).await)
+}
+
+/// Drop a server: from the file, and from the process table if it was running.
+#[tauri::command]
+pub async fn mcp_remove_server(state: tauri::State<'_, AppState>, name: String) -> Result<String, String> {
+    if cwoffee_engine::mcp::listed_from_env() {
+        return Err(mcp_env_refusal());
+    }
+    let file_says = cwoffee_engine::config::remove_server_with(&state.config_path, &name);
+    Ok(mcp_after_write(&state, file_says).await)
+}
+
+/// The master switch: whether any third-party program runs in this app at all.
+#[tauri::command]
+pub async fn mcp_set_enabled(state: tauri::State<'_, AppState>, on: bool) -> Result<String, String> {
+    if cwoffee_engine::mcp::listed_from_env() {
+        return Err(mcp_env_refusal());
+    }
+    let file_says = cwoffee_engine::config::set_mcp_enabled_with(&state.config_path, on);
+    if file_says.starts_with("not changed") {
+        return Err(file_says);
+    }
+    Ok(mcp_after_write(&state, file_says).await)
+}
+
+/// Re-read `[mcp]` and make the running set match it. This is for a person who edited the file in an
+/// editor: the app has no file watcher, and a page that never offered anything but its own form
+/// would leave a hand edit invisible until the next boot.
+#[tauri::command]
+pub async fn mcp_reconcile(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let (mut cfg, _) = cwoffee_engine::Config::load(Some(&state.config_path)).unwrap_or_default();
+    cfg.apply_env();
+    let mcfg = cfg.mcp_cfg();
     match &state.mcp {
         Some(hub) => {
-            let h = hub.lock().await;
-            let (block, body, lead) = h.catalog_parts();
-            Ok(serde_json::json!({
-                "core": core,
-                "mounted": true,
-                // Two numbers, because they answer two different questions: what the prompt pays
-                // in total, and how much of that grows when somebody adds a server.
-                "catalog_bytes": block,
-                "catalog_body_bytes": body,
-                "catalog_lead_bytes": lead,
-                "catalog_budget": cwoffee_engine::mcp::CATALOG_BYTE_BUDGET,
-                "tools": h.catalog().len(),
-                "servers": h.servers_named().iter().map(|(n, s)| serde_json::json!({ "name": n, "says": s })).collect::<Vec<_>>(),
-                "configured": cfg.servers.len(),
-                "config_path": state.config_path.display().to_string(),
-                "why": "",
-            }))
+            let said = cwoffee_engine::mcp::reconcile(hub, &mcfg).await;
+            state.host.mcp_refresh(Arc::clone(hub));
+            Ok(format!("the config file was read again — {said}"))
         }
-        None => Ok(serde_json::json!({
-            "core": core,
-            "mounted": false,
-            "catalog_bytes": 0,
-            "catalog_body_bytes": 0,
-            "catalog_lead_bytes": 0,
-            "catalog_budget": cwoffee_engine::mcp::CATALOG_BYTE_BUDGET,
-            "tools": 0,
-            "servers": [],
-            "configured": cfg.servers.len(),
-                "config_path": state.config_path.display().to_string(),
-            // The honest sentence for the pi core. It names the reason rather than leaving the
-            // reader to infer it from an empty list, and it says what to do about it.
-            "why": if core == "pi" {
-                "this core does not mount MCP tools: its tool host is one process per call, so a \
-                 server it started would restart on every call. Start with CWOFFEE_CORE=rust to use \
-                 the servers in [mcp].".to_string()
-            } else if cfg.servers.is_empty() {
-                "no [mcp] servers configured".to_string()
-            } else {
-                "[mcp] lists servers and none is enabled".to_string()
-            },
-        }))
+        None => Ok("no hub is mounted in this app, so there is nothing to reconcile".to_string()),
     }
 }
 
@@ -261,6 +803,109 @@ pub fn start_turn(
     }
     state.host.send_turn_to(text, atts, session);
     Ok(())
+}
+
+/// A message typed **while a turn is running**. Same address assertion as `start_turn`: the host
+/// refuses a press aimed at a conversation it is not answering, and it refuses one when nothing is
+/// running, in words that say to send it as a message instead.
+///
+/// The answer is the pending item — its id is the handle for taking it back, and its kind is the
+/// promise the composer announced. Nothing here claims the model has the message: it is waiting, and
+/// the landing receipt arrives on the event stream when a request actually carries it.
+#[tauri::command]
+pub fn steer_turn(
+    state: tauri::State<'_, AppState>,
+    text: String,
+    attachments: Option<Vec<AttachmentIn>>,
+    session: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let atts: Vec<cwoffee_engine::provider::Attachment> = attachments
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| cwoffee_engine::provider::Attachment {
+            mime: a.mime,
+            data_b64: a.data_b64,
+            name: a.name,
+        })
+        .collect();
+    eprintln!(
+        "[cwoffee] steer_turn (desktop): session={:?} text={} attachments={}",
+        session,
+        text.chars().count(),
+        atts.len()
+    );
+    let view = state.host.queue_mid_turn(text, atts, session)?;
+    serde_json::to_value(view).map_err(|e| e.to_string())
+}
+
+/// Take a waiting message back before it lands. A refusal means it already landed — the row stays,
+/// and no control can unsend bytes that went out.
+#[tauri::command]
+pub fn withdraw_steer(state: tauri::State<'_, AppState>, id: i64) -> Result<serde_json::Value, String> {
+    let view = state.host.withdraw_queued(id.max(0) as u64)?;
+    serde_json::to_value(view).map_err(|e| e.to_string())
+}
+
+/// What is waiting right now. Read from the host rather than remembered by the window, so a second
+/// client that reloaded mid-turn paints the lines it missed instead of losing them.
+#[tauri::command]
+pub fn queue_state(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    serde_json::to_value(state.host.queue_state()).map_err(|e| e.to_string())
+}
+
+/// Change what a mid-turn press promises. `rename_all` because Tauri's default would demand
+/// `kind` spelled the same — it is one word, but the gateway reads its own snake_case frame and the
+/// UI is written once.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_mid_turn(state: tauri::State<'_, AppState>, kind: String) -> Result<serde_json::Value, String> {
+    let kind = cwoffee_engine::steer::MidTurn::parse(&kind).ok_or_else(|| {
+        "that is not a mid-turn promise: expected steer (into this turn) or follow_up (after it)".to_string()
+    })?;
+    state.host.set_mid_turn(kind);
+    serde_json::to_value(state.host.state().mid_turn).map_err(|e| e.to_string())
+}
+
+/// Change the **stored** palette, in `config.toml`, which is what the window, a device tab and the
+/// terminal all start from. Refused in words when the word is not a palette — `theme` used to be
+/// read by nobody, so a bad word and an ignored word looked identical from outside.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_theme(state: tauri::State<'_, AppState>, kind: String) -> Result<serde_json::Value, String> {
+    let kind = cwoffee_engine::theme::Theme::parse(&kind).ok_or_else(|| {
+        "that is not a palette: expected light, dark or system (system follows this client's own \
+         colour scheme, live)"
+            .to_string()
+    })?;
+    state.host.set_theme(kind);
+    serde_json::to_value(state.host.state().theme).map_err(|e| e.to_string())
+}
+
+/// About's palette line. `window` is the override this screen is showing, sent for the wording and
+/// stored nowhere: a window's override must not rewrite the host's choice, and the sentence has to
+/// be able to say which of the two the person is looking at.
+#[tauri::command(rename_all = "snake_case")]
+pub fn theme_words(state: tauri::State<'_, AppState>, window: Option<String>) -> Result<String, String> {
+    let window = match window.as_deref() {
+        Some(w) => Some(cwoffee_engine::theme::Theme::parse(w).ok_or_else(|| "that is not a palette: expected light, dark or system".to_string())?),
+        None => None,
+    };
+    Ok(state.host.theme_words(window))
+}
+
+/// What `config.toml` holds, for the armed page harness only.
+///
+/// Narrow on purpose: the path is the **host's own** config path, not an argument, and the command
+/// answers only in an armed run. The theme check needs to prove that a choice made in Settings
+/// landed in the file every surface reads at start, and `selftest_file_bytes` is confined to the
+/// workspace — a check that could name an arbitrary path would be a test that reads the user's files.
+#[tauri::command]
+pub fn selftest_config_text(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    if !selftest_armed() {
+        return Err("this is not an armed self-test run, so the settings file is not readable here".to_string())
+    }
+    let path = state.config_path.clone();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+    Ok(serde_json::json!({ "path": path.display().to_string(), "text": text }))
 }
 
 /// Open a native folder picker. Non-blocking: the plugin hands the result to a
@@ -675,18 +1320,32 @@ pub fn search_messages(state: tauri::State<'_, AppState>, query: String) -> Resu
 /// thing standing between a model-authored path and `~/.ssh/id_rsa` is this
 /// confine() call. Paths are workspace-relative on the wire for the same
 /// reason - an absolute path in a tool result would be an invitation.
+///
+/// `session` is the conversation whose transcript the row came from, and it is what the
+/// path resolves against first — not the folder the host happens to be working in. A row
+/// is a record of where a turn wrote its bytes; the app can restore a conversation from
+/// another workspace, or show an old one while a new one is open, and the previous rule
+/// ("resolve against wherever we are now") then reported a file sitting intact on disk as
+/// `no longer exists`. `save_attachment_as` already resolves through the row for exactly
+/// this reason; a click must not disagree with the Save control about where the file is.
+/// The host's folder is tried second, because a conversation that moved between folders
+/// took its files with it, and a miss names both folders instead of telling a story about
+/// deletion.
 #[tauri::command]
 pub fn open_file(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    session: Option<i64>,
     path: String,
 ) -> Result<String, String> {
     use tauri_plugin_opener::OpenerExt;
-    let ws = state.host.state().workspace;
-    let full = cwoffee_engine::tools::path::confine(std::path::Path::new(&ws), &path)
-        .map_err(|e| e.to_string())?;
-    let md = std::fs::metadata(&full).map_err(|_| format!("{path} no longer exists"))?;
-    if !md.is_file() {
+    let host_ws = std::path::PathBuf::from(&state.host.state().workspace);
+    let conv_ws = session
+        .filter(|s| *s > 0)
+        .and_then(|s| state.store.session(s).ok().flatten())
+        .map(|row| std::path::PathBuf::from(row.workspace));
+    let full = cwoffee_engine::tools::scratch::turn_file_path(conv_ws.as_deref(), &host_ws, &path)?;
+    if !full.is_file() {
         return Err(format!("{path} is not a file"));
     }
     app.opener()
@@ -1058,6 +1717,29 @@ pub fn selftest_armed() -> bool {
 /// with an empty filter, because nothing outside a self-test should be able to switch off checks.
 #[tauri::command]
 pub fn selftest_config() -> serde_json::Value {
+    // Which palette this run paints. The surface groups are graded in *both*, and one run can only
+    // be in one of them, so `--theme light` is the second arm rather than a bonus: a floating surface
+    // whose colour is hard-coded dark passes the dark run and fails the light one, which is the
+    // sabotage that proves the light arm bites. Read from the environment and refused if it is not a
+    // palette word — a typo here would silently run the suite in whichever palette the app booted in
+    // and report a pass for the other one.
+    let theme: Option<String> = if selftest_armed() {
+        match std::env::var("CWOFFEE_SELFTEST_THEME") {
+            Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let theme = theme.map(|t| {
+        match cwoffee_engine::theme::Theme::parse(&t) {
+            Some(cwoffee_engine::theme::Theme::Light) => "light".to_string(),
+            Some(cwoffee_engine::theme::Theme::Dark) => "dark".to_string(),
+            // `system` would make the arm's palette depend on the machine, which is not a claim the
+            // surface groups can grade. The run says so in its own header rather than guessing.
+            _ => String::new(),
+        }
+    });
     let only: Vec<String> = if selftest_armed() {
         std::env::var("CWOFFEE_SELFTEST_ONLY")
             .unwrap_or_default()
@@ -1068,7 +1750,21 @@ pub fn selftest_config() -> serde_json::Value {
     } else {
         Vec::new()
     };
-    serde_json::json!({ "only": only })
+    // Groups this launch must not grade, named by the launcher rather than by the check. A kept
+    // browser is one shape per process — a relayed picture column or a page painted in this window —
+    // so a full pass runs the other shape in a launch of its own and asks this one to stand down
+    // instead of grading a page that is not there and reporting a failure nobody caused.
+    let skip: Vec<String> = if selftest_armed() {
+        std::env::var("CWOFFEE_SELFTEST_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    serde_json::json!({ "only": only, "theme": theme, "skip": skip })
 }
 
 /// Resize the self-test window, from inside the app.
@@ -1326,6 +2022,120 @@ pub async fn branch_conversation(
     // created.
     let out = cwoffee_engine::branch::apply_and_open(state.store.as_ref(), state.host.as_ref(), &req)
         .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+/// Who is whose parent, where each branch was cut, and which node the next answer reads.
+///
+/// The desktop and the phone call the same `crate::tree::read`, so one tree is drawn from one set of
+/// facts: a sidebar that showed lineage the phone's tree did not, or a node list that agreed with the
+/// transcript but not with pi's thread, would be two answers to one question about what the model was
+/// told.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_tree(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+) -> Result<serde_json::Value, String> {
+    let out = cwoffee_engine::tree::read(state.store.as_ref(), state.host.as_ref(), session)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+/// Move the conversation's leaf — the node its next answer reads through.
+///
+/// Same function as the gateway's `switch_leaf`, so the mid-turn refusal and the proof of which node
+/// was meant are one text on both sides of the wire, and a stale phone tab cannot move a leaf the
+/// desktop would refuse. A refusal is an error, never a field: a client that read `{"Err": "…"}` as a
+/// payload would tell the person the leaf moved when nothing moved.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn switch_leaf(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    message_id: Option<i64>,
+    from_end: Option<usize>,
+    role: Option<String>,
+    shown: String,
+) -> Result<serde_json::Value, String> {
+    eprintln!(
+        "[cwoffee] switch_leaf (desktop): session={session} id={message_id:?} from_end={from_end:?} \
+         role={role:?} shown={} chars",
+        shown.chars().count()
+    );
+    let req = cwoffee_engine::tree::LeafReq {
+        session,
+        message_id,
+        from_end,
+        role: role.unwrap_or_default(),
+        shown,
+    };
+    let out = cwoffee_engine::tree::move_leaf(state.store.as_ref(), state.host.as_ref(), &req)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+/// Every file this conversation's turns touched, grouped by turn, with what each turn did to it
+/// and whether it can still be put back.
+///
+/// The gateway's `files_ledger` calls the same function, so a phone and a desktop cannot be shown
+/// two different answers to "what did this conversation write". Read-only, and it answers while a
+/// turn is running — asking what a conversation has done to a folder is not a way to change it.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn files_ledger(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+) -> Result<serde_json::Value, String> {
+    let out = cwoffee_engine::ledger::read(state.store.as_ref(), session).map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+/// One stored copy against the bytes on disk now.
+///
+/// The copy is named by index row, and `shown` repeats the path the card painted: the pair is what
+/// stops a window that has been open through two more turns from diffing whatever that path belongs
+/// to by now. A mismatch is an error that names what the record says instead, and diffs nothing.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn file_diff(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    checkpoint: i64,
+    shown: String,
+) -> Result<serde_json::Value, String> {
+    let out = cwoffee_engine::ledger::diff_of(state.store.as_ref(), session, checkpoint, &shown)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+/// What this conversation's copies cost — rows, blobs counted once, and the bytes in the store that
+/// no index row points at.
+///
+/// Deliberately its own verb rather than a field of the ledger: the index's total and the store's
+/// total are two answers, and a card that printed one number for both would be a disk usage nobody
+/// can reconcile with `du`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn snapshot_stats(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+) -> Result<serde_json::Value, String> {
+    let out = cwoffee_engine::ledger::stats(state.store.as_ref(), session).map_err(|e| e.to_string())?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+/// Drop this conversation's snapshots, keeping any blob another conversation points at.
+///
+/// Drive-side and audited on the gateway, like the revert next to it: this deletes files. `shown`
+/// is the copy count the card printed, so a window holding an old list changes nothing and is told
+/// what the record says now. Refused while a turn runs — that turn is taking copies right now.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn forget_copies(
+    state: tauri::State<'_, AppState>,
+    session: i64,
+    shown: usize,
+) -> Result<serde_json::Value, String> {
+    eprintln!("[cwoffee] forget_copies (desktop): session={session} shown={shown}");
+    let out = cwoffee_engine::ledger::forget(state.store.as_ref(), state.host.as_ref(), session, shown)
         .map_err(|e| e.to_string())?;
     serde_json::to_value(out).map_err(|e| e.to_string())
 }
@@ -1657,6 +2467,7 @@ fn render_is_sane(r: &RenderReport) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::panel_target;
     use super::picked_to_path;
     use super::ws_row_of;
     use super::render_is_sane;
@@ -1740,5 +2551,61 @@ mod tests {
     fn a_non_file_url_is_not_a_path() {
         let u = url::Url::parse("content://media/external/images/1").unwrap();
         assert_eq!(picked_to_path(FilePath::Url(u)), None);
+    }
+
+    // --- what the panel's address box accepts ---------------------------------------------
+
+    fn ws() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cwoffee-panel-target-{}", std::process::id()))
+    }
+
+    /// A typed address is not a URL a person wrote in a config file; it is whatever they typed.
+    /// A bare host gets a scheme, and a bare word is refused rather than guessed at — a box that
+    /// sends `pi` to `https://pi` is a box that wastes somebody's afternoon.
+    #[test]
+    fn a_typed_address_becomes_the_page_the_person_meant() {
+        let root = ws();
+        std::fs::create_dir_all(&root).unwrap();
+        let (url, file) = panel_target("example.com", &root).unwrap();
+        assert_eq!((url.as_str(), file), ("https://example.com", false));
+        let (url, _) = panel_target("https://x.dev/a?b=1", &root).unwrap();
+        assert_eq!(url, "https://x.dev/a?b=1");
+        assert!(panel_target("pi", &root).is_err(), "a bare word is not an address");
+        assert!(panel_target("", &root).is_err());
+    }
+
+    /// A local page inside the workspace opens. The old box refused every local address, which
+    /// made it useless for the local pages people write, and the fix must not become a way to read
+    /// a home directory off a text field: the refusal names both sides of the line.
+    #[test]
+    fn a_local_page_opens_inside_the_workspace_and_not_outside_it() {
+        let root = ws();
+        std::fs::create_dir_all(root.join("site")).unwrap();
+        std::fs::write(root.join("site/index.html"), "<p>hi</p>").unwrap();
+        let (url, file) = panel_target(&format!("{}/site/index.html", root.display()), &root).unwrap();
+        assert!(file, "a local page is a file address, and the caller is told so");
+        assert!(url.starts_with("file://"), "{url}");
+        let (url, _) = panel_target("site/index.html", &root).unwrap();
+        assert!(url.contains("site/index.html"), "a relative path is read against the workspace: {url}");
+
+        let outside = std::env::temp_dir().join(format!("outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.html"), "<p>no</p>").unwrap();
+        let why = panel_target(&format!("{}/secret.html", outside.display()), &root).unwrap_err();
+        assert!(why.contains("outside the workspace"), "{why}");
+        assert!(why.contains(&root.display().to_string()), "and the refusal names the folder it stayed out of: {why}");
+        assert!(why.contains("secret.html"), "and the path it refused: {why}");
+    }
+
+    /// A scheme that is not a page — `javascript:`, `data:`, `ftp:` — is refused as itself, by
+    /// name. A box that hands `javascript:` to a webview is a box that runs a page's script with
+    /// the person's own keyboard.
+    #[test]
+    fn a_scheme_that_is_not_a_page_is_refused_by_name() {
+        let root = ws();
+        let why = panel_target("javascript:alert(1)", &root).unwrap_err();
+        assert!(why.contains("javascript"), "{why}");
+        let why = panel_target("data:text/html,<script>1</script>", &root).unwrap_err();
+        assert!(why.contains("data"), "{why}");
     }
 }

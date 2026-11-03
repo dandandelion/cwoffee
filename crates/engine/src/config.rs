@@ -84,6 +84,15 @@ pub struct Config {
     #[serde(default)]
     pub mcp: crate::mcp::McpCfg,
 
+    /// The built-in browser (`browse`). The section is declared so a `[browser]` block a
+    /// person writes is either understood or rejected, never ignored.
+    ///
+    /// There is deliberately no "install a browser for me" behaviour: a program other than
+    /// cwoffee downloading a ~150 MB binary onto this machine is a decision the person makes
+    /// by running a command, and the tool says which command.
+    #[serde(default)]
+    pub browser: BrowserCfg,
+
     /// Sampling overrides for the inference endpoint. Every key is optional, and
     /// a key that is absent is not sent at all - the server's default then
     /// decides, which is the right answer for an endpoint someone else tuned.
@@ -109,8 +118,22 @@ pub struct Config {
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
 
+    /// The palette every surface starts from: `light` | `dark` | `system`. One value, in this file,
+    /// read by the window, a device tab and the terminal. A window may carry its own override, and
+    /// only that window's chrome says so — see `crate::theme`.
     #[serde(default)]
     pub theme: Option<String>,
+
+    /// What a message typed **while a turn is running** promises: `steer` (into this turn, at its
+    /// next step) or `follow_up` (asked after it). pi's own RPC vocabulary, so the setting, the
+    /// composer's announcement and the command on the wire are one word rather than three.
+    ///
+    /// Absent means `steer`, which is what a person means when they type during an answer. Checked
+    /// rather than defaulted quietly, for the same reason `reasoning` is: a word that is not one of
+    /// the two is a typo, and an ignored typo here changes what a message the person typed is
+    /// promised.
+    #[serde(default)]
+    pub mid_turn: Option<String>,
 
     /// Provider round-trips allowed inside one user turn. **0 or absent = no cap.**
     ///
@@ -274,6 +297,57 @@ fn default_auto_idle() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BrowserCfg {
+    /// Set to false to keep the browser tool out of the prompt entirely, on a machine that
+    /// has a driver but where the person does not want the model opening pages.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Force the browser to run with a visible window (`true`) or never (`false`).
+    ///
+    /// Absent means the honest default: headed when the conversation's model can see images,
+    /// headless when it cannot or when the endpoint never said. The model is not asked, and
+    /// cannot ask: whether a window is painted on a person's desktop is their decision.
+    pub headed: Option<bool>,
+    /// Where `driver.mjs` is. Absent means "look for it in the places cwoffee installs it",
+    /// which is next to the program and next to its source tree.
+    pub driver: Option<String>,
+    /// The node runtime. Absent means `CWOFFEE_NODE`, then `node` on PATH.
+    pub node: Option<String>,
+    /// Ceiling on the screenshot handed to the model, in bytes. A picture is the most
+    /// expensive thing a tool result can carry into every later prompt of a session.
+    pub max_image_kb: Option<u64>,
+    /// How long the **kept** browser (the one behind the window's sidebar) may sit with
+    /// nobody touching it before it closes itself. Absent means five minutes.
+    ///
+    /// A knob at all because "keep it open while I work through a login" and "never leave a
+    /// browser running on this machine" are both reasonable, and the second one should not
+    /// need a rebuild of cwoffee. It is not a switch to *disable* the feature silently: the
+    /// panel always says what the current number is.
+    pub idle_secs: Option<u64>,
+    /// Set to false to refuse kept browsers entirely: `browse` keeps doing one-shot walks,
+    /// and the sidebar says the person turned it off rather than failing.
+    ///
+    /// This is a person's decision, not the model's. The tool's schema has no way to ask
+    /// for a browser to stay open against it, and the check refuses before a card appears.
+    pub keep: Option<bool>,
+}
+
+impl Default for BrowserCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            headed: None,
+            driver: None,
+            node: None,
+            max_image_kb: None,
+            idle_secs: None,
+            keep: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCfg {
     /// Disabling the sandbox is supported for debugging only; the denylist is a
@@ -433,6 +507,7 @@ fn table_hint(err: &toml::de::Error) -> String {
         "compact_timeout_secs",
         "question_timeout_secs",
         "theme",
+        "mid_turn",
         "provider",
         "context",
         "search",
@@ -830,8 +905,9 @@ impl Config {
     /// Write **top-level** keys to `path`.
     ///
     /// Legal top-level keys are the ones declared on `Config` itself: `workspace`,
-    /// `mode`, `reasoning`, `theme`, `max_tool_iters`, `approval_timeout_secs`,
-    /// `question_timeout_secs`, `max_output_tokens`. `model` is **not** one of them:
+    /// `mode`, `reasoning`, `theme`, `mid_turn`, `max_tool_iters`,
+    /// `approval_timeout_secs`, `question_timeout_secs`, `max_output_tokens`. `model` is
+    /// **not** one of them:
     /// it belongs to `[provider]`, and a second one at the top level is a file the
     /// next start cannot read.
     ///
@@ -989,6 +1065,49 @@ impl Config {
         }
     }
 
+    /// What a mid-turn press promises, with the default applied. `crate::steer::MidTurn` carries
+    /// the wording, so the composer, the settings note and the wire verb all come from here.
+    pub fn mid_turn(&self) -> crate::steer::MidTurn {
+        self.mid_turn_checked().unwrap_or_default()
+    }
+
+    /// The word written in the file, refused when it is not one of the two promises. Same rule as
+    /// `reasoning_checked`: an ignored typo here would decide what a message the person typed is
+    /// promised, by not being read at all.
+    pub fn mid_turn_checked(&self) -> Result<crate::steer::MidTurn, String> {
+        let Some(word) = self.mid_turn.as_deref() else {
+            return Ok(crate::steer::MidTurn::default());
+        };
+        crate::steer::MidTurn::parse(word).ok_or_else(|| {
+            format!(
+                "mid_turn = {word:?} is not a mid-turn promise; expected steer (into this turn) or \
+                 follow_up (after it)"
+            )
+        })
+    }
+
+    /// The palette the host stores, with the default applied. `crate::theme` carries the wording, so
+    /// the settings row, the About line and the wire verb all say the same thing.
+    pub fn theme(&self) -> crate::theme::Theme {
+        self.theme_checked().unwrap_or_default()
+    }
+
+    /// The word written in the file, refused when it is not one of the three. The reason this is
+    /// checked rather than defaulted: `theme` used to be *read by nobody*, so a bad word and an
+    /// ignored word looked the same from the outside, and the palette stayed in `localStorage` where
+    /// a restart, a phone and the next window could not see it.
+    pub fn theme_checked(&self) -> Result<crate::theme::Theme, String> {
+        let Some(word) = self.theme.as_deref() else {
+            return Ok(crate::theme::Theme::default());
+        };
+        crate::theme::Theme::parse(word).ok_or_else(|| {
+            format!(
+                "theme = {word:?} is not a palette; expected light, dark or system (system follows \
+                 this client's own colour scheme, live)"
+            )
+        })
+    }
+
     pub fn api_key(&self) -> Option<String> {
         let k = self.provider.api_key.as_deref()?;
         if let Some(var) = k.strip_prefix("env:") {
@@ -1044,6 +1163,85 @@ impl Config {
         }
     }
 
+    /// The browser this start can actually offer: the driver that exists on disk, the node
+    /// that runs it, and the person's headed/headless choice.
+    ///
+    /// `driver` is `None` when nothing was found. That is reported rather than papered over:
+    /// the tool answers with the command that would install it, the settings page says the
+    /// tool is not mounted, and the model is not charged ~1.1 KB of prompt for a door that
+    /// is not there.
+    pub fn browser_cfg(&self) -> crate::tools::browser::BrowserCfg {
+        let b = &self.browser;
+        if !b.enabled {
+            return crate::tools::browser::BrowserCfg { driver: None, ..Default::default() };
+        }
+        let driver = b
+            .driver
+            .as_deref()
+            .map(Self::expand_tilde)
+            .or_else(|| std::env::var("CWOFFEE_BROWSER_DRIVER").ok().filter(|v| !v.trim().is_empty()))
+            .map(PathBuf::from)
+            .or_else(find_browser_driver)
+            .filter(|p| p.is_file());
+        let node = b
+            .node
+            .as_deref()
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("CWOFFEE_NODE").ok().filter(|v| !v.trim().is_empty()))
+            .unwrap_or_else(|| "node".to_string());
+        crate::tools::browser::BrowserCfg {
+            driver,
+            node,
+            vision: crate::tools::browser::Vision::Unknown,
+            headed_override: b.headed,
+            // `keep` and `idle_secs` reach a tool process through the environment as well, and the
+            // app has to read the same pair — otherwise `CWOFFEE_BROWSER_KEEP=no` switches off the
+            // tool's half and leaves the panel offering a browser the tool will refuse. The file
+            // wins where both speak, exactly as it does for `driver` and `node`: one file, one
+            // answer, and the environment is the road for a harness, not an override of a person.
+            keep: Self::keep_decision(b.keep, std::env::var("CWOFFEE_BROWSER_KEEP").ok().as_deref()),
+            idle_secs: Self::idle_decision(b.idle_secs, std::env::var("CWOFFEE_BROWSER_IDLE_SECS").ok().as_deref()),
+            max_image_bytes: b
+                .max_image_kb
+                .map(|kb| (kb as usize).saturating_mul(1024))
+                .unwrap_or(2 * 1024 * 1024),
+        }
+    }
+
+    /// Whether the kept browser exists: the config file first, the environment as the harness's
+    /// road, and "nobody said anything" meaning **yes**. Split out so the ordering can be tested
+    /// without mutating a process-wide variable that every other test in this binary reads.
+    pub fn keep_decision(file: Option<bool>, env: Option<&str>) -> bool {
+        if let Some(v) = file {
+            return v;
+        }
+        match env.map(|v| v.trim()) {
+            Some(v) if !v.is_empty() => !Self::env_says_off(v),
+            _ => true,
+        }
+    }
+
+    /// The idle span, in seconds: the file's number if it has one, otherwise the environment's,
+    /// and otherwise nothing — which the browser hub reads as "use the default" rather than as a
+    /// number invented here.
+    pub fn idle_decision(file: Option<u64>, env: Option<&str>) -> Option<u64> {
+        file.or_else(|| {
+            env.map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+    }
+
+    /// Whether an environment value says "off". Four spellings, because a person typing this into a
+    /// shell will type one of four, and a switch that only understands `no` looks like it did
+    /// nothing when somebody writes `0` — and silence that reads as success is the worst outcome for
+    /// a switch. An unset value is **not** off: the default is that a kept browser exists.
+    pub fn env_says_off(v: &str) -> bool {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "no" | "0" | "false" | "off"
+        )
+    }
     /// Validate the egress block before anything runs. A mode word that does not
     /// parse would otherwise fall back to the default silently, which is the worst
     /// possible outcome for a security-shaped setting: the user writes `off`, gets
@@ -1341,6 +1539,40 @@ pub fn set_provider_row_in(
 /// from it, and pi's fold threshold are all built from this answer. A llama.cpp server's
 /// `n_ctx` gets changed without telling the client, and a meter built on the endpoint's claim
 /// then keeps a confident wrong number.
+/// Whether this model takes image input, as the config file records it.
+///
+/// `None` means the endpoint was never asked or never said, which is a different answer
+/// from "no": the browser tool refuses to paint a window on a person's desktop for a model
+/// nobody has confirmed can see it, and refuses to withhold pixels from one it has.
+pub fn vision_in(path: &std::path::Path, model: &str) -> Option<bool> {
+    model_rows_in(path)
+        .into_iter()
+        .find(|(id, _)| id == model)
+        .and_then(|(_, r)| r.supports_vision)
+}
+
+/// Where the browser driver lives when nobody named one.
+///
+/// Two places, and they are the two shapes cwoffee is actually run in: from a checkout
+/// (`target/release/cwoffee-app` with `browser/driver.mjs` two levels up) and from an
+/// installed layout (`<exe>/browser/driver.mjs`). A driver found is a driver reported, so
+/// the boot line can say which one is in use.
+fn find_browser_driver() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let mut probes = vec![dir.join("browser").join("driver.mjs"), dir.join("driver.mjs")];
+    if let Some(up) = dir.parent() {
+        probes.push(up.join("browser").join("driver.mjs"));
+        if let Some(up2) = up.parent() {
+            probes.push(up2.join("browser").join("driver.mjs"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        probes.push(cwd.join("browser").join("driver.mjs"));
+    }
+    probes.into_iter().find(|p| p.is_file())
+}
+
 pub fn window_override_in(path: &std::path::Path, model: &str) -> Option<usize> {
     model_rows_in(path)
         .into_iter()
@@ -2027,8 +2259,415 @@ fn drop_region(text: &str, header: &str) -> (String, bool) {
     (out, true)
 }
 
+// ---------------------------------------------------------------------------
+// `[mcp]`: the servers this app is allowed to start
+//
+// Reading parses; writing does line surgery, so a person's comments, ordering and hand-written
+// sections survive a settings write. That rule is not cosmetic: `[mcp]` is the one block a person
+// most often writes by hand, and a save that rebuilt the file from a struct would delete it.
+// ---------------------------------------------------------------------------
+
+/// The table one server's keys live under: `[mcp.servers.<name>]`.
+///
+/// Bare, because `mcp::is_server_name` admits only characters TOML allows in a bare key. A
+/// hand-written `[mcp.servers."jira"]` reads identically; the next write normalises it.
+pub fn server_header(name: &str) -> String {
+    format!("mcp.servers.{name}")
+}
+
+/// The sub-table one server's environment lives in, and the reason removal takes both: a leftover
+/// `[mcp.servers.jira.env]` makes TOML read `jira` back into the file as a server with no command,
+/// so a delete that stopped half way round would leave somebody's deleted server sitting in the
+/// list as a broken one.
+fn server_env_header(name: &str) -> String {
+    format!("mcp.servers.{name}.env")
+}
+
+/// Why a name cannot be a server, in the words the engine already uses at boot. `None` when it can.
+///
+/// One source for the sentence: `Hub::start`, `Config::mcp_problem` and this function all refuse the
+/// same names, and three wordings of one rule is how a UI starts accepting what the boot refuses.
+fn server_name_problem(name: &str) -> Option<String> {
+    if name.trim().is_empty() {
+        return Some(
+            "a server needs a name: it is what every tool it offers is filed under (mcp__<name>__<tool>)"
+                .to_string(),
+        );
+    }
+    if crate::mcp::is_server_name(name) {
+        return None;
+    }
+    Some(format!(
+        "server name {name:?} is not usable: 2-32 characters of a-z, 0-9, '_' or '-', starting with a \\n         letter or digit, never a double underscore — that is cwoffee's namespace marker"
+    ))
+}
+
+/// What `[mcp]` in the file says, as opposed to what the running hub answered.
+///
+/// Two questions a settings page has to keep apart: *what may be started* (the file) and *what is
+/// answering* (the hub). A server can be listed and switched off, running from a start that read a
+/// different file, or hand-edited into a shape the reader refuses.
+#[derive(Debug, Clone)]
+pub struct McpFileState {
+    /// `[mcp] enabled`. False means nothing is started at boot and nothing is offered to the model.
+    pub enabled: bool,
+    pub timeout_secs: u64,
+    /// The servers the file lists, in name order.
+    pub servers: Vec<(String, crate::mcp::McpServerCfg)>,
+    /// What the reader refused, verbatim — empty when the file parses. A block that does not parse
+    /// has to arrive as a complaint, not as an empty list: an empty list says "you have no servers",
+    /// which is a different claim from "this file is unreadable".
+    pub problem: String,
+}
+
+impl Default for McpFileState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: crate::mcp::DEFAULT_MCP_TIMEOUT,
+            servers: Vec::new(),
+            problem: String::new(),
+        }
+    }
+}
+
+/// Read `[mcp]` out of the file without going through `Config::load`'s all-or-nothing answer.
+///
+/// A file that fails to parse is reported with its own message *and* still walked for server names,
+/// because the screen that shows nothing on a typo looks exactly like the screen for somebody who
+/// never configured a server.
+pub fn mcp_state_in(path: &std::path::Path) -> McpFileState {
+    let mut st = McpFileState::default();
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return st,
+    };
+    let doc: toml::Value = match text.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            st.problem = format!("the config file does not parse: {e}");
+            return st;
+        }
+    };
+    let Some(m) = doc.get("mcp").and_then(|x| x.as_table()) else {
+        return st;
+    };
+    if let Some(e) = m.get("enabled").and_then(|x| x.as_bool()) {
+        st.enabled = e;
+    }
+    if let Some(t) = m.get("timeout_secs").and_then(|x| x.as_integer()) {
+        st.timeout_secs = t.max(1) as u64;
+    }
+    if let Some(srv) = m.get("servers").and_then(|x| x.as_table()) {
+        for (name, val) in srv.iter() {
+            match val.clone().try_into() {
+                Ok(cfg) => st.servers.push((name.clone(), cfg)),
+                Err(e) => {
+                    // Keep the row visible with whatever the table did manage to say about the
+                    // command, and say what was refused. `[mcp.servers.jira] typoe = 1` is a
+                    // server the person believes they configured.
+                    let command = val
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    st.servers.push((
+                        name.clone(),
+                        crate::mcp::McpServerCfg {
+                            command,
+                            ..Default::default()
+                        },
+                    ));
+                    st.problem = format!(
+                        "{} is not readable: {e}",
+                        server_header(name)
+                    );
+                }
+            }
+        }
+    }
+    st.servers.sort_by(|a, b| a.0.cmp(&b.0));
+    st
+}
+
+/// Remove keys from one table's region. The counterpart to `set_keys_in`, and it follows the same
+/// region rule (a table runs to the next header) so a key of the same name in the table *below*
+/// cannot be hit by accident.
+fn drop_keys_in(text: &str, table: &str, keys: &[&str]) -> (String, Vec<String>) {
+    let want = format!("[{table}]");
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let Some(h) = lines.iter().position(|l| l.trim() == want) else {
+        return (text.to_string(), Vec::new());
+    };
+    let end = (h + 1..lines.len())
+        .find(|i| {
+            let t = lines[*i].trim();
+            t.starts_with('[') && t.ends_with(']')
+        })
+        .unwrap_or(lines.len());
+    let mut changed = Vec::new();
+    let mut i = h + 1;
+    // `end` moves with every removal: the region's far edge is a line index in the text as it was,
+    // and a vec that shrank underneath it would let the loop walk off the end.
+    let mut end = end;
+    while i < end {
+        let t = lines[i].trim();
+        if let Some(k) = keys.iter().find(|k| {
+            t.starts_with(&format!("{k} ")) || t.starts_with(&format!("{k}="))
+        }) {
+            changed.push(format!("{k} removed ({t})"));
+            lines.remove(i);
+            end -= 1;
+            continue;
+        }
+        i += 1;
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') || !out.ends_with('\n') {
+        out.push('\n');
+    }
+    (out, changed)
+}
+
+/// Write one server's keys, creating `[mcp.servers.<name>]` when it is not there.
+///
+/// The refusals are the point. A server with no command is a table the boot will report as dead,
+/// and a name that cannot become a tool name is worse than that: the catalog would offer tools no
+/// approval card can attribute to a server. Both are caught here, at the moment the person typed
+/// them, rather than at the next boot.
+pub fn set_server_in(
+    path: &std::path::Path,
+    name: &str,
+    cfg: &crate::mcp::McpServerCfg,
+) -> Result<Vec<String>, String> {
+    let name = name.trim();
+    if let Some(p) = server_name_problem(name) {
+        return Err(p);
+    }
+    let command = cfg.command.trim();
+    if command.is_empty() {
+        return Err(format!(
+            "{name}: a server needs a command — the program that speaks MCP on the other end of the pipe"
+        ));
+    }
+    for k in cfg.env.keys() {
+        if k.trim().is_empty() || k.contains('=') {
+            return Err(format!(
+                "{name}: an environment key has to be a name with no `=` in it (what was written was {k:?})"
+            ));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
+    }
+    let mut text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut changed: Vec<String> = Vec::new();
+
+    {
+        let kv: Vec<(&str, String)> = vec![
+            ("command".into(), q(command)),
+            ("enabled".into(), cfg.enabled.to_string()),
+        ];
+        let refs: Vec<(&str, &str)> = kv.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let (next, c) = Config::set_keys_in(&text, Some(&server_header(name)), &refs);
+        text = next;
+        changed.extend(c);
+    }
+    let args: Vec<&str> = cfg
+        .args
+        .iter()
+        .map(|a| a.as_str())
+        .filter(|a| !a.trim().is_empty())
+        .collect();
+    if args.is_empty() {
+        // No arguments is how the file already says it: leave the key out, rather than writing `[]`
+        // that a hand-editor then reads as meaningful.
+        let (next, c) = drop_keys_in(&text, &server_header(name), &["args"]);
+        text = next;
+        changed.extend(c);
+    } else {
+        let rendered = format!("[{}]", args.iter().map(|a| q(a)).collect::<Vec<_>>().join(", "));
+        let (next, c) = Config::set_keys_in(&text, Some(&server_header(name)), &[("args", rendered.as_str())]);
+        text = next;
+        changed.extend(c);
+    }
+
+    // The environment block belongs to the form that is writing it, so keys the form did not send
+    // are dropped rather than left behind: a token for a server you deleted, or for a command you
+    // replaced, must not go on being handed to whatever runs next under that name.
+    let env_hdr = server_env_header(name);
+    let existing: Vec<String> = mcp_state_in(path)
+        .servers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, c)| c.env.keys().cloned().collect())
+        .unwrap_or_default();
+    let stale: Vec<&str> = existing
+        .iter()
+        .filter(|k| !cfg.env.contains_key(k.as_str()))
+        .map(|k| k.as_str())
+        .collect();
+    if !stale.is_empty() {
+        let (next, c) = drop_keys_in(&text, &env_hdr, &stale);
+        text = next;
+        changed.extend(c);
+    }
+    if cfg.env.is_empty() {
+        let (next, removed) = drop_region(&text, &env_hdr);
+        if removed {
+            text = next;
+            changed.push(format!("[{env_hdr}] removed"));
+        }
+    } else {
+        let kv: Vec<(String, String)> = cfg.env.iter().map(|(k, v)| (k.clone(), q(v))).collect();
+        let refs: Vec<(&str, &str)> = kv.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (next, c) = Config::set_keys_in(&text, Some(&env_hdr), &refs);
+        text = next;
+        changed.extend(c);
+    }
+
+    std::fs::write(path, text).map_err(|e| format!("config write failed: {e}"))?;
+    Ok(changed)
+}
+
+/// Switch one server that is already in the file. A switch cannot invent a server: silently
+/// creating a table for a name the file never had would be the UI deciding who may run.
+pub fn set_server_enabled_in(path: &std::path::Path, name: &str, on: bool) -> Result<(), String> {
+    let name = name.trim();
+    let listed = mcp_state_in(path).servers.iter().any(|(n, _)| n == name);
+    if !listed {
+        return Err(format!(
+            "{name} is not in the config file, so there is nothing to switch — add it first"
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let (next, _) = Config::set_keys_in(&text, Some(&server_header(name)), &[("enabled", if on { "true" } else { "false" })]);
+    std::fs::write(path, next).map_err(|e| format!("config write failed: {e}"))
+}
+
+/// Drop a server: its table and its environment table together.
+pub fn remove_server_in(path: &std::path::Path, name: &str) -> Result<bool, String> {
+    let name = name.trim();
+    if !mcp_state_in(path).servers.iter().any(|(n, _)| n == name) {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let (text, _) = drop_region(&text, &server_env_header(name));
+    let (next, removed) = drop_region(&text, &server_header(name));
+    if removed {
+        std::fs::write(path, next).map_err(|e| format!("config write failed: {e}"))?;
+    }
+    Ok(removed)
+}
+
+/// The `[mcp] enabled` switch — the one that decides whether any third-party program runs at all.
+pub fn set_mcp_enabled_in(path: &std::path::Path, on: bool) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let (next, _) = Config::set_keys_in(&text, Some("mcp"), &[("enabled", if on { "true" } else { "false" })]);
+    std::fs::write(path, next).map_err(|e| format!("config write failed: {e}"))
+}
+
+/// What the file says about the servers, in a sentence a settings row can show.
+fn server_shape(cfg: &crate::mcp::McpServerCfg) -> String {
+    let mut bits = vec![format!("command `{}`", cfg.command.trim())];
+    let n = cfg.args.iter().filter(|a| !a.trim().is_empty()).count();
+    bits.push(format!("{n} argument{}", if n == 1 { "" } else { "s" }));
+    if !cfg.env.is_empty() {
+        bits.push(format!("{} environment key(s)", cfg.env.len()));
+    }
+    bits.join(", ")
+}
+
+/// Add or update one server in the file, and say which of the two it was.
+///
+/// The caller pairs this with `mcp::reconcile`, which says what happened to the process. Two
+/// sentences, because they are two facts: what the file now holds, and what is answering.
+pub fn add_server_with(path: &std::path::Path, name: &str, cfg: &crate::mcp::McpServerCfg) -> String {
+    let name = name.trim();
+    let existed = mcp_state_in(path).servers.iter().any(|(n, _)| n == name);
+    match set_server_in(path, name, cfg) {
+        Err(e) => format!("not saved: {e}"),
+        Ok(changed) if existed => format!(
+            "{name} updated in the config file ({} line(s) changed)",
+            changed.len()
+        ),
+        Ok(_) => format!("{name} written to [{}] with {}", server_header(name), server_shape(cfg)),
+    }
+}
+
+pub fn set_server_enabled_with(path: &std::path::Path, name: &str, on: bool) -> String {
+    match set_server_enabled_in(path, name, on) {
+        Err(e) => format!("not changed: {e}"),
+        Ok(()) => format!(
+            "{name} is switched {} in the config file",
+            if on { "on" } else { "off" }
+        ),
+    }
+}
+
+pub fn remove_server_with(path: &std::path::Path, name: &str) -> String {
+    let name = name.trim();
+    let had_env = mcp_state_in(path)
+        .servers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, c)| !c.env.is_empty())
+        .unwrap_or(false);
+    match remove_server_in(path, name) {
+        Err(e) => format!("could not remove {name}: {e}"),
+        Ok(false) => format!("{name} is not in the config file — nothing changed"),
+        Ok(true) => format!(
+            "{name} removed from the config file{}",
+            if had_env { ", its environment keys with it" } else { "" }
+        ),
+    }
+}
+
+pub fn set_mcp_enabled_with(path: &std::path::Path, on: bool) -> String {
+    match set_mcp_enabled_in(path, on) {
+        Err(e) => format!("not changed: {e}"),
+        Ok(()) if on => "third-party servers are allowed again ([mcp] enabled = true): the servers listed under [mcp.servers] are started at boot and offered to the model through explore".to_string(),
+        Ok(()) => "third-party servers are switched off for this app ([mcp] enabled = false): nothing is started, nothing is offered, and a call that names one is refused".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_kept_browser_switch_reads_as_off_in_the_four_ways_people_type_it() {
+        // Graded as pure functions, because the alternative is a test that mutates a process-wide
+        // variable every other test in this binary reads.
+        for off in ["no", "0", "false", "off", "OFF", "  no "] {
+            assert!(!Config::keep_decision(None, Some(off)), "{off} must read as switched off");
+        }
+        // Nobody said anything: a kept browser exists. An empty value is nobody saying anything,
+        // not a person saying no.
+        assert!(Config::keep_decision(None, None));
+        assert!(Config::keep_decision(None, Some("")));
+        assert!(Config::keep_decision(None, Some("1")));
+        assert!(Config::keep_decision(None, Some("yes")));
+        // The file wins where both speak, as it does for `driver` and `node`: one file is one
+        // answer, and the environment is a harness's road, not an override of a person's choice.
+        assert!(Config::keep_decision(Some(true), Some("no")));
+        assert!(!Config::keep_decision(Some(false), Some("yes")));
+
+        // The span, same ordering, and an unparseable value staying absent rather than becoming a
+        // number invented on the way: `[browser] idle_secs = "5 minutes"` has to be reported as a
+        // bad line, not answered with a default nobody chose.
+        assert_eq!(Config::idle_decision(Some(4), Some("300")), Some(4));
+        assert_eq!(Config::idle_decision(None, Some("45")), Some(45));
+        assert_eq!(Config::idle_decision(None, Some(" 45 ")), Some(45));
+        assert_eq!(Config::idle_decision(None, Some("")), None);
+        assert_eq!(Config::idle_decision(None, Some("ten")), None);
+        assert_eq!(Config::idle_decision(None, None), None);
+    }
+
     /// Tests that read or write process-wide environment variables take this, because `CWOFFEE_URL`
     /// is one variable shared by the whole test binary: two tests editing it decide the outcome by
     /// scheduling rather than by assertion.
@@ -2707,6 +3346,42 @@ mod tests {
         assert_eq!(c.reasoning_checked().unwrap(), None);
     }
 
+    /// The mid-turn promise is written back by the host (`mid_turn`), so the parser has to declare
+    /// the key, the reader has to name it when the word is wrong, and the two words the file accepts
+    /// are pi's own verbs — one vocabulary from the config line to the RPC frame.
+    #[test]
+    fn the_mid_turn_promise_is_read_back_and_a_strange_word_names_the_key() {
+        let c: Config = toml::from_str("mid_turn = \"follow_up\"\n")
+            .expect("the key the writer produces must parse");
+        assert_eq!(c.mid_turn(), crate::steer::MidTurn::FollowUp);
+        assert_eq!(c.mid_turn_checked().unwrap(), crate::steer::MidTurn::FollowUp);
+
+        let c: Config = toml::from_str("mid_turn = \"steer\"\n").unwrap();
+        assert_eq!(c.mid_turn(), crate::steer::MidTurn::Steer);
+
+        let c: Config = toml::from_str("mid_turn = \"interrupt\"\n").unwrap();
+        let err = c.mid_turn_checked().expect_err("a word that is not a promise is a typo");
+        assert!(err.contains("mid_turn"), "{err}");
+        assert!(err.contains("follow_up"), "the message should list the choices: {err}");
+
+        // Absent is a choice, and it is the one the composer announces by default.
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.mid_turn(), crate::steer::MidTurn::Steer);
+    }
+
+    /// The round trip the settings screen depends on: the word `MidTurn::word` writes is the word
+    /// the parser reads, so a choice made in a window survives the next start instead of quietly
+    /// falling back to the default.
+    #[test]
+    fn the_mid_turn_word_the_host_writes_is_the_word_the_file_reads() {
+        for kind in [crate::steer::MidTurn::Steer, crate::steer::MidTurn::FollowUp] {
+            let line = format!("mid_turn = {}\n", Config::toml_str(kind.word()));
+            let c: Config = toml::from_str(&line)
+                .unwrap_or_else(|e| panic!("{line:?} must parse ({}): {e}", kind.word()));
+            assert_eq!(c.mid_turn(), kind, "{line:?} came back as something else");
+        }
+    }
+
     /// The trap the shipped example config fell into: a top-level key written
     /// after `[provider]` is parsed as `provider.workspace` and silently does
     /// nothing. It must be a startup error with a hint, not a shrug.
@@ -2898,6 +3573,173 @@ JIRA_URL = "https://issues.example.com"
         assert_eq!(after.mcp.timeout_secs, 20, "the block's own keys survived verbatim");
         assert_eq!(after.mcp.servers["jira"].command, "jira-mcp");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The settings form writes a server; the next read has to see the same server, and the person's
+    /// own comments and unrelated sections have to still be there afterwards. A write that rebuilt
+    /// the file from a struct would answer "what may be started" with a lie about their file.
+    #[test]
+    fn a_server_written_from_the_settings_form_comes_back_as_a_row_the_file_holds() {
+        let dir = std::env::temp_dir().join(format!("cw-mcp-form-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "mode = \"ask\"\n\n# my own note about why search is off\n[search]\nbackend = \"off\"\n",
+        )
+        .unwrap();
+
+        let row = crate::mcp::McpServerCfg {
+            command: "node".into(),
+            args: vec!["/srv/jira-mcp.mjs".into(), "--stdio".into()],
+            enabled: true,
+            env: std::collections::BTreeMap::from([
+                ("JIRA_URL".to_string(), "https://issues.example.com".to_string()),
+                ("JIRA_TOKEN".to_string(), "sk-new".to_string()),
+            ]),
+        };
+        let says = add_server_with(&path, "jira", &row);
+        assert!(says.starts_with("jira written to [mcp.servers.jira]"), "{says}");
+        assert!(says.contains("2 arguments"), "{says}");
+        assert!(says.contains("2 environment key(s)"), "{says}");
+
+        let st = mcp_state_in(&path);
+        assert_eq!(st.problem, "", "{}", std::fs::read_to_string(&path).unwrap());
+        assert_eq!(st.servers.len(), 1);
+        let (name, back) = &st.servers[0];
+        assert_eq!(name, "jira");
+        assert_eq!(back.command, "node");
+        assert_eq!(back.args, vec!["/srv/jira-mcp.mjs", "--stdio"]);
+        assert!(back.enabled);
+        assert_eq!(back.env["JIRA_TOKEN"], "sk-new");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my own note about why search is off"), "{text}");
+        assert!(text.contains("[search]"), "{text}");
+        assert!(text.contains("[mcp.servers.jira.env]"), "{text}");
+
+        // Update it: the environment the form no longer sends is dropped rather than left behind, so
+        // a token for a command that was replaced stops being handed to whatever runs next.
+        let second = crate::mcp::McpServerCfg {
+            command: "node".into(),
+            args: vec![],
+            enabled: false,
+            env: std::collections::BTreeMap::from([("JIRA_URL".to_string(), "https://other".to_string())]),
+        };
+        let says = add_server_with(&path, "jira", &second);
+        assert!(says.starts_with("jira updated in the config file"), "{says}");
+        let st = mcp_state_in(&path);
+        let back = &st.servers[0].1;
+        assert!(!back.enabled, "the switch is the file's now");
+        assert!(back.args.is_empty(), "no arguments means the key is left out, not written empty");
+        assert_eq!(back.env.keys().cloned().collect::<Vec<_>>(), vec!["JIRA_URL"]);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("sk-new"), "a dropped token is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A name that cannot become a tool name is worse than a typo in a value: the catalog would offer
+    /// tools no approval card can attribute to a server. Refused where it was typed, in the same words
+    /// the boot uses.
+    #[test]
+    fn a_server_name_that_could_never_become_a_tool_name_is_refused_where_it_was_typed() {
+        let dir = std::env::temp_dir().join(format!("cw-mcp-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "mode = \"ask\"\n").unwrap();
+        let row = |cmd: &str| crate::mcp::McpServerCfg {
+            command: cmd.into(),
+            ..Default::default()
+        };
+        for bad in ["Jira", "j", "has space", "a__b", "mcp__x", ""] {
+            let e = set_server_in(&path, bad, &row("x")).unwrap_err();
+            assert!(
+                e.contains("not usable") || e.contains("needs a name"),
+                "{bad:?} was answered with {e:?}"
+            );
+        }
+        // A name that is fine but no command: the boot would report it as dead, and a row that looks
+        // configured while doing nothing is what the page exists to avoid.
+        let e = set_server_in(&path, "jira", &row("   ")).unwrap_err();
+        assert!(e.contains("needs a command"), "{e}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("jira"), "a refusal writes nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_switch_cannot_invent_a_server_the_file_never_listed() {
+        let dir = std::env::temp_dir().join(format!("cw-mcp-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "mode = \"ask\"\n").unwrap();
+        let e = set_server_enabled_with(&path, "ghost", true);
+        assert!(e.contains("not in the config file") && e.contains("add it first"), "{e}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("ghost"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A leftover `[mcp.servers.jira.env]` makes TOML read `jira` back into the file as a server with
+    /// no command, so a half-removal would leave somebody's deleted server in the list as a broken
+    /// one — and the page would report it as theirs.
+    #[test]
+    fn removing_a_server_takes_its_environment_block_with_it() {
+        let dir = std::env::temp_dir().join(format!("cw-mcp-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp.servers.jira]\ncommand = \"jira-mcp\"\nargs = [\"--stdio\"]\nenabled = true\n\n[mcp.servers.jira.env]\nJIRA_TOKEN = \"sk-old\"\n\n[mcp.servers.other]\ncommand = \"other\"\n",
+        )
+        .unwrap();
+        let says = remove_server_with(&path, "jira");
+        assert!(says.contains("removed from the config file"), "{says}");
+        assert!(says.contains("environment keys with it"), "{says}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("jira"), "{text}");
+        assert!(!text.contains("sk-old"), "{text}");
+        let st = mcp_state_in(&path);
+        assert_eq!(st.servers.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), vec!["other"], "{text}");
+        let says = remove_server_with(&path, "nobody");
+        assert!(says.contains("not in the config file"), "{says}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The master switch is the one that decides whether any third-party program runs. Its sentence
+    /// has to say what stops, not just that a key was written.
+    #[test]
+    fn the_master_switch_says_what_stops_running() {
+        let dir = std::env::temp_dir().join(format!("cw-mcp-master-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "mode = \"ask\"\n\n[mcp.servers.jira]\ncommand = \"jira-mcp\"\n").unwrap();
+        let says = set_mcp_enabled_with(&path, false);
+        assert!(says.contains("nothing is started") && says.contains("nothing is offered"), "{says}");
+        assert!(!mcp_state_in(&path).enabled);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("enabled = false"));
+        let says = set_mcp_enabled_with(&path, true);
+        assert!(says.contains("allowed again"), "{says}");
+        assert!(mcp_state_in(&path).enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block the person typed by hand and the reader refuses has to arrive as a complaint with the
+    /// row still visible. Returning an empty list would tell them they have no servers, which is a
+    /// different claim from "this file is unreadable" — and they would go looking in the wrong place.
+    #[test]
+    fn a_server_that_does_not_parse_is_reported_rather_than_hidden() {
+        let dir = std::env::temp_dir().join(format!("cw-mcp-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp]\ntimeout_secs = 20\n\n[mcp.servers.jira]\ncommand = \"jira-mcp\"\ncomand = \"typo\"\n",
+        )
+        .unwrap();
+        let st = mcp_state_in(&path);
+        assert!(!st.problem.is_empty(), "the refusal is said, not swallowed");
+        assert!(st.problem.contains("mcp.servers.jira"), "{}", st.problem);
+        assert_eq!(st.servers.len(), 1, "the row they wrote is still on the page");
+        assert_eq!(st.servers[0].1.command, "jira-mcp", "with what the table did say about it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

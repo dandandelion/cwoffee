@@ -204,6 +204,15 @@ pub struct Message {
     /// cache is keyed on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<crate::tools::changes::FileChange>,
+    /// When the person pressed Enter, if this message arrived mid-turn and landed later.
+    ///
+    /// A steer is stamped at the press and written into the record with that time, so the
+    /// transcript reads in the order it was actually typed rather than in the order the loop got
+    /// round to it. Deliberately **not on the wire**: a per-message clock value in a request body
+    /// would change prompt bytes every turn and throw away the prefix cache, and a changing fact
+    /// belongs in the record, not in what the model is shown.
+    #[serde(skip)]
+    pub sent_at: Option<i64>,
 }
 
 impl Message {

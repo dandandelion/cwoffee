@@ -275,6 +275,7 @@ mod tests {
             mime: "text/markdown".into(),
             bytes: 12,
             kind: crate::tools::FileKind::Edit,
+            created: false,
         }];
         let doc = markdown_document("Trip plan", "/home/u/ws", &[msg("user", "plan lisbon?"), a]);
         assert!(doc.contains("## You"));

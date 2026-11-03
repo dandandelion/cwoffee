@@ -445,7 +445,13 @@ impl Tool for WriteFileTool {
                     n,
                     content.lines().count()
                 ))
-                .with_file(OutputFile::from_path(&ctx.workspace, &path));
+                .with_file(
+                    // `existed` is the whole fact, taken before the write: a turn that creates
+                    // a file made it, and a turn that replaces one changed it. The transcript
+                    // shows those two differently, and cannot recover the difference later —
+                    // once the bytes are on disk there is nothing left to inspect.
+                    OutputFile::from_path(&ctx.workspace, &path).with_created(!existed),
+                );
                 if let Some(after) = after {
                     res.changes
                         .push(line_change(&ctx.workspace, &path, before.as_deref(), &after));
@@ -1105,8 +1111,71 @@ ToolCtx { workspace: dir.to_path_buf(), max_output_bytes: 4096, ..Default::defau
         // paper over it.
         let esc = WriteFileTool.risk_for(&json!({ "path": "../../../outside.html", "place": "attach" }), &ctx);
         assert_eq!(esc.level, Risk::Sensitive, "an attach is not a licence to escape: {esc:?}");
+        // **`place: "attach"` is the one placement whose folder is the decision.** An absolute
+        // `path` under it used to stay absolute — and then the result was labelled `Attachment` on
+        // the strength of the argument, so the transcript drew a hand-over unit around a file sitting
+        // at `/etc/...` or in the workspace root, offering a Save control the host refused. The
+        // destination now moves into the hand-over folder and keeps only the file name, which makes
+        // the write a workspace write: nothing outside the workspace is proposed, so nothing is
+        // escaped, and the card shows the folder path the tool will really use.
         let abs = WriteFileTool.risk_for(&json!({ "path": "/etc/outside.html", "place": "attach" }), &ctx);
-        assert_eq!(abs.level, Risk::Sensitive, "an absolute path stays an escape: {abs:?}");
+        assert_eq!(abs.level, Risk::Harmless, "the write moved inside: {abs:?}");
+        assert!(abs.escapes.is_empty(), "no escape to approve: {abs:?}");
+        // `Keep` and `Scratch` still show the person the absolute path they were shown, so the
+        // approval card and the write cannot disagree about it.
+        let abs_keep = WriteFileTool.risk_for(&json!({ "path": "/etc/outside.html", "place": "keep" }), &ctx);
+        assert_eq!(abs_keep.level, Risk::Sensitive, "a keep of an absolute path is an escape: {abs_keep:?}");
+        let abs_scratch = WriteFileTool.risk_for(&json!({ "path": "/etc/outside.html", "place": "scratch" }), &ctx);
+        assert_eq!(abs_scratch.level, Risk::Sensitive, "{abs_scratch:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The transcript shows a file this turn *made* as a card and a file it *changed* as a
+    /// chip, and the only place that difference exists is the disk before the write. Once the
+    /// bytes are down there, a created file and a replaced one are indistinguishable — so the
+    /// tool has to say, and say now.
+    #[tokio::test]
+    async fn a_write_says_whether_it_made_the_file_or_replaced_it() {
+        let d = tmp("created-write");
+        let ctx = ctx_in(&d);
+        let first = WriteFileTool
+            .run(json!({ "path": "brief.md", "content": "# Brief\n" }), &ctx, &sink())
+            .await;
+        assert!(first.ok, "{}", first.error.unwrap_or_default());
+        assert_eq!(first.files.len(), 1);
+        assert!(first.files[0].created, "a new file was made by this turn: {:?}", first.files[0]);
+        assert!(
+            first.output.contains("created"),
+            "and the sentence says so too: {}",
+            first.output
+        );
+
+        let again = WriteFileTool
+            .run(json!({ "path": "brief.md", "content": "# Brief\n\nmore\n" }), &ctx, &sink())
+            .await;
+        assert!(
+            !again.files[0].created,
+            "replacing a file the person already had is not making one: {:?}",
+            again.files[0]
+        );
+        assert!(again.output.contains("overwrote"), "{}", again.output);
+
+        // An append that creates is a create: the file did not exist before this turn.
+        let fresh = WriteFileTool
+            .run(json!({ "path": "log.md", "content": "one\n", "append": true }), &ctx, &sink())
+            .await;
+        assert!(fresh.files[0].created, "{:?}", fresh.files[0]);
+
+        // An edit never claims to have made anything — the file was there to edit.
+        let ed = EditFileTool
+            .run(json!({ "path": "brief.md", "old_text": "# Brief", "new_text": "# Briefing" }), &ctx, &sink())
+            .await;
+        assert!(ed.ok, "{}", ed.error.unwrap_or_default());
+        assert!(
+            ed.files.iter().all(|f| !f.created),
+            "an edit reported making a file: {:?}",
+            ed.files
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

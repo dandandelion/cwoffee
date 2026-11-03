@@ -29,6 +29,14 @@
 //! * A dead server is a sentence, not a hang. Timeouts are `timeout_secs` from `[mcp]` and the
 //!   app's existing `approval_timeout_secs`; there is no third number, because a magic timeout
 //!   is a hang with a decimal point in it.
+//!
+//! Both cores mount the same catalog, and the difference between them is only how a call
+//! reaches the servers. The Rust core holds the hub in the app's process. The pi core cannot:
+//! its tool host is one process per call, so a server it spawned would restart on every call.
+//! There the app still owns the hub, and the tool host asks it over a socket - see [`socket`],
+//! and `Route` below, which is the one place those two roads to the same hub diverge.
+
+pub mod socket;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -60,7 +68,7 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 /// pipe. A `url` (HTTP/SSE transport) is not supported, and saying so here rather than parsing
 /// and ignoring it is deliberate: a key that parses and does nothing is how a person believes
 /// they have a feature.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerCfg {
     /// The program to run. Empty means "not configured", which is reported, not spawned.
@@ -83,6 +91,95 @@ impl Default for McpServerCfg {
             enabled: true,
             env: BTreeMap::new(),
         }
+    }
+}
+
+impl McpServerCfg {
+    /// Read the environment a form sends: `KEY=value` lines, in order.
+    ///
+    /// Refused rather than guessed. A line with no `=` is a half-typed key, and a key containing
+    /// `=` (which the split would put in the value) hands a token to a name nobody wrote down.
+    /// Blank lines are ignored, because a text area always seems to end with one.
+    pub fn env_from_lines(lines: &[String]) -> Result<BTreeMap<String, String>, String> {
+        let mut out = BTreeMap::new();
+        for l in lines {
+            let l = l.trim();
+            if l.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = l.split_once('=') else {
+                return Err(format!(
+                    "{l:?} is not KEY=value: an environment entry needs the equals sign between the name and the value"
+                ));
+            };
+            let k = k.trim();
+            if k.is_empty() || k.contains(' ') {
+                return Err(format!("{l:?}: the part before `=` has to be a name with no spaces in it"));
+            }
+            out.insert(k.to_string(), v.trim().to_string());
+        }
+        Ok(out)
+    }
+
+    /// Read the environment a form sends, keeping the values the form was never shown.
+    ///
+    /// A settings row cannot echo a token back — that puts a secret in the next screenshot somebody
+    /// posts — so the edit form lists the keys it found and lets a person type over the ones they mean
+    /// to change. `KEY` alone therefore means "this one stays as it is"; only `KEY=value` writes a
+    /// value, and an empty one is a deliberate empty (`KEY=`).
+    ///
+    /// Without that rule, opening a server to change its command would blank every token it had: the
+    /// form prefills from a row that holds names only, and the write would report a successful edit
+    /// that broke the program. A name the server does not already have is refused rather than created
+    /// empty, because the person who typed it meant to give a value.
+    pub fn env_keep_lines(
+        existing: &BTreeMap<String, String>,
+        lines: &[String],
+    ) -> Result<BTreeMap<String, String>, String> {
+        let mut out = BTreeMap::new();
+        for l in lines {
+            let l = l.trim();
+            if l.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = l.split_once('=') else {
+                let k = l;
+                if k.contains(' ') || k.is_empty() {
+                    return Err(format!("{l:?}: an environment entry is a name, or NAME=value"));
+                }
+                match existing.get(k) {
+                    Some(v) => {
+                        out.insert(k.to_string(), v.clone());
+                    }
+                    None => {
+                        return Err(format!(
+                            "{k:?} is not one of this server's keys, so there is no value to keep: write {k}=value to give it one"
+                        ))
+                    }
+                }
+                continue;
+            };
+            let k = k.trim();
+            if k.is_empty() || k.contains(' ') {
+                return Err(format!("{l:?}: the part before `=` has to be a name with no spaces in it"));
+            }
+            out.insert(k.to_string(), v.trim().to_string());
+        }
+        Ok(out)
+    }
+
+    /// Read the arguments a form sends: one per line.
+    ///
+    /// One per line rather than one shell-looking line, because there is no shell here: nothing
+    /// splits quotes, and a form that pretended otherwise would quietly turn `--dir "/my docs"`
+    /// into two arguments. A person who needs a space inside one argument gets one line.
+    pub fn args_from_lines(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(|a| a.to_string())
+            .collect()
     }
 }
 
@@ -150,7 +247,7 @@ pub fn is_server_name(s: &str) -> bool {
 /// What one server offered at startup. The schema is kept because a discovered tool has to be
 /// callable with the arguments it described; what is *not* kept in the prompt is that schema,
 /// until the model asks for the tool — which is the whole economy of this design.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
     pub server: String,
     /// The name the server gave it.
@@ -240,6 +337,213 @@ struct Server {
     restarts: usize,
 }
 
+/// One server, from the config keys to a live child or a reason there is not one.
+///
+/// Split out of `Hub::start` because `Hub::apply` needs the identical answer: a server enabled
+/// from the settings page must be started the same way, refused the same way for the same reasons,
+/// and land in the same status vocabulary. Two copies of that logic is how the boot log and the
+/// settings page start disagreeing about one server.
+async fn boot_server(
+    name: &str,
+    scfg: &McpServerCfg,
+    master_on: bool,
+    timeout: std::time::Duration,
+) -> Server {
+    // Why this server will not be talked to, if it will not — written as a reason rather
+    // than as a pre-set status. A status that starts out dead and is only replaced after
+    // a successful connect makes every server dead on its way in, and "did this server
+    // start?" is the one question the catalog exists to answer.
+    let refusal = if scfg.command.trim().is_empty() {
+        Some("no command".to_string())
+    } else if !is_server_name(name) {
+        Some(format!(
+            "the name {name:?} is not usable: server names are 2-32 characters of a-z, \
+             0-9, '_' or '-', starting with a letter or digit, and never containing a \
+             double underscore — that is cwoffee's namespace marker"
+        ))
+    } else {
+        None
+    };
+    let mut srv = Server {
+        cfg: scfg.clone(),
+        status: if !master_on || !scfg.enabled {
+            Status::Disabled
+        } else if let Some(why) = &refusal {
+            Status::Dead(why.clone())
+        } else {
+            // Optimistic until `connect` answers; every path below replaces it.
+            Status::Live
+        },
+        tools: Vec::new(),
+        live: None,
+        restarts: 0,
+    };
+    if refusal.is_some() || !master_on || !scfg.enabled {
+        // Nothing to spawn: with no command, a name that cannot be a tool name, or a
+        // switch turned off, `tools` stays empty so the catalog cannot offer a ghost.
+    } else {
+        match connect(name, &srv.cfg, timeout).await {
+            Ok((live, tools, protocol)) => {
+                srv.live = Some(Live { child: live.child, stdin: live.stdin, stdout: live.stdout, next_id: live.next_id, protocol });
+                srv.tools = tools;
+                srv.status = Status::Live;
+            }
+            Err(Dead(why)) => srv.status = Status::Dead(why),
+        }
+    }
+    srv
+}
+
+/// Close one server's child. Shared by `apply` (a switch off, or a name the file dropped) and
+/// `shutdown` (the app is going away), because a dropped child that nobody closed keeps a pipe
+/// open and a process running for the rest of the session.
+async fn close_server(s: &mut Server) {
+    if let Some(live) = s.live.as_mut() {
+        let _ = live.stdin.shutdown().await;
+        match tokio::time::timeout(std::time::Duration::from_secs(2), live.child.wait()).await {
+            Ok(_) => {}
+            Err(_) => {
+                live.child.start_kill().ok();
+                eprintln!("[cwoffee] mcp: a server did not exit within 2s and was killed");
+            }
+        }
+    }
+    s.live = None;
+    s.tools.clear();
+    s.status = Status::Disabled;
+}
+
+/// Reconcile the running hub with the config and say what came of it, in the words a status row
+/// has room for.
+///
+/// One function rather than a sentence assembled in each transport: "what did that switch do to the
+/// process" must not mean two things depending on whether the click came from the desktop or a
+/// re-read after a hand edit.
+pub async fn reconcile(hub: &Arc<Mutex<Hub>>, cfg: &McpCfg) -> String {
+    let says = {
+        let mut h = hub.lock().await;
+        h.apply(cfg).await
+    };
+    if says.is_empty() {
+        return "nothing is listed under [mcp.servers], so nothing is running and nothing is offered".to_string();
+    }
+    let live = says.iter().filter(|(_, s)| s.starts_with("live")).count();
+    format!(
+        "and now: {} — {live} of {} answering",
+        says.iter()
+            .map(|(n, s)| format!("{n}: {s}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+        says.len()
+    )
+}
+
+/// Whether this start's server list came from the environment rather than the file.
+///
+/// `CWOFFEE_MCP_SERVERS` replaces the file's `[mcp.servers]` wholesale. A settings page that wrote
+/// the file in that situation would report success and change nothing the next boot reads, which is
+/// the shape this project keeps calling a lie — so a write refuses and names the variable instead.
+pub fn listed_from_env() -> bool {
+    std::env::var("CWOFFEE_MCP_SERVERS")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The status payload, assembled in one place.
+///
+/// Both transports used to build this by hand and had already drifted by one field each when the
+/// theme payload test caught the pattern (`parsed` is not the same as `published`). The desktop and
+/// a phone tab now read the same object, and a cargo test reads the wire rather than the struct.
+pub fn status_payload(
+    hub: Option<&Hub>,
+    cfg: &McpCfg,
+    core: &str,
+    config_path: &std::path::Path,
+    route: &str,
+    file: &crate::config::McpFileState,
+    writable: bool,
+) -> Value {
+    let servers: Vec<Value> = match hub {
+        Some(h) => h
+            .servers_named()
+            .iter()
+            .map(|(n, s)| {
+                let tools = h.server_tools(n);
+                serde_json::json!({
+                    "name": n,
+                    "says": s,
+                    "tools": tools
+                        .iter()
+                        .map(|(d, desc)| serde_json::json!({ "declared": d, "description": desc }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let (block, body, lead) = hub.map(|h| h.catalog_parts()).unwrap_or((0, 0, 0));
+    let listed: Vec<Value> = file
+        .servers
+        .iter()
+        .map(|(n, c)| {
+            serde_json::json!({
+                "name": n,
+                "command": c.command,
+                "args": c.args,
+                "enabled": c.enabled,
+                "env": c.env.keys().cloned().collect::<Vec<_>>(),
+                "running": hub.map(|h| matches!(h.status(n), Some(Status::Live))).unwrap_or(false),
+                "says": hub.and_then(|h| h.status(n)).map(|s| s.says()).unwrap_or_else(|| "not started in this app".to_string()),
+                "tools": hub.map(|h| h.server_tools(n).len()).unwrap_or(0),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "core": core,
+        "mounted": hub.is_some(),
+        // Two numbers, because they answer two different questions: what the prompt pays in total,
+        // and how much of that grows when somebody adds a server.
+        "catalog_bytes": block,
+        "catalog_body_bytes": body,
+        "catalog_lead_bytes": lead,
+        "catalog_budget": CATALOG_BYTE_BUDGET,
+        "tools": hub.map(|h| h.catalog().len()).unwrap_or(0),
+        "running": hub.map(|h| h.live_count()).unwrap_or(0),
+        "servers": servers,
+        // What this start resolved — the file *or* `CWOFFEE_MCP_SERVERS` — and what the file itself
+        // holds. Both, because the person reading this page is asking about the file.
+        "configured": cfg.servers.len(),
+        "file_configured": file.servers.len(),
+        "env_lists": listed_from_env(),
+        // Whether *this* transport may change any of it. A phone tab reads the same page: the
+        // servers run on the machine that started them, and a control there that wrote the desktop's
+        // config would be a remote launch of somebody else's program.
+        "writable": writable && !listed_from_env(),
+        "config_path": config_path.display().to_string(),
+        "route": route,
+        // The file's own facts, kept apart from the hub's: what may be started, what is answering.
+        "file": {
+            "enabled": file.enabled,
+            "timeout_secs": file.timeout_secs,
+            "servers": listed,
+            "problem": file.problem,
+        },
+        // Which servers exist is one fact and whether a call can reach them is another. The second
+        // is answered from the config, not from a guess about the core: the pi core mounts the same
+        // servers the Rust core does, so a `why` that named the core would be a stale claim about a
+        // capability that now exists.
+        "why": match hub {
+            Some(h) if h.live_count() > 0 => String::new(),
+            Some(h) if h.servers.is_empty() => "no [mcp] servers configured".to_string(),
+            Some(_) if !cfg.enabled => "[mcp] enabled = false: nothing is started in this start".to_string(),
+            Some(_) => "[mcp] lists servers and none is answering".to_string(),
+            None if file.servers.is_empty() => "no [mcp] servers configured".to_string(),
+            None => "[mcp] lists servers and none is mounted here".to_string(),
+        },
+    })
+}
+
 /// The catalog of third-party tools, and the only thing that talks to the servers.
 ///
 /// Shared behind `Arc<Mutex<..>>` because a tool call runs on its own task (a panic in one tool
@@ -265,51 +569,107 @@ impl Hub {
         let timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
         let mut servers = BTreeMap::new();
         for (name, scfg) in cfg.servers.iter() {
-            // Why this server will not be talked to, if it will not — written as a reason rather
-            // than as a pre-set status. A status that starts out dead and is only replaced after
-            // a successful connect makes every server dead on its way in, and "did this server
-            // start?" is the one question the catalog exists to answer.
-            let refusal = if scfg.command.trim().is_empty() {
-                Some("no command".to_string())
-            } else if !is_server_name(name) {
-                Some(format!(
-                    "the name {name:?} is not usable: server names are 2-32 characters of a-z, \
-                     0-9, '_' or '-', starting with a letter or digit, and never containing a \
-                     double underscore — that is cwoffee's namespace marker"
-                ))
-            } else {
-                None
-            };
-            let mut srv = Server {
-                cfg: scfg.clone(),
-                status: if !cfg.enabled || !scfg.enabled {
-                    Status::Disabled
-                } else if let Some(why) = &refusal {
-                    Status::Dead(why.clone())
-                } else {
-                    // Optimistic until `connect` answers; every path below replaces it.
-                    Status::Live
-                },
-                tools: Vec::new(),
-                live: None,
-                restarts: 0,
-            };
-            if refusal.is_some() || !cfg.enabled || !scfg.enabled {
-                // Nothing to spawn: with no command, a name that cannot be a tool name, or a
-                // switch turned off, `tools` stays empty so the catalog cannot offer a ghost.
-            } else {
-                match connect(name, &srv.cfg, timeout).await {
-                    Ok((live, tools, protocol)) => {
-                        srv.live = Some(Live { child: live.child, stdin: live.stdin, stdout: live.stdout, next_id: live.next_id, protocol });
-                        srv.tools = tools;
-                        srv.status = Status::Live;
-                    }
-                    Err(Dead(why)) => srv.status = Status::Dead(why),
-                }
-            }
+            let srv = boot_server(name, scfg, cfg.enabled, timeout).await;
             servers.insert(name.clone(), srv);
         }
         Hub { timeout, servers }
+    }
+
+    /// Make the running set match the config file: start what is new or switched on, stop what is
+    /// switched off or gone, and leave a server that is unchanged and alive exactly as it is.
+    ///
+    /// This is what a settings write ends with, so "I pressed Enable" has one answer: the file says
+    /// it and the process is now what the file says. A person who edits `config.toml` in an editor
+    /// reaches the same place by pressing the page's re-read control.
+    ///
+    /// Returns `(name, what it says now)` for every server the file lists, plus the names that were
+    /// dropped because the file no longer mentions them.
+    pub async fn apply(&mut self, cfg: &McpCfg) -> Vec<(String, String)> {
+        let timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
+        self.timeout = timeout;
+        // Stop and forget what the file no longer lists. Doing this before starting anything keeps
+        // a renamed server from holding its old child while the new one spawns.
+        let gone: Vec<String> = self
+            .servers
+            .keys()
+            .filter(|n| !cfg.servers.contains_key(*n))
+            .cloned()
+            .collect();
+        for name in &gone {
+            if let Some(mut s) = self.servers.remove(name) {
+                close_server(&mut s).await;
+            }
+        }
+        let mut says = Vec::new();
+        for (name, scfg) in cfg.servers.iter() {
+            let keep = self
+                .servers
+                .get(name)
+                .map(|s| s.cfg == *scfg && s.live.is_some() && cfg.enabled && scfg.enabled)
+                .unwrap_or(false);
+            if keep {
+                // Nothing moved: the child is alive and the keys it was started with are the keys
+                // the file holds. Restarting it here would drop a session somebody's already using.
+                says.push((
+                    name.clone(),
+                    format!("{} ({} tool(s))", self.servers[name].status.says(), self.servers[name].tools.len()),
+                ));
+                continue;
+            }
+            let mut fresh = boot_server(name, scfg, cfg.enabled, timeout).await;
+            // A server that is being re-read after a death keeps its restart count, so `call`'s
+            // bound still means "twice per conversation" rather than resetting on every settings
+            // write. Anything else starts at zero, including a deliberate enable.
+            if let Some(old) = self.servers.get(name) {
+                if matches!(old.status, Status::Dead(_)) && fresh.live.is_some() {
+                    fresh.restarts = old.restarts;
+                }
+            }
+            if let Some(mut old) = self.servers.insert(name.clone(), fresh) {
+                close_server(&mut old).await;
+            }
+            let s = &self.servers[name];
+            says.push((name.clone(), format!("{} ({} tool(s))", s.status.says(), s.tools.len())));
+        }
+        for name in &gone {
+            says.push((name.clone(), "removed from the file, so it is stopped".to_string()));
+        }
+        says.sort_by(|a, b| a.0.cmp(&b.0));
+        says
+    }
+
+    /// Stop every child and forget the catalog. Used when the master switch goes off.
+    pub async fn stop_all(&mut self) {
+        for (_, s) in self.servers.iter_mut() {
+            close_server(s).await;
+        }
+    }
+
+    /// How many servers are answering right now.
+    pub fn live_count(&self) -> usize {
+        self.servers.values().filter(|s| matches!(s.status, Status::Live)).count()
+    }
+
+    /// What one server offered, as `(declared name, first line of its description)`.
+    ///
+    /// The settings page needs this to answer "what does this server actually give me?" without
+    /// asking the model to go looking, and it is read off the same list the catalog is built from
+    /// rather than from a second read of the server.
+    pub fn server_tools(&self, server: &str) -> Vec<(String, String)> {
+        self.servers
+            .get(server)
+            .map(|s| {
+                s.tools
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.declared.clone(),
+                            t.description.lines().next().unwrap_or("").trim().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn has_servers(&self) -> bool {
@@ -820,15 +1180,38 @@ fn walk(v: &Value, out: &mut Vec<String>, workspace: &Path) {
     }
 }
 
+/// How a call reaches the server.
+///
+/// Two routes, one behaviour: the risk, the escapes, `per_call`, the truncation limit and the
+/// wording of a failure are all decided *before* this is consulted, so a call through the
+/// socket is the same call the Rust core makes - it only takes a different road to the same
+/// hub. The socket route exists because `cwtool` is one process per tool call and cannot own
+/// a long-lived server; it does not reach a server itself, it asks the host that owns one.
+pub enum Route {
+    Hub(Arc<Mutex<Hub>>),
+    Socket(PathBuf),
+}
+
 /// One third-party tool, declared only after `explore` names it.
 pub struct McpTool {
     info: ToolInfo,
-    hub: Arc<Mutex<Hub>>,
+    route: Route,
 }
 
 impl McpTool {
     pub fn new(info: ToolInfo, hub: Arc<Mutex<Hub>>) -> Self {
-        Self { info, hub }
+        Self {
+            info,
+            route: Route::Hub(hub),
+        }
+    }
+    /// The pi core's route: the hub lives in the host process, and this tool asks it over
+    /// the socket it was given.
+    pub fn via_socket(info: ToolInfo, sock: &Path) -> Self {
+        Self {
+            info,
+            route: Route::Socket(sock.to_path_buf()),
+        }
     }
     pub fn info(&self) -> &ToolInfo {
         &self.info
@@ -883,13 +1266,29 @@ impl Tool for McpTool {
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx, _sink: &ExecSink) -> ToolResult {
-        match self
-            .hub
-            .lock()
-            .await
-            .call(&self.info.server, &self.info.tool, &args, ctx.max_output_bytes)
-            .await
-        {
+        // One body, two roads. The socket road blocks on a syscall, so it goes to the
+        // blocking pool rather than holding the async loop that is serving the turn.
+        let reached = match &self.route {
+            Route::Hub(hub) => hub
+                .lock()
+                .await
+                .call(&self.info.server, &self.info.tool, &args, ctx.max_output_bytes)
+                .await,
+            Route::Socket(sock) => {
+                let server = self.info.server.clone();
+                let tool = self.info.tool.clone();
+                let max = ctx.max_output_bytes;
+                let sock = sock.clone();
+                match tokio::task::spawn_blocking(move || socket::call(&sock, &server, &tool, &args, max)).await {
+                    Ok(r) => r,
+                    // The blocking task died rather than answering. The model gets the same
+                    // shape of sentence it gets for a dead server, because what it can do with
+                    // either one is the same: stop and say what could not be reached.
+                    Err(e) => Err(format!("the call could not be carried to the host: {e}")),
+                }
+            }
+        };
+        match reached {
             Ok(text) => {
                 let failed = text.contains("[the server reported this call as an error]");
                 let mut r = ToolResult::ok(text);
@@ -923,6 +1322,16 @@ impl Tool for McpTool {
 pub fn install_into(reg: &mut crate::tools::Registry, catalog: &[ToolInfo], hub: &Arc<Mutex<Hub>>) {
     for info in catalog.iter() {
         reg.register_lazy(Arc::new(McpTool::new(info.clone(), hub.clone())));
+    }
+}
+
+/// The pi core's registration: the same hidden tools, reaching the hub through the host's
+/// socket. Nothing here decides what is hidden - `register_lazy` is the one answer to that,
+/// and both cores go through it, so "a server nobody uses costs no prompt bytes" is one
+/// implementation rather than two that drift.
+pub fn install_socket_into(reg: &mut crate::tools::Registry, catalog: &[ToolInfo], sock: &Path) {
+    for info in catalog.iter() {
+        reg.register_lazy(Arc::new(McpTool::via_socket(info.clone(), sock)));
     }
 }
 

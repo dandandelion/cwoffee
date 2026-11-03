@@ -50,12 +50,60 @@ export type OutputFile = {
   // working material under `.cws/`, `edit` a file changed in your own tree, and
   // `unknown` a row stored before the distinction existed (rendered as it always was).
   kind?: 'artifact' | 'edit' | 'scratch' | 'attachment' | 'unknown'
+  /**
+   * Did this turn make the file, or change one that was already there? From the tool that
+   * looked at the disk before writing (`OutputFile::created`), because the distinction stops
+   * being recoverable afterwards. A made file is shown as a card; a changed one is a chip.
+   * Absent on rows written before the fact existed, which are rendered the way they always
+   * were — an unlabelled row must not claim a turn made something.
+   */
+  created?: boolean
 }
 
 // Mirrors engine `Risk`. Harmless never prompts; Workspace changes a file that
 // already exists inside the workspace; Sensitive runs code or reaches outside it.
 export type Risk = 'harmless' | 'workspace' | 'sensitive'
 export type ApprovalAnswer = 'allow' | 'allowSession' | 'deny'
+
+/**
+ * What a message typed during a turn promises. The words are pi's own RPC verbs —
+ * `crates/engine/src/steer.rs` owns them, and the config key `mid_turn` takes the same two —
+ * so the settings screen, the composer's announcement and the frame on the wire cannot drift.
+ */
+export type MidTurn = 'steer' | 'follow_up'
+
+/** The stored palette. `system` is a subscription, not a colour: each surface follows its own
+ * system's preference, live, which is why a phone tab and a desktop can disagree and both be right. */
+export type HostTheme = 'light' | 'dark' | 'system'
+
+/**
+ * One mid-turn message that is waiting: the words, the promise, and the id this host assigned.
+ * The id is cwoffee's, not pi's — pi's queue is a list of plain strings — so it is the only handle
+ * a withdrawal has on either core.
+ *
+ * `attachments` is a count, never the bytes: this rides every status read and every queue change,
+ * and a picture inside a status line is a megabyte of IPC per repaint.
+ */
+export type QueuedItem = {
+  id: number
+  text: string
+  kind: MidTurn
+  /** Seconds: when Enter was pressed. The stored row gets this stamp, not the landing time. */
+  typed_at: number
+  session: number
+  attachments: number
+  /**
+   * "into this turn" / "after this turn", from the engine (`crate::steer::MidTurn::label`). The
+   * card prints this rather than writing its own, because two clients paraphrasing one promise is
+   * how they drift.
+   */
+  label: string
+  /**
+   * The engine's pending sentence (`MidTurn::pending_note`), which says the message has not been
+   * sent yet — the half a waiting line must never imply on its own.
+   */
+  note: string
+}
 
 export interface TurnTelemetry {
   prompt_tokens: number
@@ -129,6 +177,35 @@ export type EngineEvent =
   // by a failed reply, has no reason attached and gets the neutral wording.
   | { kind: 'questionExpired'; d: { id: number; why?: 'turnStopped' | 'timedOut' | 'windowGone' } }
   | { kind: 'turnStats'; d: TurnStats }
+  /**
+   * A message typed during a turn went into the conversation. Emitted when the words are put into
+   * the prompt the *next* request is built from — never when they were typed — because "the model
+   * has it" is only a claim once a request carries it. `step` is that round-trip; `typed_at` is
+   * when Enter was pressed, which is also the stamp on the row.
+   */
+  | {
+      kind: 'steerLanded'
+      d: {
+        id: number
+        session: number
+        kind: MidTurn
+        text: string
+        typed_at: number
+        turn_id: number
+        step: number
+      }
+    }
+  /**
+   * The whole mid-turn queue, as it stands. Whole rather than incremental for the same reason the
+   * host's `queue_update` parity needs it: a tab that missed one event must not keep painting a
+   * line for a message that is no longer waiting.
+   */
+  | { kind: 'queueChanged'; d: { session: number; items: QueuedItem[] } }
+  /**
+   * The turn stopped with messages still waiting. Their words go back to the composer and nothing
+   * was sent — a queued line that quietly disappears is a lost keystroke with a card on top of it.
+   */
+  | { kind: 'queueReturned'; d: { session: number; items: QueuedItem[] } }
   | { kind: 'usage'; d: TurnTelemetry }
   | { kind: 'turnEnd'; d: { turn_id: number; finish: FinishReason } }
   | { kind: 'note'; d: { message: string; session?: number } }
@@ -165,6 +242,53 @@ export interface HostState {
    * agree, and a second window looking at the same conversation has to see the same answer.
    */
   web?: boolean
+  /**
+   * What a message typed during a turn promises: into this turn at its next step (`steer`), or
+   * after it (`follow_up`). Read from the host rather than kept per window, because two tabs
+   * pressing Enter in one conversation must be given the same promise — and the composer's line
+   * says which kind the next press is, so it has to be the host's answer.
+   *
+   * Optional: a window talking to a host built before the field exists shows no announcement rather
+   * than inventing one.
+   */
+  mid_turn?: MidTurn
+  /**
+   * The palette the **host** stores: `light` | `dark` | `system`. One value in `config.toml`, read at
+   * start by the window, a device tab and the terminal. A window may show an override, and only that
+   * window's chrome says so — see `theme_note` and `theme_about`.
+   */
+  theme?: HostTheme
+  /** Where the choice lives, in the engine's words (`crate::theme::Theme::setting_note`). */
+  theme_note?: string
+  /** About's line: which value is the host's and which is this client's (`crate::theme::Theme::about_says`). */
+  theme_about?: string
+  /** How the palette this surface shows got chosen — a media query, a stored value, or a terminal's `COLORFGBG`. */
+  theme_resolved?: string
+  /**
+   * The composer's mid-turn line, in the engine's words (`crate::steer::composer_hint`). Printed
+   * rather than paraphrased: it is a claim about what the next request will carry, and the process
+   * that carries it is the one that gets to say so. Absent means a host that never published one,
+   * and the composer then falls back to the two sentences it knows, and says nothing about a step it
+   * has not been told about.
+   */
+  mid_turn_hint?: string
+  /**
+   * What the stored choice means, in the engine's sentence (`crate::steer::setting_note`), quoted by
+   * Settings. It names where the choice lives, because a phone tab and the desktop press the same
+   * Enter and must be promised the same thing.
+   */
+  mid_turn_note?: string
+  /**
+   * What a mid-turn press cannot do — answer a card, change the approval mode, change the tools this
+   * turn started with (`crate::steer::card_refusal`). Printed beside the dial so a reader is not told
+   * one limit by a refusal and a different one by a description.
+   */
+  mid_turn_refusal?: string
+  /**
+   * What is waiting in the mid-turn queue for the conversation this host holds. A tab that reloaded
+   * mid-turn paints these lines rather than showing a transcript that lost what the person typed.
+   */
+  queued?: QueuedItem[]
   /**
    * What the running model process was actually started with, in words: "no tools at all",
    * "web_search, web_fetch". The Web chip is a promise about what the model can reach; this is the
@@ -294,4 +418,111 @@ export interface StoredMessage {
   attachments: AttachmentMeta[]
   /** Line counts / diff for a file call; UI metadata, never sent to the model. */
   changes?: FileChange[]
+}
+
+/**
+ * cwoffee's **kept** browser — the one behind the window's browser panel, which the `browse`
+ * tool can drive with `"session": true`.
+ *
+ * The payload is built by the engine (`browser_hub::status_payload`) on both transports; the
+ * fields are typed here rather than read ad hoc because a panel that guesses at a field name
+ * fails quietly, and this one fails as a blank picture.
+ */
+export interface BrowserPanel {
+  mounted: boolean
+  driver?: string | null
+  node?: string
+  /** False when the person turned kept browsers off (`[browser] keep = false`). */
+  keep_off?: boolean
+  off_reason?: string | null
+  idle_secs: number
+  /** Seconds of idle left; null when nothing is alive to time out. */
+  idle_left: number | null
+  alive: boolean
+  opened: boolean
+  url: string
+  title: string
+  opened_by: 'person' | 'model' | 'nobody' | string
+  last_actor: 'person' | 'model' | 'nobody' | string
+  last_act: string
+  /** Why it is not alive — including "closed itself after 5 minutes idle". */
+  why: string
+  console: { kind: string; text: string }[]
+  page_errors: string[]
+  requests_failed: string[]
+  downloads_blocked: string[]
+  frames_taken: number
+  /** Whether the browser is sending frames of its own (its screencast is on), which is what makes
+      the panel a live view rather than a picture somebody took. Reported by the driver, not
+      assumed by the asking: a Chromium with no screencast answers `false` and the panel says so. */
+  live?: boolean
+  /** Why the live view is not available, when it was asked for and is not. */
+  live_why?: string
+  /** The id of the newest picture this session has. Separate from `seq`, which counts page state:
+      a live view draws several pictures of one state, so a poll that compared `seq` would report a
+      moving page as nothing new. */
+  frame_pic?: number
+  /** True when the page is a page **in this window** — painted by this app into the panel's box.
+      It changes what the panel draws: there is no picture, no live mark and no stream to ask for,
+      because the thing in the box is the document itself. Reported by the app, never inferred. */
+  native?: boolean
+  /** How many documents this session has had. A record says which of them it happened on, which is
+      the difference between "the page was already broken" and "your click broke it". */
+  nav?: number
+  /** The id of the newest record the page has made. A reader holding this id has seen everything. */
+  diag_seq?: number
+  /** Records per kind — the numbers behind the header badge. The records themselves are one command
+      away (`browser_log`), so a shut drawer does not carry them once a second. */
+  diag_counts?: Record<string, number>
+  /** How many of the held records are things that went wrong, rather than things the page said. */
+  diag_failed?: number
+  viewport?: { width: number; height: number }
+  /** For a page painted in this window: where the widget tree put the page widget, in window
+   *  pixels. `shown: false` or a zero box means the page was never given the area the panel left
+   *  for it, which the panel says rather than leaving as an empty frame. */
+  placed?: { x: number; y: number; width: number; height: number; shown: boolean } | null
+  /** Bumps whenever the page or the session changes. Not what the frame poll compares against —
+      that compares `frame_pic` — but the panel shows the page's own state with it. */
+  seq: number
+  /** Whether *this* client may drive the browser, or only watch it. */
+  writable: boolean
+  /** Which browser this is, said out loud: this window's own, or the machine running the tools. */
+  route: string
+  says: string
+}
+
+/** One thing a page said about itself. The shape is the engine's (`browser_hub::Diag`), not one
+    invented here: the drawer, the model's `page_log` tool and the health report are three readings
+    of the same record, and a fourth vocabulary would be three answers to one question. */
+export interface DiagRecord {
+  seq: number
+  /** What the record is of: what the page printed, what threw, what it asked for that failed, what
+      it loaded, where it went, what it handed over. */
+  kind: 'console' | 'error' | 'network' | 'resource' | 'navigation' | 'download' | string
+  level: 'info' | 'warning' | 'error' | string
+  text: string
+  url?: string | null
+  /** An HTTP status, when the record is about a request. Zero when the request never answered. */
+  status?: number | null
+  method?: string | null
+  /** Where in the page it happened, as the page gave it: file:line:col. */
+  at?: string | null
+  /** Which document it belongs to. */
+  nav: number
+  on_this_page?: boolean
+  ago_secs?: number
+}
+
+/** One answer from `browser_log` / `page_log`: the records, and the numbers that say whether there
+    are more than the reader has seen. */
+export interface BrowserLog {
+  ok: boolean
+  alive: boolean
+  url: string
+  nav: number
+  newest: number
+  held: number
+  returned: number
+  health?: { counts: Record<string, number>; failed_total: number; nav: number; url: string }
+  records: DiagRecord[]
 }

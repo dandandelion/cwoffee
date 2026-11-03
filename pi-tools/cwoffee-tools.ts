@@ -14,6 +14,7 @@
  * hand-written tool and a fake guardrail. This one is what the seam is for.
  */
 import { execFileSync } from "node:child_process";
+import { createConnection } from "node:net";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const CWTOOL = process.env.CWOFFEE_CWTOOL ?? "";
@@ -117,6 +118,56 @@ function piSessionFile(ctx: any): string {
 	}
 }
 
+/**
+ * Ask the host's MCP hub one question, over the socket it named in `CWOFFEE_MCP_SOCK`.
+ *
+ * The hub cannot live in this process, and it cannot live in `cwtool` either: an MCP server
+ * is a long-lived child whose pipes carry JSON-RPC frames, and cwoffee's tool host on this
+ * core is one process per call. The app owns the servers, and this is the only road to them.
+ *
+ * `null` means "no hub was named, or it did not answer", which is a fact the caller has to
+ * say rather than guess past: a catalog read that silently returned nothing would leave the
+ * model believing no server is configured when one is sitting in the parent process.
+ */
+function askHub(req: Record<string, unknown>): Promise<any> {
+	const sock = (process.env.CWOFFEE_MCP_SOCK ?? "").trim();
+	if (!sock) return Promise.resolve(null);
+	return new Promise((resolve) => {
+		let settled = false;
+		const done = (v: any) => {
+			if (settled) return;
+			settled = true;
+			resolve(v);
+		};
+		try {
+			const s = createConnection({ path: sock });
+			let buf = "";
+			s.setTimeout(5000, () => {
+				s.destroy();
+				done(null);
+			});
+			s.on("error", () => {
+				s.destroy();
+				done(null);
+			});
+			s.on("data", (d) => {
+				buf += d.toString();
+				const nl = buf.indexOf("\n");
+				if (nl < 0) return;
+				try {
+					done(JSON.parse(buf.slice(0, nl)));
+				} catch {
+					done(null);
+				}
+				s.destroy();
+			});
+			s.write(`${JSON.stringify(req)}\n`);
+		} catch {
+			done(null);
+		}
+	});
+}
+
 function cwtool(sub: string, tool: string, args: unknown, permits: string[] = [], extra: string[] = [], sessionFile = ""): unknown {
 	if (!CWTOOL) throw new Error("CWOFFEE_CWTOOL is not set — the cwoffee tool host cannot start");
 	const raw = execFileSync(CWTOOL, [sub, tool, ...permits, ...extra], {
@@ -181,6 +232,18 @@ const ALLOW = (process.env.CWOFFEE_TOOL_ALLOW ?? "")
  *  engine's answer and this host's note both make. */
 let discoverable = new Set<string>();
 
+/**
+ * Third-party tools: registered, callable, and out of the prompt until `explore` names them.
+ *
+ * These are not the lean-mode set, and the difference matters. `lean` is a dial about how much
+ * of *cwoffee's own* menu a given model is shown; a server's tools are withheld in every mode,
+ * because a server somebody configured and never uses must not pay its schemas in every turn
+ * of every conversation. The names come from the registry through `cwtool specs` — this file
+ * does not decide what is hidden, and a list of hidden tools written here would be a second
+ * answer to the engine's question.
+ */
+let withheldNames = new Set<string>();
+
 /** Which of those `explore` has named to the model in this process. */
 const revealed = new Set<string>();
 
@@ -189,7 +252,7 @@ const revealed = new Set<string>();
 function withheld(loadout: { declared: readonly { name: string }[] }): string[] {
 	return loadout.declared
 		.map((t) => t.name)
-		.filter((n) => discoverable.has(n) && !revealed.has(n));
+		.filter((n) => (discoverable.has(n) || withheldNames.has(n)) && !revealed.has(n));
 }
 
 /** Ask pi to apply its loadout again so the `prepareLoadout` hook recomputes what is withheld.
@@ -223,8 +286,15 @@ export default function (pi: ExtensionAPI) {
 	// bridge cannot supply is a bug in the bridge, and it should show up in the log that the person
 	// is pointed at, not as a mysterious "I cannot do that" from the model.
 	let mounted = tools;
+	// Third-party tools ride the same registration path as cwoffee's own: registered here,
+	// defined by the engine, withheld from the prompt by the registry's answer. Chat sessions
+	// mount no extension at all, and a narrowed allow-list narrows these too — a conversation
+	// granted two tools must not be able to reach somebody else's server.
+	const hiddenList: any[] = Array.isArray(spec.hidden) ? spec.hidden : [];
+	withheldNames = new Set(hiddenList.map((t) => String(t.name)));
+	mounted = [...tools, ...hiddenList];
 	if (ALLOW.length) {
-		const missing = ALLOW.filter((n) => !tools.some((t: any) => t.name === n));
+		const missing = ALLOW.filter((n) => !mounted.some((t: any) => t.name === n));
 		if (missing.length) {
 			console.error(
 				`[cwoffee-tools] CWOFFEE_TOOL_ALLOW names ${missing.join(", ")} and the registry has no such tool`,
@@ -275,10 +345,9 @@ export default function (pi: ExtensionAPI) {
 			// `explore` owns the withholding, since it is the tool that can put the words back:
 			// its `prepareLoadout` hook runs whenever pi applies a loadout and names the active
 			// tools whose declarations requests leave out.
-			...(name === "explore"
+			...(name === "explore" && (leanOn || withheldNames.size > 0)
 				? {
 						prepareLoadout(loadout: { declared: readonly { name: string }[] }) {
-							if (!leanOn) return undefined;
 							return { hiddenDeclarations: withheld(loadout) };
 						},
 					}
@@ -348,20 +417,24 @@ export default function (pi: ExtensionAPI) {
 						// model is the parameter schema, which arrives when the withholding lifts;
 						// if that cannot happen, the model is told rather than left wondering why
 						// a tool it was just told about answers with a validation error.
-						const problem = leanOn ? redeclare(pi) : null;
+						const problem = found.some((n) => discoverable.has(n) || withheldNames.has(n))
+							? redeclare(pi)
+							: null;
 						segs.push(problem ? `[host] ${problem}` : `[host] made callable from your next call: ${found.join(", ")}`);
 						// What pi itself still withholds, read back rather than assumed. This one
 						// is for a developer watching pi's own log: an extension's stderr does not
 						// reach the parent process, so no gate can grep for it - the claim about
 						// the prompt is graded by gateway-prompt-shape.mjs on request bytes, and the
 						// claim about usability by gateway-explore.mjs on the discovered tool running.
-						if (leanOn && typeof pi.getActiveTools === "function") {
+						if (typeof pi.getActiveTools === "function") {
 							const still = (pi.getActiveTools() as string[]).filter(
-								(n) => discoverable.has(n) && !revealed.has(n),
+								(n) => (discoverable.has(n) || withheldNames.has(n)) && !revealed.has(n),
 							);
-							console.error(
-								`[cwoffee-tools] lean: still withheld after explore: ${still.length ? still.join(", ") : "nothing"}`,
-							);
+							if (still.length) {
+								console.error(
+									`[cwoffee-tools] still withheld from the prompt after explore: ${still.join(", ")}`,
+								);
+							}
 						}
 					}
 					if (notMounted.length)
@@ -388,7 +461,18 @@ export default function (pi: ExtensionAPI) {
 				// pi's `details`, which is kept out of the prompt and given to the UI and the
 				// log — that is where the bridge reads `files` and the `+N -M` from.
 				const text = typeof res?.rendered === "string" && res.rendered.length > 0 ? res.rendered : JSON.stringify(res);
-				return { content: [{ type: "text", text }], details: res, isError: res?.ok !== true };
+				const blocks: any[] = [{ type: "text", text }];
+				// A tool that *saw* something (the browser, looking at a page) hands back pixels.
+				// The engine decides whether they exist at all — it fills `images` only for a model
+				// the config says takes image input — so the rule here is only "carry what you were
+				// given". A vision rule duplicated in TypeScript is a second rule, and the two would
+				// disagree the first time a model changed mid-session.
+				for (const im of Array.isArray(res?.images) ? res.images : []) {
+					const data = typeof im?.data_b64 === "string" ? im.data_b64 : "";
+					if (data.length === 0) continue;
+					blocks.push({ type: "image", data, mimeType: String(im?.mime || "image/png") });
+				}
+				return { content: blocks, details: res, isError: res?.ok !== true };
 			},
 		});
 	}
@@ -398,12 +482,58 @@ export default function (pi: ExtensionAPI) {
 		// are different facts, and the second one is what saves the tokens.
 		pi.on("session_start", () => {
 			const active: string[] = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
-			const shown = active.filter((n) => !discoverable.has(n) || revealed.has(n));
-			const held = active.filter((n) => discoverable.has(n) && !revealed.has(n));
+			const held = active.filter((n) => (discoverable.has(n) || withheldNames.has(n)) && !revealed.has(n));
+			const shown = active.filter((n) => !held.includes(n));
 			console.error(
 				`[cwoffee-tools] lean mode: ${shown.length} declaration(s) (${shown.join(", ") || "none"}); declarations withheld for ${held.length ? held.join(", ") : "nothing"} - those stay callable`,
 			);
 			if (!shown.length) console.error("[cwoffee-tools] lean mode declared nothing at all: the model has no tools");
+		});
+	}
+	// Which servers the model can reach, in the words sent for the turn rather than in the
+	// system prompt. Which servers are up changes inside a session — one can be reloaded, one
+	// can die — and the stable prefix is the one place a changing fact must not live.
+	//
+	// This rides `before_provider_request`, not `context`: the block is a fact about the request
+	// being made, and rewriting the message list is rewriting the transcript the agent loop is
+	// walking. Editing the outgoing payload leaves the record alone — the person's own words stay
+	// what they were, and the catalog exists only on the wire, re-read from the hub each time so
+	// no stale copy of it survives a server dying mid-session.
+	if (withheldNames.size > 0 || (process.env.CWOFFEE_MCP_SOCK ?? "").trim()) {
+		pi.on("before_provider_request", async (event: any) => {
+			const payload: any = event?.payload;
+			const msgs: any[] = payload?.messages ?? [];
+			if (!Array.isArray(msgs) || msgs.length === 0) return undefined;
+			const reply = await askHub({ cmd: "block" });
+			const block = typeof reply?.block === "string" ? reply.block.trim() : "";
+			if (!block) return undefined;
+			// The newest user message, because that is where the Rust core puts it too (inside
+			// <env> on the freshest row) and where a mid-session change is allowed to appear.
+			for (let i = msgs.length - 1; i >= 0; i--) {
+				const m = msgs[i];
+				if (m?.role !== "user") continue;
+				const body = m.content;
+				// Idempotent: a retry of the same payload object must not stack a second catalog.
+				const already = (t: unknown) => String(t ?? "").includes("<mcp>");
+				if (typeof body === "string") {
+					if (already(body)) return undefined;
+					const next = msgs.map((x: any, j: number) => (j === i ? { ...x, content: `${body}\n\n${block}` } : x));
+					return { ...payload, messages: next };
+				}
+				if (Array.isArray(body)) {
+					const idx = body.reduce((last: number, b: any, j: number) => (b?.type === "text" ? j : last), -1);
+					if (idx >= 0 && already(body[idx].text)) return undefined;
+					const copy = body.map((b: any) => ({ ...b }));
+					// A user turn can carry image blocks; a sentence belongs with the text, not
+					// with the picture.
+					if (idx < 0) copy.push({ type: "text", text: block });
+					else copy[idx] = { ...copy[idx], text: `${copy[idx].text ?? ""}\n\n${block}` };
+					const next = msgs.map((x: any, j: number) => (j === i ? { ...x, content: copy } : x));
+					return { ...payload, messages: next };
+				}
+				return undefined;
+			}
+			return undefined;
 		});
 	}
 	console.error(`[cwoffee-tools] ${tools.length} tool(s) mounted from the rust registry`);

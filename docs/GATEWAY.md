@@ -89,13 +89,15 @@ Two roles, enforced server-side per command:
 
 * **watch** - `session_state`, `list_sessions`, `session_messages`, `message_attachments`,
   `search_messages`, `migration_notes`, `list_workspaces`, `about`, `checkpoint_preview`,
-  `mcp_status`, `tool_inventory`. Read-only.
+  `files_ledger`, `file_diff`, `snapshot_stats`, `mcp_status`, `tool_inventory`, `session_tree`,
+  `browser_status`. Read-only.
 * **drive** - everything that changes state: `start_turn`, `cancel_turn`,
   `respond_approval`, `respond_question`, `set_mode`, `set_reasoning`, `new_session`,
   `switch_session`, `rename_session`, `delete_session`, `clear_session`, `set_model`,
   `set_workspace`, `add_workspace`, `remove_workspace`, `set_workspace_label`,
   `set_workspace_color`, `set_session_web`, `provider_set_primary`,
-  `export_markdown`, `edit_message`, `branch_conversation`, `checkpoint_revert`.
+  `export_markdown`, `edit_message`, `branch_conversation`, `switch_leaf`, `checkpoint_revert`,
+  `forget_copies`.
 
 `share_markdown` takes `{ session }` and returns `{ name, markdown }`: that conversation as a
 Markdown document, built from **the workspace stored on that session** rather than the host's
@@ -130,6 +132,28 @@ an answer is not something to send.
 Like `edit_message` it is drive-only, and for the same two reasons: it writes rows, and it moves what
 the model can see onto the new conversation. It refuses while a turn is running - a mid-turn branch
 would leave that turn's output to land in whichever conversation the queue reached first.
+
+`session_tree` takes `{ session }` and returns the conversation's lineage (parent, the role and row id
+each child was cut at, the quote captured there, depth, row counts, how many children), its nodes, which
+node is current, how many rows are on branches nobody is reading, what pi's thread said if there was a
+thread to ask, and the lines where the two records disagree. It is **watch**-role: a phone that can read
+the transcript should be able to see where the conversation was cut and what its next answer will read,
+and reading changes nothing — which is why it answers while a turn is running, when `switch_leaf` will
+not. The desktop command and this verb call the same `cwoffee_engine::tree::read`, so a phone and a
+window cannot be shown two different answers to "who is whose parent".
+
+`switch_leaf` takes `{ session, message_id?, from_end?, role?, shown }` and returns
+`{ session, leaf, reads_through, off_branch, prefill, note }`. It moves what the next answer reads, and
+nothing else: it copies no rows (that is `branch_conversation`) and deletes none (that is
+`edit_message` with `resend`), and a message sent afterwards joins the branch the leaf was left on.
+`leaf` is `0` when the leaf sits in front of the first message — the conversation reads nothing — and
+`prefill` carries the words that message was, because taking back your own ask is the point of standing
+in front of it. It is drive-only and audited, it refuses mid-turn, and it refuses a row whose words the
+caller did not paint: a leaf moved by a row id alone is a leaf moved onto whatever that id holds by now.
+On the pi core the move is a fork of pi's own thread, so the receipt names the thread the model is on
+now and says the previous thread is still there holding the off-path messages; on the Rust core it says
+the branch was re-read from the record. The two cores answer differently on purpose, and the phone gets
+whichever sentence the running core gives.
 
 The identity arguments are the same discipline as the pencil's, and for the same reason: a phone tab,
 a desktop window and the harness all read one conversation, so the caller names the row (`message_id`,
@@ -167,6 +191,42 @@ where restoring a copy restores the wrong thing.
 The transcript is not touched, and `messages` is the message count after the revert, so a client can
 say "the conversation still holds N messages" as a measured fact rather than a promise: undoing
 files is not undoing the conversation, and the record still says what was asked and answered.
+
+`files_ledger` takes `{ session }` and returns `{ session, workspace, turns, paths, turns_total,
+turns_hidden, files_total, paths_total, paths_hidden, copies, pruned, prune_notes, copies_missing,
+unstamped, edited_since, note }`. Where `checkpoint_preview` reads one turn, this reads the whole
+conversation: every turn that wrote a file, newest first, with its rows (`checkpoint`, `path`, `kind`,
+`bytes`, `copy_present`, `can_revert`, `edited_since`, `path_missing`, `live_exists`, `live_bytes`,
+`says`). Watch-role and answered mid-turn, because it is a question about what has already happened
+and reading changes nothing. `pruned` counts **only** the copies the size cap discarded; copies a
+person deleted, and copies the snapshot folder lost out of band, are in `prune_notes` and
+`copies_missing` instead, so a short list is never misread as a limit somebody hit. The caps
+(`turns_hidden`, `paths_hidden`) hide the oldest turns from the card while `files_total` stays the
+record's count.
+
+`file_diff` takes `{ session, checkpoint, shown }` and returns the stored copy against the bytes on
+disk through the same diff the tool card prints. `checkpoint` is the ledger row's id and `shown` is
+the path that card painted, as a pair: a window that has been sitting open cannot ask for "the copy
+of `a.md`" and get whatever `a.md` belongs to for the newest turn by now, so a mismatch refuses and
+names what the row holds. It also refuses when there is only one side to show — a row that *created*
+the file has no earlier bytes, and a row whose copy is gone has no stored side; printing the live
+file alone would read as every line having been added by somebody. Both refusals say "Nothing was
+diffed" and write nothing. Watch-role: it reads two files and changes none.
+
+`snapshot_stats` takes `{ session }` and returns the cost of that conversation's copies, with the two
+numbers kept apart on purpose: `rows`/`row_bytes` from the index (which double-counts a blob two turns
+share, because it counts the copies the turns took) and `blobs`/`blob_bytes` from the store (distinct
+files, what `du` agrees with), plus `shared` for blobs another conversation points at and
+`orphan_blobs`/`orphan_bytes` for bytes in the store no index row reaches. Putting those in one
+sentence is how a double-count gets read as disk usage.
+
+`forget_copies` takes `{ session, shown }` and returns `{ session, dropped, freed_bytes, kept, note }`.
+It deletes files — the copies, never the workspace's own files — so it is drive-only and audited like
+`checkpoint_revert`, refused while a turn runs (that turn is taking copies right now), and `shown` is
+the copy count the card printed: a mismatch deletes nothing and prints both counts. It checks every
+conversation for reach before deleting a blob and leaves the ones another conversation points at,
+saying how many in `kept`; `freed_bytes` counts the blobs it actually removed, deduped, so two rows
+sharing one copy report one file's bytes and not twice them.
 
 `message_attachments` takes `{ message_id }` and returns `[{ mime, data_b64, name }]` - the bytes
 behind one stored message. It exists because a transcript page deliberately carries name and size
@@ -217,12 +277,18 @@ read-only verb reachable by a watch token, and "which build am I running" must n
 read a secret.
 
 `mcp_status` takes nothing and returns `{ core, mounted, catalog_bytes, catalog_body_bytes,
-catalog_lead_bytes, catalog_budget, tools, servers, configured, config_path, why }`. It answers the
+catalog_lead_bytes, catalog_budget, tools, servers, configured, config_path, route, why }`. It answers the
 one question a person with a `[mcp]` block actually has: *is what I wrote running?* So it reads the
 hub the app started, not the config file - a config says what was intended, a status says what
 happened - and it re-reads the config and re-applies the environment first, because
 `CWOFFEE_MCP_SERVERS` describes the same servers as `[mcp]` and a page that read only the file would
 tell someone whose servers come from a systemd unit that none exist.
+
+`route` answers a question `mounted` cannot: *how does a call get there*. On the Rust core it is
+this process; on the pi core the hub is still the app's but the tool host is a child of it and asks
+over a unix socket, so the route names that socket — or says the hub is unreachable from a tool
+process, which happens when the socket could not be opened and is not something a green row should
+cover. A phone reading this row is reading the same Arc its own turns go through.
 
 The three byte fields are the prompt cost, split so a page can print the part a server controls
 against the budget without hiding the sentence around it: `catalog_body_bytes` is the tool list,
@@ -232,6 +298,16 @@ when nothing is mounted, and the total is always the sum of the two parts - a pa
 
 It is watch-role and it is not a control surface: nothing in the reply starts or stops a server, and
 a phone has no business launching a program somebody else wrote on the desktop machine.
+
+`browser_status` takes `{ model }` and answers what the built-in browser will do in this start:
+`{ mounted, driver, node, headed, why, screenshot_default, vision, says }`. The model is an argument
+because the answer is about the model that is answering — whether a run paints a window on the
+machine the app is running on comes from that model's recorded modalities, and those are read from
+the config file the settings screen writes, not from a claim carried across the wire. `says` is the
+tool's own sentence rather than a paraphrase written on the phone side, because a screen that
+restates a policy is a screen that eventually contradicts it. When no driver was found, `mounted` is
+false and `says` names the two commands that would install one; a client must not render an absent
+tool as an available one. See [`BROWSER.md`](BROWSER.md).
 
 `tool_inventory` takes nothing and returns `{ declared, hidden }` - the tool names the model was
 handed, and the names registered but withheld until `explore` looks them up. Names only: no schemas,

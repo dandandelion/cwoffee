@@ -14,3 +14,4 @@ tokio = { workspace = true }
 ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"
+libc = "0.2"

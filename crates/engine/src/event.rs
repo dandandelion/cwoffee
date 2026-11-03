@@ -239,6 +239,40 @@ pub enum EngineEvent {
         finish: FinishReason,
     },
 
+    /// A message typed during a turn went into the conversation.
+    ///
+    /// Emitted at the moment the words are put into the prompt the *next* request is built from —
+    /// never when they were typed. That ordering is the whole claim: a card that said the model has
+    /// the message before a request carries it would be asserting something nobody measured.
+    /// `step` is the round-trip that carries it; `typed_at` is when Enter was pressed, which is also
+    /// the stamp the stored row gets.
+    SteerLanded {
+        id: u64,
+        session: i64,
+        kind: crate::steer::MidTurn,
+        text: String,
+        typed_at: i64,
+        turn_id: u64,
+        step: usize,
+    },
+
+    /// What is waiting in the mid-turn queue, complete. Whole rather than incremental: pi's own
+    /// `queue_update` carries the entire queue and cwoffee's ids have to be reconciled against it,
+    /// and a client that missed one event must not keep painting a line for a message that is no
+    /// longer queued.
+    QueueChanged {
+        session: i64,
+        items: Vec<crate::steer::View>,
+    },
+
+    /// The turn stopped with messages still waiting. Their words go back to the composer; nothing
+    /// was sent, and the event says so because a queued line that quietly disappears is a lost
+    /// keystroke with a card attached to it.
+    QueueReturned {
+        session: i64,
+        items: Vec<crate::steer::View>,
+    },
+
     /// A non-actionable state change worth showing in the transcript, e.g. the
     /// workspace moving. Not an error: nothing went wrong.
     Note {

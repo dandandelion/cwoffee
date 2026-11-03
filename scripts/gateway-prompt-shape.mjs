@@ -14,13 +14,19 @@
 //   * cowork declares the tools the registry has, and says which folder it is in;
 //   * the two cores may phrase things differently but neither may send the model a
 //     tool list for tools that were not mounted, or a prompt for a persona the user
-//     did not choose.
+//     did not choose;
+//   * a configured MCP server is *catalogued*, not declared: the model gets a capped
+//     list of names and no schema until `explore` names one, so a server nobody uses
+//     cannot cost prompt bytes. Both cores are measured on the same two numbers, which
+//     is why this arm exists: the pi core reaches its servers through a socket, and a
+//     catalog that rode the wire differently there would be a second behaviour.
 //
 // Run:  node scripts/gateway-prompt-shape.mjs [--core pi] [--port 8316] [--ep 8317]
 //                                                [--db /tmp/cwoffee-prompt-shape]
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import http from 'node:http'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -135,13 +141,48 @@ const gwChild = spawn(path.join(TGT, 'release', 'cwoffee-gateway'), gwArgs, {
     CWOFFEE_MODE: 'ask',
     CWOFFEE_CWTOOL: process.env.CWOFFEE_CWTOOL ?? path.join(TGT, 'release', 'cwtool'),
     CWOFFEE_PI_TOOL_MODE: MODE,
+    // Two servers, one of them offering enough tools to blow past the catalog ceiling if
+    // the cap were a hope rather than a rule. Nothing here touches a person's config file:
+    // the suite's servers come from the environment for exactly that reason.
+    CWOFFEE_MCP_SERVERS: JSON.stringify({
+      shape: { command: process.env.CWOFFEE_NODE ?? 'node', args: [path.join(REPO, 'scripts', 'fake-mcp-server.mjs'), '--tools', '2'] },
+      wide: { command: process.env.CWOFFEE_NODE ?? 'node', args: [path.join(REPO, 'scripts', 'fake-mcp-server.mjs'), '--tools', '40'] },
+    }),
   },
 })
 kids.push(gwChild)
 let gwLog = ''
 gwChild.stdout.on('data', (b) => (gwLog += String(b)))
 gwChild.stderr.on('data', (b) => (gwLog += String(b)))
-await t(3500)
+// Wait for the port rather than for a fixed sleep. With `[mcp]` configured the gateway
+// starts other people's programs before it listens, and a driver that connected at a fixed
+// 3.5 s would report a slow-but-healthy start as a gateway that never came up.
+const waitPort = async (port, ms) => {
+  const dl = Date.now() + ms
+  while (Date.now() < dl) {
+    const ok = await new Promise((r) => {
+      const s = net.connect(port, '127.0.0.1')
+      s.once('connect', () => {
+        s.destroy()
+        r(true)
+      })
+      s.once('error', () => r(false))
+      s.setTimeout(1000, () => {
+        s.destroy()
+        r(false)
+      })
+    })
+    if (ok) return true
+    await t(200)
+  }
+  return false
+}
+if (!(await waitPort(PORT, 30000))) {
+  console.log(`FAIL the scratch gateway never listened on :${PORT} within 30s:\n` + gwLog.slice(0, 600))
+  for (const k of kids) (k.kill ? k.kill() : k.kill('SIGTERM'))
+  process.exit(1)
+}
+await t(400)
 
 // --- drive: one cowork turn, one chat turn ------------------------------------------
 const ws = new globalThis.WebSocket(`ws://127.0.0.1:${PORT}/ws`)
@@ -201,7 +242,13 @@ const shapeOf = (seen) => {
   const same = keys.length > 1 && keys.every((k) => k === keys[0])
   const b = (seen.find((p) => p.body?.messages?.length) ?? { body: {} }).body
   const msgs = b.messages ?? []
-  const sys = msgs.filter((m) => m.role === 'system').map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n')
+  // `system` and `developer` are the same thing in two provider dialects: pi's OpenAI-compatible
+  // path sends the prompt as `developer`, and a gate that read only `system` would report a core
+  // sending a 0-byte prompt - which is the kind of measurement that invents a bug.
+  const sys = msgs
+    .filter((m) => m.role === 'system' || m.role === 'developer')
+    .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+    .join('\n')
   const tools = (b.tools ?? []).map((x) => ({
     name: x.function?.name ?? x.name,
     bytes: JSON.stringify(x).length,
@@ -229,7 +276,8 @@ const shapeOf = (seen) => {
 }
 
 const sessCowork = (await call('new_session', { title: 'shape cowork', workspace: path.join(DIR, 'ws') })).data
-const cowork = shapeOf(await runTurn('Remember this for the shape check.', sessCowork))
+const coworkSeen = await runTurn('Remember this for the shape check.', sessCowork)
+const cowork = shapeOf(coworkSeen)
 console.log(
   `\ncowork: ${cowork.requests} request(s) to the endpoint, model=${cowork.model} ` +
     `system=${cowork.sysBytes} B, ${cowork.tools.length} tool declaration(s) = ${cowork.toolBytes} B, ` +
@@ -239,6 +287,15 @@ console.log(
 console.log(`  prompt sections: tools list ${cowork.lists.tools} B, docs ${cowork.lists.docs} B, cwd ${cowork.lists.cwd} B`)
 console.log(`  declared: ${cowork.tools.map((x) => `${x.name} (${x.bytes} B)`).join(', ') || '(none)'}`)
 console.log(`  system head: ${JSON.stringify(cowork.sys.slice(0, 150))}`)
+if (process.env.SHAPE_DEBUG)
+  console.log(
+    '  debug: cowork request keys ' +
+      JSON.stringify(Object.keys(coworkSeen[0]?.body ?? {})) +
+      ' roles ' +
+      JSON.stringify((coworkSeen[0]?.body?.messages ?? []).map((m) => m.role)) +
+      ' system-field ' +
+      JSON.stringify(String(coworkSeen[0]?.body?.system ?? '').slice(0, 120)),
+  )
 if (otherRequests.length) console.log(`  the core also asked the endpoint: ${otherRequests.join(', ')}`)
 if (cowork.each.length > 1) console.log(`  each request: ${cowork.each.join(' || ')}`)
 
@@ -298,6 +355,73 @@ if (MODE === 'lean') {
 } else if (cowork.requests > 0 && cowork.tools.length < 8) {
   fails.push(`full mode declared only ${cowork.tools.length} tools — the switch is leaking the wrong way`)
 }
+// --- the MCP catalog on the wire ----------------------------------------------------
+// Two numbers the feature promises on both cores: the block the model is shown about its
+// servers is capped, and nothing a server offers is declared until somebody asks for it.
+const CATALOG_CEILING = 1024 // cwoffee_engine::mcp::CATALOG_BYTE_BUDGET
+const mcpBlockOf = (seen) => {
+  for (const p of seen) {
+    for (const m of p.body?.messages ?? []) {
+      const c =
+        typeof m.content === 'string'
+          ? m.content
+          : (m.content ?? []).map((x) => x.text ?? '').join('\n')
+      const hit = c.match(/<mcp>[\s\S]*?<\/mcp>/)
+      if (hit) return hit[0]
+    }
+  }
+  return ''
+}
+const mcpBlockTxt = mcpBlockOf(coworkSeen)
+const mcpDeclared = cowork.tools.filter((x) => (x.name ?? '').startsWith('mcp__'))
+if (cowork.requests > 0) {
+  if (!mcpBlockTxt)
+    fails.push(
+      `two servers are configured and the model is never told they exist: no <mcp> block in ` +
+        `${cowork.requests} request(s) — a model that cannot see a server cannot ask for one`,
+    )
+  else {
+    // The ceiling is on the part that scales with the number of servers - the tool lines - not on
+    // the fixed sentence above them, which is the same length whatever is configured. Grading the
+    // whole block against the budget would fail an engine that is doing exactly what it promises.
+    // The block is: a fixed explanatory head, one line per server, one line per tool, a tag.
+    // The scaling part is the server and tool lines; the head is the same length whatever is
+    // configured, so the ceiling is measured on the part a person's config actually drives.
+    const body = mcpBlockTxt
+      .split('\n')
+      .filter((l) => /^- /.test(l) || /^ {2}\S/.test(l))
+      .join('\n')
+    if (body.length > CATALOG_CEILING)
+      fails.push(
+        `the catalog's tool list is ${body.length} B against a ${CATALOG_CEILING} B ceiling — ` +
+          `that is the part every prompt pays per server, and 42 tools would cost more than the first-party set`,
+      )
+    console.log(
+      `  mcp: catalog body ${body.length} B of a ${CATALOG_CEILING} B ceiling, ` +
+        `block ${mcpBlockTxt.length} B including the fixed explanation`,
+    )
+    if (!mcpBlockTxt.includes('shape') || !mcpBlockTxt.includes('wide'))
+      fails.push(`the block names neither configured server: ${JSON.stringify(mcpBlockTxt.slice(0, 120))}`)
+    if (!/explore/i.test(mcpBlockTxt))
+      fails.push('the block does not say how a server tool becomes callable, so the model would guess')
+    if (!/not listed|more tool/i.test(mcpBlockTxt) && body.length >= CATALOG_CEILING - 40)
+      fails.push('the tool list is at its ceiling without saying how many names it left out')
+    console.log(
+      `\n  mcp: the block the model is shown is ${mcpBlockTxt.length} B of a ${CATALOG_CEILING} B ceiling, ` +
+        `and ${mcpDeclared.length} of its ${mcpBlockTxt.split('\n').length} line(s) reached the request as a tool declaration`,
+    )
+    // Printed so a reader can see what a capped catalog actually says, rather than taking a
+    // truncation on faith: the last line is where a cut list admits how much it cut.
+    console.log(`  mcp block tail: ${JSON.stringify(mcpBlockTxt.slice(-200))}`)
+  }
+  if (mcpDeclared.length)
+    fails.push(
+      `a configured server declared ${mcpDeclared.map((x) => `${x.name} (${x.bytes} B)`).join(', ')} before ` +
+        'anything asked for it — third-party schemas in every prompt is the cost this feature exists to avoid',
+    )
+  else console.log('  mcp: no mcp__ tool declaration in the request: a server nobody asks for costs nothing')
+}
+
 if (cowork.tools.length && !/cwoffee|workspace|folder/i.test(cowork.sys))
   console.log('\n  note: the cowork system text never mentions the workspace or cwoffee by name')
 

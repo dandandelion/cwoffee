@@ -22,7 +22,14 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2" }
+# The embedded browser is built on wry directly, not through tauri's WebviewBuilder: a page the app
+# drives *itself* needs `build_gtk` into a `gtk::Fixed` (the one container wry honours an exact
+# position and size in), and it needs to carry no tauri IPC at all. `gtk` is the widget tree the
+# page floats in; `dpi` is wry's own unit type for a rectangle.
+wry = "0.57"
+gtk = "0.18"
+dpi = "0.1"
 # Opening links in the real browser. Deliberately the official plugin rather than
 # an xdg-open command of our own: it validates the URL against a declared scope
 # instead of handing a caller's string to a shell.

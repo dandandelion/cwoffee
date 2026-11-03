@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use cwoffee_bridge::translate::Translator;
 use cwoffee_engine::event::{EngineEvent, FinishReason};
-use cwoffee_engine::provider::Role;
+use cwoffee_engine::provider::{Message, Role};
 
 fn fixture(name: &str) -> Vec<serde_json::Value> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -700,5 +700,134 @@ fn an_early_stored_send_still_reconciles_what_came_back() {
         out.events.iter().any(|e| matches!(e, EngineEvent::Note { message, .. } if message.contains("echoed 0 of 1"))),
         "a picture that never reached the endpoint must be reported: {:?}",
         out.events
+    );
+}
+
+/// pi answers `get_entries` with a flat list of entries plus a `leafId`, and the path its model reads
+/// is the one that runs up from that leaf. The fixture is written so the two disagree on purpose: the
+/// straight path (a1..a4) was appended first, then the leaf moved back to the first answer and the
+/// branch (b1, b2) was appended after it, hanging off a2.
+///
+/// `rewind.rs` only ever needed `leafId`, and reading the list would have been enough for that. The
+/// tree read needs every entry and its parent, because what it answers is "which of your messages is
+/// the model reading, and which is it not" — and a read that walked the list marks a3/a4, the earlier
+/// path, as the conversation.
+#[test]
+fn a_thread_whose_file_order_is_not_its_conversation_order_is_read_as_a_tree() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("pi-tree-branched.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e} — the tree fixture is a captured get_entries answer", path.display()));
+    let d: serde_json::Value = serde_json::from_str(&raw).expect("the tree fixture is not JSON");
+    let t = cwoffee_engine::tree::pi_entries_from_json(
+        d.get("entries")
+            .expect("the fixture is a get_entries answer with entries in it"),
+        d.get("leafId").and_then(serde_json::Value::as_str),
+        "/tmp/pi-tree-branched.jsonl",
+    );
+
+    // The order the entries were appended to the file, which is the order they are answered in.
+    let written = ["a1", "a2", "a3", "a4", "b1", "b2", "m1"];
+    let listed: Vec<&str> = t.nodes.iter().map(|n| n.entry.as_str()).collect();
+    assert_eq!(listed, written, "the read keeps pi's list order");
+
+    // The path the next answer reads is the one that runs up from the leaf, not the prefix of the
+    // list — which is exactly the mistake a list-order read makes on this fixture: reading down the
+    // list to its last message entry would call a3/a4 the conversation and drop b1/b2.
+    let on: Vec<&str> = t.nodes.iter().filter(|n| n.on_branch).map(|n| n.entry.as_str()).collect();
+    assert_eq!(on, ["a1", "a2", "b1", "b2"]);
+    assert_ne!(
+        on,
+        ["a1", "a2", "a3", "a4"],
+        "the branch is the newer path in the file, not the one written first"
+    );
+    assert_eq!(t.leaf.as_deref(), Some("b2"));
+    assert_eq!(t.file, "/tmp/pi-tree-branched.jsonl");
+    // pi's own writing is a node of the thread, named by what it changed.
+    let book = t.nodes.iter().find(|n| n.entry == "m1").expect("the model entry is a node");
+    assert_eq!(book.kind, "model_change");
+    assert_eq!(book.text, "glm-4.5", "and it has something to show for itself");
+    assert!(!book.on_branch, "it was not on the path the leaf reads");
+}
+
+/// The same thread against a record of its own. Where they agree, the entries land on rows; where
+/// they do not, the disagreement is a line of the tree rather than a hole in it.
+#[test]
+fn a_thread_and_a_record_that_disagree_report_themselves() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("pi-tree-branched.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let d: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let t = cwoffee_engine::tree::pi_entries_from_json(
+        d.get("entries").unwrap(),
+        d.get("leafId").and_then(serde_json::Value::as_str),
+        "/tmp/pi-tree-branched.jsonl",
+    );
+
+    let store = cwoffee_engine::store::Store::in_memory().unwrap();
+    let c = store.create_session("Roast notes", "/tmp", "m").unwrap();
+    // Written in the order the file has them: the two asks that went on, then — after the leaf moved
+    // back to the first answer — the branch pi's thread was forked at. That leaf move is the only
+    // thing in the record that says `second ask` is on a path nobody is reading; a record that merely
+    // appended all six rows would put them all on one line and the card would draw a conversation
+    // pi's tree does not hold.
+    for (role, text) in [
+        ("user", "first ask"),
+        ("assistant", "first answer"),
+        ("user", "second ask"),
+        ("assistant", "second answer"),
+    ] {
+        let m = match role {
+            "user" => Message::user(text),
+            _ => Message::assistant(text),
+        };
+        store.append_message(c, &m).unwrap();
+    }
+    let cut = store.messages(c).unwrap()[1].id;
+    store.set_leaf(c, Some(cut)).unwrap();
+    for (role, text) in [("user", "branch ask"), ("assistant", "branch answer")] {
+        let m = match role {
+            "user" => Message::user(text),
+            _ => Message::assistant(text),
+        };
+        store.append_message(c, &m).unwrap();
+    }
+    // The conversation is being read from the branch, which is what pi's own leaf says too.
+    let branch_tip = store.messages(c).unwrap().last().unwrap().id;
+    store.set_leaf(c, Some(branch_tip)).unwrap();
+
+    let (nodes, drift, drift_count, hidden) = cwoffee_engine::tree::nodes_of(&store, c, Some(&t));
+    assert_eq!(hidden, 0, "six rows and seven entries fit on one card");
+    assert_eq!(drift_count, 0, "the two records answer to each other: {drift:?}");
+    assert!(drift.is_empty());
+    // The other branch is drawn, and said as the branch it is, not left out because the leaf moved.
+    let off = nodes.iter().filter(|n| !n.on_branch && n.row.is_some()).count();
+    assert!(
+        nodes.iter().any(|n| n.content == "second answer" && !n.on_branch),
+        "the answer the leaf left behind is missing from the card"
+    );
+    assert!(off >= 2, "both rows of the other branch are drawn: {off}");
+    // pi's leaf maps onto a row of the record, so the card marks a row rather than an entry id.
+    let cur: Vec<&cwoffee_engine::tree::TreeNode> = nodes.iter().filter(|n| n.current).collect();
+    assert_eq!(cur.len(), 1, "one node is what the next answer reads through");
+    assert_eq!(cur[0].content, "branch answer");
+    assert_eq!(cur[0].pi_entry.as_deref(), Some("b2"), "and it names pi's entry as well");
+
+    // Now let the two records drift: a rewind took the branch's answer out of the record, and pi's
+    // thread still holds it. That is the out-of-band case the read has to say rather than swallow.
+    store.truncate_from(c, branch_tip).unwrap();
+    let (nodes2, drift2, drift_count2, _) = cwoffee_engine::tree::nodes_of(&store, c, Some(&t));
+    assert!(drift_count2 > 0, "a thread with a message the record has no row for is drift");
+    assert!(
+        drift2.iter().any(|l| l.contains("branch answer")),
+        "and it names the message it is about: {drift2:?}"
+    );
+    assert!(
+        nodes2.iter().any(|n| n.drift && n.pi_entry.as_deref() == Some("b2")),
+        "the node itself is marked, so the card can draw it as the disagreement it is"
     );
 }

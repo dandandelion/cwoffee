@@ -127,6 +127,19 @@ async fn render_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) {
                 println!("(the model asks: {question} - nobody here to answer)")
             }
             EngineEvent::QuestionAnswered { .. } => {}
+            // Mid-turn steering, narrated rather than answered: this example has no keyboard on
+            // the turn, so it prints what the queue did rather than pretending to type into it.
+            EngineEvent::QueueChanged { items, .. } => {
+                if !items.is_empty() {
+                    println!("(waiting mid-turn: {})", items.len());
+                }
+            }
+            EngineEvent::SteerLanded { kind, text, step, .. } => {
+                println!("(steered {kind:?} at step {step}: {text})");
+            }
+            EngineEvent::QueueReturned { items, .. } => {
+                println!("({})", cwoffee_engine::steer::returned_note(items.len()));
+            }
             EngineEvent::QuestionExpired { id, .. } => {
                 println!("[ask] question {id} closed without an answer");
             }

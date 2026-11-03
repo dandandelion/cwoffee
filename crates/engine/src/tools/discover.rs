@@ -288,7 +288,15 @@ impl Tool for ExploreTool {
         // The same construction the host used, from the same config, so a card describes the
         // tool the user actually mounted — search provider and sandbox policy and all. The
         // hidden tools come from the caller's context, because this registry cannot contain them.
-        let reg = Registry::with_v1_tools_exec(ctx.search_backend.clone(), ctx.exec_cfg.clone());
+        // Built the same way the host built the real one, browser included. On the pi core the
+        // browser lives in the hidden half of the toolset, and an explore registry that did not
+        // know about it would answer "no such tool" for a tool the model is then never able to
+        // be granted.
+        let reg = Registry::with_v1_tools_browser(
+            ctx.search_backend.clone(),
+            ctx.exec_cfg.clone(),
+            ctx.browser.usable().then(|| ctx.browser.clone()),
+        );
         let found = discover_with(&reg, &ctx.lazy_tools, &q, limit, body);
         if found.is_empty() && q.to_ascii_lowercase().starts_with("mcp:") {
             return ToolResult::ok(

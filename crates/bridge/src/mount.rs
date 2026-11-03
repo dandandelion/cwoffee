@@ -305,8 +305,13 @@ pub fn mount_provider_rows(
             });
             if let Some(w) = facts.as_ref().and_then(|f| f.context_window) {
                 entry["contextWindow"] = serde_json::json!(w);
-                let cap = (w / 2).max(1);
-                entry["maxTokens"] = serde_json::json!(cap);
+                // The row's recorded `max_tokens` is what the endpoint said about its own output
+                // limit; the old half-the-window guess is what made a server reject a request that
+                // still had room in it. See `declared_max_tokens`.
+                let rec = facts.as_ref().and_then(|f| f.max_tokens);
+                if let Some(cap) = declared_max_tokens(Some(w), rec) {
+                    entry["maxTokens"] = serde_json::json!(cap);
+                }
             }
             models.push(entry);
         }
@@ -485,8 +490,13 @@ pub fn write_dev_provider(
         // as a reply that stops in the middle with no error anywhere. Declare the cap from
         // the window the endpoint stated: half of it, never below pi's own default, and with
         // room left for the prompt. No window probed, no number invented: pi keeps its default.
-        let half = (w / 2).max(16_384).min(w.saturating_sub(4_096).max(1));
-        entry["maxTokens"] = serde_json::json!(half);
+        // This entry is the launch provider, built from `[provider]` rather than a model row, so
+        // there is no recorded output limit to honour here — the row-backed entries above are where
+        // a probed limit lands. Same floor and prompt-room ceiling as before.
+        let wu = w as usize;
+        let cap = declared_max_tokens(Some(wu), None).unwrap_or(1).max(16_384);
+        let cap = cap.min(wu.saturating_sub(4_096).max(1));
+        entry["maxTokens"] = serde_json::json!(cap);
     }
     let path = agent_dir.join("models.json");
     // Merge, and overwrite only the section this app owns. Skipping the whole file when it
@@ -579,6 +589,72 @@ pub fn write_dev_provider(
 /// `Err` names the ambiguity instead of picking one: two registered endpoints that both
 /// list the same model id mean nothing says which server the person meant, and guessing
 /// picks a bill or a model they did not choose.
+/// Which endpoint pi should be *launched* on for the configured default model.
+///
+/// cwoffee has always launched pi against its own provider entry (`cwoffee`), built from the
+/// `[provider]` block. That made an endpoint added on the settings screen a thing you could switch
+/// to mid-run but never start on: the default model was answered by the `[provider]` server even
+/// when an endpoint row served that exact model, and "I added the endpoint and it still uses the
+/// default one" is what that looks like from outside. When exactly one added endpoint serves the
+/// default model, that row is the launch provider and cwoffee's entry becomes the fallback. No
+/// match and several matches both say so out loud rather than quietly choosing.
+/// The output cap cwoffee declares in a pi model entry, or nothing when no window is known.
+///
+/// Silence is not "no limit": pi's provider composer answers `definition.maxTokens ?? 16384` ✓
+/// so an entry that says nothing truncates a long answer at 16384 tokens with no error anywhere ✓
+/// which is why this field is written at all. What cwoffee can choose is *which* number, and the
+/// previous rule — half the context window — is a made-up figure that a server can refuse: a
+/// llama.cpp slot checks `prompt + max_tokens` against its own size, so a 250k-token prompt plus a
+/// 131072 cap is an error even while the endpoint has room left. That is the complaint this fixes.
+///
+/// The honest number is the one already on record. `ModelRow::max_tokens` in `[models.<id>]` used to
+/// be read by nobody — so a recorded limit was shadowed by a guess. Recorded value wins when it exists
+/// and fits inside the window; otherwise half the window as before, always leaving room for the prompt,
+/// and never a claim when no window was probed. Note what our probe does *not* learn: llama.cpp's
+/// `/props` states `n_ctx` (the context) and nothing here reads `default_generation_settings.n_predict`,
+/// so a recorded `max_tokens` is a config fact — someone's number — not an endpoint measurement.
+pub fn declared_max_tokens(window: Option<usize>, recorded: Option<usize>) -> Option<usize> {
+    let w = window?;
+    let cap = recorded.filter(|m| *m > 0 && *m < w).unwrap_or(w / 2);
+    Some(cap.max(1).min(w.saturating_sub(4_096).max(1)))
+}
+
+pub fn launch_provider(cfg_path: &Path, fallback: &str, model: &str) -> (String, Option<String>) {
+    let rows = cwoffee_engine::config::provider_rows_in(cfg_path);
+    let bare = model.split_once('/').map(|(_, m)| m).unwrap_or(model).trim();
+    let hits: Vec<String> = rows
+        .iter()
+        .filter(|(_, r)| r.models.iter().any(|m| m.trim() == model.trim() || m.trim() == bare))
+        .map(|(n, _)| n.clone())
+        .collect();
+    match hits.len() {
+        0 => (
+            fallback.to_string(),
+            Some(format!(
+                "no endpoint you added under Settings > Models serves {model}, so pi starts on cwoffee's own entry ({fallback}) from [provider]"
+            )),
+        ),
+        1 => {
+            let name = &hits[0];
+            (
+                name.clone(),
+                Some(format!(
+                    "pi starts on the endpoint you added ({name}), because that is the endpoint which serves {model}; cwoffee's own entry is the fallback, not the default"
+                )),
+            )
+        }
+        n => {
+            let many = hits.join(", ");
+            (
+                fallback.to_string(),
+                Some(format!(
+                    "{model} is served by {n} of your endpoints ({many}), so nothing says which to start on and pi starts on cwoffee's own entry ({fallback}); remove one of those rows to pick a default endpoint"
+                )),
+            )
+        }
+    }
+}
+
 pub fn pi_target(cfg_path: &Path, own_provider: &str, id: &str) -> anyhow::Result<(String, String)> {
     let id = id.trim();
     if id.is_empty() {
@@ -656,6 +732,68 @@ mod tests {
     /// `scripts/pi-reasoning-gate.mjs` feeds that same fixture to pi's own functions. One
     /// fixture, both halves: this test grades what cwoffee writes, the gate grades what pi makes
     /// of it.
+    #[test]
+    fn the_output_cap_prefers_the_recorded_limit_over_half_the_window() {
+        // A probed limit is a fact about the server; half the window is a guess that the server can
+        // refuse, because a llama.cpp slot checks `prompt + max_tokens` against its own size.
+        assert_eq!(declared_max_tokens(Some(262_144), Some(16_000)), Some(16_000));
+        // Recorded but impossible (not below the window) is not a fact worth honouring.
+        assert_eq!(declared_max_tokens(Some(262_144), Some(300_000)), Some(131_072));
+        assert_eq!(declared_max_tokens(Some(262_144), Some(0)), Some(131_072));
+        // Nothing recorded: the previous rule, unchanged, and never above the window minus prompt room.
+        assert_eq!(declared_max_tokens(Some(262_144), None), Some(131_072));
+        assert_eq!(declared_max_tokens(Some(8_192), None), Some(4_096));
+        assert_eq!(declared_max_tokens(Some(8_192), Some(6_000)), Some(4_096));
+        // No window probed is no claim made: pi's own default stays in charge.
+        assert_eq!(declared_max_tokens(None, Some(16_000)), None);
+    }
+
+    #[test]
+    fn the_endpoint_pi_starts_on_is_the_one_that_serves_the_default_model() {
+        let root = std::env::temp_dir().join(format!("cwoffee_launch_ep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = root.join("config.toml");
+
+        // Nothing added: cwoffee's own entry answers, and the sentence says that is what happened.
+        std::fs::write(
+            &cfg,
+            "[provider]\nkind = \"llama.cpp\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"solo\"\n",
+        )
+        .unwrap();
+        let (name, why) = launch_provider(&cfg, "cwoffee", "solo");
+        assert_eq!(name, "cwoffee", "no endpoint row exists, so the fallback stands");
+        assert!(why.unwrap().contains("no endpoint you added"), "the fallback has to be admitted out loud");
+
+        // One added endpoint serves the default model: that row is the launch provider, and
+        // cwoffee's entry is demoted to a fallback rather than quietly answering anyway.
+        std::fs::write(
+            &cfg,
+            "[provider]\nkind = \"llama.cpp\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"solo\"\n\n[providers.\"the-box\"]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = [\"solo\", \"other\"]\n",
+        )
+        .unwrap();
+        let (name, why) = launch_provider(&cfg, "cwoffee", "solo");
+        assert_eq!(name, "the-box", "the endpoint that serves the default model is the default endpoint");
+        assert!(why.unwrap().contains("the endpoint you added"));
+
+        // A `row/model` spelling means the same model and must match the same row.
+        let (name, _) = launch_provider(&cfg, "cwoffee", "the-box/solo");
+        assert_eq!(name, "the-box", "the prefixed spelling is the same model");
+
+        // Two endpoints serving it is a decision nobody made, and guessing one would pick a server
+        // the person never chose. Say so, and stay on the fallback.
+        std::fs::write(
+            &cfg,
+            "[provider]\nkind = \"llama.cpp\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"solo\"\n\n[providers.\"box-a\"]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = [\"solo\"]\n\n[providers.\"box-b\"]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = [\"solo\"]\n",
+        )
+        .unwrap();
+        let (name, why) = launch_provider(&cfg, "cwoffee", "solo");
+        assert_eq!(name, "cwoffee", "an ambiguous default must not silently pick a server");
+        let why = why.unwrap();
+        assert!(why.contains("2 of your endpoints") && why.contains("box-a") && why.contains("box-b"), "{why}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_pi_entry_declares_the_thinking_levels_the_rust_core_would_send() {
         let root = std::env::temp_dir().join(format!("cw-reasoning-{}", std::process::id()));

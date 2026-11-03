@@ -7,6 +7,11 @@
 --------------------------------------------------------------------------- */
 @theme {
   /* surfaces */
+  /* A page's own colour — what a browser tab is before anywhere to go has been typed. The card's
+     paper is warm cream; a page is white, and the difference is what makes "nothing is open here"
+     read as a blank page rather than as a hole in the desk. The dark palette keeps its promise with
+     its own near-black, because white in a dark room is a lamp, not a page. */
+  --color-page: #ffffff;
   --color-paper: #fdfcf9;
   --color-paper-2: #f7f5ef;
   /* A floating surface has to separate from the screen it floats over, not just
@@ -25,6 +30,14 @@
   --color-pane: #f2efe7;
   --color-hairline: #e8e5dd;
   --color-hairline-2: #dcd8ce;
+  /* Every floating surface — drawer, notice, approval card, preview overlay, revert card, tree
+     panel — wears `--color-raise` plus this lift. A drop dark enough to read on a near-white screen
+     is invisible on a near-black one, so the shadow is a token and each theme sets its own:
+     separation is what gets graded, in both palettes, and a colour name cannot be graded in both. */
+  --lift: 0 10px 28px rgba(60, 50, 30, 0.14);
+  /* The drawer's trailing edge and the dim behind it. Both themes name their own. */
+  --scrim-edge: rgba(60, 50, 30, 0.16);
+  --scrim-dim: rgba(60, 50, 30, 0.34);
 
   /* The window's chrome row, and the height everything under it is measured from.
    *
@@ -83,6 +96,7 @@
    Semantic tokens shift hue, not just lightness: var(--color-ok) on a dark surface is
    barely legible. */
 [data-theme='dark'] {
+  --color-page: #141311;
   --color-paper: #1e1d1b;
   --color-paper-2: #26241f;
   --color-raise: #2c2a24;
@@ -92,6 +106,12 @@
   --color-pane: #191816;
   --color-hairline: #35332d;
   --color-hairline-2: #4a473f;
+  /* The same lift, aimed the other way: on a dark ground a brown-black shadow reads as nothing, so
+     the separation comes from a darker drop plus a hairline halo. Graded by contrast and distance
+     from the surface behind, never by a colour name. */
+  --lift: 0 8px 22px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(233, 230, 222, 0.07);
+  --scrim-edge: rgba(233, 230, 222, 0.12);
+  --scrim-dim: rgba(0, 0, 0, 0.55);
 
 
   --color-ink: #e9e6de;
@@ -266,6 +286,18 @@ body {
    a streamed turn, because the ring is repainted with every line that scrolls past under it.
    The gutter lives here rather than as padding on `.scrollerwrap` so the wrap keeps exactly the
    box the geometry checks measure. */
+/* The card's own button row. A row rather than a button floating over the paper: the transcript
+   scrolls under anything absolutely positioned inside the card, so the first line of an answer
+   would run beneath the control. Taking the height off the top is the only arrangement that
+   cannot be collided with. */
+.cardtools {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: none;
+  padding: 10px 14px 0;
+}
 .panecard {
   display: flex;
   flex: 1 1 auto;
@@ -609,11 +641,12 @@ body {
   padding: 10px 12px 11px;
   border: 1px solid var(--color-hairline-2);
   border-radius: 11px;
-  background: var(--color-paper-2);
+  background: var(--color-raise);
   display: flex;
   flex-direction: column;
   gap: 8px;
   max-width: min(76%, 660px);
+  box-shadow: var(--lift);
 }
 .revert-h {
   font-size: 11px;
@@ -709,6 +742,357 @@ body {
 .revert-cancel:disabled { opacity: 0.55; cursor: default; }
 .revert-go[data-warn] { border-color: var(--color-warn-hairline); color: var(--color-warn); }
 .revert-cancel { border-color: transparent; color: var(--color-ink-3); }
+
+/* The tree of a conversation: its lineage, its nodes, and which node the next answer reads through.
+
+   Same plain box as the revert card, for the same reason — it is a question with a list in it, and a
+   question that looks like the answer it is about gets skimmed as part of it. The one difference is
+   indentation: a tree has to read as a tree, so each row is pushed in by its own depth rather than
+   nested in markup, which is how a card with a thousand nodes keeps one flat DOM. */
+.turn > .tree-card { animation: none; }
+.tree-card {
+  margin-top: 8px;
+  padding: 10px 12px 11px;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 11px;
+  background: var(--color-raise);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(76%, 660px);
+  box-shadow: var(--lift);
+}
+.tree-h {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+  color: var(--color-ink);
+}
+.tree-said {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-ink-3);
+  max-width: 62ch;
+}
+.tree-fam,
+.tree-nodes,
+.tree-drift {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.tree-convo,
+.tree-node {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  /* Depth is a padding, not a wrapper: one flat list keeps the repaint cost of a long conversation
+     the same as a short one, which is the lesson the reasoning block had to learn the hard way. */
+  padding-left: calc(var(--depth, 0) * 14px);
+}
+.tree-convo-t { color: var(--color-ink); font-weight: 550; }
+.tree-cut,
+.tree-count,
+.tree-quote,
+.tree-role { color: var(--color-ink-3); }
+.tree-quote { overflow-wrap: anywhere; }
+/* The leaf is filled, not underlined — the same treatment the revert card gives its chosen scope, on
+   the one fact in this card that is a position rather than a description. */
+.tree-node[data-cur] .tree-quote {
+  color: var(--color-ink);
+  background: var(--color-tint);
+  border-radius: 5px;
+}
+.tree-flag {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--color-hairline-2);
+  color: var(--color-ink-3);
+  background: var(--color-paper);
+}
+.tree-node[data-cur] .tree-flag { color: var(--color-shell-deep); border-color: var(--color-shell); }
+/* Off the path being read, and a disagreement between the two records, are different facts and read
+   differently: one is where the leaf is, the other is that the two memories do not match. */
+.tree-node[data-off] .tree-flag { color: var(--color-ink-3); font-style: italic; }
+.tree-node[data-drift] .tree-flag {
+  color: var(--color-warn);
+  background: var(--color-warn-bg);
+  border-color: var(--color-warn-hairline);
+}
+.tree-only {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--color-ink-3);
+}
+.tree-go {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 2px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--color-hairline-2);
+  background: none;
+  color: var(--color-ink-2);
+  cursor: pointer;
+  transition: background var(--d1) var(--ease), color var(--d1) var(--ease);
+}
+.tree-go:hover:not(:disabled) { background: var(--color-tint); color: var(--color-ink); }
+.tree-go:disabled { opacity: 0.55; cursor: default; }
+.tree-more,
+.tree-pi {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-ink-3);
+  font-style: italic;
+}
+.tree-drift-l {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-warn);
+  overflow-wrap: anywhere;
+}
+.tree-acts { display: flex; gap: 6px; justify-content: flex-end; }
+.tree-close {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--color-ink-3);
+  cursor: pointer;
+}
+.tree-close:hover { color: var(--color-ink); }
+
+/* Where the conversation is being read from, when that is not its newest message. It sits above the
+   composer because it changes what the next send means: the words typed here join a branch that is
+   not the newest one, and messages already past it are still in the record on the other branch. */
+.leaf-line {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-shell-deep);
+  margin: 0 2px 4px;
+}
+
+/* What a mid-turn press is doing while the turn runs: the words, where they will land, and the way
+   back. This plate belongs to the composer rather than floating over the transcript — the lines are
+   about the box that typed them, and a card above the answer would read as part of it. The kind is
+   told by the left rule and the label, in two colours the palette owns: a steer and a follow-up are
+   two promises, and they must not look like one list. */
+.queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 2px 6px;
+}
+.queue-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: baseline;
+  gap: 2px 10px;
+  padding: 7px 9px 8px;
+  border: 1px solid var(--color-hairline);
+  border-left: 3px solid var(--color-sea);
+  border-radius: 9px;
+  background: var(--color-paper-2);
+}
+.queue-item[data-queue-kind='follow_up'] {
+  border-left-color: var(--color-note);
+}
+.queue-kind {
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--color-ink-2);
+  white-space: nowrap;
+}
+.queue-text {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+/* The engine's own sentence about where the message is — "not sent to the model yet" is the half
+   that keeps a waiting line from reading as a delivered one. */
+.queue-note {
+  grid-column: 2;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-ink-3);
+}
+.queue-x {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  align-self: center;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 7px;
+  padding: 3px 8px;
+  background: none;
+  color: var(--color-ink-2);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.queue-x:hover {
+  color: var(--color-ink);
+  background: var(--color-tint);
+}
+
+/* The file ledger: one conversation's whole file history, in the turn it happened.
+
+   Same plate as the tree and revert cards, because all three are questions asked *about* a turn and
+   read best beside it. The per-turn line is the revert card's line widened — path, what the turn did
+   to it, and whether it can still be put back — and a row that can offer neither a diff nor a revert
+   says which of those it is missing rather than printing an empty button. */
+.turn > .ledger-card { animation: none; }
+.ledger-card {
+  margin-top: 8px;
+  padding: 10px 12px 11px;
+  border: 1px solid var(--color-hairline-2);
+  border-radius: 11px;
+  background: var(--color-raise);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(76%, 660px);
+  box-shadow: var(--lift);
+}
+.ledger-h {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+  color: var(--color-ink);
+}
+.ledger-said,
+.ledger-turn-note,
+.ledger-stats {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-ink-3);
+  max-width: 62ch;
+}
+.ledger-turns,
+.ledger-paths,
+.ledger-prunes,
+.ledger-surface {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ledger-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 0 2px;
+  border-top: 1px solid var(--color-hairline);
+}
+.ledger-turn:first-child { border-top: none; }
+.ledger-turn-h {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-ink-2);
+}
+.ledger-file,
+.ledger-pathline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.ledger-path { color: var(--color-ink); overflow-wrap: anywhere; }
+/* created / modified / deleted are the file's story, and the three read apart on purpose: undoing a
+   created file deletes it, undoing a modified one writes the earlier bytes back. */
+.ledger-kind,
+.ledger-flag,
+.ledger-kinds,
+.ledger-live,
+.ledger-says {
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+}
+.ledger-kind {
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--color-hairline-2);
+  background: var(--color-paper);
+}
+.ledger-file[data-kind='created'] .ledger-kind { color: var(--color-ok); border-color: var(--color-ok-hairline); background: var(--color-ok-bg); }
+.ledger-file[data-kind='modified'] .ledger-kind { color: var(--color-ink-2); }
+.ledger-file[data-kind='deleted'] .ledger-kind { color: var(--color-danger); border-color: var(--color-danger-hairline); background: var(--color-danger-bg); }
+.ledger-flag {
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--color-warn-hairline);
+  background: var(--color-warn-bg);
+  color: var(--color-warn);
+}
+.ledger-says { font-style: italic; }
+.ledger-diff-btn {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 2px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--color-hairline-2);
+  background: none;
+  color: var(--color-ink-2);
+  cursor: pointer;
+  transition: background var(--d1) var(--ease), color var(--d1) var(--ease);
+}
+.ledger-diff-btn:hover:not(:disabled) { background: var(--color-tint); color: var(--color-ink); }
+.ledger-diff-btn:disabled { opacity: 0.55; cursor: default; }
+.ledger-paths-h { font-size: 11px; font-weight: 600; color: var(--color-ink-2); }
+.ledger-more, .ledger-prune {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-warn);
+  overflow-wrap: anywhere;
+}
+/* The diff is the tool card's surface, not a new one: a file has exactly one way to be shown on this
+   screen, and a second layout would be a second thing to learn. */
+.ledger-diff-h {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-ink-2);
+  overflow-wrap: anywhere;
+}
+.ledger-diff-note {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-ink-3);
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+.ledger-acts { display: flex; gap: 6px; justify-content: flex-end; }
+.ledger-forget,
+.ledger-close {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--color-hairline-2);
+  background: none;
+  color: var(--color-ink-2);
+  cursor: pointer;
+}
+.ledger-forget:hover:not(:disabled) { background: var(--color-danger-bg); color: var(--color-danger); }
+/* Arming is a different colour, because "press again to delete these files" is not the same ask as
+   "forget copies" and a reader who missed the first press has to see the change. */
+.ledger-forget[data-armed] {
+  background: var(--color-danger-bg);
+  border-color: var(--color-danger-hairline);
+  color: var(--color-danger);
+  font-weight: 600;
+}
+.ledger-forget:disabled { opacity: 0.55; cursor: default; }
+.ledger-close { border-color: transparent; color: var(--color-ink-3); }
+.ledger-close:hover { color: var(--color-ink); }
 
 .blk-answer .blk-body { color: var(--color-ink); }
 /* A thought is one line, and that is the whole block.
@@ -1159,10 +1543,10 @@ body {
   max-height: 320px;
   overflow-y: auto;
   padding: 6px;
-  border: 1px solid var(--color-hairline);
+  border: 1px solid var(--color-hairline-2);
   border-radius: 13px;
-  background: var(--color-paper);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
+  background: var(--color-raise);
+  box-shadow: var(--lift);
 }
 .pop-left { left: 8px; }
 .pop-right { right: 8px; }
@@ -1408,7 +1792,10 @@ body {
 .approval-card {
   padding: 12px 14px;
   border-color: var(--color-warn-hairline);
-  background: var(--color-warn-bg);
+    /* The signal is the warn tint and it stays; the *surface* underneath it is the floating one, so
+     the card separates from the transcript behind it in both palettes rather than only being
+     coloured. A card that is merely tinted is a card that reads as content, not as a decision. */
+  background: color-mix(in srgb, var(--color-warn-bg) 62%, var(--color-raise));
   /* A long command must not push the decision row out of the window. The card
      lives in a fixed strip above the composer, so there is no page scroll to
      escape into and no way to click Allow or Deny: the body scrolls on its own
@@ -1417,6 +1804,7 @@ body {
   display: flex;
   flex-direction: column;
   max-height: 62vh;
+  box-shadow: var(--lift);
 }
 .appr-body {
   /* min-height:0 is what lets a flex child scroll instead of growing. */
@@ -1823,7 +2211,9 @@ body {
   inset: 0;
   border: 0;
   padding: 0;
-  background: rgba(20, 18, 15, 0.34);
+  /* `--scrim-dim`, not a fixed brown: the dim that reads over a near-white desk is invisible over
+     a near-black one, and a drawer whose dim vanishes in the dark theme looks like it never opened. */
+  background: var(--scrim-dim);
   z-index: 30;
   /* Always mounted, faded rather than inserted. Mounting it inside the same
      frame the sidebar starts sliding adds a layout+paint pass in the middle of
@@ -1866,7 +2256,11 @@ body {
        that the aside used to carry an inline wash gradient which the one-surface change deleted.
        `--color-pane` is the desk tone, so the drawer keeps the relationship the docked sidebar has
        always had: one notch under the paper it covers, with its own shadow down the right edge. */
-    background: var(--color-pane);
+    /* A drawer is a floating surface, so it wears `--color-raise` like every other one: the desk
+       tone is what the conversation sits on, and a drawer wearing the desk tone separates from
+       nothing. Each theme names its own edge and lift, because a black fade is a direction only one
+       of the two palettes has. */
+    background: var(--color-raise);
     z-index: 40;
     top: var(--titlebar-h);      /* below the titlebar */
     bottom: 0;
@@ -1894,7 +2288,10 @@ body {
     bottom: 0;
     left: 100%;
     width: 16px;
-    background: linear-gradient(to right, rgba(0, 0, 0, 0.16), rgba(0, 0, 0, 0));
+    /* `--scrim-edge` is a token because a black fade is the dark theme's own direction: on a
+       near-black screen it reads as nothing, and the drawer looks like part of the page instead of
+       something laid over it. */
+    background: linear-gradient(to right, var(--scrim-edge), transparent);
     opacity: 0;
     transition: opacity 0.16s ease;
     pointer-events: none;
@@ -2963,7 +3360,13 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin: 10px 0 4px 62px;
+  /* One column, the same left edge as the sentences above it. The 62px this used to carry
+     is a leftover from the layout where a block's label hung in a gutter and the body was
+     pushed past it — the gutter is gone (see `.blk`), so the indent stopped aligning with
+     anything and read as a stray margin on the file row. The hand-over line already starts
+     at the prose edge; a working row indented differently from the row above it looks like
+     two columns. */
+  margin: 10px 0 4px 0;
 }
 /* An attachment — the one file the model wrote in order to hand it over — keeps its
    Save control against the chip instead of floating in the strip. A loose "Save" reads
@@ -3005,6 +3408,15 @@ body {
   border: 1px dashed var(--color-hairline-2);
   border-radius: 8px;
 }
+.attach-note {
+  /* The sentence for a file that claims to be hand-over material and is not. Small and dim on
+     purpose: the file rows are the thing being read, and this says why one of them has no Save
+     control rather than competing with them. */
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+  overflow-wrap: anywhere;
+  flex-basis: 100%;
+}
 .attachunit .filechip {
   border: 0;
   background: transparent;
@@ -3015,6 +3427,19 @@ body {
      the button's own box is now a small square that does not reach the unit's edges. */
   border-right: 1px dashed var(--color-hairline-2);
 }
+/* A card for a file the turn *made*, with nothing offered for handing it over. The chip is the
+   whole card then, so it keeps a symmetric radius and drops the seam that used to divide file from
+   act. The dashed edge is deliberately the same one the hand-over card wears — one shape for "a
+   file this turn produced", which is what the report asked for — and the difference between the two
+   is the thing that actually carries a promise: the Save control, present on one and absent on the
+   other. Absent means no control at all, not a greyed-out one: a disabled Save would still be an
+   offer the host refuses. */
+.attachunit.made .filechip {
+  border-radius: 7px;
+  border-right: 0;
+  padding-right: 8px;
+}
+
 /* No hover fill anywhere inside the hand-over unit — not on the name half, not on the save half.
    The unit already draws its own dashed box, and a fill inside a box reads as a second control
    appearing rather than as the control answering the pointer. This has to be said explicitly
@@ -3359,7 +3784,7 @@ body {
   gap: 12px;
   padding: 8px 12px;
   border-radius: 10px 10px 0 0;
-  background: var(--color-paper-2);
+  background: var(--color-raise);
   border: 1px solid var(--color-hairline);
   border-bottom: 0;
 }
@@ -3381,7 +3806,7 @@ body {
   overflow: auto;
   border: 1px solid var(--color-hairline);
   border-radius: 0 0 10px 10px;
-  background: var(--color-paper);
+  background: var(--color-raise);
 }
 .pv-frame { flex: 1; width: 100%; height: 100%; border: 0; background: #fff; }
 .pv-svg { max-width: 100%; max-height: 100%; margin: auto; }
@@ -4215,14 +4640,14 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   gap: 10px;
   max-width: min(560px, calc(100vw - 48px));
   padding: 9px 10px 9px 14px;
-  border: 1px solid var(--color-hairline);
+  border: 1px solid var(--color-hairline-2);
   border-left: 3px solid var(--color-shell);
   border-radius: 10px;
-  background: var(--color-paper);
+  background: var(--color-raise);
   color: var(--color-ink);
   font-size: 12.5px;
   line-height: 1.45;
-  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.14);
+  box-shadow: var(--lift);
   z-index: 60;
   /* The entrance animates `translate`, not `transform`. The old rule animated `cwoffee-rise`,
      whose `to` frame is `transform: none`, and with `animation-fill-mode: both` a keyframe value
@@ -5338,9 +5763,14 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   font-style: italic;
 }
 
-/* Third-party MCP servers, on Settings › Workspace. A status page about programs the app
-   started, so it reads like one log line per server rather than like a control: there is no
-   control here, and a switch that only reopened a config file would misstate what the row does. */
+/* Third-party MCP servers, behind their own door in the sidebar.
+ *
+   Two lists, and they are deliberately not the same shape. "What is answering" is one log line per
+   server — nothing on it can be acted on, and a row that looked like a control would promise a control.
+   "What the file allows" is a row with a switch, an Edit and a Remove on it, because those are the three
+   things a person can do to it. Merging them was the version that left people asking why a server they
+   can see listed is not running: one list, one word, and the word had to mean both things.
+ */
 .mcpsum {
   font-size: 13px;
   color: var(--color-ink-soft);
@@ -5351,10 +5781,19 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+/* One search over both lists, because the question that sends someone here is usually "what did the
+   thing called jira give me?" — which is a tool name, not a server name. */
+.mcpsearch {
+  display: block;
+  margin: 0 0 10px;
+}
+.mcpsearch .sinp {
+  width: 100%;
+}
 .mcprows {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
 .mcprow {
   display: flex;
@@ -5375,4 +5814,1015 @@ button:disabled, .pop-item:disabled, .wsrow:disabled, .ask-opt:disabled,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* What a running server offered, named rather than counted: the catalog the model is shown is bounded
+   and can leave tools out, so the page that wants to answer "does it have a write_note?" has to say
+   which ones it is holding. */
+.mcp-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 0;
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.mcp-tool {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--color-ink-3);
+}
+.mcp-tool code {
+  font-family: var(--font-mono);
+  color: var(--color-ink-2);
+  flex: 0 0 auto;
+}
+.mcp-tool span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcpgroup {
+  display: flex;
+  flex-direction: column;
+  margin: 6px 0 8px;
+}
+.mcprow2 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 9px 0;
+  border-top: 1px solid var(--color-hairline);
+  min-width: 0;
+}
+.mcprow2:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.mcplead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+/* The command and its arguments, and the names of the environment keys — names only. A page that
+   echoed a token back would put a secret in the next screenshot somebody posts. */
+.mcp-cmd,
+.mcp-env {
+  flex: 1 1 100%;
+  font-size: 11.5px;
+  color: var(--color-ink-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcprow2 .pvacts {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* A row the file holds but has switched off is dimmed, not hidden: it is still in the file, and a
+   list that dropped it would read as "you never configured that one". */
+.mcprow2[data-mcp-file-enabled='no'] .mcp-name {
+  color: var(--color-ink-3);
+}
+.mcpform {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.mcptext {
+  width: 100%;
+  min-height: 3.2em;
+  resize: vertical;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+}
+/* Armed, the same way the session list arms a delete: the first press names what it will do and the
+   second does it. Here it is somebody else's program being un-configured. */
+.set-btn.armed {
+  color: var(--color-danger);
+  border-color: var(--color-danger-hairline);
+}
+/*   The browser column: a window onto cwoffee's kept browser, on the right of the
+   transcript.
+
+   It is a column and not an overlay, and it wears `--color-raise` like every
+   other floating surface in this app. Two reasons it is not a floating card over
+   the conversation: a person reading an answer should not have their text moved
+   or covered by a browser they asked to look at, and a panel that overlaps has
+   to be dismissed to read anything, which turns "watch what the model is doing"
+   into a fight.
+
+   The picture area keeps its own aspect: the frame arrives at the browser's
+   viewport size, and stretching it to the column would misreport what is on the
+   page — the same reason the transcript shows file sizes rather than a word
+   like "small".
+
+   The controls are icons, and each one carries its name in a form a machine can
+   read (an accessible label) and a person can ask for (a tooltip that says what it
+   does, not what it is called). A column 33vw wide has no room for "Back to the
+   previous page" as a button, and a bare glyph is only safe when the words travel
+   with it — which is also what makes a keyboard and a screen reader reach the same
+   control a mouse does.
+
+   The picture is a control too: clicking it clicks the page. So it is drawn as
+   something to point at, and a press is echoed by a mark at the point pressed.
+   Without that mark, a click that lands somewhere other than where it was aimed is
+   invisible until the page happens to move.
+--------------------------------------------------------------------------- */
+
+/* The conversation's door, on the card it belongs to. The dot is the browser's own state rather
+   than a count: it is there while a browser is alive and the panel is shut, which is the one
+   question a shut panel cannot otherwise answer — "the model opened something I am not looking
+   at" is worth being readable without opening anything. */
+.bpy-toggle {
+  position: relative;
+}
+.bpy-toggle[aria-pressed='true'] {
+  background: var(--color-tint);
+  color: var(--color-ink);
+}
+.bpy-dot {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-ok);
+  box-shadow: 0 0 0 1.5px var(--color-shell);
+}
+
+.browserpane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  width: clamp(320px, 33vw, 460px);
+  flex: none;
+  /* The same top and bottom the transcript card is given, so the two columns end on one line. The
+     column used to run to 10px below the card's floor and start above its ceiling, which reads as
+     one window being a few pixels out of true. */
+  margin: 10px 16px 14px 10px;
+  border-radius: var(--radius-card, 10px);
+  background: var(--color-raise);
+  border: 1px solid var(--color-hairline);
+  box-shadow: var(--lift);
+  overflow: hidden;
+}
+
+/* Full window: the page becomes the screen. The column's width, margin and rounding all go. This
+   is not an overlay left partly on top of the transcript — a page worth reading is a page that gets
+   the whole rectangle, and Escape or the same button hands the column back.
+
+   It sits *below* the titlebar rather than under it, because the titlebar is the window's own
+   controls (the drag region, minimise, close) and a page that swallowed them is a page you cannot
+   move. The conversation stays behind it, unscrolled and untouched: nothing about going full screen
+   should cost a person their place in the transcript. */
+.browserpane[data-browser-wide='yes'] {
+  position: fixed;
+  inset: var(--titlebar-h) 0 0 0;
+  width: auto;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  z-index: 44;
+}
+
+/* ── who and what ─────────────────────────────────────────────────────── */
+.bpy-bar {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px 7px;
+  min-width: 0;
+}
+.bpy-glyph {
+  width: 27px;
+  height: 27px;
+  flex: none;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--color-ink-3);
+  background: var(--color-paper);
+  border: 1px solid var(--color-hairline);
+}
+.bpy-glyph.live {
+  color: var(--color-ok);
+  border-color: var(--color-ok-hairline);
+  background: var(--color-ok-bg);
+}
+.bpy-id {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.bpy-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+.bpy-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.bpy-pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--color-ink-3);
+}
+.bpy-pip.live {
+  background: var(--color-ok);
+}
+.bpy-pip.off {
+  background: var(--color-warn);
+}
+.bpy-trouble {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  border: 1px solid var(--color-danger-hairline);
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
+}
+.bpy-trouble[aria-pressed='true'] {
+  outline: 1px solid var(--color-danger);
+}
+
+/* The idle clock, drawn as a ring rather than a sentence: the span is a promise about the
+   future, and a ring that empties as the span runs out says "how much is left" without
+   being read. The words are still there for the machine. */
+.bpy-clock {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  padding: 2px 7px 2px 2px;
+  border-radius: 99px;
+  border: 1px solid var(--color-hairline);
+  background: var(--color-paper);
+}
+.bpy-ring {
+  width: 19px;
+  height: 19px;
+  transform: rotate(-90deg);
+}
+.bpy-ring-b {
+  fill: none;
+  stroke: var(--color-hairline);
+  stroke-width: 2.4;
+}
+.bpy-ring-f {
+  fill: none;
+  stroke: var(--color-ink-2);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.5s linear;
+}
+.bpy-clock-n {
+  font-size: 11px;
+  color: var(--color-ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── the controls ─────────────────────────────────────────────────────── */
+/* An icon button whose name lives in `aria-label` and `title`, never painted. The
+   title is the sentence about what the control does, because "Reload" is a word and
+   "re-reads the page that is open; it does not go back" is an answer. */
+.bpy-ic {
+  width: 27px;
+  height: 26px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-ink-2);
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s ease;
+}
+.bpy-ic:hover:not(:disabled) {
+  background: var(--color-paper);
+  border-color: var(--color-hairline);
+  color: var(--color-ink);
+}
+.bpy-ic:active:not(:disabled) {
+  background: var(--color-hairline);
+}
+.bpy-ic:focus-visible {
+  outline: 2px solid var(--color-shell-deep);
+  outline-offset: 1px;
+}
+.bpy-ic:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+.bpy-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 9px 9px;
+}
+.bpy-addr {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 3px 0 8px;
+  border-radius: 8px;
+  background: var(--color-paper);
+  border: 1px solid var(--color-hairline);
+}
+.bpy-addr:focus-within {
+  border-color: var(--color-shell-deep);
+  background: var(--color-paper-2);
+}
+.bpy-sec {
+  display: grid;
+  place-items: center;
+  color: var(--color-ink-3);
+  flex: none;
+}
+.bpy-urlin {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-ink);
+  font-size: 12px;
+  padding: 6px 0;
+}
+.bpy-urlin::placeholder {
+  color: var(--color-ink-3);
+}
+.bpy-urlin:focus {
+  outline: none;
+}
+.bpy-spin {
+  display: grid;
+  place-items: center;
+}
+.bpy-spin.spinning {
+  animation: bpy-spin 0.9s linear infinite;
+}
+@keyframes bpy-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.bpy-err {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 10px 8px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  background: var(--color-danger-bg);
+  border: 1px solid var(--color-danger-hairline);
+  color: var(--color-danger);
+}
+
+/* ── the picture ──────────────────────────────────────────────────────── */
+/* The stage is the part of the column that grows. It used to be capped at `min(56vh, 480px)`, which
+   in a tall window left a band of empty card under everything: the column had more height than its
+   rows could use, and nothing was allowed to take the difference. Now the picture area absorbs the
+   slack, the page is asked to the shape of the box it is in (the panel sends the browser a viewport
+   the box can fill), and the log below keeps a modest share of its own. */
+.bpy-stage {
+  position: relative;
+  margin: 0 10px;
+  display: grid;
+  place-items: center;
+  flex: 1 1 auto;
+  min-height: 132px;
+  border-radius: 9px;
+  border: 1px solid var(--color-hairline);
+  /* the desk, not the page: a page's own pixels (white in a light page, dark in a dark one)
+     has to read as a rectangle sitting *on* this column, and a box the same colour as the
+     window gives that edge away. `--color-raise` is the one surface token that is a step off
+     the paper in both palettes. */
+  background: var(--color-raise);
+  overflow: hidden;
+}
+.bpy-stage.pointable {
+  cursor: crosshair;
+}
+.bpy-shot {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #fff;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+}
+/* The live view's mark, on the picture rather than in the header: the question it answers is
+   "is this moving, or is this a photograph of a moment?", and that question gets asked about the
+   picture. */
+.bpy-live {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-shell) 16%, var(--color-paper));
+  border: 1px solid var(--color-ok-hairline);
+  color: var(--color-ink-2);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+.bpy-live i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-ok);
+  animation: bpy-breathe 1.6s ease-in-out infinite;
+}
+@keyframes bpy-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.bpy-ripple {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  margin: -10px 0 0 -10px;
+  border-radius: 50%;
+  border: 2px solid var(--color-ink);
+  background: color-mix(in srgb, var(--color-shell) 40%, transparent);
+  pointer-events: none;
+  animation: bpy-pop 0.45s ease-out forwards;
+}
+@keyframes bpy-pop {
+  from {
+    opacity: 0.9;
+    transform: scale(0.35);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.7);
+  }
+}
+.bpy-hint {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 99px;
+  font-size: 10.5px;
+  color: var(--color-ink-2);
+  background: var(--color-raise);
+  border: 1px solid var(--color-hairline);
+  box-shadow: var(--lift);
+}
+.bpy-beside {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  max-width: 62%;
+  padding: 4px 9px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--color-ink-2);
+  background: var(--color-raise);
+  border: 1px dashed var(--color-hairline-2);
+  box-shadow: var(--lift);
+}
+.bpy-skel,
+/* Nothing open is a shape, not a hole: the stage turns into a page's own surface and the invitation
+   to start sits in the middle of it. The desk colour would say "a box with nothing in it"; white
+   says "a page, not written on yet", which is what a tab looks like. */
+.bpy-stage.quiet {
+  background: var(--color-page);
+}
+.bpy-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 22px 16px;
+  text-align: center;
+}
+.bpy-skel {
+  animation: bpy-breathe 1.7s ease-in-out infinite;
+}
+@keyframes bpy-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+.bpy-skel-i,
+.bpy-empty-i {
+  color: var(--color-ink-3);
+}
+.bpy-skel-t {
+  font-size: 11px;
+  color: var(--color-ink-3);
+}
+.bpy-empty-t {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-ink-2);
+}
+.bpy-empty-w {
+  font-size: 11px;
+  color: var(--color-ink-3);
+  max-width: 34ch;
+  line-height: 1.45;
+}
+.bpy-busybar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--color-ink-2), transparent);
+  background-size: 45% 100%;
+  background-repeat: no-repeat;
+  animation: bpy-slide 1.15s linear infinite;
+}
+@keyframes bpy-slide {
+  from {
+    background-position: -45% 0;
+  }
+  to {
+    background-position: 145% 0;
+  }
+}
+
+/* ── keys to the page ─────────────────────────────────────────────────── */
+.bpy-keys {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 10px 0;
+}
+.bpy-keys.gone {
+  display: none;
+}
+.bpy-keys-i {
+  color: var(--color-ink-3);
+  flex: none;
+}
+.bpy-keys-in {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  background: var(--color-paper);
+  border: 1px solid var(--color-hairline);
+  color: var(--color-ink);
+}
+.bpy-keys-in:focus {
+  outline: none;
+  border-color: var(--color-shell-deep);
+  background: var(--color-paper-2);
+}
+.bpy-keys-in:disabled {
+  opacity: 0.45;
+}
+
+/* ── where the browser is looking ─────────────────────────────────────── */
+.bpy-crumb {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 9px 10px 0;
+  min-width: 0;
+}
+.bpy-host {
+  flex: none;
+  font-size: 9.5px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--color-ink-3);
+  border: 1px solid var(--color-hairline);
+  border-radius: 99px;
+  padding: 1px 6px;
+}
+.bpy-url {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bpy-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 10px 0;
+  min-width: 0;
+}
+.bpy-says {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--color-ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bpy-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+}
+
+/* ── the page in the window ───────────────────────────────────────────── */
+/* A stage that holds a page is not a frame around a picture; it is the hole the page gets painted
+   into. `.bpy-pagearea` is that hole: the panel measures it, the app places the widget on it, and it
+   is empty on purpose — anything drawn here would be this panel guessing at what a page it cannot
+   see looks like. The caption below it belongs to the panel, not the page, and stays visible: the
+   page covers the area above, never the words. */
+.bpy-stage.inpage {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  border-style: dashed;
+}
+.bpy-pagearea {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 120px;
+}
+/* A page in the window that is not where the panel said it is. This line only appears when the two
+   disagree, and it quotes both sets of numbers: an empty bordered box would otherwise read as a page
+   that failed to load, and the reader would go looking in the wrong place. */
+.bpy-placedoff {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 10px;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--color-alert, #b4322a);
+  background: color-mix(in srgb, var(--color-alert, #b4322a) 9%, var(--color-paper));
+  color: var(--color-alert, #b4322a);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.bpy-pagecap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-top: 1px solid var(--color-hairline);
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+  flex: none;
+}
+
+/* ── the page's own log, opened by the header ────────────────────────── */
+/* A drawer, not a permanent band: the rows below the page used to be there whether or not anybody
+   was reading them, and the page wanted the height. The records keep being collected while it is
+   shut — this is a window onto a log, not the switch that turns logging on. */
+.bpy-drawer {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin-top: 9px;
+  border-top: 1px solid var(--color-hairline);
+}
+.bpy-dbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px 0;
+}
+.bpy-dbar .bpy-tabs {
+  margin: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.bpy-chips {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 7px 10px 0;
+}
+.bpy-chip {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-ink-3);
+  cursor: pointer;
+}
+.bpy-chip:hover {
+  background: var(--color-paper);
+  color: var(--color-ink);
+}
+.bpy-chip[aria-pressed='true'] {
+  background: var(--color-paper);
+  border-color: var(--color-hairline);
+  color: var(--color-ink);
+}
+.bpy-n {
+  font-size: 9.5px;
+  color: var(--color-ink-2);
+}
+.bpy-dsum {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--color-ink-3);
+  white-space: nowrap;
+}
+/* The kind is set in small capitals because it is the one column of a log a reader scans by: six
+   kinds, and a wall of identical rows gives them nothing to scan by. */
+.bpy-kind {
+  flex: none;
+  width: 74px;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-ink-3);
+  padding-top: 1.5px;
+}
+.bpy-durl,
+.bpy-dat,
+.bpy-dverb {
+  color: var(--color-ink-3);
+}
+.bpy-dcode {
+  font-variant-numeric: tabular-nums;
+}
+/* The header badge sits on the corner of its own icon rather than beside it: a button that widens
+   when a page goes wrong moves the two buttons after it, and a row of controls that jumps is a row
+   a person cannot aim at. */
+.bpy-ic {
+  position: relative;
+}
+.bpy-ic .bpy-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+}
+
+/* ── what the body is showing ─────────────────────────────────────────── */
+.bpy-tabs {
+  display: flex;
+  gap: 3px;
+  margin: 10px 10px 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--color-hairline);
+}
+.bpy-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  padding: 4px 9px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-ink-3);
+  cursor: pointer;
+}
+.bpy-tab:hover {
+  background: var(--color-paper);
+  color: var(--color-ink);
+}
+.bpy-tab[aria-pressed='true'] {
+  background: var(--color-paper);
+  border-color: var(--color-hairline);
+  color: var(--color-ink);
+}
+.bpy-badge {
+  font-size: 9.5px;
+  padding: 0 5px;
+  border-radius: 99px;
+  background: var(--color-hairline);
+  color: var(--color-ink-2);
+}
+.bpy-badge.bad {
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
+}
+.bpy-body {
+  /* Takes its own share and no more. Growing into the leftover height is what left the slack: the
+     picture area above it is the part with something to show, and a log of four rows does not need
+     the rest of the window to prove it is a log. */
+  flex: 0 1 auto;
+  min-height: 74px;
+  max-height: 30vh;
+  overflow: auto;
+  padding: 8px 11px 4px;
+}
+.bpy-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.bpy-row {
+  display: flex;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-ink-2);
+}
+.bpy-row.bad {
+  color: var(--color-danger);
+}
+.bpy-k {
+  flex: none;
+  min-width: 74px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--color-ink-3);
+}
+.bpy-gh {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 7px 0 2px;
+  font-size: 9.5px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--color-ink-3);
+}
+.bpy-gh.bad {
+  color: var(--color-danger);
+}
+.bpy-group + .bpy-group {
+  margin-top: 4px;
+}
+.bpy-dim {
+  font-size: 11.5px;
+  color: var(--color-ink-3);
+  line-height: 1.5;
+  padding: 3px 0;
+}
+.bpy-note {
+  font-size: 11.5px;
+  color: var(--color-ink-2);
+  padding: 4px 0;
+  line-height: 1.45;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+/* ── the one destructive thing in the column ──────────────────────────── */
+.bpy-foot {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--color-hairline);
+}
+.bpy-close {
+  width: auto;
+  min-width: 27px;
+  padding: 0 8px;
+  gap: 5px;
+}
+/* The first press arms and shows the words; the second does it. A kept browser is
+   shared with the model's next turn, so closing it is not a refresh button. */
+.bpy-close[aria-pressed='true'] {
+  background: var(--color-danger-bg);
+  border-color: var(--color-danger-hairline);
+  color: var(--color-danger);
+}
+.bpy-armed-w {
+  font-size: 10.5px;
+}
+.bpy-foot-w {
+  font-size: 10.5px;
+  color: var(--color-ink-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* One utility, used by the icon set and the panel alike: words for the machine,
+   invisible to the eye, still in the text a check or a reader can reach. */
+.ic-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bpy-busybar,
+  .bpy-skel,
+  .bpy-spin.spinning {
+    animation: none;
+  }
+  .bpy-ring-f {
+    transition: none;
+  }
+  .bpy-ripple {
+    animation-duration: 0.01s;
+  }
+  .bpy-ic {
+    transition: none;
+  }
+  .bpy-live i {
+    animation: none;
+  }
+}
+
+@media (max-width: 900px) {
+  /* Below this the transcript would be squeezed to a strip, and the conversation is the
+     thing a person came for. So the column floats over the pane's band instead — still
+     below the titlebar, still raised, and dismissible by its own icon rather than by a
+     scrim: a browser panel that swallows clicks on the conversation is worse than one
+     that covers part of it. */
+  .browserpane {
+    position: absolute;
+    right: 0;
+    top: var(--titlebar-h);
+    bottom: 0;
+    width: min(440px, 88vw);
+    margin: 0;
+    border-radius: 0;
+    border-right: 0;
+    border-top: 0;
+    z-index: 38;
+  }
+  .bpy-stage,
+  .bpy-shot {
+    min-height: 120px;
+  }
+  .bpy-body {
+    max-height: 26vh;
+  }
 }

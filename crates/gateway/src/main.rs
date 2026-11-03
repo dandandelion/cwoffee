@@ -29,36 +29,36 @@ fn help() -> &'static str {
     "\
 cwoffee-gateway - serve the cwoffee UI and engine over HTTP
 
-  --config PATH      config file (default ~/.config/cwoffee/config.toml, like the app)
-  --host ADDR        bind address (default 127.0.0.1; anything else needs --token)
-  --port N           port (default 8099)
-  --token T          grants watch AND drive; required unless binding to loopback.
+  --config PATH config file (default ~/.config/cwoffee/config.toml, like the app)
+  --host ADDR bind address (default 127.0.0.1; anything else needs --token)
+  --port N port (default 8099)
+  --token T grants watch AND drive; required unless binding to loopback.
                      Unset falls back to CWOFFEE_GATEWAY_TOKEN, then the token file the
                      desktop app writes next to its config — the hand-off at window close
                      relies on that, because a token in argv is readable in `ps`.
-  --watch-token T    optional; grants read only (same fallbacks, CWOFFEE_GATEWAY_WATCH_TOKEN)
-  --dist PATH        built frontend (default <repo>/ui/dist)
-  --url URL          endpoint base, e.g. http://127.0.0.1:8090/v1
-  --model ID         model id (empty asks the endpoint)
-  --workspace PATH   where tools operate
-  --db PATH          session database
+  --watch-token T optional; grants read only (same fallbacks, CWOFFEE_GATEWAY_WATCH_TOKEN)
+  --dist PATH built frontend (default <repo>/ui/dist)
+  --url URL endpoint base, e.g. http://127.0.0.1:8090/v1
+  --model ID model id (empty asks the endpoint)
+  --workspace PATH where tools operate
+  --db PATH session database
   --mode ask|session|auto
-  --core rust|pi     engine behind the gateway (default rust, or CWOFFEE_CORE; pi = `pi --mode rpc`)
+  --core rust|pi engine behind the gateway (default rust, or CWOFFEE_CORE; pi = `pi --mode rpc`)
   --persona cowork|chat
                      cowork = tools + workspace (default). chat = the model with nothing
                      mounted: no tools, no folder, one line of system prompt
-  --pi PATH          pi binary for --core pi (default: CWOFFEE_PI, then whatever PATH resolves)
-  --pi-version V     refuse a pi that is not exactly this version (default pinned)
-  --any-pi           skip the version handshake; development only
-  --pi-ext PATH      extension to mount for --core pi (repeatable; this is where
+  --pi PATH pi binary for --core pi (default: CWOFFEE_PI, then whatever PATH resolves)
+  --pi-version V refuse a pi that is not exactly this version (default pinned)
+  --any-pi skip the version handshake; development only
+  --pi-ext PATH extension to mount for --core pi (repeatable; this is where
                      the Rust tool shims hang off pi; falls back to CWOFFEE_PI_EXT)
-  --pi-tools LIST    pi --tools entries (default -read,-bash,-edit,-write: pi's own
+  --pi-tools LIST pi --tools entries (default -read,-bash,-edit,-write: pi's own
                      coding tools stay off, ours come in as extensions; falls back to
                      CWOFFEE_PI_TOOLS)
-  --pi-agent-dir PATH  pi config home (default CWOFFEE_PI_AGENT_DIR, else <state>/cwoffee/pi)
-  --pi-session-dir PATH  where pi files its conversations (default CWOFFEE_PI_SESSION_DIR,
+  --pi-agent-dir PATH pi config home (default CWOFFEE_PI_AGENT_DIR, else <state>/cwoffee/pi)
+  --pi-session-dir PATH where pi files its conversations (default CWOFFEE_PI_SESSION_DIR,
                      else <agent dir>/sessions)
-  --pi-idle-reap SECS  close an idle pi process after this (default 600)
+  --pi-idle-reap SECS close an idle pi process after this (default 600)
   -h, --help
 "
 }
@@ -207,6 +207,51 @@ async fn main() -> anyhow::Result<()> {
     let configured_model = appcfg.provider.model.clone();
     let mut cfg = HostConfig::new(configured_model.clone(), workspace.clone());
     cfg.cfg_path = Some(config_path.clone());
+    // The browser, read once. The registry the rust core runs from and the ToolCtx its tools
+    // read must agree, and on the pi core the tool process reads the same config file itself;
+    // either way there is one rule for finding the driver and one for deciding the model's eyes.
+    let browser_cfg = appcfg.browser_cfg();
+    cfg.browser = browser_cfg.clone();
+    // The **kept** browser. A gateway that outlives the window still owns one: the model's
+    // `session: true` calls and the page a phone tab watches have to be the same browser, and
+    // a browser held in a per-call tool process would be a different browser per call. Mounting
+    // spawns nothing; the idle clock closes the browser a few minutes after the last touch, so
+    // a gateway left running on a server does not leave a browser running either.
+    let browser_keep = cwoffee_engine::browser_hub::SessionCfg::from_browser_cfg(&browser_cfg);
+    let browser_hub = Arc::new(tokio::sync::Mutex::new(cwoffee_engine::browser_hub::Hub::mount(
+        browser_keep.clone(),
+    )));
+    let browser_state = browser_hub.lock().await.shared();
+    cfg.browser_route = Some(cwoffee_engine::tools::browser::BrowserRoute::in_process(
+        Arc::clone(&browser_hub),
+        browser_state.clone(),
+    ));
+    {
+        // The idle clock, on the same timer the desktop uses. "Did this leave a browser
+        // running?" has to have a boring answer on a headless gateway, and a clock nobody
+        // starts is a promise rather than a behaviour.
+        let hub = Arc::clone(&browser_hub);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if let Some(why) = hub.lock().await.reap_if_idle().await {
+                    eprintln!("[cwoffee] kept browser: {why}");
+                }
+            }
+        });
+    }
+    println!(
+        "[cwoffee] browser: {}",
+        if browser_cfg.usable() {
+            format!(
+                "{} (node {})",
+                browser_cfg.driver.as_ref().unwrap().display(),
+                browser_cfg.node
+            )
+        } else {
+            "not mounted - no driver found (browser/driver.mjs)".to_string()
+        }
+    );
     if let Some(m) = &appcfg.mode {
         cfg.mode = match m.as_str() {
             "ask" => cwoffee_engine::ApprovalMode::Ask,
@@ -223,6 +268,13 @@ async fn main() -> anyhow::Result<()> {
     cfg.max_tokens = appcfg.max_output_tokens;
     // 0 = no cap. The hardcoded 14 was cutting real tasks short; see Config.
     cfg.max_tool_iters = appcfg.max_tool_iters();
+    // What a message typed during a turn promises — `mid_turn` in config.toml, and the same
+    // word the composer announces and the settings page writes back.
+    cfg.mid_turn = appcfg.mid_turn();
+    // The palette is one value in `config.toml`, read by the window, a device tab and the terminal.
+    // A window can still carry an override and says so on its own screen; what it cannot do is
+    // rewrite this value, which is why the verb is drive-only.
+    cfg.theme = appcfg.theme();
     // The thinking level the window persists is the level the phone sees on connect.
     // Two clients of one engine showing different levels is the same drift the mode
     // persistence closed, one dial further along the console.
@@ -261,11 +313,12 @@ async fn main() -> anyhow::Result<()> {
     if core != "rust" && core != "pi" {
         anyhow::bail!("unknown --core {core:?} (rust or pi)");
     }
-    let (host, receivers, questions, mcp_hub): (
+    let (host, receivers, questions, mcp_hub, mcp_route): (
         Arc<dyn HostOps>,
         Option<(EventIn, ApprovalIn)>,
         Option<QuestionIn>,
         Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>>,
+        String,
     ) = if core == "pi" {
         // pi selects a model by provider+model out of its own provider file, so an
         // empty model is not "ask the endpoint" the way it is for the Rust core. It is
@@ -453,11 +506,97 @@ async fn main() -> anyhow::Result<()> {
                 cwoffee_engine::host::Persona::CHAT_PROMPT
             );
         }
+        // Third-party MCP servers, on this core too. The hub cannot live in the tool host —
+        // `cwtool` is one process per tool call, and a server spawned inside it would restart
+        // on every call — so this process owns the servers and the tool processes ask it over
+        // a socket in the agent directory. Same terms as the Rust core and the desktop: startup
+        // bounded per server, dead ones reported as sentences, the catalog capped, and the
+        // tools hidden until `explore` names them. A phone on this transport gets the same
+        // servers as the window, or neither says it has them.
+        let mcp_cfg = appcfg.mcp_cfg();
+        if let Err(e) = Config::mcp_problem(&mcp_cfg) {
+            eprintln!("[cwoffee] bad [mcp] config: {e}");
+            std::process::exit(1);
+        }
+        let (mcp_hub, mcp_sock): (
+            Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>>,
+            Option<std::path::PathBuf>,
+        ) = if mcp_cfg.has_servers() {
+            let hub = Arc::new(tokio::sync::Mutex::new(
+                cwoffee_engine::mcp::Hub::start(&mcp_cfg).await,
+            ));
+            for (name, line) in hub.lock().await.servers_named() {
+                println!("[cwoffee/pi] mcp {name}: {line}");
+            }
+            // One guard, taken once. Two `lock().await` temporaries in one statement deadlock:
+            // the first guard lives until the statement ends, and the second lock waits for a
+            // guard that is never released. Caught here because this line prints at boot, and a
+            // boot that prints nothing looks like a gateway that never started.
+            let (tools, block_bytes) = {
+                let g = hub.lock().await;
+                (g.catalog().len(), g.catalog_block().len())
+            };
+            println!(
+                "[cwoffee/pi] mcp: {tools} tool(s) catalogued at {block_bytes}B of a {}B ceiling, hidden behind explore",
+                cwoffee_engine::mcp::CATALOG_BYTE_BUDGET
+            );
+            let sock = agent_dir.join("cwoffee-mcp.sock");
+            match cwoffee_engine::mcp::socket::serve(Arc::clone(&hub), sock.clone()).await {
+                Ok(()) => (Some(hub), Some(sock)),
+                // Said, not swallowed: the servers exist and this process can see them, so the
+                // only honest statement about a call from a tool process is that it has no road.
+                Err(e) => {
+                    eprintln!(
+                        "[cwoffee/pi] mcp: the hub is running but no tool process can reach it ({e}); \
+                         MCP calls will refuse rather than guess at a server"
+                    );
+                    (Some(hub), None)
+                }
+            }
+        } else {
+            if !mcp_cfg.servers.is_empty() {
+                println!("[cwoffee/pi] [mcp] lists {} server(s), none enabled; nothing started", mcp_cfg.servers.len());
+            }
+            (None, None)
+        };
+        // How a tool call reaches these servers, said rather than implied. On this core the
+        // answer is never "this process": the tool host is a child of it and asks over the
+        // socket, and a hub no call can reach is a fact the settings page has to state instead
+        // of showing a row that reads as if the tools were there.
+        // The kept browser, for the tool processes: this owns it, they ask over a socket.
+        let browser_sock = {
+            let sock = agent_dir.join("cwoffee-browser.sock");
+            match cwoffee_engine::browser_hub::socket::serve(Arc::clone(&browser_hub), &sock).await {
+                Ok(()) => {
+                    // `serve` prints the path it bound, on both shells.
+                    Some(sock)
+                }
+                Err(e) => {
+                    eprintln!("[cwoffee/pi] {e} - `browse` with `session: true` will say there is no kept browser to reach");
+                    None
+                }
+            }
+        };
+
+        let mcp_route = match (&mcp_hub, &mcp_sock) {
+            (Some(_), Some(sock)) => format!("the app's hub, reached over {}", sock.display()),
+            (Some(_), None) => "a hub no tool process can reach".to_string(),
+            (None, _) => "none - no server is running in this start".to_string(),
+        };
         let mut host = cwoffee_bridge::PiHost::spawn(cwoffee_bridge::PiHostConfig {
             launch: cwoffee_bridge::PiLaunch {
                 bin: pi_bin,
                 workdir: workspace.clone(),
-                provider: PI_PROVIDER.into(),
+                // Same rule as the desktop: the endpoint that serves the default model is the one
+                // pi starts on, and the gateway log says which that was and why.
+                provider: {
+                    let (name, why) =
+                        cwoffee_bridge::mount::launch_provider(&cfg_path, PI_PROVIDER, &configured_model);
+                    if let Some(s) = why {
+                        println!("[cwoffee/pi] endpoint: {s}");
+                    }
+                    name
+                },
                 model: configured_model.clone(),
                 agent_dir: agent_dir.clone(),
                 session_dir,
@@ -506,8 +645,16 @@ async fn main() -> anyhow::Result<()> {
             cfg_path: Some(config_path.clone()),
             max_tool_iters: appcfg.max_tool_iters(),
             compact_timeout: appcfg.compact_timeout(),
+            // Same choice, same file: a phone's press during a turn is answered by the host's
+            // stored promise, not by whatever the app was started with.
+            mid_turn: appcfg.mid_turn(),
+            // Same file, same value: a phone's palette choice and the desktop's are answered by one
+            // stored theme, and the pi core paints nothing itself so it changes no colour anywhere.
+            theme: appcfg.theme(),
             // A chat starts with no network reach at boot; the composer's Web chip grants it, per conversation.
             web: false,
+            mcp_sock,
+            browser_sock,
         })
         .await?;
         // Not a claim about tools or extensions: those are chosen per process by the
@@ -523,9 +670,10 @@ async fn main() -> anyhow::Result<()> {
         );
         let receivers = host.take_receivers();
         let questions = host.take_questions();
-        // No hub on the pi core, carried as a value so `mcp_status` can say why it is empty
-        // instead of reporting an empty list as if nothing were configured.
-        (Arc::new(host) as Arc<dyn HostOps>, receivers, questions, None)
+        // The hub is this process's, and `mcp_status` reads the same Arc the tool calls go
+        // through: a settings page that read the config file could claim a server the process
+        // lost, and a page on this core could claim it has none.
+        (Arc::new(host) as Arc<dyn HostOps>, receivers, questions, mcp_hub, mcp_route)
     } else {
         // Third-party MCP servers, on the same terms as in the desktop app: started
         // sequentially, each bounded, dead ones reported rather than hung on, and installed into
@@ -537,7 +685,11 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("[cwoffee] bad [mcp] config: {e}");
             std::process::exit(1);
         }
-        let mut reg = Registry::with_v1_tools_exec(appcfg.search_backend(), appcfg.exec_cfg());
+        let mut reg = Registry::with_v1_tools_browser(
+            appcfg.search_backend(),
+            appcfg.exec_cfg(),
+            browser_cfg.usable().then(|| browser_cfg.clone()),
+        );
         let mcp: Option<Arc<tokio::sync::Mutex<cwoffee_engine::mcp::Hub>>> =
             if mcp_cfg.has_servers() {
                 let hub = Arc::new(tokio::sync::Mutex::new(
@@ -572,7 +724,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("[cwoffee] using the endpoint's first model: {m}");
             }
         }
-        (host as Arc<dyn HostOps>, receivers, questions, mcp)
+        (
+            host as Arc<dyn HostOps>,
+            receivers,
+            questions,
+            mcp,
+            if mcp_cfg.has_servers() { "this process".to_string() } else { "none - no server is running in this start".to_string() },
+        )
     };
 
     // The host's receivers are taken once and fanned out to every connected
@@ -646,7 +804,12 @@ async fn main() -> anyhow::Result<()> {
         clients: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         migration_notes,
         config_path,
+        browser_cfg: browser_cfg.clone(),
+        browser: Some(Arc::clone(&browser_hub)),
+        browser_state: browser_state.clone(),
+        browser_keep: browser_keep.clone(),
         mcp: mcp_hub,
+        mcp_route,
     });
 
     cwoffee_gateway::serve(gw, handle).await.map_err(|e| anyhow::anyhow!("{e}"))

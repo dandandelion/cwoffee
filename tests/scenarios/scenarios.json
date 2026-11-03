@@ -234,6 +234,19 @@
       ]
     },
     {
+      "name": "one-line-answer",
+      "match": "the line typed after the turn",
+      "_why": "the press a person makes **after** a turn ended, in `composer-type`: the words typed once the answer was finished have to reach the model as their own turn. Two facts about this scenario, both learned the hard way. (1) It has to exist: the mock matches the newest user message first and older ones only afterwards, so with no scenario of its own that press fell back to the older ask sitting in the same conversation ('What is 6 times 7?'), whose single step the mid-turn steer had already spent - the mock answered 400 EXHAUSTED, the page reported a provider error, and the pass lost every group after it. (2) Its `match` phrase must belong to this group alone: `match` is a substring test over every user message in the conversation, so the first version ('answer in one line') also sat inside the `steer` group's setup prompt, answered that turn instantly, and turned its mid-turn press into a second turn.",
+      "steps": [
+        {
+          "content": "One line, on purpose.",
+          "finish": "stop",
+          "chunk_chars": 9,
+          "delay_ms": 8
+        }
+      ]
+    },
+    {
       "name": "six-times-seven",
       "match": "What is 6 times 7?",
       "steps": [
@@ -1674,6 +1687,45 @@
       ]
     },
     {
+      "name": "tree-first-ask",
+      "_why": "the tree check's first turn. It needs a conversation with two exchanges to read a tree off, and a prompt with no scenario is a 400 rather than an answer",
+      "match": "Selftest tree one",
+      "steps": [
+        {
+          "content": "one",
+          "finish": "stop",
+          "chunk_chars": 4,
+          "delay_ms": 4
+        }
+      ]
+    },
+    {
+      "name": "tree-second-ask",
+      "_why": "the same conversation's second exchange: rows past the one the leaf will be moved to, which is what makes “the branch is not being read” something a check can count",
+      "match": "Selftest tree two",
+      "steps": [
+        {
+          "content": "two",
+          "finish": "stop",
+          "chunk_chars": 4,
+          "delay_ms": 4
+        }
+      ]
+    },
+    {
+      "name": "tree-branch-ask",
+      "_why": "the message sent after the leaf moved: its rows belong to the branch the leaf was left on, and the check reads the branch and the whole record to see that they grew apart",
+      "match": "Selftest tree three",
+      "steps": [
+        {
+          "content": "three",
+          "finish": "stop",
+          "chunk_chars": 6,
+          "delay_ms": 4
+        }
+      ]
+    },
+    {
       "name": "checkpoint-overwrite",
       "_why": "the turn the checkpoint check reverts: two writes to one file and one edit inside it, so the copy that matters is the earliest one and the dedupe claim has something to dedupe",
       "match": "Selftest checkpoint: rewrite the note file twice and correct one line",
@@ -1722,7 +1774,7 @@
     },
     {
       "name": "checkpoint-slow",
-      "_why": "a turn long enough to ask for a revert under it: the guard has to be measured against a turn in flight, not an idle host",
+      "_why": "a turn long enough to ask for a revert under it: the guard has to be measured against a turn in flight, not an idle host. Step 1 exists because the composer-type group presses Enter inside this turn — a steer makes the run continue, and an exhausted scenario would 400 on the request that carries it.",
       "match": "Selftest checkpoint: count slowly",
       "steps": [
         {
@@ -1730,12 +1782,18 @@
           "finish": "stop",
           "chunk_chars": 3,
           "delay_ms": 120
+        },
+        {
+          "content": "Second step: the turn took a message typed while it was running.",
+          "finish": "stop",
+          "chunk_chars": 6,
+          "delay_ms": 10
         }
       ]
     },
     {
       "name": "mcp-lazy",
-      "_why": "third-party tools ride lazy exposure: the model is handed a name list, not schemas, so the only way it can reach a server is to ask explore and then call what explore named. The require strings are the three links in that chain — explore's answer naming the server, the declared name the model then used, and words only the server itself can produce.",
+      "_why": "third-party tools ride lazy exposure: the model is handed a name list, not schemas, so the only way it can reach a server is to ask explore and then call what explore named. The require strings are the links in that chain — explore's answer naming the server, the declared name the model then used, and words only the server itself can produce. The catalog block those words are a reply to is graded where it lives: scripts/gateway-prompt-shape.mjs reads the request bodies on both cores and fails if the block is missing, over its ceiling, or accompanied by an `mcp__` declaration nobody asked for.",
       "match": "MCP LAZY",
       "steps": [
         {
@@ -1775,7 +1833,8 @@
           "chunk_chars": 8,
           "delay_ms": 10
         }
-      ]
+      ],
+      "require": []
     },
     {
       "name": "mcp-dead",
@@ -1874,6 +1933,376 @@
           "finish": "stop",
           "chunk_chars": 8,
           "delay_ms": 10
+        }
+      ]
+    },
+    {
+      "name": "ledger-write",
+      "_why": "the ledger check's first turn: it creates one file, so the ledger's first line for that path is `created` with no copy behind it",
+      "match": "Selftest ledger: write the note file",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-lg-1",
+              "name": "write_file",
+              "arguments": "{\"path\": \"selftest_ledger_note.md\", \"content\": \"the shared bytes\\n\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "content": "Wrote the note.",
+          "finish": "stop",
+          "chunk_chars": 6,
+          "delay_ms": 8
+        }
+      ]
+    },
+    {
+      "name": "ledger-edit",
+      "_why": "the second turn on the same path: the copy it takes is the bytes the first turn wrote, which is the blob the third turn shares and the 'before' side of the diff",
+      "match": "Selftest ledger: edit the note file",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-lg-2",
+              "name": "edit_file",
+              "arguments": "{\"path\": \"selftest_ledger_note.md\", \"old_text\": \"the shared bytes\", \"new_text\": \"the edited bytes\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "content": "Edited the note.",
+          "finish": "stop",
+          "chunk_chars": 6,
+          "delay_ms": 8
+        }
+      ]
+    },
+    {
+      "name": "ledger-twin",
+      "_why": "a second path whose copy is the SAME bytes as the first path's copy, so the stats have a shared blob to dedupe and the index total to disagree with the store's",
+      "match": "Selftest ledger: overwrite the twin file",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-lg-3",
+              "name": "write_file",
+              "arguments": "{\"path\": \"selftest_ledger_twin.md\", \"content\": \"a different line\\n\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "content": "Overwrote the twin.",
+          "finish": "stop",
+          "chunk_chars": 6,
+          "delay_ms": 8
+        }
+      ]
+    },
+    {
+      "name": "ledger-slow",
+      "_why": "a turn long enough to press the ledger's delete control against: forgetting copies mid-turn has to refuse, because that turn is taking copies right now",
+      "match": "Selftest ledger: count slowly",
+      "steps": [
+        {
+          "content": "Counting: one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen done.",
+          "finish": "stop",
+          "chunk_chars": 3,
+          "delay_ms": 120
+        }
+      ]
+    },
+    {
+      "name": "browse-page",
+      "_why": "the browser check: the model opens a page the harness is serving, walks one click into it, and the tool's own words must contain what the page really did — its title, its click, and the uncaught error its own script threw. `$base` is filled by the mock with its own origin, so the URL is real whatever MOCK_PORT is. The needles are the evidence: a tool that only pretended to run cannot put Chrome's own TypeError text into the transcript.",
+      "match": "Selftest browse:",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-br-1",
+              "name": "browse",
+              "arguments": "{\"url\": \"$base/selftest-page.html\", \"steps\": [{\"do\": \"click\", \"target\": \"More\"}, {\"do\": \"eval\", \"code\": \"window.cwoffeeProbe\"}]}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "require": [
+            "opened ",
+            "selftest-page.html",
+            "Cwoffee browse selftest",
+            "click \"More\" ok",
+            "uncaught errors in the page's own code",
+            "Cannot read properties of undefined",
+            "eval ok -> \"5\""
+          ],
+          "content": "The page renders, the button works, and its own script throws once.",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 8
+        }
+      ]
+    },
+    {
+      "name": "browse-session",
+      "_why": "the kept browser behind the window's sidebar panel. Two calls, and the second names no url at all: that only works if the browser really stayed open between them, which is the one claim that separates a kept browser from a throwaway walk. The needles are the evidence — the first step's `require` has the page's own title and the click's own reply, so a tool that only described a browser cannot pass.",
+      "match": "Selftest kept browser:",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-bs-1",
+              "name": "browse",
+              "arguments": "{\"url\": \"$base/selftest-page.html\", \"session\": true, \"steps\": [{\"do\": \"click\", \"target\": \"More\"}]}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "require": [
+            "opened ",
+            "selftest-page.html",
+            "in the browser cwoffee is keeping open",
+            "Cwoffee browse selftest",
+            "step click \"More\" ok",
+            "the page is at ",
+            "closes itself after "
+          ],
+          "tool_calls": [
+            {
+              "id": "mock-bs-2",
+              "name": "browse",
+              "arguments": "{\"session\": true, \"steps\": [{\"do\": \"eval\", \"code\": \"document.title\"}]}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "require": [
+            "acted in the browser that was already open at ",
+            "Nothing was reloaded",
+            "it gave back: cwoffee selftest"
+          ],
+          "content": "Same page, still open: the click and the title came out of the browser that is on screen.",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 8
+        }
+      ]
+    },
+    {
+      "name": "steer-into-turn",
+      "_why": "the mid-turn press the model really receives: a slow first step, then a tool call, then a second step whose request must carry the typed words after the tool results. The slow first step is what makes the press mid-turn rather than after-the-boundary: the boundary comes round only when the tool results are back.",
+      "match": "Selftest steer: write the note then answer slowly",
+      "steps": [
+        {
+          "reasoning": "Writing the note the user asked for, then answering.",
+          "tool_calls": [
+            {
+              "id": "mock-steer-1",
+              "name": "write_file",
+              "arguments": "{\"path\": \"selftest_steer_note.md\", \"content\": \"the first draft\\n\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 140,
+          "content": "Thinking about the file before writing it, one sentence at a time, so a message typed during this turn has room to arrive. ",
+          "chunk_chars": 26
+        },
+        {
+          "require": [
+            "selftest_steer_note.md"
+          ],
+          "require_steer": [
+            "Selftest steer midword"
+          ],
+          "content": "Answered after taking the mid-turn message.",
+          "finish": "stop",
+          "chunk_chars": 4,
+          "delay_ms": 120
+        }
+      ]
+    },
+    {
+      "name": "steer-withdraw",
+      "_why": "the same gesture with the words taken back before they land: the first step is slow so the Take back press has a boundary to beat, and the endpoint refuses the request outright if the withdrawn words appear anywhere in it.",
+      "match": "Selftest steer: write then take the press back",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-steer-w1",
+              "name": "write_file",
+              "arguments": "{\"path\": \"selftest_steer_note.md\", \"content\": \"the second draft\\n\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 140,
+          "content": "Thinking about the file before writing it, one sentence at a time, so a message typed during this turn has room to arrive. ",
+          "chunk_chars": 26
+        },
+        {
+          "require": [
+            "selftest_steer_note.md"
+          ],
+          "require_steer_absent": [
+            "Selftest steer withdrawn"
+          ],
+          "content": "Answered without the withdrawn message.",
+          "finish": "stop",
+          "chunk_chars": 5,
+          "delay_ms": 60
+        }
+      ]
+    },
+    {
+      "name": "steer-stop",
+      "_why": "a turn long enough to stop with a message still waiting: the words come back to the composer and nothing is sent",
+      "match": "Selftest steer: answer slowly and get stopped",
+      "steps": [
+        {
+          "content": "Streaming for a long time so the harness can stop this turn while a message is still waiting to land in it. Streaming for a long time so the harness can stop this turn while a message is still waiting to land in it. Streaming for a long time so the harness can stop this turn while a message is still waiting to land in it. Streaming for a long time so the harness can stop this turn while a message is still waiting to land in it. Streaming for a long time so the harness can stop this turn while a message is still waiting to land in it. Streaming for a long time so the harness can stop this turn while a message is still waiting to land in it. ",
+          "finish": "stop",
+          "chunk_chars": 14,
+          "delay_ms": 70
+        }
+      ]
+    },
+    {
+      "name": "steer-approval-card",
+      "_why": "the card a mid-turn press must not answer: the approval stays up, and only the card's own button resolves it",
+      "match": "Selftest steer: read outside the workspace while a card is up",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-steer-c1",
+              "name": "read_file",
+              "arguments": "{\"path\":\"/etc/hostname\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 20
+        },
+        {
+          "require_steer": [
+            "Selftest steer beside the card"
+          ],
+          "content": "Read it after the card was answered, with the mid-turn message in that same request.",
+          "finish": "stop",
+          "chunk_chars": 6,
+          "delay_ms": 40
+        }
+      ]
+    },
+    {
+      "name": "tui-gate-write",
+      "_why": "scripts/tui-gate.mjs: the turn whose file the terminal's /files must name and /undo must put back. The workspace file already holds other words, so a revert has something to prove off the disk rather than on the screen.",
+      "match": "TUI GATE: rewrite the note file",
+      "steps": [
+        {
+          "reasoning": "Rewriting the file the person pointed at.",
+          "tool_calls": [
+            {
+              "id": "mock-tg-1",
+              "name": "write_file",
+              "arguments": "{\"path\": \"tui_gate_note.txt\", \"content\": \"the words the turn wrote\\n\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 140
+        },
+        {
+          "require": [
+            "tui_gate_note.txt"
+          ],
+          "content": "TUI GATE DONE",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 30
+        }
+      ]
+    },
+    {
+      "name": "tui-gate-anchor",
+      "_why": "the row /branch cuts from: one answer, no tools, so the branch's row count is about the conversation and not about a turn's copies.",
+      "match": "TUI GATE: one sentence to branch from",
+      "steps": [
+        {
+          "content": "TUI GATE BRANCHED-ANCHOR",
+          "finish": "stop",
+          "chunk_chars": 10,
+          "delay_ms": 20
+        }
+      ]
+    },
+    {
+      "name": "tui-gate-mcp",
+      "_why": "the terminal's explore reaching this run's own server. The require strings are the two links the gate cannot see on disk: the catalog sentence naming the server, and the withheld tool name the model was then told about. No tool call here — the call itself is graded by the mcp group on the desktop; this one grades that the terminal mounted a hub at all.",
+      "match": "TUI GATE MCP: look for a third-party tool",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-tgm-1",
+              "name": "explore",
+              "arguments": "{\"need\":\"mcp: write a note file\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 20
+        },
+        {
+          "require": [
+            "MCP server fake",
+            "mcp__fake__"
+          ],
+          "content": "TUI GATE MCP DONE",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 20
+        }
+      ]
+    },
+    {
+      "name": "page-log-read",
+      "_why": "the model reading what the page said about itself instead of looking at it. The needles are the tool's own reply — the page's url, the line that counts what is held, and the kind — so a model that only narrated a log cannot pass, and a page with nothing to report is a different answer.",
+      "match": "Selftest page log:",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "id": "mock-pl-1",
+              "name": "page_log",
+              "arguments": "{\"kind\": \"error\"}"
+            }
+          ],
+          "finish": "tool_calls",
+          "delay_ms": 10
+        },
+        {
+          "require": [
+            "selftest-page.html",
+            "held:",
+            "error"
+          ],
+          "content": "The page threw on its own; that is what it complained about.",
+          "finish": "stop",
+          "chunk_chars": 8,
+          "delay_ms": 8
         }
       ]
     }

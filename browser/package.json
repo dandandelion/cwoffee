@@ -1,0 +1,10 @@
+{
+  "name": "cwoffee-browser-driver",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The browser half of cwoffee's `browse` tool: a one-shot Playwright walk over a page, run by the Rust tool as a child process. Kept in its own package so the app itself stays free of a JS dependency at build time.",
+  "dependencies": {
+    "playwright-core": "1.58.2"
+  }
+}

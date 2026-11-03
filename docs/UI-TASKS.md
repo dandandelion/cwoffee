@@ -2208,20 +2208,39 @@ What the surface says, and why:
 * **A dead server is a sentence.** Timeouts come from `[mcp] timeout_secs` (approvals reuse the
   app's `approval_timeout_secs`); a call into a server whose pipes closed answers within the timeout
   naming the server, and the status then says `dead`. Nothing in this feature can hang a turn.
-* **Settings › Workspace › Third-party tools is status, not a control.** "Is what I configured
+* **Settings › Workspace › Third-party tools was status, not a control.** "Is what I configured
   actually running?", per server, plus the byte counts and the declared/withheld split — and it
-  re-reads config and re-applies `CWOFFEE_MCP_SERVERS`, because a page that reads only the file tells
-  a systemd user that none are configured. No button launches somebody else's program.
+  re-read config and re-applied `CWOFFEE_MCP_SERVERS`, because a page that reads only the file tells
+  a systemd user that none are configured. No button launched somebody else's program. That page has
+  been replaced by the one below; what it kept is the second half of that rule.
+* **The servers page is a door in the sidebar, and it holds the two lists apart.** `MCP servers`, just
+  above Settings, opens a page rather than a popup: while changing one of these programs, the thing a
+  person is reading is what else is already running, and a modal hides it. **Running now** is the hub's
+  answer, with each server's tool names spelled out (the catalog is budgeted and can leave names out, so
+  a count cannot answer "does it have a write tool?"). **In the config file** is what may be started,
+  with a switch, an Edit and a two-press Remove. Merging them would need one word for a server that is
+  listed but not answering, and every word available — configured, installed, enabled — says something
+  the app does not know. A write is one act on both halves: the sentence comes from the engine (`written
+  to [mcp.servers.jira]`) and is extended by what the process did (`jira-mcp: live (3 tool(s))`), so a
+  file written next to a program that refused to start is visible as that. Config edits are line surgery,
+  so comments, unknown tables and wrapped arrays survive. `CWOFFEE_MCP_SERVERS` disables the controls and
+  says why — that variable replaces the file's list wholesale, so writing the file would report a success
+  the next start ignores — and a phone tab is told the programs belong to the machine that started them.
+  What the old page refused to be is still true: adding a server names a program already on this machine.
+  Nothing here downloads, installs or contacts anything.
 * **A tool card names the server instead of repeating the tense.** `third-party · fake`; the status
   chip already says working/done/failed, and which server ran is the fact a reader cannot re-derive.
 * **A refused call says who refused.** A denied MCP call used to close as a bare "failed". The card
   now carries `denied by you (…)` or `blocked by the denylist: …` — the one state where "who said no"
   changes what the reader does next.
-* **The pi core says it cannot mount MCP, rather than showing an empty list.** `cwtool` is one
-  process per tool call, so a server it spawned would be born and die around each call; there is no
-  process in the pi core that can hold a server open. `mcp_status` answers `mounted: false` with the
-  reason, `tool_inventory` answers with an **error** instead of `{declared: [], hidden: []}` — two
-  empty lists would claim nothing is hidden about something that side cannot observe.
+* **The pi core has no process that can hold a server, so the app holds it there too.** `cwtool` is one
+  process per tool call, so a server it spawned would be born and die around each call — a stateful one
+  would answer correctly exactly once. The app starts the hub on both cores and hands the tool process a
+  unix socket in its own state directory (`mcp::install_socket_into`); `mcp_status` prints the route a
+  call takes so a row cannot read as *mounted* while no call can get there. `tool_inventory` still
+  answers with an **error** on that core rather than `{declared: [], hidden: []}` — two empty lists would
+  claim nothing is hidden about something that side cannot observe, because the declared list is decided
+  inside the model process.
 
 Lessons that came out of building it:
 
@@ -2346,3 +2365,215 @@ typed mid-turn stayed in the box and in the app, Enter mid-turn sent nothing and
 the words typed after the turn are the words the record holds
 ```
 
+
+---
+
+## Feature 4: `browse` — a browser the model can point at the page it just wrote
+
+**User asked:** "Once it is done, let's add a new tool (built-in). Playwright (headless if LLM has
+no vision, otherwise normal). So that LLMs can test their code before handing off to the user."
+
+**Status:** DONE on both cores, targeted green.
+
+    browse ok (a real window opened the page because this model takes image input, reported the
+    click, the inline value and the page's own TypeError, and the server it loaded from counted 2
+    fetches)
+
+**Notes, in the order they got decided:**
+
+- *One call, one browser.* Open, act, report, close. A browser held between turns would be a window
+  the app owns and the model drives, with no approval in sight — and a walk the model cannot
+  interrupt is not a thing to hold open.
+- *Headless versus headed is not the model's call.* There is no `headed`/`headless` argument in the
+  schema, so a prompt cannot ask for a window. The host decides: `[browser] headed` wins, otherwise
+  the model's recorded inputs decide it. Unknown — the endpoint never stated its modalities — gets
+  headless and no pixels, and says it was silence rather than a verdict.
+- *The vision fact is per turn, not per boot.* It is read from the config row of the model that is
+  answering, on the same line the env block is rebuilt. Freezing it at spawn was caught twice: once
+  by the selftest, which grades the card's mode against the settings page's answer for the same
+  model, and once by a probe recording modalities after the host was already up.
+- *`file://` is confinement, judged on the resolved path.* Inside the workspace is a workspace-level
+  call; outside is gated and names the folder escaped; a `file://` URL with a host is refused. The
+  browser is pointed at the canonicalised path rather than the caller's spelling, because otherwise
+  `file:///etc/hostname` reads as a workspace file and the escape is invisible.
+- *Risk is `Sensitive`, one grant per conversation.* A fetch reads a page; a browser runs it, and
+  that run does not go through the sandbox's package-manager proxy. The tool says so in its own
+  description, and ask mode sees one card naming the origin.
+- *Nothing downloads automatically.* A ~150 MB browser is a person's decision. Absent driver, absent
+  tool: no schema bytes, and the settings line carries the two commands to install it.
+- *A screenshot is model-facing only when the model has eyes.* `ToolResult.images` is new and
+  separate from the UI's `files`; Anthropic puts the picture inside the `tool_result`, an
+  OpenAI-shaped endpoint gets it as a following captioned `user` message, and a tool result with no
+  picture keeps the exact bytes it had before.
+
+**How to verify:** `./scripts/selftest.sh browse` (and `CWOFFEE_CORE=pi` for the other core);
+`cargo test -p cwoffee-engine --lib browser::` plus `provider::` for the picture's placement, and
+`host::tests::the_browsers_mode_follows_the_config_row_and_not_the_boot_snapshot` for the timing.
+The selftest grades the *endpoint's* page-hit counter, not just the tool's prose: a narrated browser
+run cannot pass.
+
+### The browser column: shaped like a browser, aimed at with pixels
+
+The kept browser's column was a stack of text buttons — `Open`, `Close browser`, `✕ closed`, `Back`,
+`Reload`, a `url` line. It worked, and it read like a diagnostics box rather than like the thing it is
+for. What was decided when it was redrawn:
+
+* **The shape is a browser's shape.** An address field with a Go control, Back, Forward, Reload, a page
+  area, and a footer holding the one destructive thing in it. A person who has used a browser knows
+  what each part is for; a panel that invents its own vocabulary has to be learned before it can be
+  used.
+* **Icons, with the words kept where they do work.** Every control is a glyph, and each carries an
+  accessible name plus a tooltip that answers the question rather than naming the button: Reload's
+  title is *"re-reads the page that is open. It does not go back."*, because that confusion is this
+  driver's actual history. An icon with no name behind it is a control only a mouse can use, and the
+  self-test counts the icon-only buttons and refuses any that carry no name.
+* **The picture is the pointing device.** A click in the frame sends `click_xy` at page pixels; a wheel
+  over it sends `scroll` at the point under the pointer; a keys row sends `type_keys` into whatever the
+  page already has focus. The column owns the scaling because it is the only party holding both boxes —
+  the picture's rect on screen and the viewport the browser reports. A press is echoed with a mark at
+  the point pressed, because a click that landed elsewhere is otherwise invisible until the page moves.
+* **`fill` needs a selector; a person aiming has none.** Hence `type_keys`: click the field in the
+  picture, then type. That pair is graded end to end — the check clicks the page's own input through
+  the picture, types in the column, and reads the field's value back out of the browser.
+* **The page's own complaints are shown.** Three views — the page, what the page reported, what this
+  browser is — and the middle one exists because `pageerror`, failed requests and refused downloads
+  arrive whether anybody asks. A column that shows a screenshot while hiding "this page threw a
+  TypeError twice" is showing half the picture.
+* **The idle promise is drawn, not written.** A ring that empties answers "how much of the span is
+  left" without being read; the sentence stays in the DOM for a screen reader, for a check, and for the
+  unit the config file actually uses.
+* **Nothing about the meaning moved.** The engine still owns the status sentence, the panel still shows
+  pictures of the model's browser rather than its own webview, closing is still two presses, and a
+  read-only watcher still cannot drive. The redesign moved pixels and vocabulary, not rules — and the
+  claims that guarded those rules pass unchanged.
+
+The visual pass, in the order it was needed:
+
+* **glyphs with names.** every icon-only control carries `aria-label` *and* `title`; the board counts
+  them and fails a control that carries only one, because a glyph without words is a guess.
+* **the picture is the control.** click sends `click_xy` in page pixels, wheel sends `scroll` at the
+  pointer, a keys row sends `type_keys` to whatever the page has focused. The panel owns the scaling
+  (it holds the picture's rect; the browser reports the viewport) and the driver refuses a point
+  outside the viewport by name.
+* **the empty state is a shape, not a hole.** a page outline in hairlines over the engine's own reason,
+  and the stage on `--color-raise` so a page reads as a page.
+* **a watcher says it watches.** disabled address field, placeholder that says so, and a footer that
+  names the assistant as the only one who can open a page — the gateway's payload is `writable:false`,
+  and the copy follows the payload instead of the layout.
+* **a row that repeats is noise.** with nothing open the column used to say it three times — the page
+  area's title, the URL line under it, and the engine's sentence two rows down. The middle one went
+  away: the shape and the engine's sentence are the two facts worth the vertical space.
+* **what was kept**: the engine still owns the status sentence (the column quotes it, digits normalised
+  so a countdown is not graded as a mismatch), the two-press close, the picture-only-after-close rule,
+  and every `data-*` hook the board reads (Trap 135).
+
+### The servers page: a door above Settings, two lists that answer two questions, and writes that reach both halves
+
+The page used to be a status readout buried in Settings › Workspace. It is now a door in the sidebar,
+above Settings, and it can add, switch, edit and remove a server. What was decided on the way:
+
+* **A page, not a popup.** While changing one of these programs, the fact a person is reading is what
+  else is already running and what each one answered. A modal sits on top of exactly that.
+* **Two lists, not one.** *Running now* is the hub's answer, with each server's tool names spelled out;
+  *In the config file* is what may be started, with the switches on it. A merged row needs one word for
+  a server that is listed but not answering, and every word available — configured, installed, enabled —
+  claims something the app does not know. The counts are graded separately against `mcp_status.servers`
+  and `mcp_status.file.servers`, because one list could be wrong twice.
+* **A write is two facts or it is a lie.** The engine's sentence (`jira written to
+  [mcp.servers.jira] with command …`) is extended by what the process did (`and now: jira: live (3
+  tool(s))`). A file written beside a program that refused to start is visible as that, not as a green
+  row. The page re-reads the status after every write rather than painting what it sent, so a refused
+  write cannot leave a row shaped like a success.
+* **The config file is edited by line surgery.** Comments, tables this app has never heard of, and
+  arrays wrapped across lines survive, and a removed server loses `[mcp.servers.jira]` and
+  `[mcp.servers.jira.env]` together. A TOML serializer would rewrite the file and quietly drop the
+  annotations the person wrote by hand.
+* **An environment value is not this page's to show.** Rows carry key *names*; the edit form prefills
+  bare names, and a bare `KEY` line means "keep what the file holds". Only `KEY=value` writes a value.
+  Without that rule, opening a server to fix its command would blank its token and report a successful
+  edit that broke the program.
+* **`CWOFFEE_MCP_SERVERS` refuses the write and says why.** That variable replaces the file's
+  `[mcp.servers]` list wholesale, so a form writing the file would report a success the next start
+  ignores. Same on a phone tab, where the programs belong to the machine that started them:
+  `writable: false`, controls disabled, and a sentence naming which of the two it is. Both transports
+  build that payload from one function so they cannot disagree about "running".
+* **Removing takes the callable handles with it.** `Registry::forget_stale_mcp` drops the third-party
+  names the hub no longer offers, in the session that removed the server. Otherwise the model spends
+  its remaining turns able to name a tool of a program that is gone, and the only thing that tells it
+  otherwise is an approval card for a call that cannot happen. The `mcp__` prefix is the filter: the
+  hub does not own first-party tools, so this sweep cannot take them.
+* **Remove is two presses,** and **Re-read the file** exists: the app does not watch the config file, so
+  a server typed in an editor needs one explicit act to join the running set, and the button names how
+  many it would start.
+* **Nothing is downloaded, installed or contacted.** The form names a program already on this machine,
+  and its help says so — which is the half of the old page's "no button launches somebody else's
+  program" that stayed true.
+
+**How to verify:** `./scripts/selftest.sh mcp` runs both arms on either core — the board's run, whose
+servers come from `CWOFFEE_MCP_SERVERS` and which must find the page read-only and told why, and the
+`mcp write` arm, a second window whose servers come from a scratch `config.toml`, where the page adds,
+switches, edits and removes one and each step is graded in the file the next start reads **and** in the
+hub that answers a call. `cargo test -p cwoffee-engine --lib mcp::` covers the framing, the payload
+shape, `env_keep_lines`, and the pruning; `cargo test -p cwoffee-engine --lib config::` covers the line
+surgery. See `docs/TESTING.md` ("The servers page is graded as an actor, in two arms") for the failure
+strings each assertion prints.
+
+## Feature 5: the browser panel — a window onto a browser the app holds
+
+**User asked:** "Add a browser sidebar on the right side of the transcript, controllable by the LLM
+and openable/closable by the user with a browser icon on the upper-right. It can be ephemeral — kill
+itself when idle around 5 minutes — and it may reuse Playwright." Then, when the first sketch showed
+a webview in the column: *"a kept browser session owned by the app, not a new browser inside each
+tool process; the sidebar must be a window onto that same browser, not a second pretending webview."*
+
+**Status:** built; targeted green on the Rust core; the shape is the same on the pi core (the tool
+process reaches the app's hub over a socket).
+
+**Notes, in the order they got decided:**
+
+- *The panel shows pictures, not a browser.* A webview in that column would be a second browser with
+  its own profile, cookies and history, and it would look exactly like the one the model is clicking.
+  No test can tell those apart and no user can either — which is the class of bug this app keeps
+  meeting, so the column draws the frames the app captures from the page the tool acts on.
+- *The app owns the browser; a tool process borrows it.* `cwtool` is one process per call on the pi
+  core, so a browser there would be a new browser per call (the same wall MCP hit). The hub lives in
+  the app; `BrowserRoute` is one type with two links, in-process and over a unix socket, so a tool
+  call runs one sequence rather than two.
+- *Mounting spawns nothing.* The browser starts at the first `open`, and the hub is mounted even when
+  `[browser] keep` is on and no page exists — so a running app costs an object, not a browser.
+- *The idle clock is started, not promised.* A 15s reaper task in each shell that owns a hub; the
+  driver has its own longer backstop (`idle_secs + 3min`) in case nobody calls; `Drop` kills the
+  child; the driver exits on stdin EOF if the app is killed outright. The panel prints the countdown
+  from `idle_left_now()`, computed from a deadline, because a countdown copied from the last action
+  is wrong in the exact case a person looks for.
+- *The unit is the person's unit.* `idle_words` renders `45` as "45 seconds" and `300` as "5 minutes",
+  in the tool's report and the panel. Rounding a 45-second wait up to "1 minute" is a small lie about
+  the one number that tells you whether the page vanished by design.
+- *`session: true` is asked every time.* `CallRisk::per_call` defeats a Session grant, and the card
+  says which browser it is: "…in a throwaway browser, which closes when the call ends" against
+  "…in cwoffee's KEPT browser, which stays open in the person's sidebar and may be theirs". A grant
+  given to a throwaway browser is not consent to click inside a page somebody has open and may be
+  logged into.
+- *The model cannot make a window, still.* The one-shot rule survived: no `headed` in any schema. A
+  kept browser's window is opened by a person, or shown to a person because the model started a page
+  they asked for — and the panel can be dismissed, and stays dismissed while that browser lives.
+- *The panel's address box is narrower than the model's file rule.* `http(s)` only. The model's
+  `file://` path has an approval card and a confinement check behind it; a box in a panel has neither,
+  so the honest answer is a refusal that says what it does open.
+- *The panel follows a browser the model starts, until you close it.* Auto-open on the closed→alive
+  transition; a manual close while a page is open is respected until that browser ends. Otherwise
+  "controllable by the LLM" means the answer to a request you made is never visible.
+- *Two presses to close.* One click ending a browser the model may be mid-walk in is how you break
+  somebody else's work by accident. Same rule as removing an MCP server and forgetting copies.
+- *No picture after the browser is gone.* The frame is dropped when `alive` goes false. A frame left
+  above "closed itself" reads as a page that still exists.
+- *The env block says what is open.* URL, who opened it, who touched it last, that `session: true`
+  acts on that page, and that it closes itself. Nothing about a browser when none is open. A one-shot
+  walk that runs next to somebody's open page gets a note — "the model opened a second browser" and
+  "the model used the page I was looking at" look identical in a transcript.
+
+**How to verify:** `./scripts/selftest.sh browser-panel browser-idle` (the second group runs in its
+own launch over a scratch `[browser] idle_secs = 4`), `--no-browser` for the switched-off arm, and
+`cargo test -p cwoffee-engine --lib browser_hub::` / `tools::browser::` for the hub and the tool.
+`docs/TESTING.md` ("The kept browser: one page seen twice, and a clock that has to fire") lists what
+each assertion prints when it fails.

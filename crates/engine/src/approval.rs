@@ -403,6 +403,44 @@ pub fn summarize(tool: &str, args: &serde_json::Value) -> String {
             "fetch: {}",
             crate::tools::repair::field_as_string(args, "url").unwrap_or_else(|| "???".into())
         ),
+        // A browser call gets its own sentence, on purpose. The fallback prints the argument
+        // blob, which for `browse` is a URL and up to forty steps of JSON — the part a person
+        // has to weigh is *which page*, and whether the browser **stays open afterwards in
+        // their own window**. The second fact is the one that changes the answer, and it is
+        // invisible in a blob.
+        "browse" => {
+            let url = crate::tools::repair::field_as_string(args, "url").unwrap_or_else(|| "(no page named)".into());
+            let steps: Vec<String> = args
+                .get("steps")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|st| {
+                            let what = st.get("do").and_then(|d| d.as_str()).unwrap_or("?");
+                            match st.get("target").and_then(|t| t.as_str()) {
+                                Some(t) if !t.is_empty() => format!("{what} \"{t}\""),
+                                _ => what.to_string(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut walk = String::new();
+            if !steps.is_empty() {
+                let shown = steps.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+                let more = if steps.len() > 4 { format!(", +{} more", steps.len() - 4) } else { String::new() };
+                walk = format!(" — then {shown}{more}");
+            }
+            if args.get("session").and_then(|v| v.as_bool()) == Some(true) {
+                format!(
+                    "open {url} in cwoffee's KEPT browser{walk}: this browser stays open in the \
+                     person's sidebar afterwards, and the call clicks inside a browser that may \
+                     be theirs"
+                )
+            } else {
+                format!("open {url} in a throwaway browser{walk}, which closes when the call ends")
+            }
+        }
         other => {
             let s = serde_json::to_string(args).unwrap_or_default();
             let s: String = s.chars().take(120).collect();

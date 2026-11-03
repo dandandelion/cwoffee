@@ -240,6 +240,7 @@ impl Tool for WriteXlsxTool {
         // Taken before the save: `write_xlsx` overwrites an existing workbook, and the
         // person who asks to undo that turn wants their spreadsheet back, not the one the
         // model just made.
+        let made_it = !path.exists();
         let pre = ctx.pre_state(&path);
         match wb.save(&path) {
             Ok(_) => {
@@ -248,7 +249,9 @@ impl Tool for WriteXlsxTool {
                     "wrote {rel} ({})",
                     summary.join("; ")
                 ))
-                .with_file(super::OutputFile::from_path(&ctx.workspace, &path));
+                .with_file(
+                    super::OutputFile::from_path(&ctx.workspace, &path).with_created(made_it),
+                );
                 let res = ctx.stamp_checkpoint(res, &path, &pre);
                 if matches!(place, super::scratch::Place::Attach) {
                     let mut res = res;

@@ -283,6 +283,7 @@ impl Tool for ExecTool {
                 changes: Vec::new(),
                 checkpoints: Vec::new(),
                 activates: Vec::new(),
+            images: Vec::new(),
                 error: Some(timeout_error(timeout_secs)),
                 files: Vec::new(),
             };
@@ -298,6 +299,7 @@ impl Tool for ExecTool {
                 changes: Vec::new(),
                 checkpoints: Vec::new(),
                 activates: Vec::new(),
+            images: Vec::new(),
                 error: Some(timeout_error(timeout_secs)),
                 files: Vec::new(),
             };
@@ -360,6 +362,7 @@ impl Tool for ExecTool {
             changes: Vec::new(),
             checkpoints: Vec::new(),
             activates: Vec::new(),
+            images: Vec::new(),
         }
     }
 }

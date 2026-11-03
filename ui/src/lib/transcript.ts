@@ -185,6 +185,17 @@ const iconDoc = () =>
   svgIcon(['M3.6 2.6h6l2.8 2.8v8H3.6z', 'M9.6 2.6v2.8h2.8', 'M8 8.2v4', 'M6.2 10.4 8 12.2l1.8-1.8'])
 const iconBranch = () =>
   svgIcon(['M5 3.6v7.2', 'M5 12.4a1.4 1.4 0 1 0 0 .1', 'M5 3.5a1.4 1.4 0 1 0 0 .1', 'M11.4 5.6a1.4 1.4 0 1 0 0 .1', 'M11.4 6.9c0 2.4-2.6 2.6-4.4 3.6'])
+// A trunk with two offshoots and a dot on the one being read: the tree, and the leaf is the dot.
+// It is drawn apart from `iconBranch` on purpose — Branch opens a new conversation, Tree moves this
+// one's own leaf, and an identical icon would say they are the same ask.
+const iconTree = () =>
+  svgIcon(['M4.4 12.6V2.4', 'M4.4 4.6h5.2', 'M4.4 8.2h3.6', 'M10.6 3.4a1.2 1.2 0 1 0 0 .1', 'M8.6 7.4a1.2 1.2 0 1 0 0 .1', 'M4.4 12.7a1.4 1.4 0 1 0 0 .1'])
+// Two sheets, one behind the other, with a folded corner on the front one: the file ledger — the
+// whole conversation's file history, not one turn's. Drawn apart from `iconUndo` (which puts one
+// turn's files back) and `iconDoc` (which exports the transcript), because all three are about
+// files and a reader has to be able to tell the asks apart without reading the label.
+const iconFiles = () =>
+  svgIcon(['M4.6 3.4h5.2l2.2 2.2v6.8H4.6z', 'M9.8 3.4v2.2h2.2', 'M3 5v7.6h6.2'])
 // An arrow curving back to where it came from: undo, and specific enough about direction that it
 // does not read as a generic refresh next to it.
 const iconUndo = () =>
@@ -274,6 +285,212 @@ export interface RevertPreview {
   /** Copies this conversation lost to the size cap. Non-zero means the list is what survived, not
    *  everything the conversation ever changed — the note says so, and the card shows the number. */
   pruned: number
+  note: string
+}
+
+/** One conversation on the lineage, as the engine read it. */
+export interface TreeConversation {
+  session: number
+  title: string
+  parent: number | null
+  /** Which kind of row this conversation was cut out of: `user`, `assistant`, or empty when it is
+   *  the root — the conversation nobody was cut out of. */
+  branch_role: string
+  branch_row: number | null
+  /** The words that were there when it was cut. A branch made before the record kept lineage, or one
+   *  whose cut row has since been deleted, is said in words by the tree's own note instead. */
+  branch_quote: string
+  current: boolean
+  parent_gone: boolean
+  rows: number
+  off_branch: number
+  depth: number
+  children: number
+}
+
+/**
+ * One node of a conversation's tree: a row of the record, an entry of the model's thread, or both.
+ *
+ * `content` is the node's words in full, not decoration. Moving the leaf onto a node has to send
+ * those words back, which is how the host knows this window meant *this* row and not a row id it
+ * remembered from an older paint — the same proof `MessageBranch` makes.
+ */
+export interface TreePoint {
+  row: number | null
+  pi_entry: string | null
+  role: string
+  quote: string
+  content: string
+  /** False means the next answer does not read this node: it is on a branch the leaf left behind. */
+  on_branch: boolean
+  /** The node the record's next answer reads through. */
+  current: boolean
+  /** Where pi's own thread stands. On the pi core this can be a different node than `current`, and
+   * the card says so rather than picking one of the two to present as the answer. */
+  pi_current: boolean
+  depth: number
+  /** A node one record has and the other does not — the two memories disagree about the history. */
+  drift: boolean
+}
+
+/** What pi answered about its own thread, kept beside the record's node list so "pi was asked" is
+ *  readable as different from "we guessed from the file". */
+export interface TreePi {
+  consulted: boolean
+  entries: number
+  leaf_entry: string | null
+  file: string
+  why: string
+}
+
+/** The tree of one conversation: where it came from, what hangs off it, and what is being read. */
+export interface TreeRead {
+  session: number
+  core: string
+  lineage: TreeConversation[]
+  nodes: TreePoint[]
+  /** Nodes the card did not list. Always off-path ones — the branch being read is never the part
+   *  that gets dropped, and the note names the number so a short card is not a short conversation. */
+  nodes_hidden: number
+  off_branch: number
+  /** `null` means the conversation reads its newest row: nobody has moved the leaf. */
+  leaf: number | null
+  pi: TreePi
+  drift: string[]
+  drift_count: number
+  note: string
+}
+
+/** An ask to leave the leaf on one node. `shown` is the words this window painted for that node. */
+export interface LeafMove {
+  session: number
+  id: number
+  role: 'user' | 'assistant'
+  shown: string
+}
+
+/** What the engine moved, and what it says the next answer will read. */
+export interface LeafMoveOut {
+  session: number
+  leaf: number | null
+  reads_through: string
+  off_branch: number
+  /** Your own words, coming back to the composer because the leaf now sits in front of them. */
+  prefill: string | null
+  note: string
+}
+
+/** One file, as one turn left it. `checkpoint` is the index row: the diff is addressed at it. */
+export interface LedgerFileRow {
+  checkpoint: number
+  path: string
+  kind: string
+  bytes: number
+  /** The copy is on disk. A file the turn created has no copy by design, and says so. */
+  copy_present: boolean
+  can_revert: boolean
+  edited_since: boolean
+  path_missing: boolean
+  /** The live side, so the card can say which half of a comparison exists before it offers one. */
+  live_exists: boolean
+  live_bytes: number
+  says: string
+}
+
+export interface LedgerTurnRow {
+  turn: number
+  /** The answer row this turn's copies belong to; `null` while that row is not written yet. */
+  message_id: number | null
+  files: number
+  /** The files of this turn, in path order. `files` is this same count. */
+  file_rows: LedgerFileRow[]
+  paths: string[]
+  revertable: number
+  latest: boolean
+  note: string
+}
+
+export interface LedgerPathRow {
+  path: string
+  turns: number[]
+  kinds: string
+  copies: number
+  live_exists: boolean
+  live_bytes: number
+}
+
+export interface LedgerRead {
+  session: number
+  workspace: string
+  turns: LedgerTurnRow[]
+  paths: LedgerPathRow[]
+  turns_total: number
+  turns_hidden: number
+  files_total: number
+  paths_total: number
+  paths_hidden: number
+  copies: number
+  /** Copies the per-conversation cap discarded. Those rows offer nothing, and say so. */
+  pruned: number
+  prune_notes: string[]
+  /** Rows whose blob is gone for some other reason — the folder was emptied outside the app. */
+  copies_missing: number
+  unstamped: number
+  edited_since: number
+  note: string
+}
+
+export interface SnapshotStats {
+  session: number
+  workspace: string
+  dir: string
+  dir_exists: boolean
+  rows: number
+  /** The index's own total. It counts a shared blob once per row, and says so next to the store's. */
+  row_bytes: number
+  blobs: number
+  blob_bytes: number
+  shared: number
+  orphan_blobs: number
+  orphan_bytes: number
+  neighbours: number
+  note: string
+}
+
+/** The copy to compare against, named by row. A window that has drifted gets a refusal, not a guess. */
+export interface FileDiffReq {
+  session: number
+  checkpoint: number
+  shown: string
+}
+
+export interface FileDiffRead {
+  session: number
+  checkpoint: number
+  turn: number
+  message_id: number | null
+  path: string
+  kind: string
+  stored_bytes: number
+  stored_present: boolean
+  live_exists: boolean
+  live_bytes: number
+  added: number
+  removed: number
+  diff: string | null
+  too_big: boolean
+  binary: boolean
+  edited_since: boolean
+  can_revert: boolean
+  note: string
+}
+
+export interface ForgetCopiesOut {
+  session: number
+  dropped: number
+  freed_bytes: number
+  /** Blobs left in the store because another conversation points at them. */
+  kept: number
   note: string
 }
 
@@ -578,6 +795,32 @@ export class Transcript {
   onMessageEdit: ((edit: MessageEdit) => Promise<string>) | null = null
   /** Opens a second path out of one message and returns the sentence the host answered with. */
   onMessageBranch: ((branch: MessageBranch) => Promise<string>) | null = null
+  /**
+   * Read one conversation's tree: where it was cut out of, what hangs off it, which node the next
+   * answer reads through, and what the two records disagree about. Nothing is changed by this call,
+   * which is why the card can be opened on a conversation that is mid-turn.
+   */
+  onTree: ((session: number) => Promise<TreeRead>) | null = null
+  /**
+   * Every file this conversation's turns touched, grouped by turn.
+   *
+   * Read-only, and both transports call the same engine function, so a phone and a desktop read one
+   * answer to "what did this conversation write".
+   */
+  onLedger: ((session: number) => Promise<LedgerRead>) | null = null
+  /** What this conversation's copies cost: deduped blobs, shared blobs, and orphan bytes. */
+  onLedgerStats: ((session: number) => Promise<SnapshotStats>) | null = null
+  /** One stored copy against the bytes on disk now, named by index row rather than by path. */
+  onFileDiff: ((q: FileDiffReq) => Promise<FileDiffRead>) | null = null
+  /** Drop this conversation's snapshots. Drive-side: it deletes files. */
+  onForgetCopies: ((session: number, shown: number) => Promise<ForgetCopiesOut>) | null = null
+  /**
+   * Leave the leaf on one node: the record's leaf and the model's own memory move together.
+   *
+   * A phone reaches the same verb through the gateway, so both cores answer in their own terms and
+   * this card paints whichever sentence comes back.
+   */
+  onLeafMove: ((move: LeafMove) => Promise<LeafMoveOut>) | null = null
   /** Ask the engine what undoing this turn's files would do. Nothing is touched by this call. */
   onRevertPreview:
     | ((session: number, id: number, throughLatest: boolean) => Promise<RevertPreview>)
@@ -2554,6 +2797,20 @@ export class Transcript {
     if (id === null) branch.disabled = true
     branch.onclick = () => this.requestBranch(this.sessionId, id, 'user', text, branch)
 
+    // Tree next to Branch, because the two are the two ways a message can be the *end* of something
+    // rather than its middle: Branch opens a new conversation at this row, Tree moves this
+    // conversation's own leaf back here so the next answer reads up to it and nothing is deleted.
+    const tree = btn(
+      'treebtn',
+      'Tree',
+      id === null
+        ? 'Show the conversation\'s tree once this message is stored - a moment after the turn ends'
+        : 'Show this conversation\'s tree: where it was cut out of, what hangs off it, and which message the next answer reads through.',
+      iconTree(),
+    )
+    if (id === null) tree.disabled = true
+    tree.onclick = () => this.openTreeCard(this.sessionId, id, wrap)
+
     wrap.append(row)
   }
 
@@ -2887,12 +3144,17 @@ export class Transcript {
   // ---- produced files -----------------------------------------------------
 
   /**
-   * Files a turn wrote into the workspace, shown as clickable attachments.
-   * The path is workspace-relative and the shell re-validates it before
-   * opening anything, so a model-authored name cannot escape the workspace.
-   */
-  /**
    * Show the files this turn has produced.
+   *
+   * Three shapes, and the file's *location* picks the shape, never a label on the
+   * event: `.cws/assistant_attachments/` becomes the dashed hand-over unit with the
+   * Save control, a generated file in the person's own tree becomes an artifact chip,
+   * and everything the turn merely touched becomes a working chip (rolled into a count
+   * past a few). An earlier version of this comment called all of them "clickable
+   * attachments", and that is how a file the model wrote at the workspace root ended up
+   * wearing the delivery control - see `isAttachPath`. Paths are workspace-relative and
+   * the shell re-validates before opening anything, so a model-authored name cannot
+   * escape the workspace.
    *
    * The event carries the *cumulative* list and fires whenever a tool produces
    * something, so appending a row per event used to print the same file two and
@@ -3422,7 +3684,10 @@ export class Transcript {
     this.ensureTurn()
     for (const f of files) {
       const at = this.turnFiles.findIndex((e) => e.path === f.path)
-      if (at >= 0) this.turnFiles[at] = f
+      // Newest metadata, except for `created`: a turn that made a file and then rewrote it still
+      // made it, and the live path must not disagree with the record the same turn ends in
+      // (both cores keep the flag sticky for the same reason).
+      if (at >= 0) this.turnFiles[at] = { ...f, created: f.created || this.turnFiles[at].created }
       else this.turnFiles.push(f)
     }
     for (const el of this.fileEls) el.remove()
@@ -3456,33 +3721,89 @@ export class Transcript {
     // repository is dozens of files, and a strip of 38 chips used to bury the one
     // artifact in the turn. Below the threshold, chips are the right shape for changes
     // too — two edited files are worth seeing.
-    const deliverables0 = all.filter((f) => f.kind === 'artifact')
-    const attachments = all.filter((f) => f.kind === 'attachment')
+    // **The hand-over folder is the only place a file can be handed over from.** The engine's
+    // placement rule and `scratch::attachment_path` both test the path against
+    // `.cws/assistant_attachments/`, and the transcript now does the same: a row that *claims*
+    // `kind: 'attachment'` while sitting at the workspace root or loose inside `.cws/` gets no
+    // dashed unit and no Save control, because that control offers to copy a file nobody agreed to
+    // put in the hand-over folder — and on the desktop it would offer it and then be refused by the
+    // host. Rows are re-read from the record, so a session written before the placement rule was
+    // fixed keeps the claim it was given; the path is what decides here, not the label.
+    const claims = all.filter((f) => f.kind === 'attachment')
+    const attachments = claims.filter((f) => isAttachPath(f.path))
+    // What a mislabelled row really is, by where its bytes are: loose scratch under `.cws/`, or an
+    // ordinary file in the person's own folder. Same split `kind_for` makes, so a chip and a kind
+    // cannot disagree about the same file.
+    const misplaced = claims.filter((f) => !isAttachPath(f.path))
+    const deliverables0 = all.filter(
+      (f) => f.kind === 'artifact' || (misplaced.includes(f) && !isScratchPath(f.path)),
+    )
+    const reclassified = misplaced.filter((f) => isScratchPath(f.path))
+    // **A file this turn made is shown as a card; a file it changed is a chip in a list.**
+    // The fact comes from the tool rather than from a guess afterwards: `write_file` looks at the
+    // disk before it writes, and once the bytes are down there a created file and a replaced one
+    // are indistinguishable. `kind` alone cannot tell them apart — it says `edit` for both — which
+    // is exactly why a screenshot of a workspace-root file wearing a delivery control turned into
+    // an argument about borders: the row could not say "I made this", so the only signal the
+    // renderer had was a label.
+    //
+    // A card is not a delivery. The Save control is the delivery, and it appears only inside
+    // `.cws/assistant_attachments/` (see `isAttachPath`); a card without one opens the file where
+    // it sits and promises nothing past that.
+    //
+    // The cap is what keeps this a design instead of a wall: a turn that created a dozen files in
+    // a build is describing work, not handing things over, and those belong in the rolled working
+    // strip with the edits. One number, `ROLL_FILES_AT`, decides both halves, so the point where
+    // "a few things I made" becomes "a pile of work" is a single rule nobody has to re-derive.
+    const made0 = all.filter(
+      (f) =>
+        f.created === true &&
+        !attachments.includes(f) &&
+        !misplaced.includes(f) &&
+        (f as { kind?: string }).kind !== 'scratch',
+    )
+    const made = made0.length <= ROLL_FILES_AT ? made0 : []
     // One chip per file *name*. A turn that wrote `report.md` in the workspace and then handed a
     // copy over drew the same filename twice, once as a working chip and once as an attachment —
     // and the reader sees names, not paths, so that reads as a bug rather than as two files. The
     // hand-over copy wins, because it is the one the model wrote in order to give; the other is
     // still on disk where the tooltip says.
-    const given = new Set(attachments.map((f) => f.name))
+    const given = new Set([...attachments, ...made].map((f) => f.name))
     const deliverables = deliverables0.filter((f) => !given.has(f.name))
     // A file the model fetched for itself landed under .cws/ on purpose, so the
     // transcript does not present it as something the person asked for. It is
     // still one click away — hidden is not the same as gone, and a file the model
     // read should be checkable by the person who was told about it.
-    const scratch = all.filter((f) => (f as { kind?: string }).kind === 'scratch' && !given.has(f.name))
+    const scratch = all.filter(
+      (f) =>
+        ((f as { kind?: string }).kind === 'scratch' || reclassified.includes(f)) &&
+        !given.has(f.name),
+    )
     const changes = all.filter(
       (f) =>
         f.kind !== 'artifact' &&
         f.kind !== 'attachment' &&
         (f as { kind?: string }).kind !== 'scratch' &&
+        !made.includes(f) &&
         !given.has(f.name),
     )
+    if (misplaced.length) {
+      // Said out loud rather than quietly re-sorted: a turn that shows a file the host will not
+      // hand over is a claim the record made, and the reader deserves to know which of the two is
+      // wrong. One line per turn, and it names the paths.
+      const line = this.el('attach-note')
+      line.textContent = `${misplaced.length} file(s) in this turn are outside .cws/assistant_attachments/, so nothing here is offered for saving: ${misplaced
+        .map((f) => f.path)
+        .join(', ')}`
+      row.append(line)
+    }
     // Attachments on their own line, against the right edge of the column. They are the files the
     // model wrote *to hand over*, and they are read differently from the working strip: the strip
     // says what the turn touched (left, under the prose, in the order it touched them), the line
     // says what it made for you. Sharing one left-aligned row made a deliverable look like one more
     // file it edited - which is how a person ends up hunting for the thing they came back to fetch.
-    for (const f of attachments) line.append(this.attachmentUnit(f))
+    for (const f of attachments) line.append(this.attachmentUnit(f, true))
+    for (const f of made) line.append(this.attachmentUnit(f, false))
     for (const f of deliverables) row.append(this.fileChip(f))
     if (scratch.length) row.append(this.scratchGroup(scratch))
     if (changes.length <= ROLL_FILES_AT) {
@@ -3504,8 +3825,12 @@ export class Transcript {
    * and does not try: it asks the shell, which on the desktop opens a save dialog and
    * on a browser tab downloads.
    */
-  private attachmentUnit(f: OutputFile & { writes?: number }): HTMLElement {
+  private attachmentUnit(f: OutputFile & { writes?: number }, handover: boolean): HTMLElement {
     const unit = this.el('attachunit')
+    // Graded, and readable with the tooltip closed: the control is the whole difference between
+    // "the model put this where it can be copied out" and "the model made this, here".
+    unit.dataset.handover = handover ? 'yes' : 'no'
+    if (!handover) unit.classList.add('made')
     // A file the model meant you to have — and say where it is, rather than drawing a box
     // around it. The folder starts with a dot, so no file manager, screenshot or listing shows
     // it: a solid border promises a container that is not there, and a second box inside a box
@@ -3517,6 +3842,14 @@ export class Transcript {
     // The save control is an icon, like every other action on a block: the row is one line tall and
     // the filename is the thing that has to stay readable. What it does, and what just happened,
     // live in `title` and `aria-label` - a name in those costs no pixels and is still announced.
+    if (!handover) {
+      // No control at all rather than a disabled one: a greyed-out Save is still a promise the
+      // host refuses, which is the shape this rule exists to stop. The chip is already in the
+      // unit, and so is the "written N times" title when there was one; otherwise the tooltip
+      // names the path clicking opens, because that is all a card like this offers.
+      if (!(f.writes && f.writes > 1)) unit.title = `Open ${f.path}`
+      return unit
+    }
     const idle = `Save ${f.name} (${fmtSize(f.bytes)}) wherever you choose`
     const btn = this.btn('attach-save', '')
     btn.innerHTML = actIcon('download', 13)
@@ -3732,7 +4065,433 @@ export class Transcript {
     )
     if (rowId === null) undo.disabled = true
     undo.onclick = () => this.openRevertCard(rowId, row)
+
+    // The tree control is on an answer too, because standing at an answer is the common case: the
+    // turn after it is the one you want to take back, and its ask is still in the record.
+    const tree = btn(
+      'treebtn',
+      'Tree',
+      rowId === null
+        ? 'Show the conversation\'s tree once this answer is stored - a moment after the turn ends'
+        : 'Show this conversation\'s tree: where it was cut out of, what hangs off it, and which message the next answer reads through.',
+      iconTree(),
+    )
+    if (rowId === null) tree.disabled = true
+    tree.onclick = () => this.openTreeCard(this.sessionId, rowId, row)
+
+    // Files, next to the undo it belongs to. `Undo files` answers one question - put this turn's
+    // files back - and this answers the other: what has this conversation written at all. That is
+    // the question a person asks when they are not undoing anything, and until now nothing on the
+    // screen could answer it. It is a read, so it opens mid-turn; the half that deletes files is a
+    // button inside it, and refuses mid-turn.
+    const files = btn(
+      'filesbtn',
+      'Files',
+      rowId === null
+        ? 'Show this conversation\'s files once this answer is stored - a moment after the turn ends'
+        : 'Show every file this conversation\'s turns touched, what each turn did to it, and what can still be put back.',
+      iconFiles(),
+    )
+    if (rowId === null) files.disabled = true
+    files.onclick = () => this.openLedgerCard(this.sessionId, rowId, row)
     return row
+  }
+
+  /**
+   * The tree of one conversation: where it was cut out of, what hangs off it, and which message the
+   * next answer reads through.
+   *
+   * A card rather than a dialog, for the reason the revert card is one: the question is about the
+   * turn it was opened from, and a person answering it needs that turn on screen while they read.
+   *
+   * It is a read, not an action, so it opens mid-turn too — moving the leaf is what refuses, and the
+   * button on each node is the thing that carries that refusal.
+   */
+  private openTreeCard(session: number, rowId: number | null, anchor: HTMLElement) {
+    if (!this.onTree || !this.onLeafMove) {
+      this.onToast?.('the conversation tree is not available on this connection', true)
+      return
+    }
+    if (rowId === null) {
+      this.onToast?.('this message is not stored yet - the tree can name it once the turn has landed', true)
+      return
+    }
+    const turn = anchor.closest('.turn') as HTMLElement | null
+    const host = turn ?? anchor
+    const old = host.querySelector('.tree-card')
+    if (old) old.remove()
+
+    const card = this.el('tree-card')
+    card.dataset.row = String(rowId)
+    const head = this.el('tree-h', 'Tree')
+    const said = this.el('tree-said')
+    const fam = this.el('tree-fam')
+    const nodes = this.el('tree-nodes')
+    const piLine = this.el('tree-pi')
+    const drift = this.el('tree-drift')
+    const acts = this.el('tree-acts')
+    const close = this.btn('tree-close', 'Close')
+    close.onclick = () => card.remove()
+    acts.append(close)
+    card.append(head, said, fam, nodes, piLine, drift, acts)
+    host.append(card)
+
+    const paint = (t: TreeRead) => {
+      said.textContent = t.note
+      fam.textContent = ''
+      for (const c of t.lineage) {
+        const li = this.el('tree-convo')
+        li.style.setProperty('--depth', String(c.depth))
+        if (c.current) li.dataset.cur = '1'
+        li.append(this.el('tree-convo-t', c.title))
+        if (c.current) li.append(this.el('tree-flag', 'this conversation'))
+        if (c.parent_gone) li.append(this.el('tree-flag', 'cut out of a conversation that was deleted'))
+        if (c.branch_role === 'user') li.append(this.el('tree-cut', `cut from your message: “${c.branch_quote}”`))
+        else if (c.branch_role === 'assistant')
+          li.append(this.el('tree-cut', `cut from an answer: “${c.branch_quote}”`))
+        li.append(this.el('tree-count', `${c.rows} row${c.rows === 1 ? '' : 's'}${c.children ? ` · ${c.children} branch${c.children === 1 ? '' : 'es'}` : ''}${c.off_branch ? ` · ${c.off_branch} not being read` : ''}`))
+        fam.append(li)
+      }
+      nodes.textContent = ''
+      for (const n of t.nodes) {
+        const li = this.el('tree-node')
+        li.style.setProperty('--depth', String(n.depth))
+        if (n.current) li.dataset.cur = '1'
+        if (!n.on_branch) li.dataset.off = '1'
+        if (n.drift) li.dataset.drift = '1'
+        li.append(this.el('tree-role', n.role === 'user' ? 'you' : n.role === 'assistant' ? 'answer' : n.role))
+        li.append(this.el('tree-quote', n.quote))
+        if (n.current) li.append(this.el('tree-flag', 'read through'))
+        else if (!n.on_branch) li.append(this.el('tree-flag', 'on a branch not being read'))
+        if (n.pi_current && !n.current && (n.row !== null || this.speaks(n)))
+          li.append(this.el('tree-flag', "pi's thread reads through here, not the record"))
+        if (n.drift) li.append(this.el('tree-flag', 'the two records disagree'))
+        if (n.row === null) {
+          // A node pi's thread has and the record does not answer to. There is nothing to press:
+          // moving the leaf is a move onto a row of the record, and a button that addressed an entry
+          // id the engine cannot resolve would be a control that lies about what it does.
+          li.append(this.el('tree-only', this.piOnlyNote(n)))
+        } else {
+          const go = this.btn('tree-go', n.current ? 'Already read' : 'Read from here')
+          go.disabled = n.current
+          go.title =
+            (n.role === 'user'
+              ? 'Stand here: the next answer reads up to this message and not past it, and these words come back for you to send again.'
+              : 'Stand here: the next answer reads up to and including this answer, and your next message joins it.') +
+            ' Nothing is deleted - the messages past here stay in the conversation, on a branch that is not being read.'
+          go.onclick = () => {
+            if (go.dataset.busy) return
+            go.dataset.busy = '1'
+            go.disabled = true
+            void Promise.resolve(
+              this.onLeafMove!({ session, id: n.row!, role: n.role as 'user' | 'assistant', shown: n.content }),
+            )
+              .then(async (out) => {
+                this.onToast?.(out.note)
+                // Repaint from the record rather than from what this click assumed: the leaf moved,
+                // and the conversation may now be reading a different path than the one painted.
+                const again = await this.onTree!(session)
+                paint(again)
+              })
+              .catch((e) => {
+                this.onToast?.(`the leaf did not move: ${e}`, true)
+                go.disabled = false
+              })
+              .finally(() => {
+                delete go.dataset.busy
+              })
+          }
+          li.append(go)
+        }
+        nodes.append(li)
+      }
+      if (t.nodes_hidden > 0) {
+        nodes.append(
+          this.el(
+            'tree-more',
+            `${t.nodes_hidden} node${t.nodes_hidden === 1 ? '' : 's'} on branches that are not being `
+              + 'read are not listed here.',
+          ),
+        )
+      }
+      piLine.textContent = t.pi.consulted
+        ? `the model's own thread: ${t.pi.entries} entries, reading through ${t.pi.leaf_entry ?? 'nothing'}, in ${t.pi.file}`
+        : t.pi.why
+      drift.textContent = ''
+      for (const d of t.drift) drift.append(this.el('tree-drift-l', d))
+      if (t.drift_count > t.drift.length) {
+        drift.append(this.el('tree-drift-l', `${t.drift_count - t.drift.length} more the two records do not answer to each other`))
+      }
+      drift.style.display = t.drift.length ? '' : 'none'
+    }
+
+    said.textContent = 'reading the tree…'
+    void this.onTree(session)
+      .then(paint)
+      .catch((e) => {
+        said.textContent = String(e)
+      })
+  }
+
+  /**
+   * Open the tree card for the conversation on screen from somewhere that is not a message row —
+   * the sidebar's row menu, which is where a person goes when they want the conversation rather than
+   * one message of it.
+   *
+   * It presses the card's own control rather than building a second card: two ways to open the same
+   * tree is two ways for the two to disagree about what is current.
+   */
+  showTree(): boolean {
+    if (!this.onTree || !this.onLeafMove) {
+      this.onToast?.('the conversation tree is not available on this connection', true)
+      return false
+    }
+    const buttons = [
+      ...this.root.querySelectorAll('.blk-user .user-acts .tact.treebtn, .turn .tacts .tact.treebtn'),
+    ] as HTMLButtonElement[]
+    // The newest stored row, which is what the conversation is reading from unless the leaf moved.
+    const live = buttons.reverse().find((b) => !b.disabled)
+    if (!live) {
+      this.onToast?.('nothing on this screen is stored yet, so the tree has nothing to name', true)
+      return false
+    }
+    live.click()
+    return true
+  }
+
+  /** Why a node has no button on it, in the terms of the core that reported it. */
+  /** Is this node something a person said or the model answered, as opposed to pi's own writing? */
+  private speaks(n: TreePoint): boolean {
+    // The record stores messages, answers and tool results. pi's own prompt and its bookkeeping are
+    // not messages of the conversation, and saying the record is missing one of those would be a wolf.
+    return ['user', 'assistant', 'toolResult', 'tool'].includes(n.role)
+  }
+
+  private piOnlyNote(n: TreePoint): string {
+    if (n.pi_current)
+      return this.speaks(n)
+        ? "this is where pi's thread is, and the record has no row for it - there is nothing to stand on"
+        : "pi's thread ends here, on its own bookkeeping - it is reading no message of this conversation"
+    return n.on_branch
+      ? 'an entry of the model\'s thread the record has no row for - there is nothing to stand on'
+      : 'an entry of the model\'s thread, on a branch the record is not reading'
+  }
+
+  /**
+   * Every file this conversation wrote, in one card.
+   *
+   * A card rather than a dialog, for the reason the revert card is one: the question is about the
+   * turn it was opened from, and the answer is only worth reading next to it. The diff is drawn in
+   * the same surface the tool card uses, so one file has one way to be shown.
+   *
+   * Reading it changes nothing, so it opens mid-turn. The one control in it that deletes files
+   * refuses mid-turn, and says so on the button rather than after the press.
+   */
+  private openLedgerCard(session: number, rowId: number | null, anchor: HTMLElement) {
+    if (!this.onLedger || !this.onFileDiff) {
+      this.onToast?.('the file ledger is not available on this connection', true)
+      return
+    }
+    if (rowId === null) {
+      this.onToast?.('this turn is not stored yet - the file record names it a moment later', true)
+      return
+    }
+    const turn = anchor.closest('.turn') as HTMLElement | null
+    const host = turn ?? anchor
+    const old = host.querySelector('.ledger-card')
+    if (old) old.remove()
+
+    const card = this.el('ledger-card')
+    card.dataset.row = String(rowId)
+    const head = this.el('ledger-h', 'Files')
+    const said = this.el('ledger-said')
+    const turns = this.el('ledger-turns')
+    const paths = this.el('ledger-paths')
+    const stats = this.el('ledger-stats')
+    const prunes = this.el('ledger-prunes')
+    const surface = this.el('ledger-surface')
+    const acts = this.el('ledger-acts')
+    const forget = this.btn('ledger-forget', 'Forget copies')
+    // A control that deletes files has to say whether this connection can do it. The desktop and the
+    // gateway both answer `forget_copies`; a client that never wired the hook gets an inert button
+    // naming that, not a button that swallows the press.
+    if (!this.onForgetCopies) {
+      forget.disabled = true
+      forget.title =
+        "Deleting this conversation's copies is not available on this connection - the copies stay where they are"
+    }
+    const close = this.btn('ledger-close', 'Close')
+    close.onclick = () => card.remove()
+    acts.append(forget, close)
+    card.append(head, said, turns, paths, stats, prunes, surface, acts)
+    host.append(card)
+
+    let read: LedgerRead | null = null
+
+    const paintDiff = (d: FileDiffRead) => {
+      surface.textContent = ''
+      const line = this.el('ledger-diff-h')
+      const sides =
+        d.kind === 'created'
+          ? 'written by this turn, so there is no earlier copy'
+          : d.stored_present
+            ? `the copy this app took (${d.stored_bytes} B) against ${d.live_exists ? 'the file on disk' : 'nothing: the file is gone'}`
+            : `no copy was kept, so only the live side exists${d.live_exists ? ` (${d.live_bytes} B on disk)` : ': the file is gone'}`
+      line.textContent = `${d.path} · ${sides} · +${d.added} -${d.removed}`
+      surface.append(line)
+      if (d.diff) {
+        const pre = this.el('tool-diff')
+        for (const l of d.diff.split('\n')) {
+          if (!l) continue
+          const cls = l.startsWith('@@')
+            ? 'diff-hunk'
+            : l.startsWith('+++') || l.startsWith('---')
+              ? 'diff-file'
+              : l.startsWith('+')
+                ? 'diff-add'
+                : l.startsWith('-')
+                  ? 'diff-del'
+                  : 'diff-ctx'
+          pre.append(this.el(`diff-line ${cls}`, l))
+        }
+        surface.append(pre)
+      }
+      surface.append(this.el('ledger-diff-note', d.note))
+    }
+
+    const paint = (l: LedgerRead) => {
+      read = l
+      said.textContent = l.note
+      turns.textContent = ''
+      for (const t of l.turns) {
+        const li = this.el('ledger-turn')
+        li.dataset.turn = String(t.turn)
+        const h = this.el('ledger-turn-h')
+        h.textContent = `turn ${t.turn} - ${t.files} file${t.files === 1 ? '' : 's'}` +
+          (t.latest ? ' (the newest turn that wrote files)' : '')
+        li.append(h)
+        li.append(this.el('ledger-turn-note', t.note))
+        for (const f of t.file_rows) {
+          const row = this.el('ledger-file')
+          row.dataset.kind = f.kind
+          row.dataset.checkpoint = String(f.checkpoint)
+          row.append(this.el('ledger-path', f.path))
+          row.append(this.el('ledger-kind', f.kind))
+          if (f.edited_since) row.append(this.el('ledger-flag', 'edited since'))
+          if (f.path_missing) row.append(this.el('ledger-flag', 'file is gone'))
+          if (!f.can_revert) row.append(this.el('ledger-flag', 'no revert'))
+          row.append(this.el('ledger-says', f.says))
+          // A diff needs two sides. A stored copy against no live file is still a comparison —
+          // "this is what the turn took, and the file is gone" — but a file this turn *created*
+          // has no earlier bytes, and printing its live content as a diff would read as every line
+          // being added by somebody. Those rows carry no button; their `says` line already names
+          // what a revert would do.
+          if (f.copy_present) {
+            const d = this.btn('ledger-diff-btn', 'Diff')
+            d.title = 'Compare the copy this app took with the bytes on disk now.'
+            d.onclick = () => {
+              if (d.dataset.busy) return
+              d.dataset.busy = '1'
+              d.disabled = true
+              void this
+                .onFileDiff!({ session, checkpoint: f.checkpoint, shown: f.path })
+                .then(paintDiff)
+                .catch((e) => {
+                  surface.textContent = ''
+                  surface.append(this.el('ledger-diff-note', String(e)))
+                })
+                .finally(() => {
+                  delete d.dataset.busy
+                  d.disabled = false
+                })
+            }
+            row.append(d)
+          }
+          li.append(row)
+        }
+        turns.append(li)
+      }
+      paths.textContent = ''
+      if (l.paths.length) {
+        paths.append(this.el('ledger-paths-h', `${l.paths_total} path${l.paths_total === 1 ? '' : 's'} in this conversation`))
+        for (const p of l.paths) {
+          const li = this.el('ledger-pathline')
+          li.append(this.el('ledger-path', p.path))
+          li.append(this.el('ledger-kinds', p.kinds))
+          li.append(
+            this.el(
+              'ledger-live',
+              p.live_exists ? `on disk: ${p.live_bytes} B` : 'not in the folder now',
+            ),
+          )
+          paths.append(li)
+        }
+        if (l.paths_hidden > 0)
+          paths.append(this.el('ledger-more', `${l.paths_hidden} path${l.paths_hidden === 1 ? '' : 's'} not listed on this card`))
+      }
+      prunes.textContent = ''
+      for (const n of l.prune_notes) prunes.append(this.el('ledger-prune', n))
+      forget.textContent = labelFor(l.files_total)
+      forget.disabled = l.files_total === 0
+      delete forget.dataset.armed
+    }
+
+    const askStats = () => {
+      if (!this.onLedgerStats) return
+      void this.onLedgerStats(session)
+        .then((s) => {
+          stats.textContent = s.note
+        })
+        .catch((e) => {
+          stats.textContent = String(e)
+        })
+    }
+
+    void this
+      .onLedger(session)
+      .then((l) => {
+        paint(l)
+        askStats()
+      })
+      .catch((e) => {
+        said.textContent = String(e)
+        forget.disabled = true
+      })
+
+    const labelFor = (n: number) =>
+      n === 0 ? 'Nothing to forget' : `Forget ${n} cop${n === 1 ? 'y' : 'ies'} of this conversation`
+
+    forget.onclick = () => {
+      if (!read || !this.onForgetCopies) return
+      // The count is taken from what the card just read, not from what this window assumed: the
+      // engine compares the number against its own rows before it deletes anything.
+      const count = read.files_total
+      if (!forget.dataset.armed) {
+        // Two presses, because this deletes files. The first says what the second will do.
+        forget.dataset.armed = '1'
+        forget.textContent = `Press again to delete ${count} cop${count === 1 ? 'y' : 'ies'}`
+        return
+      }
+      forget.disabled = true
+      void this
+        .onForgetCopies(session, count)
+        .then((out) => {
+          this.onToast?.(out.note)
+          delete forget.dataset.armed
+          forget.textContent = 'Copies forgotten'
+          // Repaint from the record: the rows are gone, and a card still listing them is a list of
+          // files that no longer exist.
+          void this.onLedger!(session).then(paint).catch((e) => {
+            said.textContent = String(e)
+          })
+        })
+        .catch((e) => {
+          this.onToast?.(`nothing was forgotten: ${e}`, true)
+          delete forget.dataset.armed
+          forget.disabled = false
+          forget.textContent = labelFor(count)
+        })
+    }
   }
 
   /**
@@ -4382,6 +5141,43 @@ export class Transcript {
  * the same turn (an artifact, always shown as its own chip) disappears.
  */
 const ROLL_FILES_AT = 4
+
+/**
+ * The hand-over folder, spelled the way the engine spells it (`scratch::attach_prefix`).
+ *
+ * Three places test a path against it — the engine's placement rule when it writes, the host when
+ * it copies a file somewhere the person picked, and the transcript when it decides what shape a
+ * file row takes. The transcript's half used to be "the row says `kind: 'attachment'`", which made
+ * the *label* the authority: a download with `place: "attach"` and a workspace-root `path` was
+ * labelled an attachment while its bytes sat outside the folder, and the dashed unit offered to
+ * Save a file the host would then refuse to hand over. The path is the fact; the kind is a
+ * description of it.
+ */
+const SCRATCH_DIR = '.cws'
+const ATTACH_DIR = 'assistant_attachments'
+
+/**
+ * Whether a stored path sits in the hand-over folder, decided the way `kind_for` decides it: the
+ * two components next to each other, `.cws` then `assistant_attachments`.
+ *
+ * A prefix test would be a second, weaker rule. It would miss an absolute path (`/work/.cws/…`,
+ * which is how a fixture and an out-of-workspace row are spelled) and, worse, a *substring* test
+ * would call somebody's repository folder `src/assistant_attachments/x` a hand-over file — the same
+ * mistake the engine's comment names: a directory of source files presented as hand-over material.
+ */
+function isAttachPath(path: string): boolean {
+  const parts = (path ?? '').trim().replace(/^\.\//, '').split('/')
+  for (let i = 1; i < parts.length; i++) {
+    if (parts[i] === ATTACH_DIR && parts[i - 1] === SCRATCH_DIR) return true
+  }
+  return false
+}
+
+/** Anything under `.cws/` that is not the hand-over folder is the model's own working material. */
+function isScratchPath(path: string): boolean {
+  const parts = (path ?? '').trim().replace(/^\.\//, '').split('/')
+  return parts.includes(SCRATCH_DIR)
+}
 
 /**
  * How many app announcements stay attachable to a transcript. Enough that the

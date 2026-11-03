@@ -66,6 +66,14 @@ pub struct Output {
     pub checkpoints_by_call: Vec<(String, Vec<cwoffee_engine::checkpoint::Mark>)>,
     /// True when this record began a compaction, so the host can count them.
     pub compaction_start: bool,
+    /// pi's queue as `queue_update` described it: the complete steering list and the complete
+    /// follow-up list, text only. pi names no ids, so this is a snapshot of *words*, and the bridge
+    /// reconciles it against the ids cwoffee assigned.
+    pub queue: Option<(Vec<String>, Vec<String>)>,
+    /// cwoffee ids of queued messages whose text arrived as a user record — pi delivered them, so
+    /// the host stops listing them as pending. The row itself travels in `rows`, stamped with the
+    /// time the person typed it.
+    pub landed: Vec<u64>,
     /// Context size as of the last assistant message, in tokens: input + cached,
     /// because that is what the window is actually holding.
     pub context_tokens: Option<usize>,
@@ -172,11 +180,26 @@ pub struct Translator {
     pub iter_cap: usize,
     /// The note is said once per run, not once per call.
     soft_note_sent: bool,
+    /// What cwoffee has queued for this conversation, in typing order: the mirror the host keeps
+    /// (ids and kinds are ours — pi's queue carries only text) plus the items pi has just handed to
+    /// the run. A user record whose text matches one of these is a **landing**, and this is the only
+    /// place on this core where the receipt can name the id and the promise the person typed.
+    pub pending: Vec<cwoffee_engine::steer::View>,
+    /// Assistant messages closed in the current run. "Step 3" is counted from here: the request that
+    /// carries a steer is the one after the round-trip that finished.
+    round_trips: usize,
 }
 
 impl Translator {
     pub fn running(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// The round-trip the next request is, counted from the start of this turn. Quoted in the
+    /// landing receipt so "it went in at step 2" is a claim about a request rather than about
+    /// somebody's attention.
+    pub fn step(&self) -> usize {
+        self.round_trips + 1
     }
 
     /// What the host is about to send. Set before the prompt, consumed by the
@@ -330,7 +353,10 @@ impl Translator {
                 }
                 None => {}
             },
-            "queue_update" | "ping" | "pong" | "mcp_update" => {}
+            "queue_update" => {
+                out.queue = Some(queue_texts(rec));
+            }
+            "ping" | "pong" | "mcp_update" => {}
             _ => {
                 *self.unknown.entry(kind).or_insert(0) += 1;
             }
@@ -389,6 +415,7 @@ impl Translator {
         self.soft_note_sent = false;
         self.pending_error = None;
         self.retry_attempts = 0;
+        self.round_trips = 0;
         if self.run.is_some() {
             // A steer or follow-up can restart the agent inside one run; the turn
             // is already open and stays open.
@@ -502,6 +529,28 @@ impl Translator {
                     self.skip_user_row = false;
                     let _ = &m;
                 } else {
+                    // A user record that is not our own prompt echoed back is a mid-turn message
+                    // pi delivered. It becomes its own row, stamped when it was typed, and the
+                    // receipt says which round-trip carries it — the same sentence the Rust core
+                    // prints for the same gesture, because one gesture cannot have two explanations.
+                    if let Some(at) = self.pending.iter().position(|v| v.text == m.content) {
+                        let v = self.pending.remove(at);
+                        m.sent_at = Some(v.typed_at);
+                        out.landed.push(v.id);
+                        out.events.push(EngineEvent::SteerLanded {
+                            id: v.id,
+                            session: self.session,
+                            kind: v.kind,
+                            text: v.text.clone(),
+                            typed_at: v.typed_at,
+                            turn_id: self.turn_id,
+                            step: self.step(),
+                        });
+                        out.events.push(EngineEvent::Note {
+                            session: Some(self.session),
+                            message: cwoffee_engine::steer::landing_note(v.kind, self.step()),
+                        });
+                    }
                     out.rows.push(m);
                 }
             }
@@ -570,6 +619,7 @@ impl Translator {
                 if let Some(r) = self.run.as_mut() {
                     r.context_tokens = msg.get("usage").and_then(used_tokens);
                 }
+                self.round_trips += 1;
                 out.rows.push(m);
             }
             "toolResult" => {
@@ -1075,6 +1125,20 @@ fn s(rec: &Value, key: &str) -> Option<String> {
     rec.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
+/// A `queue_update` record as two lists of text: what is queued for this turn's next step, and
+/// what is queued for after it. pi sends the **complete** queue each time, which is what makes a
+/// snapshot safe to reconcile against: a client that missed an event cannot keep a line for a
+/// message that is no longer waiting.
+fn queue_texts(rec: &Value) -> (Vec<String>, Vec<String>) {
+    let read = |key: &str| {
+        rec.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    (read("steering"), read("followUp"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1145,5 +1209,193 @@ mod tests {
         r.chars += 8;
         mark_first(&mut r, t0 + Duration::from_millis(4200));
         assert_eq!(r.gen_ms, 150, "window was {} ms with a 4 s dialog inside it", r.gen_ms);
+    }
+
+    // ---- mid-turn steering, on pi's records -------------------------------------------
+
+    fn view(id: u64, kind: cwoffee_engine::steer::MidTurn, text: &str, typed_at: i64) -> cwoffee_engine::steer::View {
+        cwoffee_engine::steer::View {
+            id,
+            text: text.into(),
+            kind,
+            typed_at,
+            session: 7,
+            attachments: 0,
+            label: kind.label().to_string(),
+            note: kind.pending_note().to_string(),
+        }
+    }
+
+    /// `queue_update` used to be swallowed with the pings, which is how pi's own queue
+    /// capability stayed invisible: the UI had nothing to paint, so a message typed during a turn
+    /// looked like a lost keystroke.
+    #[test]
+    fn a_queue_update_reports_both_lists_and_is_not_swallowed_with_the_pings() {
+        let mut t = Translator::default();
+        let rec = serde_json::json!({
+            "type": "queue_update",
+            "steering": ["change direction"],
+            "followUp": ["summarise when finished"],
+        });
+        let out = t.on_record(&rec, Instant::now());
+        let (steer, follow) = out.queue.expect("the queue update was thrown away");
+        assert_eq!(steer, vec!["change direction".to_string()]);
+        assert_eq!(follow, vec!["summarise when finished".to_string()]);
+        assert!(t.unknown.is_empty(), "an unmapped record counted as unknown: {:?}", t.unknown);
+    }
+
+    /// A queue pi says is empty must read as empty, not as "no such record".
+    #[test]
+    fn an_empty_queue_is_an_empty_list_not_a_missing_one() {
+        let mut t = Translator::default();
+        let out = t.on_record(&serde_json::json!({ "type": "queue_update", "steering": [], "followUp": [] }), Instant::now());
+        let (steer, follow) = out.queue.expect("an empty queue should still be a snapshot");
+        assert!(steer.is_empty() && follow.is_empty());
+    }
+
+    /// pi hands the queued text to the run as a user record. That is the moment the message is in
+    /// the conversation: it becomes its own row, stamped when the person typed it, and the receipt
+    /// names the round-trip carrying it.
+    #[test]
+    fn a_delivered_steer_is_its_own_row_stamped_at_the_press_with_a_landing_receipt() {
+        let mut t = Translator::default();
+        t.session = 7;
+        t.pending = vec![view(3, cwoffee_engine::steer::MidTurn::Steer, "stop and do this instead", 1_700_000_500)];
+        // One assistant round-trip first, so "step 2" means something.
+        t.on_record(
+            &serde_json::json!({
+                "type": "agent_start",
+            }),
+            Instant::now(),
+        );
+        t.on_record(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "role": "assistant", "content": [{ "type": "text", "text": "working on it" }] },
+            }),
+            Instant::now(),
+        );
+        let out = t.on_record(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "stop and do this instead" }] },
+            }),
+            Instant::now(),
+        );
+
+        assert_eq!(out.rows.len(), 1, "the delivered steer did not become a row");
+        assert_eq!(out.rows[0].content, "stop and do this instead");
+        assert_eq!(out.rows[0].sent_at, Some(1_700_000_500), "the row is stamped when it landed, not when it was typed");
+        assert_eq!(out.landed, vec![3], "the host was not told to stop listing it as pending");
+        let landed = out
+            .events
+            .iter()
+            .find(|e| matches!(e, EngineEvent::SteerLanded { .. }))
+            .expect("no landing receipt on the pi core");
+        match landed {
+            EngineEvent::SteerLanded { id, kind, step, typed_at, turn_id, .. } => {
+                assert_eq!(*id, 3);
+                assert_eq!(*kind, cwoffee_engine::steer::MidTurn::Steer);
+                assert_eq!(*step, 2, "the steer landed on the round-trip after the one that finished");
+                assert_eq!(*typed_at, 1_700_000_500);
+                assert_eq!(*turn_id, 1);
+            }
+            _ => unreachable!(),
+        }
+        let note = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::Note { message, .. } if message.contains("went into this turn") => Some(message.clone()),
+                _ => None,
+            })
+            .expect("no receipt sentence");
+        assert!(note.contains("before the next request"), "{note}");
+        assert!(t.pending.is_empty(), "the translator still holds a message that has landed");
+    }
+
+    /// A follow-up is a different promise, so its receipt must not read like a steer's — and pi
+    /// delivers it after the run's pending work rather than at the next step.
+    #[test]
+    fn a_delivered_follow_up_is_receipted_as_a_follow_up() {
+        let mut t = Translator::default();
+        t.session = 7;
+        t.pending = vec![view(9, cwoffee_engine::steer::MidTurn::FollowUp, "also summarise it", 1_700_000_600)];
+        t.on_record(&serde_json::json!({ "type": "agent_start" }), Instant::now());
+        let out = t.on_record(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "also summarise it" }] },
+            }),
+            Instant::now(),
+        );
+        assert_eq!(out.rows[0].sent_at, Some(1_700_000_600));
+        let landed = out.events.iter().find(|e| matches!(e, EngineEvent::SteerLanded { .. })).expect("no landing receipt");
+        match landed {
+            EngineEvent::SteerLanded { kind, step, .. } => {
+                assert_eq!(*kind, cwoffee_engine::steer::MidTurn::FollowUp);
+                assert_eq!(*step, 1, "nothing had closed yet: the follow-up is asked on the next request");
+            }
+            _ => unreachable!(),
+        }
+        let note = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::Note { message, .. } if message.contains("asked after this turn") => Some(message.clone()),
+                _ => None,
+            })
+            .expect("no follow-up receipt");
+        assert!(!note.contains("into this turn"), "a follow-up worded like a steer: {note}");
+    }
+
+    /// Our own prompt echoed back is not a landing: pi repeats the message it was given, and the
+    /// host already stored that row. Reporting it as a steer would put a receipt on the person's
+    /// own send and, worse, drop the pending line for a message that never queued.
+    #[test]
+    fn the_echo_of_our_own_prompt_is_not_reported_as_a_landing() {
+        let mut t = Translator::default();
+        t.session = 7;
+        t.pending = vec![view(4, cwoffee_engine::steer::MidTurn::Steer, "the thing I just sent", 1_700_000_700)];
+        t.on_record(&serde_json::json!({ "type": "agent_start" }), Instant::now());
+        t.expect_attachments(vec![cwoffee_engine::provider::Attachment {
+            mime: "image/png".into(),
+            data_b64: "AA==".into(),
+            name: Some("p.png".into()),
+        }]);
+        t.store_user_early(&[]);
+        let out = t.on_record(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "the thing I just sent" }] },
+            }),
+            Instant::now(),
+        );
+        assert!(out.rows.is_empty(), "the echo was written as a second row");
+        assert!(
+            !out.events.iter().any(|e| matches!(e, EngineEvent::SteerLanded { .. })),
+            "the echo was reported as a mid-turn landing"
+        );
+        assert_eq!(out.landed, Vec::<u64>::new());
+        assert_eq!(t.pending.len(), 1, "an echo consumed a queued item that is still waiting");
+    }
+
+    /// A user row nobody queued is somebody else's message (an extension's, a resumed thread's).
+    /// It stays a row, and no receipt is invented for it.
+    #[test]
+    fn a_user_row_nobody_queued_is_a_row_and_no_receipt() {
+        let mut t = Translator::default();
+        t.session = 7;
+        t.on_record(&serde_json::json!({ "type": "agent_start" }), Instant::now());
+        let out = t.on_record(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "from pi itself" }] },
+            }),
+            Instant::now(),
+        );
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].sent_at, None, "a row nobody typed mid-turn carries a mid-turn stamp");
+        assert!(!out.events.iter().any(|e| matches!(e, EngineEvent::SteerLanded { .. })));
     }
 }

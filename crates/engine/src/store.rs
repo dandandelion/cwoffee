@@ -69,7 +69,19 @@ impl From<rusqlite::Error> for StoreError {
 // survives restarts. `checkpoint_prunes` records eviction under the per-conversation cap, so
 // the transcript can say "older snapshots were pruned" instead of offering fewer reverts and
 // not explaining why.
-const SCHEMA_VERSION: i64 = 15;
+// v16: lineage. Branching made a second conversation out of part of one, and nothing recorded
+// which row came from which or where the cut was made — the sidebar showed a branch as an
+// unrelated row, and `get_tree` on the pi core was read for nothing but a leaf id. Four columns
+// on the session (`parent`, `branch_role`, `branch_row`, `leaf_row`) and one on the message
+// (`parent_row`), so a conversation is a **tree of rows** in both cores and one tree is readable
+// whichever core made the branch. `parent_row` defaults to NULL, which is read as "the row before
+// it" — the rule every pre-v16 database already lived by — so an old store reads unchanged.
+// v17: why a copy is gone. `checkpoint_prunes` recorded only the per-conversation cap, and the
+// ledger adds a second way copies leave — a person forgetting them on request. Summing every
+// notice and printing "discarded to stay under the limit" would be a sentence about a limit that
+// nobody reached, so each notice now says which of the two it is, and the revert card's count
+// stays the cap's own.
+const SCHEMA_VERSION: i64 = 17;
 
 /// A workspace the user has registered (or that holds sessions).
 /// How many conversations one folder can be asked for at a time. See
@@ -117,6 +129,68 @@ pub struct Session {
     /// that quietly lost its network reach.
     #[serde(default)]
     pub web_on: bool,
+    /// The conversation this one was branched from. `None` means it is a **root** — a
+    /// conversation nobody cut out of another — which is a fact, not a missing value: a row
+    /// with no lineage renders as the start of its own tree.
+    #[serde(default)]
+    pub parent: Option<i64>,
+    /// Which kind of row the child was cut at (`user` / `assistant`, empty when there is no
+    /// parent). It decides what the branch point means: cut at one of the person's messages,
+    /// the branch holds what came *before* it; cut at an answer, the branch holds that answer.
+    #[serde(default)]
+    pub branch_role: String,
+    /// The parent's row the cut was made at. `None` with a parent means the branch was made
+    /// before this column existed, and the tree says so rather than guessing a row.
+    #[serde(default)]
+    pub branch_row: Option<i64>,
+    /// The node the next answer reads through — the leaf of this conversation's own row tree.
+    /// `None` means "the newest row", which is what every conversation this app has ever written
+    /// had. It moves on a leaf switch and advances on every send; it copies nothing and deletes
+    /// nothing, which is the whole difference between that and a rewind.
+    #[serde(default)]
+    pub leaf_row: Option<i64>,
+}
+
+/// The session row, in one place. Three readers (`session`, `list_sessions`, `sessions_in`) once
+/// spelled the same eleven columns separately, which meant a twelfth column — lineage — had to be
+/// added three times and could be added twice.
+const SESSION_SELECT: &str = "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at, \
+                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id), \
+                        s.persona, s.web_on, s.parent, s.branch_role, s.branch_row, s.leaf_row \
+                 FROM sessions s WHERE s.id = ?1";
+
+/// The same columns with the clause the caller supplies, so the window and the folder query
+/// cannot disagree about what a `Session` is made of.
+///
+/// A function rather than a `&str` template with a `{}` hole: `format!` needs a literal format
+/// string, and a constant holding one is exactly the drift this select exists to prevent — a query
+/// written inline somewhere else, missing the lineage columns, reading the same rows as a
+/// conversation with no parent.
+fn sessions_query(clause: &str) -> String {
+    format!(
+        "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at, \
+         (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id), \
+         s.persona, s.web_on, s.parent, s.branch_role, s.branch_row, s.leaf_row \
+         FROM sessions s {clause}"
+    )
+}
+
+fn session_from_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        workspace: r.get(2)?,
+        model: r.get(3)?,
+        created_at: r.get(4)?,
+        updated_at: r.get(5)?,
+        message_count: r.get(6)?,
+        persona: r.get(7)?,
+        web_on: r.get::<_, i64>(8)? != 0,
+        parent: r.get::<_, Option<i64>>(9)?,
+        branch_role: r.get::<_, String>(10)?,
+        branch_row: r.get::<_, Option<i64>>(11)?,
+        leaf_row: r.get::<_, Option<i64>>(12)?,
+    })
 }
 
 /// One checkpoint index row: a path a file call touched, and where its copy lives.
@@ -153,6 +227,11 @@ pub struct CheckpointPrune {
     pub session: i64,
     pub dropped: usize,
     pub note: String,
+    /// `cap` — the per-conversation limit evicted them — or `forget` — a person asked for
+    /// this conversation's copies to be dropped. The two read differently: one is a limit
+    /// the app enforced, the other is a decision the person made, and a card that mixed
+    /// them would tell someone their own request was an eviction.
+    pub reason: String,
     pub created_at: i64,
 }
 
@@ -266,6 +345,17 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// Raw connection, for this crate's own tests only.
+    ///
+    /// A pre-v16 database has to be *built* by hand to test the migration — a store that has lineage
+    /// columns but no lineage written into them is exactly what an upgraded file looks like, and no
+    /// shipped code path can produce that state on purpose. Keeping this `cfg(test)` is what stops
+    /// a feature from reaching through the same hole to hand-write rows.
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
+    }
+
     pub fn in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         Self::setup(conn)
@@ -305,6 +395,36 @@ impl Store {
             params![path, now_ts()],
         )?;
         Ok(())
+    }
+
+    /// Forget registered folders that are gone and hold nothing, and say how many went.
+    ///
+    /// A folder row is kept for its label and colour, which means a row survives the folder
+    /// disappearing — a drive that is simply unmounted today should not lose either. But a run that
+    /// registers a scratch folder and then deletes it leaves a row the person never added and can
+    /// never open: the probes did exactly that, and the sidebar ended up with a screen of `ws` rows
+    /// holding zero conversations each. Two things have to be true to forget a row: the folder is not
+    /// there to open, *and* nothing in the database still says it lives there. A workspace with
+    /// sessions is never dropped, because history is worth more than a missing mount.
+    pub fn prune_dead_workspaces(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT w.path, (SELECT COUNT(*) FROM sessions s WHERE s.workspace = w.path) \
+             FROM workspaces w",
+        )?;
+        let dead: Vec<String> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .filter_map(|row| match row {
+                Ok((path, n)) if n == 0 && !std::path::Path::new(&path).is_dir() => Some(path),
+                _ => None,
+            })
+            .collect();
+        drop(stmt);
+        let mut gone = 0usize;
+        for path in &dead {
+            gone += conn.execute("DELETE FROM workspaces WHERE path = ?1", params![path])?;
+        }
+        Ok(gone)
     }
 
     /// Drop the sidebar entry. Sessions that live in the workspace are untouched -
@@ -602,7 +722,7 @@ impl Store {
         self.drop_unreferenced_blobs(&workspace, &dropped);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO checkpoint_prunes (session_id, dropped, note, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO checkpoint_prunes (session_id, dropped, note, reason, created_at) VALUES (?1, ?2, ?3, 'cap', ?4)",
             params![
                 session_id,
                 n,
@@ -751,7 +871,7 @@ impl Store {
             params![session_id],
             |r| r.get(0),
         )?;
-        let mut stmt = conn.prepare("SELECT id, session_id, dropped, note, created_at FROM checkpoint_prunes WHERE session_id = ?1 ORDER BY id ASC")?;
+        let mut stmt = conn.prepare("SELECT id, session_id, dropped, note, reason, created_at FROM checkpoint_prunes WHERE session_id = ?1 AND reason = 'cap' ORDER BY id ASC")?;
         let mut pruned = 0usize;
         for row in stmt.query_map(params![session_id], |r| r.get::<_, i64>(2))? {
             pruned += row? as usize;
@@ -766,7 +886,7 @@ impl Store {
     pub fn checkpoint_prunes(&self, session_id: i64) -> Result<Vec<CheckpointPrune>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, dropped, note, created_at FROM checkpoint_prunes WHERE session_id = ?1 ORDER BY id ASC",
+            "SELECT id, session_id, dropped, note, reason, created_at FROM checkpoint_prunes WHERE session_id = ?1 ORDER BY id ASC",
         )?;
         let mut out = Vec::new();
         for row in stmt.query_map(params![session_id], |r| {
@@ -775,12 +895,128 @@ impl Store {
                 session: r.get(1)?,
                 dropped: r.get::<_, i64>(2)? as usize,
                 note: r.get(3)?,
-                created_at: r.get(4)?,
+                reason: r.get(4)?,
+                created_at: r.get(5)?,
             })
         })? {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Every blob key any conversation's index points at. The snapshot folder is a separate
+    /// thing from the index, and the gap between the two is orphan bytes — files on disk that
+    /// nothing can find again. Saying that number is how a person can tell a store is being
+    /// tidy rather than quietly full.
+    pub fn referenced_hashes(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT DISTINCT hash FROM checkpoints WHERE hash <> ''")?;
+        let mut out = Vec::new();
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Rows for `hash` in conversations *other than* `session`. Content-addressing means two
+    /// conversations that wrote the same bytes share one blob, so this is the question behind
+    /// "would dropping this one free it?" — and it is not answered by this conversation's rows.
+    pub fn rows_pointing_at_outside(&self, hash: &str, session_id: i64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE hash = ?1 AND session_id <> ?2",
+            params![hash, session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// The conversations that share a folder's snapshot store. `neighbours` in the stats line,
+    /// because "whose copies are these" is answered per folder and not per conversation.
+    pub fn sessions_sharing_workspace(&self, workspace: &str) -> Result<Vec<i64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM sessions WHERE workspace = ?1 ORDER BY id ASC")?;
+        let mut out = Vec::new();
+        for row in stmt.query_map(params![workspace], |r| r.get::<_, i64>(0))? {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Drop one conversation's copies: its index rows, and the blobs no other conversation
+    /// points at. Returns `(rows, bytes freed, blobs left behind)`.
+    ///
+    /// Reachability is checked before anything is deleted, and across every conversation:
+    /// two conversations that overwrote the same file share one blob, and freeing it because
+    /// one of them asked would leave the other unable to revert. What is left is reported
+    /// rather than mentioned in passing — a person who asked to free space and freed none
+    /// deserves to know why.
+    pub fn forget_checkpoints(&self, session_id: i64, workspace: &str) -> Result<(usize, u64, usize), StoreError> {
+        if workspace.trim().is_empty() {
+            return Err(StoreError::Invalid(format!(
+                "conversation {session_id} has no folder, so it keeps no copies"
+            )));
+        }
+        let dir = crate::checkpoint::snapshot_dir(std::path::Path::new(workspace));
+        let conn = self.conn.lock().unwrap();
+        let mut hashes: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT hash FROM checkpoints WHERE session_id = ?1 AND hash <> ''")?;
+            let it = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+            it.filter_map(|x| x.ok()).collect()
+        };
+        // One row per copy, and copies are content-addressed: two turns that wrote the same bytes
+        // name one file. Summing the rows here would report twice the bytes that actually leave the
+        // disk on a verb whose whole receipt is about what it deleted.
+        hashes.sort();
+        hashes.dedup();
+        let rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let mut freed = 0u64;
+        let mut left = 0usize;
+        for h in &hashes {
+            let still: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM checkpoints WHERE hash = ?1 AND session_id <> ?2",
+                    params![h, session_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if still > 0 {
+                left += 1;
+                continue;
+            }
+            freed += std::fs::metadata(crate::checkpoint::blob_path(&dir, h))
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
+        conn.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        drop(conn);
+        self.drop_unreferenced_blobs(workspace, &hashes);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO checkpoint_prunes (session_id, dropped, note, reason, created_at) VALUES (?1, ?2, ?3, 'forget', ?4)",
+            params![
+                session_id,
+                rows,
+                format!(
+                    "{rows} cop{} forgotten at the person's request: {} freed{}, {} blob{} pointed at by another \
+                     conversation and left in the store",
+                    if rows == 1 { "y was" } else { "ies were" },
+                    crate::checkpoint::human_bytes(freed),
+                    if freed == 0 { " (nothing was on disk to free)" } else { "" },
+                    left,
+                    if left == 1 { " was" } else { "s were" }
+                ),
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        Ok((rows as usize, freed, left))
     }
 
     /// How many conversations the record holds, and how many messages are in them. Two counts for
@@ -800,27 +1036,8 @@ impl Store {
 
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<Session>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
-                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                    s.persona, s.web_on
-             FROM sessions s
-             ORDER BY s.updated_at DESC, s.id DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |r| {
-            Ok(Session {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                workspace: r.get(2)?,
-                model: r.get(3)?,
-                created_at: r.get(4)?,
-                updated_at: r.get(5)?,
-                message_count: r.get(6)?,
-                persona: r.get(7)?,
-                web_on: r.get::<_, i64>(8)? != 0,
-            })
-        })?;
+        let mut stmt = conn.prepare(&sessions_query("ORDER BY s.updated_at DESC, s.id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map(params![limit], |r| session_from_row(r))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -838,53 +1055,132 @@ impl Store {
     /// count with `SESSIONS_IN_CAP` and says so rather than deleting a silent subset.
     pub fn sessions_in(&self, workspace: &str) -> Result<Vec<Session>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
-                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                    s.persona, s.web_on
-             FROM sessions s
-             WHERE s.workspace = ?1
-             ORDER BY s.updated_at DESC, s.id DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![workspace, SESSIONS_IN_CAP], |r| {
-            Ok(Session {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                workspace: r.get(2)?,
-                model: r.get(3)?,
-                created_at: r.get(4)?,
-                updated_at: r.get(5)?,
-                message_count: r.get(6)?,
-                persona: r.get(7)?,
-                web_on: r.get::<_, i64>(8)? != 0,
-            })
-        })?;
+        let mut stmt = conn.prepare(&sessions_query(
+            "WHERE s.workspace = ?1 ORDER BY s.updated_at DESC, s.id DESC LIMIT ?2",
+        ))?;
+        let rows = stmt.query_map(params![workspace, SESSIONS_IN_CAP], |r| session_from_row(r))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The conversation's row tree, as `(id, parent)` pairs in file order plus its leaf.
+    ///
+    /// `parent_row` is the lineage a leaf switch wrote. A row with none was written before v16,
+    /// or is the conversation's first row: for the first, `None` means "root"; for the rest, the
+    /// row *before it in this conversation* is what its lineage meant, because that is exactly what
+    /// every read of a pre-v16 store did. Reading a missing parent as "no parent" would collapse
+    /// an old database to its last row, which is a transcript quietly lost to a migration.
+    fn rows_locked(&self, conn: &rusqlite::Connection, session_id: i64) -> Result<(Vec<i64>, Vec<Option<i64>>, Option<i64>), StoreError> {
+        let leaf: Option<i64> = conn
+            .query_row(
+                "SELECT leaf_row FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut parents: Vec<Option<i64>> = Vec::new();
+        let mut stmt = conn.prepare("SELECT id, parent_row FROM messages WHERE session_id = ?1 ORDER BY id ASC")?;
+        for row in stmt.query_map(params![session_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))? {
+            let (id, p) = row?;
+            // Resolve before returning: a row with no recorded parent continues from the row that
+            // was already there, which is what its lineage meant before the column existed.
+            parents.push(if ids.is_empty() { None } else { p.or(Some(*ids.last().unwrap())) });
+            ids.push(id);
+        }
+        Ok((ids, parents, leaf))
+    }
+
+    /// The rows the next answer reads, in reading order: the path from the leaf up to the root.
+    ///
+    /// Rows that hang off another branch stay in the store — a leaf switch deletes nothing — and
+    /// are what [`Store::off_branch_rows`] counts, so the tree can say how much of a conversation
+    /// is not currently being read rather than leaving the person to wonder where the rest went.
+    pub fn branch_chain(&self, session_id: i64) -> Result<Vec<i64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        self.chain_locked(&conn, session_id)
+    }
+
+    /// Where the next answer reads through. `None` is "the newest row", which is the state every
+    /// conversation had before leaf switching existed and the state a send returns it to.
+    pub fn leaf_row(&self, session_id: i64) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT leaf_row FROM sessions WHERE id = ?1", params![session_id], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten())
+    }
+
+    /// Move the leaf. Refuses a row that belongs to another conversation, because a leaf pointing
+    /// outside its own conversation is not a branch to read — it is a prompt assembled from a
+    /// conversation nobody named.
+    ///
+    /// `None` means the newest row. `Some(0)` means *before the first message*, the node pi's own
+    /// navigation leaves you at when you take back a conversation's opening ask: nothing is read, and
+    /// every row of the conversation is then reported as off the path. It needs its own value because
+    /// "no leaf recorded" and "deliberately at the root" are different facts.
+    pub fn set_leaf(&self, session_id: i64, row: Option<i64>) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(r) = row.filter(|r| *r != 0) {
+            let own: Option<i64> = conn
+                .query_row("SELECT session_id FROM messages WHERE id = ?1", params![r], |q| q.get(0))
+                .optional()?;
+            match own {
+                Some(s) if s == session_id => {}
+                Some(s) => {
+                    return Err(StoreError::Invalid(format!(
+                        "message {r} belongs to conversation {s}, not {session_id}, so the leaf was \
+                         not moved: the next answer would read a path out of the wrong conversation"
+                    )));
+                }
+                None => {
+                    return Err(StoreError::Invalid(format!(
+                        "message {r} is not in the record any more, so the leaf was not moved"
+                    )));
+                }
+            }
+        }
+        conn.execute(
+            "UPDATE sessions SET leaf_row = ?2, updated_at = ?3 WHERE id = ?1",
+            params![session_id, row, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    /// Record who a conversation was cut out of, and where. Written by the branch path, read by
+    /// the tree.
+    pub fn set_lineage(&self, id: i64, parent: i64, role: &str, row: Option<i64>) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET parent = ?2, branch_role = ?3, branch_row = ?4 WHERE id = ?1",
+            params![id, parent, role, row],
+        )?;
+        Ok(())
+    }
+
+    /// The conversations cut out of this one, oldest first — the children the tree draws.
+    pub fn children_of(&self, id: i64) -> Result<Vec<Session>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sessions_query("WHERE s.parent = ?1 ORDER BY s.id ASC"))?;
+        let rows = stmt.query_map(params![id], |r| session_from_row(r))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// How many rows this conversation holds that are **not** on the branch the leaf sits on.
+    /// Nothing was deleted to make them that way; they are simply not what the next answer reads.
+    pub fn off_branch_rows(&self, session_id: i64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let (ids, parents, leaf) = self.rows_locked(&conn, session_id)?;
+        Ok(ids.len().saturating_sub(chain_from(&ids, &parents, leaf).len()))
     }
 
     pub fn session(&self, id: i64) -> Result<Option<Session>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT s.id, s.title, s.workspace, s.model, s.created_at, s.updated_at,
-                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                        s.persona, s.web_on
-                 FROM sessions s WHERE s.id = ?1",
+                SESSION_SELECT,
                 params![id],
-                |r| {
-                    Ok(Session {
-                        id: r.get(0)?,
-                        title: r.get(1)?,
-                        workspace: r.get(2)?,
-                        model: r.get(3)?,
-                        created_at: r.get(4)?,
-                        updated_at: r.get(5)?,
-                        message_count: r.get(6)?,
-                        persona: r.get(7)?,
-                        web_on: r.get::<_, i64>(8)? != 0,
-                    })
-                },
+                |r| session_from_row(r),
             )
             .optional()?;
         Ok(row)
@@ -899,7 +1195,10 @@ impl Store {
     /// on — rewriting history invalidates the prefix cache and makes the audit
     /// trail useless.
     pub fn append_message(&self, session_id: i64, m: &Message) -> Result<i64, StoreError> {
-        let now = now_ts();
+        // A message typed mid-turn carries the time it was typed (`Message::sent_at`), and that is
+        // the time the row gets: a steer that lands two minutes later must not read as though the
+        // person asked it after the answer they were reacting to. Everything else is stamped now.
+        let now = m.sent_at.unwrap_or_else(now_ts);
         let tool_calls = if m.tool_calls.is_empty() {
             String::new()
         } else {
@@ -911,9 +1210,21 @@ impl Store {
             serde_json::to_string(&m.changes).unwrap_or_default()
         };
         let conn = self.conn.lock().unwrap();
+        // The new row hangs off the leaf, not off the newest row: that is what makes a message sent
+        // after a leaf switch join *that* branch instead of whichever path happened to be last in
+        // the file. Same rule pi's tree follows when its leaf is moved and a prompt is sent.
+        let tip: Option<i64> = conn
+            .query_row(
+                "SELECT COALESCE(leaf_row, (SELECT MAX(id) FROM messages WHERE session_id = ?1)) \
+                 FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, reasoning, reasoning_signature, reasoning_ms, tool_call_id, tool_calls_json, tool_meta_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO messages (session_id, role, content, reasoning, reasoning_signature, reasoning_ms, tool_call_id, tool_calls_json, tool_meta_json, parent_row, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 session_id,
                 role_str(&m.role),
@@ -924,6 +1235,7 @@ impl Store {
                 m.tool_call_id,
                 tool_calls,
                 tool_meta,
+                tip,
                 now
             ],
         )?;
@@ -949,7 +1261,10 @@ impl Store {
                 params![id, a.mime, a.name, a.data_b64, now],
             )?;
         }
-        conn.execute("UPDATE sessions SET updated_at = ?2 WHERE id = ?1", params![session_id, now])?;
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?2, leaf_row = ?3 WHERE id = ?1",
+            params![session_id, now, id],
+        )?;
         Ok(id)
     }
 
@@ -959,6 +1274,10 @@ impl Store {
     /// and inserting all of them costs memory and scroll performance for content
     /// nobody is looking at. The agent still reads the full history through
     /// `history()` - this is a display concern, not a context concern.
+    ///
+    /// "Full history" and "this window" both mean **the branch the leaf sits on**, not every row
+    /// the conversation ever held. A row kept on another branch is still in the store and still in
+    /// the tree; it is not what the reader is looking at, and it is not what the next answer reads.
     pub fn messages_before(
         &self,
         session_id: i64,
@@ -966,14 +1285,24 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let chain = self.chain_locked(&conn, session_id)?;
+        let mut keep: Vec<i64> = chain
+            .into_iter()
+            .filter(|id| before_id.map(|b| *id < b).unwrap_or(true))
+            .collect();
+        if keep.len() > limit {
+            keep = keep[keep.len() - limit..].to_vec();
+        }
+        if keep.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ph = keep.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
                     reasoning_signature, reasoning_ms, files, tool_meta_json, created_at
-             FROM messages
-             WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2)
-             ORDER BY id DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![session_id, before_id, limit as i64], |r| {
+             FROM messages WHERE id IN ({ph}) ORDER BY id ASC"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(keep.iter()), |r| {
             Ok(StoredMessage {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -991,9 +1320,16 @@ impl Store {
             })
         })?;
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
-        out.reverse();
         attach_meta(&conn, &mut out)?;
         Ok(out)
+    }
+
+    /// The conversation's row tree, read under a lock the caller already holds. Split out so
+    /// `messages_before` does not lock twice — and twice would deadlock, because this store's
+    /// mutex is not reentrant.
+    fn chain_locked(&self, conn: &rusqlite::Connection, session_id: i64) -> Result<Vec<i64>, StoreError> {
+        let (ids, parents, leaf) = self.rows_locked(conn, session_id)?;
+        Ok(chain_from(&ids, &parents, leaf))
     }
 
     /// One bounded page of transcript history, newest window in reading order.
@@ -1073,6 +1409,38 @@ impl Store {
     /// quietly deleting part of a person's usage history is not what "undo that message" asks for.
     pub fn truncate_from(&self, session_id: i64, from_id: i64) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
+        // Resolved **before** the delete, because the walk needs the rows that are about to go. A leaf
+        // inside the cut moves to the first surviving row of *its own* path — where the person is
+        // standing when the cut lands. `MAX(id)` would be wrong and quietly worse: that is the newest
+        // row in the file, and in a conversation with two branches it belongs to a path nobody was
+        // reading. A leaf earlier than the cut is left alone: it marks a branch the cut did not reach,
+        // and moving it would change what the next answer reads without anybody asking.
+        let (ids, parents, leaf) = self.rows_locked(&conn, session_id)?;
+        let pos: std::collections::HashMap<i64, usize> =
+            ids.iter().copied().enumerate().map(|(i, id)| (id, i)).collect();
+        let mut new_leaf = leaf;
+        if let Some(l) = leaf {
+            if l >= from_id {
+                let mut cur: Option<i64> = Some(l);
+                let mut guard = 0usize;
+                while let Some(id) = cur {
+                    guard += 1;
+                    if guard > ids.len() + 1 {
+                        break;
+                    }
+                    if id < from_id {
+                        new_leaf = Some(id);
+                        break;
+                    }
+                    cur = pos.get(&id).and_then(|i| parents[*i]);
+                }
+                if new_leaf == leaf {
+                    // Nothing on this path survived the cut. `None` is the honest answer: the newest
+                    // row that is left, and when the whole transcript went, nothing at all.
+                    new_leaf = None;
+                }
+            }
+        }
         let n = conn.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND id >= ?2",
             params![session_id, from_id],
@@ -1082,13 +1450,14 @@ impl Store {
             params![session_id, from_id],
         )?;
         conn.execute(
-            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-            params![session_id, now_ts()],
+            "UPDATE sessions SET updated_at = ?2, leaf_row = ?3 WHERE id = ?1",
+            params![session_id, now_ts(), new_leaf],
         )?;
         Ok(n)
     }
 
-    /// Copy a conversation's rows, up to and including `through_id`, into another conversation.
+    /// Copy the rows the source conversation is **reading**, up to and including `through_id`, into
+    /// another conversation.
     ///
     /// This is what a branch is made of: the new conversation has to hold the same words, the same
     /// thinking (including the signature an Anthropic replay needs), the same tool calls and results,
@@ -1096,6 +1465,12 @@ impl Store {
     /// [`Store::history`] instead would rebuild rows from the *model's* view of them and quietly drop
     /// the columns that only the UI reads — a branch whose tool cards and picture chips had vanished,
     /// which is the same loss v8 and v9 were added to prevent.
+    ///
+    /// The path, not the file. Once a leaf has been moved, a conversation holds rows on more than one
+    /// branch, and `id <= through_id` alone would copy rows the person never saw in that conversation:
+    /// the transcript of a conversation is the branch its leaf sits on, so a branch cut at a node
+    /// carries that node's path and leaves the rest behind. `crate::tree` is where the rows left behind
+    /// are still shown.
     ///
     /// Row by row, keeping each source row's `created_at`: the transcript's order is its meaning, and
     /// a branch that read as a scrambled version of the original is a conversation nobody can trust.
@@ -1109,6 +1484,9 @@ impl Store {
         }
         let now = now_ts();
         let conn = self.conn.lock().unwrap();
+        // The branch the source's leaf sits on. Everything the source holds is `all_rows`; what it
+        // *is* — the transcript a person looking at it would recognise — is this path.
+        let path: std::collections::HashSet<i64> = self.chain_locked(&conn, from)?.into_iter().collect();
         let mut stmt = conn.prepare(
             "SELECT id, role, content, reasoning, tool_call_id, tool_calls_json,
                     reasoning_signature, reasoning_ms, files, tool_meta_json, created_at
@@ -1132,14 +1510,21 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut copied = 0usize;
+        let mut prev: Option<i64> = None;
         for (sid, role, content, reasoning, tool_call_id, tool_calls, sig, ms, files, meta, created) in src {
+            if !path.contains(&sid) {
+                continue;
+            }
+            // The copy is one branch: each row continues from the one before it, and the branch
+            // point itself (`prev = None` for the first row) is what the tree draws as the cut.
             conn.execute(
                 "INSERT INTO messages (session_id, role, content, reasoning, reasoning_signature, reasoning_ms,
-                                       tool_call_id, tool_calls_json, tool_meta_json, files, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![to, role, content, reasoning, sig, ms, tool_call_id, tool_calls, meta, files, created],
+                                       tool_call_id, tool_calls_json, tool_meta_json, files, parent_row, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![to, role, content, reasoning, sig, ms, tool_call_id, tool_calls, meta, files, prev, created],
             )?;
             let new_id = conn.last_insert_rowid();
+            prev = Some(new_id);
             conn.execute(
                 "INSERT INTO messages_fts (rowid, content, session_id, message_id, role)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1155,18 +1540,28 @@ impl Store {
         // The branch is a conversation with content in it, so it belongs at "now": a fresh row that
         // keeps the source's old `updated_at` sorts behind everything in the sidebar list, which reads
         // as the branch never happened.
-        conn.execute("UPDATE sessions SET updated_at = ?2 WHERE id = ?1", params![to, now])?;
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?2, leaf_row = ?3 WHERE id = ?1",
+            params![to, now, prev],
+        )?;
         Ok(copied)
     }
 
     pub fn messages(&self, session_id: i64) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        // The branch the leaf sits on. See `messages_before` for why a row on another branch is
+        // not part of the transcript, and `crate::tree` for where it is still shown.
+        let chain = self.chain_locked(&conn, session_id)?;
+        if chain.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ph = chain.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, session_id, role, content, reasoning, tool_call_id, tool_calls_json,
                     reasoning_signature, reasoning_ms, files, tool_meta_json, created_at
-             FROM messages WHERE session_id = ?1 ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map(params![session_id], |r| {
+             FROM messages WHERE id IN ({ph}) ORDER BY id ASC"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chain.iter()), |r| {
             Ok(StoredMessage {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -1186,6 +1581,23 @@ impl Store {
         let mut out = rows.collect::<Result<Vec<_>, _>>()?;
         attach_meta(&conn, &mut out)?;
         Ok(out)
+    }
+
+    /// Every row this conversation holds, on any branch, oldest first.
+    ///
+    /// The tree needs the rows that are *not* on the current branch — they are the ones a leaf
+    /// switch left behind, and a tree that only draws the path being read cannot say what it left
+    /// out. Nothing else reads this: the transcript, the prompt and the share path all want the
+    /// branch, not the whole tree.
+    pub fn all_rows(&self, session_id: i64) -> Result<Vec<(i64, Option<i64>, String, String)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_row, role, content FROM messages WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Full payloads for a set of messages, keyed by message id.
@@ -1276,6 +1688,10 @@ impl Store {
                 changes: Vec::new(),
                 reasoning: if s.reasoning.is_empty() { None } else { Some(s.reasoning) },
                 reasoning_ms: if s.reasoning_ms == 0 { None } else { Some(s.reasoning_ms) },
+                // A stored row's own time is not a mid-turn stamp: these rows are already in the
+                // record and nothing re-persists them. `sent_at` is set only by a press that lands
+                // at a step boundary later in the conversation.
+                sent_at: None,
                 reasoning_signature: if s.reasoning_signature.is_empty() {
                     None
                 } else {
@@ -1585,6 +2001,40 @@ fn decode_files(raw: String) -> Vec<crate::tools::OutputFile> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
+/// Walk leaf→root and hand back the path in reading order.
+///
+/// `ids` is ascending by id and `parents[i]` is row `ids[i]`'s recorded parent, already resolved
+/// for rows that pre-date the column (see [`Store::row_tree`]). A parent id that is not in this
+/// conversation ends the walk rather than jumping to another conversation's rows, and a repeated
+/// id means the file contradicts itself: the walk stops at the repeat instead of spinning.
+fn chain_from(ids: &[i64], parents: &[Option<i64>], leaf: Option<i64>) -> Vec<i64> {
+    // `0` is not a row id. It is the leaf that means *before the first message*: taking back a
+    // conversation's opening ask leaves the model reading nothing but its prompt, which is where pi's
+    // own navigation puts you at that node. `None` cannot stand for it — `None` means "the newest
+    // row", which is what a store with no leaf column at all says.
+    if leaf == Some(0) {
+        return Vec::new();
+    }
+    let pos: std::collections::HashMap<i64, usize> = ids.iter().copied().enumerate().map(|(i, id)| (id, i)).collect();
+    let mut start = leaf.and_then(|l| pos.get(&l).copied()).or_else(|| ids.len().checked_sub(1));
+    let mut out: Vec<i64> = Vec::new();
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    while let Some(i) = start {
+        if !seen.insert(i) {
+            break;
+        }
+        out.push(ids[i]);
+        match parents[i] {
+            // A parent outside this conversation (another conversation's row, or one that has been
+            // deleted) is the end of the path, not a link to follow.
+            Some(p) => start = pos.get(&p).copied(),
+            None => start = None,
+        }
+    }
+    out.reverse();
+    out
+}
+
 fn add_column_if_missing(conn: &Connection, table: &str, col: &str, ddl: &str) -> rusqlite::Result<()> {
     let names: Vec<String> = {
         let mut s = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -1826,6 +2276,42 @@ fn migrate(conn: &Connection, from: i64) -> Result<(), StoreError> {
              CREATE INDEX IF NOT EXISTS idx_ckprune_session ON checkpoint_prunes(session_id);",
         )?;
     }
+    if from < 16 {
+        // v16: lineage. A branch made a second conversation and recorded nothing about where it
+        // came from, so the sidebar showed a branch as an unrelated row and the tree pi owns was
+        // read for nothing but a leaf id. A session gains its parent, the role and row id of the
+        // cut it was made at, and a leaf; a message gains the row it continues from.
+        //
+        // NULL is a value, not a gap, in three of these four places: a session with no parent is a
+        // **root** (and the tree must draw it as one, not as "unknown"), a session with no leaf is
+        // reading its newest row, and a message with no `parent_row` continues from the row before
+        // it — which is the rule every pre-v16 database already lived by, so an old store reads
+        // exactly as it did before this migration.
+        add_column_if_missing(conn, "sessions", "parent", "parent INTEGER")?;
+        add_column_if_missing(
+            conn,
+            "sessions",
+            "branch_role",
+            "branch_role TEXT NOT NULL DEFAULT ''",
+        )?;
+        add_column_if_missing(conn, "sessions", "branch_row", "branch_row INTEGER")?;
+        add_column_if_missing(conn, "sessions", "leaf_row", "leaf_row INTEGER")?;
+        add_column_if_missing(conn, "messages", "parent_row", "parent_row INTEGER")?;
+        // Rows the older build wrote keep `parent_row` NULL on purpose — see the note above — but
+        // every conversation had a newest row, and that row is where a leaf switch starts from.
+        // Writing it here would make `leaf_row` mean "newest" in two ways at once.
+    }
+    if from < 17 {
+        // v17: `reason` on the prune notices. Old rows are all cap evictions, because that was
+        // the only thing that ever wrote one, and the default says so rather than leaving the
+        // history blank.
+        add_column_if_missing(
+            conn,
+            "checkpoint_prunes",
+            "reason",
+            "reason TEXT NOT NULL DEFAULT 'cap'",
+        )?;
+    }
     if from < 10 {
         // v10: workspaces became things you can add, not just side effects of the
         // last path you typed. The sidebar groups sessions by workspace and lets
@@ -1934,6 +2420,32 @@ pub trait StoreOps: Send + Sync {
     /// only worked on the Rust core would be a feature the phone cannot use.
     fn copy_through(&self, from: i64, to: i64, through_id: i64) -> Result<usize, StoreError>;
 
+    // ---- lineage and the leaf ----------------------------------------------------------
+    //
+    // On this trait rather than only on `Store` for the same reason `copy_through` is: the pi core
+    // writes the record beside the thread it forks, and both cores need the same four facts —
+    // which conversation a conversation was cut out of, where it was cut, which node it reads
+    // through now, and what is left on the branch it is not reading.
+
+    /// Record the parent and the cut. Written by the branch path on both cores.
+    fn set_lineage(&self, id: i64, parent: i64, role: &str, row: Option<i64>) -> Result<(), StoreError>;
+    /// Move the leaf — the node the next answer reads through. `None` means the newest row.
+    ///
+    /// This is not a rewind: it deletes no row and copies none. Rows it leaves behind stay in the
+    /// record and are reported by [`StoreOps::off_branch_rows`].
+    fn set_leaf(&self, session_id: i64, row: Option<i64>) -> Result<(), StoreError>;
+    /// Where the leaf is. `None` is "the newest row", the state every conversation starts in.
+    fn leaf_row(&self, session_id: i64) -> Result<Option<i64>, StoreError>;
+    /// The conversations cut out of this one, oldest first.
+    fn children_of(&self, id: i64) -> Result<Vec<Session>, StoreError>;
+    /// Rows this conversation holds that are not on the branch the leaf sits on.
+    fn off_branch_rows(&self, session_id: i64) -> Result<usize, StoreError>;
+    /// The row ids the next answer reads, in reading order.
+    fn branch_chain(&self, session_id: i64) -> Result<Vec<i64>, StoreError>;
+    /// Every row on any branch: `(id, parent_row, role, content)`, oldest first. The tree reads
+    /// this; the transcript, the prompt and the share path read the branch.
+    fn all_rows(&self, session_id: i64) -> Result<Vec<(i64, Option<i64>, String, String)>, StoreError>;
+
     /// The folder a conversation works in: where its snapshot store lives, and what
     /// stored checkpoint paths are relative to.
     fn session_workspace(&self, session_id: i64) -> Result<String, StoreError>;
@@ -1969,6 +2481,25 @@ pub trait StoreOps: Send + Sync {
         &self,
         session_id: i64,
     ) -> Result<CheckpointOverview, StoreError>;
+    /// Every copy this conversation holds, oldest first — the file ledger reads the whole
+    /// conversation, where a revert card reads one turn.
+    fn checkpoints_for_session(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<CheckpointRow>, StoreError>;
+    /// The notices saying copies went away, each carrying the reason it says so.
+    fn checkpoint_prunes(&self, session_id: i64) -> Result<Vec<CheckpointPrune>, StoreError>;
+    /// Blob keys any conversation points at. Anything in the snapshot folder that is not
+    /// here is orphan bytes.
+    fn referenced_hashes(&self) -> Result<Vec<String>, StoreError>;
+    /// Rows for `hash` outside `session_id` — what "would dropping this conversation free it?"
+    /// has to ask, because a blob two conversations share is not this one's to free.
+    fn rows_pointing_at_outside(&self, hash: &str, session_id: i64) -> Result<usize, StoreError>;
+    /// Conversations sharing one folder's snapshot store.
+    fn sessions_sharing_workspace(&self, workspace: &str) -> Result<Vec<i64>, StoreError>;
+    /// Drop one conversation's copies and the blobs nothing else points at. See
+    /// [`Store::forget_checkpoints`] for what is checked before anything is deleted.
+    fn forget_checkpoints(&self, session_id: i64, workspace: &str) -> Result<(usize, u64, usize), StoreError>;
     /// See `Store::message_attachments`.
     fn message_attachments(&self, message_id: i64) -> Result<Vec<crate::provider::Attachment>, StoreError>;
     fn history(&self, session_id: i64) -> Result<Vec<Message>, StoreError>;
@@ -2033,6 +2564,28 @@ impl StoreOps for Store {
         Store::copy_through(self, from, to, through_id)
     }
 
+    fn set_lineage(&self, id: i64, parent: i64, role: &str, row: Option<i64>) -> Result<(), StoreError> {
+        Store::set_lineage(self, id, parent, role, row)
+    }
+    fn set_leaf(&self, session_id: i64, row: Option<i64>) -> Result<(), StoreError> {
+        Store::set_leaf(self, session_id, row)
+    }
+    fn leaf_row(&self, session_id: i64) -> Result<Option<i64>, StoreError> {
+        Store::leaf_row(self, session_id)
+    }
+    fn children_of(&self, id: i64) -> Result<Vec<Session>, StoreError> {
+        Store::children_of(self, id)
+    }
+    fn off_branch_rows(&self, session_id: i64) -> Result<usize, StoreError> {
+        Store::off_branch_rows(self, session_id)
+    }
+    fn branch_chain(&self, session_id: i64) -> Result<Vec<i64>, StoreError> {
+        Store::branch_chain(self, session_id)
+    }
+    fn all_rows(&self, session_id: i64) -> Result<Vec<(i64, Option<i64>, String, String)>, StoreError> {
+        Store::all_rows(self, session_id)
+    }
+
     fn session_workspace(&self, session_id: i64) -> Result<String, StoreError> {
         Store::session_workspace(self, session_id)
     }
@@ -2073,6 +2626,24 @@ impl StoreOps for Store {
 
     fn checkpoint_overview(&self, session_id: i64) -> Result<CheckpointOverview, StoreError> {
         Store::checkpoint_overview(self, session_id)
+    }
+    fn checkpoints_for_session(&self, session_id: i64) -> Result<Vec<CheckpointRow>, StoreError> {
+        Store::checkpoints_for_session(self, session_id)
+    }
+    fn checkpoint_prunes(&self, session_id: i64) -> Result<Vec<CheckpointPrune>, StoreError> {
+        Store::checkpoint_prunes(self, session_id)
+    }
+    fn referenced_hashes(&self) -> Result<Vec<String>, StoreError> {
+        Store::referenced_hashes(self)
+    }
+    fn rows_pointing_at_outside(&self, hash: &str, session_id: i64) -> Result<usize, StoreError> {
+        Store::rows_pointing_at_outside(self, hash, session_id)
+    }
+    fn sessions_sharing_workspace(&self, workspace: &str) -> Result<Vec<i64>, StoreError> {
+        Store::sessions_sharing_workspace(self, workspace)
+    }
+    fn forget_checkpoints(&self, session_id: i64, workspace: &str) -> Result<(usize, u64, usize), StoreError> {
+        Store::forget_checkpoints(self, session_id, workspace)
     }
     fn db_path(&self) -> String {
         Store::db_path(self)
@@ -2424,6 +2995,33 @@ mod tests {
         assert_eq!(a.reasoning_ms, Some(154_000));
     }
 
+    /// A message typed during a turn is written with the time it was typed, not the time the loop
+    /// got round to it. That stamp is the difference between a transcript that reads in the order
+    /// the person typed and one that says they asked something after the answer they were reacting
+    /// to — and it is the row's own `created_at`, so every read path gets it for free.
+    #[test]
+    fn a_message_typed_mid_turn_is_written_with_the_time_it_was_typed() {
+        let s = store();
+        let sid = s.create_session("t", "/w", "m").unwrap();
+        s.append_message(sid, &Message::user("the question")).unwrap();
+        s.append_message(
+            sid,
+            &Message {
+                role: Role::User,
+                content: "steered in later".into(),
+                sent_at: Some(1_700_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let rows = s.messages(sid).unwrap();
+        assert_eq!(rows[1].content, "steered in later");
+        assert_eq!(rows[1].created_at, 1_700_000_000, "the row was stamped when it landed, not when it was typed");
+        // An ordinary send still gets the clock, and the two must not be confused.
+        assert!(rows[0].created_at > 1_700_000_000, "a plain row inherited the mid-turn stamp");
+    }
+
     #[test]
     fn no_thinking_stores_zero_not_a_null_guess() {
         let s = store();
@@ -2749,6 +3347,34 @@ mod tests {
             ws.iter().map(|w| (w.path.as_str(), w.sessions)).collect::<Vec<_>>(),
             vec![("/home/me/ws-a", 2), ("/home/me/ws-b", 1)]
         );
+    }
+
+    /// A scratch folder that was registered and then deleted must not stay in the sidebar. This
+    /// happened for real: every probe run left a `/tmp/....../ws` row, and the person's sidebar
+    /// ended up a screen of folders named `ws` holding nothing.
+    #[test]
+    fn a_gone_folder_holding_nothing_stops_showing_and_a_folder_holding_history_does_not() {
+        let s = Store::in_memory().unwrap();
+        let base = std::env::temp_dir().join(format!("cwoffee-prune-{}", std::process::id()));
+        let scratch = base.join("ws");
+        let alive = base.join("real");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&alive).unwrap();
+        s.add_workspace(scratch.to_str().unwrap()).unwrap();
+        s.add_workspace(alive.to_str().unwrap()).unwrap();
+        s.create_session("history outlives the mount", "/mnt/gone/ws", "m").unwrap();
+        assert_eq!(s.list_workspaces().unwrap().len(), 3, "two folders plus one from sessions");
+        std::fs::remove_dir(&scratch).unwrap();
+        assert_eq!(
+            s.prune_dead_workspaces().unwrap(),
+            1,
+            "only the deleted scratch folder: `/mnt/gone/ws` holds a conversation, and a folder that exists is nobody's dead row"
+        );
+        let left: Vec<String> = s.list_workspaces().unwrap().into_iter().map(|w| w.path).collect();
+        assert!(!left.contains(&scratch.to_str().unwrap().to_string()), "gone and empty: gone from the list");
+        assert!(left.contains(&alive.to_str().unwrap().to_string()), "a folder that exists is kept");
+        assert!(left.contains(&"/mnt/gone/ws".to_string()), "and the conversation still says where it lives");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Removing a folder from the list is not deleting anyone's work.
